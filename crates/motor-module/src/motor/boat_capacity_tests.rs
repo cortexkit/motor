@@ -7,7 +7,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
 async fn stored_fresh_boat_booking_uses_lease_id_for_status_cancel_attach_and_finish() {
+    assert_fresh_boat_cancel_result(Some(Outcome::Exit { code: 23 }), false).await;
+}
+
+#[tokio::test]
+async fn fresh_boat_cancelled_terminal_finishes_as_cancelled() {
+    assert_fresh_boat_cancel_result(Some(Outcome::Cancelled), false).await;
+}
+
+#[tokio::test]
+async fn fresh_boat_cancel_ack_without_terminal_settles_after_bounded_wait() {
+    assert_fresh_boat_cancel_result(None, false).await;
+}
+
+#[tokio::test]
+async fn fresh_boat_cancel_ack_when_replay_disconnects_still_has_a_bounded_wait() {
+    assert_fresh_boat_cancel_result(None, true).await;
+}
+
+async fn assert_fresh_boat_cancel_result(real_outcome: Option<Outcome>, disconnect_replay: bool) {
     let boat = Boat::new(0, false).await;
+    boat.attach_gate.send_replace(false);
+    if let Some(outcome) = &real_outcome {
+        *boat.attach_outcome.lock().unwrap() = outcome.clone();
+    }
     boat.connect_host_full.store(1, Ordering::SeqCst);
     boat.fresh_no_capacity.store(1, Ordering::SeqCst);
     let (scratch, repo) = committed_repo();
@@ -38,6 +61,15 @@ async fn stored_fresh_boat_booking_uses_lease_id_for_status_cancel_attach_and_fi
         3
     );
     storage.run_sent(id, true).unwrap();
+    storage
+        .hosted_update(id, |state| {
+            state.started_at_ms = Some(
+                crate::hosted::now_s()
+                    .saturating_mul(1000)
+                    .saturating_sub(2000),
+            );
+        })
+        .unwrap();
     storage.shutdown().unwrap();
     drop(storage);
     let direct = Arc::new(NoSsh(AtomicUsize::new(0)));
@@ -48,26 +80,84 @@ async fn stored_fresh_boat_booking_uses_lease_id_for_status_cancel_attach_and_fi
     let status = motor.job_status(id).await.unwrap();
     assert_eq!(status.job_id, id);
     assert_eq!(status.state, "running");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while boat.attaches.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the result owner must hold Attach before cancellation");
     motor.send_cancel(id).await.unwrap();
+    boat.disconnect_replay
+        .store(disconnect_replay, Ordering::SeqCst);
+    if real_outcome.is_some() {
+        boat.attach_gate.send_replace(true);
+    }
     let stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
-    let (_, terminal) = records(stream).await;
+    let terminal = if real_outcome.is_none() {
+        let mut stream = stream;
+        tokio::time::timeout(Duration::from_secs(40), async {
+            while let Some(record) = stream.records.recv().await {
+                if let StreamRecord::Terminal(terminal) = record.unwrap() {
+                    return terminal;
+                }
+            }
+            panic!("cancel collection ended without its unknown summary");
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let state = motor.hosted_state(id).unwrap();
+            panic!("cancel acknowledgment exceeded the terminal wait: terminal={:?}, pending_finish={:?}, finish_done={}, billing={:?}, attaches={}",
+                state.terminal, state.pending_finish, state.finish_done, state.billing, boat.attaches.load(Ordering::SeqCst));
+        })
+    } else {
+        records(stream).await.1
+    };
     assert_eq!(terminal.job_id, id);
-    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(
+        terminal.outcome,
+        real_outcome.clone().unwrap_or(Outcome::OutcomeUnknown)
+    );
     assert_eq!(direct.0.load(Ordering::SeqCst), 0);
     let calls = boat.requests.lock().unwrap().clone();
     assert!(calls
         .iter()
         .filter(|(p, _)| p.ends_with("/reattach"))
         .all(|(p, _)| p == &format!("/v1/leases/{booking}/reattach")));
+    let expected_finish = if matches!(real_outcome, Some(Outcome::Exit { .. })) {
+        "exit"
+    } else {
+        "cancelled"
+    };
     assert!(calls
         .iter()
-        .any(|(p, b)| p == &format!("/v1/leases/{booking}/finish") && b["outcome"] == "cancelled"));
+        .any(|(p, b)| p == &format!("/v1/leases/{booking}/finish")
+            && b["outcome"] == expected_finish));
+    if real_outcome.is_none() {
+        assert!(
+            calls
+                .iter()
+                .any(|(p, body)| p == &format!("/v1/leases/{booking}/finish")
+                    && body["run_ms"]
+                        .as_u64()
+                        .is_some_and(|runtime| runtime >= 2000)),
+            "{calls:?}"
+        );
+        assert!(terminal.wall_ms >= 2000);
+    }
     assert!(boat
         .frames
         .lock()
         .unwrap()
         .iter()
         .any(|f| matches!(f, Frame::Cancel(c) if c.job_id == booking)));
+    assert!(boat
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Attach(attach) if attach.job_id == booking)));
+    motor.close().await;
 }
 
 #[tokio::test]

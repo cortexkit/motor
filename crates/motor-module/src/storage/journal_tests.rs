@@ -490,7 +490,6 @@ fn rollback_fixture(root: &Path) -> (Storage, Uuid, Value) {
     let id = Uuid::now_v7();
     lifecycle(&storage, id);
     storage.local_terminal(terminal(id)).unwrap();
-    storage.cancel(id, true).unwrap();
     storage
         .accepted(
             "rollback".into(),
@@ -511,6 +510,8 @@ fn rollback_fixture(root: &Path) -> (Storage, Uuid, Value) {
     storage
         .update(|s| {
             let job = s.jobs.get_mut(&id).unwrap();
+            // Completed jobs refuse new cancels; seed legacy intent to check older readers preserve it.
+            job.pending_cancel = true;
             job.terminal_delivered_at_ms = None;
             job.retain_until_ms = Some(1);
             job.hosted.as_mut().unwrap().pending_finish = Some(crate::hosted::placement::Finish {
@@ -522,6 +523,122 @@ fn rollback_fixture(root: &Path) -> (Storage, Uuid, Value) {
     let expected = durable_value(root).unwrap();
     (storage, id, expected)
 }
+
+fn archived_hosted_replacement(root: &Path) -> (Storage, Uuid) {
+    let storage = Storage::open(root).unwrap();
+    let id = Uuid::now_v7();
+    lifecycle(&storage, id);
+    storage
+        .update(|state| {
+            let job = state.jobs.get_mut(&id).unwrap();
+            job.build_server_job_id = Some(Uuid::now_v7());
+            job.local_terminal = None;
+            job.remote_terminal = None;
+            job.terminal_observed_at_ms = None;
+            job.terminal_delivered_at_ms = None;
+            let hosted = job.hosted.as_mut().unwrap();
+            hosted.run_sent = false;
+            hosted.billing = crate::BillingStatus::Unavailable;
+        })
+        .unwrap();
+    (storage, id)
+}
+
+#[test]
+fn audit_12_archived_hosted_completion_preserves_replacement_cancel() {
+    let root = ScratchDir::new("archived-hosted-cancel");
+    let (storage, id) = archived_hosted_replacement(&root);
+    storage.cancel(id, true).unwrap();
+    assert!(
+        storage.job(id).unwrap().pending_cancel,
+        "the completed archived booking discarded a live replacement's cancel intent"
+    );
+    storage.cancel(id, false).unwrap();
+    assert!(
+        !storage.job(id).unwrap().hosted_complete(),
+        "an archived hosted terminal cannot complete its replacement job"
+    );
+    assert!(
+        !storage.unsettled_hosted().contains(&id),
+        "a settled archived booking cannot be re-elected because its replacement is live"
+    );
+    storage.cancel(id, true).unwrap();
+    storage
+        .hosted_update(id, |state| {
+            state.finish_done = false;
+            state.lease_attempted = true;
+        })
+        .unwrap();
+    assert!(
+        storage.unsettled_hosted().contains(&id),
+        "an unsettled archived booking still needs its own cleanup"
+    );
+    assert!(storage.job(id).unwrap().pending_cancel);
+    storage.shutdown().unwrap();
+}
+
+#[test]
+fn audit_12_stale_hosted_terminal_preserves_replacement_cancel() {
+    let root = ScratchDir::new("archived-hosted-terminal");
+    let (storage, id) = archived_hosted_replacement(&root);
+    storage
+        .update(|state| state.jobs.get_mut(&id).unwrap().pending_cancel = true)
+        .unwrap();
+    storage.hosted_terminal(id, terminal(id)).unwrap();
+    let job = storage.job(id).unwrap();
+    assert!(
+        job.pending_cancel,
+        "a stale hosted terminal consumed the replacement's cancel intent"
+    );
+    assert!(job.terminal_observed_at_ms.is_none());
+    storage.shutdown().unwrap();
+}
+
+#[test]
+fn audit_12_settlement_metadata_preserves_unconfirmed_cancel_without_real_terminal() {
+    for terminal_kind in 0..3 {
+        for finish_done in [false, true] {
+            let root = ScratchDir::new("metadata-only-cancel");
+            let storage = Storage::open(&root).unwrap();
+            let id = Uuid::now_v7();
+            lifecycle(&storage, id);
+            storage
+                .update(|state| {
+                    let job = state.jobs.get_mut(&id).unwrap();
+                    job.pending_cancel = true;
+                    let hosted = job.hosted.as_mut().unwrap();
+                    hosted.terminal = match terminal_kind {
+                        0 => None,
+                        1 => Some(
+                            TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                                .with_refusal_detail(
+                                    "hosted_cancel_unconfirmed: no real terminal received",
+                                ),
+                        ),
+                        _ => Some(
+                            TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                                .with_refusal_detail(crate::hosted::CANCEL_ACKNOWLEDGED),
+                        ),
+                    };
+                    hosted.finish_done = finish_done;
+                    hosted.billing = if finish_done {
+                        crate::BillingStatus::Pending
+                    } else {
+                        crate::BillingStatus::Available
+                    };
+                })
+                .unwrap();
+            storage.cancel(id, true).unwrap();
+            assert!(storage.job(id).unwrap().pending_cancel, "settlement metadata consumed unconfirmed intent: terminal_kind={terminal_kind}, finish_done={finish_done}");
+            storage.shutdown().unwrap();
+            drop(storage);
+            let reopened = Storage::open(&root).unwrap();
+            assert!(reopened.job(id).unwrap().pending_cancel);
+            reopened.shutdown().unwrap();
+        }
+    }
+}
+
 fn assert_old_client(root: &Path, id: Uuid, expected: &Value) {
     let helper = std::env::var_os("MOTOR_ROLLBACK_CLIENT")
         .expect("run python3 scripts/mixed-version.py for the real 222d833 client");

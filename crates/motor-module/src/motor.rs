@@ -72,6 +72,8 @@ pub struct Motor {
     /// still move the command to another runner. Closing a watch opens the fence.
     submissions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, watch::Sender<()>>>>,
     hosted_cleanup: Arc<hosted_cleanup::Cleanup>,
+    hosted_results:
+        Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Arc<hosted_result::Owner>>>>,
     #[cfg(test)]
     hosted_connector: Option<Arc<dyn Connector>>,
     #[cfg(test)]
@@ -131,6 +133,7 @@ impl Drop for CancelInFlight {
 #[path = "hosted/account/boundary_tests.rs"]
 mod hosted_account_tests;
 mod hosted_cleanup;
+mod hosted_result;
 impl Motor {
     pub(crate) fn set_connector(&mut self, connector: Arc<dyn Connector>) {
         self.connector = connector;
@@ -163,6 +166,7 @@ impl Motor {
             hosted_cancels: Arc::default(),
             submissions: Arc::default(),
             hosted_cleanup: Arc::default(),
+            hosted_results: Arc::default(),
             #[cfg(test)]
             hosted_connector: None,
             #[cfg(test)]
@@ -300,15 +304,23 @@ impl Motor {
     /// reopens the same store right away must wait for that, not retry.
     #[cfg(test)]
     pub(crate) async fn close(self) {
-        let storage = Arc::downgrade(&self.storage);
+        self.stop_hosted_cleanup_for_test().await;
+        // Model process loss without settling bookings or acknowledging cancels.
+        // Graceful shutdown is exercised separately through shutdown_hosted.
+        self.hosted_cleanup.shutdown.send_replace(true);
+        self.stop_hosted_results().await;
+        // Keep the last store reference here so its destructor and lease release
+        // finish synchronously before a test reopens the same directory.
+        let storage = self.storage.clone();
         drop(self);
         tokio::time::timeout(Duration::from_secs(30), async {
-            while storage.strong_count() > 0 {
+            while Arc::strong_count(&storage) > 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("the motor's tasks still hold its store after 30s");
+        drop(storage);
     }
     pub(crate) fn direct_authorized(&self, id: Uuid, secret: Option<&str>) -> bool {
         self.storage.direct_authorized(id, secret)
@@ -458,9 +470,21 @@ impl Motor {
         if !returns.return_paths.is_empty() {
             self.storage.return_cap(id, returns.return_max_bytes)?;
         }
-        let (stream, tx, rx) = self.stream(id);
+        let (mut stream, caller_tx, caller_wake) = self.stream(id);
+        let owner = self
+            .hosted_state(id)
+            .map(|_| self.reserve_hosted_result(id, 0));
+        let (tx, rx, records) = if let Some(owner) = &owner {
+            let (tx, records) = mpsc::channel(32);
+            stream.wake = owner.wake.clone();
+            self.subscribe_hosted_result(id, owner.clone(), 0, true, caller_tx);
+            (tx, owner.wake.subscribe(), Some(records))
+        } else {
+            (caller_tx, caller_wake, None)
+        };
+        let owner_tx = tx.clone();
         let motor = self.clone();
-        tokio::spawn(async move {
+        let producer = tokio::spawn(async move {
             let _submission = submission;
             if let Some(detail) = memory_refusal {
                 if let Err(error) = motor
@@ -531,6 +555,9 @@ impl Motor {
                     .await;
             }
         });
+        if let Some(owner) = owner {
+            self.collect_hosted_result(id, owner, owner_tx, records.unwrap(), producer);
+        }
         Ok(stream)
     }
     pub fn attach(&self, request: AttachRequest) -> io::Result<JobStream> {
@@ -546,10 +573,36 @@ impl Motor {
         {
             self.connector_for_job(id)?;
         }
-        let (stream, tx, rx) = self.stream(id);
+        let (mut stream, tx, rx) = self.stream(id);
+        if self.hosted_state(id).is_some_and(|state| {
+            state.run_sent || self.hosted_results.lock().unwrap().contains_key(&id)
+        }) {
+            let completed = self
+                .storage
+                .job(id)
+                .filter(|job| job.hosted_complete())
+                .and_then(|job| job.hosted_route()?.terminal);
+            if let Some(terminal) = completed {
+                tokio::spawn(async move {
+                    let _ = emit(&tx, StreamRecord::Terminal(terminal)).await;
+                });
+            } else {
+                let owner = self.ensure_hosted_result(id, None);
+                let owner = self.subscribe_hosted_result(id, owner, request.from_seq, false, tx);
+                stream.wake = owner.wake.clone();
+            }
+            return Ok(stream);
+        }
         let motor = self.clone();
         tokio::spawn(async move {
             if !motor.wait_for_submission(id, &tx).await {
+                return;
+            }
+            if motor.hosted_state(id).is_some_and(|state| state.run_sent) {
+                let owner = motor.ensure_hosted_result(id, None);
+                let owner =
+                    motor.subscribe_hosted_result(id, owner, request.from_seq, false, tx.clone());
+                owner.forward_wake(rx, &tx).await;
                 return;
             }
             let result = if let Some(t) = motor.storage.job(id).and_then(|j| j.local_terminal) {
@@ -1937,10 +1990,10 @@ impl Motor {
                 // may already have acknowledged cancellation and settled Boat.
                 if let Some(state) = self.hosted_state(id).filter(|s| {
                     s.cancel_settlement_ready()
-                        || s.finish_done
-                        || s.terminal
-                            .as_ref()
-                            .is_some_and(|t| !matches!(t.outcome, Outcome::OutcomeUnknown))
+                        || self
+                            .storage
+                            .job(id)
+                            .is_some_and(|job| job.hosted_cancel_complete())
                 }) {
                     if state.awaiting_cancel_terminal() && !state.finish_done {
                         self.storage.cancel_acknowledged(id)?;
@@ -1955,10 +2008,16 @@ impl Motor {
                 // Delivery outlives any one waiting caller, so detaching cannot
                 // cancel the request another waiter still needs.
                 tokio::spawn(async move {
-                    let result = motor
-                        .send_cancel_once(id)
-                        .await
-                        .map_err(|error| (error.kind(), error.to_string()));
+                    let result =
+                        tokio::time::timeout(Duration::from_secs(5), motor.send_cancel_once(id))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "hosted cancellation delivery timed out",
+                                ))
+                            })
+                            .map_err(|error| (error.kind(), error.to_string()));
                     tx.send_replace(Some(result));
                     motor.hosted_cancels.lock().unwrap().remove(&id);
                 });
@@ -1991,7 +2050,13 @@ impl Motor {
         match channel.next().await? {
             Incoming::Frame(Frame::CancelReply(reply)) if reply.job_id == build_server_id => {
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "runner acknowledged cancel");
-                self.storage.cancel_acknowledged(id)
+                let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+                self.storage
+                    .cancel_acknowledged_with_owner(id, owner.is_some())?;
+                if let Some(owner) = owner {
+                    owner.wake.send_replace(true);
+                }
+                Ok(())
             }
             Incoming::Frame(Frame::Refusal(refusal)) if refusal.job_id == Some(build_server_id) => {
                 Err(io::Error::other(
@@ -2138,7 +2203,11 @@ impl Motor {
                 _ => None,
             };
             if let Some(cause) = cause {
-                match self.storage.retire_hosted_job(
+                let owners = self.hosted_results.lock().unwrap();
+                if owners.contains_key(&id) {
+                    return opened;
+                }
+                let retired = self.storage.retire_hosted_job(
                     id,
                     cause,
                     now,
@@ -2146,7 +2215,9 @@ impl Motor {
                         opened,
                         Err(crate::hosted::Error::Finished | crate::hosted::Error::ReattachUnknown)
                     ),
-                ) {
+                );
+                drop(owners);
+                match retired {
                     Ok(true) => {
                         tracing::warn!(job_id = %id, cause, "retired abandoned hosted job");
                         self.recover_hosted(id);
@@ -2186,21 +2257,25 @@ impl Motor {
         // Attempt cancellation first, but a network failure must not leave the
         // caller without a terminal. Retain and retry unconfirmed cancellation.
         let mut cancel_unconfirmed = false;
-        let host_expired = state
-            .host_deadline_s()
-            .is_some_and(|d| crate::hosted::now_s() >= d);
+        let host_expired = state.run_sent
+            && crate::hosted::now_s().saturating_mul(1000) >= self.hosted_result_deadline(id)?;
+        if host_expired && matches!(terminal.outcome, Outcome::OutcomeUnknown) {
+            self.storage.cancel(id, false)?;
+        }
         if matches!(terminal.outcome, Outcome::OutcomeUnknown)
+            && !state.has_real_terminal()
             && state.run_sent
             && !state.cancel_settlement_ready()
-            && !state.finish_done
             && !host_expired
             && !*self.hosted_cleanup.shutdown.borrow()
             && state.hosted_code.as_deref() != Some("hosted_sandbox_lost")
             && (self.pending(id)
-                || self
-                    .storage
-                    .job(id)
-                    .is_none_or(|job| job.terminal_observed_at_ms.is_none()))
+                || (state.billing != crate::BillingStatus::Available
+                    && !state.finish_done
+                    && self
+                        .storage
+                        .job(id)
+                        .is_none_or(|job| job.terminal_observed_at_ms.is_none())))
         {
             self.storage.cancel(id, true)?;
             if let Err(error) = self.send_cancel(id).await {
@@ -2219,13 +2294,7 @@ impl Motor {
         // this flow was attaching. Share its terminal without claiming a second
         // failed delivery after the booking has already been settled.
         if let Some(recorded) = self.hosted_state(id) {
-            if recorded.cancel_settlement_ready()
-                || recorded.finish_done
-                || recorded
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|t| !matches!(t.outcome, Outcome::OutcomeUnknown))
-            {
+            if recorded.cancel_settlement_ready() || recorded.has_real_terminal() {
                 if let Some(terminal_record) = recorded.terminal {
                     terminal = terminal_record;
                     cancel_unconfirmed = false;
@@ -2239,6 +2308,8 @@ impl Motor {
                 .hosted_client(self.hosted_state(id).unwrap())
                 .finish(id, Some(&terminal), &self.storage)
                 .await?
+            && matches!(terminal.outcome, Outcome::OutcomeUnknown)
+            && !state.has_real_terminal()
         {
             terminal = Self::sandbox_lost_terminal(id, &state);
         }
@@ -2258,7 +2329,7 @@ impl Motor {
             tracing::warn!(job_id = %id, step = "finish", hosted_code = ?state.hosted_code,
                 cause, wall_ms = terminal.wall_ms, "hosted job outcome unknown");
         }
-        if unavailable {
+        if unavailable || host_expired {
             self.storage.hosted_update(id, |s| {
                 if s.billing != crate::BillingStatus::Available {
                     s.billing = crate::BillingStatus::Unavailable;
@@ -2267,11 +2338,62 @@ impl Motor {
         }
         self.storage
             .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
+        if self.hosted_state(id).is_some_and(|state| {
+            state.finish_done
+                && state
+                    .placement
+                    .as_ref()
+                    .is_some_and(|placement| placement.host.starts_with("boat:"))
+        }) {
+            let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+            if let Some(owner) = owner {
+                owner.finish_boat_replay();
+            }
+        }
+        if !cancel_unconfirmed
+            && (host_expired
+                || self
+                    .storage
+                    .job(id)
+                    .is_some_and(|job| job.hosted_cancel_complete()))
+        {
+            self.storage.cancel(id, false)?;
+        }
         self.storage.terminal_observed(id)?;
         if cancel_unconfirmed {
             self.retry_cancel(id);
         }
         emit(tx, StreamRecord::Terminal(terminal)).await
+    }
+    fn persist_hosted_terminal(
+        &self,
+        id: Uuid,
+        mut terminal: TerminalRecord,
+    ) -> io::Result<TerminalRecord> {
+        terminal.job_id = id;
+        if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
+            terminal.retry_after_ms = None;
+        }
+        terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
+        if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
+            && !terminal
+                .refusal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("lease_mismatch: "))
+        {
+            terminal.refusal_detail = Some(bounded_detail(format!(
+                "lease_mismatch: {}",
+                terminal.refusal_detail.take().unwrap_or_default()
+            )));
+        }
+        self.storage.hosted_terminal(id, terminal)?;
+        let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+        if let Some(owner) = owner {
+            self.start_boat_terminal_drain(id, &owner);
+        }
+        self.hosted_state(id)
+            .and_then(|state| state.terminal)
+            .ok_or_else(|| io::Error::other("missing hosted terminal"))
     }
     async fn lost_sandbox(
         &self,
@@ -2281,7 +2403,11 @@ impl Motor {
         let state = self
             .hosted_state(id)
             .ok_or_else(|| io::Error::other("missing hosted route"))?;
-        let terminal = Self::sandbox_lost_terminal(id, &state);
+        let terminal = state
+            .terminal
+            .clone()
+            .filter(|_| state.has_real_terminal())
+            .unwrap_or_else(|| Self::sandbox_lost_terminal(id, &state));
         self.storage.hosted_update(id, |s| {
             s.hosted_code = Some("hosted_sandbox_lost".into());
             s.hosted_no_fallback = true;
@@ -2345,13 +2471,40 @@ impl Motor {
         mut placement_queue: Option<&mut PlacementQueue>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
+        if self
+            .storage
+            .job(id)
+            .is_some_and(|job| job.hosted_cancel_complete())
+        {
+            self.storage.cancel(id, false)?;
+        }
+        let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+        let probe_settlement = owner
+            .as_ref()
+            .is_some_and(|owner| owner.take_probe_settlement());
+        let mut delivery_cursor = if cursor == u64::MAX { 0 } else { cursor };
         // Frames to and from the build server carry its ID for the job; records
         // and storage keep the caller's.
         let build_server_id = self.build_server_id(id);
         if self
-            .hosted_state(id)
-            .is_some_and(|s| s.billing != crate::BillingStatus::Pending && s.terminal.is_some())
+            .storage
+            .job(id)
+            .is_some_and(|job| job.hosted_complete())
+            && owner.as_ref().is_none_or(|owner| !owner.has_rewind())
         {
+            return self.finish_hosted(id, false, tx).await.map(|_| false);
+        }
+        if self.hosted_state(id).is_some_and(|state| {
+            state
+                .placement
+                .as_ref()
+                .is_some_and(|p| p.host.starts_with("boat:"))
+                && (state.pending_finish.is_some()
+                    || (channel.is_none()
+                        && state
+                            .host_deadline_s()
+                            .is_some_and(|deadline| crate::hosted::now_s() >= deadline)))
+        }) {
             return self.finish_hosted(id, false, tx).await.map(|_| false);
         }
         let wait = self
@@ -2364,6 +2517,8 @@ impl Motor {
         let mut queue_deadline = None;
         let mut wake_open = true;
         let mut reattaches = 0;
+        let mut reconnect_delay = 1;
+        let mut rewind_auth_attempts = None;
         let mut hosted_terminal_deadline = self
             .hosted_state(id)
             .filter(|state| state.awaiting_cancel_terminal())
@@ -2377,6 +2532,42 @@ impl Motor {
                         + Duration::from_secs(deadline.saturating_sub(crate::hosted::now_s()))
                 });
         loop {
+            if hosted_terminal_deadline.is_none()
+                && self
+                    .hosted_state(id)
+                    .is_some_and(|state| state.awaiting_cancel_terminal())
+            {
+                // CancelReply can arrive on a separate delivery connection.
+                // Its wake starts the same bounded real-terminal wait here.
+                hosted_terminal_deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_secs(30));
+            }
+            let cancel_deadline = hosted_terminal_deadline.filter(|_| {
+                self.hosted_state(id)
+                    .is_some_and(|state| state.awaiting_cancel_terminal())
+            });
+            if cancel_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                self.storage.cancel_terminal_wait_expired(id)?;
+                return self.finish_hosted(id, false, tx).await.map(|_| false);
+            }
+            if let Some(owner) = &owner {
+                if let Some(from) = owner.take_rewind() {
+                    if channel.take().is_some() {
+                        // A self-initiated rewind can reach the host before EOF
+                        // frees our old slot. First attaches get no such allowance.
+                        rewind_auth_attempts = Some(0u8);
+                    }
+                    cursor = from;
+                    delivery_cursor = from;
+                    if !self
+                        .hosted_state(id)
+                        .is_some_and(|state| state.awaiting_cancel_terminal())
+                    {
+                        hosted_terminal_deadline = None;
+                    }
+                }
+                owner.live(channel.is_some());
+            }
             if tx.is_closed() {
                 self.log_hosted_failure(id, "follow", "caller detached");
                 return Err(io::Error::other("caller detached"));
@@ -2385,18 +2576,30 @@ impl Motor {
             // needs nothing from this stream, which keeps reading so the
             // terminal arrives without a reconnect.
             if self.pending(id)
+                && self
+                    .hosted_state(id)
+                    .is_none_or(|state| !state.has_real_terminal())
                 && (hosted || !self.cancel_in_flight(id))
                 && tokio::time::Instant::now() >= cancel_retry_at
             {
                 if hosted && channel.is_some() {
                     cancel_retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
-                    if channel
-                        .as_ref()
-                        .unwrap()
-                        .send(Frame::Cancel(CancelRequest::new(build_server_id)))
-                        .await
-                        .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
-                        .is_err()
+                    if tokio::time::timeout(
+                        Duration::from_secs(5),
+                        channel
+                            .as_ref()
+                            .unwrap()
+                            .send(Frame::Cancel(CancelRequest::new(build_server_id))),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "hosted cancel write timed out",
+                        ))
+                    })
+                    .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
+                    .is_err()
                     {
                         channel = None;
                     }
@@ -2423,23 +2626,104 @@ impl Motor {
             }
             if channel.is_none() {
                 queue_deadline = None;
-                if hosted && reattaches == 3 {
+                if hosted && reattaches == 3 && owner.is_none() {
                     self.log_hosted_failure(id, "reattach", "attempt limit reached");
                     return self.finish_hosted(id, false, tx).await.map(|_| false);
                 }
                 if hosted {
                     if reattaches > 0 {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let retry_at =
+                            tokio::time::Instant::now() + Duration::from_secs(reconnect_delay);
+                        let retry_at =
+                            cancel_deadline.map_or(retry_at, |deadline| deadline.min(retry_at));
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(retry_at) => {},
+                            changed = wake.changed(), if wake_open => {
+                                if changed.is_err() { wake_open = false; }
+                                continue;
+                            },
+                        }
+                        if cancel_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            continue;
+                        }
+                        reconnect_delay = (reconnect_delay * 2).min(30);
                     }
                     reattaches += 1;
                 }
+                if let Some(owner) = &owner {
+                    if self
+                        .hosted_state(id)
+                        .is_some_and(|state| state.terminal.is_some())
+                        && owner.now_ms() >= self.hosted_result_deadline(id)?
+                        && (!probe_settlement || reattaches > 1)
+                    {
+                        return self.finish_hosted(id, true, tx).await.map(|_| false);
+                    }
+                }
+                if let Some(owner) = &owner {
+                    if !self.claim_hosted_result_transport(id, owner) {
+                        if let Some(terminal) =
+                            self.storage.job(id).and_then(|job| job.local_terminal)
+                        {
+                            return emit(tx, StreamRecord::Terminal(terminal))
+                                .await
+                                .map(|_| false);
+                        }
+                        return Err(io::Error::other(
+                            "hosted result owner no longer owns the transport",
+                        ));
+                    }
+                }
+                let now = owner.as_ref().map_or_else(
+                    || crate::hosted::now_s().saturating_mul(1000),
+                    |owner| owner.now_ms(),
+                );
                 let opened = tokio::select! {
-                    result = self.open_job_channel(id) => result,
+                    result = self.open_job_channel_at(id, now) => result,
+                    _ = async { match cancel_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                        self.storage.cancel_terminal_wait_expired(id)?;
+                        return self.finish_hosted(id, false, tx).await.map(|_| false);
+                    },
+                    changed = wake.changed(), if wake_open => {
+                        if changed.is_err() { wake_open = false; }
+                        continue;
+                    },
                     _ = tx.closed() => {
                         self.log_hosted_failure(id, "reattach", "caller detached");
                         return Err(io::Error::other("caller detached"));
                     },
                 };
+                if let Some(owner) = &owner {
+                    owner.live(opened.is_ok());
+                    if let Some(from) = owner.take_rewind() {
+                        cursor = from;
+                    }
+                    if let Err(error) = &opened {
+                        let fenced = if matches!(error, crate::hosted::Error::AttachAuth) {
+                            if let Some(attempt) = rewind_auth_attempts.as_mut() {
+                                *attempt += 1;
+                                let fenced = *attempt < 3;
+                                tracing::info!(job_id = %id, step = "rewind_auth", attempt = *attempt, fenced,
+                                    "host refused owner-initiated rewind");
+                                if !fenced {
+                                    rewind_auth_attempts = None;
+                                }
+                                fenced
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !fenced {
+                            self.retire_failed_hosted_result(id, *error, now)?;
+                        }
+                    } else {
+                        rewind_auth_attempts = None;
+                    }
+                }
                 if let Err(error) = &opened {
                     self.log_hosted_failure(id, "reattach", error.code());
                 }
@@ -2464,7 +2748,10 @@ impl Motor {
                     self.storage.hosted_update(id, |s| {
                         s.hosted_code = Some(error.code().into());
                         s.hosted_no_fallback = true;
-                        s.terminal = Some(terminal);
+                        if !s.has_real_terminal() {
+                            s.terminal = Some(terminal);
+                            s.observed_unknown_terminal = false;
+                        }
                     })?;
                     return self.finish_hosted(id, true, tx).await.map(|_| false);
                 }
@@ -2480,6 +2767,9 @@ impl Motor {
                     // A persisted cancellation may arrive while the connection
                     // opens. Send it first, unless `cancel` is delivering it.
                     if self.pending(id)
+                        && self
+                            .hosted_state(id)
+                            .is_none_or(|state| !state.has_real_terminal())
                         && (hosted || !self.cancel_in_flight(id))
                         && tokio::time::Instant::now() >= cancel_retry_at
                     {
@@ -2495,9 +2785,18 @@ impl Motor {
                         .is_ok()
                     {
                         channel = Some(c);
-                        if hosted && self.hosted_state(id).is_some_and(|s| s.terminal.is_some()) {
-                            hosted_terminal_deadline =
-                                Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                        if let Some(state) = self
+                            .hosted_state(id)
+                            .filter(|state| state.terminal.is_some())
+                        {
+                            if state.awaiting_cancel_terminal() {
+                                hosted_terminal_deadline.get_or_insert(
+                                    tokio::time::Instant::now() + Duration::from_secs(30),
+                                );
+                            } else {
+                                hosted_terminal_deadline =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                            }
                         }
                     }
                 }
@@ -2518,13 +2817,22 @@ impl Motor {
                     return Err(io::Error::other("caller detached"));
                 },
                 frame = c.next_job() => Some(frame),
-                _ = async { if let Some(deadline) = host_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => {
+                _ = async { if let Some(deadline) = host_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if owner.is_none() => {
                     self.log_hosted_failure(id, "follow", "host deadline passed without a terminal");
                     return self.finish_hosted(id, false, tx).await.map(|_| false);
                 },
                 _ = async { if let Some(deadline) = hosted_terminal_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => {
+                    if self.hosted_state(id).is_some_and(|state| state.awaiting_cancel_terminal()) {
+                        self.storage.cancel_terminal_wait_expired(id)?;
+                        return self.finish_hosted(id, false, tx).await.map(|_| false);
+                    }
                     self.log_hosted_failure(id, "hosted_terminal", "timeout waiting for settlement record");
-                    channel = None; hosted_terminal_deadline = None; None
+                    let collecting_first_party_usage = owner.is_some() && self.hosted_state(id).is_some_and(|state|
+                        state.has_real_terminal() && state.placement.as_ref().is_some_and(|placement| !placement.host.starts_with("boat:")));
+                    if !collecting_first_party_usage {
+                        channel = None;
+                    }
+                    hosted_terminal_deadline = None; None
                 },
                 changed = wake.changed(), if wake_open => { if changed.is_err() { wake_open = false; } None },
                 _ = async { if let Some(deadline) = queue_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if !withdraw_sent => {
@@ -2566,8 +2874,15 @@ impl Motor {
                     cursor = seq.saturating_add(1);
                     let mut started = Started::new(seq, queue_wait_ms, started_at_ms);
                     started.path_mapping = path_mapping;
-                    emit(tx, StreamRecord::Started(started)).await?;
+                    delivery_cursor = delivery_cursor.max(seq.saturating_add(1));
+                    hosted_result::emit_follow_record(
+                        owner.as_deref(),
+                        tx,
+                        StreamRecord::Started(started),
+                    )
+                    .await?;
                     backoff = 1;
+                    reconnect_delay = 1;
                 }
                 Ok(Incoming::Frame(Frame::Output(output))) => {
                     placement_queue = None;
@@ -2579,9 +2894,16 @@ impl Motor {
                     // Unknown streams still advance the replay cursor; they are
                     // not terminal and cannot authorize a local fallback.
                     if matches!(output.stream, OutputStream::Stdout | OutputStream::Stderr) {
-                        emit(tx, StreamRecord::Output(output)).await?;
+                        delivery_cursor = delivery_cursor.max(output.seq.saturating_add(1));
+                        hosted_result::emit_follow_record(
+                            owner.as_deref(),
+                            tx,
+                            StreamRecord::Output(output),
+                        )
+                        .await?;
                     }
                     backoff = 1;
+                    reconnect_delay = 1;
                 }
                 Ok(Incoming::Frame(Frame::ReturnResult(mut result)))
                     if result.job_id == build_server_id =>
@@ -2593,6 +2915,7 @@ impl Motor {
                     result.job_id = id;
                     self.storage.return_result(result)?;
                     backoff = 1;
+                    reconnect_delay = 1;
                 }
                 // Chunked returned files go to the job stream as they arrive;
                 // only the agent route ever asks for them. A replay after the
@@ -2606,8 +2929,15 @@ impl Motor {
                     }
                     cursor = chunk.seq.saturating_add(1);
                     chunk.job_id = id;
-                    emit(tx, StreamRecord::ReturnChunk(chunk)).await?;
+                    delivery_cursor = delivery_cursor.max(chunk.seq.saturating_add(1));
+                    hosted_result::emit_follow_record(
+                        owner.as_deref(),
+                        tx,
+                        StreamRecord::ReturnChunk(chunk),
+                    )
+                    .await?;
                     backoff = 1;
+                    reconnect_delay = 1;
                 }
                 Ok(Incoming::Frame(Frame::ReturnManifest(mut manifest)))
                     if manifest.job_id == build_server_id =>
@@ -2617,8 +2947,15 @@ impl Motor {
                     }
                     cursor = manifest.seq.saturating_add(1);
                     manifest.job_id = id;
-                    emit(tx, StreamRecord::ReturnManifest(manifest)).await?;
+                    delivery_cursor = delivery_cursor.max(manifest.seq.saturating_add(1));
+                    hosted_result::emit_follow_record(
+                        owner.as_deref(),
+                        tx,
+                        StreamRecord::ReturnManifest(manifest),
+                    )
+                    .await?;
                     backoff = 1;
+                    reconnect_delay = 1;
                 }
                 Ok(Incoming::Unknown(seq)) => {
                     if let Some(seq) = seq {
@@ -2658,6 +2995,7 @@ impl Motor {
                             self.with_spill_attempt(id, terminal.refusal_detail.take());
                     }
                     if hosted {
+                        terminal = self.persist_hosted_terminal(id, terminal)?;
                         log_hosted_terminal(id, &terminal);
                     }
                     let boat = hosted
@@ -2665,6 +3003,14 @@ impl Motor {
                             .hosted_state(id)
                             .and_then(|s| s.placement)
                             .is_some_and(|p| p.host.starts_with("boat:"));
+                    if boat {
+                        if let Some(owner) = &owner {
+                            if !owner.wait_boat_subscribers(delivery_cursor).await {
+                                drop(channel.take());
+                                continue;
+                            }
+                        }
+                    }
                     if boat
                         && self
                             .hosted_client(self.hosted_state(id).unwrap())
@@ -2675,16 +3021,12 @@ impl Motor {
                     }
                     self.storage.terminal_observed(id)?;
                     if hosted {
-                        self.storage.cancel(id, false)?;
-                        if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
-                            terminal.refusal_detail = Some(format!(
-                                "lease_mismatch: {}",
-                                terminal.refusal_detail.take().unwrap_or_default()
-                            ));
-                            self.storage.hosted_update(id, |state| {
-                                state.hosted_no_fallback = true;
-                                state.hosted_code = Some("lease_mismatch".into());
-                            })?;
+                        if self
+                            .storage
+                            .job(id)
+                            .is_some_and(|job| job.hosted_cancel_complete())
+                        {
+                            self.storage.cancel(id, false)?;
                         }
                         self.storage.hosted_update(id, |state| {
                             if state
@@ -2705,6 +3047,9 @@ impl Motor {
                         }
                         hosted_terminal_deadline =
                             Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                        if let Some(owner) = &owner {
+                            owner.begin_first_party_delivery();
+                        }
                         continue;
                     }
                     // Retain only the terminal summary, not the output stream, so
@@ -2743,7 +3088,20 @@ impl Motor {
                     if hosted && reply.job_id == build_server_id =>
                 {
                     tracing::info!(job_id = %id, step = "cancel", cause = "runner acknowledged cancellation", "hosted cancellation acknowledged");
-                    self.storage.cancel_acknowledged(id)?;
+                    self.storage
+                        .cancel_acknowledged_with_owner(id, owner.is_some())?;
+                    if owner.is_none()
+                        && self.hosted_state(id).is_some_and(|state| {
+                            state.pending_finish.is_some()
+                                && state
+                                    .placement
+                                    .as_ref()
+                                    .is_some_and(|p| p.host.starts_with("boat:"))
+                        })
+                    {
+                        drop(channel.take());
+                        return self.finish_hosted(id, false, tx).await.map(|_| false);
+                    }
                     if self
                         .hosted_state(id)
                         .is_some_and(|s| s.awaiting_cancel_terminal())
@@ -2757,8 +3115,8 @@ impl Motor {
                             .unwrap()
                             .send(Frame::Attach(AttachRequest::new(build_server_id, cursor)))
                             .await;
-                        hosted_terminal_deadline =
-                            Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                        hosted_terminal_deadline
+                            .get_or_insert(tokio::time::Instant::now() + Duration::from_secs(30));
                     }
                 }
                 Ok(Incoming::Frame(Frame::Refusal(refusal)))
@@ -2790,7 +3148,13 @@ impl Motor {
                         );
                     }
                     channel = None;
-                    hosted_terminal_deadline = None;
+                    // EOF cannot renew the acknowledgment's real-terminal wait.
+                    if !self
+                        .hosted_state(id)
+                        .is_some_and(|state| state.awaiting_cancel_terminal())
+                    {
+                        hosted_terminal_deadline = None;
+                    }
                     // EOF and write failure wake immediately; only failed
                     // reconnects back off, not the first status query.
                 }
@@ -2841,6 +3205,15 @@ impl Motor {
         // The task streaming a hosted job already owns its only allowed attach
         // connection. It checks pending cancellation on each heartbeat and sends
         // it there, rather than opening a conflicting second connection.
+        let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+        if let Some(owner) = owner {
+            owner.wake.send_replace(true);
+            let delivering = self.hosted_cancels.lock().unwrap().contains_key(&id);
+            if delivering {
+                let _ = self.send_cancel(id).await;
+            }
+            return Ok(CancelReply::new(id));
+        }
         if self.hosted_state(id).is_some() && self.storage.has_live_stream(id) {
             return Ok(CancelReply::new(id));
         }
@@ -2866,6 +3239,10 @@ impl Motor {
         Ok(CancelReply::new(id))
     }
     fn retry_cancel(&self, id: Uuid) {
+        if let Some(owner) = self.hosted_results.lock().unwrap().get(&id) {
+            owner.wake.send_replace(true);
+            return;
+        }
         if self.hosted_state(id).is_some_and(|s| {
             !s.run_sent
                 || s.placement
@@ -3009,7 +3386,36 @@ impl Motor {
             .ok_or_else(|| io::Error::other("runner does not report health (upgrade required)"))
     }
     pub async fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
+        tokio::time::timeout(Duration::from_secs(5), self.job_status_inner(id))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "job status timed out"))?
+    }
+
+    async fn job_status_inner(&self, id: Uuid) -> io::Result<JobStatusReply> {
         self.storage.retain_job(id, None)?;
+        if self.hosted_state(id).is_some_and(|state| {
+            state.run_sent || self.hosted_results.lock().unwrap().contains_key(&id)
+        }) {
+            if let Some(terminal) = self
+                .storage
+                .job(id)
+                .filter(|job| job.hosted_complete())
+                .and_then(|job| job.hosted_route()?.terminal)
+            {
+                return Ok(JobStatusReply {
+                    job_id: id,
+                    state: "terminal".into(),
+                    waiting_on: None,
+                    queue_wait_ms: Some(terminal.queue_wait_ms),
+                    terminal: Some(terminal),
+                    unit: None,
+                    unit_alive: None,
+                });
+            }
+            return Ok(self
+                .hosted_result_status(id, crate::hosted::now_s().saturating_mul(1000))
+                .await);
+        }
         // A hosted refusal before Run has no runner job to inspect. Keep its
         // recorded result after restart, as direct clients do after runner eviction.
         // Other callers still inspect the runner for unit and route diagnostics.

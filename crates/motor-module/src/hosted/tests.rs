@@ -553,7 +553,7 @@ async fn hosted_route_survives_switch_flip_restart_cancel_status_and_attach() {
 }
 
 #[tokio::test]
-async fn hosted_quiet_caller_detach_closes_relay_and_next_caller_gets_live_output_and_terminal() {
+async fn hosted_quiet_detach_joins_owner_and_host_drop_reconnects_without_auth_contention() {
     let h = Harness::new(Behavior::QuietAttach).await;
     h.run_gate.send_replace(false);
     let scratch = Scratch::new();
@@ -576,17 +576,27 @@ async fn hosted_quiet_caller_detach_closes_relay_and_next_caller_gets_live_outpu
     // Closing the caller's receiver must not depend on also dropping the
     // separate cancellation wake sender stored in JobStream.
     first.records.close();
-    tokio::time::timeout(Duration::from_secs(5), lifecycle.wait_for(|s| s.1 == 1))
-        .await
-        .expect("quiet detached caller must close its host relay")
-        .unwrap();
     drop(first);
-
     let mut second = motor.attach(AttachRequest::new(id, 0)).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), lifecycle.wait_for(|s| s.2 == 2))
+    motor.job_status(id).await.unwrap();
+    assert_eq!(*lifecycle.borrow(), (1, 0, 1));
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with("/reattach"))
+            .count(),
+        1
+    );
+    h.drop_follow.send_replace(1);
+    tokio::time::timeout(Duration::from_secs(15), lifecycle.wait_for(|s| s.2 == 2))
         .await
-        .expect("new caller must reach the host")
+        .expect("one owner reconnect must replace the dropped relay")
         .unwrap();
+    assert_eq!(lifecycle.borrow().1, 1);
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 3);
     h.run_gate.send_replace(true);
     let record = tokio::time::timeout(Duration::from_secs(5), second.records.recv())
         .await
@@ -618,42 +628,84 @@ async fn hosted_quiet_caller_detach_closes_relay_and_next_caller_gets_live_outpu
 }
 
 #[tokio::test]
-async fn hosted_terminal_disconnect_reattaches_three_times_and_preserves_exit_pending() {
+async fn hosted_missing_settlement_retries_with_backoff_and_preserves_real_exit_until_expiry() {
     let h = Harness::new(Behavior::DropTerminal).await;
     let scratch = Scratch::new();
     let id = Uuid::now_v7();
     seed_running(&h, &scratch, None, id).await;
+    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    storage
+        .hosted_update(id, |state| state.run_sent = true)
+        .unwrap();
+    drop(storage);
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor =
         crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
-    let t = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
-    assert_eq!(t.outcome, Outcome::Exit { code: 23 });
+    let mut caller = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    let mut lifecycle = h.attach_lifecycle.subscribe();
+    let began = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), lifecycle.wait_for(|s| s.2 == 3))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        began.elapsed() >= Duration::from_secs(3),
+        "one- then two-second backoff must separate failed settlement replays"
+    );
+    let state = motor.hosted_state(id).unwrap();
+    let expected = state.terminal.unwrap();
+    assert_eq!(expected.job_id, id);
+    assert_eq!(expected.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(state.billing, BillingStatus::Pending);
+    let early = match caller.records.try_recv() {
+        Ok(Ok(StreamRecord::Terminal(terminal))) => {
+            assert_eq!(terminal, expected, "replays must not invent a terminal");
+            assert!(
+                caller.records.try_recv().is_err(),
+                "replays must not duplicate the terminal"
+            );
+            Some(terminal)
+        }
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+        other => panic!("unexpected record during settlement replay: {other:?}"),
+    };
+    let result = if let Some(terminal) = early {
+        terminal
+    } else {
+        let record = tokio::time::timeout(Duration::from_secs(15), caller.records.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let StreamRecord::Terminal(terminal) = record else {
+            panic!("real terminal missing during pending settlement")
+        };
+        terminal
+    };
+    assert_eq!(result, expected);
     assert_eq!(
         motor.hosted_state(id).unwrap().billing,
         BillingStatus::Pending
     );
-    assert_eq!(
-        h.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|p| p.ends_with("/reattach"))
-            .count(),
-        3
-    );
-    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
-    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
-    h.finished.store(true, Ordering::SeqCst);
-    assert_eq!(
-        terminal(motor.attach(AttachRequest::new(id, 0)).unwrap())
-            .await
-            .outcome,
-        t.outcome
-    );
+    motor.expire_hosted_result_for_test(id);
+    tokio::time::timeout(Duration::from_secs(15), motor.wait_hosted_cleanup(id))
+        .await
+        .unwrap();
     assert_eq!(
         motor.hosted_state(id).unwrap().billing,
         BillingStatus::Unavailable
     );
+    assert_eq!(h.attach_lifecycle.borrow().2, 3);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(
+        caller.records.try_recv().is_err(),
+        "settlement must not deliver a second terminal"
+    );
+    let replay = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(replay, result);
+    drop(caller);
+    motor.close().await;
 }
 
 #[tokio::test]

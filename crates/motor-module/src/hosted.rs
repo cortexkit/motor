@@ -49,6 +49,10 @@ pub struct HostedJobState {
     pub billed_vcpu_ms: Option<u64>,
     pub billing: BillingStatus,
     pub terminal: Option<TerminalRecord>,
+    /// Unknown summaries from older clients may already have an observation
+    /// timestamp. Only a terminal read in this process proves their provenance.
+    #[serde(skip)]
+    pub(crate) observed_unknown_terminal: bool,
     #[serde(default)]
     pub(crate) pending_finish: Option<placement::Finish>,
     #[serde(default)]
@@ -157,6 +161,19 @@ impl HostedJobState {
                 .as_ref()
                 .is_some_and(|finish| finish.outcome == "cancelled")
     }
+    pub(crate) fn recovering_recorded_unknown(&self) -> bool {
+        !self.cancel_settlement_ready()
+            && self.terminal.as_ref().is_some_and(|terminal| {
+                matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                    && !self.observed_unknown_terminal
+            })
+    }
+    pub(crate) fn has_real_terminal(&self) -> bool {
+        self.terminal.as_ref().is_some_and(|terminal| {
+            !matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                || self.observed_unknown_terminal
+        })
+    }
     pub(crate) fn booked_or_attempted(&self) -> bool {
         self.lease_attempted
             || self.placement.is_some()
@@ -193,14 +210,22 @@ impl HostedJobState {
     }
 
     pub(crate) fn needs_cleanup(&self) -> bool {
-        !self.finish_done
-            && (self.pending_finish.is_some()
-                || (self.booked_or_attempted() && !self.run_sent)
-                || (self
-                    .placement
-                    .as_ref()
-                    .is_some_and(|p| p.host.starts_with("boat:"))
-                    && self.terminal.is_some()))
+        self.booked_or_attempted() && !self.settlement_done()
+    }
+
+    pub(crate) fn settlement_done(&self) -> bool {
+        self.pending_finish.is_none()
+            && if self.run_sent {
+                self.terminal.is_some()
+                    && self.billing != BillingStatus::Pending
+                    && (self.finish_done
+                        || self
+                            .placement
+                            .as_ref()
+                            .is_none_or(|p| !p.host.starts_with("boat:")))
+            } else {
+                self.finish_done
+            }
     }
     pub(crate) fn capacity_routed(&self) -> bool {
         self.repository_routed || self.fleet_routed

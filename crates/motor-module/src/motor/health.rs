@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 // Legacy rows lack the requested timeout. Eight-hour jobs have run here;
 // 48 hours leaves ample headroom before treating an abandoned row as stale.
-const LEGACY_JOB_HORIZON_MS: u64 = 48 * 60 * 60 * 1000;
+pub(super) const LEGACY_JOB_HORIZON_MS: u64 = 48 * 60 * 60 * 1000;
 const FAILURE_HORIZON_MS: u64 = 60 * 60 * 1000;
 const STALE_PROBE_INTERVAL_MS: u64 = 15 * 60 * 1000;
 
@@ -207,9 +207,12 @@ impl Motor {
                 let motor = self.clone();
                 let id = *id;
                 probes.spawn(async move {
-                    // Use a status frame directly so health neither renews job retention
-                    // nor reports final usage and releases the broker's reservation.
+                    // Hosted status joins the result owner; the timeout drops only
+                    // this waiter, not terminal collection or settlement.
                     let probe = async {
+                        if motor.hosted_state(id).is_some() {
+                            return Some(motor.hosted_result_status(id, now).await);
+                        }
                         let mut channel = motor.open_job_channel_at(id, now).await.ok()?;
                         let runner_id = motor.build_server_id(id);
                         channel
@@ -238,9 +241,16 @@ impl Motor {
                     if let Some(reply) = &reply {
                         self.health_probes.lock().unwrap().remove(&id);
                         if let Some(terminal) = &reply.terminal {
-                            if self.hosted_state(id).is_none() {
-                                let mut terminal = terminal.clone();
-                                terminal.job_id = id;
+                            let mut terminal = terminal.clone();
+                            terminal.job_id = id;
+                            if self.hosted_state(id).is_some() {
+                                let _ = self.storage.hosted_update(id, |state| {
+                                    if state.terminal.is_none() {
+                                        state.terminal = Some(terminal);
+                                    }
+                                });
+                                self.recover_hosted(id);
+                            } else {
                                 let _ = self.storage.remote_terminal(terminal);
                             }
                         } else if retirable && reply.state == "not_found" {
@@ -278,7 +288,12 @@ impl Motor {
                         }
                     }
                     if let Some(cause) = retire_cause {
-                        match self.storage.retire_health_job(id, cause, now) {
+                        let retired = if self.hosted_state(id).is_some() {
+                            self.retire_idle_hosted_result(id, now, cause, false)
+                        } else {
+                            self.storage.retire_health_job(id, cause, now)
+                        };
+                        match retired {
                             Ok(true) => {
                                 self.health_probes.lock().unwrap().remove(&id);
                                 tracing::info!(job_id = %id, cause, "retired abandoned job from health polling");

@@ -179,7 +179,7 @@ async fn fleet_workspace_with_a_recorded_placement_leaves_affinity_to_the_broker
     let (_, terminal) = records(stream).await;
     assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
     let placement = motor.hosted_state(first_id).unwrap().placement.unwrap();
-    drop(motor);
+    motor.close().await;
 
     let restored = Motor::with_connector(config(&h), &root, ssh.clone()).unwrap();
     assert_eq!(

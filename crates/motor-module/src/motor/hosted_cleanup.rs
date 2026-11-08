@@ -29,7 +29,9 @@ impl Motor {
         let cleanup = self.hosted_cleanup.tasks.lock().unwrap();
         let deliveries = self.hosted_cancels.lock().unwrap();
         let cancels = self.cancels_in_flight.lock().unwrap();
-        if progress.contains_key(&id)
+        let owners = self.hosted_results.lock().unwrap();
+        if owners.contains_key(&id)
+            || progress.contains_key(&id)
             || submissions.contains_key(&id)
             || cleanup
                 .as_ref()
@@ -44,7 +46,22 @@ impl Motor {
     }
 
     #[cfg(test)]
-    pub(super) async fn wait_hosted_cleanup(&self, id: Uuid) {
+    pub(super) async fn stop_hosted_cleanup_for_test(&self) {
+        let tasks = self
+            .hosted_cleanup
+            .tasks
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default();
+        for (_, task) in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_hosted_cleanup(&self, id: Uuid) {
         let task = self
             .hosted_cleanup
             .tasks
@@ -55,6 +72,10 @@ impl Motor {
         if let Some(task) = task {
             task.await.unwrap();
         }
+        let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+        if let Some(owner) = owner {
+            owner.wait_stopped().await;
+        }
     }
 
     /// Own settlement independently of the caller's stream. In particular, an
@@ -63,21 +84,45 @@ impl Motor {
         let Some(job) = self.storage.job(id) else {
             return;
         };
+        if job.hosted_booking_complete() {
+            return;
+        }
+        let active_route = job.hosted_route().is_some();
         let Some(state) = job.hosted else {
             return;
         };
-        if state.finish_done
-            || (!state.booked_or_attempted()
-                && state.pending_finish.is_none()
-                && !(state.terminal.is_some()
-                    && state
-                        .placement
-                        .as_ref()
-                        .is_some_and(|p| p.host.starts_with("boat:"))))
+        if !state.booked_or_attempted()
+            && state.pending_finish.is_none()
+            && !(state.terminal.is_some()
+                && state
+                    .placement
+                    .as_ref()
+                    .is_some_and(|p| p.host.starts_with("boat:")))
         {
             return;
         }
-        if state.run_sent
+        if active_route && state.run_sent && !*self.hosted_cleanup.shutdown.borrow() {
+            if self.hosted_results.lock().unwrap().contains_key(&id) {
+                return;
+            }
+            let direct_settlement = state
+                .placement
+                .as_ref()
+                .is_some_and(|p| p.host.starts_with("boat:"))
+                && (state.pending_finish.is_some()
+                    || state.cancel_settlement_ready()
+                    || state
+                        .host_deadline_s()
+                        .is_some_and(|deadline| crate::hosted::now_s() >= deadline));
+            if !direct_settlement {
+                if !self.submissions.lock().unwrap().contains_key(&id) {
+                    self.ensure_hosted_result(id, None);
+                }
+                return;
+            }
+        }
+        if active_route
+            && state.run_sent
             && state.pending_finish.is_none()
             && state
                 .placement
@@ -176,18 +221,22 @@ impl Motor {
         let Some(job) = self.storage.job(id) else {
             return Ok(true);
         };
+        if job.hosted_booking_complete() {
+            return Ok(true);
+        }
+        let active_route = job.hosted_route().is_some();
         let Some(state) = job.hosted else {
             return Ok(true);
         };
-        if state.finish_done {
-            return Ok(true);
-        }
         let boat = state
             .placement
             .as_ref()
             .is_some_and(|p| p.host.starts_with("boat:"));
-        if !boat && state.billing == crate::BillingStatus::Available && state.terminal.is_some() {
-            return Ok(true); // First-party hosts settle their own usage.
+        if state.settlement_done() && (!state.run_sent || state.has_real_terminal()) {
+            if active_route {
+                self.storage.cancel(id, false)?;
+            }
+            return Ok(true);
         }
         let client = self.hosted_client(state.clone());
         if !state.run_sent {
@@ -219,7 +268,8 @@ impl Motor {
                 terminal.wall_ms = state.elapsed_ms();
                 terminal
             });
-            let unknown = matches!(terminal.outcome, Outcome::OutcomeUnknown);
+            let unknown =
+                matches!(terminal.outcome, Outcome::OutcomeUnknown) && !state.has_real_terminal();
             if unknown && state.pending_finish.is_none() {
                 let deadline = state
                     .host_deadline_s()
@@ -236,14 +286,18 @@ impl Motor {
                 if !expired && state.terminal.is_none() && (stopping || !job.pending_cancel) {
                     return Ok(stopping);
                 }
-                if !stopping && !expired && !state.awaiting_cancel_terminal() {
+                if !stopping
+                    && !expired
+                    && !state.awaiting_cancel_terminal()
+                    && self.hosted_state(id).is_some()
+                {
                     self.storage.cancel(id, true)?;
                     if let Err(error) = self.send_cancel(id).await {
                         self.log_hosted_failure(id, "settlement_cancel", error);
                         return Ok(false);
                     }
                 }
-                if state.awaiting_cancel_terminal() {
+                if state.awaiting_cancel_terminal() && self.hosted_state(id).is_some() {
                     self.storage.cancel_acknowledged(id)?;
                 }
                 if let Some(recorded) = self.storage.job(id).and_then(|j| j.hosted?.terminal) {
@@ -253,22 +307,31 @@ impl Motor {
             }
             client.finish(id, Some(&terminal), &self.storage).await?;
         }
-        let done = self
+        let settled = self
             .storage
             .job(id)
             .and_then(|j| j.hosted)
-            .is_none_or(|s| s.finish_done);
-        if done {
+            .is_none_or(|s| s.settlement_done());
+        if settled {
             // An archived spill may now be cancelling its build-server ID.
             // Settling the old booking must not consume that newer intent.
-            if self
-                .storage
-                .job(id)
-                .is_some_and(|j| j.build_server_job_id.is_none())
-            {
+            if self.storage.job(id).is_some_and(|j| {
+                j.hosted_cancel_complete()
+                    || j.hosted_route().is_some_and(|state| {
+                        (!state.run_sent && state.finish_done)
+                            || state
+                                .host_deadline_s()
+                                .or(legacy_deadline)
+                                .is_some_and(|deadline| crate::hosted::now_s() >= deadline)
+                    })
+            }) {
                 self.storage.cancel(id, false)?;
             }
         }
+        let done = self
+            .storage
+            .job(id)
+            .is_none_or(|job| job.hosted_booking_complete());
         Ok(done)
     }
 
@@ -277,6 +340,7 @@ impl Motor {
         // Close it before taking the inventory, so shutdown cannot miss a grant.
         *self.hosted_cleanup.booking_open.lock().unwrap() = false;
         self.hosted_cleanup.shutdown.send_replace(true);
+        self.stop_hosted_results().await;
         for id in self.storage.unsettled_hosted() {
             self.recover_hosted(id);
         }
