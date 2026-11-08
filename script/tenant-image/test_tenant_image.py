@@ -17,6 +17,16 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT_MOUNTINFO = "1 0 8:1 / / rw - xfs /dev/root rw\n"
+BALLOON_DAX_OPTIONS = (
+    "VIRTIO_BALLOON", "BALLOON_COMPACTION", "PAGE_REPORTING", "COMPACTION",
+    "MEMORY_HOTPLUG", "MEMORY_HOTREMOVE", "MIGRATION", "MEMORY_ISOLATION",
+    "SPARSEMEM", "SPARSEMEM_VMEMMAP", "SPARSEMEM_VMEMMAP_ENABLE",
+    "ARCH_ENABLE_MEMORY_HOTPLUG", "ARCH_ENABLE_MEMORY_HOTREMOVE",
+    "ZONE_DEVICE", "LIBNVDIMM", "BLK_DEV_PMEM", "VIRTIO_PMEM", "DAX", "FS_DAX",
+    "BLOCK", "BLK_DEV", "64BIT", "MMU", "PHYS_ADDR_T_64BIT", "HAS_IOMEM",
+    "MEMREGION", "XARRAY_MULTI", "HAVE_BOOTMEM_INFO_NODE", "FS_IOMAP", "EXT4_FS",
+    "VIRTIO", "VIRTIO_MMIO", "VIRTIO_MMIO_CMDLINE_DEVICES",
+)
 
 
 def module(name, path):
@@ -467,6 +477,24 @@ class ImageTests(unittest.TestCase):
                      "EXT4_FS", "TMPFS", "MEMCG", "CGROUP_PIDS", "BPF_SYSCALL", "CGROUP_BPF",
                      "SECCOMP_FILTER", "NET_NS", "NF_TABLES", "VETH"):
             self.assertIn(f"CONFIG_{name}=y", config)
+
+    def test_kernel_options_include_balloon_and_pmem_dax_dependencies(self):
+        options = set((HERE / "kernel-options.txt").read_text().splitlines())
+        for name in BALLOON_DAX_OPTIONS:
+            with self.subTest(name=name):
+                self.assertIn(f"{name}=y", options)
+
+    def test_resolved_kernel_rejects_missing_or_modular_balloon_and_pmem_dax(self):
+        path = self.root / "kernel.config"
+        config = resolved_config()
+        path.write_text(config)
+        image.check_kernel(path)
+        for name in BALLOON_DAX_OPTIONS:
+            for replacement in (f"# CONFIG_{name} is not set", f"CONFIG_{name}=m", ""):
+                with self.subTest(name=name, replacement=replacement):
+                    path.write_text(config.replace(f"CONFIG_{name}=y\n", replacement + "\n"))
+                    with self.assertRaisesRegex(ValueError, f"CONFIG_{name} must be built in"):
+                        image.check_kernel(path)
 
     def test_resolved_kernel_rejects_missing_driver_module_or_fallback_tunnel(self):
         path = self.root / "kernel.config"
