@@ -44,6 +44,8 @@ impl MirrorJournal {
 }
 
 impl EventLog {
+    // Only the Linux tenant server opts a lease in and acknowledges reports.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn enable_reports(&self, per_job: bool, opted_in: bool) -> io::Result<()> {
         // Old tenant images cannot decode the new event kind on rollback.
         // Per-job boots discard tenant-events.json; the separate mirror journal
@@ -128,6 +130,7 @@ impl EventLog {
         })
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(super) fn ack_report(&self, report: &MirrorRefReport) -> io::Result<()> {
         let mut guard = self.mirror_journal.lock().unwrap();
         let mut next = guard.clone();
