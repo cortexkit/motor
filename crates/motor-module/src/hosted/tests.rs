@@ -393,7 +393,7 @@ async fn hosted_capacity_replaces_three_times_but_auth_and_expiry_do_not() {
         );
         assert_eq!(
             requests.iter().filter(|p| p.ends_with("/replace")).count(),
-            usize::from(reason == "host_full")
+            usize::from(matches!(reason, "host_full" | "capacity"))
         );
         assert_eq!(h.tokens.load(Ordering::SeqCst), count);
         assert!(h

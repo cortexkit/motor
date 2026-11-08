@@ -816,6 +816,73 @@ fn reattach_body(key: &SigningKey) -> ReattachRequest {
     }
 }
 
+/// Observations from one queue wait, not lease identity. A replacement fence
+/// says nothing about why placement is waiting; keep the last definite answer
+/// so its deadline cannot turn a full host into an unreachable host.
+#[derive(Default)]
+struct WaitAnswers {
+    last: Option<Error>,
+    last_response: Option<Error>,
+    mixed: bool,
+    expired: bool,
+}
+impl WaitAnswers {
+    fn observe(&mut self, error: Error) {
+        let answer = match error {
+            Error::HostFull | Error::Capacity => Error::NoCapacity(HOST_FULL_RETRY_MS),
+            // A fence is not a new placement or transport answer.
+            Error::ReplacePending(_) => {
+                self.last_response = Some(error);
+                return;
+            }
+            answer @ (Error::NoCapacity(_)
+            | Error::Connect
+            | Error::Broker
+            | Error::ReattachUnknown
+            | Error::Provisioning(_)) => answer,
+            _ => return,
+        };
+        self.last_response = Some(error);
+        if let Some(last) = self.last {
+            self.mixed |= last.code() != answer.code();
+        }
+        self.last = Some(answer);
+    }
+
+    fn expire(&mut self, pending: Error) -> Error {
+        self.expired = true;
+        // Keep BoatHostFull's spill_attempted detail instead of replacing it
+        // with the ordinary registered-host capacity refusal.
+        if pending == Error::BoatHostFull {
+            return pending;
+        }
+        match self.last {
+            Some(Error::NoCapacity(delay)) => {
+                Error::NoCapacity(pending.retry_after_ms().unwrap_or(delay))
+            }
+            Some(answer) if answer.code() == pending.code() => pending,
+            Some(answer) => answer,
+            None => pending,
+        }
+    }
+
+    fn detail(&self, error: Error, mut detail: String) -> String {
+        if self.expired {
+            detail.push_str(&format!(
+                "; queue wait expired; final_cause={}",
+                error.code()
+            ));
+            if let Some(last) = self.last_response {
+                detail.push_str(&format!("; last_response={}", last.code()));
+            }
+            if self.mixed {
+                detail.push_str("; mixed_answers=true; using last definite answer");
+            }
+        }
+        detail
+    }
+}
+
 pub(crate) struct Client {
     http: reqwest::Client,
     route: HostedJobState,
@@ -827,6 +894,7 @@ pub(crate) struct Client {
     /// was not a success, so a lease refusal can be logged with its body.
     broker_status: std::sync::Mutex<Option<u16>>,
     broker_failure: std::sync::Mutex<Option<String>>,
+    wait_answers: std::sync::Mutex<WaitAnswers>,
     probe_replies: Option<std::sync::Mutex<fence_probe::Replies>>,
     booking_open: Option<Arc<std::sync::Mutex<bool>>>,
     progress: crate::motor::progress::Reporter,
@@ -846,6 +914,7 @@ impl Client {
             broker_code: std::sync::Mutex::new(None),
             broker_status: std::sync::Mutex::new(None),
             broker_failure: std::sync::Mutex::new(None),
+            wait_answers: std::sync::Mutex::new(WaitAnswers::default()),
             probe_replies: None,
             booking_open: None,
             progress: crate::motor::progress::Reporter::new(false, 2),
@@ -856,6 +925,12 @@ impl Client {
     /// The `error` code of the broker's last refusal seen by this client.
     pub(crate) fn broker_code(&self) -> Option<String> {
         self.broker_code.lock().unwrap().clone()
+    }
+    pub(crate) fn refusal_detail(&self, error: Error, detail: String) -> String {
+        self.wait_answers.lock().unwrap().detail(error, detail)
+    }
+    fn wait_expired(&self, pending: Error) -> Error {
+        self.wait_answers.lock().unwrap().expire(pending)
     }
     /// The broker's 4xx status for the latest request, if it answered one.
     fn broker_client_error(&self) -> Option<u16> {
@@ -1184,6 +1259,7 @@ impl Client {
         storage: &Arc<Storage>,
         caller: &str,
     ) -> Result<(Channel, Lease), Error> {
+        *self.wait_answers.lock().unwrap() = WaitAnswers::default();
         self.progress
             .phase(motor_protocol::ProgressPhase::PlacementWait);
         let job = storage.job(id).ok_or(Error::Broker)?;
@@ -1275,7 +1351,7 @@ impl Client {
                     .await
                     .is_err()
                 {
-                    return Err(cut_off);
+                    return Err(self.wait_expired(cut_off));
                 }
             }
             let attempt = state.placement_attempts;
@@ -1289,7 +1365,7 @@ impl Client {
             // means no HTTP request was sent to create a reservation for it.
             let bearer = match tokio::time::timeout_at(provisioning_deadline, self.bearer()).await {
                 Ok(result) => result?,
-                Err(_) => return Err(cut_off),
+                Err(_) => return Err(self.wait_expired(cut_off)),
             };
             // Even if the lease response is lost, the broker may have issued a
             // token. Wait past its possible issue second before requesting another:
@@ -1394,6 +1470,7 @@ impl Client {
                 match &connected {
                     Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
                     Err(failure) => {
+                        self.wait_answers.lock().unwrap().observe(failure.error);
                         tracing::info!(job_id = %id, attempt, code = failure.error.code(), step = failure.step,
                         cause = failure.host_reason.as_deref().unwrap_or(failure.error.code()),
                         host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted connect failed")
@@ -1454,7 +1531,9 @@ impl Client {
                     cut_off = Error::BoatHostFull;
                     continue 'lease_requests;
                 }
-                if matches!(&connected, Err(failure) if failure.error == Error::HostFull) && !boat {
+                if matches!(&connected, Err(failure) if matches!(failure.error, Error::HostFull | Error::Capacity))
+                    && !boat
+                {
                     let state = storage
                         .job(id)
                         .and_then(|j| j.hosted)
@@ -1463,6 +1542,8 @@ impl Client {
                         && state.repository_placement_hint.is_none()
                         && !state.replacement_hosts.contains(&lease.placement.host)
                     {
+                        tracing::info!(job_id = %id, host_id = %lease.placement.host,
+                            "hosted capacity refusal; requesting replacement");
                         // A refusal proves this connection never reached Run. Keep
                         // the reservation and requester key while the broker tries
                         // another host; any refusal leaves the old placement intact.
@@ -1503,7 +1584,9 @@ impl Client {
                                 lease = next;
                                 continue;
                             }
-                            Err(error @ Error::ReplacePending(_)) => return Err(error),
+                            Err(error) if self.wait_answers.lock().unwrap().expired => {
+                                return Err(error);
+                            }
                             Err(error) => {
                                 if matches!(
                                     error,
@@ -1562,7 +1645,7 @@ impl Client {
                             tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
                         if retry_at >= provisioning_deadline {
                             tokio::time::sleep_until(provisioning_deadline).await;
-                            return Err(Error::NoCapacity(HOST_FULL_RETRY_MS));
+                            return Err(self.wait_expired(Error::NoCapacity(HOST_FULL_RETRY_MS)));
                         }
                         storage
                             .hosted_update(id, |state| {
@@ -1592,9 +1675,9 @@ impl Client {
     /// Posts until the broker grants or refuses, waiting out `202
     /// provisioning`, routed `503 no_capacity` and `replace_pending` answers until `deadline`.
     /// When the deadline passes first, the request in flight is dropped and
-    /// the refusal for the wait the deadline ended is returned: the broker's
-    /// latest provisioning or capacity answer or, before the broker has sent
-    /// one, `cut_off`, which describes the caller's own wait.
+    /// the last definite placement or transport answer is returned. Replacement
+    /// fences preserve that answer; before any answer, `cut_off` describes the
+    /// caller's own wait.
     async fn post_ready_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1613,8 +1696,11 @@ impl Client {
                 }
                 reply => reply,
             };
+            if let Ok(Err(error)) = &reply {
+                self.wait_answers.lock().unwrap().observe(*error);
+            }
             match reply {
-                Err(_) => return Err(pending),
+                Err(_) => return Err(self.wait_expired(pending)),
                 Ok(Err(
                     error @ (Error::Provisioning(_)
                     | Error::NoCapacity(_)
@@ -1639,12 +1725,12 @@ impl Client {
                     tracing::info!(path, "hosted broker retry wait");
                     if retry_at >= deadline {
                         tokio::time::sleep_until(deadline).await;
-                        return Err(pending);
+                        return Err(self.wait_expired(pending));
                     }
                     tokio::time::sleep_until(retry_at).await;
                     bearer = match tokio::time::timeout_at(deadline, self.bearer()).await {
                         Ok(result) => result?,
-                        Err(_) => return Err(pending),
+                        Err(_) => return Err(self.wait_expired(pending)),
                     };
                 }
                 Ok(result) => return result,
