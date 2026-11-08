@@ -12,6 +12,8 @@ pub(super) struct Owner {
     changed: watch::Sender<()>,
     pub(super) wake: watch::Sender<bool>,
     stopped: watch::Sender<bool>,
+    #[cfg(test)]
+    transport_events: Mutex<Vec<(std::time::SystemTime, &'static str)>>,
 }
 
 struct State {
@@ -92,7 +94,17 @@ impl Owner {
             changed: watch::channel(()).0,
             wake: watch::channel(false).0,
             stopped: watch::channel(false).0,
+            #[cfg(test)]
+            transport_events: Mutex::new(Vec::new()),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn trace_transport_for_test(&self, event: &'static str) {
+        self.transport_events
+            .lock()
+            .unwrap()
+            .push((std::time::SystemTime::now(), event));
     }
 
     fn publish(&self, record: io::Result<StreamRecord>) {
@@ -212,12 +224,13 @@ impl Motor {
         };
         let state = owner.state.lock().unwrap();
         format!(
-            "ring={:?} floor={} cursor={} index={} rewind={:?} ingress={} published={} discard={} subscribers={:?} finished={} closing={} stopped={} terminal={} complete={} live={}",
+            "ring={:?} floor={} cursor={} index={} rewind={:?} ingress={} published={} discard={} subscribers={:?} finished={} closing={} stopped={} terminal={} complete={} live={} transport_events={:?}",
             state.ring.iter().map(|(index, _, record)| (*index, sequence(record))).collect::<Vec<_>>(),
             state.floor, state.cursor, state.index, state.rewind, state.ingress_records,
             state.published_records, state.discard_through, state.subscribers, state.finished,
             state.closing, *owner.stopped.borrow(), state.terminal.is_some(),
             self.storage.job(id).is_some_and(|job| job.hosted_complete()), state.live,
+            owner.transport_events.lock().unwrap(),
         )
     }
 
