@@ -1271,9 +1271,11 @@ version = "0.1.0"
 dependencies = [
  "cortexkit-test-support",
  "libc",
+ "motor-protocol",
  "serde",
  "serde_json",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -6,9 +6,21 @@ pub const WORKSPACES: &str = "/var/lib/motor-vm/workspaces";
 pub const IMAGES: &str = "/var/lib/motor-vm/job-images";
 pub const RECORDS: &str = "/var/lib/motor-vm/jobs";
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmKind {
+    #[default]
+    Job,
+    Fill,
+    BaseBuild,
+    Recovery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Start {
+    #[serde(default)]
+    pub kind: VmKind,
     pub job_id: String,
     pub account: String,
     pub workspace_disk_id: String,
@@ -112,6 +124,41 @@ impl Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vm_kind_defaults_to_job_and_never_accepts_key_material_or_store_paths() {
+        let value = serde_json::json!({"op":"start_job", "job_id":"00000000-0000-4000-8000-000000000001", "account":"account-1", "workspace_disk_id":"disk-1", "image_generation_id":"gen-1", "vcpus":1, "memory_mib":1024});
+        let request: crate::Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            request,
+            crate::Request::StartJob {
+                kind: VmKind::Job,
+                ..
+            }
+        ));
+        for (kind, expected) in [
+            ("job", VmKind::Job),
+            ("fill", VmKind::Fill),
+            ("base_build", VmKind::BaseBuild),
+            ("recovery", VmKind::Recovery),
+        ] {
+            let mut request = value.clone();
+            request["kind"] = serde_json::json!(kind);
+            let request: crate::Request = serde_json::from_value(request).unwrap();
+            assert!(matches!(request, crate::Request::StartJob { kind, .. } if kind == expected));
+        }
+        for field in [
+            "read_key",
+            "write_key",
+            "config",
+            "store_path",
+            "drive_path",
+        ] {
+            let mut request = value.clone();
+            request[field] = serde_json::json!("not-accepted");
+            assert!(serde_json::from_value::<crate::Request>(request).is_err());
+        }
+    }
     #[test]
     fn resource_identities_cannot_select_paths() {
         for id in ["", ".", "..", "a/b", "/a", "a\\b", "a\n", "a.json"] {
