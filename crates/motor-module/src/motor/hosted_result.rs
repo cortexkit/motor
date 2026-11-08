@@ -30,6 +30,14 @@ struct State {
     reply: Option<JobStatusReply>,
     error: Option<String>,
     finished: bool,
+    closing: bool,
+    ingress_records: u64,
+    published_records: u64,
+    discard_through: u64,
+    probe_settlement: bool,
+    boat_drain_expired: bool,
+    boat_cursor: u64,
+    replaying: bool,
     started: bool,
     observed_now_ms: u64,
     live: bool,
@@ -46,6 +54,9 @@ fn sequence(record: &StreamRecord) -> Option<u64> {
 }
 
 impl Owner {
+    pub(super) fn has_rewind(&self) -> bool {
+        self.state.lock().unwrap().rewind.is_some()
+    }
     fn new(cursor: u64) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
@@ -64,6 +75,14 @@ impl Owner {
                 reply: None,
                 error: None,
                 finished: false,
+                closing: false,
+                ingress_records: 0,
+                published_records: 0,
+                discard_through: 0,
+                probe_settlement: false,
+                boat_drain_expired: false,
+                boat_cursor: 0,
+                replaying: false,
                 started: false,
                 observed_now_ms: 0,
                 live: true,
@@ -76,6 +95,12 @@ impl Owner {
 
     fn publish(&self, record: io::Result<StreamRecord>) {
         let mut state = self.state.lock().unwrap();
+        if record.as_ref().ok().and_then(sequence).is_some() {
+            state.published_records += 1;
+            if state.published_records <= state.discard_through {
+                return;
+            }
+        }
         match record {
             Ok(StreamRecord::Accepted(accepted)) => state.accepted = Some(accepted),
             Ok(StreamRecord::Terminal(terminal)) => state.terminal = Some(terminal),
@@ -89,7 +114,12 @@ impl Owner {
                 state.index += 1;
                 state.bytes += bytes;
                 state.ring.push_back((index, bytes, record));
-                while state.bytes > RING_BYTES || state.ring.len() > RING_RECORDS {
+                // A valid frame can grow when re-encoded. Always retain the
+                // newest record so it remains deliverable, even if it alone
+                // exceeds the byte budget.
+                while state.ring.len() > 1
+                    && (state.bytes > RING_BYTES || state.ring.len() > RING_RECORDS)
+                {
                     let (_, bytes, record) = state.ring.pop_front().unwrap();
                     state.bytes -= bytes;
                     if let Some(seq) = sequence(&record) {
@@ -106,6 +136,11 @@ impl Owner {
     pub(super) fn take_rewind(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         let cursor = state.rewind.take()?;
+        // The source records this watermark before enqueueing sequenced records.
+        // FIFO publication can therefore discard every old-generation record,
+        // including records still buffered by progress forwarding.
+        state.discard_through = state.ingress_records;
+        state.replaying = true;
         state.ring.clear();
         state.bytes = 0;
         state.floor = cursor;
@@ -130,6 +165,17 @@ impl Owner {
 }
 
 struct Subscriber(Arc<Owner>, u64);
+
+pub(super) async fn emit_follow_record(
+    owner: Option<&Owner>,
+    tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    record: StreamRecord,
+) -> io::Result<()> {
+    if let Some(owner) = owner.filter(|_| sequence(&record).is_some()) {
+        owner.state.lock().unwrap().ingress_records += 1;
+    }
+    emit(tx, record).await
+}
 impl Drop for Subscriber {
     fn drop(&mut self) {
         self.0.state.lock().unwrap().subscribers.remove(&self.1);
@@ -138,6 +184,42 @@ impl Drop for Subscriber {
 }
 
 impl Motor {
+    #[cfg(test)]
+    pub(crate) fn hosted_result_stopped_for_test(&self, id: Uuid) -> watch::Receiver<bool> {
+        self.hosted_results
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .stopped
+            .subscribe()
+    }
+    #[cfg(test)]
+    pub(crate) fn expire_boat_drain_for_test(&self, id: Uuid) {
+        let owner = self
+            .hosted_results
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .clone();
+        owner.state.lock().unwrap().boat_drain.as_mut().unwrap().0 = tokio::time::Instant::now();
+        owner.changed.send_replace(());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rewind_hosted_for_test(&self, id: Uuid, cursor: u64) {
+        let owner = self
+            .hosted_results
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .clone();
+        owner.state.lock().unwrap().rewind = Some(cursor);
+        owner.wake.send_replace(true);
+        owner.changed.send_replace(());
+    }
     pub(super) fn reserve_hosted_result(&self, id: Uuid, cursor: u64) -> Arc<Owner> {
         let mut owners = self.hosted_results.lock().unwrap();
         owners
@@ -148,27 +230,60 @@ impl Motor {
 
     pub(super) fn subscribe_hosted_result(
         &self,
-        owner: Arc<Owner>,
+        id: Uuid,
+        mut owner: Arc<Owner>,
         mut cursor: u64,
         original: bool,
         tx: mpsc::Sender<io::Result<StreamRecord>>,
-    ) {
-        let subscriber = {
+    ) -> Arc<Owner> {
+        let subscriber = loop {
             let mut state = owner.state.lock().unwrap();
+            if state.closing || *owner.stopped.borrow() {
+                drop(state);
+                if let Some(terminal) = self
+                    .storage
+                    .job(id)
+                    .filter(|job| job.hosted_complete())
+                    .and_then(|job| job.hosted?.terminal)
+                {
+                    tokio::spawn(async move {
+                        let _ = tx.send(Ok(StreamRecord::Terminal(terminal))).await;
+                    });
+                    return owner;
+                }
+                if *self.hosted_cleanup.shutdown.borrow() {
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(Err(io::Error::other(
+                                "hosted result collection is shutting down",
+                            )))
+                            .await;
+                    });
+                    return owner;
+                }
+                owner = self.ensure_hosted_result(id, None);
+                continue;
+            }
             let subscriber = state.next_subscriber;
             state.next_subscriber += 1;
             state.subscribers.insert(subscriber, cursor);
-            subscriber
+            if state.boat_drain_expired {
+                state.subscriber_errors.insert(subscriber, format!("hosted replay ended at the drain deadline while subscriber cursor {cursor} was pending; query exec.status or exec.attach at u64::MAX"));
+            }
+            break subscriber;
         };
+        let subscribed = owner.clone();
         tokio::spawn(async move {
             let _subscriber = Subscriber(owner.clone(), subscriber);
             let mut changed = owner.changed.subscribe();
+            let mut stopped = owner.stopped.subscribe();
             let mut index = 0;
             let mut accepted = !original;
             loop {
                 let (records, terminal, error, request) = {
                     let mut state = owner.state.lock().unwrap();
-                    let rewind = cursor < state.floor;
+                    let subscriber_error = state.subscriber_errors.get(&subscriber).cloned();
+                    let rewind = subscriber_error.is_none() && cursor < state.floor;
                     let request = rewind && state.rewind.is_none_or(|old| cursor < old);
                     if request {
                         state.rewind = Some(state.rewind.map_or(cursor, |old| old.min(cursor)));
@@ -200,10 +315,7 @@ impl Motor {
                     (
                         records,
                         (!rewind).then(|| state.terminal.clone()).flatten(),
-                        state
-                            .subscriber_errors
-                            .get(&subscriber)
-                            .cloned()
+                        subscriber_error
                             .or_else(|| state.finished.then(|| state.error.clone()).flatten()),
                         request,
                     )
@@ -236,9 +348,11 @@ impl Motor {
                 tokio::select! {
                     _ = tx.closed() => return,
                     result = changed.changed() => if result.is_err() { return; },
+                    _ = stopped.wait_for(|stopped| *stopped) => return,
                 }
             }
         });
+        subscribed
     }
 }
 
@@ -264,19 +378,34 @@ impl Motor {
                     break;
                 }
                 if !running {
-                    let (complete, subscribers, rewind, cursor) = {
-                        let state = owner.state.lock().unwrap();
+                    let (complete, rewind, cursor, closing) = {
+                        let mut state = owner.state.lock().unwrap();
+                        if state.terminal.is_some()
+                            && state.subscribers.is_empty()
+                            && motor
+                                .storage
+                                .job(id)
+                                .is_some_and(|job| job.hosted_complete())
+                        {
+                            state.closing = true;
+                        }
                         (
                             state.terminal.is_some(),
-                            state.subscribers.len(),
                             state.rewind.is_some(),
                             state.cursor,
+                            state.closing,
                         )
                     };
-                    if complete && subscribers == 0 {
+                    if closing {
                         break;
                     }
-                    if rewind || (!complete && motor.hosted_state(id).is_some_and(|s| s.run_sent)) {
+                    if rewind
+                        || (!motor
+                            .storage
+                            .job(id)
+                            .is_some_and(|job| job.hosted_complete())
+                            && motor.hosted_state(id).is_some_and(|s| s.run_sent))
+                    {
                         if !rewind {
                             tokio::select! {
                                 _ = tokio::time::sleep(Duration::from_secs(restart_delay)) => {},
@@ -296,7 +425,33 @@ impl Motor {
                         break;
                     }
                 }
+                let drain_deadline = {
+                    let state = owner.state.lock().unwrap();
+                    (!state.boat_drain_expired
+                        && !motor
+                            .storage
+                            .job(id)
+                            .is_some_and(|job| job.hosted_complete()))
+                    .then(|| state.boat_drain.as_ref().map(|drain| drain.0))
+                    .flatten()
+                };
                 tokio::select! {
+                    _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                        owner.expire_boat_drain();
+                        if running {
+                            producer.abort();
+                            let _ = (&mut producer).await;
+                        }
+                        owner.live(false);
+                        let task_motor = motor.clone();
+                        let task_tx = tx.clone();
+                        producer = tokio::spawn(async move {
+                            if let Err(error) = task_motor.finish_hosted(id, false, &task_tx).await {
+                                let _ = task_tx.send(Err(error)).await;
+                            }
+                        });
+                        running = true;
+                    },
                     record = records.recv() => if let Some(record) = record { owner.publish(record); },
                     result = &mut producer, if running => {
                         if let Err(error) = result { owner.publish(Err(io::Error::other(error))); }
@@ -326,10 +481,14 @@ impl Motor {
                     owners.remove(&id);
                 }
             }
-            owner.state.lock().unwrap().finished = true;
+            {
+                let mut state = owner.state.lock().unwrap();
+                state.finished = true;
+                state.closing = true;
+            }
+            motor.recover_hosted(id);
             owner.stopped.send_replace(true);
             owner.changed.send_replace(());
-            motor.recover_hosted(id);
         });
     }
 
@@ -345,14 +504,17 @@ impl Motor {
         tokio::spawn(async move {
             let delivery = motor.hosted_cancels.lock().unwrap().get(&id).cloned();
             if let Some(mut delivery) = delivery {
-                loop {
-                    if delivery.borrow().is_some() {
-                        break;
+                let wait = async {
+                    loop {
+                        if delivery.borrow().is_some() {
+                            break;
+                        }
+                        if delivery.changed().await.is_err() {
+                            break;
+                        }
                     }
-                    if delivery.changed().await.is_err() {
-                        break;
-                    }
-                }
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(5), wait).await;
             }
             if let Some(now) = probe_at {
                 let reply = motor.probe_hosted_result(id, now, &owner).await;
@@ -403,7 +565,8 @@ impl Motor {
                 }
                 return Ok(true);
             }
-            let result = self.finish_hosted(id, false, tx).await;
+            let expired = owner.now_ms() >= self.hosted_result_deadline(id);
+            let result = self.finish_hosted(id, expired, tx).await;
             owner.live(false);
             result?;
             let Some(state) = self.hosted_state(id) else {
@@ -420,17 +583,45 @@ impl Motor {
     }
 
     pub(super) fn ensure_hosted_result(&self, id: Uuid, probe_at: Option<u64>) -> Arc<Owner> {
+        self.ensure_hosted_result_entry(id, probe_at).0
+    }
+
+    fn ensure_hosted_result_entry(&self, id: Uuid, probe_at: Option<u64>) -> (Arc<Owner>, bool) {
         let mut owners = self.hosted_results.lock().unwrap();
-        if let Some(owner) = owners.get(&id) {
-            return owner.clone();
+        if let Some(owner) = owners
+            .get(&id)
+            .filter(|owner| !owner.state.lock().unwrap().closing && !*owner.stopped.borrow())
+        {
+            return (owner.clone(), false);
         }
-        let owner = Owner::new(u64::MAX);
+        let cursor = self.storage.job(id).map_or(u64::MAX, |job| {
+            if job.return_result.is_none()
+                && (job.return_requested.is_some()
+                    || job.return_cap_bytes.is_some()
+                    || job.return_cwd.is_some())
+            {
+                0
+            } else {
+                u64::MAX
+            }
+        });
+        let owner = Owner::new(cursor);
+        if *self.hosted_cleanup.shutdown.borrow() {
+            {
+                let mut state = owner.state.lock().unwrap();
+                state.closing = true;
+                state.finished = true;
+                state.error = Some("hosted result collection is shutting down".into());
+            }
+            owner.stopped.send_replace(true);
+            return (owner, false);
+        }
         owners.insert(id, owner.clone());
         drop(owners);
         let (tx, records) = mpsc::channel(32);
-        let producer = self.hosted_result_follow(id, owner.clone(), tx.clone(), u64::MAX, probe_at);
+        let producer = self.hosted_result_follow(id, owner.clone(), tx.clone(), cursor, probe_at);
         self.collect_hosted_result(id, owner.clone(), tx, records, producer);
-        owner
+        (owner, true)
     }
 }
 
@@ -466,20 +657,8 @@ impl Motor {
                             return None;
                         }
                         terminal.job_id = id;
-                        terminal.refusal_detail =
-                            terminal.refusal_detail.take().map(bounded_detail);
-                        self.storage
-                            .hosted_update(id, |state| {
-                                if state
-                                    .terminal
-                                    .as_ref()
-                                    .is_none_or(|t| matches!(t.outcome, Outcome::OutcomeUnknown))
-                                {
-                                    state.terminal = Some(terminal.clone());
-                                }
-                            })
-                            .ok()?;
-                        self.storage.terminal_observed(id).ok()?;
+                        *terminal = self.persist_hosted_terminal(id, terminal.clone()).ok()?;
+                        owner.state.lock().unwrap().probe_settlement = true;
                     }
                     Some(reply)
                 }
@@ -498,13 +677,15 @@ impl Motor {
     }
 
     pub(super) async fn hosted_result_status(&self, id: Uuid, now: u64) -> JobStatusReply {
-        let already_owned = self.hosted_results.lock().unwrap().contains_key(&id);
-        let owner = self.ensure_hosted_result(id, Some(now));
+        let (owner, elected) = self.ensure_hosted_result_entry(id, Some(now));
+        let already_owned = !elected;
         {
             let mut state = owner.state.lock().unwrap();
             state.observed_now_ms = state.observed_now_ms.max(now);
         }
         let mut changed = owner.changed.subscribe();
+        let mut stopped = owner.stopped.subscribe();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let reply = {
                 let state = owner.state.lock().unwrap();
@@ -538,12 +719,14 @@ impl Motor {
                         && owner.state.lock().unwrap().subscribers.is_empty();
                 if retired_without_subscribers {
                     let mut stopped = owner.stopped.subscribe();
-                    let _ = stopped.wait_for(|done| *done).await;
+                    let _ = tokio::time::timeout_at(deadline, stopped.wait_for(|done| *done)).await;
                 }
                 return reply;
             }
-            if changed.changed().await.is_err() {
-                return empty_status(id);
+            tokio::select! {
+                result = changed.changed() => if result.is_err() { return empty_status(id); },
+                _ = stopped.wait_for(|done| *done) => return empty_status(id),
+                _ = tokio::time::sleep_until(deadline) => return empty_status(id),
             }
         }
     }
@@ -576,6 +759,30 @@ fn empty_status(id: Uuid) -> JobStatusReply {
 }
 
 impl Owner {
+    pub(super) fn take_probe_settlement(&self) -> bool {
+        std::mem::take(&mut self.state.lock().unwrap().probe_settlement)
+    }
+
+    fn expire_boat_drain(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.boat_drain_expired = true;
+        let replay_pending = state.rewind.take().is_some() || state.replaying;
+        let Some((_, cohort)) = state.boat_drain.clone() else {
+            return;
+        };
+        for subscriber in cohort {
+            if let Some(cursor) = state
+                .subscribers
+                .get(&subscriber)
+                .copied()
+                .filter(|cursor| replay_pending || *cursor < state.boat_cursor)
+            {
+                state.subscriber_errors.entry(subscriber).or_insert_with(|| format!("hosted replay ended at the drain deadline while subscriber cursor {cursor} was pending; query exec.status or exec.attach at u64::MAX"));
+            }
+        }
+        drop(state);
+        self.changed.send_replace(());
+    }
     pub(super) async fn forward_wake(
         &self,
         mut wake: watch::Receiver<bool>,
@@ -606,6 +813,8 @@ impl Owner {
         let mut changed = self.changed.subscribe();
         let (deadline, cohort) = {
             let mut state = self.state.lock().unwrap();
+            state.boat_cursor = state.boat_cursor.max(cursor);
+            state.replaying = false;
             let subscribers: Vec<_> = state.subscribers.keys().copied().collect();
             state
                 .boat_drain
@@ -617,9 +826,13 @@ impl Owner {
                 })
                 .clone()
         };
+        self.changed.send_replace(());
         loop {
             {
                 let mut state = self.state.lock().unwrap();
+                if state.rewind.is_some() && tokio::time::Instant::now() < deadline {
+                    return false;
+                }
                 let behind: Vec<_> = cohort
                     .iter()
                     .filter_map(|id| {
@@ -721,6 +934,10 @@ impl Motor {
             .unwrap_or(u64::MAX)
     }
 }
+
+#[cfg(test)]
+#[path = "hosted_result_audit_tests.rs"]
+mod audit_tests;
 
 #[cfg(test)]
 mod tests {

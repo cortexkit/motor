@@ -177,6 +177,13 @@ impl PartialEq for Job {
     }
 }
 impl Job {
+    pub(crate) fn hosted_complete(&self) -> bool {
+        !self.pending_cancel
+            && self
+                .hosted
+                .as_ref()
+                .is_some_and(|state| state.settlement_done())
+    }
     pub(crate) fn health_retired(&self) -> bool {
         self.local_terminal.as_ref().is_some_and(|terminal| {
             matches!(
@@ -455,7 +462,7 @@ impl Storage {
             .filter_map(|(id, job)| {
                 job.hosted
                     .as_ref()
-                    .filter(|s| s.booked_or_attempted() && !s.finish_done)
+                    .filter(|s| s.booked_or_attempted() && !job.hosted_complete())
                     .map(|_| *id)
             })
             .collect()
@@ -934,8 +941,16 @@ impl Storage {
         })
     }
     pub(crate) fn cancel_acknowledged(&self, id: Uuid) -> io::Result<()> {
+        self.cancel_acknowledged_with_owner(id, false)
+    }
+
+    pub(crate) fn cancel_acknowledged_with_owner(
+        &self,
+        id: Uuid,
+        owner_live: bool,
+    ) -> io::Result<()> {
         self.update(|s| {
-            let streamed = s.active_jobs.contains_key(&id);
+            let streamed = owner_live || s.active_jobs.contains_key(&id);
             let job = s.jobs.entry(id).or_default();
             if job.build_server_job_id.is_none() {
                 if let Some(hosted) = job.hosted.as_mut() {
@@ -988,14 +1003,58 @@ impl Storage {
     pub fn cancel(&self, id: Uuid, pending: bool) -> io::Result<()> {
         self.update(|s| {
             let job = s.jobs.entry(id).or_default();
-            job.pending_cancel = pending;
-            if pending {
+            let completed = job.hosted_complete()
+                || job.hosted.as_ref().is_some_and(|state| {
+                    state.finish_done
+                        || state.billing == crate::BillingStatus::Available
+                        || state.cancel_settlement_ready()
+                })
+                || job
+                    .hosted
+                    .as_ref()
+                    .and_then(|state| state.terminal.as_ref())
+                    .is_some_and(|terminal| !matches!(terminal.outcome, Outcome::OutcomeUnknown));
+            job.pending_cancel = pending && !completed;
+            if job.pending_cancel {
                 job.retain_until_ms = Some(
                     job.retain_until_ms
                         .unwrap_or_default()
                         .max(now_ms().saturating_add(RETENTION_MS)),
                 );
             }
+        })
+    }
+
+    pub(crate) fn hosted_terminal(&self, id: Uuid, terminal: TerminalRecord) -> io::Result<()> {
+        self.update(|state| {
+            let Some(job) = state.jobs.get_mut(&id) else {
+                return;
+            };
+            let Some(hosted) = job.hosted.as_mut() else {
+                return;
+            };
+            if hosted
+                .terminal
+                .as_ref()
+                .is_none_or(|old| matches!(old.outcome, Outcome::OutcomeUnknown))
+            {
+                hosted.terminal = Some(terminal.clone());
+                if !hosted.finish_done
+                    && hosted.pending_finish.is_some()
+                    && !matches!(terminal.outcome, Outcome::OutcomeUnknown)
+                {
+                    hosted.pending_finish = Some(crate::hosted::placement::Finish::from_terminal(
+                        &terminal,
+                        hosted.max_runtime_s.unwrap_or(0),
+                    ));
+                }
+            }
+            if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
+                hosted.hosted_no_fallback = true;
+                hosted.hosted_code = Some("lease_mismatch".into());
+            }
+            job.pending_cancel = false;
+            job.terminal_observed_at_ms.get_or_insert_with(now_ms);
         })
     }
     pub fn local_terminal(&self, t: TerminalRecord) -> io::Result<()> {

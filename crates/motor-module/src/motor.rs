@@ -474,7 +474,7 @@ impl Motor {
         let (tx, rx, records) = if let Some(owner) = &owner {
             let (tx, records) = mpsc::channel(32);
             stream.wake = owner.wake.clone();
-            self.subscribe_hosted_result(owner.clone(), 0, true, caller_tx);
+            self.subscribe_hosted_result(id, owner.clone(), 0, true, caller_tx);
             (tx, owner.wake.subscribe(), Some(records))
         } else {
             (caller_tx, caller_wake, None)
@@ -585,13 +585,8 @@ impl Motor {
                 });
             } else {
                 let owner = self.ensure_hosted_result(id, None);
+                let owner = self.subscribe_hosted_result(id, owner, request.from_seq, false, tx);
                 stream.wake = owner.wake.clone();
-                let cursor = if state.terminal.is_some() {
-                    u64::MAX
-                } else {
-                    request.from_seq
-                };
-                self.subscribe_hosted_result(owner, cursor, false, tx);
             }
             return Ok(stream);
         }
@@ -602,7 +597,8 @@ impl Motor {
             }
             if motor.hosted_state(id).is_some_and(|state| state.run_sent) {
                 let owner = motor.ensure_hosted_result(id, None);
-                motor.subscribe_hosted_result(owner.clone(), request.from_seq, false, tx.clone());
+                let owner =
+                    motor.subscribe_hosted_result(id, owner, request.from_seq, false, tx.clone());
                 owner.forward_wake(rx, &tx).await;
                 return;
             }
@@ -2009,10 +2005,16 @@ impl Motor {
                 // Delivery outlives any one waiting caller, so detaching cannot
                 // cancel the request another waiter still needs.
                 tokio::spawn(async move {
-                    let result = motor
-                        .send_cancel_once(id)
-                        .await
-                        .map_err(|error| (error.kind(), error.to_string()));
+                    let result =
+                        tokio::time::timeout(Duration::from_secs(5), motor.send_cancel_once(id))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "hosted cancellation delivery timed out",
+                                ))
+                            })
+                            .map_err(|error| (error.kind(), error.to_string()));
                     tx.send_replace(Some(result));
                     motor.hosted_cancels.lock().unwrap().remove(&id);
                 });
@@ -2196,7 +2198,7 @@ impl Motor {
                 if owners.contains_key(&id) {
                     return opened;
                 }
-                match self.storage.retire_hosted_job(
+                let retired = self.storage.retire_hosted_job(
                     id,
                     cause,
                     now,
@@ -2204,7 +2206,9 @@ impl Motor {
                         opened,
                         Err(crate::hosted::Error::Finished | crate::hosted::Error::ReattachUnknown)
                     ),
-                ) {
+                );
+                drop(owners);
+                match retired {
                     Ok(true) => {
                         tracing::warn!(job_id = %id, cause, "retired abandoned hosted job");
                         self.recover_hosted(id);
@@ -2245,10 +2249,14 @@ impl Motor {
         // caller without a terminal. Retain and retry unconfirmed cancellation.
         let mut cancel_unconfirmed = false;
         let host_expired = state
-            .host_deadline_s()
+            .reattach_deadline_s()
             .is_some_and(|d| crate::hosted::now_s() >= d);
+        if host_expired && matches!(terminal.outcome, Outcome::OutcomeUnknown) {
+            self.storage.cancel(id, false)?;
+        }
         if matches!(terminal.outcome, Outcome::OutcomeUnknown)
             && state.run_sent
+            && state.billing != crate::BillingStatus::Available
             && !state.cancel_settlement_ready()
             && !state.finish_done
             && !host_expired
@@ -2298,7 +2306,9 @@ impl Motor {
                 .finish(id, Some(&terminal), &self.storage)
                 .await?
         {
-            terminal = Self::sandbox_lost_terminal(id, &state);
+            if matches!(terminal.outcome, Outcome::OutcomeUnknown) {
+                terminal = Self::sandbox_lost_terminal(id, &state);
+            }
         }
         if matches!(terminal.outcome, Outcome::OutcomeUnknown) {
             // Every route to an unknown outcome logs here: the terminal's
@@ -2316,7 +2326,7 @@ impl Motor {
             tracing::warn!(job_id = %id, step = "finish", hosted_code = ?state.hosted_code,
                 cause, wall_ms = terminal.wall_ms, "hosted job outcome unknown");
         }
-        if unavailable {
+        if unavailable || host_expired {
             self.storage.hosted_update(id, |s| {
                 if s.billing != crate::BillingStatus::Available {
                     s.billing = crate::BillingStatus::Unavailable;
@@ -2325,11 +2335,47 @@ impl Motor {
         }
         self.storage
             .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
+        if !cancel_unconfirmed
+            && self.hosted_state(id).is_some_and(|state| {
+                state.finish_done
+                    || state.billing == crate::BillingStatus::Available
+                    || state.cancel_settlement_ready()
+                    || host_expired
+            })
+        {
+            self.storage.cancel(id, false)?;
+        }
         self.storage.terminal_observed(id)?;
         if cancel_unconfirmed {
             self.retry_cancel(id);
         }
         emit(tx, StreamRecord::Terminal(terminal)).await
+    }
+    fn persist_hosted_terminal(
+        &self,
+        id: Uuid,
+        mut terminal: TerminalRecord,
+    ) -> io::Result<TerminalRecord> {
+        terminal.job_id = id;
+        if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
+            terminal.retry_after_ms = None;
+        }
+        terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
+        if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
+            && !terminal
+                .refusal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("lease_mismatch: "))
+        {
+            terminal.refusal_detail = Some(bounded_detail(format!(
+                "lease_mismatch: {}",
+                terminal.refusal_detail.take().unwrap_or_default()
+            )));
+        }
+        self.storage.hosted_terminal(id, terminal)?;
+        self.hosted_state(id)
+            .and_then(|state| state.terminal)
+            .ok_or_else(|| io::Error::other("missing hosted terminal"))
     }
     async fn lost_sandbox(
         &self,
@@ -2339,7 +2385,11 @@ impl Motor {
         let state = self
             .hosted_state(id)
             .ok_or_else(|| io::Error::other("missing hosted route"))?;
-        let terminal = Self::sandbox_lost_terminal(id, &state);
+        let terminal = state
+            .terminal
+            .clone()
+            .filter(|terminal| !matches!(terminal.outcome, Outcome::OutcomeUnknown))
+            .unwrap_or_else(|| Self::sandbox_lost_terminal(id, &state));
         self.storage.hosted_update(id, |s| {
             s.hosted_code = Some("hosted_sandbox_lost".into());
             s.hosted_no_fallback = true;
@@ -2403,15 +2453,30 @@ impl Motor {
         mut placement_queue: Option<&mut PlacementQueue>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
+        if self.hosted_state(id).is_some_and(|state| {
+            state.finish_done
+                || state.billing == crate::BillingStatus::Available
+                || state.cancel_settlement_ready()
+                || state
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| !matches!(terminal.outcome, Outcome::OutcomeUnknown))
+        }) {
+            self.storage.cancel(id, false)?;
+        }
         let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+        let probe_settlement = owner
+            .as_ref()
+            .is_some_and(|owner| owner.take_probe_settlement());
         let mut delivery_cursor = if cursor == u64::MAX { 0 } else { cursor };
         // Frames to and from the build server carry its ID for the job; records
         // and storage keep the caller's.
         let build_server_id = self.build_server_id(id);
-        if owner.is_none()
-            && self
-                .hosted_state(id)
-                .is_some_and(|s| s.billing != crate::BillingStatus::Pending && s.terminal.is_some())
+        if self
+            .storage
+            .job(id)
+            .is_some_and(|job| job.hosted_complete())
+            && owner.as_ref().is_none_or(|owner| !owner.has_rewind())
         {
             return self.finish_hosted(id, false, tx).await.map(|_| false);
         }
@@ -2461,6 +2526,7 @@ impl Motor {
                         rewind_auth_attempts = Some(0u8);
                     }
                     cursor = from;
+                    delivery_cursor = from;
                     hosted_terminal_deadline = None;
                 }
                 owner.live(channel.is_some());
@@ -2527,6 +2593,7 @@ impl Motor {
                         .hosted_state(id)
                         .is_some_and(|state| state.terminal.is_some())
                         && owner.now_ms() >= self.hosted_result_deadline(id)
+                        && (!probe_settlement || reattaches > 1)
                     {
                         return self.finish_hosted(id, true, tx).await.map(|_| false);
                     }
@@ -2609,7 +2676,12 @@ impl Motor {
                     self.storage.hosted_update(id, |s| {
                         s.hosted_code = Some(error.code().into());
                         s.hosted_no_fallback = true;
-                        s.terminal = Some(terminal);
+                        if s.terminal
+                            .as_ref()
+                            .is_none_or(|old| matches!(old.outcome, Outcome::OutcomeUnknown))
+                        {
+                            s.terminal = Some(terminal);
+                        }
                     })?;
                     return self.finish_hosted(id, true, tx).await.map(|_| false);
                 }
@@ -2712,7 +2784,12 @@ impl Motor {
                     let mut started = Started::new(seq, queue_wait_ms, started_at_ms);
                     started.path_mapping = path_mapping;
                     delivery_cursor = delivery_cursor.max(seq.saturating_add(1));
-                    emit(tx, StreamRecord::Started(started)).await?;
+                    hosted_result::emit_follow_record(
+                        owner.as_deref(),
+                        tx,
+                        StreamRecord::Started(started),
+                    )
+                    .await?;
                     backoff = 1;
                     reconnect_delay = 1;
                 }
@@ -2727,7 +2804,12 @@ impl Motor {
                     // not terminal and cannot authorize a local fallback.
                     if matches!(output.stream, OutputStream::Stdout | OutputStream::Stderr) {
                         delivery_cursor = delivery_cursor.max(output.seq.saturating_add(1));
-                        emit(tx, StreamRecord::Output(output)).await?;
+                        hosted_result::emit_follow_record(
+                            owner.as_deref(),
+                            tx,
+                            StreamRecord::Output(output),
+                        )
+                        .await?;
                     }
                     backoff = 1;
                     reconnect_delay = 1;
@@ -2757,7 +2839,12 @@ impl Motor {
                     cursor = chunk.seq.saturating_add(1);
                     chunk.job_id = id;
                     delivery_cursor = delivery_cursor.max(chunk.seq.saturating_add(1));
-                    emit(tx, StreamRecord::ReturnChunk(chunk)).await?;
+                    hosted_result::emit_follow_record(
+                        owner.as_deref(),
+                        tx,
+                        StreamRecord::ReturnChunk(chunk),
+                    )
+                    .await?;
                     backoff = 1;
                     reconnect_delay = 1;
                 }
@@ -2770,7 +2857,12 @@ impl Motor {
                     cursor = manifest.seq.saturating_add(1);
                     manifest.job_id = id;
                     delivery_cursor = delivery_cursor.max(manifest.seq.saturating_add(1));
-                    emit(tx, StreamRecord::ReturnManifest(manifest)).await?;
+                    hosted_result::emit_follow_record(
+                        owner.as_deref(),
+                        tx,
+                        StreamRecord::ReturnManifest(manifest),
+                    )
+                    .await?;
                     backoff = 1;
                     reconnect_delay = 1;
                 }
@@ -2812,6 +2904,7 @@ impl Motor {
                             self.with_spill_attempt(id, terminal.refusal_detail.take());
                     }
                     if hosted {
+                        terminal = self.persist_hosted_terminal(id, terminal)?;
                         log_hosted_terminal(id, &terminal);
                     }
                     let boat = hosted
@@ -2820,8 +2913,6 @@ impl Motor {
                             .and_then(|s| s.placement)
                             .is_some_and(|p| p.host.starts_with("boat:"));
                     if boat {
-                        self.storage
-                            .hosted_update(id, |state| state.terminal = Some(terminal.clone()))?;
                         if let Some(owner) = &owner {
                             if !owner.wait_boat_subscribers(delivery_cursor).await {
                                 drop(channel.take());
@@ -2840,16 +2931,6 @@ impl Motor {
                     self.storage.terminal_observed(id)?;
                     if hosted {
                         self.storage.cancel(id, false)?;
-                        if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
-                            terminal.refusal_detail = Some(format!(
-                                "lease_mismatch: {}",
-                                terminal.refusal_detail.take().unwrap_or_default()
-                            ));
-                            self.storage.hosted_update(id, |state| {
-                                state.hosted_no_fallback = true;
-                                state.hosted_code = Some("lease_mismatch".into());
-                            })?;
-                        }
                         self.storage.hosted_update(id, |state| {
                             if state
                                 .terminal
@@ -2907,14 +2988,17 @@ impl Motor {
                     if hosted && reply.job_id == build_server_id =>
                 {
                     tracing::info!(job_id = %id, step = "cancel", cause = "runner acknowledged cancellation", "hosted cancellation acknowledged");
-                    self.storage.cancel_acknowledged(id)?;
-                    if self.hosted_state(id).is_some_and(|state| {
-                        state.pending_finish.is_some()
-                            && state
-                                .placement
-                                .as_ref()
-                                .is_some_and(|p| p.host.starts_with("boat:"))
-                    }) {
+                    self.storage
+                        .cancel_acknowledged_with_owner(id, owner.is_some())?;
+                    if owner.is_none()
+                        && self.hosted_state(id).is_some_and(|state| {
+                            state.pending_finish.is_some()
+                                && state
+                                    .placement
+                                    .as_ref()
+                                    .is_some_and(|p| p.host.starts_with("boat:"))
+                        })
+                    {
                         drop(channel.take());
                         return self.finish_hosted(id, false, tx).await.map(|_| false);
                     }
@@ -3196,6 +3280,12 @@ impl Motor {
             .ok_or_else(|| io::Error::other("runner does not report health (upgrade required)"))
     }
     pub async fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
+        tokio::time::timeout(Duration::from_secs(5), self.job_status_inner(id))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "job status timed out"))?
+    }
+
+    async fn job_status_inner(&self, id: Uuid) -> io::Result<JobStatusReply> {
         self.storage.retain_job(id, None)?;
         if let Some(state) = self
             .hosted_state(id)

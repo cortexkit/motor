@@ -84,17 +84,19 @@ impl Motor {
         let Some(job) = self.storage.job(id) else {
             return;
         };
+        if job.hosted_complete() {
+            return;
+        }
         let Some(state) = job.hosted else {
             return;
         };
-        if state.finish_done
-            || (!state.booked_or_attempted()
-                && state.pending_finish.is_none()
-                && !(state.terminal.is_some()
-                    && state
-                        .placement
-                        .as_ref()
-                        .is_some_and(|p| p.host.starts_with("boat:"))))
+        if !state.booked_or_attempted()
+            && state.pending_finish.is_none()
+            && !(state.terminal.is_some()
+                && state
+                    .placement
+                    .as_ref()
+                    .is_some_and(|p| p.host.starts_with("boat:")))
         {
             return;
         }
@@ -217,18 +219,23 @@ impl Motor {
         let Some(job) = self.storage.job(id) else {
             return Ok(true);
         };
+        if job.hosted_complete() {
+            return Ok(true);
+        }
         let Some(state) = job.hosted else {
             return Ok(true);
         };
-        if state.finish_done {
-            return Ok(true);
-        }
         let boat = state
             .placement
             .as_ref()
             .is_some_and(|p| p.host.starts_with("boat:"));
-        if !boat && state.billing == crate::BillingStatus::Available && state.terminal.is_some() {
-            return Ok(true); // First-party hosts settle their own usage.
+        if state.settlement_done()
+            && (state.finish_done || state.billing == crate::BillingStatus::Available)
+        {
+            if job.build_server_job_id.is_none() {
+                self.storage.cancel(id, false)?;
+            }
+            return Ok(true);
         }
         let client = self.hosted_client(state.clone());
         if !state.run_sent {
@@ -294,22 +301,26 @@ impl Motor {
             }
             client.finish(id, Some(&terminal), &self.storage).await?;
         }
-        let done = self
+        let settled = self
             .storage
             .job(id)
             .and_then(|j| j.hosted)
-            .is_none_or(|s| s.finish_done);
-        if done {
+            .is_none_or(|s| s.settlement_done());
+        if settled {
             // An archived spill may now be cancelling its build-server ID.
             // Settling the old booking must not consume that newer intent.
-            if self
-                .storage
-                .job(id)
-                .is_some_and(|j| j.build_server_job_id.is_none())
-            {
+            if self.storage.job(id).is_some_and(|j| {
+                j.build_server_job_id.is_none()
+                    && j.hosted.as_ref().is_some_and(|state| {
+                        state.finish_done || state.billing == crate::BillingStatus::Available
+                    })
+            }) {
                 self.storage.cancel(id, false)?;
             }
         }
+        let done = self.storage.job(id).is_none_or(|job| {
+            job.hosted_complete() || (job.build_server_job_id.is_some() && settled)
+        });
         Ok(done)
     }
 

@@ -57,6 +57,7 @@ pub enum Behavior {
     DropHave,
     Refuse(&'static str),
     RefuseAttach(&'static str),
+    BrokerRefuseAttach,
     RefuseHello(&'static str),
     DropTerminal,
     WrongHost,
@@ -79,6 +80,17 @@ pub enum Behavior {
     /// Status carries the real terminal; run_gate delays Attach's terminal and
     /// HostedTerminal billing record so the test can inspect pending settlement.
     StatusTerminal,
+    StatusTerminalRetry,
+    StatusTerminalRefused,
+}
+
+impl Behavior {
+    fn status_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::StatusTerminal | Self::StatusTerminalRetry | Self::StatusTerminalRefused
+        )
+    }
 }
 
 /// Wall time of the `UnknownTerminal` job's terminal.
@@ -438,17 +450,31 @@ impl Harness {
                                         &mut tls,
                                         &Frame::JobStatusReply(motor_protocol::JobStatusReply {
                                             job_id,
-                                            state:
-                                                if matches!(behavior, Behavior::StatusTerminal) {
-                                                    "ended"
-                                                } else {
-                                                    "running"
-                                                }
-                                                .into(),
+                                            state: if behavior.status_terminal() {
+                                                "ended"
+                                            } else {
+                                                "running"
+                                            }
+                                            .into(),
                                             waiting_on: None,
                                             queue_wait_ms: None,
-                                            terminal: matches!(behavior, Behavior::StatusTerminal)
-                                                .then(|| owner_terminal(job_id)),
+                                            terminal: behavior.status_terminal().then(|| {
+                                                let mut terminal = owner_terminal(job_id);
+                                                terminal.retry_after_ms = Some(999);
+                                                if matches!(
+                                                    behavior,
+                                                    Behavior::StatusTerminalRefused
+                                                ) {
+                                                    terminal.outcome =
+                                                        Outcome::RefusedBeforeStart {
+                                                            reason: RefusalReason::RequestRejected,
+                                                        };
+                                                    terminal.ran = Some(Ran::None);
+                                                    terminal.refusal_detail =
+                                                        Some("foreign lease".into());
+                                                }
+                                                terminal
+                                            }),
                                             unit: None,
                                             unit_alive: Some(true),
                                         }),
@@ -581,7 +607,7 @@ impl Harness {
                                         .await;
                                         return;
                                     }
-                                    if matches!(behavior, Behavior::StatusTerminal) {
+                                    if behavior.status_terminal() {
                                         attach_lifecycle
                                             .send_modify(|(_, _, following)| *following += 1);
                                         let mut gate = run_gate.subscribe();
@@ -618,7 +644,9 @@ impl Harness {
                                         replay_settled(&mut tls, &claims, attach.from_seq).await;
                                         return;
                                     }
-                                    if matches!(behavior, Behavior::ReturnCapFailure) {
+                                    if matches!(behavior, Behavior::ReturnCapFailure)
+                                        && attach.from_seq == 0
+                                    {
                                         motor_protocol::write_frame_async(
                                             &mut tls,
                                             &Frame::ReturnResult(ReturnResult {
@@ -635,18 +663,11 @@ impl Harness {
                                         .await
                                         .unwrap();
                                     }
-                                    let mut terminal =
-                                        if matches!(behavior, Behavior::StatusTerminal) {
-                                            owner_terminal(id)
-                                        } else {
-                                            TerminalRecord::new(
-                                                id,
-                                                Outcome::Exit { code: 23 },
-                                                0,
-                                                0,
-                                                0,
-                                            )
-                                        };
+                                    let mut terminal = if behavior.status_terminal() {
+                                        owner_terminal(id)
+                                    } else {
+                                        TerminalRecord::new(id, Outcome::Exit { code: 23 }, 0, 0, 0)
+                                    };
                                     if matches!(behavior, Behavior::ReturnCapFailure) {
                                         terminal.ran = Some(Ran::Remote);
                                     }
@@ -803,6 +824,10 @@ impl Harness {
                     } else if release_admitted.load(Ordering::SeqCst) && path.ends_with("/release")
                     {
                         motor_lease::fake::BrokerReply::error(409, "job_admitted")
+                    } else if matches!(behavior, Behavior::BrokerRefuseAttach)
+                        && path.ends_with("/reattach")
+                    {
+                        motor_lease::fake::BrokerReply::error(409, "not_attachable")
                     } else if finished.load(Ordering::SeqCst) && path.ends_with("/reattach") {
                         motor_lease::fake::BrokerReply::error(409, "job_finished")
                     } else if path.ends_with("/replace") {

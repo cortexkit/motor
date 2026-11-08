@@ -48,6 +48,8 @@ struct Runner {
     started_at_ms: AtomicU64,
     hold_cancel: Arc<AtomicBool>,
     fail_cancel: AtomicBool,
+    output_records: AtomicUsize,
+    fail_reattach: AtomicBool,
 }
 
 impl Connector for Runner {
@@ -72,7 +74,12 @@ impl Connector for Runner {
         let started_at_ms = self.started_at_ms.load(Ordering::SeqCst);
         let hold_cancel = self.hold_cancel.clone();
         let fail_cancel = self.fail_cancel.load(Ordering::SeqCst);
+        let output_records = self.output_records.load(Ordering::SeqCst);
+        let fail_reattach = self.fail_reattach.load(Ordering::SeqCst);
         Box::pin(async move {
+            if attempt > 0 && fail_reattach {
+                return Err(io::Error::other("replay connection unavailable"));
+            }
             if attempt > 0 && matches!(branch, Branch::BeforeRun | Branch::Lost) {
                 return Err(io::Error::other("runner connection lost"));
             }
@@ -181,6 +188,21 @@ impl Connector for Runner {
                             }
                             gates.cancel_ready.notified().await;
                             if branch == Branch::Completed {
+                                for seq in 0..output_records as u64 {
+                                    if write_frame_async(
+                                        &mut server,
+                                        &Frame::Output(Output::new(
+                                            seq,
+                                            OutputStream::Stdout,
+                                            BytePayload(vec![b'x'; 8]),
+                                        )),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
                                 write_frame_async(
                                     &mut server,
                                     &Frame::Terminal(
@@ -336,6 +358,8 @@ struct Harness {
     broker: Http,
     gates: Arc<Gates>,
     runner: Arc<Runner>,
+    finish_failures: Arc<AtomicUsize>,
+    finish_calls: Arc<AtomicUsize>,
 }
 
 impl Harness {
@@ -349,12 +373,22 @@ impl Harness {
         let held = gates.clone();
         let request = Arc::new(std::sync::Mutex::new(None::<motor_lease::LeaseRequest>));
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finish_failures = Arc::new(AtomicUsize::new(0));
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let failures = finish_failures.clone();
+        let calls = finish_calls.clone();
         let broker = Http::with_async_reply(move |path, body| {
             let gates = held.clone();
             let saved = request.clone();
             let finished = finished.clone();
+            let failures = failures.clone();
+            let calls = calls.clone();
             async move {
                 let response = if path.ends_with("/finish") {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
+                        return (503, b"{}".to_vec());
+                    }
                     finished.store(true, Ordering::SeqCst);
                     (200, serde_json::json!({"job_id": path.split('/').nth(3).unwrap(),
                         "settled_vcpu_ms": 14_000, "released_vcpu_ms": 46_000}))
@@ -421,11 +455,15 @@ impl Harness {
             started_at_ms: AtomicU64::new(0),
             hold_cancel: Arc::default(),
             fail_cancel: AtomicBool::new(false),
+            output_records: AtomicUsize::new(0),
+            fail_reattach: AtomicBool::new(false),
         });
         Self {
             broker,
             gates,
             runner,
+            finish_failures,
+            finish_calls,
         }
     }
 }
@@ -1294,5 +1332,162 @@ async fn caller_detached_before_late_grant_retains_real_terminal_without_new_cal
     assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
     assert_eq!(h.runner.attaches.load(Ordering::SeqCst), 0);
     drop(replay);
+    motor.close().await;
+}
+
+async fn owned_audit_job(h: &Harness) -> (ScratchDir, Motor, JobStream) {
+    let root = ScratchDir::new("owned-boat-audit");
+    let (_repo_root, repo) = crate::hosted::boat_tests::committed_repo();
+    let config = Config {
+        runner_instance: "test".into(),
+        broker_token_source: crate::BrokerTokenSource::Fake,
+        broker_url: Some(h.broker.url.clone()),
+        ..Config::default()
+    };
+    let mut motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+    motor.hosted_connector = Some(h.runner.clone());
+    let path = repo.to_str().unwrap();
+    let caller = motor
+        .run_direct_hosted(
+            RunRequest::new(path, path, path, "sleep 7200").with_timeout(7200),
+            None,
+            crate::ReturnOptions::default(),
+        )
+        .unwrap();
+    h.gates.lease_requested.notified().await;
+    h.gates.grant.notify_one();
+    h.gates.admission.notify_one();
+    h.gates.accepted.notified().await;
+    (root, motor, caller)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_01_first_party_collector_exits_without_reelection_or_restart_attach() {
+    let h = Harness::with_host(Branch::Completed, "host:test").await;
+    let (root, motor, caller) = owned_audit_job(&h).await;
+    let id = caller.job_id;
+    let mut stopped = motor.hosted_result_stopped_for_test(id);
+    let config = motor.config.clone();
+    drop(caller);
+    h.gates.cancel_ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), stopped.wait_for(|done| *done))
+        .await
+        .expect("collector did not exit")
+        .unwrap();
+    assert!(
+        !motor.hosted_results.lock().unwrap().contains_key(&id),
+        "settled collector re-elected another owner"
+    );
+    assert!(!motor.storage.unsettled_hosted().contains(&id));
+    assert_eq!(h.runner.attaches.load(Ordering::SeqCst), 0);
+    motor.close().await;
+    let mut motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+    motor.hosted_connector = Some(h.runner.clone());
+    motor.resume_finishes().await;
+    assert!(!motor.hosted_results.lock().unwrap().contains_key(&id));
+    assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runner.attaches.load(Ordering::SeqCst), 0);
+    motor.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_06_detached_boat_cancel_retains_the_runners_real_terminal() {
+    let h = Harness::new(Branch::Accepted).await;
+    let (_root, motor, caller) = owned_audit_job(&h).await;
+    let id = caller.job_id;
+    drop(caller);
+    h.gates.cancel_ready.notify_one();
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !motor.hosted_state(id).unwrap().finish_done {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached cancel must finish");
+    let terminal = motor.hosted_state(id).unwrap().terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Cancelled);
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    assert_eq!(terminal.wall_ms, 7_000);
+    motor.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_11_silent_cancel_reply_has_a_bounded_delivery_lifetime() {
+    let h = Harness::new(Branch::Accepted).await;
+    h.runner.hold_cancel.store(true, Ordering::SeqCst);
+    let (_root, motor, caller) = owned_audit_job(&h).await;
+    let id = caller.job_id;
+    h.gates.cancel_ready.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(7), motor.send_cancel(id))
+        .await
+        .expect("silent cancel endpoint blocked delivery forever");
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    h.runner.hold_cancel.store(false, Ordering::SeqCst);
+    h.gates.cancel_reply.notify_waiters();
+    drop(caller);
+    motor.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_04_boat_drain_deadline_survives_failed_rewind_transports() {
+    let h = Harness::new(Branch::Completed).await;
+    h.runner.output_records.store(64, Ordering::SeqCst);
+    let (_root, motor, caller) = owned_audit_job(&h).await;
+    let id = caller.job_id;
+    h.runner.fail_reattach.store(true, Ordering::SeqCst);
+    h.gates.cancel_ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while motor.hosted_state(id).unwrap().terminal.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    motor.rewind_hosted_for_test(id, 0);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    motor.expire_boat_drain_for_test(id);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.finish_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed rewinds postponed Boat finish beyond its drain deadline");
+    assert_eq!(
+        motor.hosted_state(id).unwrap().terminal.unwrap().outcome,
+        Outcome::Exit { code: 47 }
+    );
+    drop(caller);
+    motor.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_09_failed_boat_finish_retries_while_subscriber_queue_is_full() {
+    let h = Harness::new(Branch::Completed).await;
+    h.runner.output_records.store(64, Ordering::SeqCst);
+    h.finish_failures.store(6, Ordering::SeqCst);
+    let (_root, motor, caller) = owned_audit_job(&h).await;
+    let id = caller.job_id;
+    h.gates.cancel_ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while motor.hosted_state(id).unwrap().terminal.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(caller.records.len(), 32);
+    motor.expire_boat_drain_for_test(id);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !motor.hosted_state(id).unwrap().finish_done {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a stalled subscriber suppressed durable settlement retry");
+    assert!(h.finish_calls.load(Ordering::SeqCst) >= 7);
+    assert_eq!(caller.records.len(), 32);
+    drop(caller);
     motor.close().await;
 }

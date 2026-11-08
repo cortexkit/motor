@@ -193,14 +193,22 @@ impl HostedJobState {
     }
 
     pub(crate) fn needs_cleanup(&self) -> bool {
-        !self.finish_done
-            && (self.pending_finish.is_some()
-                || (self.booked_or_attempted() && !self.run_sent)
-                || (self
-                    .placement
-                    .as_ref()
-                    .is_some_and(|p| p.host.starts_with("boat:"))
-                    && self.terminal.is_some()))
+        self.booked_or_attempted() && !self.settlement_done()
+    }
+
+    pub(crate) fn settlement_done(&self) -> bool {
+        self.pending_finish.is_none()
+            && if self.run_sent {
+                self.terminal.is_some()
+                    && self.billing != BillingStatus::Pending
+                    && (self.finish_done
+                        || self
+                            .placement
+                            .as_ref()
+                            .is_none_or(|p| !p.host.starts_with("boat:")))
+            } else {
+                self.finish_done
+            }
     }
     pub(crate) fn capacity_routed(&self) -> bool {
         self.repository_routed || self.fleet_routed
