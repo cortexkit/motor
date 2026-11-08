@@ -572,6 +572,11 @@ impl Backend for HostBackend {
     }
     fn materialize(&self, config: &Config, trees: &Trees, s: &Setup) -> io::Result<Prepared> {
         let r = &s.request;
+        #[cfg(target_os = "linux")]
+        let fixed = paths::fixed_paths(config, r).unwrap_or_else(|reason| {
+            tracing::warn!(job_id = %s.id, reason, "fixed checkout path unavailable; using caller paths");
+            None
+        });
         // A mapped job's trees live under a host root; every filesystem step
         // below uses their host forms, and only the sandbox sees caller paths.
         let mapped = paths::mapped_run(config, r);
@@ -943,7 +948,8 @@ impl Backend for HostBackend {
                         crate::isolation::Sandbox::prepare_writer(
                             s.id,
                             &trees.state,
-                            paths::JobTree::new(&path, paths::caller_checkout(r)),
+                            paths::JobTree::new(&path, paths::caller_checkout(r))
+                                .with_fixed(fixed.as_ref()),
                             &target,
                             wrapper.as_deref(),
                             &config.build_slot_root,
@@ -960,7 +966,8 @@ impl Backend for HostBackend {
                         crate::isolation::Sandbox::prepare_with_dependencies(
                             s.id,
                             &trees.state,
-                            paths::JobTree::new(&path, paths::caller_checkout(r)),
+                            paths::JobTree::new(&path, paths::caller_checkout(r))
+                                .with_fixed(fixed.as_ref()),
                             &target,
                             &r.siblings,
                             wrapper.as_deref(),
@@ -1140,6 +1147,15 @@ impl Backend for HostBackend {
             )
         });
         env.insert("CK_REMOTE_SOURCE_COMMIT".to_string(), caller_commit);
+        #[cfg(target_os = "linux")]
+        let fixed = paths::fixed_paths(config, r).ok().flatten();
+        #[cfg(target_os = "linux")]
+        if fixed.is_some() {
+            env.insert(
+                "MOTOR_CALLER_WORKSPACE".into(),
+                paths::caller_checkout(r).to_string_lossy().into_owned(),
+            );
+        }
         // An isolated job sees its trees at caller paths; only the test-only
         // unisolated configuration runs a mapped job at its host paths.
         let job_path = |host: &std::path::Path| {
@@ -1155,6 +1171,21 @@ impl Backend for HostBackend {
         );
         compile_cache_environment(config, s, prepared, &mut env)?;
         let env = env.into_iter().collect::<Vec<_>>();
+        let job_cwd = job_path(&prepared.host_cwd);
+        #[cfg(target_os = "linux")]
+        let job_cwd = match &fixed {
+            Some(fixed) => {
+                let relative = job_cwd
+                    .strip_prefix(paths::caller_checkout(r))
+                    .map_err(|_| invalid("cwd outside caller workspace"))?;
+                if relative.as_os_str().is_empty() {
+                    fixed.checkout.clone()
+                } else {
+                    fixed.checkout.join(relative)
+                }
+            }
+            None => job_cwd,
+        };
         let launch = if config.isolate_jobs {
             let sandbox = prepared
                 .sandbox
@@ -1162,7 +1193,7 @@ impl Backend for HostBackend {
                 .ok_or_else(|| io::Error::other("isolated job has no prepared sandbox"))?;
             sandbox.launch(
                 &s.request.command,
-                &job_path(&prepared.host_cwd),
+                &job_cwd,
                 &env,
                 &s.cpus,
                 JobResources {

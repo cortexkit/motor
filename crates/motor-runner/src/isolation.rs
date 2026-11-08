@@ -2838,7 +2838,15 @@ fn sibling_mounts<'a>(
     }
     let workspace = job_tree.caller;
     let mut mounts = Vec::new();
-    for sibling in siblings {
+    if job_tree
+        .fixed
+        .is_some_and(|fixed| fixed.siblings.len() != siblings.len())
+    {
+        return Err(io::Error::other(
+            "fixed sibling plan does not match request",
+        ));
+    }
+    for (index, sibling) in siblings.iter().enumerate() {
         // The job sees each sibling at its caller path. Only an in-place
         // sibling is read from the host, and in-place siblings are identity
         // paths: a mapped sibling is always mounted from its snapshot.
@@ -2874,10 +2882,60 @@ fn sibling_mounts<'a>(
                     .ok_or_else(|| io::Error::other("sibling name"))?,
             );
         if alias != path {
-            mounts.push((bind(source, &alias)?, alias));
+            mounts.push((bind(source, &alias)?, alias.clone()));
+        }
+        if let Some(fixed) = job_tree.fixed {
+            let destination = &fixed.siblings[index];
+            if destination != path && destination != &alias {
+                mounts.push((bind(source, destination)?, destination.clone()));
+            }
         }
     }
     Ok(mounts)
+}
+
+/// Mirror the complete checkout mount stack, not just its root bind. Otherwise
+/// an alias could bypass a read-only overlay such as `.git`, or miss a writable
+/// writer target. Mount words escape colons, so only the bind separator is raw.
+fn repeat_checkout_mounts(
+    caller: &Path,
+    fixed: &Path,
+    read_only: &mut Vec<String>,
+    read_write: &mut Vec<String>,
+    destinations: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let aliases: Vec<_> = destinations
+        .iter()
+        .filter_map(|destination| {
+            destination.strip_prefix(caller).ok().map(|relative| {
+                let alias = if relative.as_os_str().is_empty() {
+                    fixed.to_path_buf()
+                } else {
+                    fixed.join(relative)
+                };
+                (destination, alias)
+            })
+        })
+        .collect();
+    let words: BTreeMap<_, _> = aliases
+        .iter()
+        .map(|(destination, alias)| Ok((word(destination)?, word(alias)?)))
+        .collect::<io::Result<_>>()?;
+    for mounts in [read_only, read_write] {
+        let repeated: Vec<_> = mounts
+            .iter()
+            .filter_map(|spec| {
+                let (source, destination) = spec.split_once(':').unwrap_or((spec, spec));
+                words
+                    .get(destination)
+                    .map(|alias| format!("{source}:{alias}"))
+            })
+            .collect();
+        mounts.extend(repeated);
+    }
+    let aliases: Vec<_> = aliases.into_iter().map(|(_, alias)| alias).collect();
+    destinations.extend(aliases);
+    Ok(())
 }
 
 impl Sandbox {
@@ -3213,10 +3271,11 @@ impl Sandbox {
         fs::create_dir_all(host_home.join("tmp"))?;
         fs::create_dir_all(host_home.join("cargo/registry"))?;
         fs::create_dir_all(host_home.join("cargo/git"))?;
-        write_safe_directories(
-            &host_home.join(".gitconfig"),
-            &safe_directories(caller_workspace, &sibling_mounts),
-        )?;
+        let mut safe = safe_directories(caller_workspace, &sibling_mounts);
+        if let Some(fixed) = job_tree.fixed {
+            safe.push(fixed.checkout.clone());
+        }
+        write_safe_directories(&host_home.join(".gitconfig"), &safe)?;
         prepare_job_home(&host_home)?;
         let shared_cargo = PathBuf::from(
             host_inputs::environment("CARGO_HOME")
@@ -3428,6 +3487,15 @@ impl Sandbox {
         } else {
             None
         };
+        if let Some(fixed) = job_tree.fixed {
+            repeat_checkout_mounts(
+                caller_workspace,
+                &fixed.checkout,
+                &mut read_only,
+                &mut read_write,
+                &mut mount_destinations,
+            )?;
+        }
         // Build the full destination tree before root owns it; the trusted
         // daemon cannot create deeper mount ancestors after changing a parent.
         let mut root_owned = std::collections::BTreeSet::from([root.clone(), output.clone()]);
@@ -4287,4 +4355,149 @@ pub(crate) fn reserved_bind_sources(config: &crate::Config) -> Vec<PathBuf> {
     }
     sources.push(JavascriptTools::for_config(config).bun_dir().into());
     sources
+}
+
+#[cfg(test)]
+mod fixed_path_tests {
+    use super::*;
+
+    #[test]
+    fn repeats_every_checkout_overlay_with_its_original_mode_and_source() {
+        let caller = Path::new("/caller/repo with:escape");
+        let fixed = Path::new("/w/acct-test/key/repository");
+        let host = Path::new("/runner/private/job");
+        let mut read_only = vec![
+            bind(&host.join(".git"), &caller.join(".git")).unwrap(),
+            bind(
+                Path::new("/runtime/config"),
+                &caller.join("config/readonly"),
+            )
+            .unwrap(),
+            word(Path::new("/caller/repo with:escape-other")).unwrap(),
+        ];
+        let mut read_write = vec![
+            bind(host, caller).unwrap(),
+            bind(Path::new("/writer/target"), &caller.join("target")).unwrap(),
+            bind(
+                Path::new("/runtime/writable"),
+                &caller.join("config/writable"),
+            )
+            .unwrap(),
+            word(Path::new("/motor-home")).unwrap(),
+        ];
+        let mut destinations = vec![
+            caller.to_path_buf(),
+            caller.join(".git"),
+            caller.join("target"),
+            caller.join("config/readonly"),
+            caller.join("config/writable"),
+            PathBuf::from("/caller/repo with:escape-other"),
+            PathBuf::from("/motor-home"),
+        ];
+        let original_ro = read_only.clone();
+        let original_rw = read_write.clone();
+        repeat_checkout_mounts(
+            caller,
+            fixed,
+            &mut read_only,
+            &mut read_write,
+            &mut destinations,
+        )
+        .unwrap();
+        assert_eq!(&read_only[..original_ro.len()], original_ro);
+        assert_eq!(&read_write[..original_rw.len()], original_rw);
+        assert_eq!(
+            &read_only[original_ro.len()..],
+            [
+                bind(&host.join(".git"), &fixed.join(".git")).unwrap(),
+                bind(Path::new("/runtime/config"), &fixed.join("config/readonly")).unwrap(),
+            ]
+        );
+        assert_eq!(
+            &read_write[original_rw.len()..],
+            [
+                bind(host, fixed).unwrap(),
+                bind(Path::new("/writer/target"), &fixed.join("target")).unwrap(),
+                bind(
+                    Path::new("/runtime/writable"),
+                    &fixed.join("config/writable")
+                )
+                .unwrap(),
+            ]
+        );
+        for relative in ["", ".git", "target", "config/readonly", "config/writable"] {
+            assert!(destinations.contains(&fixed.join(relative)));
+        }
+    }
+
+    #[test]
+    fn identity_mounts_repeat_from_the_host_not_the_caller_alias() {
+        let caller = Path::new("/caller/repo");
+        let fixed = Path::new("/w/account/key/repo");
+        let mut ro = vec![word(&caller.join(".git")).unwrap()];
+        let mut rw = vec![word(caller).unwrap()];
+        let mut destinations = vec![caller.to_path_buf(), caller.join(".git")];
+        repeat_checkout_mounts(caller, fixed, &mut ro, &mut rw, &mut destinations).unwrap();
+        assert_eq!(ro[1], "/caller/repo/.git:/w/account/key/repo/.git");
+        assert_eq!(rw[1], "/caller/repo:/w/account/key/repo");
+    }
+
+    #[test]
+    fn fixed_siblings_use_snapshots_at_all_three_safe_directories() {
+        let scratch = cortexkit_test_support::ScratchDir::new("fixed-sibling-mounts");
+        let config = crate::Config::new(scratch.join("state"), "main");
+        let sibling = SiblingSnapshot {
+            canonical_path: "/source/commons".into(),
+            commit: "a".repeat(40),
+            tree_hash: "b".repeat(40),
+            base_commit: None,
+        };
+        let snapshot = scratch.join("snapshot");
+        let snapshots = SnapshotSiblings {
+            config: &config,
+            siblings: vec![(snapshot.clone(), PathBuf::from(&sibling.canonical_path))],
+        };
+        let fixed = crate::caller_path::FixedPaths {
+            checkout: "/w/account/key/repository".into(),
+            siblings: vec!["/w/account/key/commons".into()],
+        };
+        let caller = Path::new("/caller/worktree");
+        let tree = crate::caller_path::JobTree::new(Path::new("/host/worktree"), caller)
+            .with_fixed(Some(&fixed));
+        let mounts = sibling_mounts(tree, &[sibling], Some(&snapshots)).unwrap();
+        let expected: Vec<_> = [
+            PathBuf::from("/source/commons"),
+            PathBuf::from("/caller/commons"),
+            PathBuf::from("/w/account/key/commons"),
+        ]
+        .into_iter()
+        .map(|destination| (bind(&snapshot, &destination).unwrap(), destination))
+        .collect();
+        assert_eq!(mounts, expected);
+        let mut safe = safe_directories(caller, &mounts);
+        safe.push(fixed.checkout);
+        let file = scratch.join("gitconfig");
+        write_safe_directories(&file, &safe).unwrap();
+        let listed = workspace::git(
+            &scratch,
+            &[
+                "config",
+                "--file",
+                file.to_str().unwrap(),
+                "--get-all",
+                "safe.directory",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            listed.lines().collect::<Vec<_>>(),
+            [
+                "/caller/worktree",
+                "/source/commons",
+                "/caller/commons",
+                "/w/account/key/commons",
+                "/w/account/key/repository",
+            ]
+        );
+    }
 }
