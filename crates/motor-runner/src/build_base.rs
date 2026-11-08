@@ -5,6 +5,45 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io, path::Path, process::Command};
 
+#[cfg(test)]
+pub(crate) static DIAGNOSTICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn diagnose(
+    phase: &str,
+    id: motor_protocol::Uuid,
+    checkout: &Path,
+    reference: Option<Timestamp>,
+) {
+    use std::os::unix::fs::MetadataExt;
+    if !DIAGNOSTICS.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let mut coarse = std::mem::MaybeUninit::uninit();
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, coarse.as_mut_ptr()) },
+        0
+    );
+    let coarse = unsafe { coarse.assume_init() };
+    let coarse = Timestamp {
+        seconds: coarse.tv_sec,
+        nanos: coarse.tv_nsec,
+    };
+    let fine = Timestamp::now();
+    let mut names = vec![std::ffi::OsString::from(".")];
+    names.extend(
+        fs::read_dir(checkout)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name()),
+    );
+    names.sort();
+    for name in names {
+        let metadata = fs::symlink_metadata(checkout.join(&name)).unwrap();
+        eprintln!("BASE_DIAG phase={phase} job={id} name={name:?} inode={} ctime={}.{:09} reference={reference:?} coarse={coarse:?} fine={fine:?}", metadata.ino(), metadata.ctime(), metadata.ctime_nsec());
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub(crate) struct Timestamp {
     pub seconds: i64,
@@ -55,6 +94,13 @@ impl Timestamp {
             })
         };
         let reference = coarse()?;
+        #[cfg(test)]
+        if DIAGNOSTICS.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "BASE_DIAG phase=reference coarse={reference:?} fine={:?}",
+                Self::now()
+            );
+        }
         // Linux inode ctime uses the coarse realtime tick. Starting within that
         // same tick would let a write/restore receive ctime <= the reference.
         // Advance one tick before launching so every later mutation is newer.

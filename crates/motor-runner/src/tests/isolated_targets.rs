@@ -469,6 +469,7 @@ async fn settle_base_store(f: &Fixture, runner: &Runner) -> Job {
 #[tokio::test]
 #[ignore = "requires root, host system manager, and motor-cache/motor-job accounts"]
 async fn isolated_base_fill_publishes_nested_uplift_links_and_replaces_current() {
+    crate::build_base::DIAGNOSTICS.store(true, Ordering::SeqCst);
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let f = Fixture::new();
     let command = "mkdir -p \"$CARGO_TARGET_DIR/bd/nested/deeper\"; printf first > \"$CARGO_TARGET_DIR/bd/nested/deeper/artifact\"; ln \"$CARGO_TARGET_DIR/bd/nested/deeper/artifact\" \"$CARGO_TARGET_DIR/uplift\"";
@@ -844,6 +845,13 @@ async fn isolated_base_recovered_fill_publishes_recorded_inputs() {
         runner.core.inner.lock().unwrap().jobs[&job.id].base_launch,
         job.base_launch
     );
+    // The fake unit models the real wrapper's completion protocol: statistics
+    // are written before exit. Recovery must not invent missing measurements.
+    fs::write(
+        output.join("cache-stats"),
+        br#"{"stats":{"cache_misses":{"counts":{}},"cache_write_errors":0}}"#,
+    )
+    .unwrap();
     fs::write(output.join("exit"), b"0\n").unwrap();
     active.store(false, Ordering::SeqCst);
     drive_base_store(&runner, || {
@@ -1020,4 +1028,48 @@ fn isolated_base_unlisted_state_refuses_publication_and_removal_with_one_reason_
     )
     .unwrap();
     assert!(!generation.exists());
+}
+
+#[tokio::test]
+#[ignore = "requires root, host system manager, and motor-cache/motor-job accounts"]
+async fn isolated_base_launch_prepares_checkout_entries_before_reference() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let f = Fixture::new();
+    let mut config = base_store_config(
+        &f,
+        "mkdir -p \"$CARGO_TARGET_DIR/bd\"; printf built > \"$CARGO_TARGET_DIR/bd/artifact\"",
+    );
+    let observed = Arc::new(Mutex::new(None));
+    config.before_gate = Some({
+        let (state, observed) = (config.state_dir(), observed.clone());
+        Arc::new(move || {
+            for entry in fs::read_dir(state.join("jobs")).unwrap() {
+                let job: Job = read_json(&entry.unwrap().path().join("record.json")).unwrap();
+                if !job.base || job.started_ms.is_none() || job.terminal.is_some() {
+                    continue;
+                }
+                let reference = job.base_launch.as_ref().unwrap().reference;
+                let checkout = Path::new(&job.request.as_ref().unwrap().cwd);
+                let metadata = fs::symlink_metadata(checkout).unwrap();
+                let ctime = crate::build_base::Timestamp {
+                    seconds: metadata.ctime(),
+                    nanos: metadata.ctime_nsec(),
+                };
+                assert!(ctime <= reference, "runner changed checkout entries after the launch reference: {ctime:?} > {reference:?}");
+                *observed.lock().unwrap() = Some((job.id, reference));
+            }
+        })
+    });
+    let runner = base_store_runner(config.clone());
+    let fill = settle_base_store(&f, &runner).await;
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some((fill.id, fill.base_launch.as_ref().unwrap().reference))
+    );
+    assert!(
+        crate::build_base::repository_store(&config.state_dir(), &f.root)
+            .join("current/base.json")
+            .is_file(),
+        "runner-only checkout entry creation after the reference must prevent publication"
+    );
 }

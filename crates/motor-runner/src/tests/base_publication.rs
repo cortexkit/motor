@@ -378,3 +378,26 @@ fn startup_keeps_unknown_staging_on_live_transitions_or_unit_query_errors() {
         }
     }
 }
+
+#[test]
+fn replacing_a_tracked_file_by_rename_is_refused_even_with_identical_content() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run("true");
+    f.submit(&runner, &request, &bytes);
+    let source = f.main.join("source");
+    let replacement = f.main.join("replacement");
+    fs::write(&replacement, fs::read(&source).unwrap()).unwrap();
+    let reference = Timestamp::reference().unwrap();
+    fs::rename(&replacement, &source).unwrap();
+    assert_eq!(
+        runner.core.trees.tree_hash(&f.main).unwrap(),
+        request.tree_hash
+    );
+    let error =
+        build_base::verify_unchanged(&runner.core.trees, &request, &f.main, reference).unwrap_err();
+    assert!(error.to_string().contains("tracked"), "{error}");
+}

@@ -8559,6 +8559,10 @@ impl Runner {
         let Ok(prepared) = prepared else {
             unreachable!("a failed setup returned above");
         };
+        #[cfg(all(test, target_os = "linux"))]
+        if s.base {
+            crate::build_base::diagnose("prepared", id, &prepared.host_cwd, None);
+        }
         let catalog = self.catalog_snapshot(&inner);
         let mut job = inner.jobs[&id].clone();
         drop(inner);
@@ -8792,6 +8796,18 @@ impl Runner {
         #[cfg(test)]
         if let Some(hook) = &self.core.config.before_gate {
             hook();
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if s.base {
+            crate::build_base::diagnose(
+                "before-release",
+                id,
+                &prepared.host_cwd,
+                inner.jobs[&id]
+                    .base_launch
+                    .as_ref()
+                    .map(|launch| launch.reference),
+            );
         }
         if let Err(error) = execution.release() {
             inner.starting.insert(id);
@@ -10871,6 +10887,13 @@ impl Runner {
     #[cfg(target_os = "linux")]
     fn publish_build_base(&self, id: Uuid, success: bool) {
         let job = self.core.inner.lock().unwrap().jobs[&id].clone();
+        #[cfg(test)]
+        crate::build_base::diagnose(
+            "before-publication",
+            id,
+            &paths::job_workspace(&self.core.config, &job),
+            job.base_launch.as_ref().map(|launch| launch.reference),
+        );
         let Some(request) = &job.request else { return };
         let generation =
             crate::build_base::staging(&self.core.trees.state, &request.repository_root, id);
