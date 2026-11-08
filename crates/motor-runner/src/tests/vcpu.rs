@@ -596,13 +596,11 @@ async fn windows_start_does_not_move_existing_job_or_exempt_cache_fills() {
 #[tokio::test]
 #[ignore = "requires trusted operator, motor-job account, sudo and systemd cpuset support"]
 async fn isolated_four_vcpus_enforce_cpu_set_and_memory_max() {
+    let slice = crate::systemd::read_job_memory_budget().unwrap();
     let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
     config.cpu_topology = None;
-    // This checks the per-vCPU memory limit, not host slice clamping. Keep the
-    // probed ceiling above that limit even on a smaller operator host.
-    config.slice_budget_probe = Some(Arc::new(|| Ok((64 << 30, None))));
     let runner = Runner::open(config).unwrap();
     let (mut request, bytes) = f.run(r#"nproc; awk '/Cpus_allowed_list/ {print $2}' /proc/self/status; group=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup); cat "/sys/fs/cgroup${group}/memory.max""#);
     request.weight_hint = Some(4);
@@ -619,7 +617,9 @@ async fn isolated_four_vcpus_enforce_cpu_set_and_memory_max() {
     assert_eq!(record.weight, 4);
     assert_eq!(record.cpus.len(), 4);
     assert_eq!(crate::cpu::parse_list(lines[1]).unwrap(), record.cpus);
-    assert_eq!(lines[2], "17179869184");
+    // Four vCPUs request 16 GiB, but the unit must not exceed the shared jobs
+    // slice's live memory ceiling, including on smaller operator hosts.
+    assert_eq!(lines[2], (16_u64 << 30).min(slice.max).to_string());
 }
 
 #[cfg(target_os = "linux")]
