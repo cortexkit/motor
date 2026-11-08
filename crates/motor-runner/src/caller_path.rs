@@ -54,6 +54,7 @@ pub(crate) fn host_str(value: &str) -> HostPath<'_> {
 pub(crate) struct JobTree<'a> {
     pub(crate) host: HostPath<'a>,
     pub(crate) caller: &'a Path,
+    pub(crate) fixed: Option<&'a FixedPaths>,
 }
 
 #[cfg(target_os = "linux")]
@@ -62,7 +63,13 @@ impl<'a> JobTree<'a> {
         Self {
             host: HostPath(host),
             caller,
+            fixed: None,
         }
+    }
+
+    pub(crate) fn with_fixed(mut self, fixed: Option<&'a FixedPaths>) -> Self {
+        self.fixed = fixed;
+        self
     }
 
     /// Where the job sees `path`, a host path at or beneath this tree's host
@@ -89,6 +96,57 @@ impl<'a> From<&'a PathBuf> for JobTree<'a> {
     fn from(path: &'a PathBuf) -> Self {
         Self::new(path, path)
     }
+}
+
+/// Additional sandbox destinations, shared by all worktrees of a repository.
+/// This plan contains no host paths: each job binds its own checkout there.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FixedPaths {
+    pub(crate) checkout: PathBuf,
+    /// In request order, paired with the declared sibling snapshots.
+    pub(crate) siblings: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn fixed_paths(
+    config: &crate::Config,
+    request: &Run,
+) -> Result<Option<FixedPaths>, &'static str> {
+    let repository = &request.repository_root;
+    if !config
+        .fixed_path_repositories
+        .iter()
+        .any(|root| root == "*" || root == repository)
+    {
+        return Ok(None);
+    }
+    let account = config
+        .account_subject
+        .as_deref()
+        .ok_or("fixed checkout path requires an account subject")?
+        .replace(':', "-");
+    let name = Path::new(repository)
+        .file_name()
+        .ok_or("repository root has no basename")?;
+    let parent = Path::new("/w")
+        .join(account)
+        .join(crate::workspace::name(repository));
+    let mut names = std::collections::BTreeSet::from([name]);
+    let mut siblings = Vec::with_capacity(request.siblings.len());
+    for sibling in &request.siblings {
+        let name = Path::new(&sibling.canonical_path)
+            .file_name()
+            .ok_or("sibling root has no basename")?;
+        if !names.insert(name) {
+            return Err("checkout and sibling basenames must be distinct");
+        }
+        siblings.push(parent.join(name));
+    }
+    Ok(Some(FixedPaths {
+        checkout: parent.join(name),
+        siblings,
+    }))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -883,6 +941,77 @@ pub(crate) fn validate_host_destinations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn fixed_request() -> (crate::Config, Run) {
+        let job: Job = serde_json::from_str(include_str!(
+            "../test-fixtures/compatibility/job-record.json"
+        ))
+        .unwrap();
+        let mut request = job.request.unwrap();
+        request.repository_root = "/home/main/repository".into();
+        request.workspace_key = "/home/worktrees/first".into();
+        request.cwd = "/home/worktrees/first/src".into();
+        request.siblings.clear();
+        let mut config = crate::Config::new("unused", "fixed-paths");
+        config.fixed_path_repositories = vec![request.repository_root.clone()];
+        config.account_subject = Some("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+        (config, request)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_paths_use_repository_identity_not_worktree_or_cwd() {
+        let (mut config, mut request) = fixed_request();
+        let first = fixed_paths(&config, &request).unwrap().unwrap();
+        assert_eq!(
+            first.checkout,
+            Path::new("/w/acct-01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                .join(crate::workspace::name("/home/main/repository"))
+                .join("repository")
+        );
+        request.workspace_key = "/elsewhere/second".into();
+        request.cwd = "/elsewhere/second/subdir".into();
+        assert_eq!(fixed_paths(&config, &request).unwrap(), Some(first.clone()));
+        request.workspace_key = "base:/home/main/repository".into();
+        request.cwd = "/elsewhere/.motor-base-repository".into();
+        assert_eq!(fixed_paths(&config, &request).unwrap(), Some(first.clone()));
+        config.fixed_path_repositories = vec!["*".into()];
+        request.repository_root = "/other/main/repository".into();
+        let other = fixed_paths(&config, &request).unwrap().unwrap();
+        assert_ne!(first.checkout.parent(), other.checkout.parent());
+        assert_eq!(first.checkout.file_name(), other.checkout.file_name());
+        config.fixed_path_repositories.clear();
+        assert_eq!(fixed_paths(&config, &request).unwrap(), None);
+        config.fixed_path_repositories = vec!["/unrelated/repository".into()];
+        assert_eq!(fixed_paths(&config, &request).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_paths_reject_basename_collisions_and_keep_sibling_order() {
+        let (config, mut request) = fixed_request();
+        let sibling = |path: &str| SiblingSnapshot {
+            canonical_path: path.into(),
+            commit: "a".repeat(40),
+            tree_hash: "b".repeat(40),
+            base_commit: None,
+        };
+        request.siblings = vec![sibling("/home/main/commons"), sibling("/different/tools")];
+        let plan = fixed_paths(&config, &request).unwrap().unwrap();
+        let parent = plan.checkout.parent().unwrap();
+        assert_eq!(
+            plan.siblings,
+            [parent.join("commons"), parent.join("tools")]
+        );
+        request.siblings.push(sibling("/another/commons"));
+        assert_eq!(
+            fixed_paths(&config, &request),
+            Err("checkout and sibling basenames must be distinct")
+        );
+        request.siblings = vec![sibling("/another/repository")];
+        assert!(fixed_paths(&config, &request).is_err());
+    }
 
     #[test]
     fn identity_preserves_spelling_without_filesystem_access() {

@@ -19,6 +19,7 @@ const MARKER: &str = ".motor-build-dir-v1";
 const UNIDENTIFIED_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn prepare(config: &Config, request: &Run, target: &Path) {
+    let fixed = paths::fixed_paths(config, request).ok().flatten();
     let workspace = paths::run(request).workspace.checkout().caller;
     let roots: Vec<_> = std::iter::once(Path::new(workspace.text()))
         .chain(
@@ -26,6 +27,12 @@ pub(crate) fn prepare(config: &Config, request: &Run, target: &Path) {
                 .siblings
                 .iter()
                 .map(|s| Path::new(paths::sibling(s).caller.text())),
+        )
+        .chain(fixed.iter().map(|fixed| fixed.checkout.as_path()))
+        .chain(
+            fixed
+                .iter()
+                .flat_map(|fixed| fixed.siblings.iter().map(PathBuf::as_path)),
         )
         .collect();
     let result = maintain(target, &roots, SystemTime::now(), |path| {
@@ -271,3 +278,96 @@ fn dependency_path(bytes: &[u8]) -> Option<PathBuf> {
 #[cfg(test)]
 #[path = "cargo_build_dir_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod fixed_path_tests {
+    use super::*;
+
+    fn request() -> Run {
+        let job: crate::storage::Job = serde_json::from_str(include_str!(
+            "../test-fixtures/compatibility/job-record.json"
+        ))
+        .unwrap();
+        let mut request = job.request.unwrap();
+        request.repository_root = "/caller/main/repository".into();
+        request.workspace_key = "/caller/worktrees/job".into();
+        request.cwd = request.workspace_key.clone();
+        request.siblings = vec![motor_protocol::SiblingSnapshot {
+            canonical_path: "/caller/main/commons".into(),
+            commit: "a".repeat(40),
+            tree_hash: "b".repeat(40),
+            base_commit: None,
+        }];
+        request
+    }
+
+    fn folder(target: &Path, hash: &str, source: &Path) -> PathBuf {
+        let folder = target.join("bd/ab").join(hash);
+        let deps = folder.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        fs::write(
+            deps.join("crate.d"),
+            format!("out: {}/src/lib.rs\n", source.display()),
+        )
+        .unwrap();
+        folder
+    }
+
+    #[test]
+    fn prepare_keeps_fixed_checkout_and_sibling_dep_info() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cargo-fixed-roots");
+        let target = scratch.join("target");
+        let request = request();
+        let mut config = Config::new(scratch.join("state"), "fixed-roots");
+        config.boat_profile = true;
+        config.account_subject = Some("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+        config.fixed_path_repositories = vec![request.repository_root.clone()];
+        let fixed = paths::fixed_paths(&config, &request).unwrap().unwrap();
+        let checkout = folder(&target, "00000000000001", &fixed.checkout);
+        let sibling = folder(&target, "00000000000002", &fixed.siblings[0]);
+        let caller = folder(&target, "00000000000003", Path::new(&request.workspace_key));
+        let caller_sibling = folder(
+            &target,
+            "00000000000004",
+            Path::new(&request.siblings[0].canonical_path),
+        );
+        let foreign = folder(&target, "00000000000005", Path::new("/unrelated/repo"));
+        prepare(&config, &request, &target);
+        for kept in [checkout, sibling, caller, caller_sibling] {
+            assert!(kept.join("debug/deps/crate.d").is_file(), "{kept:?}");
+        }
+        assert!(!foreign.exists());
+    }
+
+    #[test]
+    fn disabled_and_colliding_jobs_use_only_legacy_prepare_roots() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cargo-legacy-roots");
+        let mut request = request();
+        let mut config = Config::new(scratch.join("state"), "fixed-roots");
+        config.boat_profile = true;
+        config.account_subject = Some("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+        config.fixed_path_repositories = vec!["*".into()];
+        let fixed = paths::fixed_paths(&config, &request).unwrap().unwrap();
+        for collision in [false, true] {
+            let target = scratch.join(format!("target-{collision}"));
+            if collision {
+                request.siblings[0].canonical_path = "/another/repository".into();
+                assert!(paths::fixed_paths(&config, &request).is_err());
+            } else {
+                config.fixed_path_repositories.clear();
+            }
+            let fixed = folder(&target, "00000000000001", &fixed.checkout);
+            let caller = folder(&target, "00000000000002", Path::new(&request.workspace_key));
+            let sibling = folder(
+                &target,
+                "00000000000003",
+                Path::new(&request.siblings[0].canonical_path),
+            );
+            prepare(&config, &request, &target);
+            assert!(!fixed.exists());
+            assert!(caller.exists());
+            assert!(sibling.exists());
+            config.fixed_path_repositories = vec!["*".into()];
+        }
+    }
+}

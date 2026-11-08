@@ -545,3 +545,193 @@ async fn isolated_deploy_reattaches_mapped_job_with_caller_returns() {
     let replay = serde_json::to_string(&runner.replay(request.job_id, 0).unwrap()).unwrap();
     assert!(!replay.contains(host_root.to_str().unwrap()), "{replay}");
 }
+
+fn fixed_config(f: &Fixture) -> Config {
+    let mut config = isolated_mapped_config(f);
+    config.account_subject = Some("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+    config.fixed_path_repositories = vec![format!("/home/{USER}/repository")];
+    config.slice_budget_probe = Some(Arc::new(|| {
+        Ok((crate::systemd::read_job_memory_budget()?.max, None))
+    }));
+    config
+}
+
+fn fixed_run(f: &Fixture, workspace: &str, command: &str) -> (Run, Vec<Vec<u8>>) {
+    let (mut request, bytes) = f.run(command);
+    let repository = format!("/home/{USER}/repository");
+    let sibling = format!("/home/{USER}/source/commons");
+    request.repository_root = repository.clone();
+    request.bundles[0].repository = repository;
+    request.workspace_key = workspace.into();
+    request.cwd = format!("{workspace}/subdir");
+    request.siblings[0].canonical_path = sibling.clone();
+    request.bundles[1].repository = sibling;
+    request.weight_hint = Some(1);
+    (request, bytes)
+}
+
+fn decoded_line(output: &str, key: &str) -> String {
+    String::from_utf8(STANDARD.decode(line(output, key)).unwrap()).unwrap()
+}
+
+async fn wait_fixed_ready(runner: &Runner, id: Uuid, host: &Path) {
+    let started = Instant::now();
+    while !host.join("target/ready").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "job never got ready"
+        );
+        let ended = runner.core.inner.lock().unwrap().jobs[&id].terminal.clone();
+        assert!(ended.is_none(), "{ended:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires root with CAP_LINUX_IMMUTABLE and a real motor-job system unit"]
+async fn isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.main.join("subdir")).unwrap();
+    fs::write(f.main.join("subdir/input"), "nested").unwrap();
+    commit(&f.main, "first\n");
+    let config = fixed_config(&f);
+    let h = host_root(&config);
+    let command = r#"
+set -eu
+encoded() { printf '%s=' "$1"; printf '%s' "$2" | base64 -w0; echo; }
+encoded pwd "$PWD"
+cd ..
+encoded toplevel "$(git rev-parse --show-toplevel)"
+encoded caller "$MOTOR_CALLER_WORKSPACE"
+encoded caller_toplevel "$(git -C "$MOTOR_CALLER_WORKSPACE" rev-parse --show-toplevel)"
+encoded sibling "$(git -C ../commons rev-parse --show-toplevel)"
+encoded caller_sibling "$(git -C "$MOTOR_CALLER_WORKSPACE/../commons" rev-parse --show-toplevel)"
+test "$(cat source)" = "$NEXTEST_EXPECTED_SOURCE"
+test "$(cat "$MOTOR_CALLER_WORKSPACE/source")" = "$NEXTEST_EXPECTED_SOURCE"
+printf '%s' "$NEXTEST_EXPECTED_SOURCE" > "target/only-$NEXTEST_EXPECTED_SOURCE"
+touch target/ready
+while [ ! -e target/release ]; do sleep 0.025; done
+test ! -e "target/only-$NEXTEST_OTHER_SOURCE"
+test "$(cat source)" = "$NEXTEST_EXPECTED_SOURCE"
+encoded final_source "$(cat source)"
+"#;
+    let first_workspace = format!("/home/{USER}/first");
+    let (mut first, first_bytes) = fixed_run(&f, &first_workspace, command);
+    first
+        .env
+        .insert("NEXTEST_EXPECTED_SOURCE".into(), "first".into());
+    first
+        .env
+        .insert("NEXTEST_OTHER_SOURCE".into(), "second".into());
+    commit(&f.main, "second\n");
+    let second_workspace = format!("/home/{USER}/other/second");
+    let (mut second, second_bytes) = fixed_run(&f, &second_workspace, command);
+    second
+        .env
+        .insert("NEXTEST_EXPECTED_SOURCE".into(), "second".into());
+    second
+        .env
+        .insert("NEXTEST_OTHER_SOURCE".into(), "first".into());
+    let fixed = crate::caller_path::fixed_paths(&config, &first)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::caller_path::fixed_paths(&config, &second).unwrap(),
+        Some(fixed.clone())
+    );
+    let runner = Runner::open(config).unwrap();
+    f.submit(&runner, &first, &first_bytes);
+    f.submit(&runner, &second, &second_bytes);
+    let first_host = h.join(format!("{USER}/first"));
+    let second_host = h.join(format!("{USER}/other/second"));
+    wait_fixed_ready(&runner, first.job_id, &first_host).await;
+    wait_fixed_ready(&runner, second.job_id, &second_host).await;
+    assert!(first_host.join("target/only-first").is_file());
+    assert!(second_host.join("target/only-second").is_file());
+    assert!(!first_host.join("target/only-second").exists());
+    assert!(!second_host.join("target/only-first").exists());
+    for host in [&first_host, &second_host] {
+        fs::write(host.join("target/release"), "release").unwrap();
+    }
+    for (request, source) in [(&first, "first"), (&second, "second")] {
+        let done = terminal(&runner, request.job_id).await;
+        assert_eq!(done.outcome, Outcome::Exit { code: 0 }, "{done:?}");
+        let output = stdout(&runner, request.job_id);
+        assert_eq!(
+            decoded_line(&output, "pwd"),
+            text(&fixed.checkout.join("subdir"))
+        );
+        assert_eq!(decoded_line(&output, "toplevel"), text(&fixed.checkout));
+        assert_eq!(decoded_line(&output, "caller"), request.workspace_key);
+        assert_eq!(
+            decoded_line(&output, "caller_toplevel"),
+            request.workspace_key
+        );
+        assert_eq!(decoded_line(&output, "sibling"), text(&fixed.siblings[0]));
+        let alias = Path::new(&request.workspace_key)
+            .parent()
+            .unwrap()
+            .join("commons");
+        assert_eq!(decoded_line(&output, "caller_sibling"), text(&alias));
+        assert_eq!(decoded_line(&output, "final_source"), source);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires root with CAP_LINUX_IMMUTABLE and a real motor-job system unit"]
+async fn isolated_fixed_paths_preserve_read_only_and_writable_overlays() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.main.join("subdir")).unwrap();
+    fs::write(f.main.join("subdir/input"), "nested").unwrap();
+    commit(&f.main, "first\n");
+    let config = fixed_config(&f);
+    let workspace = format!("/home/{USER}/overlay-worktree");
+    let command = r#"
+set -eu
+python3 - <<'PY'
+import errno, os, pathlib
+fixed = pathlib.Path.cwd().parent
+caller = pathlib.Path(os.environ['MOTOR_CALLER_WORKSPACE'])
+assert fixed != caller
+for root in (fixed, caller):
+    try:
+        with (root / '.git/config').open('a') as output:
+            output.write('forbidden')
+    except OSError as error:
+        assert error.errno == errno.EROFS, (root, error)
+    else:
+        raise AssertionError(f'{root}: read-only .git overlay was writable')
+    try:
+        (root / 'source').write_text('forbidden')
+    except OSError as error:
+        assert error.errno in (errno.EPERM, errno.EROFS), (root, error)
+    else:
+        raise AssertionError(f'{root}: sealed source was writable')
+(fixed / 'target/from-fixed').write_text('fixed output')
+assert (caller / 'target/from-fixed').read_text() == 'fixed output'
+(caller / 'target/from-caller').write_text('caller output')
+assert (fixed / 'target/from-caller').read_text() == 'caller output'
+for root in (fixed, caller):
+    (root / 'untracked').write_text(str(root))
+    assert (fixed / 'untracked').read_text() == (caller / 'untracked').read_text()
+assert (fixed / 'source').read_text() == 'first\n'
+assert (caller / 'source').read_text() == 'first\n'
+canonical_sibling = caller.parent / 'source/commons'
+for sibling in (canonical_sibling, caller.parent / 'commons', fixed.parent / 'commons'):
+    assert (sibling / 'source').read_text() == 'first\n'
+    try:
+        (sibling / 'forbidden').write_text('forbidden')
+    except OSError as error:
+        assert error.errno == errno.EROFS, (sibling, error)
+    else:
+        raise AssertionError(f'{sibling}: read-only sibling was writable')
+print('overlay-probes-passed')
+PY
+"#;
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = fixed_run(&f, &workspace, command);
+    f.submit(&runner, &request, &bytes);
+    let done = terminal(&runner, request.job_id).await;
+    assert_eq!(done.outcome, Outcome::Exit { code: 0 }, "{done:?}");
+    assert!(stdout(&runner, request.job_id).contains("overlay-probes-passed"));
+}
