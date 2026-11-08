@@ -466,6 +466,10 @@ fn configure_options(
             config.tenant_vm = true;
             continue;
         }
+        if arg == "--per-job" {
+            config.per_job = true;
+            continue;
+        }
         if arg == "--boat-profile" {
             config.boat_profile = true;
             config.disk_reserve_bytes = motor_runner::BOAT_DISK_RESERVE_BYTES;
@@ -596,6 +600,17 @@ mod fixed_path_options {
     use super::*;
 
     const SUBJECT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn per_job_option_requires_tenant_mode_and_keeps_isolation() {
+        assert!(parse(&["--per-job"], true).is_err());
+        assert!(parse(&["--per-job", "--tenant-vm", "--boat-profile"], true).is_err());
+        let config = parse(&["--per-job", "--tenant-vm"], true).unwrap();
+        assert!(config.per_job);
+        assert!(config.isolate_jobs);
+        assert!(!config.boat_profile);
+    }
 
     fn parse(args: &[&str], isolate_jobs: bool) -> io::Result<Config> {
         let mut config = Config::new("/state", "test");

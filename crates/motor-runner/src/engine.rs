@@ -95,6 +95,8 @@ pub struct Config {
     /// Accept host-authenticated tenant connections over vsock and limit each
     /// job unit to 4096 tasks, with no permission to open AF_VSOCK sockets.
     pub tenant_vm: bool,
+    /// A fresh job VM accepts one execution and one caller workspace for its lifetime.
+    pub per_job: bool,
     /// Exact caller repository roots selected for job checkouts at
     /// `/w/<account>/<repo-key>/<name>`; `*` selects all roots.
     pub fixed_path_repositories: Vec<String>,
@@ -499,6 +501,7 @@ impl Config {
             source_seals: Arc::default(),
             metrics: crate::metrics::Settings::default(),
             tenant_vm: false,
+            per_job: false,
             fixed_path_repositories: Vec::new(),
             account_subject: None,
             boat_profile: false,
@@ -661,6 +664,9 @@ impl Config {
 
     /// Validate serve options without opening the state directory or taking locks.
     pub fn check_options(&self) -> io::Result<()> {
+        if self.per_job && (!self.tenant_vm || self.boat_profile) {
+            return Err(io::Error::other("--per-job requires a tenant runner"));
+        }
         check_fixed_path_options(
             &self.fixed_path_repositories,
             self.account_subject.as_deref(),
@@ -1036,6 +1042,8 @@ impl QueueProgress {
 }
 
 struct Inner {
+    per_job_workspace: Option<String>,
+    per_job_id: Option<Uuid>,
     #[cfg(target_os = "linux")]
     source_seals: Arc<crate::source_seal::Runtime>,
     /// Reserve-file allocation claims the idle interval, then releases the state
@@ -2764,6 +2772,12 @@ impl Runner {
                 trees,
                 snapshots: crate::sibling_snapshots::store::SnapshotStore::default(),
                 inner: crate::state_lock::StateLock::new(Inner {
+                    per_job_workspace: jobs.values().find_map(|job| {
+                        job.request.as_ref().map(|request| {
+                            paths::request(request).caller_workspace_key.text().clone()
+                        })
+                    }),
+                    per_job_id: jobs.keys().next().copied(),
                     #[cfg(target_os = "linux")]
                     source_seals,
                     restoring_reserve: false,
@@ -3954,6 +3968,12 @@ impl Runner {
             {
                 return Ok(Admission::Duplicate);
             }
+            if self.core.config.per_job {
+                inner.per_job_workspace.get_or_insert_with(|| {
+                    paths::request(&request).caller_workspace_key.text().clone()
+                });
+                inner.per_job_id.get_or_insert(request.job_id);
+            }
             let refusal = self
                 .qualification_refusal(qualification)
                 .or_else(|| self.run_refusal(&inner, &request, &Default::default()));
@@ -4192,6 +4212,16 @@ impl Runner {
         request: &Run,
         access: &crate::workspace_access::Repairs,
     ) -> Option<(RefusalReason, String)> {
+        if self.core.config.per_job
+            && (inner.per_job_id != Some(request.job_id)
+                || inner.per_job_workspace.as_ref()
+                    != Some(paths::request(request).caller_workspace_key.text()))
+        {
+            return Some((
+                RefusalReason::RequestRejected,
+                "job VM accepts only one execution and workspace".into(),
+            ));
+        }
         #[cfg(windows)]
         if self.core.config.windows_instance() {
             if let Some(refusal) = crate::windows::guest_agent_refusal(
@@ -4857,6 +4887,7 @@ impl Runner {
     }
     pub(crate) fn fetch_prepare(&self, request: &Prepare, directory: &Path) -> io::Result<()> {
         self.allow_prepare()?;
+        self.claim_prepare_workspace(paths::request(request).caller_workspace_key.text())?;
         self.validate_request_writer_paths(paths::request(request), None, &request.siblings)?;
         self.core
             .trees
@@ -4946,6 +4977,7 @@ impl Runner {
     /// of prepares cannot hold up transfers and job starts.
     pub(crate) fn prepare(&self, r: &Prepare, default_branch_tip: bool) -> io::Result<()> {
         self.allow_prepare()?;
+        self.claim_prepare_workspace(paths::request(r).caller_workspace_key.text())?;
         let authorized = if self.core.config.caller_roots.is_empty() {
             workspace::validate_request(
                 paths::request(r),
@@ -5167,6 +5199,19 @@ impl Runner {
         drop(inner);
         self.write_catalog(catalog)
     }
+    fn claim_prepare_workspace(&self, key: &str) -> io::Result<()> {
+        if self.core.config.per_job {
+            let mut inner = self.core.inner.lock().unwrap();
+            if inner
+                .per_job_workspace
+                .get_or_insert_with(|| key.to_owned())
+                != key
+            {
+                return Err(io::Error::other("job VM accepts only one workspace"));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn allow_prepare(&self) -> io::Result<()> {
         self.ensure_admission_ownership()?;
         if self.core.config.windows_instance() {
@@ -5203,6 +5248,9 @@ impl Runner {
     /// Whether warm builds may be queued for `tip` at all, from configuration
     /// alone; `queue_base_planned` also checks for a drain under the lock.
     fn warm_builds_enabled(&self, tip: &str) -> bool {
+        if self.core.config.per_job {
+            return false;
+        }
         #[cfg(test)]
         if self.core.config.disable_warm_builds {
             return false;
