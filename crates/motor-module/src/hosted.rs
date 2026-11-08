@@ -49,8 +49,11 @@ pub struct HostedJobState {
     pub billed_vcpu_ms: Option<u64>,
     pub billing: BillingStatus,
     pub terminal: Option<TerminalRecord>,
-    /// Unknown summaries from older clients may already have an observation
-    /// timestamp. Only a terminal read in this process proves their provenance.
+    /// Set when this process read an OutcomeUnknown terminal from the host or
+    /// a status reply. The stored observation timestamp can't show that: older
+    /// clients also stamp it on unknown summaries they made up themselves.
+    /// Not persisted, so after a restart an unknown terminal counts as unproven
+    /// until it is read again.
     #[serde(skip)]
     pub(crate) observed_unknown_terminal: bool,
     #[serde(default)]

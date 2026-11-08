@@ -141,9 +141,12 @@ impl Owner {
     pub(super) fn take_rewind(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         let cursor = state.rewind.take()?;
-        // The source records this watermark before enqueueing sequenced records.
-        // FIFO publication can therefore discard every old-generation record,
-        // including records still buffered by progress forwarding.
+        // The follower counts each sequenced record into `ingress_records`
+        // before queueing it for publication, and `publish` counts them again
+        // in the same order. So a record that reaches `publish` with a number at
+        // or below this count was read from the transport being replaced while
+        // still queued, and `publish` drops it instead of advancing cursors
+        // past the replay.
         state.discard_through = state.ingress_records;
         state.replaying = true;
         state.ring.clear();
