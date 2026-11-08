@@ -113,6 +113,9 @@ fn agent_result(result: io::Result<Value>) -> Value {
 }
 
 async fn dispatch_value(value: Value, attach: &tokio::sync::Mutex<()>) -> io::Result<Value> {
+    if value["op"] == "job_status" {
+        return forward(job_status_request(value)?).await;
+    }
     if value == json!({"op":"remote_cache_probe"}) {
         return Ok(json!({"ok":true,"remote_cache_provisioning":1}));
     }
@@ -129,6 +132,22 @@ async fn dispatch_value(value: Value, attach: &tokio::sync::Mutex<()>) -> io::Re
         return resize::apply(args).await;
     }
     dispatch(serde_json::from_value(value)?, attach).await
+}
+
+fn job_status_request(value: Value) -> io::Result<Frame> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        op: String,
+        job_id: uuid::Uuid,
+    }
+    let request: Request = serde_json::from_value(value)?;
+    if request.op != "job_status" {
+        return Err(io::Error::other("invalid job status operation"));
+    }
+    Ok(Frame::JobStatus {
+        job_id: request.job_id,
+    })
 }
 
 async fn dispatch(
@@ -293,6 +312,7 @@ async fn forward_socket(
                 | (Frame::DrainIfIdle, Frame::DrainIfIdleReply { .. })
                 | (Frame::Resume, Frame::ResumeReply { .. })
                 | (Frame::Status, Frame::StatusReply(_))
+                | (Frame::JobStatus { .. }, Frame::JobStatusReply(_))
         );
         if !expected {
             return Err(io::Error::other("unexpected runner agent reply"));
@@ -1401,6 +1421,10 @@ mod tests {
                 Frame::CancelReply(CancelReply::new(id)),
             ),
             (Frame::Status, Frame::StatusReply(status)),
+            (
+                job_status_request(json!({"op":"job_status", "job_id":id})).unwrap(),
+                Frame::JobStatusReply(runner.job_status(id).unwrap()),
+            ),
         ];
         for (request, reply) in exchanges {
             let expected = request.clone();
@@ -1434,6 +1458,23 @@ mod tests {
                 task
             );
             assert_eq!(result.unwrap()["ok"], true);
+        }
+    }
+
+    #[test]
+    fn job_status_request_is_read_only_and_requires_one_valid_job_id() {
+        let id = uuid::Uuid::now_v7();
+        assert_eq!(
+            job_status_request(json!({"op":"job_status","job_id":id})).unwrap(),
+            Frame::JobStatus { job_id: id }
+        );
+        for request in [
+            json!({"op":"job_status"}),
+            json!({"op":"job_status","job_id":"not-a-uuid"}),
+            json!({"op":"job_status","job_id":id,"path":"/tenant"}),
+            json!({"op":"cancel","job_id":id}),
+        ] {
+            assert!(job_status_request(request).is_err());
         }
     }
 

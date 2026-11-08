@@ -223,6 +223,7 @@ pub struct Host {
     advert: BTreeMap<String, advertise::TenantAdvert>,
     pub(crate) broker_draining: bool,
     pub(crate) broker_heartbeat_at_ms: Option<u64>,
+    pub(crate) lost_checks: BTreeMap<String, crate::billing::LostCheck>,
 }
 impl Host {
     pub fn new(
@@ -248,6 +249,7 @@ impl Host {
             advert: BTreeMap::new(),
             broker_draining: false,
             broker_heartbeat_at_ms: None,
+            lost_checks: BTreeMap::new(),
         }
     }
     /// Replaces the journal, so tests can make writes fail the way a full

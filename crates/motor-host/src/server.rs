@@ -870,6 +870,30 @@ impl Runtime {
                 failure.get_or_insert(error);
             }
         }
+        let checks = self.host.lock().expect("host lock").lost_checks_due();
+        for (tenant, job) in checks {
+            let runtime = self.clone();
+            std::thread::spawn(move || {
+                // Read-only inspection uses the existing guest agent channel without
+                // holding admission or tenant-operation locks while the guest replies.
+                let reply = runtime
+                    .control
+                    .admin(&tenant, &json!({"op":"job_status", "job_id":job}));
+                let reply = match reply {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        tracing::warn!(job_id = job, tenant, detail = %error,
+                            "lost_guest_check_failed");
+                        Value::Null
+                    }
+                };
+                runtime
+                    .host
+                    .lock()
+                    .expect("host lock")
+                    .lost_check_reply(&job, reply);
+            });
+        }
         let stops = self.host.lock().expect("host lock").stops_due();
         for tenant in stops {
             let operations = self.tenant_operations(&tenant)?;
