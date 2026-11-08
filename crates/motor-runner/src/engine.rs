@@ -1758,6 +1758,7 @@ struct JobLog {
     cancels_waiting: Mutex<usize>,
     cancels_admitted: std::sync::Condvar,
     retention: Mutex<ReplayRetention>,
+    output_streams: Mutex<[crate::output_rewrite::Stream; 2]>,
 }
 
 #[derive(Default)]
@@ -8522,6 +8523,10 @@ impl Runner {
         // opens: a job with this field mounts no sibling host path, so no
         // sibling fence applies to it, even after a restart.
         job.sibling_sources = sibling_sources;
+        #[cfg(target_os = "linux")]
+        {
+            job.output_rewrites = crate::output_rewrite::for_job(&self.core.config, &r);
+        }
         let started_ms = self.now();
         job.started_ms = Some(started_ms);
         #[cfg(unix)]
@@ -8652,38 +8657,7 @@ impl Runner {
         let runner = self.clone();
         std::thread::spawn(move || {
             let reader = |mut file: Box<dyn Read + Send>, stream: OutputStream, runner: Runner| {
-                std::thread::spawn(move || {
-                    let mut buffer = [0; 16384];
-                    let mut persistence_error = None;
-                    let mut dropped_bytes = 0u64;
-                    loop {
-                        match file.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if persistence_error.is_none() {
-                                    if let Err(error) =
-                                        runner.output(id, stream.clone(), &buffer[..n])
-                                    {
-                                        persistence_error = Some(error);
-                                    }
-                                }
-                                // Keep the pipe flowing after storage fails; the
-                                // execution still owns another read descriptor.
-                                if persistence_error.is_some() {
-                                    dropped_bytes += n as u64;
-                                }
-                            }
-                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    if let Some(error) = persistence_error {
-                        tracing::error!(job_id = %id, %error, dropped_bytes, "output persistence failed; pipe drained");
-                        Err(error)
-                    } else {
-                        Ok(())
-                    }
-                })
+                std::thread::spawn(move || runner.read_output(id, stream, &mut file))
             };
             let a = reader(stdout, OutputStream::Stdout, runner.clone());
             let b = reader(stderr, OutputStream::Stderr, runner.clone());
@@ -8855,6 +8829,36 @@ impl Runner {
     fn output(&self, id: Uuid, stream: OutputStream, bytes: &[u8]) -> io::Result<()> {
         self.output_at(id, stream, bytes, None)
     }
+    fn read_output(&self, id: Uuid, stream: OutputStream, mut file: impl Read) -> io::Result<()> {
+        let mut buffer = [0; 16384];
+        let mut persistence_error = None;
+        let mut dropped_bytes = 0u64;
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if persistence_error.is_none() {
+                        if let Err(error) = self.output(id, stream.clone(), &buffer[..n]) {
+                            persistence_error = Some(error);
+                        }
+                    }
+                    // Keep the pipe flowing after storage fails; the execution
+                    // still owns another read descriptor.
+                    if persistence_error.is_some() {
+                        dropped_bytes += n as u64;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(error) = persistence_error {
+            tracing::error!(job_id = %id, %error, dropped_bytes, "output persistence failed; pipe drained");
+            Err(error)
+        } else {
+            self.end_output(id, stream, None)
+        }
+    }
     fn monitor_unit(&self, id: Uuid) {
         if let Err(error) = self.follow_unit(id) {
             tracing::error!(%id, %error, "durable job monitoring failed");
@@ -8919,6 +8923,7 @@ impl Runner {
     }
     fn follow_unit(&self, id: Uuid) -> io::Result<()> {
         self.start_working_memory(id);
+        self.reset_output_cursors(id);
         use std::io::{Seek, SeekFrom};
         let (process, durable) = {
             let inner = self.core.inner.lock().unwrap();
@@ -8987,15 +8992,7 @@ impl Runner {
                     ("stdout", OutputStream::Stdout),
                     ("stderr", OutputStream::Stderr),
                 ] {
-                    let offset = {
-                        let inner = self.core.inner.lock().unwrap();
-                        let job = &inner.jobs[&id];
-                        if stream == OutputStream::Stdout {
-                            job.stdout_offset
-                        } else {
-                            job.stderr_offset
-                        }
-                    };
+                    let offset = self.output_cursor(id, &stream);
                     let read = || -> io::Result<Vec<u8>> {
                         let mut file = crate::filesystem::read_nofollow(&directory.join(name))?;
                         file.seek(SeekFrom::Start(offset))?;
@@ -9017,6 +9014,9 @@ impl Runner {
                         Err(error) => {
                             output_unavailable = true;
                             tracing::warn!(%id, %error, "ended unit output unavailable; recovering exit status");
+                        }
+                        Ok(_) if !alive => {
+                            self.end_output(id, stream, Some(offset))?;
                         }
                         _ => {}
                     }
@@ -9316,6 +9316,26 @@ impl Runner {
         let _write = log.write_for_output();
         self.output_at_locked(id, stream, bytes, offset, &log, &_write)
     }
+    fn end_output(&self, id: Uuid, stream: OutputStream, offset: Option<u64>) -> io::Result<()> {
+        let log = self.job_log(id);
+        let _write = log.write_for_output();
+        self.output_pages_locked(id, stream, &[], offset, true, &log)
+    }
+    fn output_stream_index(stream: &OutputStream) -> usize {
+        usize::from(*stream == OutputStream::Stderr)
+    }
+    fn output_cursor(&self, id: Uuid, stream: &OutputStream) -> u64 {
+        self.job_log(id).output_streams.lock().unwrap()[Self::output_stream_index(stream)].cursor
+    }
+    fn reset_output_cursors(&self, id: Uuid) {
+        let log = self.job_log(id);
+        let _write = log.write_for_output();
+        let mut streams = log.output_streams.lock().unwrap();
+        let inner = self.core.inner.lock().unwrap();
+        let job = &inner.jobs[&id];
+        streams[0].reset(job.stdout_offset);
+        streams[1].reset(job.stderr_offset);
+    }
     // Launch already holds the log lock while recording Started and opening the
     // execution gate. Reuse that lock when recording output before command start.
     fn output_at_locked(
@@ -9327,57 +9347,96 @@ impl Runner {
         log: &JobLog,
         _write: &std::sync::MutexGuard<'_, ()>,
     ) -> io::Result<()> {
+        self.output_pages_locked(id, stream, bytes, offset, false, log)
+    }
+    /// The caller holds the job's write lock through rewriting and all page commits.
+    fn output_pages_locked(
+        &self,
+        id: Uuid,
+        stream: OutputStream,
+        bytes: &[u8],
+        offset: Option<u64>,
+        eof: bool,
+        log: &JobLog,
+    ) -> io::Result<()> {
         let directory = self.record_path(id).parent().unwrap().to_owned();
-        let mut consumed = 0usize;
-        for bytes_part in bytes.chunks(REPLAY_PAGE_BYTES as usize) {
-            let mut job = self
-                .core
-                .inner
-                .lock()
-                .unwrap()
-                .jobs
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "output job expired"))?;
-            let path = directory.join(format!("chunk-{}", job.next_seq));
-            #[cfg(test)]
-            if let Some(write) = &self.core.config.before_job_write {
-                write(&path)?;
-            }
-            let mut file = File::create(&path)?;
-            file.write_all(bytes_part)?;
-            file.sync_all()?;
-            job.chunks.push_back(Chunk {
-                seq: job.next_seq,
-                stream: stream.clone(),
-                length: bytes_part.len() as u64,
-            });
-            job.next_seq += 1;
-            job.output_bytes += bytes_part.len() as u64;
-            consumed += bytes_part.len();
-            if let Some(end) = offset {
-                let committed_offset = end.saturating_sub((bytes.len() - consumed) as u64);
-                if stream == OutputStream::Stdout {
-                    job.stdout_offset = committed_offset;
-                } else {
-                    job.stderr_offset = committed_offset;
-                }
-            }
-            let mut retired = Vec::new();
-            while job.output_bytes > REPLAY_BYTES {
-                let chunk = job.chunks.pop_front().unwrap();
-                job.output_bytes -= chunk.length;
-                retired.push(directory.join(format!("chunk-{}", chunk.seq)));
-            }
-            // The index is the commit boundary for both replay sequences and
-            // durable stream offsets. A failed index save leaves an unreferenced
-            // tail, never a visible cursor pointing at uncommitted data.
-            self.save(&job)?;
-            let previous = self.core.inner.lock().unwrap().jobs.insert(id, job);
-            drop(previous);
-            log.retire(retired);
+        let rewrites = self
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "output job expired"))?
+            .output_rewrites
+            .clone();
+        let mut streams = log.output_streams.lock().unwrap();
+        let matcher = &mut streams[Self::output_stream_index(&stream)];
+        let mut source_offset =
+            offset.map(|end| end - (matcher.pending_len() + bytes.len()) as u64);
+        if let Some(end) = offset {
+            matcher.cursor = end;
         }
-        Ok(())
+        let pages = matcher.push(&rewrites, bytes, eof, REPLAY_PAGE_BYTES as usize);
+        let result = (|| {
+            for page in pages {
+                let mut job = self
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .jobs
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "output job expired"))?;
+                let path = directory.join(format!("chunk-{}", job.next_seq));
+                #[cfg(test)]
+                if let Some(write) = &self.core.config.before_job_write {
+                    write(&path)?;
+                }
+                let mut file = File::create(&path)?;
+                file.write_all(&page.bytes)?;
+                file.sync_all()?;
+                job.chunks.push_back(Chunk {
+                    seq: job.next_seq,
+                    stream: stream.clone(),
+                    length: page.bytes.len() as u64,
+                });
+                job.next_seq += 1;
+                job.output_bytes += page.bytes.len() as u64;
+                if let Some(committed_offset) = source_offset.as_mut() {
+                    *committed_offset += page.source_len;
+                    if stream == OutputStream::Stdout {
+                        job.stdout_offset = *committed_offset;
+                    } else {
+                        job.stderr_offset = *committed_offset;
+                    }
+                }
+                let mut retired = Vec::new();
+                while job.output_bytes > REPLAY_BYTES {
+                    let chunk = job.chunks.pop_front().unwrap();
+                    job.output_bytes -= chunk.length;
+                    retired.push(directory.join(format!("chunk-{}", chunk.seq)));
+                }
+                // The index is the commit boundary for both replay sequences and
+                // durable stream offsets. A failed index save leaves an unreferenced
+                // tail, never a visible cursor pointing at uncommitted data.
+                self.save(&job)?;
+                let previous = self.core.inner.lock().unwrap().jobs.insert(id, job);
+                drop(previous);
+                log.retire(retired);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // An expanded read can commit several pages before a later save
+            // fails. Reread only the source suffix not covered by those commits.
+            let inner = self.core.inner.lock().unwrap();
+            let job = &inner.jobs[&id];
+            streams[0].reset(job.stdout_offset);
+            streams[1].reset(job.stderr_offset);
+        }
+        result
     }
     fn retry_start_refusals(&self, inner: &mut Inner) {
         inner.pending_start_refusals.retain(|id| {

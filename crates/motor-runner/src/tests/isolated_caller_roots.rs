@@ -570,10 +570,6 @@ fn fixed_run(f: &Fixture, workspace: &str, command: &str) -> (Run, Vec<Vec<u8>>)
     (request, bytes)
 }
 
-fn decoded_line(output: &str, key: &str) -> String {
-    String::from_utf8(STANDARD.decode(line(output, key)).unwrap()).unwrap()
-}
-
 async fn wait_fixed_ready(runner: &Runner, id: Uuid, host: &Path) {
     let started = Instant::now();
     while !host.join("target/ready").exists() {
@@ -598,14 +594,16 @@ async fn isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts() {
     let h = host_root(&config);
     let command = r#"
 set -eu
-encoded() { printf '%s=' "$1"; printf '%s' "$2" | base64 -w0; echo; }
-encoded pwd "$PWD"
+observations="$PWD/../target/fixed-paths"
+: > "$observations"
+observed() { printf '%s=%s\n' "$1" "$2" | tee -a "$observations"; }
+observed pwd "$PWD"
 cd ..
-encoded toplevel "$(git rev-parse --show-toplevel)"
-encoded caller "$MOTOR_CALLER_WORKSPACE"
-encoded caller_toplevel "$(git -C "$MOTOR_CALLER_WORKSPACE" rev-parse --show-toplevel)"
-encoded sibling "$(git -C ../commons rev-parse --show-toplevel)"
-encoded caller_sibling "$(git -C "$MOTOR_CALLER_WORKSPACE/../commons" rev-parse --show-toplevel)"
+observed toplevel "$(git rev-parse --show-toplevel)"
+observed caller "$MOTOR_CALLER_WORKSPACE"
+observed caller_toplevel "$(git -C "$MOTOR_CALLER_WORKSPACE" rev-parse --show-toplevel)"
+observed sibling "$(git -C ../commons rev-parse --show-toplevel)"
+observed caller_sibling "$(git -C "$MOTOR_CALLER_WORKSPACE/../commons" rev-parse --show-toplevel)"
 test "$(cat source)" = "$NEXTEST_EXPECTED_SOURCE"
 test "$(cat "$MOTOR_CALLER_WORKSPACE/source")" = "$NEXTEST_EXPECTED_SOURCE"
 printf '%s' "$NEXTEST_EXPECTED_SOURCE" > "target/only-$NEXTEST_EXPECTED_SOURCE"
@@ -613,7 +611,7 @@ touch target/ready
 while [ ! -e target/release ]; do sleep 0.025; done
 test ! -e "target/only-$NEXTEST_OTHER_SOURCE"
 test "$(cat source)" = "$NEXTEST_EXPECTED_SOURCE"
-encoded final_source "$(cat source)"
+observed final_source "$(cat source)"
 "#;
     let first_workspace = format!("/home/{USER}/first");
     let (mut first, first_bytes) = fixed_run(&f, &first_workspace, command);
@@ -653,27 +651,42 @@ encoded final_source "$(cat source)"
     for host in [&first_host, &second_host] {
         fs::write(host.join("target/release"), "release").unwrap();
     }
-    for (request, source) in [(&first, "first"), (&second, "second")] {
+    for (request, source, host) in [
+        (&first, "first", &first_host),
+        (&second, "second", &second_host),
+    ] {
         let done = terminal(&runner, request.job_id).await;
         assert_eq!(done.outcome, Outcome::Exit { code: 0 }, "{done:?}");
         let output = stdout(&runner, request.job_id);
+        let observations = fs::read_to_string(host.join("target/fixed-paths")).unwrap();
+        // Artifacts retain the namespace paths; streamed diagnostics use caller paths.
         assert_eq!(
-            decoded_line(&output, "pwd"),
+            line(&observations, "pwd"),
             text(&fixed.checkout.join("subdir"))
         );
-        assert_eq!(decoded_line(&output, "toplevel"), text(&fixed.checkout));
-        assert_eq!(decoded_line(&output, "caller"), request.workspace_key);
+        assert_eq!(line(&observations, "toplevel"), text(&fixed.checkout));
+        assert_eq!(line(&observations, "caller"), request.workspace_key);
         assert_eq!(
-            decoded_line(&output, "caller_toplevel"),
+            line(&observations, "caller_toplevel"),
             request.workspace_key
         );
-        assert_eq!(decoded_line(&output, "sibling"), text(&fixed.siblings[0]));
+        assert_eq!(line(&observations, "sibling"), text(&fixed.siblings[0]));
         let alias = Path::new(&request.workspace_key)
             .parent()
             .unwrap()
             .join("commons");
-        assert_eq!(decoded_line(&output, "caller_sibling"), text(&alias));
-        assert_eq!(decoded_line(&output, "final_source"), source);
+        assert_eq!(line(&observations, "caller_sibling"), text(&alias));
+        assert_eq!(line(&observations, "final_source"), source);
+        assert_eq!(
+            line(&output, "pwd"),
+            format!("{}/subdir", request.workspace_key)
+        );
+        assert_eq!(line(&output, "toplevel"), request.workspace_key);
+        assert_eq!(line(&output, "caller"), request.workspace_key);
+        assert_eq!(line(&output, "caller_toplevel"), request.workspace_key);
+        assert_eq!(line(&output, "sibling"), request.siblings[0].canonical_path);
+        assert_eq!(line(&output, "caller_sibling"), text(&alias));
+        assert_eq!(line(&output, "final_source"), source);
     }
 }
 
@@ -685,11 +698,12 @@ async fn isolated_fixed_paths_preserve_read_only_and_writable_overlays() {
     fs::write(f.main.join("subdir/input"), "nested").unwrap();
     commit(&f.main, "first\n");
     let config = fixed_config(&f);
+    let h = host_root(&config);
     let workspace = format!("/home/{USER}/overlay-worktree");
     let command = r#"
 set -eu
 python3 - <<'PY'
-import errno, os, pathlib
+import errno, json, os, pathlib
 fixed = pathlib.Path.cwd().parent
 caller = pathlib.Path(os.environ['MOTOR_CALLER_WORKSPACE'])
 assert fixed != caller
@@ -725,13 +739,31 @@ for sibling in (canonical_sibling, caller.parent / 'commons', fixed.parent / 'co
         assert error.errno == errno.EROFS, (sibling, error)
     else:
         raise AssertionError(f'{sibling}: read-only sibling was writable')
+observations = dict(pwd=str(pathlib.Path.cwd()), fixed=str(fixed), caller=str(caller), sibling=str(fixed.parent / 'commons'))
+(fixed / 'target/fixed-paths.json').write_text(json.dumps(observations))
+for key, value in observations.items():
+    print(f'{key}={value}')
 print('overlay-probes-passed')
 PY
 "#;
     let runner = Runner::open(config).unwrap();
     let (request, bytes) = fixed_run(&f, &workspace, command);
+    let fixed = crate::caller_path::fixed_paths(runner.config(), &request)
+        .unwrap()
+        .unwrap();
     f.submit(&runner, &request, &bytes);
     let done = terminal(&runner, request.job_id).await;
     assert_eq!(done.outcome, Outcome::Exit { code: 0 }, "{done:?}");
-    assert!(stdout(&runner, request.job_id).contains("overlay-probes-passed"));
+    let output = stdout(&runner, request.job_id);
+    assert!(output.contains("overlay-probes-passed"));
+    let observations: serde_json::Value =
+        read_json(&h.join(format!("{USER}/overlay-worktree/target/fixed-paths.json"))).unwrap();
+    assert_eq!(observations["pwd"], text(&fixed.checkout.join("subdir")));
+    assert_eq!(observations["fixed"], text(&fixed.checkout));
+    assert_eq!(observations["caller"], workspace);
+    assert_eq!(observations["sibling"], text(&fixed.siblings[0]));
+    assert_eq!(line(&output, "pwd"), format!("{workspace}/subdir"));
+    assert_eq!(line(&output, "fixed"), workspace);
+    assert_eq!(line(&output, "caller"), workspace);
+    assert_eq!(line(&output, "sibling"), request.siblings[0].canonical_path);
 }

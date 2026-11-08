@@ -1929,6 +1929,306 @@ fn output_splits_large_appends_at_page_boundaries_with_committed_offsets() {
         .all(|chunk| chunk.length <= 1024 * 1024));
 }
 
+fn rewrite_rules() -> Vec<crate::output_rewrite::Rewrite> {
+    vec![
+        crate::output_rewrite::Rewrite {
+            fixed: "/w/repo".into(),
+            caller: "/caller/workspace".into(),
+        },
+        crate::output_rewrite::Rewrite {
+            fixed: "/w/repo/sibling".into(),
+            caller: "/s".into(),
+        },
+    ]
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rewrite_launch_map_pairs_checkout_and_siblings_and_omits_fallback() {
+    let f = Fixture::new();
+    let (mut request, _) = f.run("true");
+    let mut config = f.config();
+    assert!(crate::output_rewrite::for_job(&config, &request).is_empty());
+    config.fixed_path_repositories = vec![f.root.clone()];
+    config.account_subject = Some("acct:0123456789ABCDEFGHJKMNPQRS".into());
+    let map = crate::output_rewrite::for_job(&config, &request);
+    assert_eq!(map.len(), 2);
+    assert_eq!(map[0].caller, f.key);
+    assert!(map[0]
+        .fixed
+        .starts_with("/w/acct-0123456789ABCDEFGHJKMNPQRS/"));
+    assert!(map[0].fixed.ends_with("/main"));
+    assert_eq!(map[1].caller, f.canonical);
+    assert!(map[1].fixed.ends_with("/commons"));
+    request.siblings[0].canonical_path = "/other/main".into();
+    assert!(crate::output_rewrite::for_job(&config, &request).is_empty());
+}
+
+fn set_rewrite_rules(runner: &Runner, id: Uuid, rules: Vec<crate::output_rewrite::Rewrite>) {
+    let mut inner = runner.core.inner.lock().unwrap();
+    let job = inner.jobs.get_mut(&id).unwrap();
+    job.output_rewrites = rules;
+    runner.save(job).unwrap();
+}
+
+fn rewritten_replay(runner: &Runner, id: Uuid) -> (Vec<u8>, Vec<u8>) {
+    let mut streams = [Vec::new(), Vec::new()];
+    let mut seq = 0;
+    loop {
+        let frames = runner.replay(id, seq).unwrap();
+        assert!(!frames.is_empty());
+        for frame in frames {
+            match frame {
+                Frame::Output(output) => {
+                    assert_eq!(output.seq, seq);
+                    assert!(output.bytes.0.len() <= REPLAY_PAGE_BYTES as usize);
+                    streams[Runner::output_stream_index(&output.stream)].extend(output.bytes.0);
+                    seq += 1;
+                }
+                Frame::Terminal(terminal) => {
+                    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+                    let job: Job = read_json(&runner.record_path(id)).unwrap();
+                    assert_eq!(job.next_seq, seq);
+                    assert_eq!(
+                        job.output_bytes,
+                        streams.iter().map(|s| s.len() as u64).sum::<u64>()
+                    );
+                    return (
+                        std::mem::take(&mut streams[0]),
+                        std::mem::take(&mut streams[1]),
+                    );
+                }
+                _ => panic!("unexpected replay frame"),
+            }
+        }
+    }
+}
+
+#[test]
+fn rewrite_pipe_eof_and_reattach_preserve_bytes_sequences_and_map() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config.clone()).unwrap();
+    let id = synthetic_running(&f, &runner);
+    set_rewrite_rules(&runner, id, rewrite_rules());
+    let mut stdout = vec![b'x'; 16384 - 4];
+    stdout.extend_from_slice(b"/w/repo/sibling \0\xff /w/repo:12 /w/repo");
+    let mut expected = vec![b'x'; 16384 - 4];
+    expected.extend_from_slice(b"/s \0\xff /caller/workspace:12 /caller/workspace");
+    // The reader is the same one the launcher joins before recording a terminal.
+    runner
+        .read_output(id, OutputStream::Stdout, io::Cursor::new(stdout))
+        .unwrap();
+    runner
+        .read_output(
+            id,
+            OutputStream::Stderr,
+            io::Cursor::new(b"/w/repo/sibling /w/rep"),
+        )
+        .unwrap();
+    runner
+        .finish(id, Ok(std::process::ExitStatus::from_raw(0)))
+        .unwrap();
+    let live = rewritten_replay(&runner, id);
+    assert_eq!(live, (expected, b"/s /w/rep".to_vec()));
+    drop(runner);
+    let runner = reopen(config);
+    assert_eq!(rewritten_replay(&runner, id), live);
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(job.output_rewrites, rewrite_rules());
+    // An empty fixed_path_repositories option on reopen must not change the recorded map.
+    runner
+        .output(id, OutputStream::Stdout, b" /w/repo")
+        .unwrap();
+    runner.end_output(id, OutputStream::Stdout, None).unwrap();
+    assert!(rewritten_replay(&runner, id)
+        .0
+        .ends_with(b" /caller/workspace"));
+}
+
+#[test]
+fn rewrite_durable_two_monitor_restarts_preserve_source_offsets() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let phase = Arc::new(AtomicU64::new(0));
+    let saves = Arc::new(AtomicU64::new(0));
+    let alive = Arc::new(AtomicBool::new(true));
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.systemd_command = Some({
+        let alive = alive.clone();
+        Arc::new(move |_| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: if alive.load(Ordering::SeqCst) {
+                    b"ActiveState=active\nSubState=running\n".to_vec()
+                } else {
+                    b"ActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=1\nExecMainStatus=0\n".to_vec()
+                },
+                stderr: Vec::new(),
+            })
+        })
+    });
+    config.before_job_write = Some({
+        let (phase, saves) = (phase.clone(), saves.clone());
+        Arc::new(move |path| {
+            if phase.load(Ordering::SeqCst) != 0
+                && path.file_name().unwrap() == "record.json"
+                && saves.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                return Err(io::Error::other("injected second-page index failure"));
+            }
+            Ok(())
+        })
+    });
+    let runner = Runner::open(config).unwrap();
+    let id = running_record(&f, &runner);
+    let expanded = format!("/caller/{}/w/x", "z".repeat(2048));
+    let mut rules = rewrite_rules();
+    rules.push(crate::output_rewrite::Rewrite {
+        fixed: "/w/x".into(),
+        caller: expanded.clone(),
+    });
+    set_rewrite_rules(&runner, id, rules);
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&id).unwrap();
+        job.process = Some(platform::ProcessIdentity {
+            pid: 0,
+            start: 0,
+            unit: Some(Uuid::now_v7()),
+        });
+        runner.save(job).unwrap();
+    }
+    let directory = runner
+        .core
+        .trees
+        .state
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    let mut stdout = vec![b'a'; 16384 - 4];
+    stdout.extend_from_slice(b"/w/r");
+    fs::write(directory.join("stdout"), &stdout).unwrap();
+    fs::write(directory.join("stderr"), b"err /w/rep").unwrap();
+    phase.store(1, Ordering::SeqCst);
+    assert!(runner
+        .follow_unit(id)
+        .unwrap_err()
+        .to_string()
+        .contains("index failure"));
+    assert_eq!(runner.output_cursor(id, &OutputStream::Stdout), 16380);
+    let first: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(first.stdout_offset, 16380);
+    assert_eq!(first.stderr_offset, 0);
+    stdout.extend_from_slice(b"epo:12\n");
+    stdout.extend_from_slice("/w/x ".repeat(4000).as_bytes());
+    stdout.extend_from_slice(b"/w/repo/sibling");
+    let stderr = b"err /w/repo/sibling\n/w/repo";
+    fs::write(directory.join("stdout"), &stdout).unwrap();
+    fs::write(directory.join("stderr"), stderr).unwrap();
+    saves.store(0, Ordering::SeqCst);
+    phase.store(2, Ordering::SeqCst);
+    assert!(runner
+        .follow_unit(id)
+        .unwrap_err()
+        .to_string()
+        .contains("index failure"));
+    let second: Job = read_json(&runner.record_path(id)).unwrap();
+    assert!(second.stdout_offset > first.stdout_offset);
+    assert!(second.stdout_offset < stdout.len() as u64);
+    assert_eq!(
+        runner.output_cursor(id, &OutputStream::Stdout),
+        second.stdout_offset
+    );
+    assert_eq!(
+        runner.job_log(id).output_streams.lock().unwrap()[0].pending_len(),
+        0
+    );
+    phase.store(0, Ordering::SeqCst);
+    alive.store(false, Ordering::SeqCst);
+    fs::write(directory.join("exit"), b"0\n").unwrap();
+    runner.follow_unit(id).unwrap();
+    let mut expected = vec![b'a'; 16384 - 4];
+    expected.extend_from_slice(b"/caller/workspace:12\n");
+    expected.extend_from_slice(format!("{expanded} ").repeat(4000).as_bytes());
+    expected.extend_from_slice(b"/s");
+    assert_eq!(
+        rewritten_replay(&runner, id),
+        (expected, b"err /s\n/caller/workspace".to_vec())
+    );
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(job.stdout_offset, stdout.len() as u64);
+    assert_eq!(job.stderr_offset, stderr.len() as u64);
+}
+
+#[test]
+fn rewrite_durable_partial_path_survives_quiet_passes_and_exit_once() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let inspections = Arc::new(AtomicU64::new(0));
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.systemd_command = Some({
+        let inspections = inspections.clone();
+        Arc::new(move |_| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: if inspections.fetch_add(1, Ordering::SeqCst) < 6 {
+                    b"ActiveState=active\nSubState=running\n".to_vec()
+                } else {
+                    b"ActiveState=inactive\nSubState=dead\n".to_vec()
+                },
+                stderr: Vec::new(),
+            })
+        })
+    });
+    let runner = Runner::open(config).unwrap();
+    let id = running_record(&f, &runner);
+    set_rewrite_rules(&runner, id, rewrite_rules());
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&id).unwrap();
+        job.process = Some(platform::ProcessIdentity {
+            pid: 0,
+            start: 0,
+            unit: Some(Uuid::now_v7()),
+        });
+        runner.save(job).unwrap();
+    }
+    let directory = runner
+        .core
+        .trees
+        .state
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("stdout"), b"/w/rep").unwrap();
+    fs::write(directory.join("stderr"), b"/w/repo").unwrap();
+    fs::write(directory.join("exit"), b"0\n").unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    let monitor = std::thread::spawn({
+        let runner = runner.clone();
+        move || done.send(runner.follow_unit(id)).unwrap()
+    });
+    finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("monitor must resolve held output at exit")
+        .unwrap();
+    monitor.join().unwrap();
+    assert!(inspections.load(Ordering::SeqCst) >= 7);
+    assert_eq!(
+        rewritten_replay(&runner, id),
+        (b"/w/rep".to_vec(), b"/caller/workspace".to_vec())
+    );
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!((job.stdout_offset, job.stderr_offset), (6, 7));
+}
+
 #[test]
 fn replay_rejects_truncated_or_oversized_committed_chunk_files_without_leaking_leases() {
     let f = Fixture::new();
