@@ -123,6 +123,8 @@ pub(crate) struct Prepared {
 /// supervisor or preparing a sandbox. Remote inputs must name the transport
 /// selected for this unit, not a later read of the runner's active generation.
 pub(crate) struct EnvironmentInputs<'a> {
+    // Only Linux's isolated Rust jobs read it, to find a configured wrapper.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub host_cwd: &'a Path,
     pub target: &'a Path,
     pub wrapper: Option<&'a Path>,
@@ -1128,6 +1130,8 @@ impl Backend for HostBackend {
         prepared: &Prepared,
         weight: u32,
     ) -> io::Result<Launch> {
+        // Read only by Linux launch checks and the test network hook.
+        #[cfg_attr(not(any(target_os = "linux", test)), allow(unused_variables))]
         let r = &s.request;
         #[cfg(target_os = "linux")]
         if config.boat_profile && config.isolate_jobs {
