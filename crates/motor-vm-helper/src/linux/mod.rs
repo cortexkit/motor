@@ -1,5 +1,6 @@
 pub mod cgroup;
 pub mod fs;
+pub mod job;
 pub mod process;
 pub mod server;
 pub mod tenant;
@@ -40,6 +41,7 @@ pub struct LinuxMachine {
     cgroups: cgroup::Cgroups,
     running: BTreeMap<usize, Running>,
     tenants: crate::tenant::Controller<tenant::LinuxTenants>,
+    jobs: job::LinuxJobs,
 }
 impl LinuxMachine {
     pub fn new(config: Config) -> Result<Self> {
@@ -78,6 +80,7 @@ impl LinuxMachine {
         let cgroups = cgroup::Cgroups::discover()?;
         let tenants =
             crate::tenant::Controller(tenant::LinuxTenants::new(&config, cgroups.root.clone()));
+        let jobs = job::LinuxJobs::new(&config);
         Ok(Self {
             config,
             base,
@@ -85,6 +88,7 @@ impl LinuxMachine {
             cgroups,
             running: BTreeMap::new(),
             tenants,
+            jobs,
         })
     }
     fn boundary(&self, slot: usize) -> PathBuf {
@@ -375,7 +379,8 @@ impl Machine for LinuxMachine {
             }
         }
         self.cgroups.enable()?;
-        self.tenants.0.reconcile()
+        self.tenants.0.reconcile()?;
+        self.jobs.reconcile()
     }
     fn start(&mut self, slot: usize, lease: &Lease, kind: Kind) -> Result<Vec<OwnedFd>> {
         let base = self.base.try_clone()?;
@@ -460,6 +465,9 @@ impl Machine for LinuxMachine {
     }
     fn tenant(&mut self, tenant: &str, op: crate::tenant::Operation) -> Result<crate::Response> {
         self.tenants.handle(tenant, op)
+    }
+    fn job(&mut self, op: crate::job::Operation, peer: crate::Peer) -> Result<crate::Response> {
+        self.jobs.handle(op, peer)
     }
     fn shutdown(&mut self) -> Result<()> {
         // stop_all logs each tenant's outcome; this only summarises.

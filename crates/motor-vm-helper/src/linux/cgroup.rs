@@ -5,6 +5,54 @@ use std::{
 };
 
 pub const CONTROLLERS: &str = "+cpu +cpuset +memory +io";
+pub const JOB_SLICE: &str = "/sys/fs/cgroup/motorvm.slice";
+
+/// A separate systemd slice is not collected when the helper service stops.
+/// Its aggregate ceiling protects host services; individual VM leaves stay
+/// unbounded so accounting for one VM cannot reclaim another VM's pmem pages.
+pub fn prepare_job_slice(memory_max_bytes: u64) -> Result<()> {
+    if memory_max_bytes == 0 {
+        return Err(Error("job slice memory ceiling is required".into()));
+    }
+    for args in [
+        vec!["start".into(), "motorvm.slice".into()],
+        vec![
+            "set-property".into(),
+            "--runtime".into(),
+            "motorvm.slice".into(),
+            format!("MemoryMax={memory_max_bytes}"),
+        ],
+    ] {
+        let output = std::process::Command::new("systemctl")
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(Error(format!(
+                "job slice setup failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+    }
+    let path = Path::new(JOB_SLICE);
+    super::fs::trusted(path, &fs::symlink_metadata(path)?)?;
+    if fs::read_to_string(path.join("memory.max"))?.trim() != memory_max_bytes.to_string() {
+        return Err(Error("job slice memory ceiling readback mismatch".into()));
+    }
+    enable(path)
+}
+
+pub fn create_job(path: &Path, vcpus: u32) -> Result<()> {
+    // create_dir, not create_dir_all: old OOM evidence is never a new boot.
+    fs::create_dir(path)?;
+    for (name, value) in job_limits(vcpus) {
+        fs::write(path.join(name), value)?;
+    }
+    Ok(())
+}
+
+fn job_limits(vcpus: u32) -> [(&'static str, String); 1] {
+    [("cpu.max", format!("{} 100000", u64::from(vcpus) * 100000))]
+}
 pub struct Cgroups {
     pub root: PathBuf,
 }
@@ -106,6 +154,23 @@ fn remove(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn job_leaf_is_new_and_does_not_set_memory_limits() {
+        let path =
+            cortexkit_test_support::scratch_root().join(format!("job-leaf-{}", std::process::id()));
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
+        }
+        create_job(&path, 7).unwrap();
+        assert_eq!(
+            fs::read_to_string(path.join("cpu.max")).unwrap(),
+            "700000 100000"
+        );
+        assert!(!path.join("memory.max").exists());
+        assert!(!path.join("memory.high").exists());
+        assert!(create_job(&path, 2).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn populated_delegation_root_is_refused_before_controller_write() {
         let path = cortexkit_test_support::scratch_root()

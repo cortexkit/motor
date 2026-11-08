@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, fmt, os::fd::OwnedFd};
 use uuid::Uuid;
 
 pub mod config;
+pub mod job;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod removal;
@@ -39,6 +40,25 @@ pub enum Kind {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    StartJob {
+        job_id: String,
+        account: String,
+        workspace_disk_id: String,
+        image_generation_id: String,
+        vcpus: u32,
+        memory_mib: u64,
+        burst_mib: Option<u64>,
+    },
+    AdoptJob {
+        job_id: String,
+    },
+    StopJob {
+        job_id: String,
+    },
+    OpenJobRelay {
+        job_id: String,
+        port: u32,
+    },
     Acquire {
         instance: String,
         job_id: String,
@@ -174,6 +194,10 @@ pub enum SlotView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Reply {
+    Job {
+        running: bool,
+        vmm_pid: Option<u32>,
+    },
     Acquired {
         slot: Option<usize>,
     },
@@ -231,6 +255,9 @@ pub trait Machine {
     fn stop(&mut self, slot: usize, lease: &Lease, export: bool) -> Result<()>;
     fn cleanup(&mut self, slot: usize) -> Result<()>;
     fn alive(&mut self, slot: usize) -> bool;
+    fn job(&mut self, _op: job::Operation, _peer: Peer) -> Result<Response> {
+        Err(Error("job VMs are not configured".into()))
+    }
     fn tenant(&mut self, _tenant: &str, _op: tenant::Operation) -> Result<Response> {
         Err(Error("tenant VMs are not configured".into()))
     }
@@ -303,6 +330,31 @@ impl<M: Machine> Helper<M> {
             return Err(Error("helper is stopping".into()));
         }
         match request {
+            Request::StartJob {
+                job_id,
+                account,
+                workspace_disk_id,
+                image_generation_id,
+                vcpus,
+                memory_mib,
+                burst_mib,
+            } => self.job(
+                job::Operation::Start(job::Start {
+                    job_id,
+                    account,
+                    workspace_disk_id,
+                    image_generation_id,
+                    vcpus,
+                    memory_mib,
+                    burst_mib,
+                }),
+                peer,
+            ),
+            Request::AdoptJob { job_id } => self.job(job::Operation::Adopt(job_id), peer),
+            Request::StopJob { job_id } => self.job(job::Operation::Stop(job_id), peer),
+            Request::OpenJobRelay { job_id, port } => {
+                self.job(job::Operation::Relay(job_id, port), peer)
+            }
             Request::Acquire { instance, job_id } => {
                 let identity = Identity::parse(instance, &job_id)?;
                 if self.slots.iter().any(
@@ -439,6 +491,10 @@ impl<M: Machine> Helper<M> {
             tenant::validate_port(port)?;
         }
         self.machine.tenant(name, op)
+    }
+    fn job(&mut self, op: job::Operation, peer: Peer) -> Result<Response> {
+        op.validate()?;
+        self.machine.job(op, peer)
     }
     pub fn disconnect(&mut self, connection: u64) {
         self.connections.remove(&connection);
