@@ -600,6 +600,9 @@ async fn isolated_four_vcpus_enforce_cpu_set_and_memory_max() {
     let mut config = f.config();
     config.isolate_jobs = true;
     config.cpu_topology = None;
+    // This checks the per-vCPU memory limit, not host slice clamping. Keep the
+    // probed ceiling above that limit even on a smaller operator host.
+    config.slice_budget_probe = Some(Arc::new(|| Ok((64 << 30, None))));
     let runner = Runner::open(config).unwrap();
     let (mut request, bytes) = f.run(r#"nproc; awk '/Cpus_allowed_list/ {print $2}' /proc/self/status; group=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup); cat "/sys/fs/cgroup${group}/memory.max""#);
     request.weight_hint = Some(4);

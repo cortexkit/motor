@@ -355,7 +355,7 @@ async fn isolated_public_non_rust_job_has_no_sccache_environment() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires motor-cache, motor-job, patched sccache, sudo, ACLs and systemd"]
 async fn isolated_public_reader_exported_incremental_keeps_dependency_hits() {
-    let mut f = ClientFixture::with_warm_command("cargo build --locked && cargo build --release --locked && test \"$CARGO_INCREMENTAL\" = 1 && test -n \"$(ls -A /run/motor/target/release/incremental)\" && sccache --show-stats").await;
+    let mut f = ClientFixture::with_warm_command("cargo build --locked && cargo build --release --locked && test \"$CARGO_INCREMENTAL\" = 1 && test -n \"$(find \"$CARGO_TARGET_DIR/bd\" -path '*/release/incremental/*' -print -quit)\" && sccache --show-stats").await;
     write(f.source.join("Cargo.toml"), "[package]\nname='incremental-reader'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nitoa='=1.0.18'\n");
     write(
         f.source.join("src/lib.rs"),
@@ -404,7 +404,7 @@ async fn isolated_public_reader_exported_incremental_keeps_dependency_hits() {
         } else {
             "1"
         };
-        let output = f.run(&format!("export-{variable}"), &format!("export {variable}={value}; cargo build --locked && sccache --show-stats && test -n \"$(ls -A /run/motor/target/debug/incremental)\""), 0).await;
+        let output = f.run(&format!("export-{variable}"), &format!("export {variable}={value}; cargo build --locked && sccache --show-stats && test -n \"$(find \"$CARGO_TARGET_DIR/bd\" -path '*/debug/incremental/*' -print -quit)\""), 0).await;
         let hits = output
             .lines()
             .find(|l| l.starts_with("Cache hits "))

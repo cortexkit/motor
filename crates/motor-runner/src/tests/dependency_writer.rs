@@ -472,6 +472,54 @@ async fn assert_exited(f: &Fixture, runner: &Runner, id: Uuid) {
 }
 
 #[cfg(target_os = "linux")]
+fn incremental_state_check(profile: &str) -> String {
+    // Cargo expands the workspace hash in CARGO_BUILD_BUILD_DIR itself, so
+    // inspect the resulting build directories rather than the literal template.
+    format!(
+        r#"test -n "$(find "$CARGO_TARGET_DIR/bd" -path '*/{profile}/incremental/*' -print -quit)""#
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn incremental_state_checks_follow_the_workspace_build_directories() {
+    let scratch = ScratchDir::new("writer-incremental-check");
+    let target = scratch.join("target with spaces");
+    for profile in ["debug", "release"] {
+        let legacy = target.join(profile).join("incremental");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("stale-state"), "legacy").unwrap();
+        let incremental = target
+            .join("bd/workspace-hash")
+            .join(profile)
+            .join("incremental");
+        fs::create_dir_all(&incremental).unwrap();
+        let check = || {
+            Command::new("sh")
+                .args(["-c", &incremental_state_check(profile)])
+                .env("CARGO_TARGET_DIR", &target)
+                .env(
+                    "CARGO_BUILD_BUILD_DIR",
+                    target.join("bd/{workspace-path-hash}"),
+                )
+                .output()
+                .unwrap()
+        };
+        assert!(
+            !check().status.success(),
+            "legacy or another profile's state must not satisfy the {profile} check"
+        );
+        fs::write(incremental.join("current-state"), "current").unwrap();
+        let output = check();
+        assert!(
+            output.status.success(),
+            "{profile}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(super) async fn isolated_graph_fixture() {
     let f = Fixture::new();
     let source = f.scratch.join("git-dependencies");
@@ -542,7 +590,7 @@ pub(super) async fn isolated_graph_fixture() {
     };
     let mut config = f.config();
     config.isolate_jobs = true;
-    config.base_commands = vec!["cargo test --no-run --workspace --features extra --locked && cargo build --release --features extra --locked && test \"$CARGO_INCREMENTAL\" = 1 && test -n \"$(ls -A /run/motor/target/release/incremental)\" && sccache --show-stats".into()];
+    config.base_commands = vec![format!("cargo test --no-run --workspace --features extra --locked && cargo build --release --features extra --locked && test \"$CARGO_INCREMENTAL\" = 1 && {} && sccache --show-stats", incremental_state_check("release"))];
     let unavailable = Command::new("cargo")
         .args(["metadata", "--locked", "--offline", "--format-version", "1"])
         .current_dir(&f.main)
@@ -596,7 +644,7 @@ pub(super) async fn isolated_graph_fixture() {
     git(&f.main, &["checkout", &tip, "--", "."]);
     commit(&f.main, "restore approved dependency graph for readers\n");
     for name in ["first-reader", "second-reader"] {
-        let (mut job, mut bytes) = job_at(&f, name, "export CARGO_INCREMENTAL=1; cargo test --no-run --workspace --features extra --locked && sccache --show-stats && test -n \"$(ls -A /run/motor/target/debug/incremental)\"");
+        let (mut job, mut bytes) = job_at(&f, name, &format!("export CARGO_INCREMENTAL=1; cargo test --no-run --workspace --features extra --locked && sccache --show-stats && {}", incremental_state_check("debug")));
         job.git_dependencies = vec![declaration.clone()];
         bytes.push(dep_bytes.clone());
         f.submit(&runner, &job, &bytes);
