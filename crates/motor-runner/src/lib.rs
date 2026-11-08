@@ -105,6 +105,11 @@ pub fn physical_chmod(args: &[String]) -> std::io::Result<()> {
 }
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
+pub fn dispatch_permission_helper(args: &[String]) -> Option<std::io::Result<()>> {
+    permissions::helper_dispatch(args)
+}
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
 pub fn staging_generation_helper(action: &str, args: &[String]) -> std::io::Result<()> {
     permissions::staging_helper(action, args)
 }

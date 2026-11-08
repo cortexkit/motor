@@ -2,7 +2,7 @@
 //! Only the trusted daemon invokes the root CLI; jobs receive no sudo grant.
 use sha2::Digest;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::CString,
     fs, io,
     os::{
@@ -25,6 +25,9 @@ pub(crate) fn digest() -> String {
     hash.update(include_bytes!("permissions.rs"));
     hash.update(include_bytes!("source_seal.rs"));
     hash.update(include_bytes!("source_seal/authority.rs"));
+    hash.update(include_bytes!("main.rs"));
+    hash.update(include_bytes!("lib.rs"));
+    hash.update(include_bytes!("isolation.rs"));
     format!("{hash:x}", hash = hash.finalize())
 }
 
@@ -240,15 +243,77 @@ pub(crate) fn seal_command(
     Ok(command)
 }
 
-fn validate_staging_form(action: &str, state: &Path, repository: &str) -> io::Result<()> {
-    if !matches!(action, "check-staging-links" | "remove-staging")
-        || !state.is_absolute()
-        || state.parent().is_none()
-        || state
+fn physical_state_form(state: &Path) -> bool {
+    state.is_absolute()
+        && state.parent().is_some()
+        && !state
             .as_os_str()
             .as_bytes()
             .split(|byte| *byte == b'/')
             .any(|part| matches!(part, b"." | b".."))
+}
+
+/// Recognize helper modes even when classic sudo's joined-argument wildcard
+/// matched a single argument containing spaces. Malformed forms must not fall
+/// through to daemon configuration, logging, or runtime initialization as root.
+pub(crate) fn helper_dispatch(args: &[String]) -> Option<io::Result<()>> {
+    let first = args.first()?;
+    let action = first.split_ascii_whitespace().next()?;
+    if !matches!(
+        action,
+        "physical-chmod"
+            | "seal"
+            | "unseal"
+            | "check-staging-links"
+            | "remove-staging"
+            | "permission-helper-digest"
+            | "check-permissions-helper"
+    ) {
+        return None;
+    }
+    let valid = first == action
+        && match action {
+            "physical-chmod" => {
+                args.len() >= 4
+                    && matches!(args[1].as_str(), "owner-rwX" | "private-rwX")
+                    && args[2] == "--"
+                    && args[3..]
+                        .iter()
+                        .all(|path| physical_state_form(Path::new(path)))
+            }
+            "seal" | "unseal" => {
+                args.len() == 3
+                    && args[1].parse::<motor_protocol::Uuid>().is_ok()
+                    && physical_state_form(Path::new(&args[2]))
+            }
+            "check-staging-links" | "remove-staging" => {
+                args.len() == 4
+                    && args[2].parse::<motor_protocol::Uuid>().is_ok()
+                    && validate_staging_form(action, Path::new(&args[3]), &args[1]).is_ok()
+            }
+            _ => args.len() == 1,
+        };
+    if !valid {
+        return Some(Err(io::Error::other(
+            "invalid fixed permissions helper invocation",
+        )));
+    }
+    Some(match action {
+        "physical-chmod" => run(&args[1..]),
+        "seal" | "unseal" => crate::source_seal::helper(action, &args[1..]),
+        "check-staging-links" | "remove-staging" => staging_helper(action, &args[1..]),
+        "permission-helper-digest" => {
+            println!("{}", digest());
+            Ok(())
+        }
+        "check-permissions-helper" => check_install(),
+        _ => unreachable!(),
+    })
+}
+
+fn validate_staging_form(action: &str, state: &Path, repository: &str) -> io::Result<()> {
+    if !matches!(action, "check-staging-links" | "remove-staging")
+        || !physical_state_form(state)
         || repository.len() != 64
         || !repository
             .bytes()
@@ -273,8 +338,73 @@ fn staging_command(
     Ok(command)
 }
 
+#[derive(Clone, Copy)]
+struct StagingOwners {
+    runner: u32,
+    writer: u32,
+}
+
+fn delegated_runner_uid() -> io::Result<u32> {
+    let uid = std::env::var("SUDO_UID")
+        .map_err(io::Error::other)?
+        .parse::<u32>()
+        .map_err(io::Error::other)?;
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let result = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if uid == 0 || result != 0 || found.is_null() || entry.pw_uid != uid {
+        return Err(io::Error::other(
+            "staging helper requires a real non-root SUDO_UID",
+        ));
+    }
+    Ok(uid)
+}
+
+impl StagingOwners {
+    fn current() -> io::Result<Self> {
+        let uid = unsafe { libc::geteuid() };
+        let runner = if uid == 0 && std::env::var_os("SUDO_UID").is_some() {
+            delegated_runner_uid()?
+        } else {
+            uid
+        };
+        let writer = crate::isolation::validate_writer_account()?.uid;
+        if writer == runner {
+            return Err(io::Error::other("fill writer must differ from the runner"));
+        }
+        Ok(Self { runner, writer })
+    }
+
+    fn store_directory(self, metadata: &fs::Metadata) -> io::Result<()> {
+        if !metadata.is_dir()
+            || ![0, self.runner].contains(&metadata.uid())
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(io::Error::other("build-base store directories must be runner/root-owned and not group/other-writable"));
+        }
+        Ok(())
+    }
+}
+
 /// Inspect or discard only a fill's staging generation. Root runners walk in
 /// process; unprivileged runners use the same fixed operation through sudo.
+/// Every caller must stop the fill unit and prevent the fill account from
+/// writing the tree before either operation. The link check holds no lock and
+/// retains no directory descriptor for the caller: publication must use the same
+/// tree immediately, without allowing the fill account to write again. The
+/// writer is motor-cache, validated as distinct from the runner, root and
+/// motor-job; there is no
+/// runner-as-writer fallback. Only root or the runner may place staging roots
+/// inside the store's protected build-bases and repository directories.
 pub(crate) fn staging_operation(
     action: &str,
     state: &Path,
@@ -282,8 +412,20 @@ pub(crate) fn staging_operation(
     fill: motor_protocol::Uuid,
 ) -> io::Result<()> {
     validate_staging_form(action, state, repository)?;
+    crate::source_seal::authority::Authority::load()?.roots(state)?;
+    let owners = StagingOwners::current()?;
+    staging_execute(action, state, repository, fill, owners)
+}
+
+fn staging_execute(
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+    owners: StagingOwners,
+) -> io::Result<()> {
     if unsafe { libc::geteuid() } == 0 {
-        return staging_apply(action, state, repository, fill);
+        return staging_apply(action, state, repository, fill, owners);
     }
     let mut command = staging_command(action, state, repository, fill)?;
     let output = crate::systemd::output(&mut command)?;
@@ -308,7 +450,9 @@ pub(crate) fn staging_helper(action: &str, args: &[String]) -> io::Result<()> {
         .map_err(io::Error::other)?;
     let state = Path::new(&args[2]);
     validate_staging_form(action, state, repository)?;
-    crate::source_seal::authority::Authority::load()?.roots(state)?;
+    delegated_runner_uid()?;
+    // Keep short-lived helper walks expendable without changing a root
+    // daemon's protected score on the in-process path.
     fs::write("/proc/self/oom_score_adj", "900")?;
     staging_operation(action, state, repository, fill)
 }
@@ -319,8 +463,96 @@ fn directory_entries(fd: &OwnedFd) -> io::Result<fs::ReadDir> {
     fs::read_dir(format!("/proc/self/fd/{}", fd.as_raw_fd()))
 }
 
-fn check_staging_links(root: OwnedFd) -> io::Result<()> {
-    let mut inodes = HashMap::<(u64, u64), (u64, u64)>::new();
+const MAX_STAGING_DEPTH: usize = 128;
+
+fn mount_id(fd: &OwnedFd) -> io::Result<u64> {
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::statx(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stat,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(io::Error::other(
+            "staging walk requires statx mount identity",
+        ));
+    }
+    Ok(stat.stx_mnt_id)
+}
+
+struct StagingWalk {
+    owners: StagingOwners,
+    device: u64,
+    mount: u64,
+    directories: HashSet<(u64, u64)>,
+    inodes: HashMap<(u64, u64), (u64, u64)>,
+    track_links: bool,
+}
+
+impl StagingWalk {
+    fn new(root: &OwnedFd, owners: StagingOwners) -> io::Result<Self> {
+        Ok(Self {
+            owners,
+            device: fs::File::from(root.try_clone()?).metadata()?.dev(),
+            mount: mount_id(root)?,
+            directories: HashSet::new(),
+            inodes: HashMap::new(),
+            track_links: true,
+        })
+    }
+
+    fn visit(&mut self, fd: &OwnedFd, depth: usize) -> io::Result<bool> {
+        let metadata = fs::File::from(fd.try_clone()?).metadata()?;
+        if metadata.uid() != self.owners.writer {
+            return Err(io::Error::other(
+                "staging inode must be owned by the fill writer",
+            ));
+        }
+        if metadata.dev() != self.device || mount_id(fd)? != self.mount {
+            return Err(io::Error::other(
+                "staging walk refuses device or mount crossings",
+            ));
+        }
+        let key = (metadata.dev(), metadata.ino());
+        if metadata.is_dir() {
+            if metadata.mode() & 0o022 != 0 {
+                return Err(io::Error::other(
+                    "staging directories must not be group/other-writable",
+                ));
+            }
+            if depth > MAX_STAGING_DEPTH {
+                return Err(io::Error::other("staging walk exceeds maximum depth"));
+            }
+            if !self.directories.insert(key) {
+                return Err(io::Error::other(
+                    "staging directory inode visited more than once",
+                ));
+            }
+        } else if self.track_links {
+            let (entries, links) = self.inodes.entry(key).or_insert((0, metadata.nlink()));
+            *entries += 1;
+            if *links != metadata.nlink() || *entries > *links {
+                return Err(io::Error::other(
+                    "staging inode visit count exceeds or changes its link count",
+                ));
+            }
+        }
+        Ok(metadata.is_dir())
+    }
+}
+
+fn inspect_staging(root: OwnedFd, owners: StagingOwners, check_links: bool) -> io::Result<()> {
+    let mut walk = StagingWalk::new(&root, owners)?;
+    if !walk.visit(&root, 0)? {
+        return Err(io::Error::other("staging root must be a directory"));
+    }
     let mut stack = vec![Frame {
         entries: directory_entries(&root)?,
         fd: root,
@@ -331,21 +563,16 @@ fn check_staging_links(root: OwnedFd) -> io::Result<()> {
             continue;
         };
         let child = open_at(parent.fd.as_raw_fd(), &entry?.file_name(), false)?;
-        let metadata = fs::File::from(child.try_clone()?).metadata()?;
-        if metadata.is_dir() {
+        if walk.visit(&child, stack.len())? {
             stack.push(Frame {
                 entries: directory_entries(&child)?,
                 fd: child,
             });
-        } else {
-            let (entries, links) = inodes.entry((metadata.dev(), metadata.ino())).or_default();
-            *entries += 1;
-            *links = (*links).max(metadata.nlink());
         }
     }
     // Directory link counts include child directories' '..' entries and are
     // not evidence of an outside hard link. Only non-directory inodes count.
-    if inodes.values().any(|(entries, links)| links > entries) {
+    if check_links && walk.inodes.values().any(|(entries, links)| links > entries) {
         return Err(io::Error::other(
             "staging generation contains an inode linked from outside the generation",
         ));
@@ -369,7 +596,20 @@ fn unlink_at(parent: RawFd, name: &std::ffi::OsStr, directory: bool) -> io::Resu
     Ok(())
 }
 
-fn remove_staging(root: OwnedFd, repository: OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+fn remove_staging(
+    root: OwnedFd,
+    repository: OwnedFd,
+    name: &std::ffi::OsStr,
+    owners: StagingOwners,
+) -> io::Result<()> {
+    // Validate the entire tree before the first unlink, so a foreign owner,
+    // writable directory, mount or excessive depth cannot cause partial removal.
+    inspect_staging(root.try_clone()?, owners, false)?;
+    let mut walk = StagingWalk::new(&root, owners)?;
+    // Preflight checked link counts. Unlinking legitimately decreases them,
+    // so deletion rechecks ownership, mounts and directories, not link totals.
+    walk.track_links = false;
+    walk.visit(&root, 0)?;
     let mut stack = vec![(
         Frame {
             entries: directory_entries(&root)?,
@@ -377,11 +617,13 @@ fn remove_staging(root: OwnedFd, repository: OwnedFd, name: &std::ffi::OsStr) ->
         },
         name.to_owned(),
     )];
-    while let Some((parent, _)) = stack.last_mut() {
+    while !stack.is_empty() {
+        let depth = stack.len();
+        let (parent, _) = stack.last_mut().unwrap();
         if let Some(entry) = parent.entries.next() {
             let name = entry?.file_name();
             let child = open_at(parent.fd.as_raw_fd(), &name, false)?;
-            if fs::File::from(child.try_clone()?).metadata()?.is_dir() {
+            if walk.visit(&child, depth)? {
                 stack.push((
                     Frame {
                         entries: directory_entries(&child)?,
@@ -408,16 +650,24 @@ fn staging_apply(
     state: &Path,
     repository: &str,
     fill: motor_protocol::Uuid,
+    owners: StagingOwners,
 ) -> io::Result<()> {
     validate_staging_form(action, state, repository)?;
     let state = physical_root(state)?;
     let bases = open_at(state.as_raw_fd(), std::ffi::OsStr::new("build-bases"), true)?;
+    owners.store_directory(&fs::File::from(bases.try_clone()?).metadata()?)?;
     let repository = open_at(bases.as_raw_fd(), std::ffi::OsStr::new(repository), true)?;
+    owners.store_directory(&fs::File::from(repository.try_clone()?).metadata()?)?;
     let name = format!("staging-{fill}");
     let root = open_at(repository.as_raw_fd(), std::ffi::OsStr::new(&name), true)?;
+    if mount_id(&root)? != mount_id(&repository)? {
+        return Err(io::Error::other(
+            "staging walk refuses device or mount crossings",
+        ));
+    }
     match action {
-        "check-staging-links" => check_staging_links(root),
-        "remove-staging" => remove_staging(root, repository, std::ffi::OsStr::new(&name)),
+        "check-staging-links" => inspect_staging(root, owners, true),
+        "remove-staging" => remove_staging(root, repository, std::ffi::OsStr::new(&name), owners),
         _ => unreachable!(),
     }
 }

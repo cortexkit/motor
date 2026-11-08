@@ -30,6 +30,10 @@ fn main() -> io::Result<()> {
         }
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    if let Some(result) = motor_runner::dispatch_permission_helper(&args) {
+        return result;
+    }
     #[cfg(windows)]
     if args.first().is_some_and(|arg| arg == "service") {
         return native_service::dispatch();
@@ -41,6 +45,10 @@ fn main() -> io::Result<()> {
 }
 
 async fn run(args: Vec<String>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = motor_runner::dispatch_permission_helper(&args) {
+        return result;
+    }
     if version_requested(&args) {
         println!("{}", binary_version());
         return Ok(());
@@ -48,33 +56,6 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     #[cfg(windows)]
     if args == ["probe-peers"] {
         return motor_runner::hyperv_probe_peers();
-    }
-    #[cfg(target_os = "linux")]
-    if args.first().is_some_and(|arg| arg == "physical-chmod") {
-        return motor_runner::physical_chmod(&args[1..]);
-    }
-    #[cfg(target_os = "linux")]
-    if args
-        .first()
-        .is_some_and(|arg| matches!(arg.as_str(), "check-staging-links" | "remove-staging"))
-    {
-        return motor_runner::staging_generation_helper(&args[0], &args[1..]);
-    }
-    #[cfg(target_os = "linux")]
-    if args
-        .first()
-        .is_some_and(|arg| matches!(arg.as_str(), "seal" | "unseal"))
-    {
-        return motor_runner::source_seal_helper(&args[0], &args[1..]);
-    }
-    #[cfg(target_os = "linux")]
-    if args == ["permission-helper-digest"] {
-        println!("{}", motor_runner::permission_helper_digest());
-        return Ok(());
-    }
-    #[cfg(target_os = "linux")]
-    if args == ["check-permissions-helper"] {
-        return motor_runner::check_permissions_helper();
     }
     #[cfg(target_os = "linux")]
     if args
@@ -901,15 +882,28 @@ mod metrics_cli_tests {
 mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn staging_operations_dispatch_to_the_fixed_helper_before_runner_options() {
-        for action in ["check-staging-links", "remove-staging"] {
-            let error = super::run(vec![action.to_owned()]).await.unwrap_err();
-            assert!(
-                error.to_string().contains(
-                    "staging helper requires root, repository key, fill UUID and state root"
-                ),
-                "{error}"
-            );
+    async fn helper_operations_reject_malformed_sudo_forms_before_runner_options() {
+        for action in [
+            "check-staging-links",
+            "remove-staging",
+            "seal",
+            "unseal",
+            "physical-chmod",
+        ] {
+            for args in [
+                vec![action.to_owned()],
+                vec![format!("{action} x")],
+                vec![format!("{action}\tx")],
+                vec![action.to_owned(), "x".into(), "--version".into()],
+            ] {
+                let error = super::run(args).await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("invalid fixed permissions helper invocation"),
+                    "{error}"
+                );
+            }
         }
     }
 

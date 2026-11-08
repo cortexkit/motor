@@ -48,11 +48,36 @@ The trusted operator uses exactly these argv forms (paths are data, not shell):
 ```text
 /usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- /absolute/tree ...
 /usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- /absolute/tree ...
+/usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions seal JOB_ID STATE_ROOT
+/usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions unseal JOB_ID STATE_ROOT
+/usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions check-staging-links REPO_KEY FILL_UUID STATE_ROOT
+/usr/bin/sudo -n /usr/local/libexec/motor-runner-permissions remove-staging REPO_KEY FILL_UUID STATE_ROOT
 ```
 
 Each path is a physical directory, repaired recursively, or a regular file,
 repaired alone. Symlink and special-inode roots, and symlinked ancestors, are
 refused before any mode changes.
+
+The two staging operations address only
+`STATE_ROOT/build-bases/REPO_KEY/staging-FILL_UUID`, where `REPO_KEY` is the
+repository's lowercase SHA-256 key. Both require the state root to appear in
+the root-owned `/etc/motor-runner/source-seal.json`, including for an in-process
+root runner. `build-bases` and its repository directory must belong to the runner
+or root and permit no group or other write. Every staging inode must belong to
+the validated `motor-cache` fill account, which must differ from the runner,
+root and `motor-job`; staging directories permit no group or other write.
+The walks refuse mount boundaries, repeated directory inodes and nesting beyond
+128 directories below the staging root. Removal validates the complete tree
+before unlinking and changes no owner, mode or ACL. The link check accepts only
+non-directory inodes whose link counts equal the names found inside the tree.
+Tests: `staging_security_preflights_all_directory_modes_before_removal`,
+`staging_security_bounds_depth_before_any_removal`, and the
+`isolated_staging_security_*` tests in `permissions::tests`.
+
+The caller must stop the fill unit and prevent the fill account from writing
+before checking or removing a generation. The link check holds no lock and
+retains no directory descriptor for the caller: publication must use the same
+tree immediately without allowing the fill account to write again.
 
 Before deploying a candidate that uses native mode repair, an **administrator**
 installs a matching copy and the operator-only sudo fragment:
@@ -87,13 +112,14 @@ The installer rejects `motor-job`, `motor-cache`, UID aliases of those accounts,
 and unsafe account/template syntax. It validates physical root-owned ancestors,
 installs an atomic root0755 binary at the fixed path and root0440 sudoers file,
 and validates the fragment with visudo. The job account cannot write the binary
-or its ancestors and receives no sudo rule. Only `physical-chmod`, the fixed
-`owner-rwX` or `private-rwX` policy, and `--` are delegated; the native parser rejects relative/root
-or symlink trees and never invokes a shell. No arbitrary mode/operation/binary
+or its ancestors and receives no sudo rule. Only the six forms listed above
+are delegated; the native parser rejects malformed helper forms before daemon
+configuration or runtime initialization, rejects relative/root or symlink trees,
+and never invokes a shell. No arbitrary mode/operation/binary
 argument is accepted. This administrator bootstrap script itself is **not** a
 delegated command.
 
-`deploy.sh` checks the fixed helper's ownership, code digest and both
+`deploy.sh` checks the fixed helper's ownership, code digest and all six
 `sudo -n -l` forms before staging/draining a new daemon, so a missing grant cannot
 silently break every job after the swap. Legacy candidates that do not use the
 helper retain their previous deploy path. Administrator helper/policy updates
