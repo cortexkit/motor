@@ -82,6 +82,28 @@ fn full() -> Snapshot {
     s.counter = 42;
     s.last_alive = 1_800_000_000_000;
     s.draining = true;
+    s.per_job.disks.insert(
+        "ws-test".into(),
+        motor_host::state::jobs::WorkspaceDisk {
+            sub: claims(JOB).sub,
+            workspace_key_hash: claims(JOB).workspace_key_hash.unwrap(),
+            queue: vec![JOB.into()],
+            attached_job: Some(JOB.into()),
+            quarantined: false,
+        },
+    );
+    s.per_job.executions.insert(
+        JOB.into(),
+        motor_host::state::jobs::Execution {
+            claims: claims(JOB),
+            disk_id: "ws-test".into(),
+            memory_debit_mib: 16_640,
+            guest_ram_mib: 21_846,
+            boot_started: true,
+            runner_hello: false,
+            ended: false,
+        },
+    );
     s
 }
 
@@ -104,10 +126,12 @@ fn sqlite_journal_round_trips_every_field_through_each_change() {
     s.outbox.clear();
     s.counter = 43;
     s.draining = false;
+    s.per_job.executions.get_mut(JOB).unwrap().runner_hello = true;
     journal.store(&s).unwrap();
     // A finished job leaving the host, as the retention pass removes it.
     s.leases.remove(JOB2);
     s.billing.remove(JOB2);
+    s.per_job.disks.get_mut("ws-test").unwrap().quarantined = true;
     s.leases.get_mut(JOB).unwrap().refusal = Some(Refusal::Auth);
     journal.store(&s).unwrap();
     drop(journal);

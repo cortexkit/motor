@@ -9,6 +9,7 @@ mod closure;
 mod drain;
 mod enroll;
 mod helper;
+mod job_admission;
 mod replacement;
 mod resize;
 #[cfg(target_os = "linux")]

@@ -7,6 +7,7 @@ use motor_lease::{Claims, Purpose};
 pub enum RefusalCause {
     Lease(Refusal),
     Permits,
+    Memory,
     Storage,
     RunnerWaking,
     RunnerStartRefused,
@@ -29,6 +30,7 @@ impl RefusalCause {
         match self {
             Self::Lease(reason) => reason.wire(),
             Self::Permits => "permits",
+            Self::Memory => "memory",
             Self::Storage => "storage",
             Self::RunnerWaking => "runner_waking",
             Self::RunnerStartRefused => "runner_start_refused",

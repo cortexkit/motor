@@ -590,6 +590,9 @@ impl Host {
     /// and any tenant while no valid capacity file has been read advertise 0.
     /// Logs each running tenant's unusable-sample case once when it starts.
     pub fn free_mem_mib(&mut self, now_ms: u64) -> u64 {
+        if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
+            return self.job_free_mem_mib(now_ms);
+        }
         let tenants: Vec<Tenant> = self.tenants.values().cloned().collect();
         tenants
             .iter()
