@@ -72,6 +72,8 @@ fn fixture() -> (PathBuf, LinuxJobs, Fake) {
     });
     let fake = Fake::default();
     jobs.network = Box::new(fake.clone());
+    std::fs::create_dir_all(&jobs.records_path).unwrap();
+    std::fs::set_permissions(&jobs.records_path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut record = record();
     record.tap_index = Some(17);
     jobs.save(&record).unwrap();
