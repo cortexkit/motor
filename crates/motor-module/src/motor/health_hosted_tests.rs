@@ -884,7 +884,7 @@ async fn caller_joins_internal_hosted_follower_while_health_and_status_probe() {
     );
     assert!(status.unwrap().terminal.is_none());
     assert!(health["linux"]["unknown"].as_u64().is_some());
-    owner_outputs(&mut caller, 7).await;
+    owner_outputs(&motor, id, &mut caller, 7).await;
     assert_eq!(owner_replay_cursors(&h), vec![u64::MAX, 7]);
     h.run_gate.send_replace(true);
     let StreamRecord::Terminal(terminal) = result_record(&mut caller).await else {
@@ -961,10 +961,20 @@ fn owner_replay_cursors(h: &Harness) -> Vec<u64> {
         .collect()
 }
 
-async fn owner_outputs(stream: &mut crate::JobStream, from: u64) {
+async fn owner_outputs(motor: &Motor, id: Uuid, stream: &mut crate::JobStream, from: u64) {
     use crate::hosted::tests::harness::{OWNER_REPLAY_BYTES, OWNER_REPLAY_RECORDS};
     for expected in from..OWNER_REPLAY_RECORDS {
-        let StreamRecord::Output(output) = result_record(stream).await else {
+        let record = tokio::time::timeout(Duration::from_secs(15), stream.records.recv())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "stream from {from} missing output {expected}: {error}; {}",
+                    motor.hosted_result_snapshot_for_test(id)
+                )
+            })
+            .expect("owner stream must remain open")
+            .expect("owner must deliver a valid record");
+        let StreamRecord::Output(output) = record else {
             panic!("output {expected} missing")
         };
         assert_eq!(output.seq, expected);
@@ -980,9 +990,9 @@ async fn hosted_late_subscriber_rewinds_single_host_connection() {
     let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-late-rewind");
     let (motor, id) = detached_job(&h, &scratch).await;
     let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
-    owner_outputs(&mut first, 0).await;
+    owner_outputs(&motor, id, &mut first, 0).await;
     let mut late = motor.attach(AttachRequest::new(id, 11)).unwrap();
-    owner_outputs(&mut late, 11).await;
+    owner_outputs(&motor, id, &mut late, 11).await;
     assert_eq!(owner_replay_cursors(&h), vec![0, 11]);
     assert_eq!(
         h.attach_lifecycle.borrow().0 - h.attach_lifecycle.borrow().1,
@@ -1009,17 +1019,31 @@ async fn hosted_concurrent_rewinds_fold_to_oldest_waiting_cursor() {
     let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-fold-rewind");
     let (motor, id) = detached_job(&h, &scratch).await;
     let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
-    owner_outputs(&mut first, 0).await;
+    owner_outputs(&motor, id, &mut first, 0).await;
     let mut newer = motor.attach(AttachRequest::new(id, 17)).unwrap();
     let mut older = motor.attach(AttachRequest::new(id, 3)).unwrap();
-    tokio::join!(owner_outputs(&mut newer, 17), owner_outputs(&mut older, 3));
+    tokio::join!(
+        owner_outputs(&motor, id, &mut newer, 17),
+        owner_outputs(&motor, id, &mut older, 3)
+    );
     assert_eq!(owner_replay_cursors(&h), vec![0, 3]);
     h.run_gate.send_replace(true);
-    for stream in [&mut first, &mut newer, &mut older] {
-        assert!(matches!(
-            result_record(stream).await,
-            StreamRecord::Terminal(_)
-        ));
+    for (name, stream) in [
+        ("first", &mut first),
+        ("newer", &mut newer),
+        ("older", &mut older),
+    ] {
+        let record = tokio::time::timeout(Duration::from_secs(15), stream.records.recv())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{name} terminal missing: {error}; {}",
+                    motor.hosted_result_snapshot_for_test(id)
+                )
+            })
+            .expect("owner stream must remain open")
+            .expect("owner must deliver a valid record");
+        assert!(matches!(record, StreamRecord::Terminal(_)));
     }
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     drop((first, newer, older));
@@ -1032,7 +1056,7 @@ async fn assert_rewind_auth_outcome(refusals: usize, expected: Outcome) {
     let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-expired-rewind-auth");
     let (motor, id) = detached_job(&h, &scratch).await;
     let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
-    owner_outputs(&mut first, 0).await;
+    owner_outputs(&motor, id, &mut first, 0).await;
     let tokens = h.tokens.load(Ordering::SeqCst);
     motor
         .storage
@@ -1042,7 +1066,7 @@ async fn assert_rewind_auth_outcome(refusals: usize, expected: Outcome) {
     let mut late = motor.attach(AttachRequest::new(id, 11)).unwrap();
     let recovered = matches!(expected, Outcome::Exit { code: 41 });
     if recovered {
-        owner_outputs(&mut late, 11).await;
+        owner_outputs(&motor, id, &mut late, 11).await;
         assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
         h.run_gate.send_replace(true);
     }
@@ -1118,7 +1142,7 @@ async fn hosted_restart_collects_terminal_without_replaying_until_subscriber_arr
     owner_attach_count(&h, 2).await;
     assert_eq!(owner_replay_cursors(&h), vec![u64::MAX, u64::MAX]);
     let mut caller = motor.attach(AttachRequest::new(id, 9)).unwrap();
-    owner_outputs(&mut caller, 9).await;
+    owner_outputs(&motor, id, &mut caller, 9).await;
     assert_eq!(owner_replay_cursors(&h), vec![u64::MAX, u64::MAX, 9]);
     h.run_gate.send_replace(true);
     assert!(matches!(
