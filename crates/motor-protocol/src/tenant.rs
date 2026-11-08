@@ -5,9 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
-/// Raw read-only `remote-cache` drive: magic, little-endian u32 JSON length,
-/// then a `RemoteCacheRequest`. Any block-alignment padding follows the JSON.
+/// Raw read-only credential drive: magic, a fresh per-start 128-bit nonce,
+/// little-endian u32 JSON length, then a `RemoteCacheRequest`. Block-alignment
+/// padding follows the JSON. The helper passes the same nonce as 32 hex digits
+/// under `REMOTE_CACHE_NONCE_CMDLINE_KEY` on the trusted kernel command line.
 pub const REMOTE_CACHE_DRIVE_MAGIC: &[u8] = b"MOTORCACHE\0\x01";
+pub const REMOTE_CACHE_DRIVE_NONCE_BYTES: usize = 16;
+pub const REMOTE_CACHE_NONCE_CMDLINE_KEY: &str = "motor.cache_nonce";
 pub const REMOTE_CACHE_DRIVE_MAX_BYTES: usize = 3 * 65536 + 1024;
 
 /// Trusted control-channel provisioning, never a job frame. Deliberately not
