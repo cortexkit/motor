@@ -903,7 +903,7 @@ pub(crate) fn protect_vmm_with(
     check().map_err(|error| crate::tenant::start_refused(StartRefusalCase::Oom, error))
 }
 
-fn connect_relay(root: &Path, port: u32) -> Result<OwnedFd> {
+pub(super) fn connect_relay(root: &Path, port: u32) -> Result<OwnedFd> {
     crate::tenant::validate_port(port)?;
     let context = |step: &str, error: &dyn std::fmt::Display| {
         Error(format!(
@@ -1122,7 +1122,7 @@ fn cgroup_limits(r: &Registry, mems: String) -> Result<[(&'static str, String); 
         ("io.weight", format!("default {}", r.io_weight)),
     ])
 }
-fn bind(file: &File, target: &Path, readonly: bool) -> Result<()> {
+pub(super) fn bind(file: &File, target: &Path, readonly: bool) -> Result<()> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1151,7 +1151,7 @@ fn bind(file: &File, target: &Path, readonly: bool) -> Result<()> {
 fn chown_path(path: &Path, uid: u32) -> Result<()> {
     fs::chown(&File::open(path)?, uid)
 }
-fn cleanup_boundary(boundary: &Path) -> Result<()> {
+pub(super) fn cleanup_boundary(boundary: &Path) -> Result<()> {
     if !boundary.exists() {
         return Ok(());
     }
@@ -1169,7 +1169,7 @@ fn cleanup_boundary(boundary: &Path) -> Result<()> {
     std::fs::remove_dir_all(boundary)?;
     Ok(())
 }
-fn wait_empty(group: &Path) -> Result<()> {
+pub(super) fn wait_empty(group: &Path) -> Result<()> {
     let end = std::time::Instant::now() + Duration::from_secs(10);
     while !std::fs::read_to_string(group.join("cgroup.procs"))?
         .trim()
@@ -1214,7 +1214,7 @@ fn remove_running_marker(path: &Path) -> Result<()> {
     File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
 }
-fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("pending");
     let mut file = OpenOptions::new()
         .write(true)

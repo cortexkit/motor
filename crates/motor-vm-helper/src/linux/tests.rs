@@ -61,6 +61,7 @@ fn capacity_machine(base: &Path) -> LinuxMachine {
     config.hugepages_per_slot = 4;
     let tenants =
         crate::tenant::Controller(tenant::LinuxTenants::new(&config, base.join("cgroups")));
+    let jobs = job::LinuxJobs::new(&config);
     LinuxMachine {
         config,
         base: File::open(base).unwrap(),
@@ -70,6 +71,7 @@ fn capacity_machine(base: &Path) -> LinuxMachine {
         },
         running: BTreeMap::new(),
         tenants,
+        jobs,
     }
 }
 
@@ -512,6 +514,7 @@ fn cgroup_placement_service() {
     settings.slots = vec![config];
     let tenants =
         crate::tenant::Controller(tenant::LinuxTenants::new(&settings, groups.root.clone()));
+    let jobs = job::LinuxJobs::new(&settings);
     let machine = LinuxMachine {
         config: settings,
         base: File::open(&base).unwrap(),
@@ -519,6 +522,7 @@ fn cgroup_placement_service() {
         cgroups: groups,
         running: BTreeMap::new(),
         tenants,
+        jobs,
     };
     let mut helper = crate::Helper::new(machine, 1, vec![1000]).unwrap();
     assert!(!child.wait().unwrap().success());

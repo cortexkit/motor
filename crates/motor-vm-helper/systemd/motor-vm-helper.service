@@ -15,8 +15,8 @@ Delegate=yes
 DelegateSubgroup=helper
 # Tenant VMs run in this unit's cgroup. SIGTERM goes only to the helper, which
 # stops each running tenant cleanly (guest drain, sync and freeze, then the
-# VMM) and exits. systemd then SIGKILLs whatever is left in the cgroup: job
-# VMs, and any tenant the helper recorded as unclean.
+# VMM) and exits. systemd then SIGKILLs legacy slot VMs and any tenant recorded
+# as unclean. Cold-booted job VMs live in motorvm.slice and survive this stop.
 KillMode=mixed
 # The helper serves one request at a time. Shutdown may first wait for one
 # tenant's in-flight stop or suspend, whose host reply budget is 600 s. It then

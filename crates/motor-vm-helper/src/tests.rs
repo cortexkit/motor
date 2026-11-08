@@ -5,6 +5,7 @@ const NEXT: &str = "00000000-0000-4000-8000-000000000002";
 #[derive(Default)]
 struct Fake {
     running: bool,
+    job_running: bool,
     dirty: bool,
     fail_cleanup: bool,
     fail_reconcile: bool,
@@ -40,6 +41,84 @@ impl Machine for Fake {
     }
     fn alive(&mut self, _: usize) -> bool {
         self.running
+    }
+    fn job(&mut self, op: job::Operation, _: Peer) -> Result<Response> {
+        match op {
+            job::Operation::Start(_) => self.job_running = true,
+            job::Operation::Stop(_) => self.job_running = false,
+            _ => {}
+        }
+        Ok(Response::new(Reply::Job {
+            running: self.job_running,
+            vmm_pid: None,
+        }))
+    }
+}
+
+#[test]
+fn job_vm_survives_connection_loss_and_is_adopted_on_another_connection() {
+    let (mut helper, connection, other) = fixture();
+    let start = serde_json::json!({"op":"start_job", "job_id":JOB, "account":"a",
+        "workspace_disk_id":"workspace-1", "image_generation_id":"gen-1", "vcpus":7,
+        "memory_mib":1536, "burst_mib":512});
+    assert!(matches!(
+        request(&mut helper, connection, start).unwrap().reply,
+        Reply::Job { running: true, .. }
+    ));
+    helper.disconnect(connection);
+    helper.maintain();
+    assert!(matches!(
+        request(
+            &mut helper,
+            other,
+            serde_json::json!({"op":"adopt_job", "job_id":JOB})
+        )
+        .unwrap()
+        .reply,
+        Reply::Job { running: true, .. }
+    ));
+    assert_eq!(helper.machine.calls, ["reconcile"]);
+}
+
+#[test]
+fn job_vm_invalid_identity_or_paths_never_reach_machine() {
+    let (mut helper, connection, _) = fixture();
+    let start = serde_json::json!({"op":"start_job", "job_id":JOB, "account":"a",
+        "workspace_disk_id":"../a", "image_generation_id":"gen-1", "vcpus":7,
+        "memory_mib":1536});
+    assert!(request(&mut helper, connection, start.clone()).is_err());
+    let mut extra = start;
+    extra["workspace_disk_id"] = serde_json::json!("workspace-1");
+    extra["rootfs"] = serde_json::json!("/etc/shadow");
+    assert!(serde_json::from_value::<Request>(extra).is_err());
+    assert!(!helper.machine.job_running);
+}
+
+#[test]
+fn job_vm_settings_require_a_separate_uid_range_and_a_slice_ceiling() {
+    let mut config: config::Config =
+        serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();
+    config.job_vms = Some(config::JobVms {
+        uid_base: 500000,
+        uid_count: 128,
+        memory_max_bytes: 1073741824,
+    });
+    config.validate_resources().unwrap();
+    for (base, count, ceiling) in [
+        (500000, 128, 0),
+        (500000, 128, 1),
+        (500000, 0, 1073741824),
+        (400000, 128, 1073741824),
+        (config.uid_base, 128, 1073741824),
+        (config.job_account_range.base, 128, 1073741824),
+        (u32::MAX, 2, 1073741824),
+    ] {
+        config.job_vms = Some(config::JobVms {
+            uid_base: base,
+            uid_count: count,
+            memory_max_bytes: ceiling,
+        });
+        assert!(config.validate_resources().is_err());
     }
 }
 fn fixture() -> (Helper<Fake>, u64, u64) {

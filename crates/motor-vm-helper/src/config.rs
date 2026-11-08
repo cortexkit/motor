@@ -28,7 +28,19 @@ pub struct UidRange {
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct JobVms {
+    pub uid_base: u32,
+    pub uid_count: u32,
+    /// Aggregate ceiling leaves memory reserved for host services. VM leaves
+    /// deliberately have no memory limit, so account-shared persistent-memory
+    /// (virtio-pmem) image pages are not reclaimed against one VM's limit.
+    pub memory_max_bytes: u64,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub job_vms: Option<JobVms>,
     #[serde(default)]
     pub uplink: String,
     #[serde(default = "missing_public_ipv4")]
@@ -88,6 +100,32 @@ impl Config {
             .base
             .checked_add(self.job_account_range.count)
             .ok_or_else(|| Error("job account uid range overflow".into()))?;
+        if let Some(jobs) = &self.job_vms {
+            let jobs_end = jobs
+                .uid_base
+                .checked_add(jobs.uid_count)
+                .ok_or_else(|| Error("job VMM uid range overflow".into()))?;
+            if jobs.uid_base == 0
+                || jobs.uid_count == 0
+                || jobs.memory_max_bytes == 0
+                || jobs.memory_max_bytes % 4096 != 0
+                || [
+                    (self.uid_base, end),
+                    (self.job_account_range.base, job_end),
+                    (400000, 400256),
+                ]
+                .iter()
+                .any(|(base, end)| jobs.uid_base < *end && *base < jobs_end)
+                || self
+                    .allowed_uids
+                    .iter()
+                    .any(|uid| (jobs.uid_base..jobs_end).contains(uid))
+            {
+                return Err(Error(
+                    "invalid or overlapping job VMM uid range or memory ceiling".into(),
+                ));
+            }
+        }
         if count == 0
             || self.allowed_uids.is_empty()
             || self.uid_base == 0

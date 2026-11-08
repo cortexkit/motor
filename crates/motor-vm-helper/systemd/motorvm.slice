@@ -1,0 +1,7 @@
+[Unit]
+Description=Motor job virtual machines (independent of the helper service)
+
+[Slice]
+MemoryAccounting=yes
+CPUAccounting=yes
+# The helper installs the required host-specific MemoryMax before any VM starts.
