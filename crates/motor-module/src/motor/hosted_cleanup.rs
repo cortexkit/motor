@@ -61,7 +61,7 @@ impl Motor {
     }
 
     #[cfg(test)]
-    pub(super) async fn wait_hosted_cleanup(&self, id: Uuid) {
+    pub(crate) async fn wait_hosted_cleanup(&self, id: Uuid) {
         let task = self
             .hosted_cleanup
             .tasks
@@ -264,8 +264,7 @@ impl Motor {
         } else {
             let mut terminal = state.terminal.clone().unwrap_or_else(|| {
                 let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                    .with_ran(Ran::Unknown("maybe".into()))
-                    .with_refusal_detail("hosted stream disconnected before terminal");
+                    .with_ran(Ran::Unknown("maybe".into()));
                 terminal.wall_ms = state.elapsed_ms();
                 terminal
             });

@@ -959,9 +959,31 @@ impl Storage {
         id: Uuid,
         owner_live: bool,
     ) -> io::Result<()> {
+        self.record_cancel_acknowledged(id, owner_live, false)
+    }
+
+    pub(crate) fn cancel_terminal_wait_expired(&self, id: Uuid) -> io::Result<()> {
+        self.record_cancel_acknowledged(id, false, true)
+    }
+
+    fn record_cancel_acknowledged(
+        &self,
+        id: Uuid,
+        owner_live: bool,
+        wait_expired: bool,
+    ) -> io::Result<()> {
         self.update(|s| {
-            let streamed = owner_live || s.active_jobs.contains_key(&id);
+            let streamed = !wait_expired && (owner_live || s.active_jobs.contains_key(&id));
             let job = s.jobs.entry(id).or_default();
+            // A real terminal may win the timeout race. Only the still-unresolved
+            // acknowledgment permits settling without an execution result.
+            if wait_expired
+                && !job
+                    .hosted_route()
+                    .is_some_and(|state| state.awaiting_cancel_terminal())
+            {
+                return;
+            }
             if job.build_server_job_id.is_none() {
                 if let Some(hosted) = job.hosted.as_mut() {
                     if !hosted.finish_done && hosted.terminal.is_none() {
@@ -980,6 +1002,7 @@ impl Storage {
                     // unchanged, so retain its acknowledgment in the finish body
                     // even when an attach is active.
                     if (!streamed || !hosted.awaiting_cancel_terminal())
+                        && !hosted.has_real_terminal()
                         && !hosted.finish_done
                         && hosted.pending_finish.is_none()
                         && hosted

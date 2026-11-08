@@ -50,6 +50,8 @@ struct Runner {
     fail_cancel: AtomicBool,
     output_records: AtomicUsize,
     fail_reattach: AtomicBool,
+    /// Simulate acknowledgment-only cancellation: Attach stays open without a result.
+    withhold_terminal: AtomicBool,
 }
 
 impl Connector for Runner {
@@ -76,6 +78,7 @@ impl Connector for Runner {
         let fail_cancel = self.fail_cancel.load(Ordering::SeqCst);
         let output_records = self.output_records.load(Ordering::SeqCst);
         let fail_reattach = self.fail_reattach.load(Ordering::SeqCst);
+        let withhold_terminal = self.withhold_terminal.load(Ordering::SeqCst);
         Box::pin(async move {
             if attempt > 0 && fail_reattach {
                 return Err(io::Error::other("replay connection unavailable"));
@@ -310,6 +313,14 @@ impl Connector for Runner {
                         }
                         Frame::Attach(_) => {
                             attaches.fetch_add(1, Ordering::SeqCst);
+                            if withhold_terminal {
+                                while read_frame_async(&mut server)
+                                    .await
+                                    .is_ok_and(|frame| frame.is_some())
+                                {
+                                }
+                                return;
+                            }
                             if branch == Branch::UploadCancelled {
                                 // Only the connection that sent Run has the final
                                 // records ready. A new Attach connection closes
@@ -458,6 +469,7 @@ impl Harness {
             fail_cancel: AtomicBool::new(false),
             output_records: AtomicUsize::new(0),
             fail_reattach: AtomicBool::new(false),
+            withhold_terminal: AtomicBool::new(false),
         });
         Self {
             broker,
@@ -771,6 +783,7 @@ async fn acknowledged_cancel_after_started_and_restart_retains_elapsed_time() {
     }
 
     let h = Harness::new(Branch::Running).await;
+    h.runner.withhold_terminal.store(true, Ordering::SeqCst);
     let started = now_ms() - 70 * 60 * 1000;
     h.runner.started_at_ms.store(started, Ordering::SeqCst);
     let mut job = Job::running(&h).await;
@@ -818,6 +831,7 @@ async fn concurrent_hosted_cancels_and_finish_share_acknowledged_result() {
     use std::{future::Future, task::Poll};
 
     let h = Harness::new(Branch::Running).await;
+    h.runner.withhold_terminal.store(true, Ordering::SeqCst);
     let job = Job::running(&h).await;
     let (motor, scratch, id) = detach_running(&h, job).await;
     motor.shutdown_hosted().await;

@@ -2050,7 +2050,13 @@ impl Motor {
         match channel.next().await? {
             Incoming::Frame(Frame::CancelReply(reply)) if reply.job_id == build_server_id => {
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "runner acknowledged cancel");
-                self.storage.cancel_acknowledged(id)
+                let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+                self.storage
+                    .cancel_acknowledged_with_owner(id, owner.is_some())?;
+                if let Some(owner) = owner {
+                    owner.wake.send_replace(true);
+                }
+                Ok(())
             }
             Incoming::Frame(Frame::Refusal(refusal)) if refusal.job_id == Some(build_server_id) => {
                 Err(io::Error::other(
@@ -2243,8 +2249,7 @@ impl Motor {
             .ok_or_else(|| io::Error::other("missing hosted route"))?;
         let mut terminal = state.terminal.clone().unwrap_or_else(|| {
             let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                .with_ran(Ran::Unknown("maybe".into()))
-                .with_refusal_detail("hosted stream disconnected before terminal");
+                .with_ran(Ran::Unknown("maybe".into()));
             terminal.wall_ms = state.elapsed_ms();
             terminal
         });
@@ -2527,6 +2532,24 @@ impl Motor {
                         + Duration::from_secs(deadline.saturating_sub(crate::hosted::now_s()))
                 });
         loop {
+            if hosted_terminal_deadline.is_none()
+                && self
+                    .hosted_state(id)
+                    .is_some_and(|state| state.awaiting_cancel_terminal())
+            {
+                // CancelReply can arrive on a separate delivery connection.
+                // Its wake starts the same bounded real-terminal wait here.
+                hosted_terminal_deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_secs(30));
+            }
+            let cancel_deadline = hosted_terminal_deadline.filter(|_| {
+                self.hosted_state(id)
+                    .is_some_and(|state| state.awaiting_cancel_terminal())
+            });
+            if cancel_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                self.storage.cancel_terminal_wait_expired(id)?;
+                return self.finish_hosted(id, false, tx).await.map(|_| false);
+            }
             if let Some(owner) = &owner {
                 if let Some(from) = owner.take_rewind() {
                     if channel.take().is_some() {
@@ -2536,7 +2559,12 @@ impl Motor {
                     }
                     cursor = from;
                     delivery_cursor = from;
-                    hosted_terminal_deadline = None;
+                    if !self
+                        .hosted_state(id)
+                        .is_some_and(|state| state.awaiting_cancel_terminal())
+                    {
+                        hosted_terminal_deadline = None;
+                    }
                 }
                 owner.live(channel.is_some());
             }
@@ -2604,7 +2632,22 @@ impl Motor {
                 }
                 if hosted {
                     if reattaches > 0 {
-                        tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
+                        let retry_at =
+                            tokio::time::Instant::now() + Duration::from_secs(reconnect_delay);
+                        let retry_at =
+                            cancel_deadline.map_or(retry_at, |deadline| deadline.min(retry_at));
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(retry_at) => {},
+                            changed = wake.changed(), if wake_open => {
+                                if changed.is_err() { wake_open = false; }
+                                continue;
+                            },
+                        }
+                        if cancel_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            continue;
+                        }
                         reconnect_delay = (reconnect_delay * 2).min(30);
                     }
                     reattaches += 1;
@@ -2639,6 +2682,14 @@ impl Motor {
                 );
                 let opened = tokio::select! {
                     result = self.open_job_channel_at(id, now) => result,
+                    _ = async { match cancel_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                        self.storage.cancel_terminal_wait_expired(id)?;
+                        return self.finish_hosted(id, false, tx).await.map(|_| false);
+                    },
+                    changed = wake.changed(), if wake_open => {
+                        if changed.is_err() { wake_open = false; }
+                        continue;
+                    },
                     _ = tx.closed() => {
                         self.log_hosted_failure(id, "reattach", "caller detached");
                         return Err(io::Error::other("caller detached"));
@@ -2734,9 +2785,18 @@ impl Motor {
                         .is_ok()
                     {
                         channel = Some(c);
-                        if hosted && self.hosted_state(id).is_some_and(|s| s.terminal.is_some()) {
-                            hosted_terminal_deadline =
-                                Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                        if let Some(state) = self
+                            .hosted_state(id)
+                            .filter(|state| state.terminal.is_some())
+                        {
+                            if state.awaiting_cancel_terminal() {
+                                hosted_terminal_deadline.get_or_insert(
+                                    tokio::time::Instant::now() + Duration::from_secs(30),
+                                );
+                            } else {
+                                hosted_terminal_deadline =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                            }
                         }
                     }
                 }
@@ -2762,8 +2822,17 @@ impl Motor {
                     return self.finish_hosted(id, false, tx).await.map(|_| false);
                 },
                 _ = async { if let Some(deadline) = hosted_terminal_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => {
+                    if self.hosted_state(id).is_some_and(|state| state.awaiting_cancel_terminal()) {
+                        self.storage.cancel_terminal_wait_expired(id)?;
+                        return self.finish_hosted(id, false, tx).await.map(|_| false);
+                    }
                     self.log_hosted_failure(id, "hosted_terminal", "timeout waiting for settlement record");
-                    channel = None; hosted_terminal_deadline = None; None
+                    let collecting_first_party_usage = owner.is_some() && self.hosted_state(id).is_some_and(|state|
+                        state.has_real_terminal() && state.placement.as_ref().is_some_and(|placement| !placement.host.starts_with("boat:")));
+                    if !collecting_first_party_usage {
+                        channel = None;
+                    }
+                    hosted_terminal_deadline = None; None
                 },
                 changed = wake.changed(), if wake_open => { if changed.is_err() { wake_open = false; } None },
                 _ = async { if let Some(deadline) = queue_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if !withdraw_sent => {
@@ -2978,6 +3047,9 @@ impl Motor {
                         }
                         hosted_terminal_deadline =
                             Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                        if let Some(owner) = &owner {
+                            owner.begin_first_party_delivery();
+                        }
                         continue;
                     }
                     // Retain only the terminal summary, not the output stream, so
@@ -3043,8 +3115,8 @@ impl Motor {
                             .unwrap()
                             .send(Frame::Attach(AttachRequest::new(build_server_id, cursor)))
                             .await;
-                        hosted_terminal_deadline =
-                            Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                        hosted_terminal_deadline
+                            .get_or_insert(tokio::time::Instant::now() + Duration::from_secs(30));
                     }
                 }
                 Ok(Incoming::Frame(Frame::Refusal(refusal)))
@@ -3076,7 +3148,13 @@ impl Motor {
                         );
                     }
                     channel = None;
-                    hosted_terminal_deadline = None;
+                    // EOF cannot renew the acknowledgment's real-terminal wait.
+                    if !self
+                        .hosted_state(id)
+                        .is_some_and(|state| state.awaiting_cancel_terminal())
+                    {
+                        hosted_terminal_deadline = None;
+                    }
                     // EOF and write failure wake immediately; only failed
                     // reconnects back off, not the first status query.
                 }

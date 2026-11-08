@@ -29,6 +29,10 @@ pub(crate) struct Boat {
     pub run_refusal: Arc<Mutex<Option<RunRefusal>>>,
     pub connect_host_full: Arc<AtomicUsize>,
     pub fresh_no_capacity: Arc<AtomicUsize>,
+    /// Hold result replay until CancelReply arrives on the separate delivery connection.
+    pub attach_gate: tokio::sync::watch::Sender<bool>,
+    pub attach_outcome: Arc<Mutex<Outcome>>,
+    pub disconnect_replay: Arc<AtomicBool>,
     _http: Http,
     _host: JoinHandle<()>,
 }
@@ -66,6 +70,11 @@ impl Boat {
         let run_count = runs.clone();
         let attach_count = attaches.clone();
         let strict = strict_attach.clone();
+        let (attach_gate, replay_gate) = tokio::sync::watch::channel(true);
+        let attach_outcome = Arc::new(Mutex::new(Outcome::Exit { code: 23 }));
+        let replay_outcome = attach_outcome.clone();
+        let disconnect_replay = Arc::new(AtomicBool::new(false));
+        let close_replay = disconnect_replay.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = host.accept().await {
                 let runs = run_count.clone();
@@ -76,6 +85,9 @@ impl Boat {
                 let host_full = host_full.clone();
                 let ran = ran.clone();
                 let frames = captured.clone();
+                let mut replay_gate = replay_gate.clone();
+                let replay_outcome = replay_outcome.clone();
+                let close_replay = close_replay.clone();
                 tokio::spawn(async move {
                     let Ok(motor_lease::Prelude::LeaseHello {
                         token,
@@ -218,13 +230,27 @@ impl Boat {
                             }
                             Frame::Attach(request) => {
                                 assert_eq!(claims.purpose, Purpose::Attach);
+                                frames.lock().unwrap().push(Frame::Attach(request.clone()));
                                 attaches.fetch_add(1, Ordering::SeqCst);
+                                if close_replay.load(Ordering::SeqCst) {
+                                    return;
+                                }
                                 if strict.load(Ordering::SeqCst)
                                     && !ran.lock().unwrap().contains(&id)
                                 {
                                     return;
                                 }
-                                send_result(&mut socket, id, request.from_seq).await;
+                                if replay_gate.wait_for(|open| *open).await.is_err() {
+                                    return;
+                                }
+                                let outcome = replay_outcome.lock().unwrap().clone();
+                                send_result_with_outcome(
+                                    &mut socket,
+                                    id,
+                                    request.from_seq,
+                                    outcome,
+                                )
+                                .await;
                                 return;
                             }
                             Frame::Cancel(request) => {
@@ -341,6 +367,9 @@ impl Boat {
             run_refusal,
             connect_host_full,
             fresh_no_capacity,
+            attach_gate,
+            attach_outcome,
+            disconnect_replay,
             _http: http,
             _host: task,
         }
@@ -351,6 +380,15 @@ pub(crate) async fn send_result<W: tokio::io::AsyncWrite + Unpin>(
     socket: &mut W,
     id: Uuid,
     from: u64,
+) {
+    send_result_with_outcome(socket, id, from, Outcome::Exit { code: 23 }).await;
+}
+
+async fn send_result_with_outcome<W: tokio::io::AsyncWrite + Unpin>(
+    socket: &mut W,
+    id: Uuid,
+    from: u64,
+    outcome: Outcome,
 ) {
     if from == 0 {
         write_frame_async(
@@ -366,9 +404,7 @@ pub(crate) async fn send_result<W: tokio::io::AsyncWrite + Unpin>(
     }
     write_frame_async(
         socket,
-        &Frame::Terminal(
-            TerminalRecord::new(id, Outcome::Exit { code: 23 }, 0, 125, 0).with_ran(Ran::Remote),
-        ),
+        &Frame::Terminal(TerminalRecord::new(id, outcome, 0, 125, 0).with_ran(Ran::Remote)),
     )
     .await
     .unwrap();

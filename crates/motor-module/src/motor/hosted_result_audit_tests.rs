@@ -870,6 +870,87 @@ async fn audit_12_streamed_terminal_waits_for_usage_before_consuming_cancel() {
     motor.close().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn first_party_result_is_published_while_same_owner_collects_late_usage() {
+    let (_root, motor, id) = fixture();
+    let (release, ready) = tokio::sync::watch::channel(false);
+    let channel = Channel::open(&TerminalBeforeUsage(ready), id)
+        .await
+        .unwrap();
+    let owner = motor.reserve_hosted_result(id, 0);
+    let (mut caller, caller_tx, _) = motor.stream(id);
+    motor.subscribe_hosted_result(id, owner.clone(), 0, false, caller_tx);
+    let (tx, records) = mpsc::channel(32);
+    let producer = {
+        let motor = motor.clone();
+        let owner = owner.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            motor
+                .follow(id, 0, Some(channel), &tx, owner.wake.subscribe())
+                .await
+                .unwrap();
+        })
+    };
+    motor.collect_hosted_result(id, owner.clone(), tx, records, producer);
+    let terminal = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if let StreamRecord::Terminal(terminal) = caller.records.recv().await.unwrap().unwrap()
+            {
+                break terminal;
+            }
+        }
+    })
+    .await
+    .expect("real terminal publication must not wait for billing");
+    assert_eq!(terminal, real_terminal(id));
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        crate::BillingStatus::Pending
+    );
+    assert!(!*owner.stopped.borrow());
+    assert!(
+        owner.state.lock().unwrap().live,
+        "publication must retain the live usage connection"
+    );
+    drop(caller);
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), owner.wait_stopped())
+        .await
+        .unwrap();
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        crate::BillingStatus::Available
+    );
+    assert_eq!(motor.hosted_state(id).unwrap().billed_vcpu_ms, Some(1));
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn late_cancel_ack_cannot_replace_an_already_observed_exit_finish() {
+    let (_root, motor, id) = fixture();
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.placement.as_mut().unwrap().host = "boat:test".into();
+        })
+        .unwrap();
+    motor
+        .persist_hosted_terminal(id, real_terminal(id))
+        .unwrap();
+    motor
+        .storage
+        .cancel_acknowledged_with_owner(id, true)
+        .unwrap();
+    let state = motor.hosted_state(id).unwrap();
+    assert_eq!(state.terminal.unwrap(), real_terminal(id));
+    assert!(
+        state.pending_finish.is_none(),
+        "a late acknowledgment must not install a cancelled finish over the real exit"
+    );
+    motor.close().await;
+}
+
 impl crate::Connector for SilentStatus {
     fn connect(
         &self,

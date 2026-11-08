@@ -25,6 +25,7 @@ struct State {
     next_subscriber: u64,
     subscriber_errors: HashMap<u64, String>,
     boat_drain: Option<(tokio::time::Instant, Vec<u64>)>,
+    first_party_delivery_at: Option<tokio::time::Instant>,
     accepted: Option<Accepted>,
     terminal: Option<TerminalRecord>,
     reply: Option<JobStatusReply>,
@@ -70,6 +71,7 @@ impl Owner {
                 next_subscriber: 0,
                 subscriber_errors: HashMap::new(),
                 boat_drain: None,
+                first_party_delivery_at: None,
                 accepted: None,
                 terminal: None,
                 reply: None,
@@ -103,7 +105,10 @@ impl Owner {
         }
         match record {
             Ok(StreamRecord::Accepted(accepted)) => state.accepted = Some(accepted),
-            Ok(StreamRecord::Terminal(terminal)) => state.terminal = Some(terminal),
+            Ok(StreamRecord::Terminal(terminal)) => {
+                state.terminal = Some(terminal);
+                state.first_party_delivery_at = None;
+            }
             Ok(record) => {
                 state.started |= matches!(record, StreamRecord::Started(_));
                 let bytes = serde_json::to_vec(&record).map_or(RING_BYTES + 1, |s| s.len());
@@ -147,6 +152,7 @@ impl Owner {
         state.cursor = cursor;
         state.finished = false;
         state.terminal = None;
+        state.first_party_delivery_at = None;
         state.error = None;
         Some(cursor)
     }
@@ -161,6 +167,17 @@ impl Owner {
 
     pub(super) fn live(&self, live: bool) {
         self.state.lock().unwrap().live = live;
+    }
+
+    pub(super) fn begin_first_party_delivery(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.terminal.is_none() {
+            state
+                .first_party_delivery_at
+                .get_or_insert(tokio::time::Instant::now() + Duration::from_secs(5));
+        }
+        drop(state);
+        self.changed.send_replace(());
     }
 }
 
@@ -488,7 +505,25 @@ impl Motor {
                     .then(|| state.boat_drain.as_ref().map(|drain| drain.0))
                     .flatten()
                 };
+                let delivery_deadline = {
+                    let state = owner.state.lock().unwrap();
+                    // Publish only after the output preceding the real terminal
+                    // has cleared both the transport and progress-forwarding queues.
+                    (state.rewind.is_none() && state.published_records >= state.ingress_records)
+                        .then_some(state.first_party_delivery_at)
+                        .flatten()
+                };
                 tokio::select! {
+                    _ = async { match delivery_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                        owner.state.lock().unwrap().first_party_delivery_at = None;
+                        if let Some(state) = motor.hosted_state(id).filter(|state| state.has_real_terminal()
+                            && state.placement.as_ref().is_some_and(|placement| !placement.host.starts_with("boat:"))) {
+                            // Non-Boat hosts retain replay independently of billing.
+                            // Deliver the real result while this same owner keeps
+                            // collecting the late usage record on its connection.
+                            owner.publish(Ok(StreamRecord::Terminal(state.terminal.unwrap())));
+                        }
+                    },
                     _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
                         owner.expire_boat_drain();
                         if running {

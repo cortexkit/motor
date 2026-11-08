@@ -653,25 +653,44 @@ async fn hosted_missing_settlement_retries_with_backoff_and_preserves_real_exit_
         "one- then two-second backoff must separate failed settlement replays"
     );
     let state = motor.hosted_state(id).unwrap();
-    assert_eq!(state.terminal.unwrap().outcome, Outcome::Exit { code: 23 });
+    let expected = state.terminal.unwrap();
+    assert_eq!(expected.job_id, id);
+    assert_eq!(expected.outcome, Outcome::Exit { code: 23 });
     assert_eq!(state.billing, BillingStatus::Pending);
-    assert!(
-        matches!(
-            caller.records.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ),
-        "missing settlement must not publish an invented final result"
+    let early = match caller.records.try_recv() {
+        Ok(Ok(StreamRecord::Terminal(terminal))) => {
+            assert_eq!(terminal, expected, "replays must not invent a terminal");
+            assert!(
+                caller.records.try_recv().is_err(),
+                "replays must not duplicate the terminal"
+            );
+            Some(terminal)
+        }
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+        other => panic!("unexpected record during settlement replay: {other:?}"),
+    };
+    let result = if let Some(terminal) = early {
+        terminal
+    } else {
+        let record = tokio::time::timeout(Duration::from_secs(15), caller.records.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let StreamRecord::Terminal(terminal) = record else {
+            panic!("real terminal missing during pending settlement")
+        };
+        terminal
+    };
+    assert_eq!(result, expected);
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        BillingStatus::Pending
     );
     motor.expire_hosted_result_for_test(id);
-    let record = tokio::time::timeout(Duration::from_secs(15), caller.records.recv())
+    tokio::time::timeout(Duration::from_secs(15), motor.wait_hosted_cleanup(id))
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
-    let StreamRecord::Terminal(result) = record else {
-        panic!("terminal missing after true expiry")
-    };
-    assert_eq!(result.outcome, Outcome::Exit { code: 23 });
     assert_eq!(
         motor.hosted_state(id).unwrap().billing,
         BillingStatus::Unavailable
@@ -679,6 +698,10 @@ async fn hosted_missing_settlement_retries_with_backoff_and_preserves_real_exit_
     assert_eq!(h.attach_lifecycle.borrow().2, 3);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(
+        caller.records.try_recv().is_err(),
+        "settlement must not deliver a second terminal"
+    );
     let replay = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
     assert_eq!(replay, result);
     drop(caller);

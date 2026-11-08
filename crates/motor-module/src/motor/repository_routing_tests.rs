@@ -138,7 +138,7 @@ async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_
     assert_eq!(bodies[0]["allow_spill"], false);
     assert_eq!(bodies[0]["avoid_host"], serde_json::Value::Null);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
-    drop(motor);
+    motor.close().await;
 
     let restored = Motor::with_connector(Config { ..h.config() }, &root, ssh.clone()).unwrap();
     let state = restored.hosted_state(id).unwrap();
