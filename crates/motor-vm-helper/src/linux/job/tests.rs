@@ -213,6 +213,31 @@ fn job_vmm_oom_score_is_read_back_above_host_and_helper() {
 }
 
 #[test]
+fn job_child_is_placed_before_exec() {
+    let base = scratch();
+    let path = base.join("procs-written-before-exec");
+    let procs = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let mut command = Command::new("/bin/sleep");
+    command
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(move || super::super::raw_place(procs.as_raw_fd()));
+    }
+    let child = command.spawn().unwrap();
+    let _vmm = Vmm { child, base };
+    // spawn returns only after the exec handshake. Placement must have happened
+    // before the guest executable could process even one request.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "0");
+}
+
+#[test]
 fn final_oom_evidence_is_not_invented() {
     let base = scratch();
     assert!(read_oom_kill(&base).is_err());
@@ -241,6 +266,46 @@ impl Drop for ServiceResources {
             .args(["stop", "motorvmtest.slice"])
             .status();
         let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+#[cfg(feature = "linux-service-tests")]
+fn slice_state(point: &str) {
+    let output = Command::new("systemctl")
+        .args([
+            "show",
+            "motorvmtest.slice",
+            "-p",
+            "ActiveState,SubState,Delegate",
+        ])
+        .output()
+        .unwrap();
+    eprintln!(
+        "{point}: systemctl show motorvmtest.slice: status={}\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(feature = "linux-service-tests")]
+fn child_placement(point: &str, pid: u32) {
+    eprintln!(
+        "{point}: pid={pid} cgroup={:?}",
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    );
+}
+
+#[cfg(feature = "linux-service-tests")]
+fn wait_for_file(path: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -275,7 +340,12 @@ fn isolated_job_vmm_survives_helper_service_restart() {
             let binary = base.join("firecracker");
             std::fs::copy("/bin/sleep", &binary).unwrap();
             let mut command = Command::new(binary);
-            command.arg("300");
+            command
+                .arg("300")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .env_clear();
             unsafe {
                 command.pre_exec(move || {
                     super::super::raw_place(procs.as_raw_fd())?;
@@ -292,13 +362,21 @@ fn isolated_job_vmm_survives_helper_service_restart() {
             // jailer's Firecracker child; the test needs no guest image.
             jobs.save(&record).unwrap();
             let child = command.spawn().unwrap();
+            child_placement("inner immediately after move", child.id());
             set_job_oom_score(
                 child.id(),
                 read_oom_score(std::process::id()).unwrap(),
                 read_oom_score(std::process::id()).unwrap(),
             )
             .unwrap();
-            std::fs::write(base.join("pid"), child.id().to_string()).unwrap();
+            tenant::durable_write(&base.join("pid"), child.id().to_string().as_bytes()).unwrap();
+            let placement =
+                std::fs::read_to_string(format!("/proc/{}/cgroup", child.id())).unwrap();
+            assert!(placement.contains("/motorvmtest.slice/job-"), "{placement}");
+            assert!(
+                !placement.contains("motor-vm-helper-job-test.service"),
+                "{placement}"
+            );
             jobs.children.insert(record.start.job_id.clone(), child);
             jobs.adopt_record(record).unwrap();
             assert_eq!(
@@ -316,6 +394,14 @@ fn isolated_job_vmm_survives_helper_service_restart() {
             assert!(std::fs::read_to_string("/proc/self/cgroup")
                 .unwrap()
                 .contains("/motor-vm-helper-job-test.service/helper"));
+            wait_for_file(&base.join("allow-helper-exit"));
+            let child = jobs.children.get_mut(&start().job_id).unwrap();
+            eprintln!(
+                "inner before exit: child try_wait={:?}",
+                child.try_wait().unwrap()
+            );
+            slice_state("inner before service exit");
+            child_placement("inner immediately before service exit", child.id());
         } else {
             jobs.reconcile().unwrap();
             let expected: u32 = std::fs::read_to_string(base.join("pid"))
@@ -330,8 +416,9 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     }
     let base = scratch();
     // Ancestors of helper-owned records must already be root-controlled. The
-    // operator must set the shared test scratch root so its ancestors are also
-    // root-controlled for this service restart test.
+    // operator must set a root-controlled, uid-traversable shared scratch root
+    // such as TMPDIR=/var/lib/motor-root-tests for this service restart test.
+    // A path below /root prevents the dropped-uid child from executing.
     for ancestor in base.ancestors() {
         fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor).unwrap()).unwrap();
     }
@@ -368,12 +455,13 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         })
         .collect();
     for phase in ["start", "adopt"] {
-        assert!(Command::new("systemd-run")
+        slice_state(&format!("outer before {phase} service"));
+        let mut service = Command::new("systemd-run")
             .args([
                 "--wait",
                 "--pipe",
                 "--collect",
-                "--unit=motor-vm-helper-job-test"
+                "--unit=motor-vm-helper-job-test",
             ])
             .args(&properties)
             .arg(format!("--setenv=MOTOR_VM_JOB_TEST_PHASE={phase}"))
@@ -383,13 +471,83 @@ fn isolated_job_vmm_survives_helper_service_restart() {
             ))
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
-            .status()
-            .unwrap()
-            .success());
+            .spawn()
+            .unwrap();
+        wait_for_file(&base.join("pid"));
         let pid: u32 = std::fs::read_to_string(base.join("pid"))
             .unwrap()
             .parse()
             .unwrap();
+        // A pidfd observes exit without confusing a reused pid for the VMM.
+        // waitid may report ECHILD because systemd, not this test, is its reaper.
+        use std::os::fd::FromRawFd;
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+        assert!(
+            pidfd >= 0,
+            "pidfd_open: {}",
+            std::io::Error::last_os_error()
+        );
+        let pidfd = unsafe { File::from_raw_fd(pidfd) };
+        if phase == "start" {
+            child_placement("outer while inner helper is alive", pid);
+            slice_state("outer immediately before allowing inner helper exit");
+            std::fs::write(base.join("allow-helper-exit"), "1").unwrap();
+        }
+        assert!(service.wait().unwrap().success());
+        slice_state(&format!("outer after {phase} service exit"));
+        child_placement("outer after service exit", pid);
+        let mut event = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut event, 1, 0) } >= 0);
+        eprintln!("outer pidfd exit readiness: {}", event.revents);
+        if event.revents != 0 {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    pidfd.as_raw_fd() as u32,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                eprintln!(
+                    "outer child exit: code={} status={}",
+                    info.si_code,
+                    unsafe { info.si_status() }
+                );
+            } else {
+                eprintln!(
+                    "outer cannot reap child exit status: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let journal = Command::new("journalctl")
+                .args([
+                    "--no-pager",
+                    "-n",
+                    "30",
+                    "-u",
+                    "motorvmtest.slice",
+                    "-u",
+                    "motor-vm-helper-job-test.service",
+                ])
+                .output()
+                .unwrap();
+            eprintln!(
+                "job test unit journal:\n{}",
+                String::from_utf8_lossy(&journal.stdout)
+            );
+            eprintln!(
+                "job cgroup memory.events after exit: {:?}",
+                std::fs::read_to_string(
+                    Path::new(SLICE).join(format!("job-{}/memory.events", start().job_id))
+                )
+            );
+        }
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
         let placement = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
         assert!(placement.contains("/motorvmtest.slice/job-"));
