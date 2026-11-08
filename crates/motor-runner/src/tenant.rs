@@ -106,7 +106,13 @@ impl EventLog {
         self.update(|s| s.push(TenantEventKind::Refused, Some(id), Some(cause)))
     }
     #[cfg(any(target_os = "linux", test))]
-    pub(crate) fn sample(&self, sample: MemorySample) {
+    pub(crate) fn sample(&self, sample: MemorySample, accepted_burst_mib: Option<u64>) {
+        // Older hosts reject non-lifecycle frames on this channel. Accepting
+        // burst is the host's opt-in to receiving memory-sample frames; legacy
+        // leases must keep their original lifecycle-only stream.
+        if accepted_burst_mib.is_none() {
+            return;
+        }
         self.samples.lock().unwrap().insert(sample.jti, sample);
     }
     #[cfg(any(target_os = "linux", test))]

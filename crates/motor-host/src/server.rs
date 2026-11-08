@@ -703,6 +703,11 @@ impl Runtime {
                         if observation.boundary(&frame)? {
                             continue;
                         }
+                        // Optional memory telemetry must not interrupt sequenced
+                        // lifecycle delivery or change its acknowledgments.
+                        if frame["type"] == "memory_sample" {
+                            continue;
+                        }
                         ensure!(frame["type"] == "event", "invalid lifecycle frame");
                         let event: motor_protocol::TenantEvent = serde_json::from_value(frame)?;
                         if let Some(phase) = &event.setup {

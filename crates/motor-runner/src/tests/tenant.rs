@@ -859,6 +859,67 @@ async fn tenant_event_replay_boundary_precedes_backlog_and_excludes_later_events
 }
 
 #[tokio::test]
+async fn tenant_no_burst_job_keeps_event_channel_lifecycle_only() {
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (mut request, _) = f.run("true");
+    request.weight_hint = Some(2);
+    request.timeout = Some(30);
+    let id = request.job_id;
+    let (mut caller, caller_task) = connect(&runner, lease(id, LeasePurpose::Run)).await;
+    motor_protocol::write_frame_async(&mut caller, &Frame::Run(request))
+        .await
+        .unwrap();
+    assert!(matches!(frame(&mut caller).await, Some(Frame::Accepted(_))));
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(job.memory_burst_mib, None);
+    pending(&runner);
+
+    let log = runner.tenant_events().unwrap();
+    log.refused(Uuid::now_v7(), RefusedCause::Disconnect)
+        .unwrap();
+    let first = log.first().unwrap();
+    log.sample(
+        motor_protocol::MemorySample {
+            jti: id,
+            mem_working_peak_mib: Some(123),
+            mem_over_mib_ms: None,
+        },
+        job.memory_burst_mib,
+    );
+    log.refused(Uuid::now_v7(), RefusedCause::Mismatch).unwrap();
+    let (mut client, server) = tokio::io::duplex(4096);
+    let r = runner.clone();
+    let task = tokio::spawn(async move { crate::tenant::event_session(&r, server).await });
+    assert_eq!(frame(&mut client).await, Some(Frame::Event(first.clone())));
+    motor_protocol::write_frame_async(
+        &mut client,
+        &Frame::Ack {
+            event_seq: first.event_seq,
+        },
+    )
+    .await
+    .unwrap();
+    let Some(Frame::Event(second)) = frame(&mut client).await else {
+        panic!("expected the next lifecycle event, not a memory sample")
+    };
+    assert_eq!(second.event_seq, first.event_seq + 1);
+    assert_eq!(second.cause, Some(RefusedCause::Mismatch));
+    motor_protocol::write_frame_async(
+        &mut client,
+        &Frame::Ack {
+            event_seq: second.event_seq,
+        },
+    )
+    .await
+    .unwrap();
+    drop(client);
+    assert!(task.await.unwrap().is_err());
+    drop(caller);
+    caller_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn tenant_memory_samples_flow_during_unacked_lifecycle_and_final_values_survive_reopen() {
     use motor_protocol::MemorySample;
     let f = Fixture::new();
@@ -876,7 +937,7 @@ async fn tenant_memory_samples_flow_during_unacked_lifecycle_and_final_values_su
             mem_working_peak_mib: Some(3),
             mem_over_mib_ms: over,
         };
-        log.sample(sample.clone());
+        log.sample(sample.clone(), Some(1));
         assert_eq!(frame(&mut client).await, Some(Frame::MemorySample(sample)));
     }
     assert_eq!(

@@ -9537,17 +9537,21 @@ impl Runner {
             if let Some(job) = inner.jobs.get(&id) {
                 if let Some(unit) = job.process.and_then(|process| process.unit) {
                     let events = self.core.tenant_events.as_ref().map(Arc::downgrade);
+                    let accepted_burst_mib = job.memory_burst_mib;
                     job.mem_working_peak_mib.start(
                         &self.core.backend.unit_name(&self.core.config, unit),
                         job.memory_stated_mib,
                         job.mem_over_mib_ms.clone(),
                         move |peak, over| {
                             if let Some(log) = events.as_ref().and_then(|events| events.upgrade()) {
-                                log.sample(motor_protocol::MemorySample {
-                                    jti: id,
-                                    mem_working_peak_mib: peak,
-                                    mem_over_mib_ms: over,
-                                });
+                                log.sample(
+                                    motor_protocol::MemorySample {
+                                        jti: id,
+                                        mem_working_peak_mib: peak,
+                                        mem_over_mib_ms: over,
+                                    },
+                                    accepted_burst_mib,
+                                );
                             }
                         },
                     );

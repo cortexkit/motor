@@ -16,6 +16,7 @@ struct Fake {
     quota_ceiling: Mutex<Option<u32>>,
     calls: Mutex<Vec<String>>,
     peers: Mutex<Vec<UnixStream>>,
+    lifecycle: Mutex<Option<UnixStream>>,
     /// The helper refuses every start with this case.
     refuse_start: Mutex<Option<&'static str>>,
     recovery_timeout: Mutex<bool>,
@@ -68,6 +69,11 @@ impl Control for Fake {
         self.calls.lock().unwrap().push(format!("relay:{port}"));
         if port == 52 && *self.fail.lock().unwrap() == Some("relay") {
             bail!("vsock connect failed: diagnostic canary");
+        }
+        if port == 53 {
+            if let Some(stream) = self.lifecycle.lock().unwrap().take() {
+                return Ok(stream);
+            }
         }
         if port != 52 {
             bail!("no lifecycle stream in this fixture");
@@ -411,6 +417,67 @@ async fn burst_token_keeps_verified_job_memory_limit_at_mem_mib() {
     drop(client);
     let _ = task.await.unwrap();
     runtime.host.lock().unwrap().guest_unready("tenant");
+}
+
+#[tokio::test]
+async fn lifecycle_memory_sample_between_events_keeps_channel_and_acknowledgments() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (host_events, guest_events) = UnixStream::pair().unwrap();
+    *fake.lifecycle.lock().unwrap() = Some(host_events);
+    guest_events.set_nonblocking(true).unwrap();
+    let mut events = tokio::net::UnixStream::from_std(guest_events).unwrap();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    respond(&mut client, &requester, &c, challenge).await;
+    write_frame(&mut client, &json!({"type":"hello"}))
+        .await
+        .unwrap();
+    let guest = peer(&fake).await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    assert_eq!(
+        read_frame(&mut guest).await.unwrap()["type"],
+        "verified_lease"
+    );
+    assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "hello");
+
+    write_frame(&mut events, &json!({"type":"event_replay","through_seq":0}))
+        .await
+        .unwrap();
+    for (seq, kind) in [
+        (1, TenantEventKind::Admitted),
+        (2, TenantEventKind::Started),
+    ] {
+        if seq == 2 {
+            write_frame(&mut events, &json!({"type":"memory_sample","jti":JOB,"mem_working_peak_mib":7000,"mem_over_mib_ms":1234}))
+                .await
+                .unwrap();
+        }
+        let event = motor_protocol::Frame::Event(super::event(seq, kind, Some(JOB), None));
+        write_frame(&mut events, &serde_json::to_value(event).unwrap())
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut events))
+            .await
+            .expect("lifecycle acknowledgment timed out")
+            .expect("lifecycle channel dropped");
+        assert_eq!(ack, json!({"type":"ack","event_seq":seq}));
+    }
+    assert_eq!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "relay:53")
+            .count(),
+        1
+    );
+    runtime.host.lock().unwrap().guest_unready("tenant");
+    drop(events);
+    drop(guest);
+    drop(client);
+    let _ = task.await.unwrap();
 }
 
 #[test]
