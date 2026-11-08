@@ -314,6 +314,8 @@ fn journal_message(message: &str) -> String {
         "bundle upload complete",
         "bundles fetched; job queued",
         "placed job CPUs",
+        "runner deadline signal was late",
+        "runner maintenance pass exceeded ten seconds",
         // Job-stream lifecycle on the tenant boundary: why a connection from
         // motor-host closed, and on which side. Their fields are the runner's
         // own labels, counters and job ids, never frame contents.
@@ -345,9 +347,24 @@ fn journal_message(message: &str) -> String {
                 value.trim_matches('"'),
                 "tree_access" | "dependency_mirror" | "build_wrapper"
             ),
-            "elapsed_ms" | "wait_ms" | "bytes" | "requested_cpus" | "from_seq" | "frames" => {
-                value.parse::<u64>().is_ok()
-            }
+            "elapsed_ms"
+            | "wait_ms"
+            | "bytes"
+            | "requested_cpus"
+            | "from_seq"
+            | "frames"
+            | "lateness_ms"
+            | "slice_budget_ms"
+            | "source_unseals_ms"
+            | "runtime_cleanup_ms"
+            | "state_ms"
+            | "expired_jobs_ms"
+            | "returned_files_ms"
+            | "return_reservations_ms"
+            | "build_folders_ms"
+            | "sibling_snapshots_ms"
+            | "prune_refs_ms"
+            | "retire_repositories_ms" => value.parse::<u64>().is_ok(),
             "jti" => uuid::Uuid::parse_str(
                 value
                     .strip_prefix("Some(")
@@ -585,6 +602,33 @@ mod tests {
         assert!(message.contains("lock=build_wrapper"));
         assert!(!message.contains("TOP_SECRET"));
         assert!(cmdline(&b"cargo\0fetch\0".repeat(200)).len() <= 200);
+    }
+
+    #[test]
+    fn journal_keeps_deadline_and_maintenance_timings_without_free_text() {
+        let job = "018d0d3b-a338-7181-8fcc-88e901ef438c";
+        assert_eq!(
+            journal_message(&format!("[runner] WARN motor_runner::engine: runner deadline signal was late job_id={job} lateness_ms=101000 error=TOP_SECRET")),
+            format!("runner deadline signal was late job_id={job} lateness_ms=101000")
+        );
+        let fields = "elapsed_ms=101000 slice_budget_ms=1 source_unseals_ms=2 runtime_cleanup_ms=3 state_ms=4 expired_jobs_ms=99000 returned_files_ms=5 return_reservations_ms=6 build_folders_ms=7 sibling_snapshots_ms=8 prune_refs_ms=9 retire_repositories_ms=10";
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::engine: runner maintenance pass exceeded ten seconds {fields} secret=TOP_SECRET")),
+            format!("runner maintenance pass exceeded ten seconds {fields}")
+        );
+        assert_eq!(
+            journal_message("[runner] WARN motor_runner::engine: runner deadline signal was late job_id=TOP_SECRET lateness_ms=-1"),
+            "runner deadline signal was late"
+        );
+        for key in fields
+            .split_whitespace()
+            .map(|field| field.split_once('=').unwrap().0)
+        {
+            assert_eq!(
+                journal_message(&format!("[runner] INFO motor_runner::engine: runner maintenance pass exceeded ten seconds {key}=TOP_SECRET")),
+                "runner maintenance pass exceeded ten seconds"
+            );
+        }
     }
 
     /// The lines that say why a hosted job stream closed keep their labels,

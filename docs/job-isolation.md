@@ -585,7 +585,11 @@ The shared slice's aggregate limit still applies. Tests:
 
 7.3. The request's `timeout`, in seconds, runs from the moment the job starts,
 not from acceptance. When it expires the runner kills the cgroup and the
-terminal record carries `killed: deadline`. Test:
+terminal record carries `killed: deadline`. The runner checks deadlines on its
+25 ms scheduler tick, independently of the background maintenance worker, so
+retention cleanup does not suspend deadline enforcement or dispatch. Tests:
+`engine::tests::state_lock::deadline_kill_proceeds_while_scheduled_maintenance_is_blocked`
+and
 `engine::tests::cancellation_deadline_and_drop_kill_even_term_ignoring_groups`
 (operator-only).
 

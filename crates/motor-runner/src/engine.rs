@@ -257,6 +257,10 @@ pub struct Config {
     /// be consumed by a concurrent background tick.
     #[cfg(test)]
     pub(crate) manual_tick: bool,
+    /// Let fake-clock fixtures finish maintenance explicitly without racing
+    /// the real-time worker, while still dispatching foreground jobs.
+    #[cfg(test)]
+    pub(crate) manual_maintenance: bool,
     #[cfg(test)]
     pub(crate) writer_unavailable: bool,
     /// Stands in for whether a tenant VM's provisioning holds a write key.
@@ -550,6 +554,8 @@ impl Config {
             disable_warm_builds: false,
             #[cfg(test)]
             manual_tick: false,
+            #[cfg(test)]
+            manual_maintenance: false,
             #[cfg(test)]
             writer_unavailable: false,
             #[cfg(test)]
@@ -1004,6 +1010,7 @@ struct Inner {
     dropping: BTreeSet<String>,
     evicting_dependencies: BTreeSet<PathBuf>,
     evicting_caches: BTreeSet<PathBuf>,
+    /// The maintenance worker advances this after a pass, skipping elapsed turns.
     maintained_ms: u64,
     /// The remote cache's switch state this runner last acted on; saved with
     /// the catalog so a change made while it was stopped is still a
@@ -1593,6 +1600,10 @@ struct Core {
     quarantine_admission: Mutex<Option<String>>,
     quarantine_probe: Mutex<Option<std::time::Instant>>,
     quarantine_cleanup: Mutex<QuarantineCleanup>,
+    /// Serialize the two cleanup timers and explicit maintenance calls, without
+    /// blocking admission on slow catalog writes or ref pruning. Timers skip a
+    /// busy claim; take it before disk, job-log, per-job and state locks.
+    maintenance: Mutex<()>,
     /// Serialize pressure cleanup, without holding the output/persistence lock.
     disk: Mutex<()>,
     /// Numbers catalog snapshots in the order they were taken under the
@@ -1624,8 +1635,55 @@ struct Core {
 const REPLAY_PAGE_BYTES: u64 = 1024 * 1024;
 const REPLAY_PAGE_CHUNKS: usize = 64;
 
+struct MaintenanceTimings {
+    started: std::time::Instant,
+    steps: [u64; 11],
+}
+
+impl MaintenanceTimings {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            steps: [0; 11],
+        }
+    }
+
+    fn step<T>(&mut self, index: usize, work: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let result = work();
+        self.steps[index] = started.elapsed().as_millis() as u64;
+        result
+    }
+}
+
+impl Drop for MaintenanceTimings {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed > Duration::from_secs(10) {
+            tracing::info!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                slice_budget_ms = self.steps[0],
+                source_unseals_ms = self.steps[1],
+                runtime_cleanup_ms = self.steps[2],
+                state_ms = self.steps[3],
+                expired_jobs_ms = self.steps[4],
+                returned_files_ms = self.steps[5],
+                return_reservations_ms = self.steps[6],
+                build_folders_ms = self.steps[7],
+                sibling_snapshots_ms = self.steps[8],
+                prune_refs_ms = self.steps[9],
+                retire_repositories_ms = self.steps[10],
+                "runner maintenance pass exceeded ten seconds"
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct JobLog {
+    /// Remember the first successful deadline signal, including a TERM on
+    /// time, so later KILL retries do not report a new late first signal.
+    deadline_signalled: std::sync::atomic::AtomicBool,
     /// Acquire before the state lock, never while waiting under it. Serializes
     /// output/index commits with cancellation, deadlines and terminal commits.
     /// Output commits take it through `write_for_output` and cancellation
@@ -2715,6 +2773,7 @@ impl Runner {
                     last_error_ms: None,
                 }),
                 quarantined,
+                maintenance: Mutex::new(()),
                 disk: Mutex::new(()),
                 catalog_generation: std::sync::atomic::AtomicU64::new(0),
                 catalog_written: Mutex::new(CatalogWritten::default()),
@@ -2847,7 +2906,41 @@ impl Runner {
                 }
             });
         }
-        let weak = Arc::downgrade(&runner.core);
+        runner.start_background_scheduler();
+        Ok(runner)
+    }
+
+    fn start_background_maintenance(&self) {
+        #[cfg(test)]
+        if self.core.config.manual_maintenance {
+            return;
+        }
+        let weak = Arc::downgrade(&self.core);
+        std::thread::spawn(move || {
+            let interval = Duration::from_secs(1);
+            let mut next = std::time::Instant::now();
+            loop {
+                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+                let Some(core) = weak.upgrade() else {
+                    break;
+                };
+                let runner = Runner { core };
+                if let Err(error) = runner.maintenance_tick() {
+                    tracing::warn!(%error, "runner maintenance failed");
+                }
+                drop(runner);
+                // Skip elapsed turns, as the pressure timer does: never queue
+                // another pass behind slow storage or service enumeration.
+                while next <= std::time::Instant::now() {
+                    next += interval;
+                }
+            }
+        });
+    }
+
+    fn start_background_scheduler(&self) {
+        self.start_background_maintenance();
+        let weak = Arc::downgrade(&self.core);
         std::thread::spawn(move || loop {
             let Some(core) = weak.upgrade() else {
                 break;
@@ -2859,7 +2952,38 @@ impl Runner {
             drop(runner);
             std::thread::park_timeout(Duration::from_millis(25));
         });
-        Ok(runner)
+    }
+
+    fn maintenance_tick(&self) -> io::Result<()> {
+        // Service enumeration can block too. Keep the cached admission fence
+        // conservative while this worker refreshes it off tick.
+        self.refresh_quarantine_admission(false);
+        {
+            let mut inner = self.core.inner.lock().unwrap();
+            let now = self.now();
+            if now.saturating_sub(inner.maintained_ms) < 60_000 {
+                return Ok(());
+            }
+            inner.maintained_ms = now;
+        }
+        // Production logs at info level, so summarize slow state-lock holds
+        // here rather than writing every per-hold debug event.
+        if let Some(longest) = self.core.inner.take_longest() {
+            tracing::info!(
+                site = %longest.site,
+                held_ms = longest.held.as_millis() as u64,
+                slow_holds = longest.slow_holds,
+                "longest state lock hold since the previous report"
+            );
+        }
+        // Only timers may skip a busy cleanup claim. Explicit callers, such
+        // as startup, require a completed pass before proceeding.
+        let result = match self.core.maintenance.try_lock() {
+            Ok(_cleanup) => self.maintenance_pass(),
+            Err(_) => Ok(()),
+        };
+        self.core.inner.lock().unwrap().maintained_ms = self.now();
+        result
     }
     pub fn config(&self) -> &Config {
         &self.core.config
@@ -6709,72 +6833,84 @@ impl Runner {
 
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
+    /// Waits for active cleanup, then completes a pass before returning.
     pub fn maintenance(&self) -> io::Result<()> {
+        let _cleanup = self.core.maintenance.lock().unwrap();
+        self.maintenance_pass()
+    }
+
+    /// Run with the shared cleanup claim held, whether acquired by an explicit
+    /// caller or by a timer that skips when cleanup is already in progress.
+    fn maintenance_pass(&self) -> io::Result<()> {
+        let mut timings = MaintenanceTimings::new();
+        self.long_work("maintenance");
         // Outside the state lock, which maintenance later takes.
-        self.refresh_slice_budget();
+        timings.step(0, || self.refresh_slice_budget());
         #[cfg(target_os = "linux")]
-        self.retry_source_unseals();
-        #[cfg(unix)]
-        if self.core.config.macos_instance() {
-            self.core
-                .config
-                .macos_runtime
-                .retry_cleanups(&self.core.config);
-            let live = {
-                let inner = self.core.inner.lock().unwrap();
-                inner
+        timings.step(1, || self.retry_source_unseals());
+        timings.step(2, || {
+            #[cfg(unix)]
+            if self.core.config.macos_instance() {
+                self.core
+                    .config
+                    .macos_runtime
+                    .retry_cleanups(&self.core.config);
+                let live = {
+                    let inner = self.core.inner.lock().unwrap();
+                    inner
+                        .jobs
+                        .values()
+                        .filter(|job| job.terminal.is_none() || inner.starting.contains(&job.id))
+                        .map(|job| job.id)
+                        .collect()
+                };
+                self.core.config.macos_runtime.prune_finished(&live);
+            }
+            if self.core.config.windows_instance() {
+                self.core.config.windows_runtime.retry_cleanups();
+                let terminal = self
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap()
                     .jobs
                     .values()
-                    .filter(|job| job.terminal.is_none() || inner.starting.contains(&job.id))
+                    .filter(|job| job.terminal.is_some() || job.state == JobState::Tombstone)
                     .map(|job| job.id)
-                    .collect()
-            };
-            self.core.config.macos_runtime.prune_finished(&live);
-        }
-        if self.core.config.windows_instance() {
-            self.core.config.windows_runtime.retry_cleanups();
-            let terminal = self
-                .core
-                .inner
-                .lock()
-                .unwrap()
-                .jobs
-                .values()
-                .filter(|job| job.terminal.is_some() || job.state == JobState::Tombstone)
-                .map(|job| job.id)
-                .collect();
-            self.core
-                .config
-                .windows_runtime
-                .reconcile_terminal(&terminal);
-        }
+                    .collect();
+                self.core
+                    .config
+                    .windows_runtime
+                    .reconcile_terminal(&terminal);
+            }
+        });
         let mut set_aside = Vec::new();
-        let maintained = self.maintain_state(&mut set_aside);
+        let maintained = timings.step(3, || self.maintain_state(&mut set_aside));
         // Expired job directories were moved aside under the state lock;
         // unlinking their output and returned files can take seconds on a
         // busy disk, so it happens here, with the lock released. Startup
         // deletes whatever a crash leaves in the trash directory.
-        for directory in set_aside {
+        timings.step(4, || for directory in set_aside {
             self.long_work("expired_job_remove");
             if let Err(error) = fs::remove_dir_all(&directory) {
                 tracing::warn!(path = %directory.display(), %error, "expired job files could not be deleted; startup retries");
             }
-        }
-        self.expire_returned_files();
-        self.release_return_reservations();
-        self.maintain_build_folders();
+        });
+        timings.step(5, || self.expire_returned_files());
+        timings.step(6, || self.release_return_reservations());
+        timings.step(7, || self.maintain_build_folders());
         if !maintained? {
             return Ok(());
         }
         // Also enforces the snapshot cap at startup, which runs maintenance.
-        self.maintain_sibling_snapshots();
-        self.prune_refs()?;
-        self.retire_unused_repositories()
+        timings.step(8, || self.maintain_sibling_snapshots());
+        timings.step(9, || self.prune_refs())?;
+        timings.step(10, || self.retire_unused_repositories())
     }
     /// Move an expired job's directory into the trash directory, so the
     /// caller can delete it after releasing the state lock. Only directories
-    /// are moved; for anything else this fails and `maintain_state` tries to
-    /// delete the path in place, which refuses a non-directory as before.
+    /// are moved; anything that cannot be detached retains its record for a
+    /// later retry instead of recursively deleting under the state lock.
     fn set_aside_job_directory(&self, id: Uuid, directory: &Path) -> io::Result<PathBuf> {
         if !directory.symlink_metadata()?.is_dir() {
             return Err(io::Error::other("expired job path is not a directory"));
@@ -6788,44 +6924,45 @@ impl Runner {
     /// whether repository maintenance may follow (not while quarantined).
     /// Expired job directories it moves aside are pushed to `set_aside` for
     /// deletion once the lock is released; one that cannot be moved is
-    /// deleted in place, under the lock, as before.
+    /// retained for a later retry.
     fn maintain_state(&self, set_aside: &mut Vec<PathBuf>) -> io::Result<bool> {
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
+        let expired_job = |inner: &Inner, j: &Job| {
+            j.return_reserved_bytes == 0
+                && !self.core.config.cleanup_pending(j.id)
+                && !inner.base_finishes.contains_key(&j.id)
+                && j.finished_ms.is_some_and(|t| {
+                    self.now().saturating_sub(t.max(mint_ms(j.id))) >= RETENTION_MS
+                })
+        };
         let expired: Vec<_> = inner
             .jobs
             .values()
-            .filter(|j| {
-                j.return_reserved_bytes == 0
-                    && !self.core.config.cleanup_pending(j.id)
-                    && !inner.base_finishes.contains_key(&j.id)
-                    && j.finished_ms.is_some_and(|t| {
-                        self.now().saturating_sub(t.max(mint_ms(j.id))) >= RETENTION_MS
-                    })
-            })
+            .filter(|j| expired_job(&inner, j))
             .map(|j| j.id)
             .collect();
+        drop(inner);
         for id in expired {
             let log = self.job_log(id);
             let Some(_write) = log.try_lock_write() else {
                 continue;
             };
+            let mut inner = self.core.inner.lock().unwrap();
+            if !inner.jobs.get(&id).is_some_and(|j| expired_job(&inner, j)) {
+                continue;
+            }
             if log.retention.lock().unwrap().readers != 0 {
                 continue;
             }
             // Once the record leaves `jobs` under this lock, no replay can
             // lease the directory's files, so the deletion may run later.
-            // Where the directory cannot be moved aside, delete it here.
+            // Failed detaches retain the record; recursive deletion must not
+            // hold the state lock needed by deadlines and dispatch.
             let directory = self.record_path(id).parent().unwrap().to_owned();
-            let removed = match self.set_aside_job_directory(id, &directory) {
+            match self.set_aside_job_directory(id, &directory) {
                 Ok(aside) => {
                     set_aside.push(aside);
-                    Ok(())
-                }
-                Err(_) => fs::remove_dir_all(&directory),
-            };
-            match removed {
-                Ok(()) => {
                     inner.jobs.remove(&id);
                     self.core.repository_usage.lock().unwrap().remove(id);
                 }
@@ -6834,6 +6971,7 @@ impl Runner {
                 }
             }
         }
+        let mut inner = self.core.inner.lock().unwrap();
         let Inner {
             jobs,
             start_retries,
@@ -7315,7 +7453,18 @@ impl Runner {
                 Ok(_) => {
                     let hard = now.saturating_sub(killed_at) >= 2000;
                     if (hard && attempts < 3) || (!hard && attempts == 0) {
-                        match self.core.backend.cancel(&self.core.config, &job, hard) {
+                        let lateness_ms = self.now().saturating_sub(killed_at);
+                        let stopped = self.core.backend.cancel(&self.core.config, &job, hard);
+                        if stopped.is_ok()
+                            && matches!(job.kill, Some((Killed::Deadline, _)))
+                            && !log
+                                .deadline_signalled
+                                .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            && lateness_ms > 5000
+                        {
+                            tracing::warn!(job_id = %id, lateness_ms, "runner deadline signal was late");
+                        }
+                        match stopped {
                             Ok(()) if hard => (
                                 attempts + 1,
                                 instant + Duration::from_millis(500 * (1 << (attempts + 1))),
@@ -7342,7 +7491,6 @@ impl Runner {
     }
     fn tick(&self) -> io::Result<()> {
         self.expire_memory_accounting();
-        self.refresh_quarantine_admission(false);
         self.enforce_kills(std::time::Instant::now())?;
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
@@ -7350,25 +7498,6 @@ impl Runner {
             self.start_base_finish(&mut inner, id)?;
         }
         let mut now = self.now();
-        if now.saturating_sub(inner.maintained_ms) >= 60_000 {
-            inner.maintained_ms = now;
-            drop(inner);
-            // Production logs at info level, so the per-hold debug events of
-            // `StateLock` are not written; one line a minute names the
-            // longest holder whenever any hold was slow.
-            if let Some(longest) = self.core.inner.take_longest() {
-                tracing::info!(
-                    site = %longest.site,
-                    held_ms = longest.held.as_millis() as u64,
-                    slow_holds = longest.slow_holds,
-                    "longest state lock hold since the previous report"
-                );
-            }
-            self.maintenance()?;
-            inner = self.core.inner.lock().unwrap();
-            // Maintenance ran without the state lock; take the time again.
-            now = self.now();
-        }
         if self.admission_closed(&inner) {
             // Do not start queued commands during a deploy. Refuse them durably
             // before acknowledging the drain so callers can retry without the

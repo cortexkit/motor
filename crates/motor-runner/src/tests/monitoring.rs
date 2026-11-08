@@ -1374,10 +1374,19 @@ fn quarantine_refresh_serializes_enumeration_and_publication() {
     *runner.core.quarantine_probe.lock().unwrap() = None;
     let older = std::thread::spawn({
         let runner = runner.clone();
-        move || runner.tick()
+        move || runner.maintenance_tick()
     });
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(runner.core.quarantine_probe.try_lock().is_err());
+    let tick = std::thread::spawn({
+        let runner = runner.clone();
+        move || runner.tick()
+    });
+    assert!(
+        poll(Duration::from_secs(2), || tick.is_finished()),
+        "dispatch waited for quarantine service enumeration"
+    );
+    tick.join().unwrap().unwrap();
     let unknown = backend::host_unit_name(Uuid::now_v7());
     state.lock().unwrap().listing = format!("{unknown} loaded active running command\n");
 

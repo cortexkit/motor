@@ -71,6 +71,7 @@ struct LockFixture {
     events: Arc<Mutex<Vec<(&'static str, Uuid)>>>,
     /// The job record whose next save pauses on the `record_save` hold.
     held_record: Arc<Mutex<Option<PathBuf>>>,
+    maintenance_passes: Arc<AtomicU64>,
     /// Keep new jobs' kill retries out of the background scheduler until a
     /// test makes them due or cancellation reschedules them.
     retry_at: std::time::Instant,
@@ -78,12 +79,26 @@ struct LockFixture {
 
 impl LockFixture {
     fn new(label: &'static str) -> Self {
+        Self::with(label, |_| {})
+    }
+
+    fn with(label: &'static str, configure: impl FnOnce(&mut Config)) -> Self {
         let fixture = Fixture::new();
         let hold = Hold::new(label);
         let events = Arc::new(Mutex::new(Vec::new()));
         let held_record = Arc::new(Mutex::new(None::<PathBuf>));
+        let maintenance_passes = Arc::new(AtomicU64::new(0));
         let mut config = fixture.config();
-        config.long_work = Some(hold.hook());
+        config.long_work = Some({
+            let hook = hold.hook();
+            let passes = maintenance_passes.clone();
+            Arc::new(move |label| {
+                if label == "maintenance" {
+                    passes.fetch_add(1, Ordering::SeqCst);
+                }
+                hook(label);
+            })
+        });
         config.before_job_write = Some({
             let hold = hold.clone();
             let held_record = held_record.clone();
@@ -94,6 +109,7 @@ impl LockFixture {
                 Ok(())
             })
         });
+        configure(&mut config);
         let runner = Runner::open_with_backend(
             config,
             Box::new(HeldBackend {
@@ -109,6 +125,7 @@ impl LockFixture {
             hold,
             events,
             held_record,
+            maintenance_passes,
             retry_at: std::time::Instant::now() + Duration::from_secs(3600),
         }
     }
@@ -322,6 +339,199 @@ fn cancel_proceeds_while_maintenance_deletes_an_expired_job() {
     .unwrap()
     .next()
     .is_none()));
+}
+
+#[test]
+fn deadline_kill_proceeds_while_scheduled_maintenance_is_blocked() {
+    let f = LockFixture::with("expired_job_remove", |config| {
+        config.manual_tick = true;
+        // This test deliberately starts both production workers after setting
+        // up the fake clock, unlike fixtures that drive maintenance by hand.
+        config.manual_maintenance = false;
+        config.disable_warm_builds = true;
+    });
+    let expired = f.finished(false);
+    let running = f.running();
+    let now = f.runner.now().max(mint_ms(expired)) + RETENTION_MS;
+    {
+        let mut inner = f.runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&running).unwrap();
+        job.started_ms = Some(now);
+        job.request.as_mut().unwrap().timeout = Some(1);
+        inner.kill_retries.remove(&running);
+    }
+    f.hold.arm();
+    f.fixture.clock.store(now, Ordering::SeqCst);
+    // Start the production workers only after the fake-clock state is ready.
+    f.runner.start_background_scheduler();
+    let release = HeldWork {
+        hold: f.hold.clone(),
+        worker: None,
+    };
+    assert!(poll(Duration::from_secs(10), || f.hold.held()));
+    f.fixture.clock.store(now + 1000, Ordering::SeqCst);
+    assert!(
+        poll(Duration::from_secs(2), || f
+            .events
+            .lock()
+            .unwrap()
+            .contains(&("stop", running))),
+        "deadline stop waited for blocked maintenance"
+    );
+    assert_eq!(
+        f.runner.core.inner.lock().unwrap().jobs[&running].kill,
+        Some((Killed::Deadline, now + 1000))
+    );
+    assert!(f.hold.held());
+    let passes = f.maintenance_passes.load(Ordering::SeqCst);
+    f.fixture.clock.store(now + 181_000, Ordering::SeqCst);
+    drop(release);
+    assert!(poll(Duration::from_secs(10), || f
+        .runner
+        .core
+        .maintenance
+        .try_lock()
+        .is_ok()
+        && f.runner.core.inner.lock().unwrap().maintained_ms
+            == now + 181_000));
+    f.runner.maintenance_tick().unwrap();
+    assert_eq!(f.maintenance_passes.load(Ordering::SeqCst), passes);
+}
+
+#[test]
+fn concurrent_maintenance_timer_skips_instead_of_overlapping() {
+    let f = LockFixture::with("maintenance", |config| config.manual_tick = true);
+    f.maintenance_passes.store(0, Ordering::SeqCst);
+    f.hold.arm();
+    let _release = f.hold_in(|runner| runner.maintenance().unwrap());
+    f.fixture.clock.fetch_add(60_000, Ordering::SeqCst);
+    let runner = f.runner.clone();
+    let second = std::thread::spawn(move || runner.maintenance_tick());
+    assert!(
+        poll(Duration::from_secs(2), || second.is_finished()),
+        "a concurrent maintenance pass queued behind the active pass"
+    );
+    second.join().unwrap().unwrap();
+    assert_eq!(f.maintenance_passes.load(Ordering::SeqCst), 1);
+    assert!(f.hold.held());
+}
+
+#[test]
+fn explicit_maintenance_waits_for_a_busy_claim_and_completes_its_own_pass() {
+    let f = LockFixture::with("maintenance", |config| config.manual_tick = true);
+    f.maintenance_passes.store(0, Ordering::SeqCst);
+    f.hold.arm();
+    let release = f.hold_in(|runner| runner.maintenance().unwrap());
+    let runner = f.runner.clone();
+    let (started, started_rx) = std::sync::mpsc::channel();
+    let (finished, finished_rx) = std::sync::mpsc::channel();
+    let second = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let result = runner.maintenance();
+        finished.send(()).unwrap();
+        result
+    });
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // A completion signal, not a sleep, distinguishes waiting from silently
+    // skipping the pass while the first caller still owns the cleanup claim.
+    let waiting = matches!(
+        finished_rx.recv_timeout(Duration::from_secs(2)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    let passes_while_held = f.maintenance_passes.load(Ordering::SeqCst);
+    drop(release);
+    second.join().unwrap().unwrap();
+    assert!(waiting, "explicit maintenance skipped a busy cleanup claim");
+    assert_eq!(passes_while_held, 1, "maintenance passes overlapped");
+    assert_eq!(f.maintenance_passes.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn maintenance_and_pressure_timers_share_a_nonblocking_claim() {
+    let probes = Arc::new(AtomicU64::new(0));
+    let f = LockFixture::with("maintenance", |config| {
+        config.manual_tick = true;
+        config.free_space_eviction_bytes = Some(1);
+        let probes = probes.clone();
+        config.free_space_probe = Arc::new(move |_| {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok(u64::MAX)
+        });
+    });
+    probes.store(0, Ordering::SeqCst);
+    f.hold.arm();
+    let held = f.hold_in(|runner| runner.maintenance().unwrap());
+    f.runner.periodic_disk_pressure().unwrap();
+    assert_eq!(probes.load(Ordering::SeqCst), 0);
+    drop(held);
+    let passes = f.maintenance_passes.load(Ordering::SeqCst);
+    let pressure = f.runner.core.maintenance.lock().unwrap();
+    f.fixture.clock.fetch_add(60_000, Ordering::SeqCst);
+    f.runner.maintenance_tick().unwrap();
+    assert_eq!(f.maintenance_passes.load(Ordering::SeqCst), passes);
+    drop(pressure);
+    f.runner.periodic_disk_pressure().unwrap();
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn slow_maintenance_reports_each_steps_duration() {
+    let quiet = capture_runner_logs(|| drop(MaintenanceTimings::new()));
+    assert!(!quiet.contains("runner maintenance pass exceeded ten seconds"));
+    let logs = capture_runner_logs(|| {
+        drop(MaintenanceTimings {
+            started: std::time::Instant::now() - Duration::from_secs(11),
+            steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        });
+    });
+    assert!(logs.contains("INFO"));
+    assert_eq!(
+        logs.matches("runner maintenance pass exceeded ten seconds")
+            .count(),
+        1
+    );
+    for field in [
+        "slice_budget_ms=1",
+        "source_unseals_ms=2",
+        "runtime_cleanup_ms=3",
+        "state_ms=4",
+        "expired_jobs_ms=5",
+        "returned_files_ms=6",
+        "return_reservations_ms=7",
+        "build_folders_ms=8",
+        "sibling_snapshots_ms=9",
+        "prune_refs_ms=10",
+        "retire_repositories_ms=11",
+    ] {
+        assert!(logs.contains(field), "missing {field}: {logs}");
+    }
+    assert!(logs
+        .split_whitespace()
+        .filter_map(|field| field.strip_prefix("elapsed_ms="))
+        .any(|value| value.parse::<u64>().unwrap() >= 11_000));
+}
+
+#[test]
+fn a_failed_job_detach_retains_the_record_and_files_until_a_later_pass() {
+    let f = LockFixture::with("unused", |config| config.manual_tick = true);
+    let expired = f.finished(false);
+    let directory = f.runner.record_path(expired).parent().unwrap().to_owned();
+    f.fixture.clock.store(
+        f.runner.now().max(mint_ms(expired)) + RETENTION_MS,
+        Ordering::SeqCst,
+    );
+    let trash = f.runner.trash();
+    fs::create_dir_all(&trash).unwrap();
+    fs::remove_dir(&trash).unwrap();
+    fs::write(&trash, b"not a directory").unwrap();
+    f.runner.maintenance().unwrap();
+    assert!(f.runner.has_job_record(expired));
+    assert_eq!(fs::read(directory.join("chunk-0")).unwrap(), b"output");
+    fs::remove_file(&trash).unwrap();
+    fs::create_dir(&trash).unwrap();
+    f.runner.maintenance().unwrap();
+    assert!(!f.runner.has_job_record(expired));
+    assert!(!directory.exists());
 }
 
 /// Expiring a job's returned files saves its record (two fsyncs) and then

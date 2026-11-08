@@ -452,6 +452,68 @@ fn overdue_deadline_keeps_its_origin_when_an_output_writer_delays_enforcement() 
     );
 }
 
+#[test]
+fn late_deadline_warning_is_strictly_over_five_seconds_and_only_on_the_first_signal() {
+    for lateness in [5000, 5001] {
+        let f = CancellationFixture::new();
+        let start = f.runner.now();
+        f.runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get_mut(&f.id)
+            .unwrap()
+            .request
+            .as_mut()
+            .unwrap()
+            .timeout = Some(1);
+        f.fixture
+            .clock
+            .store(start + 1000 + lateness, Ordering::SeqCst);
+        let logs = capture_runner_logs(|| {
+            f.retry(f.retry_at);
+            f.retry(f.retry_at + Duration::from_secs(5));
+        });
+        assert_eq!(*f.events.lock().unwrap(), ["kill", "kill"]);
+        assert_eq!(
+            logs.matches("runner deadline signal was late").count(),
+            usize::from(lateness > 5000)
+        );
+        if lateness > 5000 {
+            assert!(logs.contains(&format!("job_id={}", f.id)));
+            assert!(logs.contains("lateness_ms=5001"));
+        }
+    }
+}
+
+#[test]
+fn an_on_time_deadline_term_does_not_warn_on_a_late_hard_retry() {
+    let f = CancellationFixture::new();
+    let start = f.runner.now();
+    f.runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&f.id)
+        .unwrap()
+        .request
+        .as_mut()
+        .unwrap()
+        .timeout = Some(1);
+    let logs = capture_runner_logs(|| {
+        f.fixture.clock.store(start + 1000, Ordering::SeqCst);
+        f.retry(f.retry_at);
+        f.fixture.clock.store(start + 9000, Ordering::SeqCst);
+        f.retry(f.retry_at + Duration::from_secs(8));
+    });
+    assert_eq!(*f.events.lock().unwrap(), ["cancel", "kill"]);
+    assert!(!logs.contains("runner deadline signal was late"));
+}
+
 /// A job printing faster than its output can be committed keeps its monitor
 /// taking the job log lock back to back, one commit after another. A cancel
 /// waiting for that lock must get it before the next output commit;
