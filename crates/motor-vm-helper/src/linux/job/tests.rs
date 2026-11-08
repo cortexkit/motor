@@ -55,7 +55,11 @@ impl Vmm {
         let base = scratch();
         let binary = base.join("firecracker");
         std::fs::copy("/bin/sleep", &binary).unwrap();
-        let child = Command::new(binary).arg("300").spawn().unwrap();
+        let child = Command::new(binary)
+            .arg0("sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
         Self { child, base }
     }
 }
@@ -338,7 +342,6 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 .open(group.join("cgroup.procs"))
                 .unwrap();
             let binary = base.join("firecracker");
-            std::fs::copy("/bin/sleep", &binary).unwrap();
             let mut command = Command::new(binary);
             command
                 .arg("300")
@@ -396,9 +399,11 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 .contains("/motor-vm-helper-job-test.service/helper"));
             wait_for_file(&base.join("allow-helper-exit"));
             let child = jobs.children.get_mut(&start().job_id).unwrap();
-            eprintln!(
-                "inner before exit: child try_wait={:?}",
-                child.try_wait().unwrap()
+            let status = child.try_wait().unwrap();
+            eprintln!("inner before exit: child try_wait={status:?}");
+            assert!(
+                status.is_none(),
+                "job VMM fixture exited before the helper: {status:?}"
             );
             slice_state("inner before service exit");
             child_placement("inner immediately before service exit", child.id());
@@ -423,6 +428,13 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor).unwrap()).unwrap();
     }
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Compile fixtures/job-firecracker.c on the build server and name its path.
+    // Copying a multicall /bin/sleep under a different name can exit immediately
+    // because its applet dispatch uses argv[0], not the supplied sleep interval.
+    let fixture = std::env::var_os("MOTOR_VM_TEST_JOB_FIRECRACKER").expect(
+        "set MOTOR_VM_TEST_JOB_FIRECRACKER to the compiled fixtures/job-firecracker.c executable",
+    );
+    std::fs::copy(fixture, base.join("firecracker")).unwrap();
     let run = |args: &[&str]| {
         assert!(Command::new("systemctl")
             .args(args)
