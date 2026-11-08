@@ -299,11 +299,10 @@ impl Trees {
         dependencies: &[GitDependency],
     ) -> io::Result<()> {
         for d in dependencies {
-            let Some(b) = &d.bundle else { continue };
             let mirror = self.dependency_mirror(&d.url);
             let lock = self.dependency_lock(&mirror);
             let _guard = crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap());
-            if !mirror.exists() {
+            if d.bundle.is_some() && !mirror.exists() {
                 fs::create_dir_all(&mirror)?;
                 git(
                     &mirror,
@@ -320,22 +319,37 @@ impl Trees {
                 git(&mirror, &["config", "gc.auto", "0"])?;
                 git(&mirror, &["config", "maintenance.auto", "false"])?;
             }
-            let spool = directory.join(b.index.to_string());
-            let reference = format!("refs/ck-motor/dep/{}", d.commits[0]);
-            super::transfer::fetch(
-                &mirror,
-                &[
-                    "-c",
-                    "gc.auto=0",
-                    "fetch",
-                    "--progress",
-                    "--no-auto-maintenance",
-                    "--no-tags",
-                    "--no-write-fetch-head",
-                    spool.to_str().ok_or_else(|| invalid("bundle path"))?,
-                    &format!("{reference}:{reference}"),
-                ],
-            )?;
+            if let Some(b) = &d.bundle {
+                let spool = directory.join(b.index.to_string());
+                let reference = format!("refs/ck-motor/dep/{}", d.commits[0]);
+                super::transfer::fetch(
+                    &mirror,
+                    &[
+                        "-c",
+                        "gc.auto=0",
+                        "fetch",
+                        "--progress",
+                        "--no-auto-maintenance",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        spool.to_str().ok_or_else(|| invalid("bundle path"))?,
+                        &format!("{reference}:{reference}"),
+                    ],
+                )?;
+            }
+            let mut refs = Vec::new();
+            for commit in &d.commits {
+                git(
+                    &mirror,
+                    &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+                )
+                .map_err(|_| {
+                    crate::engine::missing_history(format!("dependency {} commit {commit}", d.url))
+                })?;
+                refs.push((format!("refs/ck-motor/dep/{commit}"), commit.clone()));
+            }
+            super::update_refs(&mirror, &refs)?;
+            super::write_mirror_identity(&mirror, "motor.dependency-url", &d.url)?;
         }
         Ok(())
     }

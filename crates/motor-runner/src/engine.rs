@@ -44,6 +44,8 @@ mod guest_disk;
 mod health;
 #[path = "migration.rs"]
 mod migration;
+#[path = "mirror_reports.rs"]
+mod mirror_reports;
 #[path = "remote_cache_engine.rs"]
 mod remote_cache_engine;
 #[path = "retirement.rs"]
@@ -358,11 +360,26 @@ pub(crate) async fn net_operator_case(mode: &str) {
 }
 
 pub(crate) fn transfer_refusal(error: &io::Error) -> RefusalReason {
-    if error.kind() == io::ErrorKind::TimedOut || MirrorRepaired::is(error) {
+    if error.kind() == io::ErrorKind::TimedOut
+        || MirrorRepaired::is(error)
+        || error.get_ref().is_some_and(|e| e.is::<MissingHistory>())
+    {
         RefusalReason::TransferInterrupted
     } else {
         RefusalReason::BundleRejected
     }
+}
+
+#[derive(Debug)]
+struct MissingHistory(String);
+impl std::fmt::Display for MissingHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mirror lacks required history: {}", self.0)
+    }
+}
+impl std::error::Error for MissingHistory {}
+pub(crate) fn missing_history(detail: impl Into<String>) -> io::Error {
+    io::Error::other(MissingHistory(detail.into()))
 }
 
 /// A bundle fetch failed and the runner then removed unusable refs from the
@@ -2713,7 +2730,7 @@ impl Runner {
         };
         let repository_usage = health::RepositoryUsage::from_jobs(jobs.values(), now);
         let tenant_events = if config.tenant_vm {
-            let log = crate::tenant::EventLog::open(&state)?;
+            let log = crate::tenant::EventLog::open_for_mode(&state, config.per_job)?;
             for job in jobs.values() {
                 log.observe(job)?;
             }
@@ -3511,6 +3528,43 @@ impl Runner {
     pub(crate) fn tenant_events(&self) -> Option<&crate::tenant::EventLog> {
         self.core.tenant_events.as_deref()
     }
+    pub(crate) fn terminal_stored(&self, id: Uuid) -> bool {
+        let inner = self.core.inner.lock().unwrap();
+        if !self.core.config.per_job
+            || inner.per_job_id != Some(id)
+            || !inner
+                .jobs
+                .get(&id)
+                .is_some_and(|j| j.terminal.is_some() && !j.memory_accounting_pending)
+        {
+            return false;
+        }
+        if let Some(events) = self.tenant_events() {
+            events.terminal_stored(id, self.now());
+        }
+        true
+    }
+    pub(crate) fn terminal_ready(&self, id: Uuid) -> bool {
+        self.core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .is_some_and(|j| j.terminal.is_some() && !j.memory_accounting_pending)
+    }
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn job_poweroff_ready(&self) -> bool {
+        if !self.core.config.per_job || !self.service_stop_blockers().is_empty() {
+            return false;
+        }
+        let inner = self.core.inner.lock().unwrap();
+        inner.per_job_id.is_some_and(|id| {
+            self.tenant_events().is_some_and(|events| {
+                events.is_terminal_stored(id) && events.reports_drain_ready(self.now())
+            })
+        })
+    }
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn tenant_idle(&self) -> bool {
         let inner = self.core.inner.lock().unwrap();
@@ -3706,6 +3760,9 @@ impl Runner {
     /// (hundreds of thousands of files) takes minutes, and holding the lock
     /// that long stalls every other job, transfer and status request.
     fn discard(&self, path: &Path) -> io::Result<()> {
+        if path.parent() == Some(self.core.trees.mirrors.as_path()) {
+            self.report_retired_mirror(path)?;
+        }
         #[cfg(target_os = "linux")]
         self.core.config.source_seals.check_host(path)?;
         if let Some(root) = paths::trash::mapped_root(&self.core.config, paths::host(path)) {
@@ -4812,7 +4869,8 @@ impl Runner {
                 &request.snapshot_commit,
                 &request.integration_tip,
                 &request.siblings,
-            )
+            )?;
+            self.report_imported_refs(request)
         });
         let fetched = fetched
             .map_err(|error| self.repair_after_failed_fetch(error, directory, &request.bundles));
@@ -7262,6 +7320,15 @@ impl Runner {
             return removed;
         }
         tracing::warn!(mirror = %mirror.display(), removed = ?removed, "removed unusable mirror refs");
+        if let Some(events) = self.tenant_events() {
+            let names = removed
+                .iter()
+                .filter_map(|r| r.split_once(' ').map(|(name, _)| name.to_owned()))
+                .collect::<Vec<_>>();
+            if let Err(error) = events.retired_names(&mirror, &names) {
+                tracing::error!(%error, "cannot record removed mirror refs");
+            }
+        }
         if let Some(offers) = self.core.held_offers.lock().unwrap().get_mut(&mirror) {
             offers.retain(|commit, _| {
                 let held = format!("{}{commit}", workspace::HELD_REFS);
@@ -7291,7 +7358,16 @@ impl Runner {
             match workspace::repair_mirror(&mirror, &[]) {
                 Ok(removed) if removed.is_empty() => {}
                 Ok(removed) => {
-                    tracing::warn!(mirror = %mirror.display(), removed = ?removed, "startup removed unusable mirror refs")
+                    tracing::warn!(mirror = %mirror.display(), removed = ?removed, "startup removed unusable mirror refs");
+                    if let Some(events) = self.tenant_events() {
+                        let names = removed
+                            .iter()
+                            .filter_map(|r| r.split_once(' ').map(|(name, _)| name.to_owned()))
+                            .collect::<Vec<_>>();
+                        if let Err(error) = events.retired_names(&mirror, &names) {
+                            tracing::error!(%error, "cannot record startup mirror ref removal");
+                        }
+                    }
                 }
                 Err(error) => {
                     tracing::error!(mirror = %mirror.display(), %error, "startup mirror ref check failed")
@@ -7469,6 +7545,7 @@ impl Runner {
                 .filter(|reference| !held.contains(*reference))
                 .map(str::to_owned)
                 .collect();
+            self.report_retired_refs(&mirror, &stale)?;
             workspace::delete_refs(&mirror, &stale)?;
         }
         Ok(())

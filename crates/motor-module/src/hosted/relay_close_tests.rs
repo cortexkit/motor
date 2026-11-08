@@ -154,6 +154,7 @@ fn lifecycle(seq: u64, event: TenantEventKind, job: Uuid) -> TenantEvent {
         mem_working_peak_mib: None,
         mem_over_mib_ms: None,
         remote_cache_totals: None,
+        mirror_refs: None,
     }
 }
 
@@ -330,6 +331,7 @@ async fn accepted_hosted_job_queued_past_read_inactivity_keeps_heartbeats_and_de
             vcpus: 1,
             mem_mib: Some(16384),
             mem_burst_mib: None,
+            mirror_reports: false,
             platform: if cfg!(target_arch = "aarch64") {
                 "linux-arm64"
             } else {

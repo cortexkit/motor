@@ -117,6 +117,7 @@ async fn local_tenant_channels_require_lease_preserve_purpose_and_cancel_via_adm
             vcpus: 1,
             mem_mib: Some(16384),
             mem_burst_mib: None,
+            mirror_reports: false,
             platform: "linux-x64".into(),
             net: false,
             max_s: 30,

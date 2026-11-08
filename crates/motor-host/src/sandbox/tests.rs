@@ -449,6 +449,7 @@ async fn sandbox_max_s_cancels_through_runner_after_requester_disconnects() {
                     mem_working_peak_mib: None,
                     mem_over_mib_ms: None,
                     remote_cache_totals: None,
+                    mirror_refs: None,
                 },
                 now,
             )

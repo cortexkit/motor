@@ -124,9 +124,15 @@ pub(crate) struct Layout {
 impl Layout {
     pub(crate) fn for_config(config: &crate::Config) -> Self {
         let role = HostRole::of(config);
-        let directory = match role {
-            HostRole::Boat => PathBuf::from(BOAT_DIRECTORY),
-            HostRole::BuildServer | HostRole::TenantVm => config.state_dir().join(STATE_DIRECTORY),
+        let directory = if config.per_job {
+            PathBuf::from(BOAT_DIRECTORY)
+        } else {
+            match role {
+                HostRole::Boat => PathBuf::from(BOAT_DIRECTORY),
+                HostRole::BuildServer | HostRole::TenantVm => {
+                    config.state_dir().join(STATE_DIRECTORY)
+                }
+            }
         };
         Self::new(directory, role)
     }
@@ -493,6 +499,25 @@ fn parse_key(bytes: &[u8]) -> Result<KeyMaterial, String> {
 pub(crate) struct FileSet {
     pub(crate) config: Result<ConfigFile, String>,
     pub(crate) keys: Vec<(KeyRole, Result<KeyMaterial, String>)>,
+}
+
+/// Validate a helper-injected set before writing any provisioning file. The
+/// returned error is deliberately independent of credential bytes.
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_injected(
+    request: &motor_protocol::RemoteCacheRequest,
+) -> std::io::Result<()> {
+    let mut keys = vec![(KeyRole::Read, parse_key(request.read_key.as_bytes()))];
+    if let Some(write) = &request.write_key {
+        keys.push((KeyRole::Write, parse_key(write.as_bytes())));
+    }
+    FileSet {
+        config: parse_config(request.config.as_bytes()),
+        keys,
+    }
+    .complete()
+    .map(|_| ())
+    .map_err(|_| std::io::Error::other("remote_cache_invalid_injected_set"))
 }
 
 impl FileSet {

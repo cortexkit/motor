@@ -13,6 +13,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod cache_drive;
 mod diagnostics;
 pub(crate) mod dns;
 mod network;
@@ -746,6 +747,7 @@ fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Resul
     let layout = paths::prepare_disk_layout(Path::new("/tenant"), 0)?;
     if per_job {
         layout.initialize_job_history(Path::new("/run/motor-job-state-initialized"))?;
+        cache_drive::install()?;
     }
     layout.runner.remove_stale_socket("runner.sock")?;
     let args = match job_args {

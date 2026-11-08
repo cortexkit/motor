@@ -2384,7 +2384,7 @@ async fn failed_fetch_or_absent_snapshot_rejects_without_held_refs() {
     assert_eq!(
         terminal(&runner, r.job_id).await.outcome,
         Outcome::RefusedBeforeStart {
-            reason: RefusalReason::BundleRejected
+            reason: RefusalReason::TransferInterrupted
         }
     );
     assert!(runner.have(vec![RepositoryCandidates {

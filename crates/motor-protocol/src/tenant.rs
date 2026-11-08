@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Raw read-only `remote-cache` drive: magic, little-endian u32 JSON length,
+/// then a `RemoteCacheRequest`. Any block-alignment padding follows the JSON.
+pub const REMOTE_CACHE_DRIVE_MAGIC: &[u8] = b"MOTORCACHE\0\x01";
+pub const REMOTE_CACHE_DRIVE_MAX_BYTES: usize = 3 * 65536 + 1024;
+
 /// Trusted control-channel provisioning, never a job frame. Deliberately not
 /// Debug: these strings contain credentials. Decode errors must be discarded.
 #[derive(Serialize, Deserialize)]
@@ -165,6 +170,9 @@ pub struct VerifiedLease {
     /// changes the stated memory reservation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_burst_mib: Option<u64>,
+    /// Opt in to durable mirror-ref reports on the tenant event channel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mirror_reports: bool,
     pub platform: String,
     pub net: bool,
     pub max_s: u64,
@@ -180,6 +188,33 @@ pub enum TenantEventKind {
     Terminal,
     Idle,
     SetupPhase,
+    MirrorRefs,
+}
+
+/// A ref holding a verified imported commit, or a ref the guest removed.
+/// Exactly one of `repository` and `dependency` identifies a known mirror;
+/// both are absent when its local identity metadata is missing or invalid.
+/// A removed unreadable ref has an empty `commit` because its target is unknown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MirrorRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency: Option<String>,
+    pub reference: String,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MirrorRefReport {
+    pub imported: bool,
+    pub refs: Vec<MirrorRef>,
+    /// Oldest reports discarded when the bounded retained guest queue filled.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_reports: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +264,8 @@ pub struct TenantEvent {
     pub mem_over_mib_ms: Option<Option<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cache_totals: Option<RemoteCacheTotals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_refs: Option<MirrorRefReport>,
 }
 
 /// Best-effort cumulative guest telemetry, not an admission or placement input.
