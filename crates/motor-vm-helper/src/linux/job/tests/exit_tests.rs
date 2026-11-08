@@ -340,3 +340,137 @@ fn concurrent_job_exits_keep_their_own_counts() {
     );
     std::fs::remove_dir_all(base).unwrap();
 }
+
+fn tombstone() -> Record {
+    Record {
+        released: true,
+        oom_kill: Some(3),
+        exit_acknowledged: true,
+        ..record()
+    }
+}
+
+fn save_with_mtime(jobs: &mut LinuxJobs, record: Record, modified: SystemTime) -> PathBuf {
+    jobs.save(&record).unwrap();
+    let path = jobs
+        .records_path
+        .join(format!("{}.json", record.start.job_id));
+    File::open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    jobs.adopt_record(record).unwrap();
+    path
+}
+
+#[test]
+fn completed_tombstone_does_not_probe_its_cgroup() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    jobs.save(&tombstone()).unwrap();
+    jobs.adopt_record(tombstone()).unwrap();
+    std::fs::create_dir_all(&jobs.groups).unwrap();
+    // A probe below this file would fail, even for root. Completed tombstones
+    // must not perform any cgroup IO during exit collection or requests.
+    std::fs::write(jobs.group(&start().job_id), "not a directory").unwrap();
+    jobs.collect_exits().unwrap();
+    assert!(reports(&mut jobs).is_empty());
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn younger_than_48_hour_tombstone_remains_and_refuses_replayed_start() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let path = save_with_mtime(&mut jobs, tombstone(), modified);
+    jobs.maintain_at(modified + Duration::from_secs(48 * 60 * 60 - 1))
+        .unwrap();
+    assert!(path.exists());
+    assert!(jobs.records.contains_key(&start().job_id));
+    let error = jobs
+        .handle(Operation::Start(start()), peer())
+        .err()
+        .unwrap();
+    assert!(error.0.contains("already booted"), "{error}");
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn expired_tombstone_is_pruned_only_by_maintenance_not_requests() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let path = save_with_mtime(&mut jobs, tombstone(), modified);
+    assert!(reports(&mut jobs).is_empty());
+    assert!(path.exists());
+    assert!(jobs
+        .handle(Operation::Start(start()), peer())
+        .err()
+        .unwrap()
+        .0
+        .contains("already booted"));
+    jobs.maintain_at(modified + Duration::from_secs(48 * 60 * 60 + 1))
+        .unwrap();
+    assert!(!path.exists());
+    assert!(!jobs.records.contains_key(&start().job_id));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn unacknowledged_or_unreleased_records_are_never_pruned_regardless_of_age() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let mut unacknowledged = tombstone();
+    unacknowledged.exit_acknowledged = false;
+    let first = save_with_mtime(&mut jobs, unacknowledged, modified);
+    let mut unreleased = tombstone();
+    unreleased.start.job_id = "00000000-0000-4000-8000-000000000002".into();
+    unreleased.released = false;
+    let second = save_with_mtime(&mut jobs, unreleased, modified);
+    jobs.maintain_at(modified + Duration::from_secs(365 * 24 * 60 * 60))
+        .unwrap();
+    assert!(first.exists());
+    assert!(second.exists());
+    assert_eq!(jobs.records.len(), 2);
+    assert_eq!(reports(&mut jobs), [expected(3)]);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn prune_waits_for_full_48_hours_and_keeps_future_timestamps() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let path = save_with_mtime(&mut jobs, tombstone(), modified);
+    jobs.prune_records(modified - Duration::from_secs(1))
+        .unwrap();
+    assert!(path.exists());
+    jobs.prune_records(modified + Duration::from_secs(48 * 60 * 60 - 1))
+        .unwrap();
+    assert!(path.exists());
+    jobs.prune_records(modified + Duration::from_secs(48 * 60 * 60))
+        .unwrap();
+    assert!(!path.exists());
+    assert!(jobs.records.is_empty());
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn frequent_maintenance_ticks_prune_at_most_once_per_minute() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let path = save_with_mtime(&mut jobs, tombstone(), modified);
+    let first_tick = modified + Duration::from_secs(48 * 60 * 60 - 10);
+    jobs.maintain_at(first_tick).unwrap();
+    assert!(path.exists());
+    jobs.maintain_at(first_tick + Duration::from_secs(59))
+        .unwrap();
+    assert!(path.exists());
+    jobs.maintain_at(first_tick + Duration::from_secs(60))
+        .unwrap();
+    assert!(!path.exists());
+    std::fs::remove_dir_all(base).unwrap();
+}

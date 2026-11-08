@@ -470,7 +470,7 @@ impl Machine for LinuxMachine {
         self.jobs.handle(op, peer)
     }
     fn maintain_jobs(&mut self) -> Result<()> {
-        self.jobs.collect_exits()
+        self.jobs.maintain()
     }
     fn shutdown(&mut self) -> Result<()> {
         // stop_all logs each tenant's outcome; this only summarises.

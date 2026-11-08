@@ -19,10 +19,12 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 const JOB_OOM_SCORE: i32 = 1000;
+const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
+const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 // Rollbacks must be able to read records written by a newer helper.
@@ -38,6 +40,10 @@ struct Record {
 }
 
 impl Record {
+    fn is_tombstone(&self) -> bool {
+        self.released && self.exit_acknowledged
+    }
+
     fn pending_exit(&self) -> Option<ExitReport> {
         self.oom_kill
             .filter(|_| !self.exit_acknowledged)
@@ -63,6 +69,7 @@ pub struct LinuxJobs {
     jail: PathBuf,
     records: BTreeMap<String, Record>,
     children: BTreeMap<String, Child>,
+    next_prune: Option<SystemTime>,
     #[cfg(test)]
     exit_fault: Option<ExitStep>,
     #[cfg(test)]
@@ -78,6 +85,7 @@ impl LinuxJobs {
             jail: Path::new(super::BUILD_ROOT).join("jail/jobs"),
             records: BTreeMap::new(),
             children: BTreeMap::new(),
+            next_prune: None,
             #[cfg(test)]
             exit_fault: None,
             #[cfg(test)]
@@ -131,7 +139,7 @@ impl LinuxJobs {
             }
             self.adopt_record(record)?;
         }
-        self.collect_exits()
+        self.maintain()
     }
 
     fn adopt_record(&mut self, record: Record) -> Result<()> {
@@ -195,7 +203,12 @@ impl LinuxJobs {
 
     pub fn collect_exits(&mut self) -> Result<()> {
         self.reap()?;
-        let ids: Vec<_> = self.records.keys().cloned().collect();
+        let ids: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| !record.is_tombstone())
+            .map(|record| record.start.job_id.clone())
+            .collect();
         let mut result = Ok(());
         for id in ids {
             if let Err(error) = self.collect_exit(&id) {
@@ -204,6 +217,48 @@ impl LinuxJobs {
             }
         }
         result
+    }
+
+    pub fn maintain(&mut self) -> Result<()> {
+        self.maintain_at(SystemTime::now())
+    }
+
+    fn maintain_at(&mut self, now: SystemTime) -> Result<()> {
+        let collection = self.collect_exits();
+        // Maintenance runs every 100 ms. Retention needs only a minute's
+        // cadence, not a metadata lookup per tombstone on every tick.
+        let pruning = if self.next_prune.is_none_or(|deadline| now >= deadline) {
+            self.prune_records(now).map(|()| {
+                self.next_prune = now.checked_add(TOMBSTONE_PRUNE_INTERVAL);
+            })
+        } else {
+            Ok(())
+        };
+        collection.and(pruning)
+    }
+
+    fn prune_records(&mut self, now: SystemTime) -> Result<()> {
+        let ids: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| record.is_tombstone())
+            .map(|record| record.start.job_id.clone())
+            .collect();
+        for id in ids {
+            let path = self.records_path.join(format!("{id}.json"));
+            // Atomic rewrites refresh mtime, so the full replay window begins
+            // only after both release and acknowledgement have been recorded.
+            let modified = std::fs::metadata(&path)?.modified()?;
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age >= TOMBSTONE_RETENTION)
+            {
+                std::fs::remove_file(&path)?;
+                File::open(&self.records_path)?.sync_all()?;
+                self.records.remove(&id);
+            }
+        }
+        Ok(())
     }
 
     fn collect_exit(&mut self, id: &str) -> Result<()> {

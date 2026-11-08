@@ -69,8 +69,11 @@ pub struct Workspace {
 
 /// Immutable evidence for one job VMM exit. The helper proves the cgroup empty
 /// and syncs this count before removing the cgroup or releasing the disk. Polls
-/// replay it until the host acknowledges durable receipt; job-id tombstones
-/// remain after acknowledgement and are not yet pruned.
+/// replay it until the host acknowledges durable receipt. Released, acknowledged
+/// tombstones reject start_job replays for 48 hours after their last record
+/// update. This outlasts the longest job plus the remaining validity of its lease
+/// token: job ids are fresh UUIDv7 values per lease and the host refuses expired
+/// tokens before helper calls.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExitReport {

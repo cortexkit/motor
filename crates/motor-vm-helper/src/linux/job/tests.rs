@@ -46,6 +46,7 @@ fn machine(base: &Path) -> LinuxJobs {
         jail: base.join("jail"),
         records: BTreeMap::new(),
         children: BTreeMap::new(),
+        next_prune: None,
         exit_fault: None,
         remove_test_group: Some(|path| std::fs::remove_dir_all(path)),
     }
