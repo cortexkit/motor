@@ -5,6 +5,10 @@ mod backend;
 mod boat_quota;
 #[cfg(target_os = "linux")]
 mod boat_quota_events;
+// Storage and seeding callers consume these inputs in the build-base lifecycle.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+mod build_base;
 mod caller_path;
 #[cfg(target_os = "linux")]
 mod cargo_build_dir;

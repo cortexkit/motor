@@ -8,13 +8,11 @@ use crate::{
     workspace::{self, Trees},
 };
 use motor_protocol::*;
-#[cfg(target_os = "linux")]
-use std::path::Path;
 use std::{
     collections::BTreeMap,
     fs,
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitStatus,
     str::FromStr,
 };
@@ -119,6 +117,66 @@ pub(crate) struct Prepared {
     pub wrapper: Option<PathBuf>,
     pub sandbox: Option<Box<dyn IsolationLauncher>>,
     pub vm: Option<std::sync::Mutex<Option<Box<dyn Execution>>>>,
+}
+
+/// Environment inputs available after tree verification, before building the
+/// supervisor or preparing a sandbox. Remote inputs must name the transport
+/// selected for this unit, not a later read of the runner's active generation.
+pub(crate) struct EnvironmentInputs<'a> {
+    pub host_cwd: &'a Path,
+    pub target: &'a Path,
+    pub wrapper: Option<&'a Path>,
+    #[cfg(unix)]
+    pub remote: Option<(
+        &'a crate::remote_cache::provisioning::ActiveGeneration,
+        &'a [crate::remote_cache::transport::Forwarder],
+    )>,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> EnvironmentInputs<'a> {
+    /// Plan an isolated unit's environment after verifying its checkout and
+    /// selecting its remote transport, but before compiling any wrapper. The
+    /// same transport must be passed to sandbox preparation; failed preparation
+    /// must not seed or publish using a different environment.
+    #[allow(dead_code)] // The seeding lifecycle consumes this pre-setup API.
+    pub(crate) fn before_setup(
+        config: &Config,
+        setup: &Setup,
+        host_cwd: &'a Path,
+        target: &'a Path,
+        remote: Option<(
+            &'a crate::remote_cache::provisioning::ActiveGeneration,
+            &'a [crate::remote_cache::transport::Forwarder],
+        )>,
+    ) -> io::Result<Self> {
+        if !config.isolate_jobs {
+            return Err(invalid("build-base environment requires isolation"));
+        }
+        let supervisor = config.shared_compile_cache()
+            && paths::host_run(config, &setup.request)
+                .host_workspace
+                .join("crates/prefrontal-build-slot/src/main.rs")
+                .try_exists()?;
+        Ok(Self {
+            host_cwd,
+            target,
+            wrapper: supervisor.then(|| Path::new("/motor-tools/prefrontal-build-slot")),
+            remote,
+        })
+    }
+}
+
+impl Prepared {
+    fn environment_inputs(&self) -> EnvironmentInputs<'_> {
+        EnvironmentInputs {
+            host_cwd: &self.host_cwd,
+            target: &self.target,
+            wrapper: self.wrapper.as_deref(),
+            #[cfg(unix)]
+            remote: self.sandbox.as_ref().and_then(|s| s.cache_generation()),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -799,13 +857,12 @@ impl Backend for HostBackend {
         let wrapper = trees.state.join("prefrontal-build-slot");
         #[cfg(target_os = "linux")]
         let wrapper = if config.isolate_jobs {
-            use sha2::{Digest, Sha256};
             // Hash the supervisor source embedded in this runner so a binary
             // compiled from an uploaded tree is never reused, and changes to
             // the embedded source invalidate the cache.
             trees.state.join(format!(
-                "prefrontal-build-slot-{:x}",
-                Sha256::digest(include_str!("../../prefrontal-build-slot/src/main.rs"))
+                "prefrontal-build-slot-{}",
+                crate::build_base::supervisor_digest()
             ))
         } else {
             wrapper
@@ -1096,71 +1153,15 @@ impl Backend for HostBackend {
                 ),
             )?;
         }
-        let mut env = BTreeMap::new();
         #[cfg(test)]
         if r.network.is_some() {
             if let Some(hook) = &config.job_network_hook {
                 setup_step("network attach", hook(crate::network::Phase::Attach(s.id)))?;
             }
         }
-        for &key in JOB_BASE_ENV {
-            if let Ok(value) = std::env::var(key) {
-                env.insert(key.to_string(), value);
-            }
-        }
-        for (k, v) in &r.env {
-            if crate::allowed_env(k) {
-                env.insert(k.clone(), v.clone());
-            }
-        }
-        #[cfg(test)]
-        if !config.isolate_jobs {
-            if let Some(cargo_home) = &config.fixture_cargo_home {
-                // Fixture Cargo jobs must not load configuration from the developer's home.
-                env.insert(
-                    "CARGO_HOME".into(),
-                    cargo_home.to_string_lossy().into_owned(),
-                );
-                env.insert("CARGO_NET_OFFLINE".into(), "true".into());
-            }
-        }
-        // Match test and compile concurrency to the permits reserved for this job, not to
-        // the host's CPU count or an unrelated daemon's worker budget.
-        for key in [
-            "RUST_TEST_THREADS",
-            "NEXTEST_TEST_THREADS",
-            "CARGO_BUILD_JOBS",
-        ] {
-            env.entry(key.to_string())
-                .or_insert_with(|| weight.to_string());
-        }
-        for key in [
-            "SUBC_LAUNCH_NONCE",
-            "SUBC_LAUNCH_NONCE_FD",
-            "SUBC_MODULE_ID",
-            "SSH_AUTH_SOCK",
-        ] {
-            env.remove(key);
-        }
-        let caller_commit = r.base_commit.clone().unwrap_or_else(|| {
-            workspace::resolve_caller_commit(
-                &trees.mirror(paths::request(r).caller_repository_root.text()),
-                &r.snapshot_commit,
-                &r.tree_hash,
-            )
-        });
-        env.insert("CK_REMOTE_SOURCE_COMMIT".to_string(), caller_commit);
+        let env = job_environment(config, trees, s, &prepared.environment_inputs(), weight)?;
         #[cfg(target_os = "linux")]
         let fixed = paths::fixed_paths(config, r).ok().flatten();
-        #[cfg(target_os = "linux")]
-        if fixed.is_some() {
-            env.insert(
-                "MOTOR_CALLER_WORKSPACE".into(),
-                paths::caller_checkout(r).to_string_lossy().into_owned(),
-            );
-        }
-        // An isolated job sees its trees at caller paths; only the test-only
-        // unisolated configuration runs a mapped job at its host paths.
         let job_path = |host: &std::path::Path| {
             if config.isolate_jobs {
                 paths::caller_form(config, host)
@@ -1168,11 +1169,6 @@ impl Backend for HostBackend {
                 host.to_path_buf()
             }
         };
-        env.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            job_path(&prepared.target).to_string_lossy().to_string(),
-        );
-        compile_cache_environment(config, s, prepared, &mut env)?;
         let env = env.into_iter().collect::<Vec<_>>();
         let job_cwd = job_path(&prepared.host_cwd);
         #[cfg(target_os = "linux")]
@@ -1366,11 +1362,102 @@ impl Execution for platform::Launch {
     }
 }
 
+/// Assemble the effective environment before seeding and again for launch.
+/// The caller supplies the same selected wrapper and remote transport to both;
+/// no generated wrapper executable is needed to compute these values.
+pub(crate) fn job_environment(
+    config: &Config,
+    trees: &Trees,
+    s: &Setup,
+    prepared: &EnvironmentInputs<'_>,
+    weight: u32,
+) -> io::Result<BTreeMap<String, String>> {
+    let r = &s.request;
+    let mut env = BTreeMap::new();
+    for &key in JOB_BASE_ENV {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_string(), value);
+        }
+    }
+    for (k, v) in &r.env {
+        if crate::allowed_env(k) {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+    #[cfg(test)]
+    if !config.isolate_jobs {
+        if let Some(cargo_home) = &config.fixture_cargo_home {
+            // Fixture Cargo jobs must not load configuration from the developer's home.
+            env.insert(
+                "CARGO_HOME".into(),
+                cargo_home.to_string_lossy().into_owned(),
+            );
+            env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+        }
+    }
+    // Match test and compile concurrency to the permits reserved for this job, not to
+    // the host's CPU count or an unrelated daemon's worker budget.
+    for key in [
+        "RUST_TEST_THREADS",
+        "NEXTEST_TEST_THREADS",
+        "CARGO_BUILD_JOBS",
+    ] {
+        env.entry(key.to_string())
+            .or_insert_with(|| weight.to_string());
+    }
+    for key in [
+        "SUBC_LAUNCH_NONCE",
+        "SUBC_LAUNCH_NONCE_FD",
+        "SUBC_MODULE_ID",
+        "SSH_AUTH_SOCK",
+    ] {
+        env.remove(key);
+    }
+    let caller_commit = r.base_commit.clone().unwrap_or_else(|| {
+        workspace::resolve_caller_commit(
+            &trees.mirror(paths::request(r).caller_repository_root.text()),
+            &r.snapshot_commit,
+            &r.tree_hash,
+        )
+    });
+    env.insert("CK_REMOTE_SOURCE_COMMIT".to_string(), caller_commit);
+    #[cfg(target_os = "linux")]
+    let fixed = paths::fixed_paths(config, r).ok().flatten();
+    #[cfg(target_os = "linux")]
+    if fixed.is_some() {
+        env.insert(
+            "MOTOR_CALLER_WORKSPACE".into(),
+            paths::caller_checkout(r).to_string_lossy().into_owned(),
+        );
+    }
+    // An isolated job sees its trees at caller paths; only the test-only
+    // unisolated configuration runs a mapped job at its host paths.
+    let job_path = |host: &std::path::Path| {
+        if config.isolate_jobs {
+            paths::caller_form(config, host)
+        } else {
+            host.to_path_buf()
+        }
+    };
+    env.insert(
+        "CARGO_TARGET_DIR".to_string(),
+        job_path(prepared.target).to_string_lossy().to_string(),
+    );
+    compile_cache_environment(config, s, prepared, &mut env)?;
+    // Sandbox::command enforces these even when the local compiler cache is off.
+    #[cfg(target_os = "linux")]
+    if config.isolate_jobs {
+        env.insert("CARGO_HOME".into(), crate::compile_cache::CARGO_HOME.into());
+        env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    }
+    Ok(env)
+}
+
 #[cfg(unix)]
 fn compile_cache_environment(
     config: &Config,
     setup: &Setup,
-    prepared: &Prepared,
+    prepared: &EnvironmentInputs<'_>,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
     #[cfg(unix)]
@@ -1422,7 +1509,7 @@ fn compile_cache_environment(
             && (setup.base
                 || !crate::compile_cache::configured_wrapper(
                     &paths::host_run(config, &setup.request).host_workspace,
-                    &prepared.host_cwd,
+                    prepared.host_cwd,
                 )?)
         {
             env.insert("RUSTC_WRAPPER".into(), "sccache".into());
@@ -1444,7 +1531,7 @@ fn compile_cache_environment(
 fn compile_cache_environment(
     _config: &Config,
     _setup: &Setup,
-    _prepared: &Prepared,
+    _prepared: &EnvironmentInputs<'_>,
     _env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
     Ok(())
@@ -1469,16 +1556,13 @@ fn rust_job(config: &Config, setup: &Setup) -> bool {
 pub(crate) fn scrub_inherited_cache_environment(
     config: &Config,
     setup: &Setup,
-    prepared: &Prepared,
+    prepared: &EnvironmentInputs<'_>,
     env: &mut BTreeMap<String, String>,
 ) {
     // Keep removing inherited cache settings on the build server; the remote
     // cache switch does not control this cleanup.
     let local = config.isolate_jobs && !config.boat_profile && !config.tenant_vm;
-    let remote = prepared
-        .sandbox
-        .as_ref()
-        .is_some_and(|sandbox| sandbox.cache_generation().is_some());
+    let remote = prepared.remote.is_some();
     if !local && !remote {
         return;
     }
@@ -1509,14 +1593,11 @@ pub(crate) fn scrub_inherited_cache_environment(
 fn remote_cache_environment(
     config: &Config,
     setup: &Setup,
-    prepared: &Prepared,
+    prepared: &EnvironmentInputs<'_>,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
     #[cfg(target_os = "linux")]
-    let remote = prepared
-        .sandbox
-        .as_ref()
-        .and_then(|sandbox| sandbox.cache_generation());
+    let remote = prepared.remote;
     #[cfg(not(target_os = "linux"))]
     let remote: Option<(
         &crate::remote_cache::provisioning::ActiveGeneration,

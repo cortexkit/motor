@@ -6,6 +6,176 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+struct ArgumentIsolationLauncher {
+    scratch: PathBuf,
+    tenant_vm: bool,
+    generation: Option<crate::remote_cache::provisioning::ActiveGeneration>,
+    forwarders: Vec<crate::remote_cache::transport::Forwarder>,
+    arguments: Arc<Mutex<Vec<std::ffi::OsString>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl IsolationLauncher for ArgumentIsolationLauncher {
+    fn cache_generation(
+        &self,
+    ) -> Option<(
+        &crate::remote_cache::provisioning::ActiveGeneration,
+        &[crate::remote_cache::transport::Forwarder],
+    )> {
+        self.generation
+            .as_ref()
+            .map(|g| (g, self.forwarders.as_slice()))
+    }
+
+    fn launch(
+        &self,
+        _command: &str,
+        _cwd: &Path,
+        env: &[(String, String)],
+        _cpus: &[u32],
+        _resources: JobResources,
+        _sources: crate::source_seal::Sources<'_>,
+    ) -> io::Result<platform::Launch> {
+        *self.arguments.lock().unwrap() = crate::isolation::Sandbox::environment_test_arguments(
+            &self.scratch,
+            self.tenant_vm,
+            env,
+        )?;
+        Err(io::Error::other("unit arguments captured"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pre_setup_fingerprint_matches_launched_setenv_in_build_server_and_tenant_vm() {
+    use crate::compile_cache::environment_fingerprint;
+    use crate::remote_cache::{gateway::Tool, transport::Forwarder};
+    for tenant in [false, true] {
+        for remote in [false, true] {
+            for fill in [false, true] {
+                for supervisor in [false, true] {
+                    let scratch = ScratchDir::new("pre-setup-environment");
+                    fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+                    if supervisor {
+                        let source = scratch.join("crates/prefrontal-build-slot/src");
+                        fs::create_dir_all(&source).unwrap();
+                        fs::write(source.join("main.rs"), "unbuilt source marker").unwrap();
+                    }
+                    let mut config = Config::new(scratch.join("state"), "main");
+                    config.isolate_jobs = true;
+                    config.tenant_vm = tenant;
+                    let mut setup = setup(&scratch);
+                    setup.base = fill;
+                    setup.request.base_commit = Some("source".into());
+                    setup.request.env = BTreeMap::from([
+                        ("CARGO_CUSTOM".into(), "é=value".into()),
+                        ("CARGO_NET_OFFLINE".into(), "false".into()),
+                        ("CARGO_INCREMENTAL".into(), "0".into()),
+                        ("RUSTFLAGS".into(), "-C debuginfo=1".into()),
+                        ("RUSTDOCFLAGS".into(), "".into()),
+                    ]);
+                    let generation = remote
+                        .then(|| crate::remote_cache::gateway::tests::generation("test", "tenant"));
+                    let forwarders = vec![Forwarder::new(Tool::Sccache, 4181)];
+                    let target = scratch.join("target");
+                    let inputs = EnvironmentInputs::before_setup(
+                        &config,
+                        &setup,
+                        &scratch,
+                        &target,
+                        generation.as_ref().map(|g| (g, forwarders.as_slice())),
+                    )
+                    .unwrap();
+                    let trees = trees(&config);
+                    let before = job_environment(&config, &trees, &setup, &inputs, 2).unwrap();
+                    assert_eq!(before["CARGO_HOME"], "/motor-home/cargo");
+                    assert_eq!(before["CARGO_NET_OFFLINE"], "true");
+                    assert_eq!(before["CARGO_CUSTOM"], "é=value");
+                    assert_eq!(before["RUSTDOCFLAGS"], "");
+                    let wrapper = inputs.wrapper.map(Path::to_path_buf);
+                    let arguments = Arc::new(Mutex::new(Vec::new()));
+                    let prepared = Prepared {
+                        host_cwd: scratch.path().to_owned(),
+                        target,
+                        wrapper,
+                        sandbox: Some(Box::new(ArgumentIsolationLauncher {
+                            scratch: scratch.path().to_owned(),
+                            tenant_vm: tenant,
+                            generation,
+                            forwarders,
+                            arguments: arguments.clone(),
+                        })),
+                        vm: None,
+                    };
+                    let error =
+                        launch_error(HostBackend.launch(&config, &trees, &setup, &prepared, 7));
+                    assert_eq!(error.to_string(), "unit arguments captured");
+                    let mut launched = BTreeMap::new();
+                    for arg in arguments.lock().unwrap().iter() {
+                        if let Some(entry) = arg.to_str().unwrap().strip_prefix("--setenv=") {
+                            let (key, value) = entry.split_once('=').unwrap();
+                            assert!(launched.insert(key.to_owned(), value.to_owned()).is_none());
+                        }
+                    }
+                    assert!(!launched.is_empty());
+                    assert_eq!(launched["CARGO_BUILD_JOBS"], "7");
+                    assert_eq!(
+                        environment_fingerprint(&before),
+                        environment_fingerprint(&launched),
+                        "tenant={tenant}, remote={remote}, fill={fill}, supervisor={supervisor}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pre_setup_fingerprint_respects_configured_wrapper_and_fill_differences() {
+    use crate::compile_cache::environment_fingerprint;
+    let scratch = ScratchDir::new("pre-setup-wrapper");
+    fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::create_dir(scratch.join(".cargo")).unwrap();
+    fs::write(
+        scratch.join(".cargo/config.toml"),
+        "[build]\nrustc-wrapper='custom'\n",
+    )
+    .unwrap();
+    let mut config = Config::new(scratch.join("state"), "main");
+    config.isolate_jobs = true;
+    let mut setup = setup(&scratch);
+    setup.request.base_commit = Some("source".into());
+    let trees = trees(&config);
+    let target = scratch.join("target");
+    let env = |setup: &Setup| {
+        let inputs =
+            EnvironmentInputs::before_setup(&config, setup, &scratch, &target, None).unwrap();
+        job_environment(&config, &trees, setup, &inputs, 2).unwrap()
+    };
+    let job = env(&setup);
+    setup.base = true;
+    let fill = env(&setup);
+    assert!(!job.contains_key("RUSTC_WRAPPER"));
+    assert_eq!(fill["RUSTC_WRAPPER"], "sccache");
+    assert_ne!(
+        environment_fingerprint(&job),
+        environment_fingerprint(&fill)
+    );
+    fs::remove_file(scratch.join(".cargo/config.toml")).unwrap();
+    setup.base = false;
+    assert_eq!(
+        environment_fingerprint(&env(&setup)),
+        environment_fingerprint(&fill)
+    );
+    setup.request.env.insert("CARGO_CUSTOM".into(), "".into());
+    assert_ne!(
+        environment_fingerprint(&env(&setup)),
+        environment_fingerprint(&fill)
+    );
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn boat_launch_rechecks_storage_and_workspace() {
     // Use /dev/shm so this scratch directory is on a different device from
@@ -565,10 +735,12 @@ fn isolated_fill_and_job_have_identical_hashed_cargo_inputs() {
             vm: None,
         };
         let mut job = BTreeMap::new();
-        compile_cache_environment(&config, &setup, &prepared, &mut job).unwrap();
+        compile_cache_environment(&config, &setup, &prepared.environment_inputs(), &mut job)
+            .unwrap();
         setup.base = true;
         let mut fill = BTreeMap::new();
-        compile_cache_environment(&config, &setup, &prepared, &mut fill).unwrap();
+        compile_cache_environment(&config, &setup, &prepared.environment_inputs(), &mut fill)
+            .unwrap();
         // The compiler shim strips incremental settings before sccache hashes either role.
         let hashed_cargo = |env: &mut BTreeMap<String, String>| {
             env.retain(|key, _| key.starts_with("CARGO_") && key != "CARGO_INCREMENTAL");
@@ -655,7 +827,7 @@ fn hosted_cache_case(
         "CARGO_TARGET_DIR".into(),
         prepared.target.to_string_lossy().into_owned(),
     )]);
-    compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+    compile_cache_environment(&config, &setup, &prepared.environment_inputs(), &mut env).unwrap();
     let mut read_only = Vec::new();
     let mut read_write = Vec::new();
     let mut destinations = Vec::new();
@@ -940,7 +1112,8 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
         env.insert("RUSTFLAGS".into(), "-C debuginfo=1".into());
-        compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+        compile_cache_environment(&config, &setup, &prepared.environment_inputs(), &mut env)
+            .unwrap();
         let mut expected: BTreeMap<String, String> = pinned
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -992,7 +1165,8 @@ fn inherited_sccache_and_aws_settings_follow_the_switch_state() {
         };
         let available = config.remote_cache_available(fill).is_some();
         let mut env = inherited();
-        compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+        compile_cache_environment(&config, &setup, &prepared.environment_inputs(), &mut env)
+            .unwrap();
         (available, env)
     };
 

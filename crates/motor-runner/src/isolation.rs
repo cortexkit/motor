@@ -3720,6 +3720,53 @@ impl Sandbox {
         Ok(self)
     }
 
+    /// Inspect real unit arguments without starting a service or preparing any
+    /// mounts. The runtime path must remain absent so there is nothing to reclaim.
+    #[cfg(test)]
+    pub(crate) fn environment_test_arguments(
+        scratch: &Path,
+        tenant_vm: bool,
+        env: &[(String, String)],
+    ) -> io::Result<Vec<std::ffi::OsString>> {
+        let sandbox = Self {
+            id: Uuid::now_v7(),
+            root: scratch.join("root"),
+            home: PathBuf::from("/motor-home"),
+            cargo: PathBuf::from("/motor-home/cargo"),
+            rustup: PathBuf::from("/toolchain"),
+            path: "/usr/bin:/bin".into(),
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            wrapper: None,
+            prepared_javascript_directories: Vec::new(),
+            runtime: std::sync::Arc::new(RuntimeDir(
+                scratch.join("unprepared"),
+                std::sync::OnceLock::new(),
+                std::sync::OnceLock::new(),
+            )),
+            retain_failed: false,
+            network: false,
+            tenant_vm,
+            private_pids: true,
+            boat_profile: false,
+            boat_memory_max: None,
+            pid_init: None,
+            provider_unset_env: Vec::new(),
+            cache_forwarders: Vec::new(),
+            cache_generation: None,
+            cargo_overlays: None,
+            cargo_image: None,
+            locked_git_commits: Vec::new(),
+            parent_umask: 0o022,
+            memory_floor_gib: None,
+            slice_budget: std::sync::Mutex::new(None),
+            user: USER,
+            writer: false,
+        };
+        let command = sandbox.command("true", scratch, env, false, &[], 2)?;
+        Ok(command.get_args().map(|arg| arg.to_owned()).collect())
+    }
+
     #[cfg(test)]
     fn command(
         &self,

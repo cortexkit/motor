@@ -40,6 +40,94 @@ pub(crate) const TARGET: &str = "/run/motor/target";
 pub(crate) const CACHE: &str = "/motor-cache";
 pub(crate) const CARGO_HOME: &str = "/motor-home/cargo";
 
+/// Format-1 build-base environment key. Frame names as well as values so
+/// swapped values, empty values and missing variables cannot alias one another.
+#[cfg(target_os = "linux")]
+pub(crate) fn environment_fingerprint(env: &BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for (name, value) in env {
+        if (name.starts_with("CARGO_")
+            || matches!(
+                name.as_str(),
+                "RUSTFLAGS" | "RUSTDOCFLAGS" | "RUSTC_WRAPPER"
+            ))
+            && !matches!(name.as_str(), "CARGO_BUILD_JOBS" | "CARGO_INCREMENTAL")
+        {
+            for input in [name, value] {
+                hash.update(
+                    u32::try_from(input.len())
+                        .expect("environment input exceeds u32")
+                        .to_be_bytes(),
+                );
+                hash.update(input.as_bytes());
+            }
+        }
+    }
+    format!("{:x}", hash.finalize())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn environment_fingerprint_uses_sorted_length_framed_names_and_values() {
+        let env = BTreeMap::from([
+            ("RUSTFLAGS".into(), "-C debuginfo=1".into()),
+            ("CARGO_Z".into(), "".into()),
+            ("CARGO_A".into(), "x".into()),
+        ]);
+        // Independently encoded as u32 big-endian byte lengths, in name order.
+        assert_eq!(
+            environment_fingerprint(&env),
+            "d781bb0df880ed0548e7bda8d7b04640f855ee280e2e2bd40be953ff63b2c945"
+        );
+        let mut changed = env.clone();
+        changed.insert("CARGO_A".into(), "".into());
+        changed.insert("CARGO_Z".into(), "x".into());
+        assert_ne!(
+            environment_fingerprint(&env),
+            environment_fingerprint(&changed)
+        );
+        changed = env.clone();
+        changed.remove("CARGO_Z");
+        assert_ne!(
+            environment_fingerprint(&env),
+            environment_fingerprint(&changed)
+        );
+        for name in [
+            "CARGO_FUTURE_VARIABLE",
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "RUSTC_WRAPPER",
+        ] {
+            changed = env.clone();
+            changed.insert(name.into(), "é=value".into());
+            assert_ne!(
+                environment_fingerprint(&env),
+                environment_fingerprint(&changed),
+                "{name}"
+            );
+        }
+        for name in [
+            "CARGO_BUILD_JOBS",
+            "CARGO_INCREMENTAL",
+            "RUST_TEST_THREADS",
+            "NEXTEST_TEST_THREADS",
+            "SCCACHE_BUCKET",
+        ] {
+            changed = env.clone();
+            changed.insert(name.into(), "different".into());
+            assert_eq!(
+                environment_fingerprint(&env),
+                environment_fingerprint(&changed),
+                "{name}"
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn build_directory() -> String {
     format!("{TARGET}/bd/{{workspace-path-hash}}")
