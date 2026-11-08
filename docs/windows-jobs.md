@@ -151,6 +151,14 @@ Windows Error Reporting writes minidumps for crashing job processes to
 and they are deleted with the job VM. To retrieve a dump, copy it into the job's
 checkout and name that path in `return_paths`.
 
+The checkout is a plain copy of the snapshot's files, exported from the commit
+with `git archive`: it has no `.git` folder, so a `git` command run in it fails
+with `not a git repository`. The job's `CK_REMOTE_SOURCE_COMMIT` environment
+variable (see 3.4) names the commit.
+Run steps that need Git metadata, such as listing tracked files or reading
+history, on Linux, where the checkout keeps a read-only `.git`, or on the
+caller's machine. Source: `crates/motor-runner/src/windows/prep.rs`.
+
 3.2. The VM has no network device. The command can use loopback inside the
 guest and nothing else. A request for outbound network is refused with
 `network_unsupported`. Tests: `windows_qualification_no_network_but_loopback_works`
