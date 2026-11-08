@@ -155,6 +155,12 @@ The checkout is a plain copy of the snapshot's files, exported from the commit
 with `git archive`: it has no `.git` folder, so a `git` command run in it fails
 with `not a git repository`. The job's `CK_REMOTE_SOURCE_COMMIT` environment
 variable (see 3.4) names the commit.
+Before starting the command, the host writes one line to the job's stderr:
+`motor: this Windows checkout has no .git folder (a plain copy of commit <CK_REMOTE_SOURCE_COMMIT>); run git commands on Linux or locally.`
+The placeholder is replaced by the same commit used for the job's environment;
+the notice precedes all command output and is not emitted for Linux jobs. Tests:
+`windows_backend_checkout_notice_precedes_all_command_output`,
+`linux_command_has_no_windows_checkout_notice`.
 Run steps that need Git metadata, such as listing tracked files or reading
 history, on Linux, where the checkout keeps a read-only `.git`, or on the
 caller's machine. Source: `crates/motor-runner/src/windows/prep.rs`.
@@ -385,9 +391,12 @@ See [drain-and-rollback.md](drain-and-rollback.md).
 
 ## Cache disks
 
-Each workspace has its own 40 GiB build-cache disk, attached to the VM as a
+Each workspace has its own dynamically expanding 100 GiB build-cache disk, attached to the VM as a
 second drive with the serial `motor-cache`; the guest mounts it at `C:\t\`
 and junctions the workspace's `target` directory to that same volume root.
+Existing smaller disks remain usable and are not resized. Tests:
+`windows_backend_new_cache_is_100_gib_and_existing_disks_are_not_resized`,
+`windows_backend_hyperv_cache_is_100_gib_and_usage_query_never_mounts`.
 Unless the caller sets `CARGO_TARGET_DIR` (case-insensitively), the agent defaults
 it to `C:\t`, keeping MSVC linker output paths short even for a long checkout.
 Default builds still persist on that workspace's cache disk, and reading
@@ -424,7 +433,22 @@ workspace's next job starts on a new disk. Tests:
 
 A disk is kept for the next job only when the command reached a known outcome
 (any exit code counts), the guest dismounted the disk cleanly, and the VM unit
-exited normally. Otherwise the disk is discarded. Disks are evicted least
+exited normally. Otherwise the disk is discarded. Even after a clean job, the
+host discards a disk whose container has allocated at least 90% of its virtual
+capacity, logging the workspace's cache-key hash and the allocated and virtual
+sizes. After stopping the VM, the host reads container metadata without mounting
+the cache: `Get-VHD`'s `FileSize` and `Size` on Hyper-V, or `qemu-img info`'s
+`actual-size` and `virtual-size` on QEMU. The comparison uses the disk's actual
+virtual capacity, including for existing smaller disks. It is a conservative
+rule, not a measurement of guest free space: dynamically expanding disks do not
+shrink when guest files are deleted, so a disk that was once nearly full can
+start cold even after files were removed. If size information is unavailable,
+the host keeps an otherwise clean disk as before. The next job after a discard
+starts on a fresh disk. Tests:
+`windows_backend_nearly_full_cache_is_discarded_and_next_job_recreates_it`,
+`windows_backend_unreported_cache_size_keeps_clean_disk`,
+`windows_cache_container_allocation_threshold_uses_virtual_size`.
+Disks are evicted least
 recently used under disk pressure, never while attached or recently used.
 Tests: `windows_cache_key_includes_baseline_name_and_toolchain`,
 `windows_cache_reuse_requires_clean_dismount_normal_exit_and_known_outcome`,

@@ -8542,6 +8542,25 @@ impl Runner {
                 return self.failed_launch(id, execution, error, true, "output_unavailable");
             }
         };
+        if self.core.config.windows_instance() {
+            let notice = format!("motor: this Windows checkout has no .git folder (a plain copy of commit {}); run git commands on Linux or locally.\n", r.snapshot_commit);
+            drop(inner);
+            let recorded = self.output_at_locked(
+                id,
+                OutputStream::Stderr,
+                notice.as_bytes(),
+                None,
+                &log,
+                &_write,
+            );
+            inner = self.core.inner.lock().unwrap();
+            if let Err(error) = recorded {
+                inner.starting.insert(id);
+                inner.finalizing.insert(id);
+                drop(inner);
+                return self.failed_launch(id, execution, error, true, "output_unavailable");
+            }
+        }
         #[cfg(test)]
         if let Some(hook) = &self.core.config.before_gate {
             hook();
@@ -9241,6 +9260,19 @@ impl Runner {
     ) -> io::Result<()> {
         let log = self.job_log(id);
         let _write = log.write_for_output();
+        self.output_at_locked(id, stream, bytes, offset, &log, &_write)
+    }
+    // Launch already holds the log lock while recording Started and opening the
+    // execution gate. Reuse that lock when recording output before command start.
+    fn output_at_locked(
+        &self,
+        id: Uuid,
+        stream: OutputStream,
+        bytes: &[u8],
+        offset: Option<u64>,
+        log: &JobLog,
+        _write: &std::sync::MutexGuard<'_, ()>,
+    ) -> io::Result<()> {
         let directory = self.record_path(id).parent().unwrap().to_owned();
         let mut consumed = 0usize;
         for bytes_part in bytes.chunks(REPLAY_PAGE_BYTES as usize) {

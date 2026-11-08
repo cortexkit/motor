@@ -33,6 +33,14 @@ pub(crate) struct CacheCandidate {
     pub last_used_ms: u64,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct DiskUsage {
+    #[serde(alias = "actual-size")]
+    allocated_bytes: u64,
+    #[serde(alias = "virtual-size")]
+    virtual_bytes: u64,
+}
+
 impl CacheDisks {
     pub(crate) fn new(vm: &VmConfig) -> Self {
         Self {
@@ -169,8 +177,33 @@ impl CacheDisks {
         self.sync_root()?;
         Ok(disk)
     }
-    /// Reuse requires all three facts: a known outcome, a clean agent dismount
-    /// after command stop, and normal VM unit exit. Any missing fact discards it.
+    pub(crate) fn reported_usage(
+        &self,
+        workspace: &str,
+        report: io::Result<std::process::Output>,
+    ) -> Option<DiskUsage> {
+        let usage = report.and_then(|output| {
+            if !output.status.success() {
+                return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+            }
+            // Windows PowerShell 5.1 can prefix redirected UTF-8 with a byte order mark.
+            let json = output
+                .stdout
+                .strip_prefix(b"\xef\xbb\xbf")
+                .unwrap_or(&output.stdout);
+            serde_json::from_slice(json).map_err(invalid)
+        });
+        match usage {
+            Ok(usage) => Some(usage),
+            Err(error) => {
+                tracing::warn!(cache_key = %self.key(workspace), %error, "Windows cache size unavailable; keeping clean cache");
+                None
+            }
+        }
+    }
+
+    /// Reuse requires a known outcome, clean agent dismount after command stop,
+    /// and normal VM unit exit. A disk at least 90% allocated also starts cold.
     #[allow(dead_code)]
     pub(crate) fn complete(
         &self,
@@ -179,10 +212,19 @@ impl CacheDisks {
         known_outcome: bool,
         clean_dismount: bool,
         normal_exit: bool,
+        usage: Option<DiskUsage>,
     ) -> io::Result<()> {
         let disk = self.disk(workspace);
         let _lock = self.lock(&disk)?;
-        if known_outcome && clean_dismount && normal_exit {
+        let nearly_full = usage.is_some_and(|usage| {
+            let nearly_full = usage.virtual_bytes > 0
+                && u128::from(usage.allocated_bytes) * 10 >= u128::from(usage.virtual_bytes) * 9;
+            if nearly_full {
+                tracing::warn!(cache_key = %self.key(workspace), allocated_bytes = usage.allocated_bytes, virtual_bytes = usage.virtual_bytes, "discarding nearly full Windows cache disk");
+            }
+            nearly_full
+        });
+        if known_outcome && clean_dismount && normal_exit && !nearly_full {
             if !self.attached(&disk)? {
                 return Err(invalid("Windows cache completion lacks attachment marker"));
             }

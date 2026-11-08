@@ -223,7 +223,7 @@ impl Resources {
                     "-f".into(),
                     "qcow2".into(),
                     resources.cache.to_string_lossy().into_owned(),
-                    "40G".into(),
+                    "100G".into(),
                 ],
             )?;
         }
@@ -290,12 +290,32 @@ impl Resources {
         Ok(())
     }
     pub(super) fn complete(&mut self, known: bool) -> io::Result<()> {
-        self.config
-            .windows
-            .as_ref()
-            .unwrap()
-            .caches()
-            .complete(&self.workspace, (self.config.clock)(), known, true, true)
+        let caches = self.config.windows.as_ref().unwrap().caches();
+        let usage = known
+            .then(|| {
+                caches.reported_usage(
+                    &self.workspace,
+                    command(
+                        &self.config,
+                        "/usr/bin/qemu-img",
+                        &[
+                            "info".into(),
+                            "--output=json".into(),
+                            self.cache.to_string_lossy().into_owned(),
+                        ],
+                    ),
+                )
+            })
+            .flatten();
+        caches
+            .complete(
+                &self.workspace,
+                (self.config.clock)(),
+                known,
+                true,
+                true,
+                usage,
+            )
             .map_err(|error| path_error("complete cache disk", &self.cache, error))?;
         self.attached = false;
         Ok(())
@@ -364,7 +384,14 @@ impl Resources {
                 .as_ref()
                 .unwrap()
                 .caches()
-                .complete(&self.workspace, (self.config.clock)(), false, false, false)
+                .complete(
+                    &self.workspace,
+                    (self.config.clock)(),
+                    false,
+                    false,
+                    false,
+                    None,
+                )
                 .map_err(|error| path_error("discard attached cache disk", &self.cache, error))?;
             self.attached = false;
         }

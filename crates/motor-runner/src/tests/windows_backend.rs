@@ -277,6 +277,13 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
             return Ok(output(0, b"/toolchain/bin/cargo\n".to_vec(), Vec::new()));
         }
         if program.ends_with("qemu-img") {
+            if args.first().is_some_and(|arg| arg == "info") {
+                return Ok(output(
+                    0,
+                    br#"{"actual-size":20,"virtual-size":100}"#.to_vec(),
+                    Vec::new(),
+                ));
+            }
             let disk = if args.len() > 5 {
                 args.last().unwrap()
             } else {
@@ -713,6 +720,9 @@ fn request(f: &Fixture) -> (Run, Vec<Vec<u8>>) {
     r.platform = Some(Platform::Windows);
     (r, bytes)
 }
+fn checkout_notice(commit: &str) -> String {
+    format!("motor: this Windows checkout has no .git folder (a plain copy of commit {commit}); run git commands on Linux or locally.\n")
+}
 async fn phase(agent: &Agent, wanted: u64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while agent.phase.load(Ordering::SeqCst) != wanted {
@@ -1145,7 +1155,10 @@ async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wir
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        assert_eq!(stderr, b"Windows stderr\n");
+        assert_eq!(
+            stderr,
+            format!("{}Windows stderr\n", checkout_notice(&r.snapshot_commit)).as_bytes()
+        );
         assert_eq!(
             runner
                 .config()
@@ -1248,6 +1261,42 @@ fn windows_backend_reports_workspace_changes_relative_to_checkout_root() {
 }
 
 #[tokio::test]
+async fn windows_backend_checkout_notice_precedes_all_command_output() {
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::None, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (mut r, bytes) = request(&f);
+    r.env
+        .insert("CK_REMOTE_SOURCE_COMMIT".into(), "caller-spoof".into());
+    f.submit(&runner, &r, &bytes);
+    assert_eq!(
+        terminal(&runner, r.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    let replay = runner.replay(r.job_id, 0).unwrap();
+    let output = replay
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Output(output) => Some(output),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0].seq, 1);
+    assert_eq!(output[0].stream, OutputStream::Stderr);
+    assert_eq!(
+        output[0].bytes.0,
+        checkout_notice(&r.snapshot_commit).as_bytes()
+    );
+    for command in &output[1..] {
+        assert!(command.seq > output[0].seq);
+        assert!(command.bytes.0 == b"Windows stdout\n" || command.bytes.0 == b"Windows stderr\n");
+    }
+    cleaned(runner.config(), r.job_id, &a);
+}
+
+#[tokio::test]
 async fn windows_backend_slow_output_storage_preserves_exit_and_ordered_streams() {
     let f = Fixture::new();
     source(&f);
@@ -1260,6 +1309,9 @@ async fn windows_backend_slow_output_storage_preserves_exit_and_ordered_streams(
             .unwrap()
             .to_string_lossy()
             .starts_with("chunk-")
+            // The host notice is persisted before the guest can start. Stall
+            // command output instead, so the guest can fill the output channel.
+            && path.file_name().unwrap() != "chunk-1"
         {
             pause.block();
         }
@@ -1306,7 +1358,14 @@ async fn windows_backend_slow_output_storage_preserves_exit_and_ordered_streams(
     }
     let expected: Vec<u8> = (0..96).flat_map(|sequence| [sequence; 256]).collect();
     assert_eq!(streams[0], expected);
-    assert_eq!(streams[1], expected);
+    assert_eq!(
+        streams[1],
+        [
+            checkout_notice(&r.snapshot_commit).as_bytes(),
+            expected.as_slice()
+        ]
+        .concat()
+    );
     cleaned(runner.config(), r.job_id, &a);
 }
 
@@ -2152,6 +2211,173 @@ async fn windows_backend_slot_busy_comes_from_child_code_75_before_hello_deadlin
             .join("vm/overlays")
             .join(format!("{}.qcow2", r.job_id))
             .exists());
+    }
+}
+
+#[tokio::test]
+async fn windows_backend_new_cache_is_100_gib_and_existing_disks_are_not_resized() {
+    for existing in [false, true] {
+        let f = Fixture::new();
+        source(&f);
+        let (mut c, a) = configure(&f, Fault::None, 0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let original = c.windows_command.take().unwrap();
+        c.windows_command = Some(Arc::new(move |program, args| {
+            if program.ends_with("qemu-img") {
+                recorded.lock().unwrap().push(args.to_vec());
+            }
+            original(program, args)
+        }));
+        let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+        let cache = runner
+            .config()
+            .windows
+            .as_ref()
+            .unwrap()
+            .caches()
+            .disk(&f.key);
+        if existing {
+            fs::write(&cache, b"smaller existing disk").unwrap();
+        }
+        let (r, bytes) = request(&f);
+        f.submit(&runner, &r, &bytes);
+        assert_eq!(
+            terminal(&runner, r.job_id).await.outcome,
+            Outcome::WindowsExit { code: 0 }
+        );
+        let calls = calls.lock().unwrap();
+        let creates = calls
+            .iter()
+            .filter(|args| {
+                args.first().is_some_and(|arg| arg == "create")
+                    && args.contains(&cache.to_string_lossy().into_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), usize::from(!existing), "{calls:?}");
+        if !existing {
+            assert_eq!(creates[0].last().unwrap(), "100G");
+        }
+        assert!(!calls.iter().flatten().any(|arg| arg == "resize"));
+        assert!(cache.exists());
+        cleaned(runner.config(), r.job_id, &a);
+    }
+}
+
+#[test]
+fn windows_backend_hyperv_cache_is_100_gib_and_usage_query_never_mounts() {
+    let script = include_str!("../../../../script/windows-runner/hyperv.ps1");
+    assert!(script.contains("if (-not (Test-Path -LiteralPath $Cache)) { New-VHD -Path $Cache -Dynamic -SizeBytes 100GB | Out-Null }"));
+    assert!(!script.contains("Resize-VHD"));
+    let usage = script
+        .split("'CacheUsage' {")
+        .nth(1)
+        .unwrap()
+        .split("'Prepare' {")
+        .next()
+        .unwrap();
+    assert!(usage.contains("Get-VHD -Path $Cache"));
+    assert!(usage.contains("allocated_bytes=[UInt64]$disk.FileSize"));
+    assert!(usage.contains("virtual_bytes=[UInt64]$disk.Size"));
+    assert!(usage.contains("throw 'Invalid cache disk'"));
+    assert!(usage.contains("throw 'Reparse cache disk refused'"));
+    assert!(!usage.contains("Mount-VHD"));
+}
+
+#[tokio::test]
+async fn windows_backend_nearly_full_cache_is_discarded_and_next_job_recreates_it() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut c, a) = configure(&f, Fault::None, 0);
+    let report = Arc::new(Mutex::new(
+        br#"{"actual-size":36,"virtual-size":40}"#.to_vec(),
+    ));
+    let current = report.clone();
+    let agent = a.clone();
+    let original = c.windows_command.take().unwrap();
+    c.windows_command = Some(Arc::new(move |program, args| {
+        if program.ends_with("qemu-img") && args.first().is_some_and(|arg| arg == "info") {
+            assert!(
+                agent.stops.load(Ordering::SeqCst) > 0,
+                "only inspect a stopped VM's cache"
+            );
+            assert_eq!(args[1], "--output=json");
+            return Ok(output(0, current.lock().unwrap().clone(), Vec::new()));
+        }
+        original(program, args)
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let cache = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&f.key);
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    assert_eq!(
+        terminal(&runner, r.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    cleaned(runner.config(), r.job_id, &a);
+    assert!(
+        !cache.exists(),
+        "a cache at 90% allocated must be discarded"
+    );
+    for extension in ["attached", "json", "source-mtimes.json"] {
+        assert!(!cache.with_extension(extension).exists());
+    }
+    *report.lock().unwrap() = br#"{"actual-size":20,"virtual-size":100}"#.to_vec();
+    let (next, bytes) = request(&f);
+    f.submit(&runner, &next, &bytes);
+    assert_eq!(
+        terminal(&runner, next.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    assert!(cache.exists());
+    assert_eq!(a.starts.load(Ordering::SeqCst), 2);
+    for path in job_artifacts(runner.config(), next.job_id) {
+        assert!(!path.exists(), "{} remains", path.display());
+    }
+    assert_eq!(a.stops.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn windows_backend_unreported_cache_size_keeps_clean_disk() {
+    for report in [
+        Ok(output(0, b"{}".to_vec(), Vec::new())),
+        Ok(output(1, Vec::new(), b"unsupported query".to_vec())),
+        Err(io::Error::other("size probe unavailable")),
+    ] {
+        let f = Fixture::new();
+        source(&f);
+        let (mut c, a) = configure(&f, Fault::None, 0);
+        let report = Mutex::new(Some(report));
+        let original = c.windows_command.take().unwrap();
+        c.windows_command = Some(Arc::new(move |program, args| {
+            if program.ends_with("qemu-img") && args.first().is_some_and(|arg| arg == "info") {
+                return report.lock().unwrap().take().unwrap();
+            }
+            original(program, args)
+        }));
+        let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+        let cache = runner
+            .config()
+            .windows
+            .as_ref()
+            .unwrap()
+            .caches()
+            .disk(&f.key);
+        let (r, bytes) = request(&f);
+        f.submit(&runner, &r, &bytes);
+        assert_eq!(
+            terminal(&runner, r.job_id).await.outcome,
+            Outcome::WindowsExit { code: 0 }
+        );
+        assert!(cache.exists());
+        assert!(!cache.with_extension("attached").exists());
+        cleaned(runner.config(), r.job_id, &a);
     }
 }
 

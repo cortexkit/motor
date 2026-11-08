@@ -1,6 +1,6 @@
 # Trusted control plane. Only installed, ACL-protected copies run as SYSTEM.
 param(
-    [Parameter(Mandatory)][ValidateSet('Validate','Prepare','Id','Run','Remove','Reconcile','Harvest','QualifyInspect')][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet('Validate','Prepare','Id','Run','Remove','Reconcile','Harvest','QualifyInspect','CacheUsage')][string]$Operation,
     [Parameter(Mandatory)][string]$Root,
     [string]$Job, [string]$Parent, [string]$ParentSha256, [string]$Cache,
     [string]$Nonce, [string]$PeerTargetsJson, [UInt64]$OverlayQuotaBytes = 42949672960,
@@ -222,6 +222,13 @@ switch ($Operation) {
         Evidence 'parent-verification' $verificationEvent $verification
         Write-Output "PASS native-host-validation cache_hit=$($verification.cache_hit) hash_duration_ms=$($verification.hash_duration_ms)"
     }
+    'CacheUsage' {
+        if ([IO.Path]::GetDirectoryName($Cache) -cne "$Root\vm\caches" -or [IO.Path]::GetFileName($Cache) -notmatch '^[0-9a-f]{64}\.vhdx$') { throw 'Invalid cache disk' }
+        if ((Get-Item -LiteralPath $Cache -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse cache disk refused' }
+        # Read container metadata only, after Remove has stopped the VM.
+        $disk = Get-VHD -Path $Cache
+        @{allocated_bytes=[UInt64]$disk.FileSize; virtual_bytes=[UInt64]$disk.Size} | ConvertTo-Json -Compress
+    }
     'Prepare' {
         if ($Nonce -notmatch '\A[0-9a-f]{32}\z') { throw 'Nonce must be exactly 32 hexadecimal characters, without hyphens, BOM or newline' }
         if ([IO.Path]::GetDirectoryName($Parent) -cne "$Root\baselines") { throw 'Parent must be an owned sealed baseline' }
@@ -238,7 +245,7 @@ switch ($Operation) {
             New-SpikeIso "$directory\nonce" "$directory\nonce.iso" 'MOTORNONCE'
             Remove-Item "$directory\nonce" -Recurse -Force
             New-VHD -Path "$directory\os.vhdx" -ParentPath $Parent -Differencing | Out-Null
-            if (-not (Test-Path -LiteralPath $Cache)) { New-VHD -Path $Cache -Dynamic -SizeBytes 40GB | Out-Null }
+            if (-not (Test-Path -LiteralPath $Cache)) { New-VHD -Path $Cache -Dynamic -SizeBytes 100GB | Out-Null }
             @{parent=$Parent; sha256=$ParentSha256; quota=$OverlayQuotaBytes} | ConvertTo-Json | Set-Content "$directory\job.json" -Encoding ascii
             $vm = New-VM -Name "$prefix$Job" -Generation 2 -MemoryStartupBytes 8GB -VHDPath "$directory\os.vhdx" -Path "$directory\config"
             Set-VM -VM $vm -Notes "$owner`:$Job" -ProcessorCount 4 -AutomaticCheckpointsEnabled $false -CheckpointType Disabled -AutomaticStartAction Nothing -AutomaticStopAction TurnOff

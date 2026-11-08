@@ -64,6 +64,29 @@ async fn started_is_recorded_only_after_setup_with_capacity_wait() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_command_has_no_windows_checkout_notice() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    assert_eq!(runner.config().served_platform(), Platform::Linux);
+    let (request, bytes) = f.run("printf linux-output");
+    f.submit(&runner, &request, &bytes);
+    terminal(&runner, request.job_id).await;
+    base_done(&runner).await;
+    let replay = runner.replay(request.job_id, 0).unwrap();
+    let output = replay
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Output(output) => Some(output),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].stream, OutputStream::Stdout);
+    assert_eq!(output[0].bytes.0, b"linux-output");
+}
+
 #[tokio::test]
 async fn started_replay_is_inclusive_durable_and_not_repeated() {
     let f = Fixture::new();

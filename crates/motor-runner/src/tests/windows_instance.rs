@@ -741,7 +741,9 @@ fn seed_disk(vm: &VmConfig, key: &str, last_used: u64, marked: bool) -> PathBuf 
     fs::write(&disk, b"fake qcow2 allocated bytes").unwrap();
     caches.attach(key, last_used).unwrap();
     if !marked {
-        caches.complete(key, last_used, true, true, true).unwrap();
+        caches
+            .complete(key, last_used, true, true, true, None)
+            .unwrap();
     }
     disk
 }
@@ -801,12 +803,57 @@ fn windows_cache_reuse_requires_clean_dismount_normal_exit_and_known_outcome() {
         let mtimes = disk.with_extension("source-mtimes.json");
         fs::write(&mtimes, "source timestamp history").unwrap();
         assert!(vm.caches().marker(&disk).exists());
-        vm.caches().complete(&key, 9, known, clean, normal).unwrap();
+        vm.caches()
+            .complete(&key, 9, known, clean, normal, None)
+            .unwrap();
         assert_eq!(disk.exists(), known && clean && normal);
         assert_eq!(mtimes.exists(), known && clean && normal);
         assert!(!vm.caches().marker(&disk).exists());
         if disk.exists() {
             assert_eq!(vm.caches().last_used(&disk).unwrap(), 9);
+        }
+    }
+}
+
+#[test]
+fn windows_cache_container_allocation_threshold_uses_virtual_size() {
+    let f = Fixture::new();
+    let c = config(&f);
+    let vm = VmConfig::load(c.vm_config.as_ref().unwrap()).unwrap();
+    for (index, (report, keep)) in [
+        (r#"{"actual-size":35,"virtual-size":40}"#, true),
+        (r#"{"actual-size":36,"virtual-size":40}"#, false),
+        (
+            "\u{feff}{\"allocated_bytes\":90,\"virtual_bytes\":100}",
+            false,
+        ),
+        (r#"{"allocated_bytes":100,"virtual_bytes":100}"#, false),
+        (r#"{"allocated_bytes":1,"virtual_bytes":0}"#, true),
+        (
+            r#"{"actual-size":18446744073709551615,"virtual-size":18446744073709551615}"#,
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = format!("allocation-{index}");
+        let disk = seed_disk(&vm, &key, 1, true);
+        let caches = vm.caches();
+        let usage = caches.reported_usage(&key, Ok(output(report)));
+        assert!(usage.is_some(), "{report}");
+        let log =
+            capture_runner_logs(|| caches.complete(&key, 9, true, true, true, usage).unwrap());
+        assert_eq!(disk.exists(), keep, "{report}");
+        assert!(!caches.marker(&disk).exists());
+        if !keep {
+            assert!(
+                log.contains("discarding nearly full Windows cache disk"),
+                "{log}"
+            );
+            assert!(log.contains(&caches.key(&key)), "{log}");
+            assert!(log.contains("allocated_bytes="), "{log}");
+            assert!(log.contains("virtual_bytes="), "{log}");
         }
     }
 }

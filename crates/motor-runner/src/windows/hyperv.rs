@@ -399,12 +399,31 @@ impl Resources {
         // cache/staging retry, but no package handles are needed for that work.
         self.bun_lease = None;
         if self.attached {
-            self.config.windows.as_ref().unwrap().caches().complete(
+            let caches = self.config.windows.as_ref().unwrap().caches();
+            let usage = known
+                .then(|| {
+                    caches.reported_usage(
+                        &self.workspace,
+                        control(
+                            &self.config,
+                            "CacheUsage",
+                            None,
+                            &[
+                                "-Cache".into(),
+                                caches.disk(&self.workspace).to_string_lossy().into_owned(),
+                            ],
+                        )
+                        .and_then(checked),
+                    )
+                })
+                .flatten();
+            caches.complete(
                 &self.workspace,
                 (self.config.clock)(),
                 known,
                 known,
                 known,
+                usage,
             )?;
             self.attached = false;
         }
