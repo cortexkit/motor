@@ -16,7 +16,7 @@ test run does not establish a working tenant VM, a deployed broker or a complete
   `crates/motor-lease/contracts/cloud/`, pinned to the broker contract revision
   recorded in its manifest. Do not run production against the fake broker.
 - An account grant for ck-motor's outbound route to the claustrum vault. The
-  daemon authenticates this caller as `reserved:ck-motor` using the supervised
+  daemon authenticates this caller as `reserved:motor` using the supervised
   module's launch nonce; this is not an inbound exec route to ck-motor.
   CKCRED must support `credential.account_token` for audience
   `cortexkit-runners`. A person must run `ck account login` if authentication is

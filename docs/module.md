@@ -264,7 +264,7 @@ only. It never validates or chooses presets. Test:
 only in the credential vault (Claustrum). It never holds the private key.
 
 1. Mint the signing credential `signing:ck-motor-ssh:1` in the vault and grant
-   `reserved:ck-motor` `sign` and `read` on it with the vault's own tooling.
+   `reserved:motor` `sign` and `read` on it with the vault's own tooling.
 2. Read the credential's public key through authenticated vault access, encode
    it as an OpenSSH `ssh-ed25519` line, and add it to the runner account's
    `authorized_keys`.
