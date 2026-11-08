@@ -67,11 +67,24 @@ pub struct Workspace {
     pub workspace_disk_id: String,
 }
 
+/// Immutable evidence for one job VMM exit. The helper proves the cgroup empty
+/// and syncs this count before removing the cgroup or releasing the disk. Polls
+/// replay it until the host acknowledges durable receipt; job-id tombstones
+/// remain after acknowledgement and are not yet pruned.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitReport {
+    pub job_id: String,
+    pub oom_kill: u64,
+}
+
 pub enum Operation {
     Start(Start),
     Adopt(String),
     Stop(String),
     Relay(String, u32),
+    Exits,
+    AckExit(ExitReport),
 }
 
 impl Operation {
@@ -79,6 +92,8 @@ impl Operation {
         match self {
             Self::Start(start) => start.validate(),
             Self::Adopt(id) | Self::Stop(id) => validate_job_id(id),
+            Self::Exits => Ok(()),
+            Self::AckExit(report) => validate_job_id(&report.job_id),
             Self::Relay(id, port) => {
                 validate_job_id(id)?;
                 crate::tenant::validate_port(*port)

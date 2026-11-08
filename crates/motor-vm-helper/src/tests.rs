@@ -46,12 +46,25 @@ impl Machine for Fake {
         match op {
             job::Operation::Start(_) => self.job_running = true,
             job::Operation::Stop(_) => self.job_running = false,
+            job::Operation::Exits => {
+                self.calls.push("job_exits");
+                return Ok(Response::new(Reply::JobExits { exits: vec![] }));
+            }
+            job::Operation::AckExit(_) => {
+                self.calls.push("ack_job_exit");
+                return Ok(Response::new(Reply::Ok));
+            }
             _ => {}
         }
         Ok(Response::new(Reply::Job {
             running: self.job_running,
             vmm_pid: None,
+            exit_report: None,
         }))
+    }
+    fn maintain_jobs(&mut self) -> Result<()> {
+        self.calls.push("maintain_jobs");
+        Ok(())
     }
 }
 
@@ -77,7 +90,32 @@ fn job_vm_survives_connection_loss_and_is_adopted_on_another_connection() {
         .reply,
         Reply::Job { running: true, .. }
     ));
-    assert_eq!(helper.machine.calls, ["reconcile"]);
+    assert_eq!(helper.machine.calls, ["reconcile", "maintain_jobs"]);
+}
+
+#[test]
+fn job_exit_requests_require_authorised_connections_and_strict_messages() {
+    let (mut helper, connection, _) = fixture();
+    for message in [
+        serde_json::json!({"op":"job_exits"}),
+        serde_json::json!({"op":"ack_job_exit", "job_id":JOB, "oom_kill":3}),
+    ] {
+        assert!(request(&mut helper, 99, message.clone()).is_err());
+        request(&mut helper, connection, message.clone()).unwrap();
+        let mut extra = message;
+        extra["path"] = serde_json::json!("/etc/shadow");
+        assert!(serde_json::from_value::<Request>(extra).is_err());
+    }
+    assert!(request(
+        &mut helper,
+        connection,
+        serde_json::json!({"op":"ack_job_exit", "job_id":"../other", "oom_kill":3})
+    )
+    .is_err());
+    assert_eq!(
+        helper.machine.calls,
+        ["reconcile", "job_exits", "ack_job_exit"]
+    );
 }
 
 #[test]
@@ -296,7 +334,10 @@ fn child_death_cleans_the_slot_without_export() {
     op(&mut h, a, "start", JOB).unwrap();
     h.machine.running = false;
     h.maintain();
-    assert_eq!(h.machine.calls, ["reconcile", "start", "cleanup"]);
+    assert_eq!(
+        h.machine.calls,
+        ["reconcile", "start", "maintain_jobs", "cleanup"]
+    );
     assert_eq!(acquire(&mut h, b, "b", NEXT), Some(0));
 }
 #[test]

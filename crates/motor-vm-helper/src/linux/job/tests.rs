@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod exit_tests;
+
 fn start() -> Start {
     Start {
         job_id: "00000000-0000-4000-8000-000000000001".into(),
@@ -21,6 +23,7 @@ fn record() -> Record {
         disk_inode: 99,
         released: false,
         oom_kill: None,
+        exit_acknowledged: false,
     }
 }
 
@@ -43,6 +46,8 @@ fn machine(base: &Path) -> LinuxJobs {
         jail: base.join("jail"),
         records: BTreeMap::new(),
         children: BTreeMap::new(),
+        exit_fault: None,
+        remove_test_group: Some(|path| std::fs::remove_dir_all(path)),
     }
 }
 
@@ -175,7 +180,7 @@ fn helper_restart_re_adopts_a_live_vmm_without_killing_it() {
         .adopt_record(serde_json::from_slice(&durable).unwrap())
         .unwrap();
     assert!(matches!(restarted.status(&start().job_id).unwrap().reply,
-        Reply::Job { running: true, vmm_pid: Some(pid) } if pid == vmm.child.id()));
+        Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None } if pid == vmm.child.id()));
     assert!(vmm.child.try_wait().unwrap().is_none());
     assert_eq!(unsafe { libc::kill(child_pid as i32, 0) }, 0);
     unsafe {
@@ -337,6 +342,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     if let Ok(phase) = std::env::var("MOTOR_VM_JOB_TEST_PHASE") {
         let base = PathBuf::from(std::env::var_os("MOTOR_VM_JOB_TEST_ROOT").unwrap());
         let mut jobs = machine(&base);
+        jobs.remove_test_group = None;
         jobs.groups = SLICE.into();
         jobs.settings = Some(JobVms {
             uid_base: 600000,
@@ -427,7 +433,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 .parse()
                 .unwrap();
             assert!(matches!(jobs.status(&start().job_id).unwrap().reply,
-                Reply::Job { running: true, vmm_pid: Some(pid) } if pid == expected));
+                Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None } if pid == expected));
             assert_eq!(read_oom_score(expected).unwrap(), JOB_OOM_SCORE);
         }
         return;
@@ -581,7 +587,40 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     let group = Path::new(SLICE).join(format!("job-{}", start().job_id));
     std::fs::write(group.join("cgroup.kill"), "1").unwrap();
     tenant::wait_empty(&group).unwrap();
-    std::fs::remove_dir(group).unwrap();
+    // The helper was absent at exit. Startup must recover the real cgroup's
+    // evidence, persist it with root ownership, and replay it until acked.
+    let mut restarted = machine(&base);
+    restarted.groups = SLICE.into();
+    restarted.remove_test_group = None;
+    restarted.settings = Some(JobVms {
+        uid_base: 600000,
+        uid_count: 1000,
+        memory_max_bytes: 268435456,
+    });
+    restarted.reconcile().unwrap();
+    assert!(!group.exists());
+    let report = ExitReport {
+        job_id: start().job_id,
+        oom_kill: 0,
+    };
+    assert!(
+        matches!(restarted.handle(Operation::Exits, Peer { uid: 0, gid: 0 }).unwrap().reply,
+        Reply::JobExits { exits } if exits == [report.clone()])
+    );
+    let path = restarted
+        .records_path
+        .join(format!("{}.json", start().job_id));
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(metadata.uid(), 0);
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+    restarted.acknowledge_exit(report.clone()).unwrap();
+    restarted.records.clear();
+    restarted.reconcile().unwrap();
+    assert!(
+        matches!(restarted.handle(Operation::Exits, Peer { uid: 0, gid: 0 }).unwrap().reply,
+        Reply::JobExits { exits } if exits.is_empty())
+    );
+    restarted.acknowledge_exit(report).unwrap();
     run(&["stop", "motorvmtest.slice"]);
     std::fs::remove_dir_all(base).unwrap();
 }

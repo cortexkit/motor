@@ -59,6 +59,11 @@ pub enum Request {
         job_id: String,
         port: u32,
     },
+    JobExits {},
+    AckJobExit {
+        job_id: String,
+        oom_kill: u64,
+    },
     Acquire {
         instance: String,
         job_id: String,
@@ -197,6 +202,11 @@ pub enum Reply {
     Job {
         running: bool,
         vmm_pid: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_report: Option<job::ExitReport>,
+    },
+    JobExits {
+        exits: Vec<job::ExitReport>,
     },
     Acquired {
         slot: Option<usize>,
@@ -257,6 +267,9 @@ pub trait Machine {
     fn alive(&mut self, slot: usize) -> bool;
     fn job(&mut self, _op: job::Operation, _peer: Peer) -> Result<Response> {
         Err(Error("job VMs are not configured".into()))
+    }
+    fn maintain_jobs(&mut self) -> Result<()> {
+        Ok(())
     }
     fn tenant(&mut self, _tenant: &str, _op: tenant::Operation) -> Result<Response> {
         Err(Error("tenant VMs are not configured".into()))
@@ -355,6 +368,11 @@ impl<M: Machine> Helper<M> {
             Request::OpenJobRelay { job_id, port } => {
                 self.job(job::Operation::Relay(job_id, port), peer)
             }
+            Request::JobExits {} => self.job(job::Operation::Exits, peer),
+            Request::AckJobExit { job_id, oom_kill } => self.job(
+                job::Operation::AckExit(job::ExitReport { job_id, oom_kill }),
+                peer,
+            ),
             Request::Acquire { instance, job_id } => {
                 let identity = Identity::parse(instance, &job_id)?;
                 if self.slots.iter().any(
@@ -509,6 +527,9 @@ impl<M: Machine> Helper<M> {
     /// Called periodically, independently of runner connections. Unexpected
     /// child death revokes the lease and kills the remaining slot processes.
     pub fn maintain(&mut self) {
+        if let Err(error) = self.machine.maintain_jobs() {
+            eprintln!("job exit evidence collection failed: {error}");
+        }
         for n in 0..self.slots.len() {
             if let Slot::Leased(l) = &self.slots[n] {
                 if l.running.is_some() && !self.machine.alive(n) {
