@@ -1,7 +1,116 @@
 use super::*;
-use motor_host::billing::LOST_GUEST_CHECK_MS;
+use motor_host::billing::{LOST_GUEST_CHECK_MS, LOST_GUEST_POLL_MS};
 
 const LOST: u64 = MS + 330_000;
+
+#[test]
+fn running_running_then_unit_gone_within_window_avoids_restart() {
+    let mut h = checking();
+    h.lost_check_reply(JOB, reply(JOB), LOST);
+    h.billing_tick(LOST + 1).unwrap();
+    assert!(!h.snapshot.billing[JOB].host_settled);
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    assert!(h.lost_checks_due(LOST).is_empty());
+    assert_eq!(LOST_GUEST_POLL_MS, 2_000);
+    assert!(h.lost_checks_due(LOST + 1_999).is_empty());
+
+    h.billing_tick(LOST + 2_000).unwrap();
+    assert_eq!(
+        h.lost_checks_due(LOST + 2_000),
+        vec![("tenant".into(), JOB.into())]
+    );
+    h.lost_check_reply(JOB, reply(JOB), LOST + 2_000);
+    h.billing_tick(LOST + 2_001).unwrap();
+    assert!(!h.snapshot.billing[JOB].host_settled);
+
+    h.billing_tick(LOST + 4_000).unwrap();
+    assert_eq!(
+        h.lost_checks_due(LOST + 4_000),
+        vec![("tenant".into(), JOB.into())]
+    );
+    let mut gone = reply(JOB);
+    gone["unit_alive"] = json!(false);
+    h.lost_check_reply(JOB, gone, LOST + 4_000);
+    h.billing_tick(LOST + 4_001).unwrap();
+    assert!(h.snapshot.billing[JOB].host_settled);
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    assert_eq!(h.snapshot.billing[JOB].restart_pending, Some(false));
+}
+
+#[test]
+fn running_for_entire_thirty_second_window_requires_restart() {
+    let mut h = checking();
+    h.lost_check_reply(JOB, reply(JOB), LOST);
+    h.billing_tick(LOST + 1).unwrap();
+    assert!(!h.snapshot.billing[JOB].host_settled);
+    for elapsed in (2_000..30_000).step_by(2_000) {
+        h.billing_tick(LOST + elapsed).unwrap();
+        assert_eq!(
+            h.lost_checks_due(LOST + elapsed),
+            vec![("tenant".into(), JOB.into())]
+        );
+        h.lost_check_reply(JOB, reply(JOB), LOST + elapsed);
+        h.billing_tick(LOST + elapsed + 1).unwrap();
+        assert!(!h.snapshot.billing[JOB].host_settled);
+        assert!(!h.snapshot.vms["tenant"].stop_pending);
+    }
+    h.billing_tick(LOST + 29_999).unwrap();
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    h.billing_tick(LOST + 30_000).unwrap();
+    assert!(h.snapshot.billing[JOB].host_settled);
+    assert!(h.snapshot.vms["tenant"].stop_pending);
+    assert_eq!(h.snapshot.billing[JOB].restart_pending, Some(true));
+}
+
+#[test]
+fn cancel_delivered_twenty_seconds_into_window_can_still_be_confirmed() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    h.billing_tick(LOST).unwrap();
+    assert!(h.lost_checks_due(LOST).is_empty());
+    h.billing_tick(LOST + 20_000).unwrap();
+    assert!(!h.snapshot.billing[JOB].host_settled);
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    h.cancel_delivered(JOB).unwrap();
+    assert_eq!(
+        h.lost_checks_due(LOST + 20_000),
+        vec![("tenant".into(), JOB.into())]
+    );
+    let mut gone = reply(JOB);
+    gone["unit_alive"] = json!(false);
+    h.lost_check_reply(JOB, gone, LOST + 20_000);
+    h.billing_tick(LOST + 20_001).unwrap();
+    assert!(h.snapshot.billing[JOB].host_settled);
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+}
+
+#[test]
+fn reply_acceptance_and_settlement_share_the_same_window_clock() {
+    for elapsed in [29_999, 30_000] {
+        let mut h = checking();
+        let mut gone = reply(JOB);
+        gone["unit_alive"] = json!(false);
+        h.lost_check_reply(JOB, gone, LOST + elapsed);
+        h.billing_tick(LOST + 30_000).unwrap();
+        assert!(h.snapshot.billing[JOB].host_settled);
+        assert_eq!(h.snapshot.vms["tenant"].stop_pending, elapsed == 30_000);
+    }
+}
+
+#[test]
+fn delayed_first_observation_does_not_extend_window_from_lost_point() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    h.billing_tick(LOST + 20_000).unwrap();
+    assert!(!h.snapshot.billing[JOB].host_settled);
+    h.cancel_delivered(JOB).unwrap();
+    assert_eq!(h.lost_checks_due(LOST + 20_000).len(), 1);
+    h.lost_check_reply(JOB, reply(JOB), LOST + 20_000);
+    h.billing_tick(LOST + 29_999).unwrap();
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    h.billing_tick(LOST + 30_000).unwrap();
+    assert!(h.snapshot.vms["tenant"].stop_pending);
+}
 
 fn reply(job: &str) -> Value {
     json!({"ok":true,"job_id":job,"state":"running","terminal":null,
@@ -15,7 +124,7 @@ fn checking() -> Host {
     assert!(!h.snapshot.billing[JOB].host_settled);
     assert!(!h.snapshot.vms["tenant"].stop_pending);
     assert!(
-        h.lost_checks_due().is_empty(),
+        h.lost_checks_due(LOST).is_empty(),
         "hard cancel must precede inspection"
     );
     assert_eq!(
@@ -23,10 +132,10 @@ fn checking() -> Host {
         Some("tenant")
     );
     h.cancel_delivered(JOB).unwrap();
-    assert_eq!(h.lost_checks_due(), vec![("tenant".into(), JOB.into())]);
+    assert_eq!(h.lost_checks_due(LOST), vec![("tenant".into(), JOB.into())]);
     assert!(
-        h.lost_checks_due().is_empty(),
-        "one inspection per lost lease"
+        h.lost_checks_due(LOST).is_empty(),
+        "one inspection in flight per lost lease"
     );
     h
 }
@@ -47,7 +156,7 @@ fn guest_confirmed_ended_keeps_admitting_with_identical_lost_billing() {
         let logs = Logs::default();
         let captured = logs.0.clone();
         tracing::subscriber::with_default(logs, || {
-            h.lost_check_reply(JOB, status);
+            h.lost_check_reply(JOB, status, LOST);
             h.billing_tick(LOST + 1).unwrap();
         });
         assert!(h.snapshot.billing[JOB].host_settled);
@@ -90,8 +199,10 @@ fn guest_confirmed_ended_keeps_admitting_with_identical_lost_billing() {
 #[test]
 fn guest_still_running_after_hard_cancel_requires_restart() {
     let mut h = checking();
-    h.lost_check_reply(JOB, reply(JOB));
+    h.lost_check_reply(JOB, reply(JOB), LOST);
     h.billing_tick(LOST + 1).unwrap();
+    assert!(!h.snapshot.billing[JOB].host_settled);
+    h.billing_tick(LOST + LOST_GUEST_CHECK_MS).unwrap();
     assert!(h.snapshot.billing[JOB].host_settled);
     assert!(h.snapshot.vms["tenant"].stop_pending);
     assert_eq!(h.snapshot.billing[JOB].restart_pending, Some(true));
@@ -119,7 +230,7 @@ fn guest_silent_old_absent_or_malformed_requires_restart_after_bound() {
     ] {
         let mut h = checking();
         if let Some(status) = status {
-            h.lost_check_reply(JOB, status);
+            h.lost_check_reply(JOB, status, LOST);
         }
         h.billing_tick(LOST + LOST_GUEST_CHECK_MS - 1).unwrap();
         assert!(!h.snapshot.billing[JOB].host_settled);
@@ -129,7 +240,7 @@ fn guest_silent_old_absent_or_malformed_requires_restart_after_bound() {
         assert!(h.snapshot.vms["tenant"].stop_pending);
         let mut late = reply(JOB);
         late["unit_alive"] = json!(false);
-        h.lost_check_reply(JOB, late);
+        h.lost_check_reply(JOB, late, LOST + LOST_GUEST_CHECK_MS + 1);
         h.billing_tick(LOST + LOST_GUEST_CHECK_MS + 1).unwrap();
         assert!(
             h.snapshot.vms["tenant"].stop_pending,
@@ -150,14 +261,14 @@ fn guest_ended_claim_cannot_raise_tenant_capacity_ceiling() {
     h.billing_tick(LOST).unwrap();
     assert!(!h.snapshot.billing[JOB].host_settled);
     h.cancel_delivered(JOB).unwrap();
-    assert_eq!(h.lost_checks_due().len(), 1);
+    assert_eq!(h.lost_checks_due(LOST).len(), 1);
     let mut status = reply(JOB);
     status["unit_alive"] = json!(false);
     status["free_vcpus"] = json!(1000);
     status["vcpu_ceiling"] = json!(1000);
-    h.lost_check_reply(JOB, status.clone());
+    h.lost_check_reply(JOB, status.clone(), LOST);
     h.billing_tick(LOST + 1).unwrap();
-    h.lost_check_reply(JOB, status);
+    h.lost_check_reply(JOB, status, LOST);
     assert!(!h.snapshot.vms["tenant"].stop_pending);
     assert_eq!(h.heartbeat(LOST + 1, 0, true).free_vcpus, normal);
     let mut claim = claims(JOB2);
@@ -232,9 +343,9 @@ fn failed_cancel_journal_write_cannot_authorize_guest_inspection() {
     h.cancel_delivered(JOB).unwrap();
     h.replace_journal(Box::new(Failed));
     assert!(h.billing_tick(LOST).is_err());
-    assert!(h.lost_checks_due().is_empty());
+    assert!(h.lost_checks_due(LOST).is_empty());
     h.replace_journal(Box::<MemoryJournal>::default());
     h.billing_tick(LOST + 1).unwrap();
     assert!(h.snapshot.pending_cancels.contains_key(JOB));
-    assert!(h.lost_checks_due().is_empty());
+    assert!(h.lost_checks_due(LOST).is_empty());
 }

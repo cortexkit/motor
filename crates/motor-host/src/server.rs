@@ -870,7 +870,7 @@ impl Runtime {
                 failure.get_or_insert(error);
             }
         }
-        let checks = self.host.lock().expect("host lock").lost_checks_due();
+        let checks = self.host.lock().expect("host lock").lost_checks_due(now_ms);
         for (tenant, job) in checks {
             let runtime = self.clone();
             std::thread::spawn(move || {
@@ -891,7 +891,7 @@ impl Runtime {
                     .host
                     .lock()
                     .expect("host lock")
-                    .lost_check_reply(&job, reply);
+                    .lost_check_reply(&job, reply, unix_ms());
             });
         }
         let stops = self.host.lock().expect("host lock").stops_due();

@@ -474,7 +474,10 @@ extra rule.
 If a started job exceeds its runtime cap without a terminal result, the host
 requests a hard cancel after 30 seconds. At five minutes past the cap, it sends
 another hard cancel and asks the guest runner for that job's status over the
-existing tenant control channel. The confirmation window is 10 seconds.
+existing tenant control channel. The confirmation window is 30 seconds from
+the lost point, covering cancel delivery and status checks. While the job is
+still stopping, the host re-asks about every two seconds rather than treating
+the first running reply as a reason to restart.
 
 A terminal record marked `execution_ended`, or a named systemd unit confirmed
 gone, proves execution ended even if the result never reached the host. The host

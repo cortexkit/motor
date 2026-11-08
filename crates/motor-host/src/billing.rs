@@ -29,12 +29,14 @@ pub const REVOCATION_CAP: usize = 4096;
 // Let the runner report its own deadline terminal before the host backstop cancels.
 pub(crate) const BACKSTOP_CANCEL_GRACE_MS: u64 = 30_000;
 const LOST_SETTLEMENT_GRACE_MS: u64 = 300_000;
-pub(crate) const LOST_GUEST_CHECK_MS: u64 = 10_000;
+pub(crate) const LOST_GUEST_CHECK_MS: u64 = 30_000;
+pub(crate) const LOST_GUEST_POLL_MS: u64 = 2_000;
 
 pub(crate) struct LostCheck {
+    // Use the host observation clock for the deadline, polling and reply acceptance.
     deadline_ms: u64,
-    started: std::time::Instant,
-    requested: bool,
+    next_poll_ms: u64,
+    in_flight: bool,
     report: Option<LostReport>,
 }
 
@@ -357,9 +359,11 @@ impl Host {
                                 .insert(job.clone(), lease.tenant.clone());
                             new_checks.push(job.clone());
                             LostCheck {
-                                deadline_ms: now_ms.saturating_add(LOST_GUEST_CHECK_MS),
-                                started: std::time::Instant::now(),
-                                requested: false,
+                                deadline_ms: cap
+                                    .saturating_add(LOST_SETTLEMENT_GRACE_MS)
+                                    .saturating_add(LOST_GUEST_CHECK_MS),
+                                next_poll_ms: now_ms,
+                                in_flight: false,
                                 report: None,
                             }
                         });
@@ -367,12 +371,17 @@ impl Host {
                             Some(LostReport::Ended(proof)) => Some(proof),
                             _ => None,
                         };
+                        // An accepted cancel starts TERM/KILL escalation; it does not
+                        // prove the unit is already gone. Keep polling until the end
+                        // of the shared window before acting on a running reply.
                         let reason = if ended.is_some() {
                             "guest_confirmed_ended"
-                        } else if matches!(check.report, Some(LostReport::Running)) {
-                            "guest_still_running_after_cancel"
                         } else if now_ms >= check.deadline_ms {
-                            "guest_unknown_or_timeout"
+                            if matches!(check.report, Some(LostReport::Running)) {
+                                "guest_still_running_after_cancel"
+                            } else {
+                                "guest_unknown_or_timeout"
+                            }
                         } else {
                             continue;
                         };
@@ -440,12 +449,18 @@ impl Host {
         Ok(())
     }
 
-    pub(crate) fn lost_checks_due(&mut self) -> Vec<(String, String)> {
+    pub(crate) fn lost_checks_due(&mut self, now_ms: u64) -> Vec<(String, String)> {
         let mut due = Vec::new();
         for (job, check) in &mut self.lost_checks {
-            if !check.requested && !self.snapshot.pending_cancels.contains_key(job) {
+            if !check.in_flight
+                && !matches!(check.report, Some(LostReport::Ended(_)))
+                && now_ms >= check.next_poll_ms
+                && now_ms < check.deadline_ms
+                && !self.snapshot.pending_cancels.contains_key(job)
+            {
                 if let Some(lease) = self.snapshot.leases.get(job) {
-                    check.requested = true;
+                    check.in_flight = true;
+                    check.next_poll_ms = now_ms.saturating_add(LOST_GUEST_POLL_MS);
                     due.push((lease.tenant.clone(), job.clone()));
                 }
             }
@@ -453,11 +468,15 @@ impl Host {
         due
     }
 
-    pub(crate) fn lost_check_reply(&mut self, job: &str, reply: Value) {
-        if let Some(check) = self.lost_checks.get_mut(job).filter(|check| {
-            check.requested && check.started.elapsed().as_millis() < u128::from(LOST_GUEST_CHECK_MS)
-        }) {
+    pub(crate) fn lost_check_reply(&mut self, job: &str, reply: Value, now_ms: u64) {
+        if let Some(check) = self
+            .lost_checks
+            .get_mut(job)
+            .filter(|check| check.in_flight && now_ms < check.deadline_ms)
+        {
             check.report = Some(lost_report(job, reply));
+            check.in_flight = false;
+            check.next_poll_ms = now_ms.saturating_add(LOST_GUEST_POLL_MS);
         }
     }
     pub fn lose_tenant(&mut self, tenant: &str, now_ms: u64) -> Result<(), Error> {
