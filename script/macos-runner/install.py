@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install or inspect the dedicated macOS VM runner (sudo from rentamac)."""
+"""Install or inspect the dedicated macOS VM runner (sudo from the operator account)."""
 
 import argparse
 import json
@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from urllib.parse import urlsplit
 
 import image as image_recipe
@@ -29,6 +30,8 @@ PASSWORD = Path("/var/root/motor-autologin-password")
 BACKUP = Path("/var/root/motor-autologin-backup.plist")
 KCPASSWORD = Path("/etc/kcpassword")
 LOGINWINDOW = "/Library/Preferences/com.apple.loginwindow"
+AUTODISKMOUNT = "/Library/Preferences/SystemConfiguration/autodiskmount"
+AUTOMOUNT_KEY = "AutomountDisksWithoutUserLogin"
 CONFIG = Path("/Library/Application Support/Motor/macos")
 SSHD = Path("/etc/ssh/sshd_config")
 SSH_ROOT = Path("/etc/ssh/motor")
@@ -138,9 +141,9 @@ def stage_metrics(endpoint, host_id):
                       "status": "staged for next planned LaunchAgent reload or host restart; LaunchAgent was not stopped or started"}, indent=2))
 
 
-def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metrics_host_id=None):
+def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metrics_host_id=None, data_volume=None):
     # Advertise 128 MiB returns with a shared 512 MiB disk budget for the two VMs.
-    return {
+    plist = {
         "Label": LABEL, "LimitLoadToSessionType": "Aqua",
         "ProgramArguments": [str(runner), "serve", "--instance", instance,
                              "--state-root", str(state_root), "--backend", "macos-vm",
@@ -153,6 +156,12 @@ def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metric
         "StandardOutPath": str(state_root / "daemon.stdout"),
         "StandardErrorPath": str(state_root / "daemon.stderr"),
     }
+    if data_volume:
+        # Runner::open recursively creates --state-root. A missing WorkingDirectory
+        # must stop launchd before that creation can fall back to the internal disk.
+        # This launchd behavior still needs an unmounted-disk test on a real host.
+        plist["WorkingDirectory"] = str(state_root)
+    return plist
 
 
 def plist_errors(plist):
@@ -191,15 +200,50 @@ def kcpassword(password):
     return bytes(value ^ key[index % len(key)] for index, value in enumerate(data))
 
 
-def auto_login_user():
+def preference(domain, key):
     # Exporting the domain distinguishes an absent key from a failed defaults read.
     try:
-        values = plistlib.loads(run("/usr/bin/defaults", "export", LOGINWINDOW, "-").encode())
+        values = plistlib.loads(run("/usr/bin/defaults", "export", domain, "-").encode())
     except subprocess.CalledProcessError:
-        if not Path(LOGINWINDOW + ".plist").exists():
+        if not Path(domain + ".plist").exists():
             return None
         raise
-    return values.get("autoLoginUser")
+    return values.get(key)
+
+
+def auto_login_user():
+    return preference(LOGINWINDOW, "autoLoginUser")
+
+
+def configure_automount():
+    backup = CONFIG / "autodiskmount-backup.plist"
+    if not backup.exists():
+        record = CONFIG / "install.json"
+        if record.exists() and json.loads(record.read_text()).get("automount_managed"):
+            raise ValueError("disk automount backup is missing; restore it before updating")
+        previous = preference(AUTODISKMOUNT, AUTOMOUNT_KEY)
+        private_write(backup, plistlib.dumps({} if previous is None else {AUTOMOUNT_KEY: previous}))
+    run("/usr/bin/defaults", "write", AUTODISKMOUNT, AUTOMOUNT_KEY, "-bool", "true")
+
+
+def restore_automount():
+    backup = CONFIG / "autodiskmount-backup.plist"
+    record = CONFIG / "install.json"
+    installed = json.loads(record.read_text()) if record.exists() else {}
+    if not backup.exists():
+        if installed.get("automount_managed"):
+            raise ValueError("disk automount backup is missing; restore it before uninstalling")
+        return
+    previous = plistlib.loads(backup.read_bytes())
+    if AUTOMOUNT_KEY in previous:
+        run("/usr/bin/defaults", "write", AUTODISKMOUNT, AUTOMOUNT_KEY,
+            "-bool", "true" if previous[AUTOMOUNT_KEY] else "false")
+    elif preference(AUTODISKMOUNT, AUTOMOUNT_KEY) is not None:
+        run("/usr/bin/defaults", "delete", AUTODISKMOUNT, AUTOMOUNT_KEY)
+    if record.exists():
+        installed["automount_managed"] = False
+        record.write_text(json.dumps(installed, indent=2) + "\n")
+    backup.unlink()
 
 
 def require_filevault_off():
@@ -343,6 +387,7 @@ def uninstall():
         subprocess.run(["/bin/launchctl", "bootout", "system/" + LABEL], capture_output=True)
         LEGACY_PLIST.unlink(missing_ok=True)
     PLIST.unlink(missing_ok=True)
+    restore_automount()
     restore_login()
     original = SSHD.read_text()
     SSHD.write_text(remove_block(original))
@@ -367,15 +412,69 @@ def entitlement(binary):
     return start >= 0 and end >= 0 and plistlib.loads(data[start:end + len(b"</plist>")]).get(ENTITLEMENT) is True
 
 
-def internal_volume(path):
+def volume_info(path):
     # diskutil accepts a device or a mount point, not an arbitrary path such as
     # /Users (a firmlink into the data volume), so ask stat for the device the
     # path lives on first.
     device = subprocess.run(["/usr/bin/stat", "-f", "%Sd", str(path)],
                             check=True, capture_output=True, text=True).stdout.strip()
-    info = plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "info", "-plist", device],
+    return plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "info", "-plist", device],
                                         check=True, capture_output=True).stdout)
+
+
+def internal_volume(path):
+    info = volume_info(path)
     return info.get("Internal") is True and info.get("FilesystemType") == "apfs"
+
+
+def volume_errors(path, data_volume=None):
+    ancestor = path
+    while not ancestor.exists():
+        ancestor = ancestor.parent
+    if not data_volume:
+        return [] if internal_volume(ancestor) else ["not on an internal APFS volume: " + str(path)]
+    info = volume_info(ancestor)
+    errors = []
+    if info.get("FilesystemType") != "apfs":
+        errors.append("data volume must be APFS; reformat the volume as APFS: " + str(path))
+    if str(info.get("VolumeUUID", "")).upper() != data_volume.upper():
+        errors.append("data volume UUID does not match " + data_volume + "; mount the recorded volume at " + str(path))
+    mount = info.get("MountPoint")
+    if not mount or not Path(mount).is_absolute() or not path.resolve().is_relative_to(Path(mount).resolve()):
+        errors.append("data volume is not mounted at the requested path; mount it and use paths beneath its mount point: " + str(path))
+    if info.get("GlobalPermissionsEnabled") is not True:
+        errors.append("data volume ownership must be enabled; run sudo diskutil enableOwnership " + str(mount or "<mount point>"))
+    if info.get("RemovableMedia") is not False:
+        errors.append("data volume must not be removable media; use a fixed-media APFS disk: " + str(path))
+    return errors
+
+
+def installation_record():
+    record = CONFIG / "install.json"
+    installed = json.loads(record.read_text()) if record.exists() else None
+    # Uninstall retains the inventory but restores login settings before a new install.
+    if installed is not None and installed.get("auto_login_managed") is False:
+        return None
+    return installed
+
+
+def data_volume_setting(requested, installed):
+    recorded = installed.get("data_volume") if installed is not None else None
+    if installed is not None and requested is not None and requested != recorded:
+        raise ValueError("data volume cannot change on update; uninstall first, then install with --data-volume")
+    return recorded if installed is not None else requested
+
+
+def operator_setting(requested, installed):
+    recorded = installed.get("operator_account", "rentamac") if installed is not None else None
+    if recorded and requested is not None and requested != recorded:
+        raise ValueError("operator account differs from the recorded operator account; use that account")
+    operator = recorded or requested
+    if not operator:
+        raise ValueError("first install requires --operator-account naming the invoking operator account")
+    if os.environ.get("SUDO_USER") != operator:
+        raise ValueError("install and updates must be invoked by the operator account using sudo")
+    return operator
 
 
 def tool_errors(tools, manifest):
@@ -446,8 +545,15 @@ def keychain_errors():
 
 
 def check_install(state_root, image, instance, manifest, config=CONFIG, plist_path=PLIST,
-                  sshd=SSHD, ssh_root=SSH_ROOT, metrics_endpoint=None, metrics_host_id=None):
+                  sshd=SSHD, ssh_root=SSH_ROOT, metrics_endpoint=None, metrics_host_id=None,
+                  data_volume=None):
     errors = []
+    installed = json.loads((config / "install.json").read_text())
+    try:
+        data_volume = data_volume_setting(data_volume, installed)
+    except ValueError as error:
+        errors.append(str(error))
+        data_volume = installed.get("data_volume")
     account = pwd.getpwnam("motor")
     try:
         require_filevault_off()
@@ -465,12 +571,16 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
                 errors.append("LaunchAgent is not running in " + gui_domain(account))
         except subprocess.CalledProcessError:
             errors.append("LaunchAgent is not loaded in " + gui_domain(account))
+    storage_errors = []
     for path in (state_root, image):
-        if not internal_volume(path):
-            errors.append("not on an internal APFS volume: " + str(path))
+        storage_errors.extend(volume_errors(path, data_volume))
+    if data_volume and preference(AUTODISKMOUNT, AUTOMOUNT_KEY) is not True:
+        storage_errors.append("external disks must mount without user login; rerun install to set " + AUTOMOUNT_KEY)
+    if storage_errors:
+        # Missing-volume remedies must survive even when the state/image paths are absent.
+        return errors + storage_errors
     if shutil.disk_usage(state_root).free < FLOOR:
         errors.append("free space below 20 GiB")
-    installed = json.loads((config / "install.json").read_text())
     if installed["manifest_sha256"] != parity.digest(config / "toolchain.json"):
         errors.append("installed pin lock differs")
     helper = Path(installed["helper"])
@@ -485,7 +595,8 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
         current_metrics = [None, None]
     if metrics_endpoint is not None or metrics_host_id is not None:
         current_metrics = [metrics_endpoint, metrics_host_id]
-    expected = agent(Path(installed["runner"]), state_root, instance, config / "vm.toml", *current_metrics)
+    expected = agent(Path(installed["runner"]), state_root, instance, config / "vm.toml", *current_metrics,
+                     data_volume=data_volume)
     if plist != expected:
         errors.append("LaunchAgent differs from installed configuration")
     if LEGACY_PLIST.exists():
@@ -534,6 +645,9 @@ def create_account():
 def install(args, manifest):
     pinlock.require_ready(manifest)
     require_filevault_off()
+    previous = installation_record()
+    args.data_volume = data_volume_setting(args.data_volume, previous)
+    args.operator_account = operator_setting(args.operator_account, previous)
     current_metrics = [None, None]
     if PLIST.exists():
         current_metrics = metrics_settings(plistlib.loads(PLIST.read_bytes()).get("ProgramArguments", []))
@@ -542,11 +656,9 @@ def install(args, manifest):
     server = json.loads((HERE.parent / "runner/toolchain.json").read_text())
     parity.validate(manifest, server)
     for path in (args.state_root, args.image):
-        ancestor = path
-        while not ancestor.exists():
-            ancestor = ancestor.parent
-        if not internal_volume(ancestor):
-            raise ValueError("runner state/image require an internal APFS volume")
+        errors = volume_errors(path, args.data_volume)
+        if errors:
+            raise ValueError("; ".join(errors))
     if shutil.disk_usage(args.image).free < FLOOR:
         raise ValueError("free space below 20 GiB")
     if tool_errors(args.tool_bundle, manifest):
@@ -558,11 +670,13 @@ def install(args, manifest):
     if len(runner_key.splitlines()) != 1 or len(runner_key.split()) != 2 or not runner_key.startswith("ssh-ed25519 "):
         raise ValueError("runner key must be one bare OpenSSH ed25519 public key line")
     account = create_account()
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    CONFIG.chmod(0o755)
+    if args.data_volume:
+        configure_automount()
     args.state_root.mkdir(parents=True, exist_ok=True)
     os.chown(args.state_root, account.pw_uid, account.pw_gid)
     args.state_root.chmod(0o700)
-    CONFIG.mkdir(parents=True, exist_ok=True)
-    CONFIG.chmod(0o755)
     stop_jobs(account)
     for name, source in (("motor-runner", args.runner), ("motor-macvm", args.vm_helper)):
         destination = CONFIG / name
@@ -599,7 +713,9 @@ def install(args, manifest):
         raise
     installed: dict[str, object] = {"runner": str(CONFIG / "motor-runner"), "helper": str(CONFIG / "motor-macvm"),
                  "manifest_sha256": parity.digest(CONFIG / "toolchain.json"),
-                 "authorized_keys_sha256": parity.digest(SSH_ROOT / "authorized_keys")}
+                 "authorized_keys_sha256": parity.digest(SSH_ROOT / "authorized_keys"),
+                 "operator_account": args.operator_account, "data_volume": args.data_volume,
+                 "automount_managed": bool(args.data_volume)}
     for directory in (HOME / "Library", PLIST.parent):
         directory.mkdir(parents=True, exist_ok=True)
         os.chown(directory, account.pw_uid, account.pw_gid)
@@ -608,7 +724,7 @@ def install(args, manifest):
     if login_changed:
         print("Restart required: the auto-login user changed to motor. The installer will not restart the host.")
     private_write(PLIST, plistlib.dumps(agent(CONFIG / "motor-runner", args.state_root, args.instance, CONFIG / "vm.toml",
-                                           *current_metrics)))
+                                           *current_metrics, data_volume=args.data_volume)))
     os.chown(PLIST, 0, 0)
     PLIST.chmod(0o644)
     installed["auto_login_managed"] = True
@@ -627,6 +743,10 @@ def main():
     parser.add_argument("--manifest", type=Path, default=HERE / "toolchain.json")
     parser.add_argument("--state-root", type=Path, default=Path("/Users/motor/.motor"))
     parser.add_argument("--image", type=Path)
+    parser.add_argument("--data-volume", type=lambda value: str(uuid.UUID(value)).upper(), metavar="UUID",
+                        help="pin state and image to this ownership-enabled, fixed-media APFS volume (updates/check use the recorded UUID)")
+    parser.add_argument("--operator-account", metavar="NAME",
+                        help="invoking operator account; required for first install, recorded for updates")
     parser.add_argument("--instance", default="macos")
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--vm-helper", type=Path)
@@ -644,7 +764,7 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     if sys.platform != "darwin" or os.geteuid() != 0:
-        parser.error("run on the VM host with sudo from rentamac")
+        parser.error("run on the VM host with sudo from the operator account")
     if args.operation in ("metrics-key", "metrics-config"):
         if args.check:
             parser.error("--check requires install")
@@ -668,19 +788,21 @@ def main():
     parity.validate(manifest, json.loads((HERE.parent / "runner/toolchain.json").read_text()))
     if args.check:
         errors = check_install(args.state_root, args.image, args.instance, manifest,
-                               metrics_endpoint=args.metrics_endpoint, metrics_host_id=args.metrics_host_id)
+                               metrics_endpoint=args.metrics_endpoint, metrics_host_id=args.metrics_host_id,
+                               data_volume=args.data_volume)
         try:
             metrics = metrics_report(plistlib.loads(PLIST.read_bytes()).get("ProgramArguments", []))
         except ValueError as error:
             metrics = {"error": str(error)}
         print(json.dumps({"passed": not errors, "checks": 15, "errors": errors, "metrics": metrics}, indent=2))
         return int(bool(errors))
-    if os.environ.get("SUDO_USER") != "rentamac":
-        parser.error("first install and updates must be invoked by rentamac using sudo")
     for name in ("runner", "vm_helper", "tool_bundle", "runner_key"):
         if getattr(args, name) is None:
             parser.error("install requires --" + name.replace("_", "-"))
-    install(args, manifest)
+    try:
+        install(args, manifest)
+    except ValueError as error:
+        parser.error(str(error))
     return 0
 
 

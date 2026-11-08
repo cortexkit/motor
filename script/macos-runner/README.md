@@ -34,9 +34,11 @@ pin change; do not change only an artifact hash to make a check green.
 
 ## Dedicated-host operator procedure
 
-Use a dedicated VM-building session on the rented Mac, not a job VM or an
-operator's unrelated workstation. Host prerequisites: Apple Silicon, internal
-APFS storage, Command Line Tools (including Swift and Python 3.9+), the native
+Use a dedicated VM-building session on the macOS host, not a job VM or an
+operator's unrelated workstation. Host prerequisites: Apple Silicon, APFS
+storage (internal by default, or an explicitly selected fixed-media data volume
+with ownership enabled; see installation below), Command Line Tools (including
+Swift and Python 3.9+), the native
 `motor-macvm` binary built from reviewed Motor source, and enough free space for
 the IPSW, sparse 96 GiB boot disk, Rust toolchains and exported tools. Keep scratch
 inside the checkout, for example `target/scratch/macos-image`.
@@ -197,19 +199,63 @@ seal acknowledgement's account-deletion prerequisite.
 
 ## Host installation and update
 
-Run once as the provider's `rentamac` account using sudo; the same command updates
-an installation. Supply ck-motor's SSH public key: the `identity.pub` its vault
-agent publishes for the vault's Ed25519 runner key (a plain key, not a CA):
+Run from the operator account using sudo. A first install requires
+`--operator-account "$OPERATOR_ACCOUNT"`, which must name the invoking `SUDO_USER`.
+The installer records that account in
+`/Library/Application Support/Motor/macos/install.json`; updates must come from
+the recorded account and may omit the flag. To bind a different operator account,
+uninstall first, then reinstall with an explicit `--operator-account`.
+Supply the submitting client's SSH public key as one plain OpenSSH Ed25519 public
+key line (not a CA or certificate):
 
 ```sh
 sudo python3 script/macos-runner/install.py install \
+  --operator-account "$OPERATOR_ACCOUNT" \
   --image "$IMAGE" --state-root /Users/motor/.motor --instance macos \
   --runner "$RUNNER" --vm-helper "$MACVM" \
-  --tool-bundle target/scratch/macos-image/tools --runner-key "$CK_MOTOR_IDENTITY_PUB"
+  --tool-bundle target/scratch/macos-image/tools --runner-key "$RUNNER_IDENTITY_PUB"
 # Restart the host yourself when prompted, then verify the logged-in runner:
 sudo python3 script/macos-runner/install.py --check \
   --image "$IMAGE" --state-root /Users/motor/.motor --instance macos
 ```
+
+Without `--data-volume`, state and image must remain on internal APFS storage.
+For an external SSD, obtain its **Volume UUID** with
+`diskutil info -plist "$DATA_MOUNT"` (not a disk, partition, or APFS container
+UUID). It must be APFS,
+report fixed rather than removable media, and have ownership enabled. If needed,
+run `sudo diskutil enableOwnership "$DATA_MOUNT"`; ownership is required for the
+runner's file isolation. Put both state and the sealed image beneath that mounted
+volume, then install:
+
+```sh
+sudo python3 script/macos-runner/install.py install \
+  --operator-account "$OPERATOR_ACCOUNT" --data-volume "$DATA_VOLUME_UUID" \
+  --image "$IMAGE" --state-root "$DATA_MOUNT/motor-state" --instance macos \
+  --runner "$RUNNER" --vm-helper "$MACVM" \
+  --tool-bundle target/scratch/macos-image/tools --runner-key "$RUNNER_IDENTITY_PUB"
+# Restart the host yourself when prompted, then check the recorded volume:
+sudo python3 script/macos-runner/install.py --check \
+  --image "$IMAGE" --state-root "$DATA_MOUNT/motor-state" --instance macos
+```
+
+The selected Volume UUID is recorded in `install.json`; updates and `--check`
+use it even when the flag is omitted. A different UUID (including adding one to
+an internal-storage installation) requires uninstalling first. Installation sets
+`AutomountDisksWithoutUserLogin` to true in
+`/Library/Preferences/SystemConfiguration/autodiskmount`, allowing external
+disks to mount at boot before a user logs in. A root-only
+`autodiskmount-backup.plist` beside `install.json` preserves the previous value
+or its absence across updates; uninstall restores it. Do not remove that backup
+while the installation is active.
+
+For a selected data volume, the LaunchAgent's `WorkingDirectory` is the absolute
+state root. `Runner::open` can recursively create a missing state root, so startup
+must stop before that call when the disk is missing, rather than create state on
+the internal disk. This relies on launchd refusing to spawn when its working
+directory is missing; the portable tests pin the path configuration, not that
+native launchd behavior. Verify refusal on a real host with the disk unmounted
+before relying on the missing-disk protection.
 
 The installer creates `motor` if absent and refuses an existing admin motor
 account. It installs the runner/helper under `/Library/Application Support/Motor`,
@@ -272,7 +318,12 @@ the account, image, pinned tools and runner state;
 it is not a destructive data/account cleanup command. Restart afterwards to leave
 the motor login session. Repeated uninstall is safe.
 
-`--check` refuses external/non-APFS state or image volumes, missing entitlement,
+`--check` requires internal APFS state and image volumes unless `install.json`
+records a data-volume UUID. With a recorded UUID, both resolved paths must be on
+that mounted APFS volume, with ownership enabled, fixed media, and
+`AutomountDisksWithoutUserLogin` true; a missing condition is a refusal with a
+remedy. It also verifies the external-volume LaunchAgent working directory.
+It refuses missing entitlement,
 wrong effective SSH CA/principals, a non-motor or non-0600 socket, changed tool
 bytes, less than 20 GiB free, or a plist without the VM backend/with a development
 flag. It also verifies the sealed-image inventory and installed lock, mounts the
@@ -313,7 +364,7 @@ capture/check paths and their manifest is unchanged.
 
 Portable checks and Swift typechecking do not qualify a real VM. Run all installed
 `macos_qualification_*` lanes documented in `docs/macos-runner.md`, including
-Aqua-session runner startup, libproc identity, actual internal-disk clones and guest mounts,
+Aqua-session runner startup, libproc identity, actual APFS clones on the selected storage and guest mounts,
 vsock/nonce isolation, key deletion and Remote Login shutdown. No such privileged
 or live-VM qualification is claimed by this recipe's portable tests.
 

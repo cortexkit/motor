@@ -17,7 +17,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +30,7 @@ import parity
 import pinlock
 
 SERVER = json.loads((HERE.parent / "runner/toolchain.json").read_text())
+DATA_UUID = "12345678-1234-1234-1234-123456789ABC"
 
 
 def pending():
@@ -304,6 +305,7 @@ class InstallerTests(unittest.TestCase):
         self.sshd = self.root / "sshd_config"
         self.sshd.write_text("Port 22\n" + install.ssh_block(self.ssh / "authorized_keys"))
         installed = {"manifest_sha256": parity.digest(self.config / "toolchain.json"),
+                     "operator_account": "operator",
                      "helper": str(self.config / "motor-macvm"), "runner": str(self.config / "motor-runner"),
                      "authorized_keys_sha256": parity.digest(self.ssh / "authorized_keys")}
         (self.config / "install.json").write_text(json.dumps(installed))
@@ -341,7 +343,8 @@ class InstallerTests(unittest.TestCase):
                          patch.object(image, "mounted_data", return_value=nullcontext(self.image)),
                          patch.object(image, "agent_requirement", return_value=self.requirement),
                          patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "no-timeout")),
-                         patch.object(install, "run", side_effect=self.command)]
+                         patch.object(install, "run", side_effect=self.command),
+                         patch.dict(install.os.environ, {"SUDO_USER": "operator"})]
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
@@ -370,7 +373,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("runner socket is missing", errors)
 
     def test_wrong_auto_login_user_and_filevault_are_refused(self):
-        with patch.object(install, "auto_login_user", return_value="rentamac"):
+        with patch.object(install, "auto_login_user", return_value="operator"):
             self.assertIn("autoLoginUser must be motor", " ".join(self.check()))
         with patch.object(install, "run", side_effect=lambda *args: "FileVault is On." if args[0] == "/usr/bin/fdesetup" else self.command(*args)):
             self.assertIn("FileVault must be off", " ".join(self.check()))
@@ -490,6 +493,7 @@ class InstallerTests(unittest.TestCase):
         key.write_text("ssh-ed25519 AAAA\n")
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
                                runner=runner, vm_helper=helper, runner_key=key, instance="macos",
+                               data_volume=None, operator_account=None,
                                metrics_endpoint='https://metrics.example', metrics_host_id='monitor-1')
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         install.LEGACY_PLIST.touch()
@@ -523,7 +527,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(plistlib.loads(self.plist.read_bytes())['ProgramArguments'][-5:],
                          ['--metrics-push', '--metrics-endpoint', 'https://metrics.example', '--metrics-host-id', 'monitor-1'])
 
-    def install_for_metrics(self, endpoint=None, host_id=None):
+    def install_for_metrics(self, endpoint=None, host_id=None, data_volume=None, operator_account: Optional[str] = "operator"):
         manifest_path = self.root / "reviewed.json"
         manifest_path.write_text(json.dumps(self.manifest))
         bundle = self.root / "bundle"
@@ -535,6 +539,7 @@ class InstallerTests(unittest.TestCase):
         key.write_text("ssh-ed25519 AAAA\n")
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
                                runner=runner, vm_helper=helper, runner_key=key, instance="macos",
+                               data_volume=data_volume, operator_account=operator_account,
                                metrics_endpoint=endpoint, metrics_host_id=host_id)
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         with patch.multiple(install, CONFIG=self.config, PLIST=self.plist, SSHD=self.sshd, SSH_ROOT=self.ssh, HOME=self.root / "home"), \
@@ -591,6 +596,165 @@ class InstallerTests(unittest.TestCase):
         path.write_text(path.read_text().replace("motor-macvm", "unsigned-macvm"))
         self.assertIn("VM configuration differs from installed pins", self.check())
 
+    def external_record(self):
+        record = self.config / "install.json"
+        installed = json.loads(record.read_text())
+        installed["data_volume"] = DATA_UUID
+        record.write_text(json.dumps(installed))
+        plist = plistlib.loads(self.plist.read_bytes())
+        plist["WorkingDirectory"] = str(self.state)
+        self.plist.write_bytes(plistlib.dumps(plist))
+        return {"FilesystemType": "apfs", "VolumeUUID": DATA_UUID, "GlobalPermissionsEnabled": True,
+                "RemovableMedia": False, "MountPoint": str(self.root), "Internal": False}
+
+    def test_check_enforces_recorded_volume_and_automount_without_cli_flag(self):
+        facts = self.external_record()
+        with patch.object(install, "volume_info", return_value=facts) as probe, \
+                patch.object(install, "preference", side_effect=lambda domain, key: True if domain == install.AUTODISKMOUNT else "motor"):
+            self.assertEqual(self.check(), [])
+            self.assertEqual([call.args[0] for call in probe.call_args_list], [self.state, self.image])
+            for path in (self.state, self.image):
+                with self.subTest(path=path), patch.object(install, "volume_info", side_effect=lambda item: {
+                        **facts, "VolumeUUID": "wrong"} if item == path else facts):
+                    self.assertIn("UUID does not match", " ".join(self.check()))
+            for value in (False, None):
+                with self.subTest(automount=value), patch.object(install, "preference", side_effect=lambda domain, key: value if domain == install.AUTODISKMOUNT else "motor"):
+                    self.assertIn("rerun install to set AutomountDisksWithoutUserLogin", " ".join(self.check()))
+            self.assertIn("uninstall first", " ".join(install.check_install(
+                self.state, self.image, "macos", self.manifest, self.config, self.plist, self.sshd, self.ssh,
+                data_volume="other")))
+            plist = plistlib.loads(self.plist.read_bytes())
+            del plist["WorkingDirectory"]
+            self.plist.write_bytes(plistlib.dumps(plist))
+            self.assertIn("LaunchAgent differs from installed configuration", self.check())
+
+    def test_install_records_volume_and_operator_then_update_reuses_them(self):
+        facts = self.external_record()
+        (self.config / "install.json").unlink()
+        with patch.object(install, "volume_info", return_value=facts), \
+                patch.object(install, "run", side_effect=self.command) as run:
+            self.install_for_metrics(data_volume=DATA_UUID)
+            self.install_for_metrics(operator_account=None)
+        installed = json.loads((self.config / "install.json").read_text())
+        self.assertEqual(installed["data_volume"], DATA_UUID)
+        self.assertEqual(installed["operator_account"], "operator")
+        self.assertTrue(installed["automount_managed"])
+        self.assertTrue((self.config / "autodiskmount-backup.plist").exists())
+        writes = [call.args for call in run.call_args_list if call.args[:3] == (
+            "/usr/bin/defaults", "write", install.AUTODISKMOUNT)]
+        self.assertEqual(writes, [("/usr/bin/defaults", "write", install.AUTODISKMOUNT,
+                                  install.AUTOMOUNT_KEY, "-bool", "true")] * 2)
+        self.assertEqual(plistlib.loads(self.plist.read_bytes())["WorkingDirectory"], str(self.state))
+
+    def test_check_missing_volume_reports_uuid_remedy_before_reading_state(self):
+        facts = self.external_record()
+        with patch.object(install, "volume_info", return_value={**facts, "VolumeUUID": "internal"}), \
+                patch.object(install, "preference", side_effect=lambda domain, key: True if domain == install.AUTODISKMOUNT else "motor"), \
+                patch.object(install.shutil, "disk_usage", side_effect=AssertionError("must not probe absent state")):
+            errors = install.check_install(self.root / "missing/state", self.image, "macos", self.manifest,
+                                           self.config, self.plist, self.sshd, self.ssh)
+        self.assertIn("mount the recorded volume", " ".join(errors))
+
+    def test_updates_refuse_changed_volume_or_operator_before_mutation(self):
+        self.external_record()
+        cases = [({"data_volume": "other"}, "data volume cannot change"),
+                 ({"operator_account": "other"}, "operator account differs")]
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs), patch.object(install, "create_account") as create, \
+                    self.assertRaisesRegex(ValueError, message):
+                self.install_for_metrics(**kwargs)
+            create.assert_not_called()
+        with patch.dict(install.os.environ, {"SUDO_USER": "other"}), \
+                self.assertRaisesRegex(ValueError, "invoked by the operator account"):
+            self.install_for_metrics(operator_account=None)
+        installed = json.loads((self.config / "install.json").read_text())
+        del installed["data_volume"]
+        (self.config / "install.json").write_text(json.dumps(installed))
+        with self.assertRaisesRegex(ValueError, "uninstall first"):
+            self.install_for_metrics(data_volume=DATA_UUID)
+
+    def test_first_install_requires_explicit_matching_operator(self):
+        (self.config / "install.json").unlink()
+        for operator, message in ((None, "first install requires --operator-account"),
+                                  ("other", "invoked by the operator account")):
+            with self.subTest(operator=operator), self.assertRaisesRegex(ValueError, message):
+                self.install_for_metrics(operator_account=operator)
+
+    def test_legacy_record_defaults_to_original_operator(self):
+        installed = json.loads((self.config / "install.json").read_text())
+        del installed["operator_account"]
+        (self.config / "install.json").write_text(json.dumps(installed))
+        with patch.dict(install.os.environ, {"SUDO_USER": "rentamac"}):
+            self.install_for_metrics(operator_account=None)
+            self.assertEqual(json.loads((self.config / "install.json").read_text())["operator_account"], "rentamac")
+        with self.assertRaisesRegex(ValueError, "invoked by the operator account"):
+            self.install_for_metrics(operator_account=None)
+
+    def test_restored_uninstall_inventory_allows_a_new_volume_and_operator(self):
+        installed = json.loads((self.config / "install.json").read_text())
+        installed["auto_login_managed"] = False
+        (self.config / "install.json").write_text(json.dumps(installed))
+        with patch.object(install, "CONFIG", self.config):
+            self.assertIsNone(install.installation_record())
+
+
+class DataVolumeTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.mount = Path(scratch.name)
+        self.path = self.mount / "runner/state"
+        self.facts = {"FilesystemType": "apfs", "VolumeUUID": DATA_UUID, "GlobalPermissionsEnabled": True,
+                      "RemovableMedia": False, "MountPoint": str(self.mount), "Internal": False}
+
+    def test_volume_facts_are_read_as_plist_for_the_existing_ancestor_device(self):
+        def command(args, **kwargs):
+            if args == ["/usr/bin/stat", "-f", "%Sd", str(self.mount)]:
+                return subprocess.CompletedProcess(args, 0, "disk7s1\n")
+            self.assertEqual(args, ["/usr/sbin/diskutil", "info", "-plist", "disk7s1"])
+            return subprocess.CompletedProcess(args, 0, plistlib.dumps(self.facts))
+        with patch.object(install.subprocess, "run", side_effect=command):
+            self.assertEqual(install.volume_errors(self.path, DATA_UUID), [])
+
+    def test_each_required_volume_fact_fails_closed_with_a_remedy(self):
+        cases = [("FilesystemType", "hfs", "reformat the volume as APFS"),
+                 ("VolumeUUID", "other", "mount the recorded volume"),
+                 ("GlobalPermissionsEnabled", False, "sudo diskutil enableOwnership " + str(self.mount)),
+                 ("RemovableMedia", True, "use a fixed-media APFS disk"),
+                 ("MountPoint", None, "mount it and use paths beneath its mount point")]
+        for key, value, message in cases:
+            for missing in (False, True):
+                with self.subTest(key=key, missing=missing):
+                    facts = dict(self.facts)
+                    if missing:
+                        del facts[key]
+                    else:
+                        facts[key] = value
+                    expected = message if key != "GlobalPermissionsEnabled" else "sudo diskutil enableOwnership"
+                    with patch.object(install, "volume_info", return_value=facts):
+                        self.assertIn(expected, " ".join(install.volume_errors(self.path, DATA_UUID)))
+
+    def test_missing_mount_uses_parent_device_and_refuses_before_state_creation(self):
+        with patch.object(install, "volume_info", return_value={
+                **self.facts, "VolumeUUID": "internal", "MountPoint": "/", "Internal": True}) as probe:
+            self.assertIn("UUID does not match", " ".join(install.volume_errors(self.path, DATA_UUID)))
+            probe.assert_called_once_with(self.mount)
+            self.assertFalse(self.path.exists())
+
+    def test_resolved_paths_cannot_escape_the_recorded_mount_point(self):
+        with patch.object(install, "volume_info", return_value={**self.facts, "MountPoint": str(self.path)}):
+            self.assertIn("paths beneath its mount point", " ".join(install.volume_errors(self.mount, DATA_UUID)))
+
+    def test_external_agent_pins_absolute_state_path_before_recursive_runner_open(self):
+        state = Path("/Volumes/RunnerData/motor/state")
+        plist = install.agent(Path("/installed/motor-runner"), state, "macos", Path("/installed/vm.toml"), data_volume=DATA_UUID)
+        self.assertEqual(plist["WorkingDirectory"], str(state))
+        args = plist["ProgramArguments"]
+        self.assertEqual(args[args.index("--state-root") + 1], str(state))
+        self.assertEqual(plist["StandardOutPath"], str(state / "daemon.stdout"))
+        self.assertEqual(plist["StandardErrorPath"], str(state / "daemon.stderr"))
+        self.assertNotIn("WorkingDirectory", install.agent(Path("/runner"), state, "macos", Path("/vm.toml")))
+
 
 class AutoLoginTests(unittest.TestCase):
     def setUp(self):
@@ -609,7 +773,8 @@ class AutoLoginTests(unittest.TestCase):
         self.legacy = self.root / "legacy.plist"
         self.sshd = self.root / "sshd_config"
         self.sshd.write_text("Port 2222\n" + install.ssh_block())
-        self.user = "rentamac"
+        self.user = "operator"
+        self.automount = None
         self.default_keychain = str(self.keychain)
         self.account = SimpleNamespace(pw_uid=502, pw_gid=20)
         patches = [patch.multiple(install, HOME=self.home, PASSWORD=self.password, BACKUP=self.backup, CONFIG=self.root,
@@ -626,6 +791,16 @@ class AutoLoginTests(unittest.TestCase):
         self.fchown: Any = install.os.fchown
 
     def command(self, *args):
+        if args[0] == "/usr/bin/defaults" and args[2] == install.AUTODISKMOUNT:
+            if args[1] == "export":
+                return plistlib.dumps({} if self.automount is None else {install.AUTOMOUNT_KEY: self.automount}).decode()
+            if args[1] == "write":
+                self.assertEqual(args[3:5], (install.AUTOMOUNT_KEY, "-bool"))
+                self.automount = args[5] == "true"
+            else:
+                self.assertEqual(args[1], "delete")
+                self.automount = None
+            return ""
         if args[:2] == ("/usr/bin/defaults", "export"):
             values = {} if self.user is None else {"autoLoginUser": self.user}
             return plistlib.dumps(values).decode()
@@ -675,6 +850,31 @@ class AutoLoginTests(unittest.TestCase):
             decoded = bytes(value ^ key[index % 11] for index, value in enumerate(encoded))
             self.assertEqual(decoded, password.encode() + b"\0" * (len(encoded) - len(password)))
             self.assertGreater(len(encoded), len(password))
+
+    def test_uninstall_restores_previous_automount_value_or_absence_after_updates(self):
+        for previous in (None, False, True):
+            with self.subTest(previous=previous):
+                self.automount = previous
+                install.configure_login(self.account)
+                install.configure_automount()
+                self.assertIs(self.automount, True)
+                (self.root / "install.json").write_text(json.dumps({
+                    "auto_login_managed": True, "automount_managed": True, "data_volume": DATA_UUID}))
+                install.configure_automount()
+                install.uninstall()
+                self.assertIs(self.automount, previous)
+                self.assertFalse((self.root / "autodiskmount-backup.plist").exists())
+                self.assertFalse(json.loads((self.root / "install.json").read_text())["automount_managed"])
+                install.uninstall()
+                self.assertIs(self.automount, previous)
+
+    def test_missing_managed_automount_backup_refuses_update_and_uninstall(self):
+        (self.root / "install.json").write_text(json.dumps({"automount_managed": True}))
+        with self.assertRaisesRegex(ValueError, "automount backup is missing.*updating"):
+            install.configure_automount()
+        with self.assertRaisesRegex(ValueError, "automount backup is missing.*uninstalling"):
+            install.uninstall()
+        self.assertIsNone(self.automount)
 
     def test_first_keychain_is_not_created_under_a_live_session(self):
         self.gui_session = True
@@ -739,7 +939,7 @@ class AutoLoginTests(unittest.TestCase):
         self.plist.touch()
         self.legacy.touch()
         install.uninstall()
-        self.assertEqual(self.user, "rentamac")
+        self.assertEqual(self.user, "operator")
         self.assertEqual(self.kc.read_bytes(), b"original obfuscated password")
         self.assertEqual(self.keychain.read_bytes(), b"original keychain")
         self.assertEqual(self.default_keychain, str(self.root / "other.keychain-db"))
@@ -756,7 +956,7 @@ class AutoLoginTests(unittest.TestCase):
         stopped = [call.args[0] for call in self.native.call_args_list if "bootout" in call.args[0]]
         self.assertIn(["/bin/launchctl", "bootout", "gui/502/" + install.LABEL], stopped)
         install.uninstall()
-        self.assertEqual(self.user, "rentamac")
+        self.assertEqual(self.user, "operator")
 
     def test_uninstall_restores_absence_of_previous_auto_login_and_keychain(self):
         self.user = None
