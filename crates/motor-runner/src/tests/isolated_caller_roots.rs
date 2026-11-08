@@ -467,7 +467,7 @@ struct MappedChild {
 
 impl MappedChild {
     fn config(&self) -> Config {
-        let mut config = Config::new(&self.state, "e2e");
+        let mut config = fixture_config(&self.state);
         config.owned_workspace_roots = vec![self.owned.clone()];
         config.free_space_floor_bytes = 0;
         config.isolate_jobs = true;
@@ -550,9 +550,6 @@ fn fixed_config(f: &Fixture) -> Config {
     let mut config = isolated_mapped_config(f);
     config.account_subject = Some("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
     config.fixed_path_repositories = vec![format!("/home/{USER}/repository")];
-    config.slice_budget_probe = Some(Arc::new(|| {
-        Ok((crate::systemd::read_job_memory_budget()?.max, None))
-    }));
     config
 }
 

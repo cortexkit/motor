@@ -596,6 +596,7 @@ async fn windows_start_does_not_move_existing_job_or_exempt_cache_fills() {
 #[tokio::test]
 #[ignore = "requires trusted operator, motor-job account, sudo and systemd cpuset support"]
 async fn isolated_four_vcpus_enforce_cpu_set_and_memory_max() {
+    let slice = crate::systemd::read_job_memory_budget().unwrap();
     let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
@@ -616,7 +617,9 @@ async fn isolated_four_vcpus_enforce_cpu_set_and_memory_max() {
     assert_eq!(record.weight, 4);
     assert_eq!(record.cpus.len(), 4);
     assert_eq!(crate::cpu::parse_list(lines[1]).unwrap(), record.cpus);
-    assert_eq!(lines[2], "17179869184");
+    // Four vCPUs request 16 GiB, but the unit must not exceed the shared jobs
+    // slice's live memory ceiling, including on smaller operator hosts.
+    assert_eq!(lines[2], (16_u64 << 30).min(slice.max).to_string());
 }
 
 #[cfg(target_os = "linux")]
