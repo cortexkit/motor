@@ -1121,6 +1121,60 @@ fn owner_terminal(id: Uuid) -> TerminalRecord {
     terminal
 }
 
+#[tokio::test]
+async fn owner_replay_flushes_output_and_terminal_before_waiting_for_peer() {
+    let (server, mut client) = tokio::io::duplex(64 * 1024);
+    // Hold the last output in a write buffer even when the socket is writable.
+    // TLS can also accept a write before all its ciphertext reaches the peer.
+    let mut server = tokio::io::BufStream::with_capacity(4096, 128 * 1024, server);
+    let gate = tokio::sync::watch::channel(false).0;
+    let server_gate = gate.clone();
+    let id = Uuid::now_v7();
+    let replay = tokio::spawn(async move {
+        replay_owner(
+            &mut server,
+            id,
+            OWNER_REPLAY_RECORDS - 1,
+            &server_gate,
+            "test-host",
+            60,
+        )
+        .await;
+    });
+    let frame = tokio::time::timeout(
+        Duration::from_secs(2),
+        motor_protocol::read_frame_async(&mut client),
+    )
+    .await
+    .expect("replay output must be flushed while the terminal gate is closed")
+    .unwrap()
+    .unwrap();
+    let Frame::Output(output) = frame else {
+        panic!("expected the final replay output")
+    };
+    assert_eq!(output.seq, OWNER_REPLAY_RECORDS - 1);
+    assert_eq!(output.bytes.0, vec![63; OWNER_REPLAY_BYTES]);
+    assert!(!*gate.borrow());
+    gate.send_replace(true);
+    for terminal in [true, false] {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            motor_protocol::read_frame_async(&mut client),
+        )
+        .await
+        .expect("terminal batch must be flushed before waiting for disconnect")
+        .unwrap()
+        .unwrap();
+        if terminal {
+            assert!(matches!(frame, Frame::Terminal(record) if record.job_id == id));
+        } else {
+            assert!(matches!(frame, Frame::HostedTerminal(record) if record.job_id == id));
+        }
+    }
+    drop(client);
+    replay.await.unwrap();
+}
+
 async fn replay_owner(
     tls: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
     id: Uuid,
@@ -1143,6 +1197,11 @@ async fn replay_owner(
         {
             return;
         }
+    }
+    // The caller drains output before opening the terminal gate. Flush any TLS
+    // ciphertext still buffered by the last write before waiting for the gate.
+    if tls.flush().await.is_err() {
+        return;
     }
     let mut gate = gate.subscribe();
     while !*gate.borrow_and_update() {
@@ -1168,6 +1227,11 @@ async fn replay_owner(
         {
             return;
         }
+    }
+    // Keep the connection open for the follower, but do not withhold the result
+    // while waiting for that follower to disconnect.
+    if tls.flush().await.is_err() {
+        return;
     }
     while motor_protocol::read_frame_async(tls)
         .await

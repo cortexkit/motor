@@ -204,6 +204,23 @@ impl Drop for Subscriber {
 }
 
 impl Motor {
+    #[cfg(test)]
+    pub(super) fn hosted_result_snapshot_for_test(&self, id: Uuid) -> String {
+        let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+        let Some(owner) = owner else {
+            return "owner absent".into();
+        };
+        let state = owner.state.lock().unwrap();
+        format!(
+            "ring={:?} floor={} cursor={} index={} rewind={:?} ingress={} published={} discard={} subscribers={:?} finished={} closing={} stopped={} terminal={} complete={} live={}",
+            state.ring.iter().map(|(index, _, record)| (*index, sequence(record))).collect::<Vec<_>>(),
+            state.floor, state.cursor, state.index, state.rewind, state.ingress_records,
+            state.published_records, state.discard_through, state.subscribers, state.finished,
+            state.closing, *owner.stopped.borrow(), state.terminal.is_some(),
+            self.storage.job(id).is_some_and(|job| job.hosted_complete()), state.live,
+        )
+    }
+
     pub(super) fn start_boat_terminal_drain(&self, id: Uuid, owner: &Owner) {
         let Some(job) = self.storage.job(id) else {
             return;
