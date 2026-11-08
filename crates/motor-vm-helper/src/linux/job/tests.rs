@@ -315,6 +315,19 @@ fn wait_for_file(path: &Path) {
 
 /// Runs outside remote jobs as root: it creates a disposable systemd service
 /// with the shipped helper's kill/delegation settings and a separate test slice.
+/// The shared scratch root and its ancestors must be root-owned, non-writable
+/// by other users, and traversable by the VM uid in 600000..601000; do not use
+/// a directory below /root. On a Linux build server with systemd 254+ as PID 1,
+/// a writable cgroup v2 hierarchy and a C compiler, run:
+///
+/// ```sh
+/// mkdir -p target/scratch
+/// cc -O2 -Wall -Wextra -Werror crates/motor-vm-helper/fixtures/job-firecracker.c -o target/scratch/job-firecracker
+/// TMPDIR=/var/lib/motor-root-tests \
+/// MOTOR_VM_TEST_JOB_FIRECRACKER="$PWD/target/scratch/job-firecracker" \
+/// cargo nextest run -p motor-vm-helper --features linux-service-tests \
+///   -E 'test(=linux::job::tests::isolated_job_vmm_survives_helper_service_restart)' --no-capture
+/// ```
 #[test]
 #[cfg(feature = "linux-service-tests")]
 fn isolated_job_vmm_survives_helper_service_restart() {
