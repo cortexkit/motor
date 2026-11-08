@@ -1,7 +1,8 @@
-//! Physical recursive mode repair, independent of coreutils option versions.
+//! Physical permission repair and staging cleanup, independent of coreutils.
 //! Only the trusted daemon invokes the root CLI; jobs receive no sudo grant.
 use sha2::Digest;
 use std::{
+    collections::HashMap,
     ffi::CString,
     fs, io,
     os::{
@@ -51,42 +52,56 @@ pub(crate) fn check_install() -> io::Result<()> {
             return Err(io::Error::other(format!("unsafe permissions helper path {}: uid={} gid={} mode={:04o} type={:?}; expected physical root-owned non-job-writable ancestry and root0755 helper", path.display(), metadata.uid(), metadata.gid(), metadata.mode() & 0o7777, metadata.file_type())));
         }
     }
-    let output = Command::new(HELPER)
-        .arg("permission-helper-digest")
-        .output()?;
+    check_install_commands()
+}
+
+fn check_install_commands() -> io::Result<()> {
+    let output = crate::systemd::output(Command::new(HELPER).arg("permission-helper-digest"))?;
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != digest() {
         return Err(io::Error::other("installed permissions helper differs from candidate; administrator must install the matching helper before deploy"));
     }
     for policy in [Policy::OwnerWrite, Policy::Private] {
-        let output = Command::new("/usr/bin/sudo")
-            .args([
-                "-n",
-                "-l",
-                HELPER,
-                "physical-chmod",
-                policy.argument(),
-                "--",
-                "/srv/build/tmp",
-            ])
-            .output()?;
+        let output = crate::systemd::output(Command::new("/usr/bin/sudo").args([
+            "-n",
+            "-l",
+            HELPER,
+            "physical-chmod",
+            policy.argument(),
+            "--",
+            "/srv/build/tmp",
+        ]))?;
         if !output.status.success() {
             return Err(io::Error::other("operator sudo policy must allow the fixed physical-chmod command forms before deploy"));
         }
     }
     for action in ["seal", "unseal"] {
-        let output = Command::new("/usr/bin/sudo")
-            .args([
-                "-n",
-                "-l",
-                HELPER,
-                action,
-                "00000000-0000-0000-0000-000000000000",
-                "/srv/build/tmp",
-            ])
-            .output()?;
+        let output = crate::systemd::output(Command::new("/usr/bin/sudo").args([
+            "-n",
+            "-l",
+            HELPER,
+            action,
+            "00000000-0000-0000-0000-000000000000",
+            "/srv/build/tmp",
+        ]))?;
         if !output.status.success() {
             return Err(io::Error::other(
                 "operator sudo policy must allow the fixed seal and unseal forms before deploy",
+            ));
+        }
+    }
+    for action in ["check-staging-links", "remove-staging"] {
+        let output = crate::systemd::output(Command::new("/usr/bin/sudo").args([
+            "-n",
+            "-l",
+            HELPER,
+            action,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "00000000-0000-0000-0000-000000000000",
+            "/srv/build/tmp",
+        ]))?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                "operator sudo policy must allow the fixed check-staging-links and remove-staging forms before deploy",
             ));
         }
     }
@@ -223,6 +238,188 @@ pub(crate) fn seal_command(
         .args(["-n", HELPER, action, &id.to_string()])
         .arg(state);
     Ok(command)
+}
+
+fn validate_staging_form(action: &str, state: &Path, repository: &str) -> io::Result<()> {
+    if !matches!(action, "check-staging-links" | "remove-staging")
+        || !state.is_absolute()
+        || state.parent().is_none()
+        || state
+            .as_os_str()
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .any(|part| matches!(part, b"." | b".."))
+        || repository.len() != 64
+        || !repository
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(io::Error::other("invalid staging generation helper form"));
+    }
+    Ok(())
+}
+
+fn staging_command(
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+) -> io::Result<Command> {
+    validate_staging_form(action, state, repository)?;
+    let mut command = Command::new("/usr/bin/sudo");
+    command
+        .args(["-n", HELPER, action, repository, &fill.to_string()])
+        .arg(state);
+    Ok(command)
+}
+
+/// Inspect or discard only a fill's staging generation. Root runners walk in
+/// process; unprivileged runners use the same fixed operation through sudo.
+pub(crate) fn staging_operation(
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+) -> io::Result<()> {
+    validate_staging_form(action, state, repository)?;
+    if unsafe { libc::geteuid() } == 0 {
+        return staging_apply(action, state, repository, fill);
+    }
+    let mut command = staging_command(action, state, repository, fill)?;
+    let output = crate::systemd::output(&mut command)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn staging_helper(action: &str, args: &[String]) -> io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 || args.len() != 3 {
+        return Err(io::Error::other(
+            "staging helper requires root, repository key, fill UUID and state root",
+        ));
+    }
+    let repository = &args[0];
+    let fill = args[1]
+        .parse::<motor_protocol::Uuid>()
+        .map_err(io::Error::other)?;
+    let state = Path::new(&args[2]);
+    validate_staging_form(action, state, repository)?;
+    crate::source_seal::authority::Authority::load()?.roots(state)?;
+    fs::write("/proc/self/oom_score_adj", "900")?;
+    staging_operation(action, state, repository, fill)
+}
+
+fn directory_entries(fd: &OwnedFd) -> io::Result<fs::ReadDir> {
+    // The kernel-owned magic link names the pinned directory, even if its
+    // former pathname has been replaced. No job-controlled link is followed.
+    fs::read_dir(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+fn check_staging_links(root: OwnedFd) -> io::Result<()> {
+    let mut inodes = HashMap::<(u64, u64), (u64, u64)>::new();
+    let mut stack = vec![Frame {
+        entries: directory_entries(&root)?,
+        fd: root,
+    }];
+    while let Some(parent) = stack.last_mut() {
+        let Some(entry) = parent.entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let child = open_at(parent.fd.as_raw_fd(), &entry?.file_name(), false)?;
+        let metadata = fs::File::from(child.try_clone()?).metadata()?;
+        if metadata.is_dir() {
+            stack.push(Frame {
+                entries: directory_entries(&child)?,
+                fd: child,
+            });
+        } else {
+            let (entries, links) = inodes.entry((metadata.dev(), metadata.ino())).or_default();
+            *entries += 1;
+            *links = (*links).max(metadata.nlink());
+        }
+    }
+    // Directory link counts include child directories' '..' entries and are
+    // not evidence of an outside hard link. Only non-directory inodes count.
+    if inodes.values().any(|(entries, links)| links > entries) {
+        return Err(io::Error::other(
+            "staging generation contains an inode linked from outside the generation",
+        ));
+    }
+    Ok(())
+}
+
+fn unlink_at(parent: RawFd, name: &std::ffi::OsStr, directory: bool) -> io::Result<()> {
+    let name =
+        CString::new(name.as_bytes()).map_err(|_| io::Error::other("NUL in staging entry"))?;
+    if unsafe {
+        libc::unlinkat(
+            parent,
+            name.as_ptr(),
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn remove_staging(root: OwnedFd, repository: OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+    let mut stack = vec![(
+        Frame {
+            entries: directory_entries(&root)?,
+            fd: root,
+        },
+        name.to_owned(),
+    )];
+    while let Some((parent, _)) = stack.last_mut() {
+        if let Some(entry) = parent.entries.next() {
+            let name = entry?.file_name();
+            let child = open_at(parent.fd.as_raw_fd(), &name, false)?;
+            if fs::File::from(child.try_clone()?).metadata()?.is_dir() {
+                stack.push((
+                    Frame {
+                        entries: directory_entries(&child)?,
+                        fd: child,
+                    },
+                    name,
+                ));
+            } else {
+                unlink_at(parent.fd.as_raw_fd(), &name, false)?;
+            }
+        } else {
+            let (_, name) = stack.pop().unwrap();
+            let parent = stack
+                .last()
+                .map_or(repository.as_raw_fd(), |(frame, _)| frame.fd.as_raw_fd());
+            unlink_at(parent, &name, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn staging_apply(
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+) -> io::Result<()> {
+    validate_staging_form(action, state, repository)?;
+    let state = physical_root(state)?;
+    let bases = open_at(state.as_raw_fd(), std::ffi::OsStr::new("build-bases"), true)?;
+    let repository = open_at(bases.as_raw_fd(), std::ffi::OsStr::new(repository), true)?;
+    let name = format!("staging-{fill}");
+    let root = open_at(repository.as_raw_fd(), std::ffi::OsStr::new(&name), true)?;
+    match action {
+        "check-staging-links" => check_staging_links(root),
+        "remove-staging" => remove_staging(root, repository, std::ffi::OsStr::new(&name)),
+        _ => unreachable!(),
+    }
 }
 
 struct Frame {

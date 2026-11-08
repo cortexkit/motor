@@ -56,6 +56,13 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     if args
         .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "check-staging-links" | "remove-staging"))
+    {
+        return motor_runner::staging_generation_helper(&args[0], &args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if args
+        .first()
         .is_some_and(|arg| matches!(arg.as_str(), "seal" | "unseal"))
     {
         return motor_runner::source_seal_helper(&args[0], &args[1..]);
@@ -892,6 +899,20 @@ mod metrics_cli_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn staging_operations_dispatch_to_the_fixed_helper_before_runner_options() {
+        for action in ["check-staging-links", "remove-staging"] {
+            let error = super::run(vec![action.to_owned()]).await.unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "staging helper requires root, repository key, fill UUID and state root"
+                ),
+                "{error}"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn check_options_accepts_installed_units_with_and_without_caller_roots_without_state() {

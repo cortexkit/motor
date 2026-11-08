@@ -49,7 +49,13 @@ class PermissionsPolicyTests(unittest.TestCase):
             '/usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- *',
             '/usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *',
             '/usr/local/libexec/motor-runner-permissions seal *',
-            '/usr/local/libexec/motor-runner-permissions unseal *'])
+            '/usr/local/libexec/motor-runner-permissions unseal *',
+            '/usr/local/libexec/motor-runner-permissions check-staging-links *',
+            '/usr/local/libexec/motor-runner-permissions remove-staging *'])
+        for action in ('check-staging-links', 'remove-staging'):
+            with self.subTest(missing=action), self.assertRaises(ValueError):
+                policy.render(template.replace(', ' + policy.HELPER + ' ' + action + ' *', ''),
+                              'ubuntu', accounts.__getitem__)
         for operator in ('motor-job','motor-cache','alias','root','ubuntu\nALL=(ALL) ALL'):
             with self.subTest(operator=operator), self.assertRaises(ValueError):
                 policy.render(template, operator, accounts.__getitem__)

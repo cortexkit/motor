@@ -104,6 +104,11 @@ pub fn physical_chmod(args: &[String]) -> std::io::Result<()> {
     permissions::run(args)
 }
 #[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn staging_generation_helper(action: &str, args: &[String]) -> std::io::Result<()> {
+    permissions::staging_helper(action, args)
+}
+#[cfg(target_os = "linux")]
 pub fn source_seal_helper(action: &str, args: &[String]) -> std::io::Result<()> {
     source_seal::helper(action, args)
 }
