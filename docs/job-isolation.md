@@ -523,6 +523,12 @@ unset. Tests: `either_submitted_debug_variable_suppresses_both_defaults`,
 `package_debug_overrides_do_not_suppress_profile_defaults`,
 `unparsable_cargo_files_keep_debug_defaults`.
 
+Only regular files of at most 1 MiB from the job or fill snapshot tree are
+inspected; symlinks and oversized files count as unset. Tests:
+`symlinked_cargo_profiles_keep_defaults_without_following_targets`,
+`symlinked_cargo_directory_keeps_defaults_without_following_targets`,
+`oversized_cargo_profiles_keep_defaults`.
+
 Cache fills use the same repository-aware default as jobs. Changing the default
 costs one rebuild of every warm workspace and one round of cache refills because
 Cargo's environment is part of the cache key. Test:

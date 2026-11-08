@@ -56,8 +56,12 @@ pub(crate) fn target_environment(env: &mut BTreeMap<String, String>) {
 /// Keep profile defaults identical for fills and readers: sccache hashes CARGO_* values.
 /// Explicit job or repository settings win over the space-saving Linux default.
 #[cfg(target_os = "linux")]
-pub(crate) fn profile_environment(env: &mut BTreeMap<String, String>, repository: &Path) {
-    if !use_line_only_debug(env, repository) {
+pub(crate) fn profile_environment(
+    env: &mut BTreeMap<String, String>,
+    repository: &Path,
+    tree: &str,
+) {
+    if !use_line_only_debug(env, repository, tree) {
         return;
     }
     for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
@@ -66,7 +70,7 @@ pub(crate) fn profile_environment(env: &mut BTreeMap<String, String>, repository
 }
 
 #[cfg(target_os = "linux")]
-fn use_line_only_debug(env: &BTreeMap<String, String>, repository: &Path) -> bool {
+fn use_line_only_debug(env: &BTreeMap<String, String>, repository: &Path, tree: &str) -> bool {
     if ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"]
         .iter()
         .any(|key| env.contains_key(*key))
@@ -74,19 +78,13 @@ fn use_line_only_debug(env: &BTreeMap<String, String>, repository: &Path) -> boo
         return false;
     }
     for file in ["Cargo.toml", ".cargo/config.toml", ".cargo/config"] {
-        let path = repository.join(file);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cannot read Cargo profile settings; treating file as unset");
-                continue;
-            }
+        let Some(text) = snapshot_profile(repository, tree, file) else {
+            continue;
         };
         let config: toml::Value = match toml::from_str(&text) {
             Ok(config) => config,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cannot parse Cargo profile settings; treating file as unset");
+                tracing::warn!(file, tree, %error, "cannot parse Cargo profile settings; treating file as unset");
                 continue;
             }
         };
@@ -104,19 +102,45 @@ fn use_line_only_debug(env: &BTreeMap<String, String>, repository: &Path) -> boo
     true
 }
 
+#[cfg(target_os = "linux")]
+fn snapshot_profile(repository: &Path, tree: &str, file: &str) -> Option<String> {
+    const MAX_BYTES: usize = 1024 * 1024;
+    let entry =
+        crate::workspace::git_bytes(repository, &["ls-tree", "-lz", tree, "--", file]).ok()?;
+    let entry = std::str::from_utf8(&entry).ok()?;
+    let metadata = entry.strip_suffix(&format!("\t{file}\0"))?;
+    let mut fields = metadata.split_whitespace();
+    let mode = fields.next()?;
+    let kind = fields.next()?;
+    let _object = fields.next()?;
+    let size = fields.next()?.parse::<usize>().ok()?;
+    if !matches!(mode, "100644" | "100755")
+        || kind != "blob"
+        || size > MAX_BYTES
+        || fields.next().is_some()
+    {
+        return None;
+    }
+    // Immutable regular blobs cannot follow checkout symlinks or grow between the size check
+    // and the read. Never open caller-controlled profile paths on the host filesystem.
+    let blob =
+        crate::workspace::git_bytes(repository, &["show", &format!("{tree}:{file}")]).ok()?;
+    String::from_utf8(blob).ok()
+}
+
 /// sccache hashes CARGO_HOME, CARGO_TARGET_DIR, CARGO_BUILD_BUILD_DIR and
 /// CARGO_NET_OFFLINE, as well as profile debug defaults, even for non-incremental dependencies.
 /// Changing their presence or value between a fill and a reader loses every hit.
 /// Writers enable incremental in Cargo,
 /// and the trusted compile shim strips incremental environment variables before
 /// sccache sees them, preserving Cargo's per-crate flags.
-pub(crate) fn cargo_environment(env: &mut BTreeMap<String, String>, repository: &Path) {
+pub(crate) fn cargo_environment(env: &mut BTreeMap<String, String>, repository: &Path, tree: &str) {
     env.remove("CARGO_INCREMENTAL");
     target_environment(env);
     #[cfg(target_os = "linux")]
-    profile_environment(env, repository);
+    profile_environment(env, repository, tree);
     #[cfg(not(target_os = "linux"))]
-    let _ = repository;
+    let _ = (repository, tree);
     for (key, value) in [("CARGO_HOME", CARGO_HOME), ("CARGO_NET_OFFLINE", "true")] {
         env.insert(key.into(), value.into());
     }
@@ -125,9 +149,10 @@ pub(crate) fn cargo_environment(env: &mut BTreeMap<String, String>, repository: 
 pub(crate) fn reader_environment(
     env: &mut BTreeMap<String, String>,
     repository: &Path,
+    tree: &str,
     size_gib: u64,
 ) {
-    cargo_environment(env, repository);
+    cargo_environment(env, repository, tree);
     for (key, value) in [
         ("SCCACHE_DIR", CACHE.to_string()),
         ("SCCACHE_CACHE_SIZE", format!("{size_gib}G")),
@@ -201,7 +226,7 @@ mod tests {
     fn reader_and_writer_have_identical_hashed_cargo_inputs() {
         let scratch = ScratchDir::new("cargo-input-parity");
         let mut writer = BTreeMap::new();
-        cargo_environment(&mut writer, scratch.path());
+        cargo_environment(&mut writer, scratch.path(), "");
         let mut reader = BTreeMap::from([
             ("CARGO_HOME".into(), "/operator/cargo".into()),
             ("CARGO_TARGET_DIR".into(), "/workspace/target".into()),
@@ -210,7 +235,7 @@ mod tests {
             ("CARGO_NET_OFFLINE".into(), "false".into()),
             ("CARGO_INCREMENTAL".into(), "1".into()),
         ]);
-        reader_environment(&mut reader, scratch.path(), 17);
+        reader_environment(&mut reader, scratch.path(), "", 17);
         reader.retain(|key, _| key.starts_with("CARGO_"));
         assert_eq!(reader, writer);
         assert_eq!(reader["CARGO_TARGET_DIR"], "/run/motor/target");
@@ -228,7 +253,7 @@ mod tests {
     fn reader_disk_configuration_is_complete_and_read_only() {
         let scratch = ScratchDir::new("cargo-reader-environment");
         let mut env = BTreeMap::new();
-        reader_environment(&mut env, scratch.path(), 17);
+        reader_environment(&mut env, scratch.path(), "", 17);
         assert_eq!(env["SCCACHE_DIR"], "/motor-cache");
         assert_eq!(env["SCCACHE_CACHE_SIZE"], "17G");
         assert_eq!(env["SCCACHE_LOCAL_RW_MODE"], "READ_ONLY");

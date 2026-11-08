@@ -423,7 +423,7 @@ impl CacheServer {
             .read_write
             .push(bind(&config.sccache_dir(), Path::new("/motor-cache")).unwrap());
         let mut environment = std::collections::BTreeMap::new();
-        crate::compile_cache::cargo_environment(&mut environment, work);
+        crate::compile_cache::cargo_environment(&mut environment, work, "");
         environment.extend([
             ("SCCACHE_DIR".into(), "/motor-cache".into()),
             ("SCCACHE_CACHE_SIZE".into(), "1G".into()),
@@ -745,7 +745,7 @@ fn isolated_reader_hits_across_workspaces_and_cannot_poison_cache() {
             bind(&fleet, Path::new(crate::compile_cache::CACHE)).unwrap()
         ));
         let mut env = std::collections::BTreeMap::new();
-        crate::compile_cache::reader_environment(&mut env, &workspace, 1);
+        crate::compile_cache::reader_environment(&mut env, &workspace, "", 1);
         cache_trace_environment(&mut env, "reader");
         env.insert("RUSTC_WRAPPER".into(), "sccache".into());
         env.insert(

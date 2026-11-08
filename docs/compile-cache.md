@@ -140,6 +140,12 @@ and do not opt out. Unparsable files log a warning and count as unset. Tests:
 `package_debug_overrides_do_not_suppress_profile_defaults`,
 `unparsable_cargo_files_keep_debug_defaults`.
 
+Only regular files of at most 1 MiB from the job or fill snapshot tree are
+inspected; symlinks and oversized files count as unset. Tests:
+`symlinked_cargo_profiles_keep_defaults_without_following_targets`,
+`symlinked_cargo_directory_keeps_defaults_without_following_targets`,
+`oversized_cargo_profiles_keep_defaults`.
+
 Fills read those same files at their checked-out tip; they do not inherit a
 job's submitted environment. With the same inputs, fills and readers must get
 byte-identical `CARGO_*` values or sccache loses every hit. Changing this default

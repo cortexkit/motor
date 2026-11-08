@@ -1352,6 +1352,7 @@ fn compile_cache_environment(
             crate::compile_cache::profile_environment(
                 env,
                 &paths::host_run(config, &setup.request).host_workspace,
+                &setup.request.tree_hash,
             );
         }
         #[cfg(unix)]
@@ -1372,6 +1373,7 @@ fn compile_cache_environment(
         crate::compile_cache::reader_environment(
             env,
             &paths::host_run(config, &setup.request).host_workspace,
+            &setup.request.tree_hash,
             config.sccache_size_gib,
         );
         if setup.base {

@@ -554,6 +554,9 @@ fn isolated_fill_and_job_have_identical_hashed_cargo_inputs() {
         let mut config = Config::new(scratch.join("state"), "main");
         config.isolate_jobs = true;
         let mut setup = setup(scratch.path());
+        crate::workspace::git(scratch.path(), &["init", "-q"]).unwrap();
+        crate::workspace::git(scratch.path(), &["add", "."]).unwrap();
+        setup.request.tree_hash = crate::workspace::git(scratch.path(), &["write-tree"]).unwrap();
         let prepared = Prepared {
             host_cwd: scratch.join("member"),
             target: scratch.join("target"),
@@ -673,7 +676,11 @@ fn hosted_cache_case(
     if rust || writer {
         assert_eq!(env["CARGO_TARGET_DIR"], "/run/motor/target", "{case}");
         let mut fill_environment = BTreeMap::new();
-        crate::compile_cache::cargo_environment(&mut fill_environment, scratch.path());
+        crate::compile_cache::cargo_environment(
+            &mut fill_environment,
+            scratch.path(),
+            &setup.request.tree_hash,
+        );
         assert_eq!(
             env["CARGO_BUILD_BUILD_DIR"], "/run/motor/target/bd/{workspace-path-hash}",
             "{case}"
