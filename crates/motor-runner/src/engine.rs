@@ -8567,12 +8567,16 @@ impl Runner {
                     .as_ref()
                     .map_err(ToString::to_string)
                     .and_then(|value| value.for_publication().map_err(str::to_owned))
-                {
-                    Ok(inputs) => {
+                    .and_then(|inputs| {
+                        crate::build_base::Timestamp::reference()
+                            .map(|reference| (inputs, reference))
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok((inputs, reference)) => {
                         job.base_launch = Some(crate::build_base::FillLaunch {
                             inputs: inputs.clone(),
                             fixed_path: fixed.checkout,
-                            reference: crate::build_base::Timestamp::now(),
+                            reference,
                         })
                     }
                     Err(reason) => {
@@ -10848,6 +10852,13 @@ impl Runner {
         })();
         if let Err(reason) = result {
             tracing::warn!(job_id = %id, %reason, "build base publication refused");
+            if let Err(error) = self.output(
+                id,
+                OutputStream::Stderr,
+                format!("runner: build base publication refused: {reason}\n").as_bytes(),
+            ) {
+                tracing::warn!(job_id = %id, %error, "build base refusal could not be persisted to fill output");
+            }
         }
     }
 

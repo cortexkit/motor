@@ -40,6 +40,29 @@ impl Timestamp {
             nanos: now.subsec_nanos() as i64,
         }
     }
+
+    pub(crate) fn reference() -> io::Result<Self> {
+        let coarse = || {
+            let mut value = std::mem::MaybeUninit::uninit();
+            if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, value.as_mut_ptr()) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let value = unsafe { value.assume_init() };
+            Ok(Self {
+                seconds: value.tv_sec,
+                nanos: value.tv_nsec,
+            })
+        };
+        let reference = coarse()?;
+        // Linux inode ctime uses the coarse realtime tick. Starting within that
+        // same tick would let a write/restore receive ctime <= the reference.
+        // Advance one tick before launching so every later mutation is newer.
+        while coarse()? <= reference {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(reference)
+    }
 }
 
 pub(crate) fn repository_store(state: &Path, repository: &str) -> std::path::PathBuf {
@@ -397,7 +420,12 @@ pub(crate) fn publish(
 /// Called only after the link, checkout, ownership and build-output checks.
 pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
-    let root = crate::permissions::physical_root(generation)?;
+    let store = generation.parent().unwrap();
+    let ancestor = crate::permissions::physical_root(store.parent().unwrap())?;
+    let parent = open_directory(&ancestor, store.file_name().unwrap())?;
+    // physical_root returns O_PATH; fsync needs an ordinary directory handle.
+    // Open both directories through their entries, without following links.
+    let root = open_directory(&parent, generation.file_name().unwrap())?;
     let fd = unsafe {
         libc::openat(
             root.as_raw_fd(),
@@ -414,7 +442,6 @@ pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<(
     file.write_all(&serde_json::to_vec(&record)?)?;
     file.sync_all()?;
     fs::File::from(root.try_clone()?).sync_all()?;
-    let parent = crate::permissions::physical_root(generation.parent().unwrap())?;
     let staging_name = cstring(generation.file_name().unwrap())?;
     let rename = |from: &std::ffi::CStr, to: &std::ffi::CStr, flags| {
         if unsafe {

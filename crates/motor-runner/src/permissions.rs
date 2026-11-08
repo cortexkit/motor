@@ -371,12 +371,10 @@ fn delegated_runner_uid() -> io::Result<u32> {
 
 impl StagingOwners {
     fn current() -> io::Result<Self> {
-        let uid = unsafe { libc::geteuid() };
-        let runner = if uid == 0 && std::env::var_os("SUDO_UID").is_some() {
-            delegated_runner_uid()?
-        } else {
-            uid
-        };
+        Self::for_runner(unsafe { libc::geteuid() })
+    }
+
+    fn for_runner(runner: u32) -> io::Result<Self> {
         let writer = crate::isolation::validate_writer_account()?.uid;
         if writer == runner {
             return Err(io::Error::other("fill writer must differ from the runner"));
@@ -450,11 +448,15 @@ pub(crate) fn staging_helper(action: &str, args: &[String]) -> io::Result<()> {
         .map_err(io::Error::other)?;
     let state = Path::new(&args[2]);
     validate_staging_form(action, state, repository)?;
-    delegated_runner_uid()?;
+    let runner = delegated_runner_uid()?;
     // Keep short-lived helper walks expendable without changing a root
     // daemon's protected score on the in-process path.
     fs::write("/proc/self/oom_score_adj", "900")?;
-    staging_operation(action, state, repository, fill)
+    // Only this explicit sudo-helper entry point delegates ownership. A root
+    // daemon's in-process path must not interpret inherited SUDO_UID as identity.
+    crate::source_seal::authority::Authority::load()?.roots(state)?;
+    let owners = StagingOwners::for_runner(runner)?;
+    staging_execute(action, state, repository, fill, owners)
 }
 
 fn directory_entries(fd: &OwnedFd) -> io::Result<fs::ReadDir> {

@@ -978,3 +978,37 @@ fn operator_staging_security_rejects_malformed_fixed_helper_forms() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires root and provisioned motor-cache/motor-job accounts"]
+fn isolated_staging_in_process_ignores_inherited_sudo_uid() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    const CHILD: &str = "MOTOR_STAGING_IDENTITY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert_ne!(std::env::var("SUDO_UID").unwrap(), "0");
+        assert_eq!(StagingOwners::current().unwrap().runner, 0);
+        return;
+    }
+    // Use a child process so this identity test never mutates another test's
+    // environment. A real non-root account makes the delegated path distinguishable.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "permissions::tests::isolated_staging_in_process_ignores_inherited_sudo_uid",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env(
+            "SUDO_UID",
+            crate::isolation::job_identity().unwrap().uid.to_string(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

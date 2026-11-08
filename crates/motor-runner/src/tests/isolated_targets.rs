@@ -561,7 +561,7 @@ async fn isolated_base_fill_external_home_hardlink_preserves_outside_metadata() 
     use std::os::fd::AsRawFd;
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let f = Fixture::new();
-    let mut config = base_store_config(&f, "mkdir -p \"$CARGO_TARGET_DIR/bd\"; printf outside > \"$HOME/outside\"; chmod 0640 \"$HOME/outside\"; setfacl -m u:motor-job:rw \"$HOME/outside\"; printf waiting > \"$CARGO_TARGET_DIR/control\"; ln \"$HOME/outside\" \"$CARGO_TARGET_DIR/bd/external\"; while [ \"$(cat \"$CARGO_TARGET_DIR/control\")\" != exit ]; do sleep 0.01; done");
+    let mut config = base_store_config(&f, "mkdir -p \"$CARGO_TARGET_DIR/bd\"; printf outside > \"$HOME/outside\"; chmod 0640 \"$HOME/outside\"; setfacl -m u:motor-job:rw \"$HOME/outside\"; printf waiting > \"$CARGO_TARGET_DIR/control\"; while [ \"$(cat \"$CARGO_TARGET_DIR/control\")\" != exit ]; do sleep 0.01; done");
     let held_fill = Arc::new(Mutex::new(None::<Uuid>));
     let settled = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
@@ -600,6 +600,9 @@ async fn isolated_base_fill_external_home_hardlink_preserves_outside_metadata() 
         let inner = runner.core.inner.lock().unwrap();
         inner.jobs.values().any(|job| {
             job.base
+                && crate::build_base::staging(&config.state_dir(), &f.root, job.id)
+                    .join("target/control")
+                    .is_file()
                 && config
                     .state_dir()
                     .join("sandboxes")
@@ -620,12 +623,15 @@ async fn isolated_base_fill_external_home_hardlink_preserves_outside_metadata() 
         .unwrap()
         .clone();
     let generation = crate::build_base::staging(&config.state_dir(), &f.root, fill.id);
-    drive_base_store(&runner, || generation.join("target/bd/external").is_file()).await;
     let home = config
         .state_dir()
         .join("sandboxes")
         .join(fill.id.to_string())
         .join("home/outside");
+    // Home and target are separate sandbox bind mounts, so link(2) between
+    // them is rejected as EXDEV. Plant the equivalent host-side link to exercise
+    // publication's link defense independently of that mount-layout protection.
+    fs::hard_link(&home, generation.join("target/bd/external")).unwrap();
     let outside = fs::File::open(&home).unwrap();
     let descriptor_path = PathBuf::from(format!(
         "/proc/{}/fd/{}",
@@ -712,7 +718,9 @@ fn isolated_base_startup_removes_only_retired_and_proven_stopped_staging() {
         let live = args.iter().any(|arg| arg.contains(&live_id.to_string()));
         Ok(std::process::Output {
             status: std::process::ExitStatus::from_raw(0),
-            stdout: if args[0] == "show" {
+            stdout: if args.iter().any(|arg| arg.contains("Version")) {
+                b"257\n".to_vec()
+            } else if args[0] == "show" {
                 if live {
                     b"ActiveState=active\n".to_vec()
                 } else {
@@ -752,7 +760,9 @@ async fn isolated_base_recovered_fill_publishes_recorded_inputs() {
         Arc::new(move |args| {
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(0),
-                stdout: if args[0] == "show" {
+                stdout: if args.iter().any(|arg| arg.contains("Version")) {
+                    b"257\n".to_vec()
+                } else if args[0] == "show" {
                     if active.load(Ordering::SeqCst) {
                         b"ActiveState=active\nSubState=running\n".to_vec()
                     } else {

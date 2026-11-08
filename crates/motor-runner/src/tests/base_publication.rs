@@ -164,7 +164,7 @@ fn tracked_change_and_restore_and_untracked_root_lock_are_refused_before_metadat
     let (request, bytes) = f.run("true");
     f.submit(&runner, &request, &bytes);
     let trees = &runner.core.trees;
-    let reference = Timestamp::now();
+    let reference = Timestamp::reference().unwrap();
     build_base::verify_unchanged(trees, &request, &f.main, reference).unwrap();
     let original = fs::read(f.main.join("source")).unwrap();
     fs::write(f.main.join("source"), b"changed").unwrap();
@@ -180,7 +180,7 @@ fn tracked_change_and_restore_and_untracked_root_lock_are_refused_before_metadat
         error.to_string().contains("tracked inode changed"),
         "{error}"
     );
-    let reference = Timestamp::now();
+    let reference = Timestamp::reference().unwrap();
     fs::write(f.main.join("Cargo.lock"), b"untracked lock").unwrap();
     let error = build_base::verify_unchanged(trees, &request, &f.main, reference).unwrap_err();
     assert!(
