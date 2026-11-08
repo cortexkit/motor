@@ -32,6 +32,15 @@ seal_spec.loader.exec_module(seal_config)
 
 
 class PermissionsPolicyTests(unittest.TestCase):
+    def test_installer_and_documentation_name_both_staging_grants(self):
+        installer = DEPLOY.with_name('install-permissions-helper.sh').read_text()
+        documentation = DEPLOY.parents[1].parent.joinpath('docs/runner-install.md').read_text()
+        for action in ('check-staging-links', 'remove-staging'):
+            form = action + ' REPO_KEY FILL_UUID STATE_ROOT'
+            with self.subTest(action=action):
+                self.assertIn(form, installer)
+                self.assertIn(policy.HELPER + ' ' + form, documentation)
+
     def test_source_seal_authority_requires_explicit_canonical_instances(self):
         grant = '/srv/build/state/e2e=/srv/build/workspaces,/srv/build/callers/e2e'
         rendered = json.loads(seal_config.render([grant]))
@@ -49,7 +58,13 @@ class PermissionsPolicyTests(unittest.TestCase):
             '/usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- *',
             '/usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *',
             '/usr/local/libexec/motor-runner-permissions seal *',
-            '/usr/local/libexec/motor-runner-permissions unseal *'])
+            '/usr/local/libexec/motor-runner-permissions unseal *',
+            '/usr/local/libexec/motor-runner-permissions check-staging-links *',
+            '/usr/local/libexec/motor-runner-permissions remove-staging *'])
+        for action in ('check-staging-links', 'remove-staging'):
+            with self.subTest(missing=action), self.assertRaises(ValueError):
+                policy.render(template.replace(', ' + policy.HELPER + ' ' + action + ' *', ''),
+                              'ubuntu', accounts.__getitem__)
         for operator in ('motor-job','motor-cache','alias','root','ubuntu\nALL=(ALL) ALL'):
             with self.subTest(operator=operator), self.assertRaises(ValueError):
                 policy.render(template, operator, accounts.__getitem__)

@@ -8,7 +8,8 @@ import sys
 HELPER = '/usr/local/libexec/motor-runner-permissions'
 ROW = ('@OPERATOR@ ALL=(root) NOPASSWD: ' + HELPER + ' physical-chmod owner-rwX -- *, '
        + HELPER + ' physical-chmod private-rwX -- *, '
-       + HELPER + ' seal *, ' + HELPER + ' unseal *')
+       + HELPER + ' seal *, ' + HELPER + ' unseal *, '
+       + HELPER + ' check-staging-links *, ' + HELPER + ' remove-staging *')
 
 
 def uid(name):
