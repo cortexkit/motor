@@ -157,6 +157,13 @@ impl HostedJobState {
                 .as_ref()
                 .is_some_and(|finish| finish.outcome == "cancelled")
     }
+    pub(crate) fn recovering_recorded_unknown(&self) -> bool {
+        !self.cancel_settlement_ready()
+            && self.terminal.as_ref().is_some_and(|terminal| {
+                matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                    && terminal.refusal_detail.is_some()
+            })
+    }
     pub(crate) fn booked_or_attempted(&self) -> bool {
         self.lease_attempted
             || self.placement.is_some()

@@ -195,7 +195,7 @@ impl Motor {
             .subscribe()
     }
     #[cfg(test)]
-    pub(crate) fn expire_boat_drain_for_test(&self, id: Uuid) {
+    pub(crate) async fn expire_boat_drain_for_test(&self, id: Uuid) {
         let owner = self
             .hosted_results
             .lock()
@@ -203,8 +203,26 @@ impl Motor {
             .get(&id)
             .unwrap()
             .clone();
-        owner.state.lock().unwrap().boat_drain.as_mut().unwrap().0 = tokio::time::Instant::now();
-        owner.changed.send_replace(());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let ready = {
+                    let mut state = owner.state.lock().unwrap();
+                    if let Some(drain) = state.boat_drain.as_mut() {
+                        drain.0 = tokio::time::Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if ready {
+                    owner.changed.send_replace(());
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first Boat terminal must initialize its drain deadline");
     }
 
     #[cfg(test)]
@@ -236,6 +254,15 @@ impl Motor {
         original: bool,
         tx: mpsc::Sender<io::Result<StreamRecord>>,
     ) -> Arc<Owner> {
+        // An unknown result already reported by an older client is a summary,
+        // not a new output replay. Cancellation recovery must still publish its
+        // updated diagnostic while retaining the durable cancellation intent.
+        if self
+            .hosted_state(id)
+            .is_some_and(|state| state.recovering_recorded_unknown())
+        {
+            cursor = u64::MAX;
+        }
         let subscriber = loop {
             let mut state = owner.state.lock().unwrap();
             if state.closing || *owner.stopped.borrow() {
@@ -267,7 +294,7 @@ impl Motor {
             let subscriber = state.next_subscriber;
             state.next_subscriber += 1;
             state.subscribers.insert(subscriber, cursor);
-            if state.boat_drain_expired {
+            if state.boat_drain_expired && cursor < state.floor {
                 state.subscriber_errors.insert(subscriber, format!("hosted replay ended at the drain deadline while subscriber cursor {cursor} was pending; query exec.status or exec.attach at u64::MAX"));
             }
             break subscriber;
@@ -544,13 +571,9 @@ impl Motor {
         owner: &Arc<Owner>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
     ) -> io::Result<bool> {
-        let recorded = self.hosted_state(id).is_some_and(|state| {
-            !state.cancel_settlement_ready()
-                && state.terminal.is_some_and(|terminal| {
-                    matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
-                        && terminal.refusal_detail.is_some()
-                })
-        });
+        let recorded = self
+            .hosted_state(id)
+            .is_some_and(|state| state.recovering_recorded_unknown());
         if !recorded {
             return Ok(false);
         }
@@ -759,6 +782,22 @@ fn empty_status(id: Uuid) -> JobStatusReply {
 }
 
 impl Owner {
+    pub(super) fn finish_boat_replay(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.boat_drain_expired = true;
+        state.rewind = None;
+        let behind: Vec<_> = state
+            .subscribers
+            .iter()
+            .filter(|(_, cursor)| **cursor < state.floor)
+            .map(|(id, cursor)| (*id, *cursor))
+            .collect();
+        for (id, cursor) in behind {
+            state.subscriber_errors.entry(id).or_insert_with(|| format!("Boat replay endpoint settled before subscriber cursor {cursor} could be replayed; query exec.status or exec.attach at u64::MAX"));
+        }
+        drop(state);
+        self.changed.send_replace(());
+    }
     pub(super) fn take_probe_settlement(&self) -> bool {
         std::mem::take(&mut self.state.lock().unwrap().probe_settlement)
     }
@@ -830,6 +869,19 @@ impl Owner {
         loop {
             {
                 let mut state = self.state.lock().unwrap();
+                let oldest = state
+                    .subscribers
+                    .iter()
+                    .filter(|(id, cursor)| {
+                        **cursor < state.floor && !state.subscriber_errors.contains_key(id)
+                    })
+                    .map(|(_, cursor)| *cursor)
+                    .min();
+                if let Some(cursor) = oldest
+                    .filter(|_| !state.boat_drain_expired && tokio::time::Instant::now() < deadline)
+                {
+                    state.rewind = Some(state.rewind.map_or(cursor, |old| old.min(cursor)));
+                }
                 if state.rewind.is_some() && tokio::time::Instant::now() < deadline {
                     return false;
                 }

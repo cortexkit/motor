@@ -107,13 +107,16 @@ async fn audit_04_sandbox_loss_preserves_real_terminal() {
 
 #[tokio::test(start_paused = true)]
 async fn audit_05_max_cursor_drain_honors_pending_subscriber_rewind() {
-    let owner = Owner::new(u64::MAX);
-    {
-        let mut state = owner.state.lock().unwrap();
-        state.subscribers.insert(0, 9);
-        state.rewind = Some(9);
+    for rewind in [None, Some(9)] {
+        let owner = Owner::new(u64::MAX);
+        {
+            let mut state = owner.state.lock().unwrap();
+            state.subscribers.insert(0, 9);
+            state.rewind = rewind;
+        }
+        assert!(!owner.wait_boat_subscribers(0).await);
+        assert_eq!(owner.state.lock().unwrap().rewind, Some(9));
     }
-    assert!(!owner.wait_boat_subscribers(0).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -205,6 +208,10 @@ fn audit_02_ownerless_boat_auth_retirement_releases_registry_before_recovery() {
         let h = Harness::with_host(Behavior::RefuseAttach("auth"), "boat:audit").await;
         let root = cortexkit_test_support::ScratchDir::new("audit-boat-retirement-lock");
         let (motor, id) = detached(&h, &root).await;
+        motor
+            .storage
+            .hosted_update(id, |state| state.retry_iat = Some(0))
+            .unwrap();
         let result = motor.open_job_channel_at(id, u64::MAX).await;
         assert!(matches!(result, Err(crate::hosted::Error::AttachAuth)));
         motor.close().await;
@@ -325,21 +332,23 @@ async fn audit_10_restart_collects_missing_return_result_without_a_subscriber() 
 
 #[tokio::test]
 async fn audit_12_cancel_intent_cannot_be_installed_after_durable_completion() {
-    let (_root, motor, id) = fixture();
-    motor
-        .storage
-        .hosted_update(id, |state| {
-            state.terminal = Some(real_terminal(id));
-            state.billing = crate::BillingStatus::Available;
-            state.finish_done = true;
-        })
-        .unwrap();
-    motor.storage.cancel(id, true).unwrap();
-    assert!(
-        !motor.pending(id),
-        "completion must fence a late cancel intent in the same store update"
-    );
-    motor.close().await;
+    for outcome in [Outcome::Exit { code: 41 }, Outcome::OutcomeUnknown] {
+        let (_root, motor, id) = fixture();
+        motor.storage.cancel(id, true).unwrap();
+        motor
+            .storage
+            .hosted_update(id, |state| {
+                let mut terminal = real_terminal(id);
+                terminal.outcome = outcome;
+                state.terminal = Some(terminal);
+                state.billing = crate::BillingStatus::Available;
+                state.finish_done = true;
+            })
+            .unwrap();
+        motor.storage.cancel(id, true).unwrap();
+        assert!(!motor.pending(id), "completion must fence a late cancel intent and consume an older one in the same store update");
+        motor.close().await;
+    }
 }
 
 #[tokio::test]

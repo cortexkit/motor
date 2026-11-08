@@ -571,14 +571,14 @@ impl Motor {
             self.connector_for_job(id)?;
         }
         let (mut stream, tx, rx) = self.stream(id);
-        if let Some(state) = self
-            .hosted_state(id)
-            .filter(|state| state.run_sent || self.hosted_results.lock().unwrap().contains_key(&id))
-        {
-            let completed = state
-                .terminal
-                .clone()
-                .filter(|_| state.billing != crate::BillingStatus::Pending);
+        if self.hosted_state(id).is_some_and(|state| {
+            state.run_sent || self.hosted_results.lock().unwrap().contains_key(&id)
+        }) {
+            let completed = self
+                .storage
+                .job(id)
+                .filter(|job| job.hosted_complete())
+                .and_then(|job| job.hosted?.terminal);
             if let Some(terminal) = completed {
                 tokio::spawn(async move {
                     let _ = emit(&tx, StreamRecord::Terminal(terminal)).await;
@@ -2305,10 +2305,9 @@ impl Motor {
                 .hosted_client(self.hosted_state(id).unwrap())
                 .finish(id, Some(&terminal), &self.storage)
                 .await?
+            && matches!(terminal.outcome, Outcome::OutcomeUnknown)
         {
-            if matches!(terminal.outcome, Outcome::OutcomeUnknown) {
-                terminal = Self::sandbox_lost_terminal(id, &state);
-            }
+            terminal = Self::sandbox_lost_terminal(id, &state);
         }
         if matches!(terminal.outcome, Outcome::OutcomeUnknown) {
             // Every route to an unknown outcome logs here: the terminal's
@@ -2335,6 +2334,18 @@ impl Motor {
         }
         self.storage
             .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
+        if self.hosted_state(id).is_some_and(|state| {
+            state.finish_done
+                && state
+                    .placement
+                    .as_ref()
+                    .is_some_and(|placement| placement.host.starts_with("boat:"))
+        }) {
+            let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+            if let Some(owner) = owner {
+                owner.finish_boat_replay();
+            }
+        }
         if !cancel_unconfirmed
             && self.hosted_state(id).is_some_and(|state| {
                 state.finish_done
@@ -2544,13 +2555,22 @@ impl Motor {
             {
                 if hosted && channel.is_some() {
                     cancel_retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
-                    if channel
-                        .as_ref()
-                        .unwrap()
-                        .send(Frame::Cancel(CancelRequest::new(build_server_id)))
-                        .await
-                        .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
-                        .is_err()
+                    if tokio::time::timeout(
+                        Duration::from_secs(5),
+                        channel
+                            .as_ref()
+                            .unwrap()
+                            .send(Frame::Cancel(CancelRequest::new(build_server_id))),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "hosted cancel write timed out",
+                        ))
+                    })
+                    .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
+                    .is_err()
                     {
                         channel = None;
                     }
@@ -3287,13 +3307,14 @@ impl Motor {
 
     async fn job_status_inner(&self, id: Uuid) -> io::Result<JobStatusReply> {
         self.storage.retain_job(id, None)?;
-        if let Some(state) = self
-            .hosted_state(id)
-            .filter(|state| state.run_sent || self.hosted_results.lock().unwrap().contains_key(&id))
-        {
-            if let Some(terminal) = state
-                .terminal
-                .filter(|_| state.billing != crate::BillingStatus::Pending)
+        if self.hosted_state(id).is_some_and(|state| {
+            state.run_sent || self.hosted_results.lock().unwrap().contains_key(&id)
+        }) {
+            if let Some(terminal) = self
+                .storage
+                .job(id)
+                .filter(|job| job.hosted_complete())
+                .and_then(|job| job.hosted?.terminal)
             {
                 return Ok(JobStatusReply {
                     job_id: id,

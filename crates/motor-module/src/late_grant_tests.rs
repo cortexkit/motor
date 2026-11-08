@@ -1446,7 +1446,7 @@ async fn audit_04_boat_drain_deadline_survives_failed_rewind_transports() {
     .unwrap();
     motor.rewind_hosted_for_test(id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    motor.expire_boat_drain_for_test(id);
+    motor.expire_boat_drain_for_test(id).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         while h.finish_calls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -1478,7 +1478,7 @@ async fn audit_09_failed_boat_finish_retries_while_subscriber_queue_is_full() {
     .await
     .unwrap();
     assert_eq!(caller.records.len(), 32);
-    motor.expire_boat_drain_for_test(id);
+    motor.expire_boat_drain_for_test(id).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         while !motor.hosted_state(id).unwrap().finish_done {
             tokio::task::yield_now().await;
