@@ -1349,6 +1349,10 @@ fn compile_cache_environment(
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && rust_job(config, setup) {
             crate::compile_cache::target_environment(env);
+            crate::compile_cache::profile_environment(
+                env,
+                &paths::host_run(config, &setup.request).host_workspace,
+            );
         }
         #[cfg(unix)]
         return remote_cache_environment(config, setup, prepared, env);
@@ -1365,7 +1369,11 @@ fn compile_cache_environment(
     }
     #[cfg(target_os = "linux")]
     if config.isolate_jobs && rust_job(config, setup) {
-        crate::compile_cache::reader_environment(env, config.sccache_size_gib);
+        crate::compile_cache::reader_environment(
+            env,
+            &paths::host_run(config, &setup.request).host_workspace,
+            config.sccache_size_gib,
+        );
         if setup.base {
             env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
             env.insert("CARGO_INCREMENTAL".into(), "1".into());

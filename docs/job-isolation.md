@@ -501,6 +501,33 @@ dropped, as is any name containing `TOKEN`, `SECRET`, `PASSWORD`, `KEY` or
 `transport_spy_filters_names_and_values_before_serialization`
 (`crates/motor-module/tests/it/safety.rs`).
 
+Isolated Linux Rust jobs default to
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
+`CARGO_PROFILE_TEST_DEBUG=line-tables-only`. Line-only debug info keeps file and
+line numbers in panics and backtraces, but omits debugger variable and type
+detail. A job wanting full debug info for a debugger or a tool that reads
+variables can set `CARGO_PROFILE_DEV_DEBUG=true` (or set `debug` in its
+repository's profile). macOS and Windows jobs are unchanged. Tests:
+`linux_debug_defaults_keep_line_tables`,
+`isolated_jobs_preserve_submitted_profile_debug`.
+
+Neither default is injected if the submitted environment already contains
+either variable, with any value, or if the checkout's root `Cargo.toml`,
+`.cargo/config.toml` or legacy `.cargo/config` sets `profile.dev.debug` or
+`profile.test.debug`. Package-level overrides do not opt out; they still apply
+on top of the default. A file that fails to parse logs a warning and counts as
+unset. Tests: `either_submitted_debug_variable_suppresses_both_defaults`,
+`root_manifest_profile_debug_suppresses_both_defaults`,
+`cargo_config_toml_profile_debug_suppresses_both_defaults`,
+`legacy_cargo_config_profile_debug_suppresses_both_defaults`,
+`package_debug_overrides_do_not_suppress_profile_defaults`,
+`unparsable_cargo_files_keep_debug_defaults`.
+
+Cache fills use the same repository-aware default as jobs. Changing the default
+costs one rebuild of every warm workspace and one round of cache refills because
+Cargo's environment is part of the cache key. Test:
+`isolated_fill_and_job_have_identical_hashed_cargo_inputs`.
+
 5.2. The `accepted` record lists the names that were dropped, never their
 values. Test: `accepted_reports_dropped_env_names_without_env_values`
 (`crates/motor-module/tests/it/recovery.rs`).

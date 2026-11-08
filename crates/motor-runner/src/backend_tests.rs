@@ -522,6 +522,8 @@ fn tenant_rust_launch_builds_in_fixed_target_without_compile_cache() {
     let observed = observed.lock().unwrap();
     let env = &observed.as_ref().unwrap().env;
     assert_eq!(env["CARGO_TARGET_DIR"], "/run/motor/target");
+    assert_eq!(env["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only");
+    assert_eq!(env["CARGO_PROFILE_TEST_DEBUG"], "line-tables-only");
     assert_eq!(
         env["CARGO_BUILD_BUILD_DIR"],
         "/run/motor/target/bd/{workspace-path-hash}"
@@ -531,6 +533,95 @@ fn tenant_rust_launch_builds_in_fixed_target_without_compile_cache() {
         !env.keys().any(|key| key.starts_with("SCCACHE_")),
         "{env:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_fill_and_job_have_identical_hashed_cargo_inputs() {
+    for file in [
+        None,
+        Some("Cargo.toml"),
+        Some(".cargo/config.toml"),
+        Some(".cargo/config"),
+    ] {
+        let scratch = ScratchDir::new("motor-fill-job-profile-parity");
+        fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+        if let Some(file) = file {
+            let path = scratch.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "[profile.test]\ndebug = true\n").unwrap();
+        }
+        let mut config = Config::new(scratch.join("state"), "main");
+        config.isolate_jobs = true;
+        let mut setup = setup(scratch.path());
+        let prepared = Prepared {
+            host_cwd: scratch.join("member"),
+            target: scratch.join("target"),
+            wrapper: None,
+            sandbox: None,
+            vm: None,
+        };
+        let mut job = BTreeMap::new();
+        compile_cache_environment(&config, &setup, &prepared, &mut job).unwrap();
+        setup.base = true;
+        let mut fill = BTreeMap::new();
+        compile_cache_environment(&config, &setup, &prepared, &mut fill).unwrap();
+        // The compiler shim strips incremental settings before sccache hashes either role.
+        let hashed_cargo = |env: &mut BTreeMap<String, String>| {
+            env.retain(|key, _| key.starts_with("CARGO_") && key != "CARGO_INCREMENTAL");
+        };
+        hashed_cargo(&mut job);
+        hashed_cargo(&mut fill);
+        assert_eq!(job, fill, "{file:?}");
+        for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+            assert_eq!(
+                job.get(key).map(String::as_str),
+                file.is_none().then_some("line-tables-only"),
+                "{file:?}: {key}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_jobs_preserve_submitted_profile_debug() {
+    for hosted in [false, true] {
+        for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+            let scratch = ScratchDir::new("motor-job-profile-opt-out");
+            fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+            let mut config = Config::new(scratch.join("state"), "main");
+            config.isolate_jobs = true;
+            config.tenant_vm = hosted;
+            let mut setup = setup(scratch.path());
+            setup.request.env.insert(key.into(), "true".into());
+            let observed = Arc::new(Mutex::new(None));
+            let prepared = Prepared {
+                host_cwd: scratch.path().into(),
+                target: scratch.join("target"),
+                wrapper: None,
+                sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
+                vm: None,
+            };
+            let error =
+                launch_error(HostBackend.launch(&config, &trees(&config), &setup, &prepared, 2));
+            assert_eq!(error.to_string(), "isolation launcher observed");
+            let observed = observed.lock().unwrap();
+            let env = &observed.as_ref().unwrap().env;
+            assert_eq!(env[key], "true");
+            assert_eq!(
+                env.keys()
+                    .filter(|key| {
+                        matches!(
+                            key.as_str(),
+                            "CARGO_PROFILE_DEV_DEBUG" | "CARGO_PROFILE_TEST_DEBUG"
+                        )
+                    })
+                    .count(),
+                1
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -582,7 +673,7 @@ fn hosted_cache_case(
     if rust || writer {
         assert_eq!(env["CARGO_TARGET_DIR"], "/run/motor/target", "{case}");
         let mut fill_environment = BTreeMap::new();
-        crate::compile_cache::cargo_environment(&mut fill_environment);
+        crate::compile_cache::cargo_environment(&mut fill_environment, scratch.path());
         assert_eq!(
             env["CARGO_BUILD_BUILD_DIR"], "/run/motor/target/bd/{workspace-path-hash}",
             "{case}"
@@ -753,6 +844,8 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
         ),
         ("CARGO_HOME", "/motor-home/cargo"),
         ("CARGO_NET_OFFLINE", "true"),
+        ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+        ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
         ("CARGO_TARGET_DIR", "/run/motor/target"),
         ("RUSTC_WRAPPER", "sccache"),
         ("RUSTFLAGS", "-C debuginfo=1"),
@@ -774,6 +867,8 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
         ("CARGO_INCREMENTAL", "1"),
         ("CARGO_HOME", "/motor-home/cargo"),
         ("CARGO_NET_OFFLINE", "true"),
+        ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+        ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
         ("CARGO_TARGET_DIR", "/run/motor/target"),
         ("RUSTC_WRAPPER", "sccache"),
         ("RUSTFLAGS", "-C debuginfo=1"),
@@ -784,12 +879,14 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
     ];
     // Boat and tenant VMs have no shared compile cache, so base strips both
     // the wrapper and every cache setting, and the Cargo environment that goes
-    // with them; a Rust job there keeps only the fixed output layout.
+    // with them; a Rust job there keeps the fixed output layout and debug defaults.
     const HOSTED_JOB: &[(&str, &str)] = &[
         (
             "CARGO_BUILD_BUILD_DIR",
             "/run/motor/target/bd/{workspace-path-hash}",
         ),
+        ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+        ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
         ("CARGO_TARGET_DIR", "/run/motor/target"),
         ("RUSTFLAGS", "-C debuginfo=1"),
     ];

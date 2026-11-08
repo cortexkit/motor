@@ -118,6 +118,34 @@ and jobs.
 Otherwise identical sources produce unrelated entries and every lookup misses.
 Test: `reader_and_writer_have_identical_hashed_cargo_inputs`.
 
+Linux fills and isolated Rust jobs also share
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
+`CARGO_PROFILE_TEST_DEBUG=line-tables-only`. Line-only debug info keeps file and
+line numbers in panics and backtraces, but omits debugger variable and type
+detail. A job wanting full debug info for a debugger or a tool that reads
+variables sets `CARGO_PROFILE_DEV_DEBUG=true` (or its repository's profile sets
+`debug`). macOS and Windows jobs are unchanged. Tests:
+`linux_debug_defaults_keep_line_tables`,
+`isolated_jobs_preserve_submitted_profile_debug`.
+
+The shared decision injects neither variable if either is already in the
+submitted environment, with any value, or if the checkout's root `Cargo.toml`,
+`.cargo/config.toml` or legacy `.cargo/config` sets `profile.dev.debug` or
+`profile.test.debug`. Package-level overrides still apply on top of the default
+and do not opt out. Unparsable files log a warning and count as unset. Tests:
+`either_submitted_debug_variable_suppresses_both_defaults`,
+`root_manifest_profile_debug_suppresses_both_defaults`,
+`cargo_config_toml_profile_debug_suppresses_both_defaults`,
+`legacy_cargo_config_profile_debug_suppresses_both_defaults`,
+`package_debug_overrides_do_not_suppress_profile_defaults`,
+`unparsable_cargo_files_keep_debug_defaults`.
+
+Fills read those same files at their checked-out tip; they do not inherit a
+job's submitted environment. With the same inputs, fills and readers must get
+byte-identical `CARGO_*` values or sccache loses every hit. Changing this default
+costs one rebuild of every warm workspace and one round of cache refills. Test:
+`isolated_fill_and_job_have_identical_hashed_cargo_inputs`.
+
 Incremental compilation: the writer builds local crates incrementally, and the
 wrapper strips `CARGO_INCREMENTAL` and `CARGO_BUILD_INCREMENTAL` before
 sccache sees them, because sccache refuses to cache when either is `1`. Test:
