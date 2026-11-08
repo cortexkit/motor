@@ -35,6 +35,9 @@ fn capture_runner_logs(work: impl FnOnce()) -> String {
     String::from_utf8(captured).unwrap()
 }
 
+#[cfg(target_os = "linux")]
+#[path = "tests/base_publication.rs"]
+mod base_publication;
 #[path = "tests/boat_disk.rs"]
 mod boat_disk;
 #[cfg(target_os = "linux")]

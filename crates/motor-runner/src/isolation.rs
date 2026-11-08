@@ -2188,6 +2188,56 @@ pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
     )
 }
 
+/// Only call after the stopped fill's entire generation passed the helper link
+/// check. Permission changes must never reach an inode linked outside it.
+pub(crate) fn reclaim_build_base(path: &Path) -> io::Result<()> {
+    // Read/search access suffices until chown. Keep every directory's ACL mask
+    // non-writable so remove-staging can also settle a crash during reclamation.
+    let acl = format!("u:{}:r-X,g::r-x,m::r-x", unsafe { libc::geteuid() });
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-m", &acl, "--"])
+            .arg(path),
+    )?;
+    let owner = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+        libc::getegid()
+    });
+    checked(
+        crate::privilege::command("/usr/bin/chown")
+            .args(["-R", "-P", &owner, "--"])
+            .arg(path),
+    )?;
+    crate::permissions::repair_tree(crate::permissions::Policy::OwnerWrite, &[path])?;
+    // Drop named and default ACLs, including entries hidden by the old mask.
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-R", "-P", "-b", "-k", "--"])
+            .arg(path),
+    )?;
+    checked(
+        crate::privilege::command("/usr/bin/chmod")
+            .args(["-R", "go-w", "--"])
+            .arg(path),
+    )
+}
+
+pub(crate) fn own_build_base_staging(path: &Path) -> io::Result<()> {
+    let account = validate_writer_account()?;
+    let owner = writer_cache_owner(account);
+    checked(
+        crate::privilege::command("/usr/bin/chown")
+            .args([&owner, "--"])
+            .arg(path),
+    )?;
+    // The runner must still traverse the generation to prepare target's bind.
+    let acl = format!("u:{}:r-x", unsafe { libc::geteuid() });
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-P", "-m", &acl, "--"])
+            .arg(path),
+    )
+}
+
 /// Give the runner account back read access to a caller checkout a job
 /// locked it out of, without changing any owner or the job's own permission
 /// bits. It walks the whole tree as the next setup's reclaim does, so a
@@ -3553,6 +3603,17 @@ impl Sandbox {
         prepare_job_checkout_root(workspace)?;
         if let Some(account) = writer_account {
             prepare_writer_trees(&[workspace, target, &host_home, &tmp], account)?;
+            if job_tree.fixed.is_some() {
+                // Publication's stat-only source check cannot repair metadata
+                // after the fill. Grant the runner read/search now, before the
+                // launch reference time; build output and private home stay private.
+                let acl = format!("u:{}:r-X", unsafe { libc::geteuid() });
+                checked(
+                    crate::privilege::command("/usr/bin/setfacl")
+                        .args(["-R", "-P", "-m", &acl, "--"])
+                        .arg(workspace),
+                )?;
+            }
             for name in &output_names {
                 writer_grants.push(output.join(name));
             }
@@ -3563,10 +3624,15 @@ impl Sandbox {
             )?;
         }
         Ok(Self {
-            // Caller job IDs can be reused in a different runner instance.
-            // The system-manager namespace is machine-wide, so never let a
-            // duplicate request select (or cancel) another instance's unit.
-            id: Uuid::now_v7(),
+            // Caller IDs can repeat across instances, so their units need fresh
+            // identities. Enabled fills already have runner-minted, single-launch
+            // IDs; keeping that identity lets recovery prove a staging fill stopped
+            // even if the daemon crashed before saving its process record.
+            id: if writer && job_tree.fixed.is_some() {
+                id
+            } else {
+                Uuid::now_v7()
+            },
             root,
             home,
             cargo,

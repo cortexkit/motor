@@ -202,6 +202,11 @@ pub(crate) struct Job {
     pub base: bool,
     #[serde(default)]
     pub writer_descriptor: Option<String>,
+    /// Available build-base inputs and the post-preparation reference time,
+    /// saved before opening the execution gate and reused after a restart.
+    #[cfg(target_os = "linux")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_launch: Option<crate::build_base::FillLaunch>,
     /// When this fill started, in runner-clock milliseconds. A publication
     /// record ages from here, and an operator reads it as the time the entries
     /// of that fill were written.
@@ -375,6 +380,8 @@ impl Job {
             order,
             base: false,
             writer_descriptor: None,
+            #[cfg(target_os = "linux")]
+            base_launch: None,
             #[cfg(unix)]
             fill_started_ms: None,
             #[cfg(unix)]

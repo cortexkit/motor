@@ -494,6 +494,7 @@ struct StagingWalk {
     directories: HashSet<(u64, u64)>,
     inodes: HashMap<(u64, u64), (u64, u64)>,
     track_links: bool,
+    removing: bool,
 }
 
 impl StagingWalk {
@@ -505,12 +506,15 @@ impl StagingWalk {
             directories: HashSet::new(),
             inodes: HashMap::new(),
             track_links: true,
+            removing: false,
         })
     }
 
     fn visit(&mut self, fd: &OwnedFd, depth: usize) -> io::Result<bool> {
         let metadata = fs::File::from(fd.try_clone()?).metadata()?;
-        if metadata.uid() != self.owners.writer {
+        if metadata.uid() != self.owners.writer
+            && !(self.removing && metadata.uid() == self.owners.runner)
+        {
             return Err(io::Error::other(
                 "staging inode must be owned by the fill writer",
             ));
@@ -550,6 +554,10 @@ impl StagingWalk {
 
 fn inspect_staging(root: OwnedFd, owners: StagingOwners, check_links: bool) -> io::Result<()> {
     let mut walk = StagingWalk::new(&root, owners)?;
+    // Publication may have crashed partway through chown. Removal can unlink
+    // the runner's own entries as well, but link inspection still requires every
+    // entry to belong to the fill writer.
+    walk.removing = !check_links;
     if !walk.visit(&root, 0)? {
         return Err(io::Error::other("staging root must be a directory"));
     }
@@ -609,6 +617,7 @@ fn remove_staging(
     // Preflight checked link counts. Unlinking legitimately decreases them,
     // so deletion rechecks ownership, mounts and directories, not link totals.
     walk.track_links = false;
+    walk.removing = true;
     walk.visit(&root, 0)?;
     let mut stack = vec![(
         Frame {

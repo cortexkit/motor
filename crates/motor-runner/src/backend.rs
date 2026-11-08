@@ -168,7 +168,7 @@ impl<'a> EnvironmentInputs<'a> {
 }
 
 impl Prepared {
-    fn environment_inputs(&self) -> EnvironmentInputs<'_> {
+    pub(crate) fn environment_inputs(&self) -> EnvironmentInputs<'_> {
         EnvironmentInputs {
             host_cwd: &self.host_cwd,
             target: &self.target,
@@ -842,9 +842,20 @@ impl Backend for HostBackend {
             return Err(invalid("mapped cwd does not resolve to its host path"));
         }
         let target = if s.base {
-            let target = config.writer_scratch_dir().join(s.id.to_string());
-            setup_step("create writer scratch", fs::create_dir_all(&target))?;
-            target
+            #[cfg(target_os = "linux")]
+            if let Some(target) = crate::build_base::prepare_target(config, r)? {
+                target
+            } else {
+                let target = config.writer_scratch_dir().join(s.id.to_string());
+                setup_step("create writer scratch", fs::create_dir_all(&target))?;
+                target
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let target = config.writer_scratch_dir().join(s.id.to_string());
+                setup_step("create writer scratch", fs::create_dir_all(&target))?;
+                target
+            }
         } else {
             path.join("target")
         };
