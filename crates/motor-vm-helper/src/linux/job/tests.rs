@@ -2,6 +2,7 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod exit_tests;
+mod network_tests;
 
 fn start() -> Start {
     Start {
@@ -24,6 +25,8 @@ fn record() -> Record {
         released: false,
         oom_kill: None,
         exit_acknowledged: false,
+        tap_index: None,
+        egress_bytes: None,
     }
 }
 
@@ -47,6 +50,7 @@ fn machine(base: &Path) -> LinuxJobs {
         records: BTreeMap::new(),
         children: BTreeMap::new(),
         next_prune: None,
+        network: Box::<network_tests::Fake>::default(),
         exit_fault: None,
         remove_test_group: Some(|path| std::fs::remove_dir_all(path)),
     }
@@ -91,8 +95,31 @@ impl Drop for Vmm {
 }
 
 #[test]
+fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
+    let image_builder = include_str!("../../../../../script/tenant-image/build.py");
+    let definition = image_builder
+        .split_once("BOOT_ARGS = (")
+        .unwrap()
+        .1
+        .split_once(")\n")
+        .unwrap()
+        .0;
+    let tenant_args: String = definition
+        .split('"')
+        .enumerate()
+        .filter_map(|(index, text)| (index % 2 == 1).then_some(text))
+        .collect();
+    assert!(!tenant_args.is_empty());
+    let requests = boot_requests(&start(), 17);
+    assert_eq!(
+        requests[1].1["boot_args"],
+        format!("{tenant_args} motor.per_job=1")
+    );
+}
+
+#[test]
 fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
-    let requests = boot_requests(&start());
+    let requests = boot_requests(&start(), 17);
     let paths: Vec<_> = requests.iter().map(|r| r.0).collect();
     assert_eq!(
         paths,
@@ -104,6 +131,7 @@ fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
             "/drives/workspace",
             "/vsock",
             "/balloon",
+            "/network-interfaces/eth0",
             "/actions"
         ]
     );
@@ -127,12 +155,20 @@ fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
         requests[6].1,
         json!({"amount_mib":0,"deflate_on_oom":true,"free_page_reporting":true,"stats_polling_interval_s":0})
     );
-    assert_eq!(requests[7].1, json!({"action_type":"InstanceStart"}));
+    assert_eq!(
+        requests[7].1,
+        json!({"iface_id":"eth0","host_dev_name":"mtap17","guest_mac":"02:fc:00:00:11:02"})
+    );
+    assert!(requests[1].1["boot_args"]
+        .as_str()
+        .unwrap()
+        .contains("net.ifnames=0"));
+    assert_eq!(requests[8].1, json!({"action_type":"InstanceStart"}));
     let mut different = start();
     different.vcpus = 2;
     different.memory_mib = 8192;
     assert_eq!(
-        boot_requests(&different)[0].1,
+        boot_requests(&different, 18)[0].1,
         json!({"vcpu_count":2,"mem_size_mib":8192,"smt":false})
     );
 }
@@ -194,7 +230,7 @@ fn helper_restart_re_adopts_a_live_vmm_without_killing_it() {
         .adopt_record(serde_json::from_slice(&durable).unwrap())
         .unwrap();
     assert!(matches!(restarted.status(&start().job_id).unwrap().reply,
-        Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None } if pid == vmm.child.id()));
+        Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == vmm.child.id()));
     assert!(vmm.child.try_wait().unwrap().is_none());
     assert_eq!(unsafe { libc::kill(child_pid as i32, 0) }, 0);
     unsafe {
@@ -335,7 +371,7 @@ fn wait_for_file(path: &Path) {
 /// Runs outside remote jobs as root: it creates a disposable systemd service
 /// with the shipped helper's kill/delegation settings and a separate test slice.
 /// The shared scratch root and its ancestors must be root-owned, non-writable
-/// by other users, and traversable by the VM uid in 600000..601000; do not use
+/// by other users, and traversable by the VM uid in 600000..600254; do not use
 /// a directory below /root. On a Linux build server with systemd 254+ as PID 1,
 /// a writable cgroup v2 hierarchy and a C compiler, run:
 ///
@@ -360,7 +396,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         jobs.groups = SLICE.into();
         jobs.settings = Some(JobVms {
             uid_base: 600000,
-            uid_count: 1000,
+            uid_count: 254,
             memory_max_bytes: 268435456,
         });
         if phase == "start" {
@@ -447,7 +483,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 .parse()
                 .unwrap();
             assert!(matches!(jobs.status(&start().job_id).unwrap().reply,
-                Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None } if pid == expected));
+                Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == expected));
             assert_eq!(read_oom_score(expected).unwrap(), JOB_OOM_SCORE);
         }
         return;
@@ -608,7 +644,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     restarted.remove_test_group = None;
     restarted.settings = Some(JobVms {
         uid_base: 600000,
-        uid_count: 1000,
+        uid_count: 254,
         memory_max_bytes: 268435456,
     });
     restarted.reconcile().unwrap();
@@ -616,6 +652,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     let report = ExitReport {
         job_id: start().job_id,
         oom_kill: 0,
+        egress_bytes: None,
     };
     assert!(
         matches!(restarted.handle(Operation::Exits, Peer { uid: 0, gid: 0 }).unwrap().reply,

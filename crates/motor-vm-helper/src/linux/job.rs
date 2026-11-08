@@ -25,6 +25,19 @@ use std::{
 const JOB_OOM_SCORE: i32 = 1000;
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+// Keep the tenant image's boot contract until published image manifests carry
+// the command line, adding only the flag that selects the one-job guest mode.
+const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1";
+
+mod network;
+use super::tenant_network::Tap;
+
+pub(super) fn network_allocations() -> Result<Vec<Tap>> {
+    let records = network::read_records(Path::new(job::RECORDS))?;
+    let taps: Vec<_> = records.iter().filter_map(Record::tap).collect();
+    super::tenant_network::validate_taps(&taps)?;
+    Ok(taps)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 // Rollbacks must be able to read records written by a newer helper.
@@ -37,11 +50,22 @@ struct Record {
     oom_kill: Option<u64>,
     #[serde(default)]
     exit_acknowledged: bool,
+    #[serde(default)]
+    tap_index: Option<u8>,
+    #[serde(default)]
+    egress_bytes: Option<u64>,
 }
 
 impl Record {
     fn is_tombstone(&self) -> bool {
-        self.released && self.exit_acknowledged
+        self.released && self.exit_acknowledged && self.tap_index.is_none()
+    }
+
+    fn tap(&self) -> Option<Tap> {
+        self.tap_index.map(|tap_index| Tap {
+            tap_index,
+            uid: self.uid,
+        })
     }
 
     fn pending_exit(&self) -> Option<ExitReport> {
@@ -50,6 +74,7 @@ impl Record {
             .map(|oom_kill| ExitReport {
                 job_id: self.start.job_id.clone(),
                 oom_kill,
+                egress_bytes: self.egress_bytes,
             })
     }
 }
@@ -70,6 +95,7 @@ pub struct LinuxJobs {
     records: BTreeMap<String, Record>,
     children: BTreeMap<String, Child>,
     next_prune: Option<SystemTime>,
+    network: Box<dyn network::Access>,
     #[cfg(test)]
     exit_fault: Option<ExitStep>,
     #[cfg(test)]
@@ -86,6 +112,7 @@ impl LinuxJobs {
             records: BTreeMap::new(),
             children: BTreeMap::new(),
             next_prune: None,
+            network: Box::new(network::System(config.clone())),
             #[cfg(test)]
             exit_fault: None,
             #[cfg(test)]
@@ -112,24 +139,15 @@ impl LinuxJobs {
     }
 
     pub fn reconcile(&mut self) -> Result<()> {
-        if !self.records_path.try_exists()? {
-            return Ok(());
+        self.reconcile_records(network::read_records(&self.records_path)?)
+    }
+
+    fn reconcile_records(&mut self, records: Vec<Record>) -> Result<()> {
+        let tenants = self.network.tenants()?;
+        if let Some(settings) = &self.settings {
+            network::check_capacity(settings.uid_count, tenants.len())?;
         }
-        fs::trusted(
-            &self.records_path,
-            &std::fs::symlink_metadata(&self.records_path)?,
-        )?;
-        for entry in std::fs::read_dir(&self.records_path)? {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let record: Record = serde_json::from_reader(fs::trusted_file(&path)?)
-                .map_err(|e| Error(format!("invalid job record: {e}")))?;
-            record.start.validate()?;
-            if path.file_stem().and_then(|p| p.to_str()) != Some(&record.start.job_id) {
-                return Err(Error("job record identity mismatch".into()));
-            }
+        for record in records {
             let settings = self
                 .settings
                 .as_ref()
@@ -139,6 +157,9 @@ impl LinuxJobs {
             }
             self.adopt_record(record)?;
         }
+        let mut taps = tenants;
+        taps.extend(self.records.values().filter_map(Record::tap));
+        super::tenant_network::validate_taps(&taps)?;
         self.maintain()
     }
 
@@ -151,6 +172,12 @@ impl LinuxJobs {
         }
         if record.exit_acknowledged && record.oom_kill.is_none() {
             return Err(Error("job acknowledgement has no exit evidence".into()));
+        }
+        if record
+            .tap_index
+            .is_some_and(|index| !(1..=254).contains(&index))
+        {
+            return Err(Error("job record TAP outside range 1..254".into()));
         }
         self.records.insert(record.start.job_id.clone(), record);
         Ok(())
@@ -265,7 +292,7 @@ impl LinuxJobs {
         let group = self.group(id);
         if !group.try_exists()? {
             // A reboot can erase cgroups. No count is better than an invented 0.
-            return Ok(());
+            return self.remove_network(id);
         }
         if !std::fs::read_to_string(group.join("cgroup.procs"))?
             .trim()
@@ -276,13 +303,33 @@ impl LinuxJobs {
         let mut record = self.records.get(id).unwrap().clone();
         if record.oom_kill.is_none() {
             record.oom_kill = Some(read_oom_kill(&group)?);
+            // No live VMM can add traffic after the empty-cgroup proof. Capture
+            // both counters in one durable write before destroying either one.
+            record.egress_bytes = record
+                .tap()
+                .map(|tap| self.network.egress_bytes(&tap))
+                .transpose()?;
             self.exit_checkpoint(ExitStep::Captured)?;
             self.save(&record)?;
             self.records.insert(id.into(), record);
             self.exit_checkpoint(ExitStep::Recorded)?;
         }
+        self.remove_network(id)?;
         self.remove_empty_group(&group)?;
         self.exit_checkpoint(ExitStep::Removed)
+    }
+
+    fn remove_network(&mut self, id: &str) -> Result<()> {
+        let mut record = self.records.get(id).unwrap().clone();
+        if let Some(tap) = record.tap() {
+            self.network.remove(&tap)?;
+            // A crash before this write retries idempotent removal, never the
+            // measurement. Until it succeeds the allocation cannot be reused.
+            record.tap_index = None;
+            self.save(&record)?;
+            self.records.insert(id.into(), record);
+        }
+        Ok(())
     }
 
     fn remove_empty_group(&self, group: &Path) -> Result<()> {
@@ -311,9 +358,9 @@ impl LinuxJobs {
             .get(&report.job_id)
             .cloned()
             .ok_or_else(|| Error("unknown job VM".into()))?;
-        if record.oom_kill != Some(report.oom_kill) {
+        if record.oom_kill != Some(report.oom_kill) || record.egress_bytes != report.egress_bytes {
             return Err(Error(
-                "job exit count does not match durable evidence".into(),
+                "job exit report does not match durable evidence".into(),
             ));
         }
         if !record.exit_acknowledged {
@@ -373,6 +420,7 @@ impl LinuxJobs {
         Ok(Response::new(Reply::Job {
             running: pid.is_some(),
             vmm_pid: pid,
+            tap_index: record.tap_index,
             exit_report: record.pending_exit(),
         }))
     }
@@ -488,6 +536,9 @@ impl LinuxJobs {
             }
         }
         let uid = self.allocate_uid(&settings)?;
+        let tenants = self.network.tenants()?;
+        network::check_capacity(settings.uid_count, tenants.len())?;
+        let tap_index = network::allocate(&tenants, &self.records)?;
         let host_score = host_oom_score(peer.uid)?;
         let helper_score = read_oom_score(std::process::id())?;
         check_oom_order(host_score, helper_score)?;
@@ -503,6 +554,8 @@ impl LinuxJobs {
             released: false,
             oom_kill: None,
             exit_acknowledged: false,
+            tap_index: Some(tap_index),
+            egress_bytes: None,
         };
         // The intent is durable before any jail or VMM can open the disk. A
         // crash in setup keeps it reserved until explicit stop has cleaned up.
@@ -513,6 +566,7 @@ impl LinuxJobs {
         let root = self.root(id);
         let group = self.group(id);
         let launch = (|| -> Result<()> {
+            self.prepare_network(tenants, Tap { tap_index, uid })?;
             cgroup::create_job(&group, start.vcpus)?;
             super::create_boundary(&boundary)?;
             std::fs::create_dir_all(&root)?;
@@ -557,7 +611,7 @@ impl LinuxJobs {
                 Duration::from_secs(10),
             )?);
             set_job_oom_score(pid, host_score, helper_score)?;
-            for (path, body) in boot_requests(&start) {
+            for (path, body) in boot_requests(&start, tap_index) {
                 tenant::api(&short_root, "PUT", path, &body)?;
             }
             Ok(())
@@ -569,6 +623,12 @@ impl LinuxJobs {
             return Err(error);
         }
         self.status(id)
+    }
+
+    fn prepare_network(&mut self, mut tenants: Vec<Tap>, tap: Tap) -> Result<()> {
+        tenants.extend(self.records.values().filter_map(Record::tap));
+        self.network.install(&tenants)?;
+        self.network.ensure(&tap)
     }
 
     fn stop(&mut self, id: &str) -> Result<()> {
@@ -712,7 +772,7 @@ fn set_job_oom_score(pid: u32, host_score: i32, helper_score: i32) -> Result<()>
 /// Cold-boot API with no snapshot load, userfaultfd, or hugepages. Only the root,
 /// toolchain and workspace images are attached; caller source bundles travel
 /// over the existing runner channel rather than on a fourth drive.
-fn boot_requests(start: &Start) -> Vec<(&'static str, Value)> {
+fn boot_requests(start: &Start, tap_index: u8) -> Vec<(&'static str, Value)> {
     vec![
         (
             "/machine-config",
@@ -720,7 +780,7 @@ fn boot_requests(start: &Start) -> Vec<(&'static str, Value)> {
         ),
         (
             "/boot-source",
-            json!({"kernel_image_path":"/kernel","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro"}),
+            json!({"kernel_image_path":"/kernel","boot_args":JOB_BOOT_ARGS}),
         ),
         (
             "/drives/root",
@@ -738,6 +798,10 @@ fn boot_requests(start: &Start) -> Vec<(&'static str, Value)> {
         (
             "/balloon",
             json!({"amount_mib":0,"deflate_on_oom":true,"free_page_reporting":true,"stats_polling_interval_s":0}),
+        ),
+        (
+            "/network-interfaces/eth0",
+            json!({"iface_id":"eth0","host_dev_name":format!("mtap{tap_index}"),"guest_mac":format!("02:fc:00:00:{tap_index:02x}:02")}),
         ),
         ("/actions", json!({"action_type":"InstanceStart"})),
     ]

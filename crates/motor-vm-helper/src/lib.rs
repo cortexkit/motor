@@ -63,6 +63,7 @@ pub enum Request {
     AckJobExit {
         job_id: String,
         oom_kill: u64,
+        egress_bytes: Option<u64>,
     },
     Acquire {
         instance: String,
@@ -202,6 +203,10 @@ pub enum Reply {
     Job {
         running: bool,
         vmm_pid: Option<u32>,
+        /// The helper's own allocation, used by the host for the guest address
+        /// and gateway, never a caller-selected TAP identity.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tap_index: Option<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_report: Option<job::ExitReport>,
     },
@@ -369,8 +374,16 @@ impl<M: Machine> Helper<M> {
                 self.job(job::Operation::Relay(job_id, port), peer)
             }
             Request::JobExits {} => self.job(job::Operation::Exits, peer),
-            Request::AckJobExit { job_id, oom_kill } => self.job(
-                job::Operation::AckExit(job::ExitReport { job_id, oom_kill }),
+            Request::AckJobExit {
+                job_id,
+                oom_kill,
+                egress_bytes,
+            } => self.job(
+                job::Operation::AckExit(job::ExitReport {
+                    job_id,
+                    oom_kill,
+                    egress_bytes,
+                }),
                 peer,
             ),
             Request::Acquire { instance, job_id } => {
