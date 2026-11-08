@@ -264,11 +264,13 @@ impl Motor {
         } else {
             let mut terminal = state.terminal.clone().unwrap_or_else(|| {
                 let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                    .with_ran(Ran::Unknown("maybe".into()));
+                    .with_ran(Ran::Unknown("maybe".into()))
+                    .with_refusal_detail("hosted stream disconnected before terminal");
                 terminal.wall_ms = state.elapsed_ms();
                 terminal
             });
-            let unknown = matches!(terminal.outcome, Outcome::OutcomeUnknown);
+            let unknown =
+                matches!(terminal.outcome, Outcome::OutcomeUnknown) && !state.has_real_terminal();
             if unknown && state.pending_finish.is_none() {
                 let deadline = state
                     .host_deadline_s()
@@ -316,8 +318,13 @@ impl Motor {
             // Settling the old booking must not consume that newer intent.
             if self.storage.job(id).is_some_and(|j| {
                 j.hosted_cancel_complete()
-                    || j.hosted_route()
-                        .is_some_and(|state| !state.run_sent && state.finish_done)
+                    || j.hosted_route().is_some_and(|state| {
+                        (!state.run_sent && state.finish_done)
+                            || state
+                                .host_deadline_s()
+                                .or(legacy_deadline)
+                                .is_some_and(|deadline| crate::hosted::now_s() >= deadline)
+                    })
             }) {
                 self.storage.cancel(id, false)?;
             }

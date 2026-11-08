@@ -55,30 +55,29 @@ impl Client {
         {
             return Ok(state.hosted_code.as_deref() == Some("hosted_sandbox_lost"));
         }
-        // Acknowledgment may arrive while another owner holds an older unknown
-        // terminal. Preserve the shared result under the finish lock, but allow
-        // a real known terminal to replace an acknowledgment-only fallback.
-        let terminal = terminal
-            .filter(|t| !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown))
-            .or(state.terminal.as_ref().filter(|t| {
-                state.cancel_settlement_ready()
-                    || !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)
-            }))
-            .or(terminal)
-            .or(state.terminal.as_ref());
+        // A terminal may arrive while another owner holds an older fallback.
+        // Keep the observed result, including a real unknown outcome, under the
+        // finish lock instead of replacing it with the caller's stale summary.
+        let terminal = state
+            .terminal
+            .as_ref()
+            .filter(|_| state.has_real_terminal())
+            .or(terminal
+                .filter(|t| !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown))
+                .or(state.terminal.as_ref().filter(|t| {
+                    state.cancel_settlement_ready()
+                        || !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                }))
+                .or(terminal)
+                .or(state.terminal.as_ref()));
         let mut body = None;
         storage.hosted_update(id, |state| {
             if !state.finish_done {
-                if state
-                    .terminal
-                    .as_ref()
-                    .is_none_or(|t| matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown))
-                    || state.awaiting_cancel_terminal()
-                {
+                if !state.has_real_terminal() {
                     state.terminal = terminal.cloned();
                 }
                 if state.pending_finish.is_none() {
-                    state.pending_finish = terminal.map(|terminal| {
+                    state.pending_finish = state.terminal.as_ref().map(|terminal| {
                         let mut finish =
                             Finish::from_terminal(terminal, state.max_runtime_s.unwrap_or(0));
                         if state.awaiting_cancel_terminal()

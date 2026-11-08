@@ -1036,12 +1036,10 @@ impl Storage {
             let Some(hosted) = job.hosted.as_mut() else {
                 return;
             };
-            if hosted
-                .terminal
-                .as_ref()
-                .is_none_or(|old| matches!(old.outcome, Outcome::OutcomeUnknown))
-            {
+            if !hosted.has_real_terminal() {
                 hosted.terminal = Some(terminal.clone());
+                hosted.observed_unknown_terminal =
+                    matches!(terminal.outcome, Outcome::OutcomeUnknown);
                 if !hosted.finish_done
                     && hosted.pending_finish.is_some()
                     && !matches!(terminal.outcome, Outcome::OutcomeUnknown)
@@ -1056,10 +1054,10 @@ impl Storage {
                 hosted.hosted_no_fallback = true;
                 hosted.hosted_code = Some("lease_mismatch".into());
             }
+            job.terminal_observed_at_ms.get_or_insert_with(now_ms);
             if job.hosted_cancel_complete() {
                 job.pending_cancel = false;
             }
-            job.terminal_observed_at_ms.get_or_insert_with(now_ms);
         })
     }
     pub fn local_terminal(&self, t: TerminalRecord) -> io::Result<()> {

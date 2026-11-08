@@ -1429,6 +1429,32 @@ async fn audit_11_silent_cancel_reply_has_a_bounded_delivery_lifetime() {
     motor.close().await;
 }
 
+#[tokio::test]
+async fn audit_04_finish_preserves_observed_unknown_over_a_stale_local_fallback() {
+    let h = Harness::new(Branch::Accepted).await;
+    let (_root, motor, caller) = owned_audit_job(&h).await;
+    let id = caller.job_id;
+    let mut actual = TerminalRecord::new(id, Outcome::OutcomeUnknown, 321, 0, 0)
+        .with_refusal_detail("runner supplied diagnostic");
+    actual.wall_ms = 321;
+    motor.storage.hosted_terminal(id, actual.clone()).unwrap();
+    let fallback = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+        .with_refusal_detail("hosted stream disconnected before terminal");
+    h.finish_failures.store(1, Ordering::SeqCst);
+    motor
+        .hosted_client(motor.hosted_state(id).unwrap())
+        .finish(id, Some(&fallback), &motor.storage)
+        .await
+        .unwrap();
+    assert_eq!(
+        motor.hosted_state(id).unwrap().terminal,
+        Some(actual),
+        "settlement replaced an actually observed unknown terminal with an older local fallback"
+    );
+    drop(caller);
+    motor.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_04_boat_drain_deadline_survives_failed_rewind_transports() {
     let h = Harness::new(Branch::Completed).await;

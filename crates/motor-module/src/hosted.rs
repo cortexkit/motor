@@ -49,6 +49,10 @@ pub struct HostedJobState {
     pub billed_vcpu_ms: Option<u64>,
     pub billing: BillingStatus,
     pub terminal: Option<TerminalRecord>,
+    /// Unknown summaries from older clients may already have an observation
+    /// timestamp. Only a terminal read in this process proves their provenance.
+    #[serde(skip)]
+    pub(crate) observed_unknown_terminal: bool,
     #[serde(default)]
     pub(crate) pending_finish: Option<placement::Finish>,
     #[serde(default)]
@@ -161,15 +165,13 @@ impl HostedJobState {
         !self.cancel_settlement_ready()
             && self.terminal.as_ref().is_some_and(|terminal| {
                 matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
-                    && terminal.refusal_detail.is_some()
+                    && !self.observed_unknown_terminal
             })
     }
     pub(crate) fn has_real_terminal(&self) -> bool {
-        // Unknown summaries carrying a detail may have been synthesized locally;
-        // settlement metadata cannot turn them into evidence from the runner.
         self.terminal.as_ref().is_some_and(|terminal| {
             !matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
-                || terminal.refusal_detail.is_none()
+                || self.observed_unknown_terminal
         })
     }
     pub(crate) fn booked_or_attempted(&self) -> bool {

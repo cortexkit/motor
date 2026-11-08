@@ -278,6 +278,93 @@ async fn attach_unknown_outcome_reports_unconfirmed_cancel_and_retries() {
 }
 
 #[tokio::test]
+async fn audit_13_restart_unknown_cancel_replay_stops_at_host_expiry() {
+    let attempts = Arc::new(tokio::sync::watch::channel(0usize).0);
+    let broker = crate::hosted::test_http::Http::with_async_reply({
+        let attempts = attempts.clone();
+        move |path, _| {
+            let attempts = attempts.clone();
+            async move {
+                if path.ends_with("/reattach") {
+                    attempts.send_modify(|count| *count += 1);
+                }
+                (
+                    404,
+                    serde_json::to_vec(&serde_json::json!({"error": "job_unknown"})).unwrap(),
+                )
+            }
+        }
+    })
+    .await;
+    let root = ScratchDir::new("unknown-cancel-restart-expiry");
+    let config = spill_config(&broker.url);
+    let motor =
+        Motor::with_connector(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 60, None, None, false).unwrap();
+    let mut route = crate::HostedJobState::new(&config);
+    route.run_sent = true;
+    route.retry_iat = Some(crate::hosted::now_s());
+    route.max_runtime_s = Some(60);
+    motor.storage.hosted_route(id, route).unwrap();
+    motor.storage.cancel(id, true).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.terminal = Some(TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0));
+            state.billing = crate::BillingStatus::Available;
+            state.finish_done = true;
+        })
+        .unwrap();
+    // Older summaries can carry this timestamp without any actual runner frame.
+    motor.storage.terminal_observed(id).unwrap();
+    motor.close().await;
+    let image: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+    assert_eq!(image["jobs"][id.to_string()]["pending_cancel"], true);
+    assert!(image["jobs"][id.to_string()]["hosted"]
+        .get("observed_unknown_terminal")
+        .is_none());
+    let motor =
+        Motor::with_connector(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
+    assert!(motor.pending(id));
+    assert!(!motor.hosted_state(id).unwrap().has_real_terminal());
+    motor.resume_finishes().await;
+    let mut stopped = motor.hosted_result_stopped_for_test(id);
+    let mut requests = attempts.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        requests.wait_for(|count| *count > 0),
+    )
+    .await
+    .expect("restart discarded an unconfirmed cancel without attempting delivery")
+    .unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| state.retry_iat = Some(0))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), stopped.wait_for(|done| *done))
+        .await
+        .expect("expired unknown cancellation recovery did not terminate")
+        .unwrap();
+    assert!(!motor.pending(id));
+    assert!(motor.storage.job(id).unwrap().hosted_complete());
+    assert!(!motor.storage.unsettled_hosted().contains(&id));
+    assert!(!motor.hosted_results.lock().unwrap().contains_key(&id));
+    let delivered = *attempts.borrow();
+    assert!(
+        (1..=2).contains(&delivered),
+        "cancel was retried beyond expiry: {delivered}"
+    );
+    motor.close().await;
+    let motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+    motor.resume_finishes().await;
+    assert!(!motor.hosted_results.lock().unwrap().contains_key(&id));
+    assert_eq!(*attempts.borrow(), delivered);
+    motor.close().await;
+}
+
+#[tokio::test]
 async fn unknown_outcome_defers_boat_finish_until_cancel_retry_is_acknowledged() {
     let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
     let scratch = ScratchDir::new("spill-unknown-cancel-retry-boat");

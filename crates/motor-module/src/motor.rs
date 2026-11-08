@@ -309,15 +309,18 @@ impl Motor {
         // Graceful shutdown is exercised separately through shutdown_hosted.
         self.hosted_cleanup.shutdown.send_replace(true);
         self.stop_hosted_results().await;
-        let storage = Arc::downgrade(&self.storage);
+        // Keep the last store reference here so its destructor and lease release
+        // finish synchronously before a test reopens the same directory.
+        let storage = self.storage.clone();
         drop(self);
         tokio::time::timeout(Duration::from_secs(30), async {
-            while storage.strong_count() > 0 {
+            while Arc::strong_count(&storage) > 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("the motor's tasks still hold its store after 30s");
+        drop(storage);
     }
     pub(crate) fn direct_authorized(&self, id: Uuid, secret: Option<&str>) -> bool {
         self.storage.direct_authorized(id, secret)
@@ -2240,7 +2243,8 @@ impl Motor {
             .ok_or_else(|| io::Error::other("missing hosted route"))?;
         let mut terminal = state.terminal.clone().unwrap_or_else(|| {
             let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                .with_ran(Ran::Unknown("maybe".into()));
+                .with_ran(Ran::Unknown("maybe".into()))
+                .with_refusal_detail("hosted stream disconnected before terminal");
             terminal.wall_ms = state.elapsed_ms();
             terminal
         });
@@ -2255,6 +2259,7 @@ impl Motor {
             self.storage.cancel(id, false)?;
         }
         if matches!(terminal.outcome, Outcome::OutcomeUnknown)
+            && !state.has_real_terminal()
             && state.run_sent
             && !state.cancel_settlement_ready()
             && !host_expired
@@ -2300,6 +2305,7 @@ impl Motor {
                 .finish(id, Some(&terminal), &self.storage)
                 .await?
             && matches!(terminal.outcome, Outcome::OutcomeUnknown)
+            && !state.has_real_terminal()
         {
             terminal = Self::sandbox_lost_terminal(id, &state);
         }
@@ -2396,7 +2402,7 @@ impl Motor {
         let terminal = state
             .terminal
             .clone()
-            .filter(|terminal| !matches!(terminal.outcome, Outcome::OutcomeUnknown))
+            .filter(|_| state.has_real_terminal())
             .unwrap_or_else(|| Self::sandbox_lost_terminal(id, &state));
         self.storage.hosted_update(id, |s| {
             s.hosted_code = Some("hosted_sandbox_lost".into());
@@ -2692,11 +2698,9 @@ impl Motor {
                     self.storage.hosted_update(id, |s| {
                         s.hosted_code = Some(error.code().into());
                         s.hosted_no_fallback = true;
-                        if s.terminal
-                            .as_ref()
-                            .is_none_or(|old| matches!(old.outcome, Outcome::OutcomeUnknown))
-                        {
+                        if !s.has_real_terminal() {
                             s.terminal = Some(terminal);
+                            s.observed_unknown_terminal = false;
                         }
                     })?;
                     return self.finish_hosted(id, true, tx).await.map(|_| false);
@@ -2949,7 +2953,13 @@ impl Motor {
                     }
                     self.storage.terminal_observed(id)?;
                     if hosted {
-                        self.storage.cancel(id, false)?;
+                        if self
+                            .storage
+                            .job(id)
+                            .is_some_and(|job| job.hosted_cancel_complete())
+                        {
+                            self.storage.cancel(id, false)?;
+                        }
                         self.storage.hosted_update(id, |state| {
                             if state
                                 .terminal

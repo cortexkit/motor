@@ -409,12 +409,12 @@ async fn audit_12_cancel_intent_cannot_be_installed_after_durable_completion() {
     for outcome in [Outcome::Exit { code: 41 }, Outcome::OutcomeUnknown] {
         let (_root, motor, id) = fixture();
         motor.storage.cancel(id, true).unwrap();
+        let mut terminal = real_terminal(id);
+        terminal.outcome = outcome;
+        motor.storage.hosted_terminal(id, terminal).unwrap();
         motor
             .storage
             .hosted_update(id, |state| {
-                let mut terminal = real_terminal(id);
-                terminal.outcome = outcome;
-                state.terminal = Some(terminal);
                 state.billing = crate::BillingStatus::Available;
                 state.finish_done = true;
             })
@@ -517,6 +517,48 @@ async fn audit_12_real_terminal_keeps_cancel_pending_until_settlement_is_recorde
         .unwrap();
     motor.storage.cancel(id, true).unwrap();
     assert!(!motor.pending(id));
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn audit_12_shutdown_fallback_cannot_turn_missing_terminal_into_cancel_completion() {
+    let (_root, motor, id) = fixture();
+    motor.storage.cancel(id, true).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| state.billing = crate::BillingStatus::Available)
+        .unwrap();
+    motor.hosted_cleanup.shutdown.send_replace(true);
+    let (tx, _records) = mpsc::channel(32);
+    motor.finish_hosted(id, false, &tx).await.unwrap();
+    assert!(motor.pending(id), "shutdown synthesized a detail-free unknown and consumed unconfirmed intent as if it came from the runner");
+    assert!(!motor.hosted_state(id).unwrap().has_real_terminal());
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn audit_12_actual_unknown_terminal_is_proof_independent_of_diagnostic_text() {
+    let (_root, motor, id) = fixture();
+    motor.storage.cancel(id, true).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| state.billing = crate::BillingStatus::Available)
+        .unwrap();
+    motor
+        .storage
+        .hosted_terminal(
+            id,
+            TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                .with_refusal_detail("runner supplied diagnostic"),
+        )
+        .unwrap();
+    assert!(motor
+        .storage
+        .job(id)
+        .unwrap()
+        .terminal_observed_at_ms
+        .is_some());
+    assert!(!motor.pending(id), "an actually observed terminal with settled usage must not be rejected because it has diagnostic text");
     motor.close().await;
 }
 
@@ -638,6 +680,105 @@ async fn audit_11_shared_cancel_watch_cannot_block_result_collection_forever() {
 }
 
 struct SilentStatus;
+
+struct TerminalBeforeUsage(tokio::sync::watch::Receiver<bool>);
+impl crate::Connector for TerminalBeforeUsage {
+    fn connect(
+        &self,
+        id: Uuid,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = io::Result<Box<dyn crate::transport::Duplex>>>
+                + Send
+                + '_,
+        >,
+    > {
+        let mut release = self.0.clone();
+        Box::pin(async move {
+            let (client, mut server) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let _ = motor_protocol::read_frame_async(&mut server).await;
+                motor_protocol::write_frame_async(
+                    &mut server,
+                    &Frame::Hello {
+                        protocol_version: motor_protocol::PROTOCOL_VERSION,
+                        started: true,
+                        gate_jobs: true,
+                        platforms: vec!["linux".into()],
+                        default_branch_tip: false,
+                        return_paths: false,
+                        return_chunked_max_bytes: None,
+                        return_chunked: false,
+                        sibling_paths: false,
+                    },
+                )
+                .await
+                .unwrap();
+                motor_protocol::write_frame_async(&mut server, &Frame::Terminal(real_terminal(id)))
+                    .await
+                    .unwrap();
+                // A subsequent frame makes the terminal handler's completion
+                // observable while the usage record remains withheld.
+                motor_protocol::write_frame_async(
+                    &mut server,
+                    &Frame::Output(motor_protocol::Output::new(
+                        1,
+                        motor_protocol::OutputStream::Stdout,
+                        motor_protocol::BytePayload(b"barrier".to_vec()),
+                    )),
+                )
+                .await
+                .unwrap();
+                release.wait_for(|ready| *ready).await.unwrap();
+                let _ = motor_protocol::write_frame_async(
+                    &mut server,
+                    &Frame::HostedTerminal(motor_protocol::HostedTerminal {
+                        job_id: id,
+                        placement: "first_party/first-party-audit".into(),
+                        billed_vcpu_ms: 1,
+                        max_runtime_s: 60,
+                    }),
+                )
+                .await;
+            });
+            Ok(Box::new(client) as Box<dyn crate::transport::Duplex>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn audit_12_streamed_terminal_waits_for_usage_before_consuming_cancel() {
+    let (_root, motor, id) = fixture();
+    motor.storage.cancel(id, true).unwrap();
+    let (release, ready) = tokio::sync::watch::channel(false);
+    let channel = Channel::open(&TerminalBeforeUsage(ready), id)
+        .await
+        .unwrap();
+    let (tx, mut records) = mpsc::channel(32);
+    let follower = {
+        let motor = motor.clone();
+        tokio::spawn(async move {
+            motor
+                .follow(id, 0, Some(channel), &tx, watch::channel(false).1)
+                .await
+        })
+    };
+    let record = tokio::time::timeout(Duration::from_secs(3), records.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(record, StreamRecord::Output(_)));
+    assert!(
+        motor.pending(id),
+        "the streamed terminal consumed cancel before the withheld usage record arrived"
+    );
+    release.send_replace(true);
+    follower.await.unwrap().unwrap();
+    assert!(!motor.pending(id));
+    motor.close().await;
+}
+
 impl crate::Connector for SilentStatus {
     fn connect(
         &self,
