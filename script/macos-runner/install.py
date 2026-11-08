@@ -252,7 +252,11 @@ def require_filevault_off():
 
 
 def as_motor(*args):
-    return ("/usr/bin/sudo", "-H", "-u", "motor", *args)
+    # macOS 27.2 refuses login-keychain operations that come from another
+    # login's security session ("The user name or passphrase you entered is not
+    # correct"), even with the right password, so run them in motor's session.
+    uid = pwd.getpwnam("motor").pw_uid
+    return ("/bin/launchctl", "asuser", str(uid), "/usr/bin/sudo", "-H", "-u", "motor", *args)
 
 
 def secret_run(*args):

@@ -275,8 +275,8 @@ class InstallerTests(unittest.TestCase):
             output.seek(0)
             install.installed_metrics_key()
             self.assertEqual(output.getvalue().strip(), 'a' * 64)
-            run.assert_called_once_with('/usr/bin/sudo', '-H', '-u', 'motor', str(self.config / 'motor-runner'),
-                                        'metrics-key', '--instance', 'macos', '--state-root', str(self.state))
+            run.assert_called_once_with(*install.as_motor(str(self.config / 'motor-runner'),
+                                        'metrics-key', '--instance', 'macos', '--state-root', str(self.state)))
             run.reset_mock()
             with patch.object(install.sys, 'platform', 'darwin'), patch.object(install.os, 'geteuid', return_value=0), \
                     patch.object(install.sys, 'argv', ['install.py', '--check', '--image', str(self.image),
@@ -808,14 +808,15 @@ class AutoLoginTests(unittest.TestCase):
             self.user = args[-1]
         elif args[:2] == ("/usr/bin/defaults", "delete"):
             self.user = None
-        elif args[:5] == install.as_motor("/usr/bin/security"):
-            if args[5:] == ("set-keychain-settings", self.keychain):
+        elif args[:len(install.as_motor("/usr/bin/security"))] == install.as_motor("/usr/bin/security"):
+            rest = args[len(install.as_motor("/usr/bin/security")):]
+            if rest == ("set-keychain-settings", self.keychain):
                 return ""
-            self.assertEqual(args[5:8], ("default-keychain", "-d", "user"))
-            if len(args) == 8:
+            self.assertEqual(rest[:3], ("default-keychain", "-d", "user"))
+            if len(rest) == 3:
                 return '"' + self.default_keychain + '"'
-            self.assertEqual(args[8], "-s")
-            self.default_keychain = str(args[9]) if len(args) == 10 else ""
+            self.assertEqual(rest[3], "-s")
+            self.default_keychain = str(rest[4]) if len(rest) == 5 else ""
         elif args[:2] == ("/usr/sbin/sshd", "-t"):
             pass
         elif args[:2] == ("/bin/launchctl", "print"):
@@ -828,11 +829,14 @@ class AutoLoginTests(unittest.TestCase):
     def native_command(self, args, **kwargs):
         if args[:4] == ["/usr/bin/dscl", ".", "-passwd", "/Users/motor"]:
             self.assertTrue(args[4])
-        elif args[:6] == list(install.as_motor("/usr/bin/security", "create-keychain")):
-            self.assertEqual(args[6], "-p")
+        elif args[:len(install.as_motor("/usr/bin/security", "create-keychain"))] == list(
+                install.as_motor("/usr/bin/security", "create-keychain")):
+            self.assertEqual(args[len(install.as_motor("/usr/bin/security", "create-keychain"))], "-p")
             Path(args[-1]).write_bytes(b"new keychain")
-        elif args[:6] == list(install.as_motor("/usr/bin/security", "unlock-keychain")):
-            self.assertEqual(args[6:], ["-p", self.password.read_text().strip(), str(self.keychain)])
+        elif args[:len(install.as_motor("/usr/bin/security", "unlock-keychain"))] == list(
+                install.as_motor("/usr/bin/security", "unlock-keychain")):
+            self.assertEqual(args[len(install.as_motor("/usr/bin/security", "unlock-keychain")):],
+                             ["-p", self.password.read_text().strip(), str(self.keychain)])
         elif args == [str(arg) for arg in install.as_motor("/usr/bin/security", "show-keychain-info", self.keychain)]:
             return subprocess.CompletedProcess(args, 0, "", "Keychain: no-timeout")
         elif args[:2] == ["/bin/launchctl", "bootout"]:
@@ -913,6 +917,12 @@ class AutoLoginTests(unittest.TestCase):
             self.assertEqual(install.keychain_errors(), [])
             self.assertEqual(self.native.call_args.args[0], [str(arg) for arg in install.as_motor(
                 "/usr/bin/security", "show-keychain-info", self.keychain)])
+
+    def test_motor_commands_run_in_motors_own_launchd_session(self):
+        # macOS 27.2 rejects the right password for motor's login keychain
+        # when the command comes from the installing operator's session.
+        self.assertEqual(install.as_motor("/usr/bin/security", "list-keychains")[:3],
+                         ("/bin/launchctl", "asuser", str(self.account.pw_uid)))
 
     def test_failed_unlock_does_not_expose_password_and_can_be_retried(self):
         def fail_unlock(args, **kwargs):
