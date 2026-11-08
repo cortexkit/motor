@@ -578,7 +578,7 @@ impl Motor {
                 .storage
                 .job(id)
                 .filter(|job| job.hosted_complete())
-                .and_then(|job| job.hosted?.terminal);
+                .and_then(|job| job.hosted_route()?.terminal);
             if let Some(terminal) = completed {
                 tokio::spawn(async move {
                     let _ = emit(&tx, StreamRecord::Terminal(terminal)).await;
@@ -1987,10 +1987,10 @@ impl Motor {
                 // may already have acknowledged cancellation and settled Boat.
                 if let Some(state) = self.hosted_state(id).filter(|s| {
                     s.cancel_settlement_ready()
-                        || s.finish_done
-                        || s.terminal
-                            .as_ref()
-                            .is_some_and(|t| !matches!(t.outcome, Outcome::OutcomeUnknown))
+                        || self
+                            .storage
+                            .job(id)
+                            .is_some_and(|job| job.hosted_cancel_complete())
                 }) {
                     if state.awaiting_cancel_terminal() && !state.finish_done {
                         self.storage.cancel_acknowledged(id)?;
@@ -2256,17 +2256,17 @@ impl Motor {
         }
         if matches!(terminal.outcome, Outcome::OutcomeUnknown)
             && state.run_sent
-            && state.billing != crate::BillingStatus::Available
             && !state.cancel_settlement_ready()
-            && !state.finish_done
             && !host_expired
             && !*self.hosted_cleanup.shutdown.borrow()
             && state.hosted_code.as_deref() != Some("hosted_sandbox_lost")
             && (self.pending(id)
-                || self
-                    .storage
-                    .job(id)
-                    .is_none_or(|job| job.terminal_observed_at_ms.is_none()))
+                || (state.billing != crate::BillingStatus::Available
+                    && !state.finish_done
+                    && self
+                        .storage
+                        .job(id)
+                        .is_none_or(|job| job.terminal_observed_at_ms.is_none())))
         {
             self.storage.cancel(id, true)?;
             if let Err(error) = self.send_cancel(id).await {
@@ -2285,13 +2285,7 @@ impl Motor {
         // this flow was attaching. Share its terminal without claiming a second
         // failed delivery after the booking has already been settled.
         if let Some(recorded) = self.hosted_state(id) {
-            if recorded.cancel_settlement_ready()
-                || recorded.finish_done
-                || recorded
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|t| !matches!(t.outcome, Outcome::OutcomeUnknown))
-            {
+            if recorded.cancel_settlement_ready() || recorded.has_real_terminal() {
                 if let Some(terminal_record) = recorded.terminal {
                     terminal = terminal_record;
                     cancel_unconfirmed = false;
@@ -2347,12 +2341,11 @@ impl Motor {
             }
         }
         if !cancel_unconfirmed
-            && self.hosted_state(id).is_some_and(|state| {
-                state.finish_done
-                    || state.billing == crate::BillingStatus::Available
-                    || state.cancel_settlement_ready()
-                    || host_expired
-            })
+            && (host_expired
+                || self
+                    .storage
+                    .job(id)
+                    .is_some_and(|job| job.hosted_cancel_complete()))
         {
             self.storage.cancel(id, false)?;
         }
@@ -2384,6 +2377,10 @@ impl Motor {
             )));
         }
         self.storage.hosted_terminal(id, terminal)?;
+        let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
+        if let Some(owner) = owner {
+            self.start_boat_terminal_drain(id, &owner);
+        }
         self.hosted_state(id)
             .and_then(|state| state.terminal)
             .ok_or_else(|| io::Error::other("missing hosted terminal"))
@@ -2464,15 +2461,11 @@ impl Motor {
         mut placement_queue: Option<&mut PlacementQueue>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
-        if self.hosted_state(id).is_some_and(|state| {
-            state.finish_done
-                || state.billing == crate::BillingStatus::Available
-                || state.cancel_settlement_ready()
-                || state
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|terminal| !matches!(terminal.outcome, Outcome::OutcomeUnknown))
-        }) {
+        if self
+            .storage
+            .job(id)
+            .is_some_and(|job| job.hosted_cancel_complete())
+        {
             self.storage.cancel(id, false)?;
         }
         let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
@@ -2550,6 +2543,9 @@ impl Motor {
             // needs nothing from this stream, which keeps reading so the
             // terminal arrives without a reconnect.
             if self.pending(id)
+                && self
+                    .hosted_state(id)
+                    .is_none_or(|state| !state.has_real_terminal())
                 && (hosted || !self.cancel_in_flight(id))
                 && tokio::time::Instant::now() >= cancel_retry_at
             {
@@ -2717,6 +2713,9 @@ impl Motor {
                     // A persisted cancellation may arrive while the connection
                     // opens. Send it first, unless `cancel` is delivering it.
                     if self.pending(id)
+                        && self
+                            .hosted_state(id)
+                            .is_none_or(|state| !state.has_real_terminal())
                         && (hosted || !self.cancel_in_flight(id))
                         && tokio::time::Instant::now() >= cancel_retry_at
                     {
@@ -3314,7 +3313,7 @@ impl Motor {
                 .storage
                 .job(id)
                 .filter(|job| job.hosted_complete())
-                .and_then(|job| job.hosted?.terminal)
+                .and_then(|job| job.hosted_route()?.terminal)
             {
                 return Ok(JobStatusReply {
                     job_id: id,

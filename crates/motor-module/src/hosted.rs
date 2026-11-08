@@ -164,6 +164,14 @@ impl HostedJobState {
                     && terminal.refusal_detail.is_some()
             })
     }
+    pub(crate) fn has_real_terminal(&self) -> bool {
+        // Unknown summaries carrying a detail may have been synthesized locally;
+        // settlement metadata cannot turn them into evidence from the runner.
+        self.terminal.as_ref().is_some_and(|terminal| {
+            !matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                || terminal.refusal_detail.is_none()
+        })
+    }
     pub(crate) fn booked_or_attempted(&self) -> bool {
         self.lease_attempted
             || self.placement.is_some()

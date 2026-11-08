@@ -106,6 +106,49 @@ async fn audit_04_sandbox_loss_preserves_real_terminal() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn audit_04_first_durable_boat_terminal_starts_drain_before_transport_progress() {
+    let (_root, motor, id) = fixture();
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.placement.as_mut().unwrap().host = "boat:audit".into()
+        })
+        .unwrap();
+    let owner = motor.reserve_hosted_result(id, u64::MAX);
+    owner.state.lock().unwrap().subscribers.insert(7, 9);
+    motor
+        .persist_hosted_terminal(id, real_terminal(id))
+        .unwrap();
+    let (deadline, cohort) = owner
+        .state
+        .lock()
+        .unwrap()
+        .boat_drain
+        .clone()
+        .expect("durable probe terminal did not start the end-to-end drain bound");
+    assert!(deadline <= tokio::time::Instant::now() + Duration::from_secs(60));
+    assert_eq!(cohort, vec![7]);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    motor
+        .persist_hosted_terminal(id, real_terminal(id))
+        .unwrap();
+    assert_eq!(
+        owner.state.lock().unwrap().boat_drain.as_ref().unwrap().0,
+        deadline,
+        "a replayed terminal extended the original drain bound"
+    );
+    motor.hosted_results.lock().unwrap().remove(&id);
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.finish_done = true;
+            state.billing = crate::BillingStatus::Unavailable;
+        })
+        .unwrap();
+    motor.close().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn audit_05_max_cursor_drain_honors_pending_subscriber_rewind() {
     for rewind in [None, Some(9)] {
         let owner = Owner::new(u64::MAX);
@@ -249,11 +292,42 @@ async fn audit_03_queued_old_transport_records_cannot_advance_rewind_cursor() {
 }
 
 #[tokio::test]
+async fn audit_03_ready_replay_batch_cannot_evict_before_subscriber_is_scheduled() {
+    let (_root, motor, id) = fixture();
+    let owner = motor.reserve_hosted_result(id, 0);
+    let (mut caller, caller_tx, _) = motor.stream(id);
+    motor.subscribe_hosted_result(id, owner.clone(), 0, false, caller_tx);
+    let (source, records) = mpsc::channel(32);
+    for seq in 0..32 {
+        emit_follow_record(Some(&owner), &source, output(seq, 32 * 1024))
+            .await
+            .unwrap();
+    }
+    let producer = tokio::spawn(std::future::pending::<()>());
+    motor.collect_hosted_result(id, owner, source, records, producer);
+    let record = tokio::time::timeout(Duration::from_secs(1), caller.records.recv())
+        .await
+        .expect(
+            "a ready transport batch evicted the requested record before scheduling its subscriber",
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(record, StreamRecord::Output(output) if output.seq == 0));
+    drop(caller);
+    motor.close().await;
+}
+
+#[tokio::test]
 async fn audit_14b_probe_terminals_clear_retry_and_pending_cancel() {
     let h = Harness::new(Behavior::StatusTerminalRetry).await;
     let root = cortexkit_test_support::ScratchDir::new("audit-probe-normalize");
     let (motor, id) = detached(&h, &root).await;
     motor.storage.cancel(id, true).unwrap();
+    // Usage arrived first; the probed execution terminal completes the pair.
+    motor
+        .storage
+        .hosted_update(id, |state| state.billing = crate::BillingStatus::Available)
+        .unwrap();
     let owner = motor.reserve_hosted_result(id, u64::MAX);
     let reply = motor
         .probe_hosted_result(id, crate::hosted::now_s() * 1000, &owner)
@@ -349,6 +423,101 @@ async fn audit_12_cancel_intent_cannot_be_installed_after_durable_completion() {
         assert!(!motor.pending(id), "completion must fence a late cancel intent and consume an older one in the same store update");
         motor.close().await;
     }
+}
+
+#[tokio::test]
+async fn audit_12_unfinished_cancel_intent_survives_export_and_reopen() {
+    let (root, motor, id) = fixture();
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.terminal.is_none());
+    assert_eq!(state.billing, crate::BillingStatus::Pending);
+    assert!(state.run_sent);
+    assert!(!state.finish_done);
+    assert!(state.reattach_deadline_s().unwrap() > crate::hosted::now_s());
+    motor.storage.cancel(id, true).unwrap();
+    assert!(motor.pending(id));
+    motor.close().await;
+    let exported: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+    assert_eq!(exported["jobs"][id.to_string()]["pending_cancel"], true);
+    let reopened = crate::storage::Storage::open(&root).unwrap();
+    assert!(reopened.job(id).unwrap().pending_cancel);
+    assert!(reopened.job(id).unwrap().hosted.unwrap().terminal.is_none());
+    reopened.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn audit_12_hosted_terminal_before_runner_terminal_keeps_cancel_pending() {
+    let (_root, motor, id) = fixture();
+    motor.storage.cancel(id, true).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| state.billing = crate::BillingStatus::Available)
+        .unwrap();
+    motor.reserve_hosted_result(id, 0);
+    let (tx, _records) = mpsc::channel(32);
+    let (_wake, wake) = watch::channel(false);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(50),
+        motor.follow_inner(id, 0, None, &tx, wake, None),
+    )
+    .await;
+    assert!(
+        motor.pending(id),
+        "HostedTerminal metadata consumed cancel before a real runner terminal was stored"
+    );
+    motor.hosted_results.lock().unwrap().remove(&id);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn audit_12_unknown_metadata_completion_does_not_end_unconfirmed_cancel_recovery() {
+    let (_root, motor, id) = fixture();
+    motor.storage.cancel(id, true).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.terminal = Some(
+                TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                    .with_refusal_detail("hosted_cancel_unconfirmed: no real terminal received"),
+            );
+            state.finish_done = true;
+            state.billing = crate::BillingStatus::Available;
+        })
+        .unwrap();
+    let owner = motor.reserve_hosted_result(id, u64::MAX);
+    let (tx, _records) = mpsc::channel(32);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(50),
+        motor.recover_recorded_unknown(id, &owner, &tx),
+    )
+    .await;
+    assert!(
+        motor.pending(id),
+        "metadata ended recovery without confirming cancel or storing a real terminal"
+    );
+    motor.hosted_results.lock().unwrap().remove(&id);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn audit_12_real_terminal_keeps_cancel_pending_until_settlement_is_recorded() {
+    let (_root, motor, id) = fixture();
+    motor.storage.cancel(id, true).unwrap();
+    motor
+        .persist_hosted_terminal(id, real_terminal(id))
+        .unwrap();
+    assert!(
+        motor.pending(id),
+        "a real terminal consumed cancel before billing or finish was settled"
+    );
+    motor
+        .storage
+        .hosted_update(id, |state| state.billing = crate::BillingStatus::Available)
+        .unwrap();
+    motor.storage.cancel(id, true).unwrap();
+    assert!(!motor.pending(id));
+    motor.close().await;
 }
 
 #[tokio::test]

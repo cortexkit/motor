@@ -84,9 +84,10 @@ impl Motor {
         let Some(job) = self.storage.job(id) else {
             return;
         };
-        if job.hosted_complete() {
+        if job.hosted_booking_complete() {
             return;
         }
+        let active_route = job.hosted_route().is_some();
         let Some(state) = job.hosted else {
             return;
         };
@@ -100,7 +101,7 @@ impl Motor {
         {
             return;
         }
-        if state.run_sent && !*self.hosted_cleanup.shutdown.borrow() {
+        if active_route && state.run_sent && !*self.hosted_cleanup.shutdown.borrow() {
             if self.hosted_results.lock().unwrap().contains_key(&id) {
                 return;
             }
@@ -120,7 +121,8 @@ impl Motor {
                 return;
             }
         }
-        if state.run_sent
+        if active_route
+            && state.run_sent
             && state.pending_finish.is_none()
             && state
                 .placement
@@ -219,9 +221,10 @@ impl Motor {
         let Some(job) = self.storage.job(id) else {
             return Ok(true);
         };
-        if job.hosted_complete() {
+        if job.hosted_booking_complete() {
             return Ok(true);
         }
+        let active_route = job.hosted_route().is_some();
         let Some(state) = job.hosted else {
             return Ok(true);
         };
@@ -229,10 +232,8 @@ impl Motor {
             .placement
             .as_ref()
             .is_some_and(|p| p.host.starts_with("boat:"));
-        if state.settlement_done()
-            && (state.finish_done || state.billing == crate::BillingStatus::Available)
-        {
-            if job.build_server_job_id.is_none() {
+        if state.settlement_done() && (!state.run_sent || state.has_real_terminal()) {
+            if active_route {
                 self.storage.cancel(id, false)?;
             }
             return Ok(true);
@@ -284,14 +285,18 @@ impl Motor {
                 if !expired && state.terminal.is_none() && (stopping || !job.pending_cancel) {
                     return Ok(stopping);
                 }
-                if !stopping && !expired && !state.awaiting_cancel_terminal() {
+                if !stopping
+                    && !expired
+                    && !state.awaiting_cancel_terminal()
+                    && self.hosted_state(id).is_some()
+                {
                     self.storage.cancel(id, true)?;
                     if let Err(error) = self.send_cancel(id).await {
                         self.log_hosted_failure(id, "settlement_cancel", error);
                         return Ok(false);
                     }
                 }
-                if state.awaiting_cancel_terminal() {
+                if state.awaiting_cancel_terminal() && self.hosted_state(id).is_some() {
                     self.storage.cancel_acknowledged(id)?;
                 }
                 if let Some(recorded) = self.storage.job(id).and_then(|j| j.hosted?.terminal) {
@@ -310,17 +315,17 @@ impl Motor {
             // An archived spill may now be cancelling its build-server ID.
             // Settling the old booking must not consume that newer intent.
             if self.storage.job(id).is_some_and(|j| {
-                j.build_server_job_id.is_none()
-                    && j.hosted.as_ref().is_some_and(|state| {
-                        state.finish_done || state.billing == crate::BillingStatus::Available
-                    })
+                j.hosted_cancel_complete()
+                    || j.hosted_route()
+                        .is_some_and(|state| !state.run_sent && state.finish_done)
             }) {
                 self.storage.cancel(id, false)?;
             }
         }
-        let done = self.storage.job(id).is_none_or(|job| {
-            job.hosted_complete() || (job.build_server_job_id.is_some() && settled)
-        });
+        let done = self
+            .storage
+            .job(id)
+            .is_none_or(|job| job.hosted_booking_complete());
         Ok(done)
     }
 

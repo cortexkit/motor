@@ -184,6 +184,32 @@ impl Drop for Subscriber {
 }
 
 impl Motor {
+    pub(super) fn start_boat_terminal_drain(&self, id: Uuid, owner: &Owner) {
+        let Some(job) = self.storage.job(id) else {
+            return;
+        };
+        if !job.hosted_route().is_some_and(|state| {
+            state.terminal.is_some()
+                && !state.awaiting_cancel_terminal()
+                && state
+                    .placement
+                    .as_ref()
+                    .is_some_and(|placement| placement.host.starts_with("boat:"))
+        }) {
+            return;
+        }
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let age_ms = job
+            .terminal_observed_at_ms
+            .map_or(0, |observed| now_ms.saturating_sub(observed));
+        owner.begin_boat_drain(Duration::from_millis(60_000_u64.saturating_sub(age_ms)));
+    }
     #[cfg(test)]
     pub(crate) fn hosted_result_stopped_for_test(&self, id: Uuid) -> watch::Receiver<bool> {
         self.hosted_results
@@ -271,7 +297,7 @@ impl Motor {
                     .storage
                     .job(id)
                     .filter(|job| job.hosted_complete())
-                    .and_then(|job| job.hosted?.terminal)
+                    .and_then(|job| job.hosted_route()?.terminal)
                 {
                     tokio::spawn(async move {
                         let _ = tx.send(Ok(StreamRecord::Terminal(terminal))).await;
@@ -479,10 +505,19 @@ impl Motor {
                         });
                         running = true;
                     },
-                    record = records.recv() => if let Some(record) = record { owner.publish(record); },
+                    record = records.recv() => if let Some(record) = record {
+                        owner.publish(record);
+                        // A ready transport batch can exceed the replay ring.
+                        // Let subscribers run before eviction, without waiting
+                        // for their delivery queues.
+                        tokio::task::yield_now().await;
+                    },
                     result = &mut producer, if running => {
                         if let Err(error) = result { owner.publish(Err(io::Error::other(error))); }
-                        while let Ok(record) = records.try_recv() { owner.publish(record); }
+                        while let Ok(record) = records.try_recv() {
+                            owner.publish(record);
+                            tokio::task::yield_now().await;
+                        }
                         {
                             let mut state = owner.state.lock().unwrap();
                             state.finished = true;
@@ -595,7 +630,7 @@ impl Motor {
             let Some(state) = self.hosted_state(id) else {
                 return Ok(true);
             };
-            if !self.pending(id) || state.finish_done {
+            if !self.pending(id) {
                 return Ok(!state.booked_or_attempted()
                     || state.finish_done
                     || state.billing != crate::BillingStatus::Pending);
@@ -629,6 +664,7 @@ impl Motor {
             }
         });
         let owner = Owner::new(cursor);
+        self.start_boat_terminal_drain(id, &owner);
         if *self.hosted_cleanup.shutdown.borrow() {
             {
                 let mut state = owner.state.lock().unwrap();
@@ -782,6 +818,15 @@ fn empty_status(id: Uuid) -> JobStatusReply {
 }
 
 impl Owner {
+    pub(super) fn begin_boat_drain(&self, remaining: Duration) {
+        let mut state = self.state.lock().unwrap();
+        if state.boat_drain.is_none() {
+            let subscribers = state.subscribers.keys().copied().collect();
+            state.boat_drain = Some((tokio::time::Instant::now() + remaining, subscribers));
+        }
+        drop(state);
+        self.changed.send_replace(());
+    }
     pub(super) fn finish_boat_replay(&self) {
         let mut state = self.state.lock().unwrap();
         state.boat_drain_expired = true;
@@ -850,20 +895,12 @@ impl Owner {
     /// callers attached at terminal time a bounded chance to drain or rewind.
     pub(super) async fn wait_boat_subscribers(&self, cursor: u64) -> bool {
         let mut changed = self.changed.subscribe();
+        self.begin_boat_drain(Duration::from_secs(60));
         let (deadline, cohort) = {
             let mut state = self.state.lock().unwrap();
             state.boat_cursor = state.boat_cursor.max(cursor);
             state.replaying = false;
-            let subscribers: Vec<_> = state.subscribers.keys().copied().collect();
-            state
-                .boat_drain
-                .get_or_insert_with(|| {
-                    (
-                        tokio::time::Instant::now() + Duration::from_secs(60),
-                        subscribers,
-                    )
-                })
-                .clone()
+            state.boat_drain.clone().unwrap()
         };
         self.changed.send_replace(());
         loop {

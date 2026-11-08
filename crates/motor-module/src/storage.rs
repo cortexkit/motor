@@ -178,11 +178,21 @@ impl PartialEq for Job {
 }
 impl Job {
     pub(crate) fn hosted_complete(&self) -> bool {
-        !self.pending_cancel
-            && self
-                .hosted
-                .as_ref()
-                .is_some_and(|state| state.settlement_done())
+        self.hosted_route().is_some() && self.hosted_booking_complete()
+    }
+    pub(crate) fn hosted_cancel_complete(&self) -> bool {
+        self.hosted_route().is_some_and(|state| {
+            state.has_real_terminal()
+                && (state.finish_done || state.billing != crate::BillingStatus::Pending)
+        })
+    }
+    /// A job resubmitted to the build server retains its old hosted booking for
+    /// cleanup. Pending cancellation belongs to the replacement command, not
+    /// that booking.
+    pub(crate) fn hosted_booking_complete(&self) -> bool {
+        self.hosted.as_ref().is_none_or(|state| {
+            state.settlement_done() && (self.hosted_route().is_none() || !self.pending_cancel)
+        })
     }
     pub(crate) fn health_retired(&self) -> bool {
         self.local_terminal.as_ref().is_some_and(|terminal| {
@@ -462,7 +472,7 @@ impl Storage {
             .filter_map(|(id, job)| {
                 job.hosted
                     .as_ref()
-                    .filter(|s| s.booked_or_attempted() && !job.hosted_complete())
+                    .filter(|s| s.booked_or_attempted() && !job.hosted_booking_complete())
                     .map(|_| *id)
             })
             .collect()
@@ -1003,17 +1013,7 @@ impl Storage {
     pub fn cancel(&self, id: Uuid, pending: bool) -> io::Result<()> {
         self.update(|s| {
             let job = s.jobs.entry(id).or_default();
-            let completed = job.hosted_complete()
-                || job.hosted.as_ref().is_some_and(|state| {
-                    state.finish_done
-                        || state.billing == crate::BillingStatus::Available
-                        || state.cancel_settlement_ready()
-                })
-                || job
-                    .hosted
-                    .as_ref()
-                    .and_then(|state| state.terminal.as_ref())
-                    .is_some_and(|terminal| !matches!(terminal.outcome, Outcome::OutcomeUnknown));
+            let completed = job.hosted_cancel_complete();
             job.pending_cancel = pending && !completed;
             if job.pending_cancel {
                 job.retain_until_ms = Some(
@@ -1030,6 +1030,9 @@ impl Storage {
             let Some(job) = state.jobs.get_mut(&id) else {
                 return;
             };
+            if job.hosted_route().is_none() {
+                return;
+            }
             let Some(hosted) = job.hosted.as_mut() else {
                 return;
             };
@@ -1053,7 +1056,9 @@ impl Storage {
                 hosted.hosted_no_fallback = true;
                 hosted.hosted_code = Some("lease_mismatch".into());
             }
-            job.pending_cancel = false;
+            if job.hosted_cancel_complete() {
+                job.pending_cancel = false;
+            }
             job.terminal_observed_at_ms.get_or_insert_with(now_ms);
         })
     }
