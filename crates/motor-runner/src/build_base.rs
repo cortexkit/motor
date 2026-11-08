@@ -107,22 +107,6 @@ pub(crate) fn prepare_target(
     Ok(Some(target))
 }
 
-pub(crate) fn remove_staging(
-    state: &Path,
-    repository: &str,
-    id: motor_protocol::Uuid,
-) -> io::Result<()> {
-    crate::permissions::staging_operation("remove-staging", state, &workspace::name(repository), id)
-}
-
-pub(crate) fn remove_staging_key(
-    state: &Path,
-    key: &str,
-    id: motor_protocol::Uuid,
-) -> io::Result<()> {
-    crate::permissions::staging_operation("remove-staging", state, key, id)
-}
-
 fn cstring(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)
@@ -377,6 +361,44 @@ pub(crate) fn publish(
     job: &crate::storage::Job,
     success: bool,
 ) -> io::Result<()> {
+    publish_after_link_check(state, trees, checkout, job, success, |repository| {
+        crate::permissions::staging_operation(
+            "check-staging-links",
+            state,
+            &workspace::name(repository),
+            job.id,
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn publish_with_authority(
+    state: &Path,
+    trees: &workspace::Trees,
+    checkout: &Path,
+    job: &crate::storage::Job,
+    success: bool,
+    authority: &crate::source_seal::authority::Authority,
+) -> io::Result<()> {
+    publish_after_link_check(state, trees, checkout, job, success, |repository| {
+        crate::permissions::staging_authorized(
+            authority,
+            "check-staging-links",
+            state,
+            &workspace::name(repository),
+            job.id,
+        )
+    })
+}
+
+fn publish_after_link_check(
+    state: &Path,
+    trees: &workspace::Trees,
+    checkout: &Path,
+    job: &crate::storage::Job,
+    success: bool,
+    check_links: impl FnOnce(&str) -> io::Result<()>,
+) -> io::Result<()> {
     let launch = publication_eligible(job, success)?;
     let request = job
         .request
@@ -384,12 +406,7 @@ pub(crate) fn publish(
         .ok_or_else(|| io::Error::other("fill request missing"))?;
     let generation = staging(state, &request.repository_root, job.id);
     // No metadata repair, including an ACL restore, may precede this check.
-    crate::permissions::staging_operation(
-        "check-staging-links",
-        state,
-        &workspace::name(&request.repository_root),
-        job.id,
-    )?;
+    check_links(&request.repository_root)?;
     verify_unchanged(trees, request, checkout, launch.reference)?;
     crate::isolation::reclaim_build_base(&generation)?;
     let root = crate::permissions::physical_root(&generation)?;

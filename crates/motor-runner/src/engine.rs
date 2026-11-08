@@ -1701,6 +1701,12 @@ struct Core {
     rustc_version: String,
     #[cfg(target_os = "linux")]
     base_toolchain: crate::build_base::RunnerToolchain,
+    #[cfg(target_os = "linux")]
+    base_removal_logged: Mutex<BTreeSet<Uuid>>,
+    #[cfg(all(test, target_os = "linux"))]
+    /// Privileged integration tests authorize only their own scratch instance.
+    /// Production Core has no policy override and loads the installed authority.
+    fixture_base_authority: Option<Arc<crate::source_seal::authority::Authority>>,
     /// Build server compiler versions a declared fill's descriptor extends. They
     /// are read once, at startup, so one runner's descriptors do not move under
     /// a host whose tools change.
@@ -2107,7 +2113,31 @@ impl Runner {
         let backend = backend::select(&config)?;
         Self::open_with_backend(config, backend)
     }
-    fn open_with_backend(mut config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
+    fn open_with_backend(config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
+        Self::open_body(
+            config,
+            backend,
+            #[cfg(all(test, target_os = "linux"))]
+            None,
+        )
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn open_with_fixture_authority(
+        config: Config,
+        authority: crate::source_seal::authority::Authority,
+    ) -> io::Result<Self> {
+        let backend = backend::select(&config)?;
+        Self::open_body(config, backend, Some(Arc::new(authority)))
+    }
+
+    fn open_body(
+        mut config: Config,
+        backend: Box<dyn Backend>,
+        #[cfg(all(test, target_os = "linux"))] fixture_base_authority: Option<
+            Arc<crate::source_seal::authority::Authority>,
+        >,
+    ) -> io::Result<Self> {
         config.check_options()?;
         paths::owner::check(&config)?;
         #[cfg(target_os = "linux")]
@@ -2894,6 +2924,10 @@ impl Runner {
                 rustc_version,
                 #[cfg(target_os = "linux")]
                 base_toolchain: crate::build_base::RunnerToolchain::probe(),
+                #[cfg(target_os = "linux")]
+                base_removal_logged: Mutex::new(BTreeSet::new()),
+                #[cfg(all(test, target_os = "linux"))]
+                fixture_base_authority,
                 compilers: Compilers::probe(&["cc", "c++", "ccache"]),
                 cpus,
             }),
@@ -10704,7 +10738,13 @@ impl Runner {
                 let Err(error) = &cleanup.scratch else {
                     break;
                 };
-                tracing::warn!(job_id = %id, %error, "warm build scratch cleanup will be retried");
+                #[cfg(target_os = "linux")]
+                let already_logged = self.core.base_removal_logged.lock().unwrap().contains(&id);
+                #[cfg(not(target_os = "linux"))]
+                let already_logged = false;
+                if !already_logged {
+                    tracing::warn!(job_id = %id, %error, "warm build scratch cleanup will be retried");
+                }
                 std::thread::park_timeout(delay);
                 delay = (delay * 2).min(Duration::from_secs(5));
                 self.long_work("base_scratch_retry");
@@ -10842,6 +10882,17 @@ impl Runner {
             if !self.base_unit_stopped(id)? {
                 return Err(io::Error::other("fill unit not proven stopped"));
             }
+            #[cfg(test)]
+            if let Some(authority) = &self.core.fixture_base_authority {
+                return crate::build_base::publish_with_authority(
+                    &self.core.trees.state,
+                    &self.core.trees,
+                    &paths::job_workspace(&self.core.config, &job),
+                    &job,
+                    success,
+                    authority,
+                );
+            }
             crate::build_base::publish(
                 &self.core.trees.state,
                 &self.core.trees,
@@ -10864,6 +10915,26 @@ impl Runner {
 
     #[cfg(target_os = "linux")]
     fn remove_build_base_staging(&self, id: Uuid) -> io::Result<()> {
+        let result = self.try_remove_build_base_staging(id);
+        if let Err(reason) = &result {
+            if self.core.base_removal_logged.lock().unwrap().insert(id) {
+                tracing::warn!(job_id = %id, %reason, "build base staging removal failed");
+                if let Err(error) = self.output(
+                    id,
+                    OutputStream::Stderr,
+                    format!("runner: build base staging removal failed: {reason}\n").as_bytes(),
+                ) {
+                    tracing::warn!(job_id = %id, %error, "build base removal error could not be persisted to fill output");
+                }
+            }
+        } else {
+            self.core.base_removal_logged.lock().unwrap().remove(&id);
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_remove_build_base_staging(&self, id: Uuid) -> io::Result<()> {
         let job = self.core.inner.lock().unwrap().jobs[&id].clone();
         let Some(request) = job.request else {
             return Ok(());
@@ -10876,11 +10947,7 @@ impl Runner {
                     "cannot remove staging: fill unit not proven stopped",
                 ));
             }
-            crate::build_base::remove_staging(
-                &self.core.trees.state,
-                &request.repository_root,
-                id,
-            )?;
+            self.remove_base_generation(&workspace::name(&request.repository_root), id)?;
         }
         Ok(())
     }
@@ -10926,9 +10993,7 @@ impl Runner {
                         }
                     };
                     if terminal_or_unknown && stopped {
-                        if let Err(reason) =
-                            crate::build_base::remove_staging_key(&self.core.trees.state, &key, id)
-                        {
+                        if let Err(reason) = self.remove_base_generation(&key, id) {
                             tracing::warn!(job_id = %id, %reason, "build base startup removal deferred");
                         }
                     }
@@ -10936,6 +11001,21 @@ impl Runner {
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_base_generation(&self, key: &str, id: Uuid) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(authority) = &self.core.fixture_base_authority {
+            return crate::permissions::staging_authorized(
+                authority,
+                "remove-staging",
+                &self.core.trees.state,
+                key,
+                id,
+            );
+        }
+        crate::permissions::staging_operation("remove-staging", &self.core.trees.state, key, id)
     }
 
     /// Record a settled warm build in memory, from `clean_base`'s results:

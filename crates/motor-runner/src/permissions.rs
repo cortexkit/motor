@@ -410,8 +410,33 @@ pub(crate) fn staging_operation(
     fill: motor_protocol::Uuid,
 ) -> io::Result<()> {
     validate_staging_form(action, state, repository)?;
-    crate::source_seal::authority::Authority::load()?.roots(state)?;
-    let owners = StagingOwners::current()?;
+    let authority = crate::source_seal::authority::Authority::load()?;
+    staging_authorized(&authority, action, state, repository, fill)
+}
+
+/// Use an already trusted policy, still enforcing its state allowlist on every
+/// operation. Production callers obtain that policy only from Authority::load.
+pub(crate) fn staging_authorized(
+    authority: &crate::source_seal::authority::Authority,
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+) -> io::Result<()> {
+    staging_authorized_as(authority, action, state, repository, fill, None)
+}
+
+fn staging_authorized_as(
+    authority: &crate::source_seal::authority::Authority,
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+    runner: Option<u32>,
+) -> io::Result<()> {
+    validate_staging_form(action, state, repository)?;
+    authority.roots(state)?;
+    let owners = runner.map_or_else(StagingOwners::current, StagingOwners::for_runner)?;
     staging_execute(action, state, repository, fill, owners)
 }
 
@@ -454,9 +479,8 @@ pub(crate) fn staging_helper(action: &str, args: &[String]) -> io::Result<()> {
     fs::write("/proc/self/oom_score_adj", "900")?;
     // Only this explicit sudo-helper entry point delegates ownership. A root
     // daemon's in-process path must not interpret inherited SUDO_UID as identity.
-    crate::source_seal::authority::Authority::load()?.roots(state)?;
-    let owners = StagingOwners::for_runner(runner)?;
-    staging_execute(action, state, repository, fill, owners)
+    let authority = crate::source_seal::authority::Authority::load()?;
+    staging_authorized_as(&authority, action, state, repository, fill, Some(runner))
 }
 
 fn directory_entries(fd: &OwnedFd) -> io::Result<fs::ReadDir> {

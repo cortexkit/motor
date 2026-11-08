@@ -400,6 +400,8 @@ fn isolated_access_repair_rescues_a_directory_a_job_made_unreadable() {
 }
 
 fn base_store_config(f: &Fixture, command: &str) -> Config {
+    // Worker threads need a process-wide subscriber, just like the real daemon.
+    let _ = motor_protocol::logging::init("[base-store-test]");
     let mut config = f.config();
     config.isolate_jobs = true;
     config.disable_warm_builds = false;
@@ -416,6 +418,11 @@ fn base_store_config(f: &Fixture, command: &str) -> Config {
     );
     require_reflink_scratch(&config.state_dir());
     config
+}
+
+fn base_store_runner(config: Config) -> Runner {
+    let authority = crate::source_seal::authority::Authority::for_fixture(&config);
+    Runner::open_with_fixture_authority(config, authority).unwrap()
 }
 
 async fn drive_base_store(runner: &Runner, condition: impl Fn() -> bool) {
@@ -466,7 +473,7 @@ async fn isolated_base_fill_publishes_nested_uplift_links_and_replaces_current()
     let f = Fixture::new();
     let command = "mkdir -p \"$CARGO_TARGET_DIR/bd/nested/deeper\"; printf first > \"$CARGO_TARGET_DIR/bd/nested/deeper/artifact\"; ln \"$CARGO_TARGET_DIR/bd/nested/deeper/artifact\" \"$CARGO_TARGET_DIR/uplift\"";
     let config = base_store_config(&f, command);
-    let runner = Runner::open(config.clone()).unwrap();
+    let runner = base_store_runner(config.clone());
     let fill = settle_base_store(&f, &runner).await;
     assert_eq!(
         fill.terminal.as_ref().unwrap().outcome,
@@ -541,7 +548,7 @@ async fn isolated_base_fill_publishes_nested_uplift_links_and_replaces_current()
         "mkdir -p \"$CARGO_TARGET_DIR/bd\"; printf second > \"$CARGO_TARGET_DIR/bd/artifact\""
             .into(),
     ];
-    let runner = Runner::open(replacement).unwrap();
+    let runner = base_store_runner(replacement);
     let second = settle_base_store(&f, &runner).await;
     assert_eq!(
         second.terminal.as_ref().unwrap().outcome,
@@ -593,7 +600,7 @@ async fn isolated_base_fill_external_home_hardlink_preserves_outside_metadata() 
         }
     }
     let release_on_unwind = Release(release.clone());
-    let runner = Runner::open(config.clone()).unwrap();
+    let runner = base_store_runner(config.clone());
     let (run, bytes) = f.run("true");
     f.submit(&runner, &run, &bytes);
     drive_base_store(&runner, || {
@@ -691,7 +698,7 @@ fn isolated_base_startup_removes_only_retired_and_proven_stopped_staging() {
     let f = Fixture::new();
     let mut config = base_store_config(&f, "true");
     config.disable_warm_builds = true;
-    let runner = Runner::open(config.clone()).unwrap();
+    let runner = base_store_runner(config.clone());
     let (mut request, _) = f.run("true");
     request.siblings.clear();
     let mut terminal_job = Job::new(request.job_id, Some(request.clone()), 123, 1, 2);
@@ -732,7 +739,7 @@ fn isolated_base_startup_removes_only_retired_and_proven_stopped_staging() {
             stderr: Vec::new(),
         })
     }));
-    let _runner = Runner::open(config).unwrap();
+    let _runner = base_store_runner(config);
     assert!(!retired.exists());
     assert!(!generations[0].exists());
     assert!(!generations[1].exists());
@@ -775,7 +782,7 @@ async fn isolated_base_recovered_fill_publishes_recorded_inputs() {
             })
         })
     });
-    let runner = Runner::open(config.clone()).unwrap();
+    let runner = base_store_runner(config.clone());
     let (run, bytes) = f.run("true");
     f.submit(&runner, &run, &bytes);
     let mut request = run;
@@ -831,7 +838,7 @@ async fn isolated_base_recovered_fill_publishes_recorded_inputs() {
     }
     atomic_json(&runner.record_path(job.id), &job).unwrap();
     drop(runner);
-    let runner = Runner::open(config.clone()).unwrap();
+    let runner = base_store_runner(config.clone());
     assert!(generation.exists());
     assert_eq!(
         runner.core.inner.lock().unwrap().jobs[&job.id].base_launch,
@@ -864,7 +871,7 @@ async fn isolated_base_fill_masking_runner_source_acl_is_refused() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let f = Fixture::new();
     let config = base_store_config(&f, "chmod 0700 .; mkdir -p \"$CARGO_TARGET_DIR/bd\"; printf built > \"$CARGO_TARGET_DIR/bd/artifact\"");
-    let runner = Runner::open(config.clone()).unwrap();
+    let runner = base_store_runner(config.clone());
     let fill = settle_base_store(&f, &runner).await;
     assert_eq!(
         fill.terminal.as_ref().unwrap().outcome,
@@ -880,7 +887,7 @@ async fn isolated_base_fill_masking_runner_source_acl_is_refused() {
 async fn isolated_base_retry_uses_a_fresh_single_launch_fill_unit_identity() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let f = Fixture::new();
-    let runner = Runner::open(base_store_config(&f, "exit 1")).unwrap();
+    let runner = base_store_runner(base_store_config(&f, "exit 1"));
     let first = settle_base_store(&f, &runner).await;
     assert_eq!(
         first.terminal.as_ref().unwrap().outcome,
@@ -922,4 +929,95 @@ async fn isolated_base_retry_uses_a_fresh_single_launch_fill_unit_identity() {
     for job in jobs {
         assert_eq!(job.process.unwrap().unit, Some(job.id));
     }
+}
+
+#[test]
+#[ignore = "requires root and provisioned motor-cache/motor-job accounts"]
+fn isolated_base_unlisted_state_refuses_publication_and_removal_with_one_reason_log() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let f = Fixture::new();
+    let mut config = base_store_config(&f, "true");
+    config.disable_warm_builds = true;
+    config.systemd_command = Some(Arc::new(|args| {
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: if args.iter().any(|arg| arg.contains("Version")) {
+                b"257\n".to_vec()
+            } else if args[0] == "show" {
+                b"ActiveState=inactive\n".to_vec()
+            } else {
+                Vec::new()
+            },
+            stderr: Vec::new(),
+        })
+    }));
+    let mut allowed = config.clone();
+    allowed.instance = "other-authorized-instance".into();
+    fs::create_dir_all(allowed.state_dir()).unwrap();
+    let authority = crate::source_seal::authority::Authority::for_fixture(&allowed);
+    let runner = Runner::open_with_fixture_authority(config.clone(), authority).unwrap();
+    let (mut request, _) = f.run("true");
+    request.workspace_key = format!("base:{}", f.root);
+    request.cwd = f.main.display().to_string();
+    request.siblings.clear();
+    let id = request.job_id;
+    crate::build_base::prepare_target(&config, &request)
+        .unwrap()
+        .unwrap();
+    let generation = crate::build_base::staging(&config.state_dir(), &f.root, id);
+    let current = generation.parent().unwrap().join("current");
+    fs::create_dir(&current).unwrap();
+    fs::write(current.join("base.json"), b"previous base").unwrap();
+    let mut job = Job::new(id, Some(request), 123, 1, 2);
+    job.base = true;
+    job.started_ms = Some(124);
+    job.base_launch = Some(crate::build_base::FillLaunch {
+        inputs: crate::build_base::CompatibleInputs {
+            toolchain: crate::build_base::ToolchainIdentity {
+                rustc_verbose: "fixture".into(),
+                rust_toolchain: None,
+                rust_toolchain_toml: None,
+                wrapper: None,
+            },
+            environment: "fixture".into(),
+        },
+        fixed_path: "/w/fixture/repository".into(),
+        reference: crate::build_base::Timestamp::reference().unwrap(),
+    });
+    runner.save(&job).unwrap();
+    runner.core.inner.lock().unwrap().jobs.insert(id, job);
+    let logs = capture_runner_logs(|| {
+        runner.publish_build_base(id, true);
+        for _ in 0..2 {
+            let error = runner.remove_build_base_staging(id).unwrap_err();
+            assert!(error.to_string().contains("has no state root"), "{error}");
+        }
+    });
+    assert!(logs.contains("has no state root"), "{logs}");
+    assert_eq!(
+        logs.matches("build base publication refused").count(),
+        1,
+        "{logs}"
+    );
+    assert_eq!(
+        logs.matches("build base staging removal failed").count(),
+        1,
+        "{logs}"
+    );
+    assert_eq!(
+        fs::read(current.join("base.json")).unwrap(),
+        b"previous base"
+    );
+    assert!(generation.exists());
+    let authority = crate::source_seal::authority::Authority::for_fixture(&config);
+    crate::permissions::staging_authorized(
+        &authority,
+        "remove-staging",
+        &config.state_dir(),
+        &workspace::name(&f.root),
+        id,
+    )
+    .unwrap();
+    assert!(!generation.exists());
 }
