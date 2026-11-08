@@ -11,6 +11,38 @@ VIRTIO_MMIO_CMDLINE_DEVICES=y
 VIRTIO_BLK=y
 VIRTIO_NET=y
 VIRTIO_CONSOLE=y
+# Balloon reclaim and free-page reporting must work without loadable modules.
+VIRTIO_BALLOON=y
+BALLOON_COMPACTION=y
+PAGE_REPORTING=y
+COMPACTION=y
+# virtio-pmem needs the complete memory-hotplug and DAX stack built in so ext4
+# toolchain images can be mounted with DAX before the workspace is accessed.
+MEMORY_HOTPLUG=y
+MEMORY_HOTREMOVE=y
+MIGRATION=y
+MEMORY_ISOLATION=y
+SPARSEMEM=y
+SPARSEMEM_VMEMMAP=y
+SPARSEMEM_VMEMMAP_ENABLE=y
+ARCH_ENABLE_MEMORY_HOTPLUG=y
+ARCH_ENABLE_MEMORY_HOTREMOVE=y
+ZONE_DEVICE=y
+LIBNVDIMM=y
+BLK_DEV_PMEM=y
+VIRTIO_PMEM=y
+DAX=y
+FS_DAX=y
+BLOCK=y
+BLK_DEV=y
+64BIT=y
+MMU=y
+PHYS_ADDR_T_64BIT=y
+HAS_IOMEM=y
+MEMREGION=y
+XARRAY_MULTI=y
+HAVE_BOOTMEM_INFO_NODE=y
+FS_IOMAP=y
 VSOCKETS=y
 VIRTIO_VSOCKETS=y
 # Selected by VIRTIO_VSOCKETS; verify its common transport stays built in too.
