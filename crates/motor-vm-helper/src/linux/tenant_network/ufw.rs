@@ -264,7 +264,7 @@ fn arguments(n: u8, delete: bool, uplink: &str) -> Vec<String> {
     values
 }
 
-pub(super) fn reconcile(registries: &[Registry], prior: &State, uplink: &str) -> Result<State> {
+pub(super) fn reconcile(registries: &[Tap], prior: &State, uplink: &str) -> Result<State> {
     let desired: BTreeSet<_> = registries.iter().map(|r| r.tap_index).collect();
     for (n, delete) in prior
         .owned

@@ -58,6 +58,7 @@ fn expected(count: u64) -> ExitReport {
     ExitReport {
         job_id: start().job_id,
         oom_kill: count,
+        egress_bytes: None,
     }
 }
 
@@ -326,7 +327,8 @@ fn concurrent_job_exits_keep_their_own_counts() {
             expected(11),
             ExitReport {
                 job_id: second.start.job_id.clone(),
-                oom_kill: 0
+                oom_kill: 0,
+                egress_bytes: None,
             }
         ]
     );
@@ -335,7 +337,8 @@ fn concurrent_job_exits_keep_their_own_counts() {
         reports(&mut jobs),
         [ExitReport {
             job_id: second.start.job_id,
-            oom_kill: 0
+            oom_kill: 0,
+            egress_bytes: None,
         }]
     );
     std::fs::remove_dir_all(base).unwrap();

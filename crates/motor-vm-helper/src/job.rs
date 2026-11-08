@@ -68,7 +68,8 @@ pub struct Workspace {
 }
 
 /// Immutable evidence for one job VMM exit. The helper proves the cgroup empty
-/// and syncs this count before removing the cgroup or releasing the disk. Polls
+/// and syncs its final OOM and egress counters before removing their cgroup and
+/// TAP evidence or releasing the disk. Polls
 /// replay it until the host acknowledges durable receipt. Released, acknowledged
 /// tombstones reject start_job replays for 48 hours after their last record
 /// update. This outlasts the longest job plus the remaining validity of its lease
@@ -79,6 +80,9 @@ pub struct Workspace {
 pub struct ExitReport {
     pub job_id: String,
     pub oom_kill: u64,
+    /// Final public-forward bytes for this VM only; absent when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_bytes: Option<u64>,
 }
 
 pub enum Operation {

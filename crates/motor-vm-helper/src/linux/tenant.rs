@@ -382,7 +382,7 @@ impl Backend for LinuxTenants {
             .trim()
             .parse::<u64>()
             .map_err(|_| Error("invalid tenant memory sample".into()))?;
-        Ok((memory, tenant_network::egress_bytes(registry)?))
+        Ok((memory, tenant_network::egress_bytes(&registry.into())?))
     }
     fn registry(&mut self, tenant: &str) -> Result<Registry> {
         crate::tenant::validate_name(tenant)?;
@@ -809,7 +809,7 @@ impl Backend for LinuxTenants {
         let registries = self.registries()?;
         // Install the deny rules before bringing a tap up, not after it can send.
         tenant_network::install(&registries, &self.config)?;
-        tenant_network::ensure(r, uid)
+        tenant_network::ensure(&r.into(), uid)
     }
     fn relay(&mut self, tenant: &str, port: u32) -> Result<OwnedFd> {
         crate::tenant::validate_port(port)?;

@@ -379,8 +379,10 @@ impl Machine for LinuxMachine {
             }
         }
         self.cgroups.enable()?;
-        self.tenants.0.reconcile()?;
-        self.jobs.reconcile()
+        // Job evidence and leftover TAPs must be reconciled before the tenant
+        // policy renderer can discard any no-longer-allocated counter.
+        self.jobs.reconcile()?;
+        self.tenants.0.reconcile()
     }
     fn start(&mut self, slot: usize, lease: &Lease, kind: Kind) -> Result<Vec<OwnedFd>> {
         let base = self.base.try_clone()?;

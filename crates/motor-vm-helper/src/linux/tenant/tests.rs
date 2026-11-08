@@ -110,7 +110,8 @@ fn network_admission_fences_live_taps_when_registry_is_unreadable() {
             |_| Err(Error("registry decode failed".into())),
             |records| {
                 assert!(records.is_empty());
-                tenant_network::fence_policy(records, Some(&existing), None, |text| {
+                let taps: Vec<_> = records.iter().map(tenant_network::Tap::from).collect();
+                tenant_network::fence_policy(&taps, Some(&existing), None, |text| {
                     writes.push(text.to_owned());
                     Ok(())
                 })
