@@ -46,7 +46,7 @@ impl PressurePass {
 #[derive(Clone, Copy, Default)]
 pub(super) struct BuildFolderSize {
     workspace_bytes: u64,
-    target_bytes: u64,
+    pub(super) target_bytes: u64,
     incremental_bytes: u64,
     measured_ms: u64,
     // Workspace estimates can be partial even when target-only cleanup is safe.
@@ -2151,6 +2151,55 @@ impl Runner {
                     c.skipped_recent += skipped_recent.len() as u64;
                 });
                 return Ok(None);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if free < soft {
+            // Bases share the job filesystem, but are not workspace build
+            // folders. Sacrifice their warmth only after all three old passes.
+            let candidates = crate::build_base::eviction_candidates(&self.core.trees.state)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "cannot enumerate build bases for disk eviction");
+                    Vec::new()
+                });
+            for candidate in candidates {
+                if free >= soft {
+                    break;
+                }
+                let deleted = (|| -> io::Result<Option<u64>> {
+                    let Some(retired) = crate::build_base::claim_eviction(&candidate)? else {
+                        return Ok(None);
+                    };
+                    let bytes = allocated_bytes(&retired, device)?;
+                    crate::build_base::remove_retired(&retired)?;
+                    Ok(Some(bytes))
+                })();
+                let before = free;
+                free = probe()?;
+                match deleted {
+                    Ok(Some(bytes)) => {
+                        let path = candidate.store.join("current");
+                        report.record(bytes);
+                        let eviction = DiskEviction {
+                            path: path.to_string_lossy().into_owned(),
+                            bytes,
+                            last_used_ms: candidate.last_used_ms,
+                            evicted_ms: self.now(),
+                        };
+                        self.core.health.lock().unwrap().record(self.now(), |c| {
+                            c.evictions += 1;
+                            c.eviction_bytes += bytes;
+                        });
+                        self.core.inner.lock().unwrap().last_eviction = Some(eviction);
+                        tracing::info!(repository = %candidate.store.display(), generation = "current",
+                            last_used_ms = candidate.last_used_ms, bytes_freed = free.saturating_sub(before),
+                            allocated_bytes = bytes, pass = 4, "runner build base eviction");
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(repository = %candidate.store.display(), %error, "runner build base eviction failed");
+                    }
+                }
             }
         }
         #[cfg(target_os = "linux")]

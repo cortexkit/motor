@@ -219,7 +219,16 @@ fn publication_is_exclusive_no_follow_and_atomically_replaces_the_generation() {
         fs::read(current.join("target/bd/artifact")).unwrap(),
         b"second"
     );
-    assert_eq!(fs::read_dir(&store).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(&store)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["current", "usage.json"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect()
+    );
     for symlink_record in [false, true] {
         let next = build_base::staging(&scratch, "/repo", Uuid::now_v7());
         fs::create_dir_all(&next).unwrap();
