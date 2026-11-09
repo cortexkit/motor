@@ -50,7 +50,8 @@ struct Dropped {
 #[derive(Clone, Deserialize, Serialize)]
 struct RefusedTail {
     // Rejected payloads still advance ingestion. Keep their sequence interval
-    // and failed paths so a higher watermark cannot hide unexplained data loss.
+    // and failed paths so advancing the index's `last_seq` cannot hide
+    // unexplained data loss.
     first_seq: u64,
     last_seq: u64,
     paths: std::collections::BTreeSet<u64>,
