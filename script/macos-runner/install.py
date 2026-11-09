@@ -477,6 +477,23 @@ def data_volume_setting(requested, installed):
     return recorded if installed is not None else requested
 
 
+def signing_team_setting(requested, installed):
+    recorded = installed.get("signing_team") if installed is not None else None
+    if installed is not None and requested is not None and requested != recorded:
+        raise ValueError("signing team cannot change on update; uninstall first, then install with --signing-team")
+    return recorded if installed is not None else requested
+
+
+def team_identifier(binary):
+    run("/usr/bin/codesign", "--verify", "--strict", binary)
+    result = subprocess.run(["/usr/bin/codesign", "-dv", str(binary)], capture_output=True, text=True, check=True)
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.startswith("TeamIdentifier="):
+            team = line.split("=", 1)[1].strip()
+            return None if team == "not set" else team
+    return None
+
+
 def operator_setting(requested, installed):
     recorded = installed.get("operator_account", "rentamac") if installed is not None else None
     if recorded and requested is not None and requested != recorded:
@@ -663,6 +680,7 @@ def install(args, manifest):
     previous = installation_record()
     args.data_volume = data_volume_setting(args.data_volume, previous)
     args.operator_account = operator_setting(args.operator_account, previous)
+    args.signing_team = signing_team_setting(args.signing_team, previous)
     current_metrics = [None, None]
     if PLIST.exists():
         current_metrics = metrics_settings(plistlib.loads(PLIST.read_bytes()).get("ProgramArguments", []))
@@ -698,8 +716,19 @@ def install(args, manifest):
         if source.resolve() != destination.resolve():
             shutil.copyfile(source, destination)
         destination.chmod(0o755)
-    # Re-sign the actual installed VM creator on updates as well as first install.
-    run("/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", HERE / "virtualization.entitlements", CONFIG / "motor-macvm")
+    if args.signing_team:
+        # macOS ties privacy approvals, such as access to the external data
+        # volume, to the program's signature. Binaries signed by one team keep
+        # that approval across updates; an ad-hoc signature changes on every
+        # build and asks again at the screen. So keep the team signature and
+        # refuse binaries that lack it rather than re-signing them ad hoc.
+        for name in ("motor-runner", "motor-macvm"):
+            team = team_identifier(CONFIG / name)
+            if team != args.signing_team:
+                raise ValueError(name + " must be signed by team " + args.signing_team + ", not " + str(team))
+    else:
+        # Re-sign the actual installed VM creator on updates as well as first install.
+        run("/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", HERE / "virtualization.entitlements", CONFIG / "motor-macvm")
     if not entitlement(CONFIG / "motor-macvm"):
         raise ValueError("signed helper lacks virtualization entitlement")
     tools = args.state_root / "tools"
@@ -731,6 +760,8 @@ def install(args, manifest):
                  "authorized_keys_sha256": parity.digest(SSH_ROOT / "authorized_keys"),
                  "operator_account": args.operator_account, "data_volume": args.data_volume,
                  "automount_managed": bool(args.data_volume)}
+    if args.signing_team:
+        installed["signing_team"] = args.signing_team
     for directory in (HOME / "Library", PLIST.parent):
         directory.mkdir(parents=True, exist_ok=True)
         os.chown(directory, account.pw_uid, account.pw_gid)
@@ -762,6 +793,8 @@ def main():
                         help="pin state and image to this ownership-enabled, fixed-media APFS volume (updates/check use the recorded UUID)")
     parser.add_argument("--operator-account", metavar="NAME",
                         help="invoking operator account; required for first install, recorded for updates")
+    parser.add_argument("--signing-team", metavar="TEAM_ID",
+                        help="require the runner and helper to be signed by this team and keep that signature (recorded for updates)")
     parser.add_argument("--instance", default="macos")
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--vm-helper", type=Path)

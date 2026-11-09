@@ -253,6 +253,19 @@ sudo python3 script/macos-runner/install.py --check \
   --image "$IMAGE" --state-root "$DATA_MOUNT/motor-state" --instance macos
 ```
 
+macOS ties privacy approvals, such as a runner's access to an external data
+volume, to the program's code signature. The installer normally re-signs the VM
+helper ad hoc, and an ad-hoc signature changes with every build, so each update
+asks again at the host's screen. To avoid that, sign `motor-runner` and
+`motor-macvm` with one team identity before installing (the helper with
+`virtualization.entitlements`) and pass `--signing-team TEAM_ID`. The installer
+then keeps those signatures, refuses binaries signed by another team or ad hoc,
+and records the team in `install.json`; updates inherit it, and changing it
+requires uninstalling first. With a team signature, grant `motor-runner` Full Disk
+Access once in System Settings → Privacy & Security; an administrator can do
+this from their own session, and the grant survives updates signed by the same
+team.
+
 The selected Volume UUID is recorded in `install.json`; updates and `--check`
 use it even when the flag is omitted. A different UUID (including adding one to
 an internal-storage installation) requires uninstalling first. Installation sets

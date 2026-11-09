@@ -502,7 +502,7 @@ class InstallerTests(unittest.TestCase):
         key.write_text("ssh-ed25519 AAAA\n")
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
                                runner=runner, vm_helper=helper, runner_key=key, instance="macos",
-                               data_volume=None, operator_account=None,
+                               data_volume=None, operator_account=None, signing_team=None,
                                metrics_endpoint='https://metrics.example', metrics_host_id='monitor-1')
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         install.LEGACY_PLIST.touch()
@@ -536,7 +536,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(plistlib.loads(self.plist.read_bytes())['ProgramArguments'][-5:],
                          ['--metrics-push', '--metrics-endpoint', 'https://metrics.example', '--metrics-host-id', 'monitor-1'])
 
-    def install_for_metrics(self, endpoint=None, host_id=None, data_volume=None, operator_account: Optional[str] = "operator"):
+    def install_for_metrics(self, endpoint=None, host_id=None, data_volume=None, operator_account: Optional[str] = "operator",
+                            signing_team=None):
         manifest_path = self.root / "reviewed.json"
         manifest_path.write_text(json.dumps(self.manifest))
         bundle = self.root / "bundle"
@@ -548,7 +549,7 @@ class InstallerTests(unittest.TestCase):
         key.write_text("ssh-ed25519 AAAA\n")
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
                                runner=runner, vm_helper=helper, runner_key=key, instance="macos",
-                               data_volume=data_volume, operator_account=operator_account,
+                               data_volume=data_volume, operator_account=operator_account, signing_team=signing_team,
                                metrics_endpoint=endpoint, metrics_host_id=host_id)
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         with patch.multiple(install, CONFIG=self.config, PLIST=self.plist, SSHD=self.sshd, SSH_ROOT=self.ssh, HOME=self.root / "home"), \
@@ -557,6 +558,25 @@ class InstallerTests(unittest.TestCase):
                 patch.object(install, "has_gui_session", return_value=False), patch("sys.stdout", io.StringIO()), \
                 patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
             install.install(args, self.manifest)
+
+    def test_signing_team_keeps_team_signatures_and_is_required_on_updates(self):
+        # A first install (no record yet) may choose a signing team.
+        (self.config / "install.json").unlink(missing_ok=True)
+        teams = {"motor-runner": "TEAM1", "motor-macvm": "TEAM1"}
+        with patch.object(install, "team_identifier", side_effect=lambda binary: teams[Path(binary).name]), \
+                patch.object(install, "run", side_effect=self.command) as run:
+            self.install_for_metrics(signing_team="TEAM1")
+            # The team signature is kept: no ad-hoc re-sign of the helper.
+            self.assertFalse([call for call in run.call_args_list if call.args[:2] == ("/usr/bin/codesign", "--force")])
+            self.assertEqual(json.loads((self.config / "install.json").read_text())["signing_team"], "TEAM1")
+            # Updates inherit the recorded team and refuse an ad-hoc build.
+            teams["motor-runner"] = None
+            with self.assertRaisesRegex(ValueError, "motor-runner must be signed by team TEAM1"):
+                self.install_for_metrics(operator_account=None)
+            teams["motor-runner"] = "TEAM1"
+            with self.assertRaisesRegex(ValueError, "signing team cannot change on update"):
+                self.install_for_metrics(operator_account=None, signing_team="TEAM2")
+            self.install_for_metrics(operator_account=None)
 
     def test_reinstall_without_metrics_flags_keeps_installed_pair(self):
         installed = plistlib.loads(self.plist.read_bytes())
