@@ -8,10 +8,11 @@ manager is used.
 ## Pin-lock status: not deployable yet
 
 `toolchain.json` is deliberately a **pending measurement** lock. The restore pin
-is measured: macOS 27.0.1, build **26A434**, 26,637,307,067 bytes, SHA-256
-`2f016638293c3e641b8b25391a76fbc16563b3711915a5551cf8aa0f5598a5c1`.
-The operator supplied this hash from the restore image and checked it against
-Apple's checksum on download. `observed_host` describes that measurement's
+is measured: macOS 27.2, build **26B123**, 25,595,669,503 bytes, SHA-256
+`6613b34e8589db2202a01ec37a2648afb141ece13428175183f8f3e38438534f`.
+The file is Apple's `UniversalMac_27.2_26B123_Restore.ipsw` from Apple's macOS
+restore image catalog; its SHA-1 matched the catalog's published digest on
+download, and the SHA-256 above was measured from that verified file. `observed_host` describes that measurement's
 host, not a required guest image version. Obtain the exact named IPSW from Apple
 or the operator's retained copy; `restore` checks its size and hash before use.
 
