@@ -680,7 +680,10 @@ impl Host {
                 .collect(),
             healthy: healthy && !self.snapshot.per_job.dax_failed,
             draining: self.snapshot.draining,
-            accept_until_ms: None,
+            accept_until_ms: self
+                .snapshot
+                .accept_until_ms
+                .filter(|_| !self.snapshot.draining),
             tenant_disk: self.tenant_disk(now_ms),
             revoked_ack: self
                 .snapshot
@@ -1037,6 +1040,7 @@ impl Host {
             last_alive: snapshot.last_alive,
             closed: snapshot.closed.clone(),
             draining: snapshot.draining,
+            accept_until_ms: snapshot.accept_until_ms,
         };
         next.nonces.retain(|_, until| *until >= now_s);
         // A removed tenant's closure record names its account; it goes on

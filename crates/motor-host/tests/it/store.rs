@@ -82,6 +82,7 @@ fn full() -> Snapshot {
     s.counter = 42;
     s.last_alive = 1_800_000_000_000;
     s.draining = true;
+    s.accept_until_ms = Some(1_800_000_030_000);
     s.per_job.disks.insert(
         "ws-test".into(),
         motor_host::state::jobs::WorkspaceDisk {

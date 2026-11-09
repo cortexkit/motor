@@ -770,6 +770,39 @@ class RunnerLogTests(unittest.TestCase):
 
 
 class HostDrainTests(unittest.TestCase):
+    def test_bounded_start_cancel_and_no_ops_are_host_level(self):
+        cases = [
+            (hosted.bounded_drain_host, "begin_bounded_drain", {"ok": True, "accept_until_ms": 123}),
+            (hosted.bounded_drain_host, "begin_bounded_drain", {"ok": True, "draining": True, "no_op": "already_draining"}),
+            (hosted.cancel_bounded_drain_host, "cancel_bounded_drain", {"ok": True, "accept_until_ms": None}),
+            (hosted.cancel_bounded_drain_host, "cancel_bounded_drain", {"ok": True, "draining": True, "no_op": "fully_drained; use undrain-host"}),
+        ]
+        for command, op, reply in cases:
+            with self.subTest(op=op, reply=reply), mock.patch.object(hosted, "admin_exchange", return_value=reply) as exchange:
+                self.assertEqual(command(), reply)
+                exchange.assert_called_once_with({"op": op}, hosted.ADMIN_SOCKET)
+        for command in (hosted.bounded_drain_host, hosted.cancel_bounded_drain_host):
+            with mock.patch.object(hosted, "admin_exchange", return_value={"ok": False}):
+                with self.assertRaisesRegex(ValueError, "motor-host refused"):
+                    command()
+
+    def test_bounded_cli_start_cancel_and_status(self):
+        for command, function in [("bounded-drain-host", "bounded_drain_host"),
+                                  ("cancel-bounded-drain-host", "cancel_bounded_drain_host")]:
+            with self.subTest(command=command), \
+                    mock.patch.object(hosted.sys, "argv", ["hosted_host.py", command]), \
+                    mock.patch.object(hosted, function, return_value={"ok": True, "no_op": "already_draining"}) as call, \
+                    mock.patch.object(hosted.sys, "stdout") as output:
+                self.assertEqual(hosted.main(), 0)
+                call.assert_called_once_with()
+                self.assertIn("already_draining", output.write.call_args.args[0])
+        with mock.patch.object(hosted.sys, "argv", ["hosted_host.py", "host-status"]), \
+                mock.patch.object(hosted, "admin_exchange", return_value={"ok": True, "accept_until_ms": 123}) as exchange, \
+                mock.patch.object(hosted.sys, "stdout") as output:
+            self.assertEqual(hosted.main(), 0)
+            exchange.assert_called_once_with({"op": "host_status"})
+            self.assertIn('"accept_until_ms": 123', output.write.call_args.args[0])
+
     def test_waits_for_an_echo_strictly_after_the_set_not_a_stale_or_equal_time(self):
         stale = {"ok": True, "draining": True, "broker_draining": True,
                  "broker_heartbeat_at_ms": 99}

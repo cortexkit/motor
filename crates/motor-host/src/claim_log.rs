@@ -15,6 +15,7 @@ pub enum RefusalCause {
     LeaseEntries,
     Suspending,
     StopPending,
+    BoundedDrain,
     QuarantinedWorkspace,
     DaxRequired,
 }
@@ -23,7 +24,7 @@ impl RefusalCause {
     pub fn reason(self) -> Refusal {
         match self {
             Self::Lease(reason) => reason,
-            Self::Suspending | Self::StopPending => Refusal::Capacity,
+            Self::Suspending | Self::StopPending | Self::BoundedDrain => Refusal::Capacity,
             _ => Refusal::HostFull,
         }
     }
@@ -40,6 +41,7 @@ impl RefusalCause {
             Self::LeaseEntries => "lease_entries",
             Self::Suspending => "suspending",
             Self::StopPending => "stop_pending",
+            Self::BoundedDrain => "bounded_drain",
             Self::QuarantinedWorkspace => "quarantined_workspace",
             Self::DaxRequired => "dax_required",
         }

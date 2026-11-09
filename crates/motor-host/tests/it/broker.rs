@@ -61,6 +61,41 @@ fn queue_heartbeat(runtime: &Runtime, ms: u64) {
 }
 
 #[test]
+fn bounded_drain_changes_publish_without_waiting_for_the_heartbeat_interval() {
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .claim(claims(JOB), NOW * 1000)
+        .unwrap();
+    let mut publisher = motor_host::broker::Heartbeats::new(runtime.clone());
+    publisher.step(NOW * 1000).unwrap();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_bounded_drain(NOW * 1000)
+        .unwrap();
+    publisher.step(NOW * 1000 + 1).unwrap();
+    {
+        let host = runtime.host.lock().unwrap();
+        let request = host.snapshot.outbox.last().unwrap();
+        assert_eq!(request.created_ms, NOW * 1000 + 1);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["accept_until_ms"], NOW * 1000 + 30_000);
+        assert!(body.get("draining").is_none());
+    }
+    runtime.host.lock().unwrap().cancel_bounded_drain().unwrap();
+    publisher.step(NOW * 1000 + 2).unwrap();
+    let host = runtime.host.lock().unwrap();
+    let request = host.snapshot.outbox.last().unwrap();
+    assert_eq!(request.created_ms, NOW * 1000 + 2);
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body.get("accept_until_ms").is_none());
+}
+
+#[test]
 fn host_drain_changes_publish_without_waiting_for_the_heartbeat_interval() {
     let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
     let mut publisher = motor_host::broker::Heartbeats::new(runtime.clone());

@@ -65,6 +65,7 @@ pub fn heartbeat_violation(heartbeat: &Heartbeat) -> Option<&'static str> {
         heartbeat.queued,
     ]
     .into_iter()
+    .chain(heartbeat.accept_until_ms)
     .any(|value| value > SAFE_INTEGER)
     {
         return Some("integer above the JSON safe range");
@@ -178,6 +179,20 @@ mod tests {
             accept_until_ms: None,
             tenant_disk: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bounded_heartbeat_requires_a_safe_integer() {
+        let mut body = heartbeat();
+        body.accept_until_ms = Some(SAFE_INTEGER);
+        assert_eq!(heartbeat_violation(&body), None);
+        body.accept_until_ms = Some(SAFE_INTEGER + 1);
+        assert_eq!(
+            heartbeat_violation(&body),
+            Some("integer above the JSON safe range")
+        );
+        body.accept_until_ms = None;
+        assert_eq!(heartbeat_violation(&body), None);
     }
 
     #[test]

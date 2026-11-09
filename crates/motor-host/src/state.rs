@@ -92,6 +92,9 @@ pub struct Snapshot {
     /// Keep fleet placement paused across host and helper restarts during an update.
     #[serde(default)]
     pub draining: bool,
+    /// Fixed admission deadline while emptying the host without stopping short jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_until_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -296,6 +299,18 @@ impl Host {
         host
     }
     pub(crate) fn save(&mut self, mut next: Snapshot) -> Result<(), Error> {
+        if next.accept_until_ms.is_some()
+            && (next.draining
+                || next
+                    .leases
+                    .values()
+                    .all(|lease| lease.state == LeaseState::Ended))
+        {
+            // Publish the last lease's end and the full drain in one durable write.
+            // Clearing the bound restores the existing full-drain canary admission.
+            next.accept_until_ms = None;
+            next.draining = true;
+        }
         if !self.provider_managed {
             crate::billing::mark_overlap(&mut next);
         }
@@ -313,7 +328,50 @@ impl Host {
         }
         let mut next = self.snapshot.clone();
         next.draining = draining;
+        next.accept_until_ms = None;
         self.save(next)
+    }
+    /// Returns false when already bounded or fully drained; neither start reopens placement.
+    pub fn begin_bounded_drain(&mut self, now_ms: u64) -> Result<bool, Error> {
+        if self.snapshot.draining || self.snapshot.accept_until_ms.is_some() {
+            return Ok(false);
+        }
+        let mut bound = now_ms;
+        for lease in self
+            .snapshot
+            .leases
+            .values()
+            .filter(|l| l.state != LeaseState::Ended)
+        {
+            // Use the host-recorded Started time: live receipt time, or the
+            // conservative restart time when Started was replayed. Unlike the
+            // guest's clock or token issue time, it bounds execution on the host
+            // clock used for admission and broker heartbeats. A lease not yet
+            // started gets its entire runtime from now, including reserved work.
+            let start = lease.started_at_ms.unwrap_or(now_ms);
+            let end = lease
+                .claims
+                .max_s
+                .checked_mul(1000)
+                .and_then(|runtime| start.checked_add(runtime))
+                .ok_or(Error::Refused(Refusal::InternalFailure))?;
+            bound = bound.max(end);
+        }
+        if bound > motor_lease::MAX_SAFE_INTEGER {
+            return Err(Error::Refused(Refusal::InternalFailure));
+        }
+        let mut next = self.snapshot.clone();
+        next.accept_until_ms = Some(bound);
+        self.save(next)?;
+        Ok(true)
+    }
+    /// A full drain must be cleared explicitly, not by cancelling a former bound.
+    pub fn cancel_bounded_drain(&mut self) -> Result<bool, Error> {
+        if self.snapshot.draining || self.snapshot.accept_until_ms.is_none() {
+            return Ok(false);
+        }
+        self.set_draining(false)?;
+        Ok(true)
     }
     fn publish_connections(&self) {
         // Job-VM relays are driven by their own durable execution records, not
@@ -558,6 +616,18 @@ impl Host {
     ) -> Result<(u64, Admission), crate::claim_log::ClaimError> {
         use crate::claim_log::RefusalCause;
         self.observed_at_ms = now_ms;
+        if claims.purpose == Purpose::Run
+            && !self.snapshot.draining
+            && self.snapshot.accept_until_ms.is_some_and(|bound| {
+                claims
+                    .max_s
+                    .checked_mul(1000)
+                    .and_then(|runtime| now_ms.checked_add(runtime))
+                    .is_none_or(|end| end > bound)
+            })
+        {
+            return Err(RefusalCause::BoundedDrain.into());
+        }
         if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
             return self.claim_job(claims, now_ms);
         }
