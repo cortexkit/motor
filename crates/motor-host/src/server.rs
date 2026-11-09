@@ -182,6 +182,7 @@ fn log_refusal(stage: &'static str, reason: Refusal, check: &str, jti: Option<&s
 pub struct Runtime {
     job_resources: Arc<dyn crate::jobs::Resources>,
     job_stops: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    job_exits: Mutex<()>,
     job_launches: Mutex<BTreeMap<String, Arc<job::Launch>>>,
     pub broker_endpoint: String,
     pub jwks_url: String,
@@ -271,6 +272,7 @@ impl Runtime {
         Arc::new(Self {
             job_resources: Arc::new(crate::jobs::Unavailable),
             job_stops: Mutex::new(BTreeMap::new()),
+            job_exits: Mutex::new(()),
             job_launches: Mutex::new(BTreeMap::new()),
             broker_endpoint,
             jwks_url,

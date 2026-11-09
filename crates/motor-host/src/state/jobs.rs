@@ -41,6 +41,8 @@ pub struct Execution {
     pub boot_started_at_ms: Option<u64>,
     pub runner_hello: bool,
     pub ended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<super::settlement::Evidence>,
 }
 
 /// Trusted host measurements. The permit budget includes CPU overcommit; the
@@ -231,6 +233,7 @@ impl Host {
                 boot_started_at_ms: None,
                 runner_hello: false,
                 ended: false,
+                evidence: None,
             };
             let mut next = self.snapshot.clone();
             next.per_job
@@ -358,6 +361,13 @@ impl Host {
             disk.attached_job = None;
             disk.quarantined |= unclean;
         }
+        let evidence = execution.evidence.get_or_insert_with(Default::default);
+        // This path also releases claims whose helper launch never happened.
+        // Those claims cannot produce a receipt and never consumed VM egress.
+        if evidence.exit.is_none() && evidence.gone_at_ms.is_none() {
+            evidence.evidence_expired = true;
+            super::settlement::finalize_usage(&mut next, job);
+        }
         self.save(next)
     }
 
@@ -365,44 +375,18 @@ impl Host {
     /// evidence and use the lost rule even when no Started frame was observed.
     pub fn job_boot_failed(&mut self, job: &str, now_ms: u64) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
-        let lease = next
-            .leases
+        let execution = next
+            .per_job
+            .executions
             .get_mut(job)
             .ok_or(Error::Refused(Refusal::Auth))?;
-        if lease.state != super::LeaseState::Ended {
-            if lease.delivered {
-                let billing = next.billing.entry(job.to_owned()).or_default();
-                crate::billing::settle_lost(lease, billing, now_ms, now_ms);
-                billing.restart_pending = Some(false);
-                // Delivery without Started is still billed at the full cap.
-                let mut usage = motor_lease::Usage {
-                    job_id: job.to_owned(),
-                    vcpus: lease.claims.vcpus,
-                    started_at_ms: now_ms.saturating_sub(lease.claims.max_s.saturating_mul(1000)),
-                    ended_at_ms: now_ms,
-                    outcome: motor_lease::UsageOutcome::Lost,
-                    mem_peak_mib: None,
-                    mem_working_peak_mib: None,
-                    mem_over_mib_ms: None,
-                    egress_bytes: None,
-                    oom_kill: None,
-                };
-                // Keep the full cap even when now_ms is below the cap duration.
-                usage.ended_at_ms = usage
-                    .started_at_ms
-                    .saturating_add(lease.claims.max_s.saturating_mul(1000));
-                billing.usage = Some(usage);
-                billing.hosted_terminal = Some(
-                    serde_json::json!({"type":"hosted_terminal", "job_id":job,
-                    "placement":format!("first_party/{}", lease.claims.placement.host),
-                    "billed_vcpu_ms":u64::from(lease.claims.vcpus).saturating_mul(lease.claims.max_s).saturating_mul(1000),
-                    "max_runtime_s":lease.claims.max_s}),
-                );
-            } else {
-                super::end_zero(&mut next, job, now_ms, Some(Refusal::InternalFailure))?;
-            }
-            crate::billing::finalize_ready(&mut next, now_ms);
+        let evidence = execution.evidence.get_or_insert_with(Default::default);
+        if evidence.winner.is_some() {
+            return Ok(());
         }
+        evidence.winner = Some(super::settlement::Winner::HostStop);
+        super::settlement::settle_failure(&mut next, job, now_ms);
+        super::settlement::defer_usage(&mut next, job);
         self.save(next)
     }
 
@@ -420,7 +404,15 @@ impl Host {
         {
             super::end_zero(&mut next, job, now_ms, Some(Refusal::InternalFailure))?;
             next.billing.entry(job.to_owned()).or_default().terminal = Some(frame);
+            next.per_job
+                .executions
+                .get_mut(job)
+                .unwrap()
+                .evidence
+                .get_or_insert_with(Default::default)
+                .winner = Some(super::settlement::Winner::Guest);
             crate::billing::finalize_ready(&mut next, now_ms);
+            super::settlement::defer_usage(&mut next, job);
             self.save(next)?;
         }
         Ok(())

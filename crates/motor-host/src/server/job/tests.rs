@@ -65,6 +65,11 @@ struct Fake {
     hello: Mutex<Option<Value>>,
     peers: Mutex<Vec<UnixStream>>,
     lifecycle: Mutex<Option<UnixStream>>,
+    exits: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
+    gone: Mutex<BTreeSet<String>>,
+    fail_ack: AtomicBool,
+    fail_poll: AtomicBool,
+    acknowledgements: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
 }
 impl Fake {
     fn wait(&self, stage: &str) {
@@ -78,6 +83,22 @@ impl Fake {
     }
 }
 impl Control for Fake {
+    fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {
+        ensure!(
+            !self.fail_poll.load(Ordering::Acquire),
+            "injected exit poll failure"
+        );
+        Ok(self.exits.lock().unwrap().clone())
+    }
+    fn ack_job_exit(&self, report: &motor_vm_helper::job::ExitReport) -> Result<()> {
+        ensure!(
+            !self.fail_ack.load(Ordering::Acquire),
+            "injected ack failure"
+        );
+        self.acknowledgements.lock().unwrap().push(report.clone());
+        self.exits.lock().unwrap().retain(|r| r != report);
+        Ok(())
+    }
     fn start_job(&self, start: &motor_vm_helper::job::Start) -> Result<Value> {
         assert_eq!(start.account, "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert!([200, 32768].contains(&start.memory_mib));
@@ -96,13 +117,21 @@ impl Control for Fake {
     }
     fn adopt_job(&self, job: &str) -> Result<bool> {
         self.calls.lock().unwrap().push(format!("adopt:{job}"));
-        Ok(true)
+        Ok(!self.gone.lock().unwrap().contains(job))
     }
     fn stop_job(&self, job: &str) -> Result<()> {
         self.calls.lock().unwrap().push(format!("stop:{job}"));
         *self.gate.0.lock().unwrap() = true;
         self.gate.1.notify_all();
         self.peers.lock().unwrap().clear();
+        self.exits
+            .lock()
+            .unwrap()
+            .push(motor_vm_helper::job::ExitReport {
+                job_id: job.into(),
+                oom_kill: 0,
+                egress_bytes: None,
+            });
         Ok(())
     }
     fn job_relay(&self, _: &str, port: u32) -> Result<UnixStream> {
@@ -1184,3 +1213,5 @@ async fn disconnect_or_refusal_before_run_stops_an_already_ready_vm_and_releases
         assert_eq!(storage.releases.lock().unwrap()[JOB], 1);
     }
 }
+
+mod settlement_tests;

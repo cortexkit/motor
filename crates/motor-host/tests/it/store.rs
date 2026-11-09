@@ -95,6 +95,36 @@ fn full() -> Snapshot {
     s.per_job.executions.insert(
         JOB.into(),
         motor_host::state::jobs::Execution {
+            evidence: Some(motor_host::state::settlement::Evidence {
+                winner: Some(motor_host::state::settlement::Winner::HostStop),
+                stop: Some(motor_host::state::settlement::Stop {
+                    cause: motor_host::state::settlement::StopCause::HostOom,
+                    at_ms: 123,
+                }),
+                exit: Some(motor_host::state::settlement::Receipt {
+                    job_id: JOB.into(),
+                    oom_kill: 3,
+                    egress_bytes: Some(23),
+                }),
+                acknowledged: true,
+                unclean_stop: Some(true),
+                usage_inputs: Some(motor_host::state::settlement::UsageInputs {
+                    started_at_ms: 1,
+                    ended_at_ms: 2,
+                    outcome: UsageOutcome::Signal,
+                    mem_peak_mib: Some(3),
+                    mem_working_peak_mib: Some(Some(4)),
+                    mem_over_mib_ms: Some(Some(5)),
+                    oom_kill: Some(motor_lease::OomKill::HostOom),
+                }),
+                evidence_expired: true,
+                gone_at_ms: Some(122),
+                memory: Some(motor_protocol::MemorySample {
+                    jti: JOB.parse().unwrap(),
+                    mem_working_peak_mib: Some(123),
+                    mem_over_mib_ms: Some(Some(456)),
+                }),
+            }),
             boot_started_at_ms: None,
             claims: claims(JOB),
             disk_id: "ws-test".into(),

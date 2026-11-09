@@ -130,12 +130,22 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
         if b.usage.is_some() {
             continue;
         }
+        if next
+            .per_job
+            .executions
+            .get(job)
+            .and_then(|e| e.evidence.as_ref())
+            .is_some_and(|e| e.usage_inputs.is_some())
+        {
+            continue;
+        }
         let zero = next.zero_usage.get(job);
         if b.terminal.is_none() && zero.is_none() {
             continue;
         }
         let observed_end = *b.ended_observed_ms.get_or_insert(now_ms);
         if lease.started_at_ms.is_some()
+            && !next.per_job.executions.contains_key(job)
             && !b.overlapping
             && !b.metrics_observed
             && (b.started_live || b.terminal_live)
@@ -180,14 +190,27 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
             ended_at_ms: end,
             // VM samples include the runner and cache fills, not just this job.
             mem_peak_mib: lease.started_at_ms.and(b.mem_peak_mib),
-            egress_bytes: (!b.overlapping).then_some(
+            egress_bytes: (!b.overlapping && !next.per_job.executions.contains_key(job)).then_some(
                 b.egress_end
                     .saturating_sub(b.egress_start.unwrap_or(b.egress_end)),
             ),
             outcome,
-            mem_working_peak_mib: lease.started_at_ms.and(b.mem_working_peak_mib).map(Some),
-            // The runner does not yet report a working-set overage integral.
-            mem_over_mib_ms: None,
+            mem_working_peak_mib: if next.per_job.executions.contains_key(job) {
+                Some(b.mem_working_peak_mib)
+            } else {
+                lease.started_at_ms.and(b.mem_working_peak_mib).map(Some)
+            },
+            mem_over_mib_ms: if next.per_job.executions.contains_key(job)
+                && lease.claims.mem_burst_mib.is_some()
+            {
+                Some(
+                    b.terminal
+                        .as_ref()
+                        .and_then(|t| t["mem_over_mib_ms"].as_u64()),
+                )
+            } else {
+                None
+            },
             oom_kill: b.terminal.as_ref().and_then(|terminal| {
                 match terminal["oom_kill"]["cause"].as_str() {
                     Some("job_limit") => Some(OomKill::JobLimit),
@@ -286,6 +309,9 @@ impl Host {
         if self.provider_managed {
             return Ok(());
         }
+        if self.snapshot.per_job.executions.contains_key(job) {
+            return self.receive_job_terminal(job, frame, now_ms, live);
+        }
         let mut next = self.snapshot.clone();
         if next.billing.get(job).is_some_and(|b| b.host_settled) {
             let stopping = next
@@ -351,7 +377,9 @@ impl Host {
                         next.pending_cancels
                             .insert(job.clone(), lease.tenant.clone());
                     }
-                    if now_ms >= cap.saturating_add(LOST_SETTLEMENT_GRACE_MS) {
+                    if now_ms >= cap.saturating_add(LOST_SETTLEMENT_GRACE_MS)
+                        && !next.per_job.executions.contains_key(job)
+                    {
                         let check = self.lost_checks.entry(job.clone()).or_insert_with(|| {
                             // Send a fresh hard cancel before inspecting this job, even
                             // if the earlier cap backstop was already acknowledged.
@@ -574,7 +602,14 @@ impl Host {
         let withdrawn = l.started_at_ms.is_none()
             && l.refusal == Some(crate::state::Refusal::Capacity)
             && self.snapshot.zero_usage.contains_key(job);
-        if !b.host_settled && !withdrawn {
+        let host_stop = self
+            .snapshot
+            .per_job
+            .executions
+            .get(job)
+            .and_then(|e| e.evidence.as_ref())
+            .is_some_and(|e| e.winner == Some(crate::state::settlement::Winner::HostStop));
+        if !b.host_settled && !withdrawn && !host_stop {
             return None;
         }
         let mut frames = Vec::new();
