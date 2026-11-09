@@ -444,7 +444,9 @@ fn hosted_relay_refusals_name_peer_port_and_handshake_step() {
         }
     });
     for detail in ["invalid acknowledgement", "failed to fill whole buffer"] {
-        let error = connect_relay(scratch.path(), 52).unwrap_err().to_string();
+        let error = connect_relay(scratch.path(), unsafe { libc::geteuid() }, 52)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(&format!("peer={}/vsock.sock", scratch.path().display())));
         assert!(error.contains("guest_port=52 step=handshake: read_CONNECT_ack:"));
         assert!(error.contains(detail), "{error}");
@@ -494,10 +496,11 @@ fn hosted_real_relay_handshakes_only_the_three_ports_without_eating_frames() {
         ports
     });
     for port in [0, 51, 55, u32::MAX] {
-        assert!(connect_relay(&root, port).is_err());
+        assert!(connect_relay(&root, unsafe { libc::geteuid() }, port).is_err());
     }
     for port in 52..=54 {
-        let mut stream = UnixStream::from(connect_relay(&root, port).unwrap());
+        let mut stream =
+            UnixStream::from(connect_relay(&root, unsafe { libc::geteuid() }, port).unwrap());
         let mut frame = [0; 5];
         stream.read_exact(&mut frame).unwrap();
         assert_eq!(&frame, b"FRAME");
@@ -548,4 +551,73 @@ fn hosted_running_marker_is_written_whole_and_removal_tolerates_absence() {
     assert!(!marker.exists());
     // A clean stop of a VM that never wrote a marker must still succeed.
     remove_running_marker(&marker).unwrap();
+}
+
+#[test]
+fn relay_pins_socket_inode_and_refuses_symlink_or_wrong_owner_without_connecting() {
+    use std::os::unix::fs::symlink;
+    let scratch = cortexkit_test_support::ScratchDir::new("relay-pinned-socket");
+    let dir = File::open(scratch.path()).unwrap();
+    let alias = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let target = alias.join("target.sock");
+    let listener = UnixListener::bind(&target).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    symlink(&target, alias.join("vsock.sock")).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    assert!(connect_relay(scratch.path(), uid, 52).is_err());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    std::fs::remove_file(alias.join("vsock.sock")).unwrap();
+    std::fs::rename(&target, alias.join("vsock.sock")).unwrap();
+    assert!(connect_relay(scratch.path(), uid + 1, 52).is_err());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+#[cfg(feature = "linux-root-tests")]
+fn isolated_tenant_relay_refuses_symlink_and_wrong_owner_without_connecting() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let scratch = cortexkit_test_support::ScratchDir::new("tenant-relay-owner");
+    let config = serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap();
+    let mut tenants = LinuxTenants::new(&config, scratch.join("groups"));
+    let child = Command::new("/bin/sleep").arg("300").spawn().unwrap();
+    let root = scratch.join("root");
+    std::fs::create_dir(&root).unwrap();
+    tenants.running.insert(
+        "tenant-1".into(),
+        Running {
+            child,
+            uid: 400001,
+            disk: File::open(scratch.path()).unwrap(),
+            root: root.clone(),
+            group: scratch.join("group"),
+            paused: false,
+            attached: false,
+            restored: false,
+            snapshot_uncertain: false,
+            snapshot_prepare_started: None,
+        },
+    );
+    let dir = File::open(&root).unwrap();
+    let alias = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let target = alias.join("host.sock");
+    let listener = UnixListener::bind(&target).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::os::unix::fs::symlink(&target, alias.join("vsock.sock")).unwrap();
+    let symlink_refused = tenants.relay("tenant-1", 52).is_err();
+    let symlink_connected = listener.accept().is_ok();
+    std::fs::remove_file(alias.join("vsock.sock")).unwrap();
+    std::fs::rename(&target, alias.join("vsock.sock")).unwrap();
+    let owner_refused = tenants.relay("tenant-1", 52).is_err();
+    let owner_connected = listener.accept().is_ok();
+    let vm = tenants.running.get_mut("tenant-1").unwrap();
+    vm.child.kill().unwrap();
+    vm.child.wait().unwrap();
+    assert!(symlink_refused && owner_refused);
+    assert!(!symlink_connected && !owner_connected);
 }

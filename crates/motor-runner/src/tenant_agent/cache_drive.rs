@@ -6,8 +6,8 @@ use motor_protocol::{
     REMOTE_CACHE_NONCE_CMDLINE_KEY,
 };
 use std::{
-    io::Read,
-    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    io::{Read, Seek},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use zeroize::Zeroizing;
 
@@ -60,7 +60,7 @@ fn discover(
     cmdline: &str,
     sys_block: &Path,
     devices: &Path,
-) -> io::Result<Option<(PathBuf, Nonce)>> {
+) -> io::Result<Option<(fs::File, Nonce)>> {
     let Some(nonce) = expected_nonce(cmdline)? else {
         return Ok(None);
     };
@@ -90,9 +90,12 @@ fn discover(
         if matched.is_some() {
             return Err(invalid());
         }
-        matched = Some((path, nonce));
+        file.rewind().map_err(|_| invalid())?;
+        matched = Some((file, nonce));
     }
-    Ok(matched)
+    // A nonce is supplied only when the helper attached a credential drive.
+    // Missing or mismatched read-only media is a boot failure, not cache opt-out.
+    matched.map(Some).ok_or_else(invalid)
 }
 
 fn load_discovered(
@@ -107,7 +110,7 @@ fn load_discovered(
                 "credential drive nonce selection failed",
             )
         })?
-        .map(|(device, nonce)| load(&device, &nonce))
+        .map(|(device, nonce)| load(device, &nonce))
         .transpose()
 }
 
@@ -129,20 +132,18 @@ fn decode(mut reader: impl Read, nonce: &Nonce) -> io::Result<RemoteCacheRequest
     Ok(request)
 }
 
-fn load(device: &Path, nonce: &Nonce) -> io::Result<RemoteCacheRequest> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(device)
-        .map_err(|_| invalid())?;
+fn load(file: fs::File, nonce: &Nonce) -> io::Result<RemoteCacheRequest> {
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_block_device()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o077 != 0
-    {
+    if !trusted_device(metadata.mode(), metadata.uid()) {
         return Err(invalid());
     }
     decode(file, nonce)
+}
+
+fn trusted_device(mode: u32, uid: u32) -> bool {
+    // udev normally creates root:disk 0660 block nodes. Group mode bits are not
+    // an authenticity check: discovery requires sysfs read-only and boot nonce.
+    mode & libc::S_IFMT == libc::S_IFBLK && uid == 0
 }
 
 fn write_set(directory: &Path, request: RemoteCacheRequest) -> io::Result<()> {
@@ -209,6 +210,34 @@ mod tests {
     use cortexkit_test_support::ScratchDir;
     const NONCE: Nonce = [0x42; REMOTE_CACHE_DRIVE_NONCE_BYTES];
 
+    #[test]
+    fn udev_root_disk_0660_block_nodes_are_trusted_but_other_owners_and_types_are_not() {
+        assert!(trusted_device(libc::S_IFBLK | 0o660, 0));
+        assert!(trusted_device(libc::S_IFBLK | 0o600, 0));
+        assert!(!trusted_device(libc::S_IFBLK | 0o660, 1000));
+        assert!(!trusted_device(libc::S_IFREG | 0o600, 0));
+        assert!(!trusted_device(libc::S_IFLNK | 0o600, 0));
+    }
+
+    #[test]
+    fn discovered_descriptor_survives_device_path_replacement() {
+        let scratch = ScratchDir::new("cache-drive-pinned-descriptor");
+        let sys_block = scratch.join("sys-block");
+        let devices = scratch.join("dev");
+        fs::create_dir_all(&devices).unwrap();
+        sys_device(&sys_block, "vdc", "1\n");
+        let device = devices.join("vdc");
+        fs::write(&device, payload(false)).unwrap();
+        let (file, nonce) = discover(&cmdline(&NONCE), &sys_block, &devices)
+            .unwrap()
+            .unwrap();
+        fs::remove_file(&device).unwrap();
+        fs::write(&device, b"replacement is not credentials").unwrap();
+        // Exercise the same decoder on the discovered descriptor; no permission
+        // checks are bypassed in load(), which requires a real root block node.
+        assert!(decode(file, &nonce).unwrap().write_key.is_none());
+    }
+
     fn cmdline(nonce: &Nonce) -> String {
         format!(
             "quiet {REMOTE_CACHE_NONCE_CMDLINE_KEY}={}",
@@ -220,8 +249,12 @@ mod tests {
     }
 
     fn payload(write: bool) -> Vec<u8> {
-        let config = json!({"generation":"1", "tenant":"acct:test", "endpoint":"https://cache.example.com",
-            "region":"test", "bucket":"motor-cache", "prefix":"tenant/acct-test/", "storage_class":"STANDARD", "enabled":true});
+        // The root helper's installer and the guest decoder consume the same
+        // subject/prefix fixture; the account itself is never normalized.
+        let config: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../motor-vm-helper/fixtures/cache-subject.json"
+        ))
+        .unwrap();
         let key =
             json!({"generation":"1", "access_key_id":"READ-ID", "secret_access_key":"READ-SECRET"});
         let mut value = json!({"op":"set_remote_cache", "config":config.to_string(), "read_key":key.to_string()});
@@ -253,20 +286,22 @@ mod tests {
     }
 
     #[test]
-    fn credential_payload_with_wrong_nonce_is_ignored() {
+    fn credential_payload_with_wrong_nonce_refuses_nonce_bearing_boot() {
         let scratch = ScratchDir::new("cache-drive-wrong-nonce");
         let sys_block = scratch.join("sys-block");
         let devices = scratch.join("dev");
         fs::create_dir_all(&devices).unwrap();
         sys_device(&sys_block, "vdc", "1\n");
         fs::write(devices.join("vdc"), payload(true)).unwrap();
-        assert!(load_discovered(
-            &cmdline(&[0x99; REMOTE_CACHE_DRIVE_NONCE_BYTES]),
-            &sys_block,
-            &devices
-        )
-        .unwrap()
-        .is_none());
+        assert_identity_refusal(
+            load_discovered(
+                &cmdline(&[0x99; REMOTE_CACHE_DRIVE_NONCE_BYTES]),
+                &sys_block,
+                &devices,
+            )
+            .err()
+            .unwrap(),
+        );
         assert!(!scratch.join("cache").exists());
     }
 
@@ -278,16 +313,17 @@ mod tests {
         fs::create_dir_all(&devices).unwrap();
         sys_device(&sys_block, "vdb", "0\n");
         fs::write(devices.join("vdb"), payload(true)).unwrap();
-        assert!(load_discovered(&cmdline(&NONCE), &sys_block, &devices)
-            .unwrap()
-            .is_none());
-        fs::remove_file(devices.join("vdb")).unwrap();
-        assert!(
+        assert_identity_refusal(
             load_discovered(&cmdline(&NONCE), &sys_block, &devices)
-                .unwrap()
-                .is_none(),
-            "a writable device must not even be opened"
+                .err()
+                .unwrap(),
         );
+        fs::remove_file(devices.join("vdb")).unwrap();
+        assert_identity_refusal(
+            load_discovered(&cmdline(&NONCE), &sys_block, &devices)
+                .err()
+                .unwrap(),
+        ); // A writable device must not even be opened.
     }
 
     #[test]
@@ -317,9 +353,13 @@ mod tests {
         sys_device(&sys_block, "vdd", "1\n");
         fs::write(devices.join("vdc"), payload(true)).unwrap();
         fs::write(devices.join("vdd"), payload(false)).unwrap();
+        let (file, nonce) = discover(&cmdline(&NONCE), &sys_block, &devices)
+            .unwrap()
+            .unwrap();
+        assert_eq!(nonce, NONCE);
         assert_eq!(
-            discover(&cmdline(&NONCE), &sys_block, &devices).unwrap(),
-            Some((devices.join("vdd"), NONCE))
+            file.metadata().unwrap().ino(),
+            fs::metadata(devices.join("vdd")).unwrap().ino()
         );
     }
 
@@ -378,19 +418,23 @@ mod tests {
                 Provisioning::new(Layout::new(directory.clone(), HostRole::TenantVm));
             provisioning.reread();
             assert!(provisioning.admit().is_some());
+            assert_eq!(
+                provisioning.active().unwrap().tenant,
+                "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            );
             assert_eq!(provisioning.active().unwrap().write_key.is_some(), write);
         }
     }
 
     #[test]
-    fn absent_drive_disables_cache_without_writing_credentials() {
+    fn absent_drive_refuses_nonce_bearing_boot_without_writing_credentials() {
         let scratch = ScratchDir::new("cache-drive-absent");
         let sys_block = scratch.join("sys-block");
         fs::create_dir_all(&sys_block).unwrap();
-        assert!(
+        assert_identity_refusal(
             load_discovered(&cmdline(&NONCE), &sys_block, &scratch.join("missing-dev"))
-                .unwrap()
-                .is_none()
+                .err()
+                .unwrap(),
         );
         assert!(!scratch.join("cache").exists());
         let layout = Layout::new(scratch.join("cache"), HostRole::TenantVm);

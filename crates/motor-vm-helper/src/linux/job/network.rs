@@ -5,7 +5,7 @@ pub(super) trait Access: Send {
     fn tenants(&self) -> Result<Vec<Tap>>;
     fn install(&mut self, taps: &[Tap]) -> Result<()>;
     fn ensure(&mut self, tap: &Tap) -> Result<()>;
-    fn egress_bytes(&mut self, tap: &Tap) -> Result<u64>;
+    fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>>;
     fn remove(&mut self, tap: &Tap) -> Result<()>;
 }
 
@@ -22,11 +22,14 @@ impl Access for System {
     fn ensure(&mut self, tap: &Tap) -> Result<()> {
         tenant_network::ensure(tap, tap.uid)
     }
-    fn egress_bytes(&mut self, tap: &Tap) -> Result<u64> {
-        tenant_network::egress_bytes(tap)
+    fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>> {
+        tenant_network::optional_egress_bytes(tap)
     }
     fn remove(&mut self, tap: &Tap) -> Result<()> {
-        tenant_network::remove_allocated(tap)
+        tenant_network::remove_allocated(tap)?;
+        // With the TAP gone no guest can create a new flow. Conntrack owns NAT
+        // mappings too; retire both before the durable allocation is released.
+        super::conntrack::flush(tap.tap_index)
     }
 }
 

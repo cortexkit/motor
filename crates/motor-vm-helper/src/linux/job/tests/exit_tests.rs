@@ -69,7 +69,11 @@ fn fault_replays_one_report(step: ExitStep) {
     jobs.adopt_record(record()).unwrap();
     let group = empty_group(&jobs, 3);
     jobs.exit_fault = Some(step);
-    let error = jobs.handle(Operation::Exits, peer()).err().unwrap();
+    let error = if step == ExitStep::Delivery {
+        jobs.handle(Operation::Exits, peer()).err().unwrap()
+    } else {
+        jobs.collect_exit(&start().job_id).unwrap_err()
+    };
     assert!(error.0.contains(&format!("{step:?}")), "{error}");
     assert!(!read_record(&jobs).released);
     assert_eq!(
@@ -99,7 +103,7 @@ fn fault_replays_one_report(step: ExitStep) {
     assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
     assert!(jobs.acknowledge_exit(expected(4)).is_err());
     let mut unknown = expected(3);
-    unknown.job_id = "00000000-0000-4000-8000-000000000002".into();
+    unknown.job_id = job::test_id(2);
     assert!(jobs.acknowledge_exit(unknown).is_err());
     assert_eq!(std::fs::read(record_path(&jobs)).unwrap(), bytes);
     assert_eq!(reports(&mut jobs), [expected(3)]);
@@ -153,7 +157,8 @@ fn failed_durable_write_keeps_cgroup_evidence_and_disk_reservation() {
     let group = empty_group(&jobs, 5);
     let records = jobs.records_path.clone();
     jobs.records_path = base.join("missing-directory");
-    assert!(jobs.collect_exits().is_err());
+    jobs.collect_exits().unwrap();
+    assert!(!jobs.collection_failures[&start().job_id].is_empty());
     assert!(group.exists());
     assert_eq!(jobs.records[&start().job_id].oom_kill, None);
     assert!(jobs.disk_available(&start(), 8, 99).is_err());
@@ -173,7 +178,8 @@ fn failed_cgroup_removal_keeps_durable_count_for_restart() {
     let group = empty_group(&jobs, 6);
     jobs.remove_test_group =
         Some(|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
-    assert!(jobs.collect_exits().is_err());
+    jobs.collect_exits().unwrap();
+    assert!(!jobs.collection_failures[&start().job_id].is_empty());
     assert_eq!(read_record(&jobs).oom_kill, Some(6));
     assert!(group.exists());
     drop(jobs);
@@ -267,7 +273,8 @@ fn absent_or_nonempty_cgroup_never_invents_an_exit_count() {
     assert!(group.exists());
     std::fs::write(group.join("cgroup.procs"), "").unwrap();
     std::fs::write(group.join("memory.events"), "oom 8\n").unwrap();
-    assert!(jobs.collect_exits().is_err());
+    jobs.collect_exits().unwrap();
+    assert!(!jobs.collection_failures[&start().job_id].is_empty());
     assert!(group.exists());
     assert_eq!(read_record(&jobs).oom_kill, None);
     std::fs::remove_dir_all(base).unwrap();
@@ -311,7 +318,7 @@ fn concurrent_job_exits_keep_their_own_counts() {
     let mut jobs = fixture(&base);
     let first = record();
     let mut second = first.clone();
-    second.start.job_id = "00000000-0000-4000-8000-000000000002".into();
+    second.start.job_id = job::test_id(2);
     for record in [&first, &second] {
         jobs.save(record).unwrap();
         jobs.adopt_record(record.clone()).unwrap();
@@ -429,7 +436,7 @@ fn unacknowledged_or_unreleased_records_are_never_pruned_regardless_of_age() {
     unacknowledged.exit_acknowledged = false;
     let first = save_with_mtime(&mut jobs, unacknowledged, modified);
     let mut unreleased = tombstone();
-    unreleased.start.job_id = "00000000-0000-4000-8000-000000000002".into();
+    unreleased.start.job_id = job::test_id(2);
     unreleased.released = false;
     let second = save_with_mtime(&mut jobs, unreleased, modified);
     jobs.maintain_at(modified + Duration::from_secs(365 * 24 * 60 * 60))

@@ -4,7 +4,7 @@ use serde_json::json;
 pub(crate) fn set(account: &str, generation: &str) -> RemoteCacheRequest {
     RemoteCacheRequest {
         op: "set_remote_cache".into(),
-        config: json!({"generation":generation,"tenant":account,"endpoint":"https://cache.example","region":"region","bucket":"cache","prefix":format!("tenant/{account}/"),"storage_class":"STANDARD","enabled":true}).to_string().into(),
+        config: json!({"generation":generation,"tenant":account,"endpoint":"https://cache.example","region":"region","bucket":"cache","prefix":format!("tenant/{}/", account.replace(':', "-")),"storage_class":"STANDARD","enabled":true}).to_string().into(),
         read_key: json!({"generation":generation,"access_key_id":"read-id","secret_access_key":format!("READ-SECRET-{generation}")}).to_string().into(),
         write_key: Some(json!({"generation":generation,"access_key_id":"write-id","secret_access_key":format!("WRITE-SECRET-{generation}")}).to_string().into()),
     }

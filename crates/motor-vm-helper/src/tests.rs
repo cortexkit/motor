@@ -2,12 +2,12 @@ use super::*;
 
 #[test]
 fn job_network_allocation_is_helper_selected_and_ack_egress_is_optional_and_strict() {
-    let job = serde_json::json!({"op":"start_job", "job_id":"00000000-0000-4000-8000-000000000001", "account":"a", "workspace_disk_id":"d", "image_generation_id":"g", "vcpus":1, "memory_mib":1024});
+    let job = serde_json::json!({"op":"start_job", "job_id":"00000000-0000-7000-8000-000000000001", "account":"a", "workspace_disk_id":"d", "image_generation_id":"g", "vcpus":1, "memory_mib":1024});
     assert!(serde_json::from_value::<Request>(job.clone()).is_ok());
     let mut caller_selected = job;
     caller_selected["tap_index"] = 17.into();
     assert!(serde_json::from_value::<Request>(caller_selected).is_err());
-    let mut ack = serde_json::json!({"op":"ack_job_exit", "job_id":"00000000-0000-4000-8000-000000000001", "oom_kill":0, "egress_bytes":1234});
+    let mut ack = serde_json::json!({"op":"ack_job_exit", "job_id":"00000000-0000-7000-8000-000000000001", "oom_kill":0, "egress_bytes":1234});
     assert!(matches!(
         serde_json::from_value::<Request>(ack.clone()).unwrap(),
         Request::AckJobExit {
@@ -19,8 +19,8 @@ fn job_network_allocation_is_helper_selected_and_ack_egress_is_optional_and_stri
     assert!(serde_json::from_value::<Request>(ack).is_err());
 }
 
-const JOB: &str = "00000000-0000-4000-8000-000000000001";
-const NEXT: &str = "00000000-0000-4000-8000-000000000002";
+const JOB: &str = "00000000-0000-7000-8000-000000000001";
+const NEXT: &str = "00000000-0000-7000-8000-000000000002";
 #[derive(Default)]
 struct Fake {
     running: bool,

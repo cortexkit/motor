@@ -126,7 +126,7 @@ fn source(path: &Path, key: bool) -> Result<Zeroizing<String>> {
 }
 
 fn validate(account: &str, set: &RemoteCacheRequest) -> Result<()> {
-    crate::job::validate_id(account)?;
+    crate::job::validate_account(account)?;
     let mut parsed = Vec::new();
     for (index, text) in [&set.config, &set.read_key]
         .into_iter()
@@ -185,6 +185,10 @@ fn hex(nonce: &[u8]) -> String {
 }
 
 pub fn install_command(args: Vec<OsString>) -> Result<()> {
+    install_command_at(args, Path::new(STORE))
+}
+
+pub(super) fn install_command_at(args: Vec<OsString>, store: &Path) -> Result<()> {
     root_only()?;
     let mut account = None;
     let mut config = None;
@@ -207,7 +211,7 @@ pub fn install_command(args: Vec<OsString>) -> Result<()> {
     let account = account
         .and_then(|value| value.into_string().ok())
         .ok_or_else(invalid)?;
-    crate::job::validate_id(&account)?;
+    crate::job::validate_account(&account)?;
     let set = RemoteCacheRequest {
         op: "set_remote_cache".into(),
         config: source(Path::new(&config.ok_or_else(invalid)?), false)?,
@@ -216,7 +220,7 @@ pub fn install_command(args: Vec<OsString>) -> Result<()> {
             .map(|path| source(Path::new(&path), true))
             .transpose()?,
     };
-    store::install(Path::new(STORE), &account, &set)
+    store::install(store, &account, &set)
 }
 
 pub(super) fn stage(
