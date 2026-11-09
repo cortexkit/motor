@@ -745,6 +745,56 @@ fn capacity_file_must_be_complete_owned_and_protected() {
     }
 }
 
+const SPARSE_VOLUME_BYTES: u64 = 512 * MIB;
+// Write 8 MiB before each new admission attempt so even a completely empty
+// volume reaches the storage threshold before accumulated leases fill the
+// host's 64-entry limit.
+const SPARSE_WRITE_BYTES: u64 = 8 * MIB;
+const DIRECT_RUNNER_FLOOR: u64 = 64 * MIB;
+
+fn sparse_disk_host() -> (Host, Capacity) {
+    let values = Capacity {
+        storage_margin_bytes: 32 * MIB,
+        ..capacity_values()
+    };
+    // The tenant's floor equals the direct runner's floor (provisioning
+    // refuses a smaller one), idle suspend is off, so the threshold is
+    // floor + margin, 96 MiB.
+    let mut tenant = tenant_one();
+    tenant.host_floor_bytes = DIRECT_RUNNER_FLOOR;
+    tenant.max_weight = Some(1_000);
+    let mut host = host_with(vec![("vm", tenant)]);
+    host.enforce_storage();
+    assert_eq!(host.storage_threshold(&values), Some(96 * MIB));
+    (host, values)
+}
+
+#[test]
+fn sparse_disk_fixture_reaches_storage_refusal_before_lease_entry_limit() {
+    let (mut host, values) = sparse_disk_host();
+    let threshold = host.storage_threshold(&values).unwrap();
+    let now = NOW * 1000;
+    // A real filesystem starts with less free space because of metadata.
+    // Use the whole volume here to bound the number of accumulated leases.
+    host.observe_storage(Ok(values.clone()), Ok(SPARSE_VOLUME_BYTES));
+    assert!(!host.storage_refusing());
+    host.claim(claims(JOB), now).unwrap();
+    for n in 1..=SPARSE_VOLUME_BYTES / SPARSE_WRITE_BYTES {
+        let free = SPARSE_VOLUME_BYTES - n * SPARSE_WRITE_BYTES;
+        host.observe_storage(Ok(values.clone()), Ok(free));
+        let job = format!("00000000-0000-7000-8000-{:012x}", n + 16);
+        let admitted = host.claim(claims(&job), now);
+        if free < threshold {
+            assert!(host.storage_refusing());
+            refused(admitted, Refusal::HostFull);
+            assert!(free >= DIRECT_RUNNER_FLOOR, "refused only at {free} free");
+            return;
+        }
+        admitted.unwrap_or_else(|error| panic!("refused with {error} at {free} free"));
+    }
+    panic!("storage latch never refused");
+}
+
 /// Operator fixture: a sparse tenant disk on a small loop-mounted XFS volume
 /// is filled by a writer under an admitted lease. motor-host's real capacity
 /// file reader and statvfs probe must refuse new leases while free space is
@@ -755,7 +805,6 @@ fn capacity_file_must_be_complete_owned_and_protected() {
 fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_runner_floor() {
     use std::io::{Seek, SeekFrom, Write};
     use std::process::Command;
-    const DIRECT_RUNNER_FLOOR: u64 = 64 * MIB;
     fn sudo(args: &[&str]) {
         let status = Command::new("sudo").arg("-n").args(args).status().unwrap();
         assert!(status.success(), "sudo {args:?}");
@@ -772,7 +821,7 @@ fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_run
     std::fs::create_dir(&mount).unwrap();
     std::fs::File::create(&image)
         .unwrap()
-        .set_len(512 * MIB)
+        .set_len(SPARSE_VOLUME_BYTES)
         .unwrap();
     assert!(Command::new("mkfs.xfs")
         .args(["-q", "-f"])
@@ -791,10 +840,7 @@ fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_run
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() }.to_string();
     sudo(&["chown", &uid, mount.to_str().unwrap()]);
-    let values = Capacity {
-        storage_margin_bytes: 32 * MIB,
-        ..capacity_values()
-    };
+    let (host, values) = sparse_disk_host();
     let staged = directory.path().join("capacity.staged");
     std::fs::write(
         &staged,
@@ -821,14 +867,6 @@ fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_run
         staged.to_str().unwrap(),
         capacity_path.to_str().unwrap(),
     ]);
-    // The tenant's floor equals the direct runner's floor (provisioning
-    // refuses a smaller one), idle suspend is off, so the threshold is
-    // floor + margin, 96 MiB.
-    let mut tenant = tenant_one();
-    tenant.host_floor_bytes = DIRECT_RUNNER_FLOOR;
-    tenant.max_weight = Some(1_000);
-    let mut host = host_with(vec![("vm", tenant)]);
-    host.enforce_storage();
     let threshold = host.storage_threshold(&values).unwrap();
     assert_eq!(threshold, 96 * MIB);
     let helper = Arc::new(motor_host::helper::Helper {
@@ -852,7 +890,7 @@ fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_run
     // The tenant disk is sparse and longer than the whole volume.
     let mut disk = std::fs::File::create(mount.join("disk.img")).unwrap();
     disk.set_len(2 * GIB).unwrap();
-    let chunk = vec![0x5a; 4 * MIB as usize];
+    let chunk = vec![0x5a; SPARSE_WRITE_BYTES as usize];
     for n in 1u64.. {
         disk.seek(SeekFrom::Start((n - 1) * chunk.len() as u64))
             .unwrap();
@@ -863,6 +901,7 @@ fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_run
         let job = format!("00000000-0000-7000-8000-{:012x}", n + 16);
         let admitted = runtime.host.lock().unwrap().claim(claims(&job), now);
         if let Err(error) = admitted {
+            assert!(runtime.host.lock().unwrap().storage_refusing());
             assert!(
                 matches!(error, Error::Refused(Refusal::HostFull)),
                 "{error}"
