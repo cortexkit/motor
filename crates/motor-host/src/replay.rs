@@ -1252,7 +1252,6 @@ mod tests {
         raw(&serde_json::to_vec(&value).unwrap())
     }
 
-    #[path = "bounds_tests.rs"]
     mod bounds_tests;
 
     #[test]
