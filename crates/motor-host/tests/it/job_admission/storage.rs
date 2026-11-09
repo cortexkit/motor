@@ -1,4 +1,5 @@
 use super::*;
+mod images;
 use motor_host::state::jobs::storage::{
     Base, ReplayCompletion, REPLAY_RECORD_BYTES, REPLAY_RESERVATION_BYTES, RETURN_BYTES,
 };

@@ -180,6 +180,7 @@ fn log_refusal(stage: &'static str, reason: Refusal, check: &str, jti: Option<&s
 }
 
 pub struct Runtime {
+    image_generations: Option<Arc<crate::jobs::images::Images>>,
     job_resources: Arc<dyn crate::jobs::Resources>,
     job_stops: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     job_exits: Mutex<()>,
@@ -207,6 +208,29 @@ pub struct Runtime {
     pub(crate) sandbox_identity: Option<crate::sandbox::IdentityFile>,
 }
 impl Runtime {
+    /// Construct a runtime with durable image-generation support.
+    pub fn with_image_generations(
+        host_id: String,
+        host: Host,
+        control: Arc<dyn Control>,
+    ) -> Arc<Self> {
+        let mut runtime = Self::new(host_id, host, control);
+        let images = Arc::new(crate::jobs::images::Images::new(
+            runtime.host.clone(),
+            runtime.control.clone(),
+        ));
+        let r = Arc::get_mut(&mut runtime).expect("new runtime");
+        r.job_resources = images.clone();
+        r.image_generations = Some(images);
+        runtime
+    }
+
+    pub fn publish_job_images(&self, generation: &str, now_ms: u64) -> Result<()> {
+        self.image_generations
+            .as_ref()
+            .context("image manager unavailable")?
+            .publish(generation, now_ms)
+    }
     /// Per-job storage and image managers are injected explicitly. The executable
     /// keeps startup disabled until production managers are available.
     pub fn with_job_resources(
@@ -275,6 +299,7 @@ impl Runtime {
             .collect();
         Arc::new(Self {
             job_resources: Arc::new(crate::jobs::Unavailable),
+            image_generations: None,
             job_stops: Mutex::new(BTreeMap::new()),
             job_exits: Mutex::new(()),
             job_launches: Mutex::new(BTreeMap::new()),

@@ -97,6 +97,19 @@ impl Host {
             .get_or_insert_with(|| Disk::new(default_cap, now_ms));
         storage.last_used_ms = storage.last_used_ms.max(now_ms);
         storage.growth_reservation_bytes = storage.cap_bytes;
+        self.reserve_storage(next, disk_id, now_ms)
+    }
+
+    pub(super) fn reserve_storage(
+        &mut self,
+        next: &mut Snapshot,
+        protected: &str,
+        now_ms: u64,
+    ) -> Result<(), ClaimError> {
+        let HostSettings::PerJob(settings) = &self.settings else {
+            unreachable!()
+        };
+        let default_cap = settings.workspace_disk_cap_bytes;
         // Sandboxes without the registered-host storage gate still persist the
         // same promises. Registered hosts never admit without trusted probes.
         if !self.storage_enforced() {
@@ -105,7 +118,8 @@ impl Host {
         let control = self.job_storage.clone().ok_or(RefusalCause::Storage)?;
         let mut attempted = std::collections::BTreeSet::new();
         loop {
-            let mut reserved = 0u64;
+            let mut reserved =
+                super::images::reserved_bytes(&next.per_job).ok_or(RefusalCause::Storage)?;
             for (id, disk) in &mut next.per_job.disks {
                 let active = !disk.deleted
                     && (disk.attached_job.is_some()
@@ -164,7 +178,7 @@ impl Host {
             {
                 return Ok(());
             }
-            if !self.evict_job_storage(next, disk_id, &*control, &mut attempted)? {
+            if !self.evict_job_storage(next, protected, &*control, &mut attempted)? {
                 return Err(RefusalCause::Storage.into());
             }
         }

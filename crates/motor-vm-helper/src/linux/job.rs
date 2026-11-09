@@ -35,6 +35,10 @@ mod memory;
 mod namespace;
 mod network;
 mod workspace;
+
+pub(super) fn image_copy_exclusive_bytes(file: &File) -> Result<u64> {
+    workspace::exclusive_bytes(file)
+}
 use super::tenant_network::Tap;
 
 pub(super) fn network_allocations() -> Result<Vec<Tap>> {
@@ -121,6 +125,19 @@ pub struct LinuxJobs {
 }
 
 impl LinuxJobs {
+    pub fn images(&mut self, op: crate::images::Operation) -> Result<Response> {
+        op.validate()?;
+        if let crate::images::Operation::Remove(id) = &op {
+            if self
+                .records
+                .values()
+                .any(|r| !r.released && &r.start.image_generation_id == id)
+            {
+                return Err(Error("image generation is held by a VM".into()));
+            }
+        }
+        super::images::handle(op)
+    }
     pub fn create_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
         self.check_workspace_size(request.size_bytes)?;
         workspace::create(&self.workspaces, request, job::WorkspaceRole::Job)
@@ -706,6 +723,10 @@ impl LinuxJobs {
         // records exclude concurrent use by both workspace id and device/inode.
         // A local flock would expire when start returns, not when the VM exits.
         let image = Path::new(job::IMAGES).join(&start.image_generation_id);
+        let hashes: crate::images::Manifest =
+            serde_json::from_reader(fs::trusted_file(&image.join("manifest.json"))?)
+                .map_err(|e| Error(format!("invalid sealed image manifest: {e}")))?;
+        hashes.validate()?;
         let inputs = [
             (fs::trusted_file(&image.join("kernel"))?, "kernel", true),
             (
@@ -725,10 +746,11 @@ impl LinuxJobs {
             ),
         ];
         for (file, _, _) in &inputs {
-            if file.metadata()?.mode() & 0o004 == 0 {
+            if file.metadata()?.mode() & 0o222 != 0 || file.metadata()?.mode() & 0o004 == 0 {
                 return Err(Error("job images must be readable by jailed VMMs".into()));
             }
         }
+        eprintln!("job_backing_files job_id={} generation={} kernel_sha256={} rootfs_sha256={} toolchain_sha256={}", start.job_id, start.image_generation_id, hashes.kernel.sha256, hashes.rootfs.sha256, hashes.toolchain.sha256);
         let binaries = Path::new("/usr/local/lib/firecracker/1.17.0");
         for name in ["jailer", "firecracker"] {
             fs::trusted_file(&binaries.join(name))?;

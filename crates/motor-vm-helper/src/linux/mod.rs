@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod cgroup;
 pub mod fs;
+pub mod images;
 pub mod job;
 pub mod process;
 pub mod server;
@@ -471,6 +472,9 @@ impl Machine for LinuxMachine {
     }
     fn job(&mut self, op: crate::job::Operation, peer: crate::Peer) -> Result<crate::Response> {
         self.jobs.handle(op, peer)
+    }
+    fn images(&mut self, op: crate::images::Operation) -> Result<crate::Response> {
+        self.jobs.images(op)
     }
     fn maintain_jobs(&mut self) -> Result<()> {
         self.jobs.maintain()
