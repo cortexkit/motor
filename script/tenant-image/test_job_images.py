@@ -2,13 +2,13 @@
 """Portable checks for the job-image split; no mounts, image builds or VM boots."""
 
 import hashlib
-import errno
 import json
 import os
 from pathlib import Path
 import runpy
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -46,7 +46,8 @@ class JobImageTests(unittest.TestCase):
             target.chmod(0o700)
             (self.root / "usr/local/bin" / name).symlink_to(f"../lib/node_modules/{name}/bin/{name}.js")
         (self.root / "etc").mkdir()
-        (self.root / "etc/passwd").write_text("motor-job:x:1001:1001::/:/usr/sbin/nologin\n")
+        self.job_uid = os.geteuid() + 1
+        (self.root / "etc/passwd").write_text(f"motor-job:x:{self.job_uid}:1001::/:/usr/sbin/nologin\n")
         (self.stage / "rootfs").write_bytes(b"already packed tenant ext4")
 
     def split(self):
@@ -71,8 +72,7 @@ class JobImageTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
         self.assertEqual(os.readlink(local / "bin/npm"), "../lib/node_modules/npm/bin/npm.js")
         self.assertEqual(stat.S_IMODE((local / "bin/node").stat().st_mode), 0o755)
-        shared = job_images.installer()
-        shared.verify_tool_trees((self.tools,), owner=os.geteuid(), group=os.getegid())
+        job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
         self.assertIn('exec /sbin/motor-job-toolchain-init "$@"', (self.root / "sbin/motor-init").read_text())
         self.assertEqual((self.root / "sbin/motor-job-toolchain-init").read_bytes(),
                          (job_images.HERE / "guest/motor-job-toolchain-init").read_bytes())
@@ -87,7 +87,7 @@ class JobImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unrecognized tenant init"):
             self.split()
 
-    def test_split_removes_access_and_default_acls_without_following_links(self):
+    def test_split_clears_inherited_acls_before_provisioning_without_following_links(self):
         removed = set()
         def attributes(path, **_kwargs):
             return [name for name in ("system.posix_acl_access", "system.posix_acl_default")
@@ -109,7 +109,7 @@ class JobImageTests(unittest.TestCase):
                 with self.subTest(path=path, bit=bit):
                     path.chmod(0o755 | bit)
                     with self.assertRaisesRegex(ValueError, "special toolchain permission"):
-                        job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+                        job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
                     path.chmod(0o755)
 
     def test_verifier_refuses_fifo_and_socket_fixtures(self):
@@ -117,30 +117,108 @@ class JobImageTests(unittest.TestCase):
         fifo = self.tools / "fifo"
         os.mkfifo(fifo, 0o644)
         with self.assertRaisesRegex(ValueError, "unsupported toolchain file type"):
-            job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+            job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
         fifo.unlink()
         sock = self.tools / "socket"
         with socket.socket(socket.AF_UNIX) as server:
             server.bind(str(sock))
             sock.chmod(0o644)
             with self.assertRaisesRegex(ValueError, "unsupported toolchain file type"):
-                job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+                job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
 
     def test_verifier_refuses_access_and_default_acl_fixtures(self):
         self.split()
         leaf = self.tools / "usr/local/bin/node"
         directory = leaf.parent
-        def access(path, name, **_kwargs):
+        original_getxattr = os.getxattr
+        def access(path, name, **kwargs):
             if path == leaf and name == "system.posix_acl_access":
                 return b"fixture access ACL"
-            raise OSError(errno.ENODATA, "no ACL")
+            return original_getxattr(path, name, **kwargs)
         with mock.patch.object(os, "getxattr", side_effect=access), \
              self.assertRaisesRegex(ValueError, "plainly world-readable"):
-            job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+            job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
         with mock.patch.object(os, "listxattr", side_effect=lambda path, **_kwargs:
                                ["system.posix_acl_default"] if path == directory else []), \
              self.assertRaisesRegex(ValueError, "default toolchain ACL"):
-            job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+            job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
+
+    def test_cargo_lower_acls_use_guest_uid_and_cover_every_descendant(self):
+        self.job_uid = 54321
+        (self.root / "etc/passwd").write_text(f"motor-job:x:{self.job_uid}:1001::/:/usr/sbin/nologin\n")
+        self.split()
+        for name in ("registry", "git"):
+            tree = self.tools / "usr/local/lib/motor/cargo" / name
+            nested = tree / "nested/deeper"
+            nested.mkdir(parents=True)
+            (nested / "source").write_text("read only\n")
+            (nested / "source").chmod(0o644)
+            (nested / "executable").write_text("tool\n")
+            (nested / "executable").chmod(0o755)
+            (nested / "link").symlink_to("source")
+        walk = job_images.installer().tool_tree_entries
+        job_images.provision_cargo_acls(self.tools, self.job_uid, walk)
+        job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
+        undefined = 0xffffffff
+        for name in ("registry", "git"):
+            tree = self.tools / "usr/local/lib/motor/cargo" / name
+            for path in walk(tree):
+                if path.is_symlink():
+                    continue
+                raw = os.getxattr(path, job_images.ACL_ACCESS)
+                self.assertEqual(raw[:4], b"\x02\x00\x00\x00")
+                executable = path.is_dir() or path.name == "executable"
+                permissions = 5 if executable else 4
+                self.assertEqual(list(struct.iter_unpack("<HHI", raw[4:])),
+                                 [(1, 7 if executable else 6, undefined), (2, permissions, self.job_uid),
+                                  (4, permissions, undefined), (16, permissions, undefined),
+                                  (32, permissions, undefined)])
+                if path.is_dir():
+                    default = os.getxattr(path, job_images.ACL_DEFAULT)
+                    self.assertEqual(list(struct.iter_unpack("<HHI", default[4:])),
+                                     [(1, 7, undefined), (2, 5, self.job_uid), (4, 5, undefined),
+                                      (16, 5, undefined), (32, 5, undefined)])
+        for name in ("rustup", "cargo/bin", "bun/bin"):
+            path = self.tools / "usr/local/lib/motor" / name
+            self.assertIsNone(job_images.read_acl(path, job_images.ACL_ACCESS))
+            self.assertIsNone(job_images.read_acl(path, job_images.ACL_DEFAULT))
+
+    def test_cargo_acl_exceptions_reject_missing_wrong_extra_and_writable_grants(self):
+        self.split()
+        tree = self.tools / "usr/local/lib/motor/cargo/registry"
+        valid = {name: os.getxattr(tree, name) for name in (job_images.ACL_ACCESS, job_images.ACL_DEFAULT)}
+        wrong_user = bytearray(valid[job_images.ACL_ACCESS])
+        struct.pack_into("<I", wrong_user, 4 + 8 + 4, self.job_uid + 1)
+        writable = bytearray(valid[job_images.ACL_ACCESS])
+        struct.pack_into("<H", writable, 4 + 8 + 2, 7)
+        extra = [(1, 7, 0xffffffff), (2, 5, self.job_uid), (2, 5, self.job_uid + 1),
+                 (4, 5, 0xffffffff), (16, 5, 0xffffffff), (32, 5, 0xffffffff)]
+        extra = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in extra)
+        for name, value in [(job_images.ACL_ACCESS, None), (job_images.ACL_DEFAULT, None),
+                            (job_images.ACL_ACCESS, wrong_user), (job_images.ACL_ACCESS, writable),
+                            (job_images.ACL_DEFAULT, extra)]:
+            with self.subTest(name=name, value=value):
+                for attr, raw in valid.items():
+                    os.setxattr(tree, attr, raw)
+                if value is None:
+                    os.removexattr(tree, name)
+                else:
+                    os.setxattr(tree, name, bytes(value))
+                with self.assertRaisesRegex(ValueError, "Cargo source requires exact"):
+                    job_images.verify_toolchain(self.tools, self.job_uid, owner=os.geteuid(), group=os.getegid())
+
+    def test_job_uid_requires_one_valid_nonroot_guest_account(self):
+        for contents in ("", "motor-job:x:0:0::/:/bin/false\n", "motor-job:x:invalid:1::/:/bin/false\n",
+                         "motor-job:x:4294967295:1::/:/bin/false\n",
+                         "motor-job:x:1:1::/:/bin/false\n" * 2):
+            (self.root / "etc/passwd").write_text(contents)
+            with self.assertRaisesRegex(ValueError, "motor-job uid"):
+                job_images.job_account_uid(self.root)
+
+    def test_source_acl_roots_track_the_runner_layers(self):
+        source = (image.REPO / "crates/motor-runner/src/isolation/cargo_sources.rs").read_text()
+        self.assertIn('["registry", "git"].map', source)
+        self.assertEqual(job_images.CARGO_SOURCES, ("registry", "git"))
 
     def test_job_manifest_matches_helper_schema_and_hashes_real_files(self):
         (self.stage / "kernel").mkdir()
