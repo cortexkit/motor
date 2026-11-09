@@ -232,6 +232,9 @@ pub struct Host {
     host_resources: Option<jobs::HostResources>,
 }
 impl Host {
+    pub(crate) fn journal_directory(&self) -> Option<std::path::PathBuf> {
+        self.journal.directory()
+    }
     pub fn new(
         tenants: BTreeMap<String, Tenant>,
         snapshot: Snapshot,

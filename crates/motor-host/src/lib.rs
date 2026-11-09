@@ -14,6 +14,7 @@ pub mod journal;
 mod lost_diagnostics;
 pub mod metrics;
 mod relay;
+mod replay;
 pub mod sandbox;
 pub mod server;
 pub mod state;

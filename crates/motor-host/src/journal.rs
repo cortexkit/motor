@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 pub trait Journal: Send {
     fn store(&mut self, snapshot: &Snapshot) -> io::Result<()>;
+    fn directory(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// A rename publishes a complete snapshot; syncing the directory makes the
@@ -57,6 +60,9 @@ fn archive_name(request: &crate::billing::Request) -> String {
 }
 
 impl Journal for FileJournal {
+    fn directory(&self) -> Option<PathBuf> {
+        self.path.parent().map(Path::to_path_buf)
+    }
     fn store(&mut self, snapshot: &Snapshot) -> io::Result<()> {
         let directory = self
             .path
