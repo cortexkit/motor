@@ -145,6 +145,13 @@ def log_directory():
     return HOME / "Library/Logs/motor-runner"
 
 
+def connect_link():
+    # ck-motor's SSH session runs `~/.cargo/bin/motor-runner connect ...` as
+    # motor (crates/motor-module/src/transport.rs), the same command it uses for
+    # Linux and Windows runners, so the installed runner must be reachable there.
+    return HOME / ".cargo/bin/motor-runner"
+
+
 def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metrics_host_id=None, data_volume=None):
     # Advertise 128 MiB returns with a shared 512 MiB disk budget for the two VMs.
     plist = {
@@ -654,6 +661,8 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
         errors.append("legacy LaunchDaemon plist must be removed; rerun install")
     if (config / "vm.toml").read_text() != vm_configuration(image, helper, state_root / "tools", manifest):
         errors.append("VM configuration differs from installed pins")
+    if connect_link().is_symlink() is False or os.readlink(connect_link()) != str(config / "motor-runner"):
+        errors.append("ck-motor's connect path " + str(connect_link()) + " must link to the installed runner; rerun install")
     socket = state_root / instance / "runner.sock"
     if not socket.exists():
         errors.append("runner socket is missing; wait for the Aqua LaunchAgent after restarting")
@@ -781,10 +790,14 @@ def install(args, manifest):
                  "automount_managed": bool(args.data_volume)}
     if args.signing_team:
         installed["signing_team"] = args.signing_team
-    for directory in (HOME / "Library", PLIST.parent):
+    for directory in (HOME / "Library", PLIST.parent, HOME / ".cargo", connect_link().parent):
         directory.mkdir(parents=True, exist_ok=True)
         os.chown(directory, account.pw_uid, account.pw_gid)
         directory.chmod(0o755)
+    if connect_link().is_symlink() or connect_link().exists():
+        connect_link().unlink()
+    connect_link().symlink_to(CONFIG / "motor-runner")
+    os.lchown(connect_link(), account.pw_uid, account.pw_gid)
     if args.data_volume:
         log_directory().mkdir(parents=True, exist_ok=True)
         os.chown(log_directory(), account.pw_uid, account.pw_gid)

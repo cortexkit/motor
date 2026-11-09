@@ -334,6 +334,9 @@ class InstallerTests(unittest.TestCase):
             self.skipTest("temporary path exceeds this platform's AF_UNIX path limit")
         self.addCleanup(self.socket.close)
         self.socket_path.chmod(0o600)
+        self.connect = self.root / "home/.cargo/bin/motor-runner"
+        self.connect.parent.mkdir(parents=True)
+        self.connect.symlink_to(self.config / "motor-runner")
         self.patches = [patch.object(install, "internal_volume", return_value=True),
                         patch.object(install, "entitlement", return_value=True),
                         patch.object(install, "tool_errors", return_value=[]),
@@ -344,7 +347,8 @@ class InstallerTests(unittest.TestCase):
                          patch.object(image, "agent_requirement", return_value=self.requirement),
                          patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "no-timeout")),
                          patch.object(install, "run", side_effect=self.command),
-                         patch.dict(install.os.environ, {"SUDO_USER": "operator"})]
+                         patch.dict(install.os.environ, {"SUDO_USER": "operator"}),
+                         patch.object(install, "HOME", self.root / "home")]
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
@@ -363,6 +367,13 @@ class InstallerTests(unittest.TestCase):
 
     def test_valid_installed_fixture_passes(self):
         self.assertEqual(self.check(), [])
+
+    def test_check_requires_the_connect_link_to_the_installed_runner(self):
+        # ck-motor's SSH session runs ~/.cargo/bin/motor-runner as motor.
+        self.connect.unlink()
+        self.assertIn("connect path", " ".join(self.check()))
+        self.connect.symlink_to(self.root / "elsewhere/motor-runner")
+        self.assertIn("connect path", " ".join(self.check()))
 
     def test_no_aqua_session_reports_restart_even_without_socket(self):
         self.socket_path.unlink()
@@ -506,6 +517,7 @@ class InstallerTests(unittest.TestCase):
                                metrics_endpoint='https://metrics.example', metrics_host_id='monitor-1')
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         install.LEGACY_PLIST.touch()
+        self.connect.unlink()
         output = io.StringIO()
         with patch.multiple(install, CONFIG=self.config, PLIST=self.plist, SSHD=self.sshd, SSH_ROOT=self.ssh, HOME=self.root / "home"), \
                 patch.object(install, "create_account", return_value=account), patch.object(install.os, "chown") as chown, \
@@ -517,6 +529,7 @@ class InstallerTests(unittest.TestCase):
             install.install(args, self.manifest)
             install.install(args, self.manifest)
         self.assertFalse(install.LEGACY_PLIST.exists())
+        self.assertEqual(os.readlink(self.connect), str(self.config / "motor-runner"))
         self.assertEqual(self.plist.stat().st_mode & 0o777, 0o644)
         bootstraps = [call.args for call in run.call_args_list if call.args[:2] == ("/bin/launchctl", "bootstrap")]
         self.assertEqual(bootstraps, [("/bin/launchctl", "bootstrap", f"gui/{account.pw_uid}", self.plist)])

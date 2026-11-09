@@ -289,7 +289,9 @@ native launchd behavior. Verify refusal on a real host with the disk unmounted
 before relying on the missing-disk protection.
 
 The installer creates `motor` if absent and refuses an existing admin motor
-account. It installs the runner/helper under `/Library/Application Support/Motor`,
+account. It links `/Users/motor/.cargo/bin/motor-runner` to the installed runner,
+because ck-motor's SSH session runs `~/.cargo/bin/motor-runner connect` as motor,
+and `--check` refuses a missing or different link. It installs the runner/helper under `/Library/Application Support/Motor`,
 **re-signs the installed VM-creating helper on every install/update**, and verifies
 its virtualization entitlement. Prep binaries and libraries are copied under
 `<state_root>/tools`, with all four executable hashes checked before and after
