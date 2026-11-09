@@ -14,6 +14,121 @@ const CAP: u64 = 1024 * 1024 * 1024;
 const FLOOR: u64 = 4096;
 const JOB_BYTES: u64 = REPLAY_RESERVATION_BYTES + motor_host::jobs::SPOOL_LIMIT;
 
+fn fill_source_slot() -> crate::jobs::fill_source::Slot {
+    use crate::jobs::fill_source::{Request, Slot};
+    Slot {
+        request: Request {
+            account: job(JOB).sub,
+            repository_root: "/home/repository".into(),
+            integration_tip: "a".repeat(40),
+            mem_mib: 100,
+            observed_ms: AT,
+        },
+        generation: "source".into(),
+        source: motor_protocol::FillSource {
+            repository_root: "/home/repository".into(),
+            integration_tip: "a".repeat(40),
+            bundles: vec![],
+            git_dependencies: vec![],
+        },
+        bytes: 1,
+        last_fill_started_ms: None,
+    }
+}
+
+#[test]
+fn source_slot_growth_and_atomic_replacement_are_both_reserved_before_a_fill() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + 3 * CAP - 2);
+    enable(&mut h, &storage);
+    let slot = fill_source_slot();
+    h.snapshot
+        .per_job
+        .export_tips
+        .insert("export".into(), slot.request.clone());
+    h.snapshot
+        .per_job
+        .fill_sources
+        .insert("source".into(), slot);
+    assert!(h
+        .reserve_fill(&job(JOB).sub, "repo", 100, AT)
+        .unwrap()
+        .is_none());
+    assert_eq!(h.snapshot.per_job.fill_sources.len(), 1);
+    storage.free.store(FLOOR + 3 * CAP - 1, Ordering::SeqCst);
+    assert!(h
+        .reserve_fill(&job(JOB).sub, "repo", 100, AT)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn a_new_fill_reservation_cannot_evict_the_source_it_will_need() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + 2 * CAP - 2);
+    enable(&mut h, &storage);
+    let slot = fill_source_slot();
+    let repository = crate::jobs::fill_source::repository_key(&slot.request.repository_root);
+    h.snapshot
+        .per_job
+        .fill_sources
+        .insert("source".into(), slot);
+    assert!(h
+        .reserve_fill(&job(JOB).sub, &repository, 100, AT)
+        .unwrap()
+        .is_none());
+    assert_eq!(h.snapshot.per_job.fill_sources.len(), 1);
+}
+
+#[test]
+fn a_replacement_export_reservation_keeps_the_older_slot_if_storage_is_insufficient() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(u64::MAX);
+    enable(&mut h, &storage);
+    h.claim(job(JOB), AT).unwrap();
+    let slot = fill_source_slot();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/exec-remote-v1/frames/run.json");
+    let motor_protocol::Frame::Run(mut run) =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    run.repository_root = slot.request.repository_root.clone();
+    run.integration_tip = "b".repeat(40);
+    h.snapshot.per_job.fill_sources.insert(
+        crate::jobs::fill_source::key(&slot.request.account, &slot.request.repository_root),
+        slot,
+    );
+    storage
+        .free
+        .store(FLOOR + 2 * CAP + JOB_BYTES, Ordering::SeqCst);
+    h.note_fill_source(JOB, &run, AT).unwrap();
+    assert!(h.snapshot.per_job.export_tips.is_empty());
+    assert_eq!(h.snapshot.per_job.fill_sources.len(), 1);
+}
+
+#[test]
+fn pressure_evicts_an_idle_repository_source_and_its_payload_before_refusing_a_job() {
+    let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+    let mut h = durable_host(scratch.path(), 10_000);
+    let storage = Storage::new(FLOOR + CAP + JOB_BYTES);
+    enable(&mut h, &storage);
+    let slot = fill_source_slot();
+    let path =
+        crate::jobs::fill_source::directory(&h.journal_directory().unwrap(), &slot.generation);
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("0"), b"x").unwrap();
+    h.snapshot
+        .per_job
+        .fill_sources
+        .insert("source".into(), slot);
+    assert!(h.claim(job(JOB), AT).is_ok());
+    assert!(h.snapshot.per_job.fill_sources.is_empty());
+    assert!(!path.exists());
+    assert!(storage.evicted.lock().unwrap().is_empty());
+}
+
 #[test]
 fn fill_storage_uses_the_same_growth_promises_as_run_claims() {
     let mut h = memory_host(10_000);

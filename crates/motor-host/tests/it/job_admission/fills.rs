@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "linux")]
+use motor_host::state::jobs::fills::Reservation;
 use motor_host::{
     helper::Control,
     jobs::{
@@ -115,6 +117,87 @@ struct Guest {
     success: bool,
     calls: AtomicUsize,
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_write_samples_are_log_only_and_never_change_heartbeat_metrics_or_billing() {
+    struct Samples(Option<u64>);
+    impl FillGuest for Samples {
+        fn candidates(&self) -> anyhow::Result<Vec<Candidate>> {
+            Guest {
+                success: true,
+                calls: AtomicUsize::new(0),
+            }
+            .candidates()
+        }
+        fn initialize(
+            &self,
+            _: &Reservation,
+            _: &Assignment,
+            _: &dyn Control,
+            _: &Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn run(&self, _: &Reservation, _: &dyn Control) -> anyhow::Result<Publication> {
+            Ok(Publication {
+                have: pins(),
+                base_published: false,
+                cache_write_keys: self.0,
+            })
+        }
+    }
+    let run = |samples| {
+        let helper = Arc::new(Helper::default());
+        let runtime =
+            motor_host::server::Runtime::new("host".into(), memory_host(10_000), helper.clone());
+        let mut scheduler = Scheduler::new(Arc::new(Samples(samples)));
+        scheduler
+            .tick(runtime.host.clone(), helper.clone(), Arc::new(Images), AT)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !runtime
+            .host
+            .lock()
+            .unwrap()
+            .snapshot
+            .per_job
+            .fills
+            .is_empty()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            scheduler
+                .tick(runtime.host.clone(), helper.clone(), Arc::new(Images), AT)
+                .unwrap();
+            std::thread::yield_now();
+        }
+        let (snapshot, heartbeat) = {
+            let mut host = runtime.host.lock().unwrap();
+            assert!(host.snapshot.billing.is_empty());
+            assert!(host.snapshot.outbox.is_empty());
+            assert!(host.snapshot.per_job.bases.is_empty());
+            let memory = host.free_mem_mib(AT);
+            (
+                serde_json::to_value(&host.snapshot).unwrap(),
+                serde_json::to_value(host.heartbeat(AT, memory, true)).unwrap(),
+            )
+        };
+        assert_eq!(*helper.finishes.lock().unwrap(), [false]);
+        let metrics = motor_host::metrics::Sampler::default()
+            .sample(&runtime, std::path::Path::new("/"), AT)
+            .unwrap();
+        let encoded = metrics.encode(AT).unwrap();
+        assert!(!String::from_utf8(encoded).unwrap().contains("cache_write"));
+        let metrics = serde_json::to_value(metrics).unwrap();
+        (
+            snapshot,
+            heartbeat,
+            metrics["tenants"].clone(),
+            metrics["runners"].clone(),
+        )
+    };
+    assert_eq!(run(None), run(Some(u64::MAX)));
+}
 impl FillGuest for Guest {
     fn candidates(&self) -> anyhow::Result<Vec<Candidate>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -148,7 +231,11 @@ impl FillGuest for Guest {
         _: &dyn Control,
     ) -> anyhow::Result<Publication> {
         anyhow::ensure!(self.success, "fill command failed");
-        Ok(Publication { have: pins() })
+        Ok(Publication {
+            cache_write_keys: None,
+            have: pins(),
+            base_published: true,
+        })
     }
 }
 

@@ -18,6 +18,10 @@ pub(super) const WARM_WORKSPACE_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fill_sources: BTreeMap<String, crate::jobs::fill_source::Slot>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub export_tips: BTreeMap<String, crate::jobs::fill_source::Request>,
     /// The helper's store may rotate while the kept tenant disk is unused.
     /// Tenant startup must install the current sets before clearing this fence.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -39,6 +43,8 @@ pub struct Ledger {
 impl Ledger {
     pub fn is_empty(&self) -> bool {
         !self.tenant_rollback_pending
+            && self.fill_sources.is_empty()
+            && self.export_tips.is_empty()
             && !self.dax_failed
             && self.fills.is_empty()
             && self.disks.is_empty()

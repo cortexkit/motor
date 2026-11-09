@@ -313,6 +313,13 @@ pub struct TenantReplayBoundary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum TenantAgentRequest {
+    ExportTip {
+        job_id: Uuid,
+        max_bytes: u64,
+    },
+    Fill {
+        source: crate::FillSource,
+    },
     RecoverWorkspace {
         budget_ms: u64,
     },

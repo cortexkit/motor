@@ -26,6 +26,13 @@ pub struct FileJournal {
 }
 
 impl FileJournal {
+    pub(crate) fn for_export(directory: &Path) -> io::Result<Self> {
+        fs::create_dir_all(directory)?;
+        Ok(Self {
+            path: directory.join("journal.json"),
+            archived: None,
+        })
+    }
     pub fn open(directory: &Path) -> io::Result<(Self, Snapshot)> {
         fs::create_dir_all(directory)?;
         let path = directory.join("journal.json");
@@ -34,6 +41,7 @@ impl FileJournal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Snapshot::default(),
             Err(e) => return Err(e),
         };
+        crate::jobs::fill_source::remove_unreferenced(directory, &snapshot.per_job.fill_sources)?;
         Ok((
             Self {
                 path,

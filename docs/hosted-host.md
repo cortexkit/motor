@@ -331,6 +331,25 @@ attachment slot until admitted again.
 Warm heartbeat entries describe workspace disks, busy while attached or
 quarantined; `tenant_disk` is omitted. Recovery and fills consume capacity too.
 
+### Per-job fill sources
+
+After a job's terminal result is durably stored, the host may ask its VM to
+export the client's default-branch tip and the Git dependency mirrors the fill
+needs. The connected caller receives its terminal result before export begins,
+and billing ends at the terminal, not at VM shutdown. Export may retain the VM's
+memory, CPU permits and workspace disk for up to 300 seconds; failure or timeout
+discards only the new fill source.
+
+The host checks bundle lengths, chunk offsets and SHA-256 before atomically
+replacing its per-account, per-repository source slot. Each slot is capped at
+1 GiB and counts in storage admission; an oversized export is refused, never
+truncated. A fresh Fill disk receives bundles, not a job-written filesystem.
+Only the helper's root-owned disk role enables the Fill guest operation; Job VMs
+refuse it, and Fill VMs refuse Run admission. Current per-job settings have no
+root-owned fixed-path repository allowlist, so these fills write the shared
+compiler cache only and their disks are deleted, not promoted to
+[build bases](compile-cache.md#fixed-paths-and-local-build-bases) that seed later jobs.
+
 ### Root remote-cache credential command
 
 Install or replace the helper's complete set for an account as root:

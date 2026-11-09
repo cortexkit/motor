@@ -1,0 +1,15 @@
+{
+  "op": "fill",
+  "source": {
+    "repository_root": "/Users/example/src/prefrontal",
+    "integration_tip": "2222222222222222222222222222222222222222",
+    "bundles": [
+      {
+        "index": 0,
+        "repository": "/Users/example/src/prefrontal",
+        "length": 13,
+        "sha256": "0b83970f1e3bbe340877a7f13fa55b521e6f884fbaf4404d315199d9eb585237"
+      }
+    ]
+  }
+}

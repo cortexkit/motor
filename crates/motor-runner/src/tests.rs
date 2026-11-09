@@ -65,6 +65,8 @@ mod declared_fills;
 mod dependency_writer;
 #[path = "tests/disk_pressure.rs"]
 mod disk_pressure;
+#[path = "tests/fill_source.rs"]
+mod fill_source;
 #[path = "tests/fixture_cleanup.rs"]
 mod fixture_cleanup;
 #[path = "tests/gate_priority.rs"]

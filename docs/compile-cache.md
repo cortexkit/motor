@@ -308,6 +308,15 @@ foreground jobs still run. Test: `unavailable_writer_account_disables_fills_and_
 
 ## Fixed paths and local build bases
 
+On per-job hosts, fills receive an exported default-branch tip and the Git
+dependency mirrors the fill needs through verified bundles on a fresh Fill
+disk. They never mount a job-written filesystem. Current per-job settings have
+no root-owned fixed-path repository allowlist, so per-job fills write the shared
+compiler cache only; their disks are deleted, not promoted to local build bases
+that seed later jobs.
+See [per-job fill sources](hosted-host.md#per-job-fill-sources) for export limits,
+storage accounting and VM lifetime.
+
 ### Enablement and paths
 
 This separate, Linux-only optimization is off by default. Provisioning's

@@ -1,5 +1,4 @@
-//! Host-side fill lifecycle. The guest's trusted-source operation is not yet
-//! available; production disables scheduling rather than booting an empty fill.
+//! Host-side fill lifecycle, isolated from billable job executions.
 use super::{Assignment, Resources};
 use crate::{
     helper::Control,
@@ -21,6 +20,8 @@ pub struct Candidate {
 
 pub struct Publication {
     pub have: Vec<motor_protocol::MirrorRef>,
+    pub base_published: bool,
+    pub cache_write_keys: Option<u64>,
 }
 
 /// The missing runner operation must obtain trusted repository objects without
@@ -130,7 +131,21 @@ impl Scheduler {
             } else {
                 None
             };
-            if let Some(publication) = publication {
+            if let Some(publication) = &publication {
+                if let Some(samples) = publication.cache_write_keys.filter(|samples| *samples > 0) {
+                    tracing::info!(
+                        fill_id = fill.fill.fill_id,
+                        guest_reported_cache_write_samples = samples,
+                        "fill_cache_writes"
+                    );
+                }
+                tracing::info!(
+                    fill_id = fill.fill.fill_id,
+                    base_published = publication.base_published,
+                    "fill_completed"
+                );
+            }
+            if let Some(publication) = publication.filter(|p| p.base_published) {
                 host.lock()
                     .expect("host lock")
                     .fill_publication(&fill.fill.fill_id, publication.have)?;
@@ -209,5 +224,123 @@ impl Scheduler {
         });
         self.worker = Some(rx);
         Ok(())
+    }
+}
+
+pub struct BundleFillGuest {
+    pub host: Arc<Mutex<Host>>,
+}
+impl FillGuest for BundleFillGuest {
+    fn candidates(&self) -> Result<Vec<Candidate>> {
+        let host = self.host.lock().expect("host lock");
+        let now = crate::server::unix_ms();
+        Ok(host
+            .snapshot
+            .per_job
+            .fill_sources
+            .values()
+            .filter(|slot| {
+                slot.last_fill_started_ms.is_none_or(|at| {
+                    now.saturating_sub(at.min(now)) >= super::fill_source::REFILL_INTERVAL_MS
+                })
+            })
+            .map(|slot| Candidate {
+                account: slot.request.account.clone(),
+                repository_key: super::fill_source::repository_key(&slot.request.repository_root),
+                mem_mib: slot.request.mem_mib,
+                last_active_ms: slot.request.observed_ms,
+            })
+            .collect())
+    }
+    fn initialize(
+        &self,
+        fill: &Reservation,
+        assignment: &Assignment,
+        control: &dyn Control,
+        start_reply: &serde_json::Value,
+    ) -> Result<()> {
+        use anyhow::{ensure, Context};
+        use serde_json::json;
+        let tap = start_reply["tap_index"]
+            .as_u64()
+            .filter(|n| (1..=254).contains(n))
+            .context("missing fill network allocation")?;
+        let mut request = assignment.guest_init.clone();
+        request["op"] = json!("attach_tenant");
+        request["generation"] = json!(1);
+        request["unix_ms"] = json!(crate::server::unix_ms());
+        request["seed"] = json!(motor_lease::base64url(&rand::random::<[u8; 32]>()));
+        request["address"] = json!(format!("10.200.{tap}.2/30"));
+        request["gateway"] = json!(format!("10.200.{tap}.1"));
+        ensure!(
+            request.get("recovery_required").is_none()
+                && request.get("recovery_budget_ms").is_none(),
+            "fill cannot recover a job disk"
+        );
+        let reply = control.job_admin(&fill.fill.fill_id, &request)?;
+        ensure!(
+            reply["ok"] == true,
+            "fill initialization refused: {}",
+            reply["error"]
+        );
+        Ok(())
+    }
+    fn run(&self, fill: &Reservation, control: &dyn Control) -> Result<Publication> {
+        use anyhow::{ensure, Context};
+        let (source, mut files) = {
+            let host = self.host.lock().expect("host lock");
+            let slot = host
+                .snapshot
+                .per_job
+                .fill_sources
+                .values()
+                .find(|slot| {
+                    slot.request.account == fill.fill.account
+                        && super::fill_source::repository_key(&slot.request.repository_root)
+                            == fill.fill.repository_key
+                })
+                .context("fill source evicted")?;
+            let directory = super::fill_source::directory(
+                &host.journal_directory().context("fill source journal")?,
+                &slot.generation,
+            );
+            // Open every file while holding the slot pointer: a newer export may
+            // unlink the old generation, but cannot change these opened bytes.
+            let files = slot
+                .source
+                .bundles
+                .iter()
+                .map(|bundle| std::fs::File::open(directory.join(bundle.index.to_string())))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            (slot.source.clone(), files)
+        };
+        source.validate(motor_protocol::FILL_SOURCE_MAX_BYTES)?;
+        let mut socket = control.job_relay(&fill.fill.fill_id, 54)?;
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(6 * 60 * 60)))?;
+        socket.set_write_timeout(Some(std::time::Duration::from_secs(
+            motor_protocol::FILL_SOURCE_EXPORT_TIMEOUT_S,
+        )))?;
+        crate::helper::write_json(
+            &mut socket,
+            &serde_json::json!({"op":"fill","source":source}),
+        )?;
+        super::fill_source::send(&mut socket, &source, &mut files)?;
+        let reply = crate::helper::read_json(&mut socket)?;
+        ensure!(reply["ok"] == true, "fill refused: {}", reply["error"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while control.adopt_job(&fill.fill.fill_id)? {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "fill did not power off"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(Publication {
+            cache_write_keys: reply["cache_write_keys"]
+                .as_u64()
+                .filter(|samples| *samples > 0),
+            have: serde_json::from_value(reply["have"].clone())?,
+            base_published: reply["base_published"] == true,
+        })
     }
 }

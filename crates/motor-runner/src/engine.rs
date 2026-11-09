@@ -3669,6 +3669,129 @@ impl Runner {
         }
         true
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn export_fill_source(
+        &self,
+        id: Uuid,
+        directory: &Path,
+        cap: u64,
+    ) -> io::Result<motor_protocol::FillSource> {
+        let request = {
+            let inner = self.core.inner.lock().unwrap();
+            let job = inner
+                .jobs
+                .get(&id)
+                .ok_or_else(|| invalid("unknown export job"))?;
+            if !self.config().per_job || job.base || job.terminal.is_none() {
+                return Err(invalid("export requires a completed job VM job"));
+            }
+            job.request
+                .clone()
+                .ok_or_else(|| invalid("missing export request"))?
+        };
+        crate::fill_source::export(
+            &self.core.trees,
+            &request.repository_root,
+            &request.integration_tip,
+            directory,
+            cap,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn import_fill_source(
+        &self,
+        source: &motor_protocol::FillSource,
+        directory: &Path,
+    ) -> io::Result<Option<Uuid>> {
+        crate::fill_source::require_fill_boot()?;
+        self.validate_writer_paths(paths::host_str(&source.repository_root), None, &[])?;
+        crate::fill_source::import(&self.core.trees, source, directory)?;
+        tracing::info!(
+            tip = source.integration_tip,
+            repository_key = workspace::name(&source.repository_root),
+            dependencies = source.git_dependencies.len(),
+            "fill_source_imported"
+        );
+        self.queue_imported_fill(source)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn queue_imported_fill(&self, source: &motor_protocol::FillSource) -> io::Result<Option<Uuid>> {
+        let plan = self.base_plan(&source.repository_root, &source.integration_tip, true);
+        let mut inner = self.core.inner.lock().unwrap();
+        if !self.warm_builds_enabled(&source.integration_tip) {
+            return Err(invalid("fill writer unavailable"));
+        }
+        self.queue_base_planned(
+            &mut inner,
+            &source.repository_root,
+            &source.repository_root,
+            plan,
+        )?;
+        let id = inner
+            .jobs
+            .values()
+            .find(|job| {
+                job.base
+                    && job.terminal.is_none()
+                    && job
+                        .request
+                        .as_ref()
+                        .is_some_and(|r| r.repository_root == source.repository_root)
+            })
+            .map(|job| job.id);
+        if id.is_none()
+            && inner
+                .catalog
+                .repositories
+                .get(&source.repository_root)
+                .is_none_or(|repo| repo.result != Some(RebuildResult::Ok))
+        {
+            return Err(invalid("fill was not queued"));
+        }
+        Ok(id)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fill_settled(&self, id: Uuid, repository: &str) -> io::Result<bool> {
+        let inner = self.core.inner.lock().unwrap();
+        if inner.base_finishes.contains_key(&id) {
+            return Ok(false);
+        }
+        if inner
+            .catalog
+            .repositories
+            .get(repository)
+            .is_none_or(|repository| repository.result != Some(RebuildResult::Ok))
+        {
+            return Err(invalid("fill writer publication failed"));
+        }
+        Ok(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fill_source_pins(
+        &self,
+        source: &motor_protocol::FillSource,
+    ) -> io::Result<Vec<motor_protocol::MirrorRef>> {
+        crate::fill_source::pins(&self.core.trees, source)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fill_write_samples(&self, id: Uuid, repository: &str) -> Option<u64> {
+        let inner = self.core.inner.lock().unwrap();
+        let descriptor = inner.jobs.get(&id)?.writer_descriptor.as_ref()?;
+        let record = inner
+            .catalog
+            .repositories
+            .get(repository)?
+            .publications
+            .get(descriptor)?;
+        let samples = record.keys.len() as u64;
+        (samples > 0).then_some(samples)
+    }
     pub(crate) fn terminal_ready(&self, id: Uuid) -> bool {
         self.core
             .inner
@@ -4414,6 +4537,22 @@ impl Runner {
         request: &Run,
         access: &crate::workspace_access::Repairs,
     ) -> Option<(RefusalReason, String)> {
+        #[cfg(target_os = "linux")]
+        if self.config().tenant_vm {
+            match std::fs::read_to_string("/proc/cmdline") {
+                Ok(line) => {
+                    if let Some(refusal) = crate::fill_source::run_refusal_for_boot(&line) {
+                        return Some(refusal);
+                    }
+                }
+                Err(_) => {
+                    return Some((
+                        RefusalReason::RequestRejected,
+                        "VM boot kind unavailable".into(),
+                    ))
+                }
+            }
+        }
         if self.core.config.per_job
             && (inner.per_job_id != Some(request.job_id)
                 || inner.per_job_workspace.as_ref()
@@ -5416,6 +5555,14 @@ impl Runner {
         Ok(())
     }
     pub(crate) fn allow_prepare(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.config().tenant_vm {
+            if let Some((_, detail)) =
+                crate::fill_source::run_refusal_for_boot(&std::fs::read_to_string("/proc/cmdline")?)
+            {
+                return Err(invalid(detail));
+            }
+        }
         self.ensure_admission_ownership()?;
         if self.core.config.windows_instance() {
             Err(io::Error::new(io::ErrorKind::Unsupported, "Prepare is unsupported by the Windows instance; caller workspaces are never materialized on the host"))
