@@ -260,11 +260,20 @@ async fn drop_failures_release_only_the_drop_fence() {
         );
     }
     fs::write(runner.trash(), "not a directory").unwrap();
+    #[cfg(target_os = "linux")]
+    let intent = seed_intent(&runner, Path::new(&f.key));
     assert!(runner.drop_workspace(&f.key).await.is_err());
+    #[cfg(target_os = "linux")]
+    assert!(
+        intent.exists(),
+        "failed drop must retain recovery authority"
+    );
     assert!(!runner.core.inner.lock().unwrap().dropping.contains(&f.key));
     assert!(Path::new(&f.key).exists());
     fs::remove_file(runner.trash()).unwrap();
     assert!(runner.drop_workspace(&f.key).await.unwrap().dropped);
+    #[cfg(target_os = "linux")]
+    assert!(!intent.exists());
 }
 
 #[tokio::test]

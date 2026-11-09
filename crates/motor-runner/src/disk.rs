@@ -2144,6 +2144,13 @@ impl Runner {
                 }
                 Ok(bytes)
             });
+            #[cfg(target_os = "linux")]
+            let deleted = deleted.and_then(|bytes| {
+                if candidate.workspace.is_some() {
+                    crate::seed::forget(&self.core.trees.state, &candidate.path)?;
+                }
+                Ok(bytes)
+            });
             self.record_disk_removal(&candidate, deleted, cache_cleared, report);
             free = probe()?;
             if free >= soft && !sweep_idle_workspaces && !self.core.config.boat_profile {

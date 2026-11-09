@@ -323,6 +323,131 @@ async fn isolated_seed_base_is_warm_and_copy_on_write() {
     assert_eq!(fs::read(current.join("base.json")).unwrap(), record);
 }
 
+async fn configured_tool_change(kind: &str) {
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Logs::default();
+    if kind == "wrapper" {
+        tracing::subscriber::set_global_default(motor_protocol::logging::LineSubscriber::new(
+            "[runner]",
+            logs.clone(),
+        ))
+        .unwrap();
+    }
+    let (f, config, _) = fixture();
+    let rustc = Command::new("rustc").arg("-vV").output().unwrap();
+    assert!(rustc.status.success());
+    let version = String::from_utf8(rustc.stdout).unwrap();
+    let triple = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let configuration = |changed: bool| match kind {
+        "linker" => format!(
+            "[target.{triple}]\nlinker = {:?}\n",
+            if changed { "/usr/bin/cc" } else { "cc" }
+        ),
+        "wrapper" => format!(
+            "[build]\nrustc-wrapper = {:?}\n",
+            if changed { "/usr/bin/env" } else { "/bin/env" }
+        ),
+        "rustflags" => format!(
+            "[build]\nrustflags = [\"--cfg\", {:?}]\n",
+            if changed { "seed_job" } else { "seed_base" }
+        ),
+        _ => unreachable!(),
+    };
+    save(&f.main, ".cargo/config.toml", &configuration(false));
+    if kind == "linker" {
+        // A binary must exercise the configured linker, even if Cargo can keep
+        // library units fresh when only the final linking command changes.
+        save(
+            &f.main,
+            "stable/src/main.rs",
+            "fn main() { assert_eq!(seed_stable::value(), 42); }\n",
+        );
+    }
+    let base = snapshot(&f);
+    let runner = base_store_runner(config);
+    fill(&f, &runner).await;
+    save(&f.main, ".cargo/config.toml", &configuration(true));
+    assert_ne!(snapshot(&f), base);
+    let (id, output) = run(&f, &runner, kind, BUILD).await;
+    if kind == "linker" {
+        assert!(
+            runner.job_log(id).seed_build.lock().unwrap().is_some(),
+            "must exercise a real seed: {output}"
+        );
+        assert!(
+            output.lines().any(
+                |line| serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                    value["reason"] == "compiler-artifact"
+                        && value["target"]["kind"] == serde_json::json!(["bin"])
+                        && value["fresh"] == false
+                })
+            ),
+            "configured linker must rebuild the binary: {output}"
+        );
+        assert!(
+            output.contains("linker=/usr/bin/cc"),
+            "job linker was not used: {output}"
+        );
+    } else {
+        assert_build(
+            &runner,
+            id,
+            &output,
+            &["seed-leaf", "seed-dependent", "seed-stable"],
+            kind != "wrapper",
+        );
+        if kind == "wrapper" {
+            let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            let refusals: Vec<_> = captured
+                .lines()
+                .filter(|line| line.contains("build base seed refused"))
+                .collect();
+            assert_eq!(refusals.len(), 1, "{captured}");
+            assert!(refusals[0].contains("inputs_match=false"), "{captured}");
+            assert!(
+                output.contains("/usr/bin/env"),
+                "job wrapper was not used: {output}"
+            );
+        } else {
+            assert!(
+                output.contains("--cfg seed_job"),
+                "job rustflags were not used: {output}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires root, systemd, motor-cache/motor-job accounts and reflink scratch"]
+async fn isolated_seed_configured_linker_change_rebuilds_binary() {
+    configured_tool_change("linker").await;
+}
+
+#[tokio::test]
+#[ignore = "requires root, systemd, motor-cache/motor-job accounts and reflink scratch"]
+async fn isolated_seed_configured_rustflags_change_rebuilds_units() {
+    configured_tool_change("rustflags").await;
+}
+
+#[tokio::test]
+#[ignore = "requires root, systemd, motor-cache/motor-job accounts and reflink scratch"]
+async fn isolated_seed_configured_rustc_wrapper_refuses_seed_and_builds_cold() {
+    configured_tool_change("wrapper").await;
+}
+
 fn digest_tree(root: &Path) -> BTreeMap<PathBuf, String> {
     fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, String>) {
         for entry in fs::read_dir(path).unwrap() {
