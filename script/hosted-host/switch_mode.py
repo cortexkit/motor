@@ -334,8 +334,7 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
     if expected_commit and install_binaries is None:
         raise ValueError("--expected-commit requires --install-binaries")
     binaries = BinaryInstall(install_binaries, expected_commit) if install_binaries is not None else None
-    scratch = Path(os.environ.get("TMPDIR", "/srv/build/tmp"))
-    with tempfile.TemporaryDirectory(prefix="motor-switch-mode-", dir=scratch) as directory:
+    with tempfile.TemporaryDirectory(prefix="motor-switch-mode-") as directory:
         staged = Path(directory) / "host.json"
         staged.write_text(json.dumps(staged_host))
         validator = Path(install_binaries) / "motor-host" if install_binaries is not None else hosted_host.HOST_BINARY

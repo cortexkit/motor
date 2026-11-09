@@ -15,7 +15,7 @@ import switch_mode as switch
 
 class SwitchModeTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR", "/srv/build/tmp"))
+        self.scratch = tempfile.TemporaryDirectory()
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name)
         self.host_path = self.root / "host.json"
