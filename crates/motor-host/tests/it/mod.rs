@@ -12,6 +12,8 @@ mod enroll;
 mod have_record;
 mod helper;
 mod job_admission;
+#[cfg(target_os = "linux")]
+mod job_contract;
 mod replacement;
 mod resize;
 #[cfg(target_os = "linux")]

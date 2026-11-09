@@ -1188,7 +1188,8 @@ fn set_job_oom_score(pid: u32, host_score: i32, helper_score: i32) -> Result<()>
 /// Git source bundles uploaded by the client use the runner channel, not a
 /// drive. Credentials use a read-only drive,
 /// bound to this boot by a nonce rather than a device letter or virtio serial.
-fn boot_requests(
+#[doc(hidden)]
+pub fn boot_requests(
     start: &Start,
     tap_index: Option<u8>,
     nonce: Option<&str>,
