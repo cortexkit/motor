@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,15 +46,15 @@ def wait_empty(path, mode, timeout):
         time.sleep(min(1, max(0, deadline - time.monotonic())))
 
 
-def replace_json(path, value):
-    # Keep a failed switch drained, with each complete config installed atomically.
+def atomic_file(path, write, metadata):
     path = Path(path)
-    mode = path.stat().st_mode & 0o777
     fd, staged = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as output:
-            os.fchmod(output.fileno(), mode)
-            output.write(json.dumps(value, indent=2) + "\n")
+        with os.fdopen(fd, "wb") as output:
+            if (os.geteuid(), os.getegid()) != (metadata.st_uid, metadata.st_gid):
+                os.fchown(output.fileno(), metadata.st_uid, metadata.st_gid)
+            os.fchmod(output.fileno(), stat.S_IMODE(metadata.st_mode))
+            write(output)
             output.flush()
             os.fsync(output.fileno())
         os.replace(staged, path)
@@ -65,11 +68,161 @@ def replace_json(path, value):
             os.unlink(staged)
 
 
-def wait_started(path, timeout):
+def replace_json(path, value):
+    payload = (json.dumps(value, indent=2) + "\n").encode()
+    atomic_file(path, lambda output: output.write(payload), Path(path).stat())
+
+
+class SavedConfig:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.metadata = self.path.stat()
+        self.original = self.path.read_bytes()
+
+    def restore(self):
+        atomic_file(self.path, lambda output: output.write(self.original), self.metadata)
+
+    def describe(self):
+        try:
+            current = self.path.read_bytes()
+            state = "original" if current == self.original else "changed"
+            parsed = json.loads(current)
+            mode = parsed.get("mode", "tenant") if isinstance(parsed, dict) and self.path.name == "host.json" else "helper"
+            return f"{self.path}: {state} ({mode}) sha256={hashlib.sha256(current).hexdigest()}"
+        except (OSError, ValueError) as error:
+            return f"{self.path}: unreadable ({error})"
+
+
+def digest_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as incoming:
+        for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def copy_atomic(source, target, metadata, *, expected_digest=None):
+    def copy(output):
+        with Path(source).open("rb") as incoming:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                digest.update(chunk)
+                output.write(chunk)
+        if expected_digest is not None and digest.digest() != expected_digest:
+            raise ValueError(f"binary changed since validation: {source}")
+    atomic_file(target, copy, metadata)
+
+
+class BinaryInstall:
+    def __init__(self, directory, expected_commit):
+        if not expected_commit or not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+            raise ValueError("--install-binaries requires --expected-commit with a full lowercase Git SHA")
+        self.files = []
+        for name, target in [("motor-host", hosted_host.HOST_BINARY), ("motor-vm-helper", hosted_host.HELPER_BINARY)]:
+            source, target = Path(directory) / name, Path(target)
+            for path in (source, target):
+                if not stat.S_ISREG(path.lstat().st_mode) or not os.access(path, os.X_OK):
+                    raise ValueError(f"binary must be an executable regular file: {path}")
+            digest = digest_file(source)
+            result = subprocess.run([str(source), "--version"], check=True, capture_output=True, text=True, timeout=10)
+            if not re.fullmatch(rf"{name} \S+ {expected_commit}", result.stdout.strip()):
+                raise ValueError(f"{name} is unstamped or does not report expected commit {expected_commit}: {result.stdout.strip()!r}")
+            if digest_file(source) != digest:
+                raise ValueError(f"binary changed during version validation: {source}")
+            self.files.append((source, target, target.stat(), digest))
+        self.backups = []
+        for source, target, metadata, digest in self.files:
+            fd, name = tempfile.mkstemp(prefix=f"{target.name}.bak-", dir=target.parent)
+            os.close(fd)
+            backup = Path(name)
+            original_digest = digest_file(target)
+            copy_atomic(target, backup, metadata, expected_digest=original_digest)
+            self.backups.append((source, target, backup, metadata, digest, original_digest))
+            print(f"binary rollback copy: {target} -> {backup}")
+
+    def install(self):
+        for source, target, _backup, metadata, digest, _original_digest in self.backups:
+            copy_atomic(source, target, metadata, expected_digest=digest)
+
+    def restore(self):
+        errors = []
+        for _source, target, backup, metadata, _digest, original_digest in self.backups:
+            try:
+                copy_atomic(backup, target, metadata, expected_digest=original_digest)
+            except Exception as error:
+                errors.append(f"restore binary {target} from {backup}: {error}")
+        if errors:
+            raise ValueError("; ".join(errors))
+
+    def describe(self):
+        states = []
+        for _source, target, backup, _metadata, _digest, _original_digest in self.backups:
+            try:
+                current = target.read_bytes()
+                state = "original" if current == backup.read_bytes() else "changed"
+                states.append(f"{target}: {state} sha256={hashlib.sha256(current).hexdigest()} (rollback {backup})")
+            except OSError as error:
+                states.append(f"{target}: unreadable ({error}); rollback {backup}")
+        return "; ".join(states)
+
+
+def service_state(unit):
+    result = subprocess.run(["systemctl", "show", "--property=ActiveState", "--value", unit],
+                            check=True, capture_output=True, text=True, timeout=30)
+    return result.stdout.strip()
+
+
+def restore_previous(configs, *, replaced, host_start_attempted, binaries, admin, registries, helper_socket, timeout):
+    errors = []
+
+    def attempt(label, action):
+        try:
+            action()
+            return True
+        except Exception as error:
+            errors.append(f"{label}: {error}")
+            return False
+
+    if replaced:
+        host_stopped = attempt("stop replacement motor-host", lambda: run("systemctl", "stop", "motor-host.service"))
+        # Recovery must not kill a tenant that the replacement mode already woke.
+        if host_stopped:
+            clean = not host_start_attempted or attempt("clean-stop replacement tenants", lambda: clean_stop_tenants(helper_socket, registries, timeout))
+            if clean:
+                attempt("stop replacement helper", lambda: run("systemctl", "stop", "motor-vm-helper.service"))
+        else:
+            errors.append("helper restart withheld because replacement motor-host did not stop")
+        for config in configs:
+            attempt(f"restore config {config.path}", config.restore)
+    if binaries:
+        attempt("restore binaries", binaries.restore)
+    # start is idempotent when a failed stop left a service running. Always try
+    # both starts, even if one recovery action failed, to avoid leaving an outage.
+    attempt("start original helper", lambda: run("systemctl", "start", "motor-vm-helper.service"))
+    attempt("wait for original helper", lambda: wait_helper_available(helper_socket, next(iter(registries)), timeout))
+    attempt("start original motor-host", lambda: run("systemctl", "start", "motor-host.service"))
+    attempt("wait for original drained host", lambda: wait_started(admin, timeout, restore_drain=True))
+    states = {}
+    for unit in ("motor-host.service", "motor-vm-helper.service"):
+        try:
+            states[unit] = service_state(unit)
+        except Exception as error:
+            states[unit] = f"unknown ({error})"
+        if states[unit] != "active":
+            errors.append(f"{unit} is {states[unit]}")
+    if errors:
+        details = "RESTORATION FAILED: " + "; ".join(errors) + "; services: " + str(states) + "; configs on disk: " + "; ".join(config.describe() for config in configs)
+        return details + ("; binaries on disk: " + binaries.describe() if binaries else "")
+    return "original configs/binaries restored; helper and motor-host started; host remains drained"
+
+
+def wait_started(path, timeout, *, restore_drain=False):
     deadline = time.monotonic() + timeout
     while True:
         try:
             status = hosted_host.admin_exchange({"op": "host_status"}, path, timeout=max(0.001, deadline - time.monotonic()))
+            if restore_drain and status.get("ok") is True and status.get("draining") is not True:
+                status = hosted_host.admin_exchange({"op": "drain_host"}, path)
             if status.get("ok") is not True or status.get("draining") is not True:
                 raise ValueError("restarted host did not retain its drain")
             return
@@ -115,9 +268,16 @@ def wait_helper_exchange(path, request, timeout):
 def wait_helper(path, tenant, timeout):
     # systemd's simple service can be active before the helper has rebound its
     # socket. A stale socket left by the old process is not evidence of readiness.
-    reply = helper_request(path, {"op": "adopt", "tenant": tenant}, timeout, wait=True)
+    reply = wait_helper_available(path, tenant, timeout)
     if reply.get("result") != "tenant" or reply.get("running") is not False:
         raise ValueError(f"restarted helper did not confirm tenant {tenant} stopped: {reply}")
+
+
+def wait_helper_available(path, tenant, timeout):
+    reply = helper_request(path, {"op": "adopt", "tenant": tenant}, timeout, wait=True)
+    if reply.get("result") != "tenant" or type(reply.get("running")) is not bool:
+        raise ValueError(f"helper did not inspect tenant {tenant}: {reply}")
+    return reply
 
 
 def publish_to_helper(path, generation):
@@ -138,7 +298,9 @@ def clean_stop_tenants(path, registries, timeout):
 
 
 def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
-           host_path=HOST_CONFIG, helper_path=hosted_host.HELPER_CONFIG):
+           host_path=HOST_CONFIG, helper_path=hosted_host.HELPER_CONFIG,
+           install_binaries=None, expected_commit=None):
+    configs = (SavedConfig(host_path), SavedConfig(helper_path))
     host = read_json(host_path)
     helper = read_json(helper_path)
     old_mode = host.get("mode", "tenant")
@@ -169,11 +331,15 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
         staged_host.pop("per_job", None)
         # Retain job_vms while the existing rollback stops job VMs and deletes their disks.
         # Removing it early would prevent helper reconciliation of old job records.
+    if expected_commit and install_binaries is None:
+        raise ValueError("--expected-commit requires --install-binaries")
+    binaries = BinaryInstall(install_binaries, expected_commit) if install_binaries is not None else None
     scratch = Path(os.environ.get("TMPDIR", "/srv/build/tmp"))
     with tempfile.TemporaryDirectory(prefix="motor-switch-mode-", dir=scratch) as directory:
         staged = Path(directory) / "host.json"
         staged.write_text(json.dumps(staged_host))
-        run(hosted_host.HOST_BINARY, "check-config", staged)
+        validator = Path(install_binaries) / "motor-host" if install_binaries is not None else hosted_host.HOST_BINARY
+        run(validator, "check-config", staged)
     admin = Path(host["admin_socket"])
     status = hosted_host.admin_exchange({"op": "host_status"}, admin)
     if status.get("draining") is not True:
@@ -182,23 +348,33 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
     wait_empty(admin, old_mode, timeout)
     if mode == "per_job":
         publish_to_helper(host["helper_socket"], generation)
-    run("systemctl", "stop", "motor-host.service")
-    # Prove the tenant stop finished before the helper loses its control channel.
-    # A timeout or unclean-stop.json recording a failed guest filesystem sync
-    # leaves the helper running and placement drained.
-    clean_stop_tenants(host["helper_socket"], registries, timeout)
-    run("systemctl", "stop", "motor-vm-helper.service")
-    replace_json(host_path, staged_host)
-    if staged_helper != helper:
-        replace_json(helper_path, staged_helper)
-    run("systemctl", "start", "motor-vm-helper.service")
-    wait_helper(host["helper_socket"], next(iter(registries)), timeout)
-    if mode == "per_job":
-        run("runuser", "-u", "motor-host", "--", hosted_host.HOST_BINARY,
-            "select-job-images", host_path, generation)
-    run(hosted_host.HOST_BINARY, "check-config", host_path)
-    run("systemctl", "start", "motor-host.service")
-    wait_started(admin, timeout)
+    replaced = host_start_attempted = False
+    try:
+        if binaries:
+            binaries.install()
+        run("systemctl", "stop", "motor-host.service")
+        # Prove tenant clean stop before helper shutdown. Any failed transition
+        # restores the original configuration and resumes the drained services.
+        clean_stop_tenants(host["helper_socket"], registries, timeout)
+        run("systemctl", "stop", "motor-vm-helper.service")
+        replaced = True
+        replace_json(host_path, staged_host)
+        if staged_helper != helper:
+            replace_json(helper_path, staged_helper)
+        run("systemctl", "start", "motor-vm-helper.service")
+        wait_helper(host["helper_socket"], next(iter(registries)), timeout)
+        if mode == "per_job":
+            run("runuser", "-u", "motor-host", "--", hosted_host.HOST_BINARY,
+                "select-job-images", host_path, generation)
+        run(hosted_host.HOST_BINARY, "check-config", host_path)
+        host_start_attempted = True
+        run("systemctl", "start", "motor-host.service")
+        wait_started(admin, timeout)
+    except BaseException as error:
+        restored = restore_previous(configs, replaced=replaced, host_start_attempted=host_start_attempted,
+                                    binaries=binaries, admin=admin, registries=registries,
+                                    helper_socket=host["helper_socket"], timeout=timeout)
+        raise ValueError(f"{error}; {restored}") from error
     print(f"Started {mode} mode; host remains drained. Run a canary lease with "
           f"placement_hint.host={host['host_id']!r}; only after success use hosted_host.py undrain-host.")
 
@@ -216,6 +392,8 @@ def main():
     parser.add_argument("--job-vms-settings", type=Path)
     parser.add_argument("--generation")
     parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--install-binaries", type=Path)
+    parser.add_argument("--expected-commit")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("run as root on the drained host")
@@ -223,8 +401,9 @@ def main():
         parser.error("--timeout must be positive and finite")
     try:
         switch(args.mode, per_job=args.per_job_settings, job_vms=args.job_vms_settings,
-               generation=args.generation, timeout=args.timeout)
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+               generation=args.generation, timeout=args.timeout,
+               install_binaries=args.install_binaries, expected_commit=args.expected_commit)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         parser.exit(1, f"mode switch failed: {error}; do not undrain the host\n")
 
 

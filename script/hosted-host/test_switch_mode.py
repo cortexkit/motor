@@ -35,14 +35,72 @@ class SwitchModeTests(unittest.TestCase):
         self.job_vms.write_text(json.dumps({"workspace_disk_max_bytes": 1024}))
         self.status = {"ok": True, "draining": True, **dict.fromkeys(switch.COUNTS, 0)}
         self.events = []
-        self.command_run = self.patch(switch, "run", side_effect=lambda *args: self.events.append(tuple(map(str, args))))
+        self.services = {"motor-host.service": True, "motor-vm-helper.service": True}
+        self.failure_point = None
+        self.failed = False
+        self.installed = self.root / "installed"
+        self.installed.mkdir()
+        self.old_binaries = {}
+        for name, constant in [("motor-host", "HOST_BINARY"), ("motor-vm-helper", "HELPER_BINARY")]:
+            path = self.installed / name
+            path.write_bytes(f"old {name}".encode())
+            path.chmod(0o755)
+            self.old_binaries[path] = path.read_bytes()
+            self.patch(switch.hosted_host, constant, new=path)
+        self.original_host = self.host_path.read_bytes()
+        self.original_helper = self.helper_path.read_bytes()
+        self.command_run = self.patch(switch, "run", side_effect=self.command)
         self.admin = self.patch(switch.hosted_host, "admin_exchange", side_effect=lambda *_, **__: dict(self.status))
         self.drain = self.patch(switch.hosted_host, "drain_host", side_effect=lambda *_: self.events.append(("fresh-drain",)))
         self.publish = self.patch(switch, "publish_to_helper", side_effect=lambda *args: self.events.append(("publish", *map(str, args))))
         self.real_clean_stop = switch.clean_stop_tenants
-        self.clean_stop = self.patch(switch, "clean_stop_tenants", side_effect=lambda *_: self.events.append(("clean-stop-tenants",)))
+        self.clean_stop = self.patch(switch, "clean_stop_tenants", side_effect=self.stop_tenants)
         self.real_wait_helper = switch.wait_helper
-        self.wait_helper = self.patch(switch, "wait_helper", side_effect=lambda *_: self.events.append(("helper-ready",)))
+        self.wait_helper = self.patch(switch, "wait_helper", side_effect=self.helper_ready)
+        self.real_available = switch.wait_helper_available
+        self.patch(switch, "wait_helper_available", return_value={"result": "tenant", "running": False})
+        self.real_wait_started = switch.wait_started
+        self.patch(switch, "wait_started", side_effect=self.host_ready)
+        self.patch(switch, "service_state", side_effect=lambda unit: "active" if self.services[unit] else "inactive")
+        self.real_replace_json = switch.replace_json
+        self.patch(switch, "replace_json", side_effect=self.replace_config)
+
+    def fault(self, point):
+        if self.failure_point == point and not self.failed:
+            self.failed = True
+            raise OSError(f"injected {point}")
+
+    def command(self, *args):
+        event = tuple(map(str, args))
+        self.events.append(event)
+        if event[0] == "systemctl":
+            action, unit = event[1:]
+            self.services[unit] = action == "start"
+            point = ("host_" if unit == "motor-host.service" else "helper_") + action
+            if point == self.failure_point and not self.failed and action == "start":
+                self.services[unit] = False
+            self.fault(point)
+        elif "select-job-images" in event:
+            self.fault("selection")
+        elif "check-config" in event and event[-1] == str(self.host_path):
+            self.fault("config_check")
+
+    def stop_tenants(self, *_):
+        self.events.append(("clean-stop-tenants",))
+        self.fault("tenant_stop")
+
+    def helper_ready(self, *_):
+        self.events.append(("helper-ready",))
+        self.fault("helper_ready")
+
+    def host_ready(self, path, timeout, **kwargs):
+        if not kwargs.get("restore_drain"):
+            self.fault("drain_check")
+        return self.real_wait_started(path, timeout, **kwargs)
+
+    def replace_config(self, path, value):
+        self.real_replace_json(path, value)
+        self.fault("host_config" if path == self.host_path else "helper_config")
 
     def patch(self, target, name, **kwargs):
         patcher = mock.patch.object(target, name, **kwargs)
@@ -50,10 +108,10 @@ class SwitchModeTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return value
 
-    def perform(self, mode):
+    def perform(self, mode, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             switch.switch(mode, per_job=self.per_job, job_vms=self.job_vms, generation="gen-1",
-                          host_path=self.host_path, helper_path=self.helper_path, timeout=1)
+                          host_path=self.host_path, helper_path=self.helper_path, timeout=1, **kwargs)
         return output.getvalue()
 
     def test_per_job_switch_validates_publishes_selects_and_keeps_placement_drained(self):
@@ -154,7 +212,7 @@ class SwitchModeTests(unittest.TestCase):
     def test_clean_stop_timeout_never_stops_helper_or_rewrites_config(self):
         self.clean_stop.side_effect = TimeoutError("tenant clean stop timed out")
         before = self.host_path.read_bytes()
-        with self.assertRaisesRegex(TimeoutError, "clean stop timed out"):
+        with self.assertRaisesRegex(ValueError, "clean stop timed out"):
             self.perform("per_job")
         self.assertIn(("systemctl", "stop", "motor-host.service"), self.events)
         self.assertNotIn(("systemctl", "stop", "motor-vm-helper.service"), self.events)
@@ -193,7 +251,8 @@ class SwitchModeTests(unittest.TestCase):
                 self.assertEqual(switch.wait_helper_exchange("helper.sock", request, 1), reply)
             self.assertEqual(exchange.call_count, 4)
         with mock.patch.object(switch, "helper_request", return_value=reply) as request:
-            self.real_wait_helper("helper.sock", "tenant", 1)
+            with mock.patch.object(switch, "wait_helper_available", self.real_available):
+                self.real_wait_helper("helper.sock", "tenant", 1)
             self.assertTrue(request.call_args.kwargs["wait"])
 
     def test_helper_start_wait_is_bounded_and_refuses_a_running_tenant(self):
@@ -203,7 +262,185 @@ class SwitchModeTests(unittest.TestCase):
                     switch.wait_helper_exchange("helper.sock", {}, 1)
         with mock.patch.object(switch, "helper_request", return_value={"result": "tenant", "running": True}):
             with self.assertRaisesRegex(ValueError, "did not confirm.*stopped"):
-                self.real_wait_helper("helper.sock", "tenant", 1)
+                with mock.patch.object(switch, "wait_helper_available", self.real_available):
+                    self.real_wait_helper("helper.sock", "tenant", 1)
+
+    def artifacts(self, stamp="a" * 40):
+        directory = self.root / "release"
+        directory.mkdir(exist_ok=True)
+        for name in ("motor-host", "motor-vm-helper"):
+            path = directory / name
+            path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{name} 0.1.0 {stamp}'\n")
+            path.chmod(0o755)
+        return directory
+
+    def assert_restored(self):
+        self.assertTrue(all(self.services.values()), self.services)
+        self.assertEqual(self.host_path.read_bytes(), self.original_host)
+        self.assertEqual(self.helper_path.read_bytes(), self.original_helper)
+        self.assertTrue(self.status["draining"])
+        for path, original in self.old_binaries.items():
+            self.assertEqual(path.read_bytes(), original)
+
+    def assert_failure_restores(self, point):
+        self.failure_point = point
+        with self.assertRaisesRegex(ValueError, f"injected {point}") as raised:
+            self.perform("per_job", install_binaries=self.artifacts(), expected_commit="a" * 40)
+        self.assertTrue(self.failed)
+        self.assert_restored()
+        self.assertIn("original configs/binaries restored", str(raised.exception))
+        starts = [event for event in self.events if event[:2] == ("systemctl", "start")]
+        self.assertEqual(starts[-2:], [("systemctl", "start", "motor-vm-helper.service"),
+                                      ("systemctl", "start", "motor-host.service")])
+
+    def test_host_stop_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("host_stop")
+
+    def test_tenant_stop_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("tenant_stop")
+
+    def test_helper_stop_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("helper_stop")
+
+    def test_host_config_replace_failure_restores_exact_original_files(self):
+        self.assert_failure_restores("host_config")
+
+    def test_helper_config_replace_failure_restores_exact_original_files(self):
+        self.assert_failure_restores("helper_config")
+
+    def test_helper_start_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("helper_start")
+
+    def test_helper_readiness_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("helper_ready")
+
+    def test_image_selection_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("selection")
+
+    def test_config_check_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("config_check")
+
+    def test_host_start_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("host_start")
+
+    def test_drain_check_failure_restores_previous_running_services(self):
+        self.assert_failure_restores("drain_check")
+
+    def test_unclean_tenant_stop_resumes_original_mode_without_stopping_helper(self):
+        self.clean_stop.side_effect = ValueError("tenant stop was not clean")
+        with self.assertRaisesRegex(ValueError, "stop was not clean.*original configs/binaries restored"):
+            self.perform("per_job")
+        self.assert_restored()
+        self.assertNotIn(("systemctl", "stop", "motor-vm-helper.service"), self.events)
+
+    def test_failed_tenant_rollback_switch_restores_original_per_job_mode(self):
+        self.host.update(mode="per_job", per_job={"workspace_disk_cap_bytes": 1024})
+        self.host_path.write_text(json.dumps(self.host))
+        self.original_host = self.host_path.read_bytes()
+        self.failure_point = "drain_check"
+        with self.assertRaisesRegex(ValueError, "injected drain_check"):
+            self.perform("tenant")
+        self.assert_restored()
+
+    def test_binary_install_keeps_rollback_copies_and_installs_complete_files_atomically(self):
+        directory = self.artifacts()
+        old_inodes = {path: path.stat().st_ino for path in self.old_binaries}
+        self.perform("per_job", install_binaries=directory, expected_commit="a" * 40)
+        for path, original in self.old_binaries.items():
+            self.assertEqual(path.read_bytes(), (directory / path.name).read_bytes())
+            self.assertNotEqual(path.stat().st_ino, old_inodes[path])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+            backups = list(path.parent.glob(path.name + ".bak-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original)
+
+    def test_binary_install_rejects_unstamped_mismatched_missing_or_unpinned_artifacts_before_stop(self):
+        for stamp, expected in [("unstamped", "a" * 40), ("b" * 40, "a" * 40), ("a" * 40, None)]:
+            with self.subTest(stamp=stamp, expected=expected):
+                with self.assertRaisesRegex(ValueError, "expected.commit|expected commit"):
+                    self.perform("per_job", install_binaries=self.artifacts(stamp), expected_commit=expected)
+                self.assert_restored()
+                self.assertFalse(any(event[0] == "systemctl" for event in self.events))
+        directory = self.artifacts()
+        (directory / "motor-vm-helper").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.perform("per_job", install_binaries=directory, expected_commit="a" * 40)
+        self.assert_restored()
+
+    def test_partial_binary_install_failure_restores_both_binaries_before_any_service_stop(self):
+        directory = self.artifacts()
+        original_copy = switch.copy_atomic
+
+        def fail_copy(source, target, metadata, **kwargs):
+            original_copy(source, target, metadata, **kwargs)
+            if Path(source) == directory / "motor-vm-helper":
+                raise OSError("binary install failed after rename")
+
+        with mock.patch.object(switch, "copy_atomic", side_effect=fail_copy):
+            with self.assertRaisesRegex(ValueError, "binary install failed.*original configs/binaries restored"):
+                self.perform("per_job", install_binaries=directory, expected_commit="a" * 40)
+        self.assert_restored()
+        self.assertFalse(any(event[:2] == ("systemctl", "stop") for event in self.events))
+
+    def test_binary_changed_after_version_validation_is_not_installed(self):
+        directory = self.artifacts()
+        with contextlib.redirect_stdout(io.StringIO()):
+            binaries = switch.BinaryInstall(directory, "a" * 40)
+        (directory / "motor-host").write_bytes(b"different artifact")
+        with self.assertRaisesRegex(ValueError, "changed since validation"):
+            binaries.install()
+        self.assert_restored()
+
+    def test_restore_failure_names_the_down_service_and_each_on_disk_config(self):
+        original_command = self.command
+
+        def fail_start(*args):
+            if args == ("systemctl", "start", "motor-vm-helper.service"):
+                self.services["motor-vm-helper.service"] = False
+                raise OSError("helper will not start")
+            return original_command(*args)
+
+        self.command_run.side_effect = fail_start
+        with self.assertRaisesRegex(ValueError, "RESTORATION FAILED") as raised:
+            self.perform("per_job")
+        message = str(raised.exception)
+        self.assertIn("motor-vm-helper.service is inactive", message)
+        self.assertIn(f"{self.host_path}: original", message)
+        self.assertIn(f"{self.helper_path}: original", message)
+        self.assertIn(("systemctl", "start", "motor-host.service"), self.events)
+
+    def test_restore_failure_identifies_a_config_that_could_not_be_put_back(self):
+        original_restore = switch.SavedConfig.restore
+
+        def fail_restore(config):
+            if config.path == self.host_path:
+                raise OSError("host config restore denied")
+            return original_restore(config)
+
+        self.failure_point = "selection"
+        with mock.patch.object(switch.SavedConfig, "restore", fail_restore):
+            with self.assertRaisesRegex(ValueError, "RESTORATION FAILED") as raised:
+                self.perform("per_job")
+        self.assertIn(f"{self.host_path}: changed (per_job)", str(raised.exception))
+        self.assertIn(f"{self.helper_path}: original", str(raised.exception))
+        self.assertTrue(all(self.services.values()))
+
+    def test_restore_does_not_stop_helper_when_replacement_host_will_not_stop(self):
+        original_command = self.command
+        self.failure_point = "drain_check"
+
+        def fail_second_stop(*args):
+            if args == ("systemctl", "stop", "motor-host.service") and self.failed:
+                self.services["motor-host.service"] = True
+                raise OSError("replacement host will not stop")
+            return original_command(*args)
+
+        self.command_run.side_effect = fail_second_stop
+        with self.assertRaisesRegex(ValueError, "helper restart withheld"):
+            self.perform("per_job")
+        self.assertEqual(self.clean_stop.call_count, 1)
+        self.assertEqual(self.events.count(("systemctl", "stop", "motor-vm-helper.service")), 1)
+        self.assert_restored()
 
 
 if __name__ == "__main__":

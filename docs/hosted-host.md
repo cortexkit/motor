@@ -359,7 +359,8 @@ Before switching:
    UID range and the host's actual memory budget. Its workspace maximum must
    cover `workspace_disk_cap_bytes`. No resource values are supplied by the
    switching script. Helper startup validates its resource ranges and isolation
-   prerequisites; a refusal leaves the host stopped and drained.
+   prerequisites; a refusal restores the original mode and running services,
+   still drained.
 4. [Drain the host](#drain-the-host-for-an-update), wait for `draining: true`, then
    run from the installed checkout:
 
@@ -368,6 +369,23 @@ Before switching:
      --per-job-settings /absolute/path/per-job.json \
      --job-vms-settings /absolute/path/job-vms.json --generation GENERATION
    ```
+
+   To install a matching binary pair during the switch, add
+   `--install-binaries /absolute/path/release --expected-commit FULL_GIT_SHA`.
+   Both executables must report that exact commit in `--version`; unstamped,
+   missing or mismatched artifacts are refused before any service stops. Build
+   them from the matching checkout:
+
+   ```sh
+   MOTOR_BUILD_COMMIT=FULL_GIT_SHA cargo build --release --locked \
+     -p motor-host -p motor-vm-helper
+   ```
+
+   The switch retains
+   each installed binary in a printed `motor-host.bak-*` or
+   `motor-vm-helper.bak-*` rollback file beside its installed path, then installs
+   the new files with atomic renames. Keep those rollback copies until the
+   canary succeeds. Without the option, installed binaries are unchanged.
 
 The script validates staged host settings with `motor-host check-config`, obtains
 a fresh broker drain acknowledgement, and waits up to `--timeout` seconds (300 by
@@ -386,8 +404,18 @@ the stop reply and the helper's subsequent `adopt` inspection both report
 has not completed a clean stop) or `unclean-stop.json` (a recorded failed guest
 flush) remains. **Only after that proof does it stop the helper service.**
 Never kill the helper or its cgroup while a tenant VM runs. A timeout or dirty
-stop leaves the helper running and the host drained; investigate rather than
-continuing the switch.
+stop aborts the switch and resumes the original services, still drained.
+
+Every failure from the first service-stop attempt triggers restoration and
+exits nonzero. Before config replacement, the original configs remain in place
+and the script starts the helper (an idempotent operation if still running),
+then `motor-host`. After replacement, it stops the replacement host, clean-stops
+any tenant it woke before stopping helper, atomically restores the exact original
+config bytes and any saved binaries, and starts helper then host in the old
+mode. It waits for the restored host's drained admin socket. If restoration
+itself fails, the error names each service's actual state and identifies the
+config and binary files left on disk, with hashes and binary rollback-copy
+paths. Do not undrain; repair the named failure before retrying.
 
 After installing the mode settings, the script starts the helper, then selects
 the initial generation while `motor-host` is stopped:

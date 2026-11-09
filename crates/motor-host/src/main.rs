@@ -71,6 +71,10 @@ struct Binding {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(version) = version_output(std::env::args_os().skip(1)) {
+        println!("{version}");
+        return Ok(());
+    }
     disable_core_dumps()?;
     motor_protocol::logging::init("[motor-host]")?;
     match std::env::args().nth(1).as_deref() {
@@ -304,6 +308,47 @@ async fn main() -> Result<()> {
                 Err(_) => ingress.tls_closed(peer, "timed out"),
             }
         });
+    }
+}
+
+fn version_output(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<String> {
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--version")) || args.next().is_some() {
+        return None;
+    }
+    Some(format!(
+        "motor-host {} {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("MOTOR_BUILD_COMMIT").unwrap_or("unstamped")
+    ))
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn version_is_an_exact_early_flag_and_reports_the_compile_time_stamp() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let output = super::version_output(args(&["--version"])).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "motor-host 0.1.0 {}",
+                option_env!("MOTOR_BUILD_COMMIT").unwrap_or("unstamped")
+            )
+        );
+        for values in [
+            vec![],
+            vec!["host.json"],
+            vec!["--version", "host.json"],
+            vec!["--version-extra"],
+        ] {
+            assert!(super::version_output(args(&values)).is_none());
+        }
     }
 }
 

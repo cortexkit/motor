@@ -31,6 +31,7 @@ TEST_FILES = [
     "script/cache-bench/test_bench.py",
     "script/cache-bench/test_schedule.py",
     "script/hosted-host/test_hosted_host.py",
+    "script/hosted-host/test_switch_mode.py",
     "script/macos-runner/test_macos_runner.py",
     "script/runner/network-check-tests.py",
     "script/runner/test_check_nested_js.py",
