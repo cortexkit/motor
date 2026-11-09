@@ -58,7 +58,15 @@ fn fixture() -> (Fixture, Config, String) {
     assert_eq!(unsafe { libc::geteuid() }, 0, "operator-only fixture");
     let f = Fixture::new();
     // This check precedes any fill or seed: a cold fallback is not a warm proof.
-    let config = base_store_config(&f, BUILD);
+    let mut config = base_store_config(&f, BUILD);
+    config.after_seed = Some(Arc::new(|target| {
+        host_layout("after seed, before build-dir prepare", target);
+        Ok(())
+    }));
+    config.before_seed_launch = Some(Arc::new(|cwd| {
+        host_layout("after sandbox prepare, before launch", &cwd.join("target"));
+        Ok(())
+    }));
     let probe = config
         .state_dir()
         .join(format!("seed-device-{}", Uuid::now_v7()));
@@ -182,7 +190,35 @@ async fn fill(f: &Fixture, runner: &Runner) -> PathBuf {
         current.join("base.json").is_file(),
         "fill must publish, not silently build cold"
     );
+    host_layout("published base", &current.join("target"));
     current
+}
+
+fn host_layout(label: &str, target: &Path) {
+    fn walk(label: &str, path: &Path) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                eprintln!("seed host {label}: {}", entry.path().display());
+                walk(label, &entry.path());
+            } else if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "d")
+            {
+                eprintln!(
+                    "seed host {label} dep-info {}: {}",
+                    entry.path().display(),
+                    fs::read_to_string(entry.path()).unwrap()
+                );
+            }
+        }
+    }
+    let bd = target.join("bd");
+    eprintln!("seed host {label} target={}", target.display());
+    if bd.is_dir() {
+        walk(label, &bd);
+    }
 }
 
 fn artifacts(output: &str) -> BTreeSet<String> {

@@ -304,6 +304,8 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) before_seed_launch: Option<JobWriteHook>,
     #[cfg(test)]
+    pub(crate) after_seed: Option<JobWriteHook>,
+    #[cfg(test)]
     pub(crate) cpu_topology: Option<CpuTopology>,
     #[cfg(test)]
     pub(crate) memory_floor_gib: Option<u64>,
@@ -658,6 +660,8 @@ impl Config {
             seed_without_times: false,
             #[cfg(test)]
             before_seed_launch: None,
+            #[cfg(test)]
+            after_seed: None,
             #[cfg(test)]
             cpu_topology: None,
             #[cfg(test)]
