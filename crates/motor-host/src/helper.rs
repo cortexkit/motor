@@ -11,6 +11,15 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    fn prepare_fill(&self, _fill: &motor_vm_helper::job::Fill) -> Result<()> {
+        anyhow::bail!("fill provisioning unavailable")
+    }
+    fn finish_fill(&self, _fill: &motor_vm_helper::job::Fill, _published: bool) -> Result<bool> {
+        anyhow::bail!("fill completion unavailable")
+    }
+    fn seed_workspace(&self, _seed: &motor_vm_helper::job::Seed) -> Result<()> {
+        anyhow::bail!("base seeding unavailable")
+    }
     fn inspect_job_images(&self, _generation: &str) -> Result<motor_vm_helper::images::Manifest> {
         anyhow::bail!("image publication unavailable")
     }
@@ -302,6 +311,21 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn prepare_fill(&self, fill: &motor_vm_helper::job::Fill) -> Result<()> {
+        self.request(json!({"op":"prepare_fill", "fill":fill}))?;
+        Ok(())
+    }
+    fn finish_fill(&self, fill: &motor_vm_helper::job::Fill, published: bool) -> Result<bool> {
+        let (reply, _) =
+            self.request(json!({"op":"finish_fill", "fill":fill, "published":published}))?;
+        reply["published"]
+            .as_bool()
+            .context("missing fill publication result")
+    }
+    fn seed_workspace(&self, seed: &motor_vm_helper::job::Seed) -> Result<()> {
+        self.request(json!({"op":"seed_workspace", "seed":seed}))?;
+        Ok(())
+    }
     fn inspect_job_images(&self, generation: &str) -> Result<motor_vm_helper::images::Manifest> {
         let (reply, _) =
             self.request(json!({"op":"inspect_job_images", "generation":generation}))?;

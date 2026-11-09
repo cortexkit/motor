@@ -187,6 +187,25 @@ impl Images {
 }
 
 impl Resources for Images {
+    fn acquire_fill(&self, fill: &crate::state::jobs::fills::Reservation) -> Result<Assignment> {
+        let id = fill
+            .image_generation
+            .as_deref()
+            .context("fill has no assigned image")?;
+        anyhow::ensure!(
+            self.host
+                .lock()
+                .expect("host lock")
+                .snapshot
+                .per_job
+                .fills
+                .get(&fill.fill.fill_id)
+                == Some(fill),
+            "fill not durably reserved"
+        );
+        self.prepare_account(id, &fill.fill.account)?;
+        self.assignment(id, &fill.fill.fill_id)
+    }
     fn acquire(&self, execution: &Execution) -> Result<Assignment> {
         let id = execution
             .image_generation

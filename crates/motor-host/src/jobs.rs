@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::PathBuf;
 
+pub mod fills;
 pub mod images;
 
 pub const SPOOL_LIMIT: u64 = 64 * 1024 * 1024;
@@ -21,6 +22,9 @@ pub struct Assignment {
 }
 
 pub trait Resources: Send + Sync {
+    fn acquire_fill(&self, _fill: &crate::state::jobs::fills::Reservation) -> Result<Assignment> {
+        anyhow::bail!("fill images unavailable")
+    }
     /// Atomically acquire all storage and generation reservations, or none.
     /// Repeating this after a restart returns the same assignment for the job id.
     /// This must not copy images or recover disks.

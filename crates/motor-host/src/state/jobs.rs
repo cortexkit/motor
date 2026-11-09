@@ -8,6 +8,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod fills;
 pub(crate) mod have;
 pub mod images;
 pub mod recovery;
@@ -15,6 +16,8 @@ pub mod storage;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fills: BTreeMap<String, fills::Reservation>,
     /// A DAX-less boot requires operator intervention, not an automatic retry.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dax_failed: bool,
@@ -30,6 +33,7 @@ pub struct Ledger {
 impl Ledger {
     pub fn is_empty(&self) -> bool {
         !self.dax_failed
+            && self.fills.is_empty()
             && self.disks.is_empty()
             && self.executions.is_empty()
             && self.bases.is_empty()
@@ -196,12 +200,19 @@ impl Host {
                     .saturating_sub(settings.host_reserve_mib),
                 |free, job| free.saturating_sub(job.memory_debit_mib),
             );
-        self.snapshot
+        let free = self
+            .snapshot
             .per_job
             .disks
             .values()
             .filter_map(|d| d.recovery.as_ref())
-            .fold(free, |free, r| free.saturating_sub(r.memory_debit_mib))
+            .fold(free, |free, r| free.saturating_sub(r.memory_debit_mib));
+        self.snapshot
+            .per_job
+            .fills
+            .values()
+            .filter(|f| !f.runner_hello)
+            .fold(free, |free, f| free.saturating_sub(f.memory_debit_mib))
     }
 
     pub(crate) fn fresh_host_resources(&self, now_ms: u64) -> Option<HostResources> {
@@ -270,9 +281,10 @@ impl Host {
                 .executions
                 .values()
                 .filter(|job| !job.ended)
-                .try_fold(self.recovery_permits(), |used, job| {
-                    used.checked_add(job.claims.vcpus)
-                });
+                .try_fold(
+                    self.recovery_permits().saturating_add(self.fill_permits()),
+                    |used, job| used.checked_add(job.claims.vcpus),
+                );
             if claims.vcpus > sample.vcpu_ceiling
                 || used
                     .and_then(|used| used.checked_add(claims.vcpus))

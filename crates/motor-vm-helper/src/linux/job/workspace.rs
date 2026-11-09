@@ -89,6 +89,11 @@ pub(super) fn finish_deletions(root: &Path) -> Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name();
+        if name.to_str().is_some_and(|n| n.starts_with(".seed-")) {
+            trusted_directory(&entry.path())?;
+            std::fs::remove_dir_all(entry.path())?;
+            continue;
+        }
         let Some(id) = name.to_str().and_then(|n| n.strip_prefix(".trash-")) else {
             continue;
         };
@@ -140,10 +145,7 @@ pub(super) fn delete_role(
     Ok(())
 }
 
-// Fill/base creation is deliberately unexposed to host requests. A future
-// root-controlled fill provisioner must select the account/repository's trusted
-// reusable checkout for cache fills and base builds, not accept a disk name
-// from the host. Ordinary job workspaces must never supply that checkout.
+// The role is chosen by the helper's provisioning operation, never by Start.
 pub(super) fn create(
     root: &Path,
     request: job::CreateWorkspace,
@@ -201,6 +203,124 @@ pub(super) fn create(
     parent.sync_all()?;
     Ok(())
 }
+
+pub(super) fn prepare_fill(root: &Path, fill: &job::Fill) -> Result<()> {
+    fill.validate()?;
+    let id = fill.disk_id();
+    if root.join(&id).try_exists()? {
+        let (registry, _) = open_disk(root, &fill.account, &id)?;
+        if registry.role != job::WorkspaceRole::Fill || read_fill(root, &id)? != *fill {
+            return Err(Error("fill provenance mismatch".into()));
+        }
+        return Ok(());
+    }
+    create(
+        root,
+        job::CreateWorkspace {
+            account: fill.account.clone(),
+            workspace_disk_id: id.clone(),
+            size_bytes: fill.size_bytes,
+        },
+        job::WorkspaceRole::Fill,
+    )?;
+    tenant::durable_write(
+        &root.join(&id).join("fill.json"),
+        &serde_json::to_vec(fill).map_err(|e| Error(e.to_string()))?,
+    )
+}
+
+pub(super) fn read_fill(root: &Path, id: &str) -> Result<job::Fill> {
+    serde_json::from_reader(fs::trusted_file(&root.join(id).join("fill.json"))?)
+        .map_err(|e| Error(e.to_string()))
+}
+
+pub(super) fn promote(root: &Path, fill: &job::Fill) -> Result<()> {
+    let id = fill.disk_id();
+    let (mut registry, disk) = open_disk(root, &fill.account, &id)?;
+    if read_fill(root, &id)? != *fill
+        || disk.metadata()?.uid() != 0
+        || !matches!(
+            registry.role,
+            job::WorkspaceRole::Fill | job::WorkspaceRole::Base
+        )
+    {
+        return Err(Error("base publication provenance mismatch".into()));
+    }
+    disk.sync_all()?;
+    registry.role = job::WorkspaceRole::Base;
+    // The synced atomic registry replacement is the publication point. A crash
+    // leaves an unpublishable Fill or a complete, immutable Base.
+    tenant::durable_write(
+        &root.join(id).join("registry.json"),
+        &serde_json::to_vec(&registry).map_err(|e| Error(e.to_string()))?,
+    )
+}
+
+pub(super) fn seed(root: &Path, seed: &job::Seed) -> Result<()> {
+    let id = &seed.disk_id;
+    if root.join(id).try_exists()? {
+        let (registry, disk) = open_disk(root, &seed.account, id)?;
+        let previous: job::Seed =
+            serde_json::from_reader(fs::trusted_file(&root.join(id).join("seed.json"))?)
+                .map_err(|e| Error(e.to_string()))?;
+        if registry.role != job::WorkspaceRole::Job
+            || disk.metadata()?.uid() != 0
+            || previous != *seed
+        {
+            return Err(Error("seed identity mismatch".into()));
+        }
+        return Ok(());
+    }
+    let base = base_lease(root, &seed.account, &seed.base_id, false)?;
+    let provenance = read_fill(root, &seed.base_id)?;
+    if provenance.account != seed.account || provenance.repository_key != seed.repository_key {
+        return Err(Error("base repository or account mismatch".into()));
+    }
+    // Publish the new Job registry only after cloning and syncing. Incomplete
+    // directories have no usable registry and cannot be attached after a crash.
+    let mut random = [0u8; 16];
+    if unsafe { libc::getrandom(random.as_mut_ptr().cast(), random.len(), 0) }
+        != random.len() as isize
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let staging = format!(".seed-{:032x}", u128::from_ne_bytes(random));
+    let path = root.join(&staging);
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+    let result = (|| {
+        let disk = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.join("workspace.img"))?;
+        fs::reflink(&base, &disk)?;
+        disk.sync_all()?;
+        tenant::durable_write(
+            &path.join("seed.json"),
+            &serde_json::to_vec(seed).map_err(|e| Error(e.to_string()))?,
+        )?;
+        tenant::durable_write(
+            &path.join("registry.json"),
+            &serde_json::to_vec(&Workspace {
+                account: seed.account.clone(),
+                workspace_disk_id: id.clone(),
+                role: job::WorkspaceRole::Job,
+            })
+            .map_err(|e| Error(e.to_string()))?,
+        )?;
+        std::fs::rename(&path, root.join(id))?;
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    result
+}
+
+#[cfg(all(test, feature = "linux-root-tests"))]
+mod fill_tests;
 
 #[cfg(all(test, feature = "linux-root-tests"))]
 mod tests {

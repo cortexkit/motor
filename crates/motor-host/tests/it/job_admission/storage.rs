@@ -14,6 +14,27 @@ const CAP: u64 = 1024 * 1024 * 1024;
 const FLOOR: u64 = 4096;
 const JOB_BYTES: u64 = REPLAY_RESERVATION_BYTES + motor_host::jobs::SPOOL_LIMIT;
 
+#[test]
+fn fill_storage_uses_the_same_growth_promises_as_run_claims() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + CAP - 1);
+    enable(&mut h, &storage);
+    assert!(h
+        .reserve_fill(&job(JOB).sub, "repo", 100, AT)
+        .unwrap()
+        .is_none());
+    assert!(h.snapshot.per_job.fills.is_empty());
+    storage.free.store(FLOOR + CAP, Ordering::SeqCst);
+    let fill = h
+        .reserve_fill(&job(JOB).sub, "repo", 100, AT)
+        .unwrap()
+        .unwrap();
+    full(h.claim(job(JOB), AT));
+    assert!(h.snapshot.per_job.fills.contains_key(&fill.fill.fill_id));
+    h.fill_finished(&fill.fill.fill_id, false, AT).unwrap();
+    assert!(h.snapshot.outbox.is_empty());
+}
+
 fn memory_host(available: u64) -> Host {
     let mut host = super::memory_host(available);
     if let motor_host::config::HostSettings::PerJob(s) = &mut host.settings {
@@ -257,6 +278,8 @@ fn eviction_is_host_lru_idle_workspaces_before_bases_and_never_tenants() {
         "base-old".into(),
         Base {
             sub: job(JOB).sub,
+            repository_key: None,
+            have: Vec::new(),
             last_used_ms: 1,
             evicting: false,
         },
@@ -288,6 +311,8 @@ fn held_base_does_not_hide_another_evictable_base_or_lose_its_deletion_fence() {
             id.into(),
             Base {
                 sub: job(JOB).sub.clone(),
+                repository_key: None,
+                have: Vec::new(),
                 last_used_ms: at,
                 evicting: false,
             },
@@ -348,6 +373,8 @@ fn busy_admitted_and_quarantined_disks_are_never_evicted() {
         "base".into(),
         Base {
             sub: job(JOB).sub,
+            repository_key: None,
+            have: Vec::new(),
             last_used_ms: 0,
             evicting: false,
         },

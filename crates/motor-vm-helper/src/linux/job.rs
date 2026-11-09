@@ -63,6 +63,8 @@ struct Record {
     tap_index: Option<u8>,
     #[serde(default)]
     egress_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fill_exit_success: Option<bool>,
 }
 
 impl Record {
@@ -200,6 +202,62 @@ impl LinuxJobs {
 
     pub fn reconcile(&mut self) -> Result<()> {
         self.reconcile_records(network::read_records(&self.records_path)?)?;
+        let abandoned: Vec<_> = self
+            .records
+            .values()
+            .filter(|r| r.start.kind == job::VmKind::Fill)
+            .filter_map(|r| match self.pid(r) {
+                Ok(None) => Some(Ok(r.start.clone())),
+                Ok(Some(_)) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<_>>()?;
+        for start in abandoned {
+            if let Ok((registry, _)) =
+                workspace::open_disk(&self.workspaces, &start.account, &start.workspace_disk_id)
+            {
+                if registry.role == job::WorkspaceRole::Fill {
+                    let fill = workspace::read_fill(&self.workspaces, &start.workspace_disk_id)?;
+                    self.finish_fill(&fill, false)?;
+                }
+            }
+        }
+        if self.workspaces.try_exists()? {
+            for entry in std::fs::read_dir(&self.workspaces)? {
+                let entry = entry?;
+                let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !id.starts_with("fill-") {
+                    continue;
+                }
+                // A live fill survives a helper restart just like a job.
+                if self
+                    .records
+                    .values()
+                    .any(|r| !r.released && r.start.workspace_disk_id == id)
+                {
+                    continue;
+                }
+                if !entry.path().join("registry.json").try_exists()? {
+                    trusted_directory(&entry.path())?;
+                    std::fs::remove_dir_all(entry.path())?;
+                    File::open(&self.workspaces)?.sync_all()?;
+                    continue;
+                }
+                let registry: Workspace =
+                    serde_json::from_reader(fs::trusted_file(&entry.path().join("registry.json"))?)
+                        .map_err(|e| Error(e.to_string()))?;
+                if registry.role == job::WorkspaceRole::Fill {
+                    workspace::delete_role(
+                        &self.workspaces,
+                        &registry.account,
+                        &id,
+                        job::WorkspaceRole::Fill,
+                    )?;
+                }
+            }
+        }
         workspace::finish_deletions(&self.workspaces)
     }
 
@@ -288,12 +346,21 @@ impl LinuxJobs {
         let mut failed = Vec::new();
         for (id, child) in &mut self.children {
             match child.try_wait() {
-                Ok(Some(_)) => ended.push(id.clone()),
+                Ok(Some(status)) => ended.push((id.clone(), status.success())),
                 Ok(None) => (),
                 Err(error) => failed.push((id.clone(), error)),
             }
         }
-        for id in ended {
+        for (id, success) in ended {
+            let mut record = self.records[&id].clone();
+            if record.start.kind == job::VmKind::Fill {
+                record.fill_exit_success = Some(success);
+                if let Err(error) = self.save(&record) {
+                    self.log_collection_failure(&id, CollectionFailure::Evidence, &error);
+                    continue;
+                }
+                self.records.insert(id.clone(), record);
+            }
             self.children.remove(&id);
         }
         for (id, error) in failed {
@@ -523,6 +590,22 @@ impl LinuxJobs {
             self.collect_exits()?;
         }
         match op {
+            Operation::PrepareFill(fill) => {
+                self.check_workspace_size(fill.size_bytes)?;
+                self.disk_available_identity(&fill.disk_id())?;
+                workspace::prepare_fill(&self.workspaces, &fill)?;
+                Ok(Response::new(Reply::Ok))
+            }
+            Operation::FinishFill { fill, published } => {
+                let published = self.finish_fill(&fill, published)?;
+                Ok(Response::new(Reply::FillFinished { published }))
+            }
+            Operation::SeedWorkspace(seed) => {
+                self.disk_available_identity(&seed.disk_id)?;
+                self.disk_available_identity(&seed.base_id)?;
+                workspace::seed(&self.workspaces, &seed)?;
+                Ok(Response::new(Reply::Ok))
+            }
             Operation::WorkspaceUsage { account, disk_id } => {
                 let exclusive_bytes = (|| -> Result<u64> {
                     let (_, disk) = workspace::open_disk(&self.workspaces, &account, &disk_id)?;
@@ -628,6 +711,56 @@ impl LinuxJobs {
         Ok(())
     }
 
+    fn finish_fill(&mut self, fill: &job::Fill, mut published: bool) -> Result<bool> {
+        let id = fill.disk_id();
+        if self.workspaces.join(&id).try_exists()? {
+            let (registry, _) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
+            if workspace::read_fill(&self.workspaces, &id)? != *fill {
+                return Err(Error("fill provenance mismatch".into()));
+            }
+            if registry.role == job::WorkspaceRole::Base {
+                return if published {
+                    Ok(true)
+                } else {
+                    Err(Error("published base cannot be discarded as a fill".into()))
+                };
+            }
+        } else {
+            published = false;
+        }
+        let record = self.records.get(&fill.fill_id).cloned();
+        if published {
+            published = if let Some(record) = record.as_ref() {
+                self.pid(record)?.is_none()
+                    && record.oom_kill == Some(0)
+                    && record.fill_exit_success == Some(true)
+            } else {
+                false
+            };
+        }
+        if let Some(record) = record {
+            if record.start.kind != job::VmKind::Fill
+                || record.start.account != fill.account
+                || record.start.workspace_disk_id != id
+            {
+                return Err(Error("fill execution identity mismatch".into()));
+            }
+            self.stop(&fill.fill_id)?;
+        }
+        self.disk_available_identity(&id)?;
+        if published {
+            workspace::promote(&self.workspaces, fill)?;
+        } else if self.workspaces.join(&id).try_exists()? {
+            workspace::delete_role(
+                &self.workspaces,
+                &fill.account,
+                &id,
+                job::WorkspaceRole::Fill,
+            )?;
+        }
+        Ok(published)
+    }
+
     fn status(&self, id: &str) -> Result<Response> {
         let record = self
             .records
@@ -710,11 +843,23 @@ impl LinuxJobs {
         {
             return Err(Error("workspace disk identity or account mismatch".into()));
         }
-        if !registry.role.permits(start.kind) {
+        if !registry.role.permits(start.kind)
+            || (registry.role == job::WorkspaceRole::Base
+                && workspace.join("fill.json").try_exists()?)
+        {
             return Ok(Response::new(Reply::StartRefused {
                 case: crate::tenant::StartRefusalCase::WorkspaceRole,
                 message: "workspace disk role does not permit requested VM kind".into(),
             }));
+        }
+        if start.kind == job::VmKind::Fill {
+            let fill = workspace::read_fill(&self.workspaces, &start.workspace_disk_id)?;
+            if fill.account != start.account
+                || fill.fill_id != start.job_id
+                || fill.disk_id() != start.workspace_disk_id
+            {
+                return Err(Error("fill start provenance mismatch".into()));
+            }
         }
         let disk = fs::trusted_file(&workspace.join("workspace.img"))?;
         let meta = disk.metadata()?;
@@ -790,6 +935,7 @@ impl LinuxJobs {
             exit_acknowledged: false,
             tap_index,
             egress_bytes: None,
+            fill_exit_success: None,
         };
         // The intent is durable before any jail or VMM can open the disk. A
         // crash in setup keeps it reserved until explicit stop has cleaned up.

@@ -288,6 +288,7 @@ impl Host {
             .executions
             .get(job)
             .is_some_and(|e| !e.ended)
+            || self.snapshot.per_job.fills.contains_key(job)
         {
             return Err(Error::Refused(crate::state::Refusal::InternalFailure));
         }
