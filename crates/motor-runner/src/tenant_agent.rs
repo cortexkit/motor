@@ -37,9 +37,14 @@ pub async fn serve_agent() -> io::Result<()> {
     // Validate immutable boot inputs before accepting even the first account
     // frame. Keep a typed refusal available to the host if validation fails.
     let preflight = if per_job::enabled()? {
-        per_job::preflight()
-            .err()
-            .map(|error| agent_result(Err(error)))
+        (if recovery::enabled()? {
+            Ok(())
+        } else {
+            per_job::install_args()
+        })
+        .and_then(|()| per_job::preflight())
+        .err()
+        .map(|error| agent_result(Err(error)))
     } else {
         None
     };

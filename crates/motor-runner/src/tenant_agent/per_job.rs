@@ -1,7 +1,8 @@
 use super::{command, paths, RunnerArgs};
 use std::{
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -120,6 +121,60 @@ pub(super) fn args() -> io::Result<RunnerArgs> {
     Ok(args)
 }
 
+fn decode_boot_args(cmdline: &str) -> io::Result<String> {
+    let mut values = cmdline
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("motor.runner_args="));
+    let encoded = values
+        .next()
+        .ok_or_else(|| io::Error::other("missing runner arguments"))?;
+    if values.next().is_some() || encoded.len() > 2 * 16384 || encoded.len() % 2 != 0 {
+        return Err(io::Error::other("invalid runner argument encoding"));
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).map_err(io::Error::other))
+        .collect::<io::Result<Vec<_>>>()?;
+    let text = String::from_utf8(bytes).map_err(io::Error::other)?;
+    RunnerArgs::parse(&text)?;
+    Ok(text)
+}
+
+fn boot_args(cmdline: &str) -> io::Result<String> {
+    decode_boot_args(cmdline).map_err(|error| failure("job_vm_args_invalid", error))
+}
+
+fn write_boot_args(
+    cmdline: &str,
+    directory: &paths::Directory,
+    owner: u32,
+    group: u32,
+) -> io::Result<()> {
+    let text = boot_args(cmdline)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.fd_path().join("runner-args"))?;
+    if unsafe { libc::fchown(file.as_raw_fd(), owner, group) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+pub(super) fn install_args() -> io::Result<()> {
+    let install = || {
+        let cmdline = fs::read_to_string("/proc/cmdline")?;
+        let run = paths::Directory::absolute(Path::new("/run"), 0)?;
+        let directory = run.create("motor", 0o755)?;
+        write_boot_args(&cmdline, &directory, 0, 0)
+    };
+    install().map_err(|error| failure("job_vm_args_invalid", error))
+}
+
 fn workspace_steps(
     kind: Option<&str>,
     mut run: impl FnMut(&str, &[&str]) -> io::Result<()>,
@@ -193,6 +248,67 @@ pub(super) fn mount_sources(image_cargo: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RUNNER: &str = "--backend host --tenant-vm --job-network veth --state-root /tenant/state --max-weight 2 --rustc-slots 2 --sccache-size-gib 1 --free-space-floor-bytes 67108864 --workspace-root /Users --owned-workspace-root /Users --workspace-root /home --owned-workspace-root /home";
+    fn encoded(text: &str) -> String {
+        format!(
+            "motor.runner_args={}",
+            text.as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    }
+
+    #[test]
+    fn runner_boot_source_refuses_missing_duplicate_nonhex_odd_oversized_and_invalid_options() {
+        let valid = encoded(RUNNER);
+        assert_eq!(boot_args(&format!("quiet {valid}")).unwrap(), RUNNER);
+        for source in [
+            "quiet".to_owned(),
+            format!("{valid} {valid}"),
+            "motor.runner_args=zz".into(),
+            "motor.runner_args=ff".into(),
+            "motor.runner_args=0".into(),
+            encoded(&format!("{RUNNER}{}", " ".repeat(16385))),
+            encoded(&format!("{RUNNER} --per-job")),
+            encoded(&RUNNER.replace("--max-weight 2", "--max-weight 0")),
+        ] {
+            let error = boot_args(&source).expect_err("must refuse boot source");
+            let reply = super::super::agent_result(Err(error));
+            assert_eq!(reply["error"], "job_vm_args_invalid");
+        }
+    }
+
+    #[test]
+    fn runner_boot_file_is_private_regular_and_never_replaces_an_existing_node() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let scratch = cortexkit_test_support::ScratchDir::new("runner-boot-args");
+        fs::set_permissions(
+            scratch.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let directory = paths::Directory::open(scratch.path(), uid).unwrap();
+        write_boot_args(&encoded(RUNNER), &directory, uid, gid).unwrap();
+        let path = scratch.join("runner-args");
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+            (uid, gid, 0o600)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), RUNNER);
+        assert!(write_boot_args(&encoded(RUNNER), &directory, uid, gid).is_err());
+        fs::remove_file(&path).unwrap();
+        let sentinel = scratch.join("sentinel");
+        fs::write(&sentinel, "untouched").unwrap();
+        symlink(&sentinel, &path).unwrap();
+        assert!(write_boot_args(&encoded(RUNNER), &directory, uid, gid).is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
+    }
 
     const DAX: &str = "44 25 259:0 / /toolchain ro,relatime - ext4 /dev/pmem0 ro,dax=always";
 

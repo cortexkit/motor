@@ -27,7 +27,7 @@ fn balloon_refuses_target_above_recorded_ram_before_opening_any_process_or_socke
 #[test]
 fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
     let nonce = "0123456789abcdef0123456789abcdef";
-    let requests = boot_requests(&start(), Some(17), Some(nonce));
+    let requests = boot_requests(&start(), Some(17), Some(nonce), 4 << 30).unwrap();
     let drive = requests
         .iter()
         .find(|request| request.0 == "/drives/remote-cache")
@@ -36,11 +36,17 @@ fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
         drive.1,
         json!({"drive_id":"remote-cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})
     );
+    let encoded: String = runner_args(&start(), 4 << 30, true)
+        .unwrap()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     assert_eq!(
         requests[1].1["boot_args"],
-        format!("{JOB_BOOT_ARGS} motor.cache_nonce={nonce}")
+        format!("{JOB_BOOT_ARGS} motor.runner_args={encoded} motor.cache_nonce={nonce}")
     );
-    let plain = boot_requests(&start(), Some(17), None);
+    let plain = boot_requests(&start(), Some(17), None, 4 << 30).unwrap();
     assert!(!plain
         .iter()
         .any(|request| request.0 == "/drives/remote-cache"));
@@ -50,7 +56,7 @@ fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
         .contains("motor.cache_nonce"));
     let mut recovery_start = start();
     recovery_start.kind = job::VmKind::Recovery;
-    let recovery = boot_requests(&recovery_start, Some(17), Some(nonce));
+    let recovery = boot_requests(&recovery_start, Some(17), Some(nonce), 4 << 30).unwrap();
     assert_eq!(
         recovery[1].1["boot_args"],
         format!("{JOB_BOOT_ARGS} motor.recovery=1")
@@ -107,7 +113,7 @@ fn isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse(
         .collect();
     assert_eq!(header, nonce);
     assert!(
-        boot_requests(&record.start, Some(17), Some(&nonce))[1].1["boot_args"]
+        boot_requests(&record.start, Some(17), Some(&nonce), 4 << 30).unwrap()[1].1["boot_args"]
             .as_str()
             .unwrap()
             .ends_with(&format!("motor.cache_nonce={header}"))
@@ -298,11 +304,70 @@ fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
         .filter_map(|(index, text)| (index % 2 == 1).then_some(text))
         .collect();
     assert!(!tenant_args.is_empty());
-    let requests = boot_requests(&start(), Some(17), None);
+    let requests = boot_requests(&start(), Some(17), None, 4 << 30).unwrap();
+    let encoded: String = runner_args(&start(), 4 << 30, false)
+        .unwrap()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     assert_eq!(
         requests[1].1["boot_args"],
-        format!("{tenant_args} motor.per_job=1")
+        format!("{tenant_args} motor.per_job=1 motor.runner_args={encoded}")
     );
+}
+
+#[test]
+fn runner_policy_matches_provisioning_for_small_large_and_cache_enabled_disks() {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../script/tenant-provision/provision.py");
+    for disk in [4 << 30, 1024_u64 << 30, u64::MAX - 511] {
+        for cache in [false, true] {
+            let output = Command::new("python3").args(["-c", r#"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('provision', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.runner_args(dict(vcpu_ceiling=4, disk_quota_bytes=int(sys.argv[2]), remote_cache=sys.argv[3] == 'true')))
+"#]).arg(&script).arg(disk.to_string()).arg(cache.to_string()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut shape = start();
+            shape.vcpus = 4;
+            let actual = runner_args(&shape, disk, cache).unwrap();
+            assert_eq!(
+                actual.split_whitespace().collect::<Vec<_>>(),
+                std::str::from_utf8(&output.stdout)
+                    .unwrap()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+            );
+            let boot = boot_requests(
+                &shape,
+                Some(17),
+                cache.then_some("0123456789abcdef0123456789abcdef"),
+                disk,
+            )
+            .unwrap();
+            let line = boot[1].1["boot_args"].as_str().unwrap();
+            assert!(line.len() < 1792);
+            assert_eq!(line.matches("motor.runner_args=").count(), 1);
+        }
+    }
+}
+
+#[test]
+fn runner_boot_refuses_invalid_shape_disk_and_oversized_command_line() {
+    for disk in [0, 1, 511, 513] {
+        assert!(boot_requests(&start(), Some(17), None, disk).is_err());
+    }
+    let mut invalid = start();
+    invalid.vcpus = 0;
+    assert!(boot_requests(&invalid, Some(17), None, 4 << 30).is_err());
+    assert!(boot_requests(&start(), Some(17), Some(&"a".repeat(2048)), 4 << 30).is_err());
 }
 
 #[test]
@@ -326,7 +391,7 @@ fn jailer_enters_the_job_namespace_before_starting_firecracker() {
 
 #[test]
 fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
-    let requests = boot_requests(&start(), Some(17), None);
+    let requests = boot_requests(&start(), Some(17), None, 4 << 30).unwrap();
     let paths: Vec<_> = requests.iter().map(|r| r.0).collect();
     assert_eq!(
         paths,
@@ -375,7 +440,7 @@ fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
     different.vcpus = 2;
     different.memory_mib = 8192;
     assert_eq!(
-        boot_requests(&different, Some(18), None)[0].1,
+        boot_requests(&different, Some(18), None, 4 << 30).unwrap()[0].1,
         json!({"vcpu_count":2,"mem_size_mib":8192,"smt":false})
     );
 }

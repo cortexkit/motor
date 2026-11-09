@@ -178,6 +178,19 @@ The build creates the following artifacts under the operator-host output root,
 - `versions.txt`, `kernel.config`, `packages.txt`, `tools.json`: input pins,
   resolved kernel options, installed package versions and executed tool probes.
 
+Each build also writes `kernel`, `rootfs.ext4`, `toolchain.ext4` and
+`manifest.json` under `/var/lib/motor-vm/job-image-staging/<generation>`.
+`--job-generation` defaults to the version for helper-compatible names:
+1–128 ASCII letters, digits, `_` or `-`, excluding `pins` and `locks`.
+Versions containing dots require an explicit generation. With `--output-root`,
+the staging root is `job-image-staging` beside the chosen tenant output root.
+The job root omits `/usr/local`; job-only init mounts the immutable pmem
+toolchain with `ro,dax=always` and binds `/usr/local` read-only before starting
+systemd. Tenant outputs are packed first and are not modified by the split.
+The toolchain includes empty Cargo `registry` and `git` directories; it seeds
+no crate sources. The helper supplies runner arguments on each VM's boot line,
+not in either image.
+
 The image contains systemd, `motor-job`/`motor-cache` nologin accounts, sudo/ACL
 and namespace prerequisites, Python 3 and `motor-runner`. The existing tools
 installer's build-only directories live inside the disposable chroot; only
@@ -258,6 +271,7 @@ Portable checks (no root, no VM, no network):
 
 ```sh
 python3 -W error script/tenant-image/test_tenant_image.py
+python3 -W error script/tenant-image/test_job_images.py
 python3 -W error script/tenant-image/test_build_storage.py
 bash -n script/tenant-image/build-kernel.sh script/tenant-image/build-rootfs.sh
 sh -n script/tenant-image/guest/motor-init
