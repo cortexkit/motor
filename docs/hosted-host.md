@@ -278,6 +278,19 @@ available`; the following settings describe the implemented scheduler, not an
 enablement procedure. Every field of `per_job` is required, with no missing,
 null or defaulted values.
 
+The installer accepts `--mode per_job --per-job-settings /path/to/per-job.json`.
+The file is the complete `per_job` object, with explicit operator values for
+every field below, including `vcpu_ceiling` and `permit_budget`. It is copied
+into the rendered host config without supplying defaults. A missing file or
+field refuses installation and names the missing input. Before installing any
+account, binary or config, the installer runs the built
+`motor-host check-config <rendered-host.json>` to check the schema and CPU bounds
+using the same rules as startup and the host's online CPU count. This check opens
+no journal, key or socket and does not enable the per-job runtime. `--check` and
+`--start` read the mode and settings from the installed host config. Without
+`--mode per_job`, the installer keeps the tenant-mode config bytes unchanged and
+writes no `per_job` object.
+
 Here VMM means the Firecracker virtual machine monitor process, and OOM means
 out of memory.
 
@@ -308,6 +321,13 @@ generation and replay. After runner hello, memory counts through host-measured
 available memory. A job's guest RAM is `ceil((mem_mib + burst) / 0.75)` MiB;
 its systemd job limit is stated memory plus burst. Same-workspace jobs queue
 until the disk is detached; quarantined disks refuse claims as `host_full`.
+Admission reserves at most 64 distinct job workspace disk attachments, the same
+limit as the warm list. A queued job reserves its disk's slot before boot, so
+simultaneous claims cannot exceed the limit. The 64th disk can be admitted; at
+64, a job needing another disk is refused before start as `host_full`, as when
+permits run out. A job for a disk already attached or queued shares its slot and
+can still queue if the other admission checks pass. Idle cached disks take no
+attachment slot until admitted again.
 Warm heartbeat entries describe workspace disks, busy while attached or
 quarantined; `tenant_disk` is omitted. Recovery and fills consume capacity too.
 

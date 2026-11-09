@@ -37,12 +37,30 @@ struct Config {
 }
 
 impl Config {
+    fn helper(&self) -> Helper {
+        Helper {
+            socket: self.helper_socket.clone(),
+            storage: self.storage.clone(),
+            capacity: motor_host::capacity::CONFIG.into(),
+            vcpu_ceiling: BTreeMap::new(),
+            guest_init: BTreeMap::new(),
+            pressure_cgroups: BTreeMap::new(),
+        }
+    }
+
+    fn checked_settings(
+        &self,
+        control: &dyn motor_host::helper::Control,
+    ) -> Result<motor_host::config::HostSettings> {
+        motor_host::config::HostSettings::from_config(self.mode, self.per_job.clone(), control)
+    }
+
     fn startup_settings(
         &self,
         control: &dyn motor_host::helper::Control,
     ) -> Result<motor_host::config::HostSettings> {
-        use motor_host::config::{HostMode, HostSettings};
-        let settings = HostSettings::from_config(self.mode, self.per_job.clone(), control)?;
+        use motor_host::config::HostMode;
+        let settings = self.checked_settings(control)?;
         // Do not serve a per-job configuration with tenant VMs while the job
         // VM lifecycle is not yet wired into this executable.
         ensure!(
@@ -66,6 +84,16 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("keygen") => return keygen(std::env::args().skip(2).collect()),
         Some("show-enrollment") => return show_enrollment(std::env::args().skip(2).collect()),
+        Some("check-config") => {
+            let args: Vec<_> = std::env::args_os().skip(2).collect();
+            ensure!(
+                args.len() == 1,
+                "usage: motor-host check-config <config.json>"
+            );
+            check_config(std::path::Path::new(&args[0]))?;
+            println!("host config settings valid");
+            return Ok(());
+        }
         Some("export-journal") => {
             let directory = std::env::args_os()
                 .nth(2)
@@ -90,14 +118,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("usage: motor-host <config.json>")?;
     let config: Config = serde_json::from_reader(File::open(&path)?)?;
-    let mut helper = Helper {
-        socket: config.helper_socket.clone(),
-        storage: config.storage.clone(),
-        capacity: motor_host::capacity::CONFIG.into(),
-        vcpu_ceiling: BTreeMap::new(),
-        guest_init: BTreeMap::new(),
-        pressure_cgroups: BTreeMap::new(),
-    };
+    let mut helper = config.helper();
     let settings = config.startup_settings(&helper)?;
     let (broker_endpoint, jwks_url) = if let Some(url) = &config.fake_broker_url {
         motor_host::broker::trusted_override_config(std::path::Path::new(&path))?;
@@ -266,6 +287,14 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+// Validate settings without opening keys, journals or sockets. Installation can
+// check a staged configuration even before those resources exist.
+fn check_config(path: &std::path::Path) -> Result<()> {
+    let config: Config = serde_json::from_reader(File::open(path)?)?;
+    config.checked_settings(&config.helper())?;
+    Ok(())
 }
 
 fn disable_core_dumps() -> std::io::Result<()> {
@@ -521,6 +550,59 @@ mod config_tests {
             config.startup_settings(&Control).unwrap_err().to_string(),
             "per_job vcpu_ceiling must be between 1 and online CPUs"
         );
+    }
+
+    #[test]
+    fn config_check_validates_staged_settings_without_starting_or_writing() {
+        let root = cortexkit_test_support::scratch_root();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let path = dir.path().join("host.json");
+        let mut value = config();
+        value["journal_dir"] = json!(dir.path().join("uncreated-journal"));
+        let write = |value: &serde_json::Value| {
+            std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        };
+        write(&value);
+        check_config(&path).unwrap();
+        value["mode"] = json!("per_job");
+        write(&value);
+        assert_eq!(
+            check_config(&path).unwrap_err().to_string(),
+            "per_job settings are required"
+        );
+        value["per_job"] = per_job();
+        for field in ["vcpu_ceiling", "permit_budget"] {
+            let mut missing = value.clone();
+            missing["per_job"].as_object_mut().unwrap().remove(field);
+            write(&missing);
+            assert!(check_config(&path)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("missing field `{field}`")));
+        }
+        value["per_job"]["permit_budget"] = json!(1);
+        write(&value);
+        check_config(&path).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Config>(value.clone())
+                .unwrap()
+                .startup_settings(&Control)
+                .unwrap_err()
+                .to_string(),
+            "per_job mode is not yet available"
+        );
+        for (ceiling, permits, field) in [
+            (0, 1, "vcpu_ceiling"),
+            (u32::MAX, u32::MAX, "vcpu_ceiling"),
+            (1, 0, "permit_budget"),
+            (1, u32::MAX, "permit_budget"),
+        ] {
+            value["per_job"]["vcpu_ceiling"] = json!(ceiling);
+            value["per_job"]["permit_budget"] = json!(permits);
+            write(&value);
+            assert!(check_config(&path).unwrap_err().to_string().contains(field));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

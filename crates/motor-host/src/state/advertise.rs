@@ -525,7 +525,7 @@ impl Host {
                 ))
                 .then_some(warm)
             })
-            .take(64)
+            .take(super::jobs::WARM_WORKSPACE_LIMIT)
             .collect()
     }
     pub(super) fn start_succeeded(&mut self, tenant: &str) {

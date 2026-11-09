@@ -3,7 +3,8 @@
 
 install.sh calls this to produce, on stdout, the exact bytes it installs:
 
-  host --host-id ID [--port N]      /etc/motor-host/host.json
+  host --host-id ID [--port N] [--mode tenant|per_job] [--per-job-settings FILE]
+                                     /etc/motor-host/host.json
   helper --uid UID --gid GID [--installed RECORD]
                                     /etc/motor-vm-helper.json, its slot CPUs
                                     taken from the installed tenant record
@@ -100,14 +101,19 @@ def cpus(text: str) -> set[int]:
     return result
 
 
-def host_config(host_id: str, port: int = PORT) -> dict:
+def host_config(host_id: str, port: int = PORT, mode: str = "tenant",
+                per_job_settings: Path | None = None) -> dict:
     """/etc/motor-host/host.json. motor-host refuses unknown keys, so this is every
     key it reads, with none of the qualification-only fake_broker_url."""
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", host_id):
         raise ValueError("host_id must match [A-Za-z0-9._-]{1,64}")
     if not 1024 < port <= 65535:
         raise ValueError("host agent port must be 1025-65535: the agent has no bind capability")
-    return {
+    if mode not in ("tenant", "per_job"):
+        raise ValueError("mode must be tenant or per_job")
+    if mode == "tenant" and per_job_settings is not None:
+        raise ValueError("--per-job-settings requires --mode per_job")
+    config = {
         "host_id": host_id,
         # IPv4 only: the broker endpoint and the firewall exception are IPv4.
         "listen": f"0.0.0.0:{port}",
@@ -124,6 +130,14 @@ def host_config(host_id: str, port: int = PORT) -> dict:
         # uses; /srv/build/vm, its source, sits under an unprivileged-owned parent.
         "storage": str(STORAGE),
     }
+    if mode == "per_job":
+        if per_job_settings is None:
+            raise ValueError("per_job mode requires --per-job-settings (no defaults)")
+        config["mode"] = mode
+        # motor-host check-config validates the complete object with the same
+        # typed settings and online CPU bounds used at startup.
+        config["per_job"] = json.loads(per_job_settings.read_text())
+    return config
 
 
 def render_json(value) -> str:
@@ -476,6 +490,8 @@ def main() -> int:
     host = commands.add_parser("host")
     host.add_argument("--host-id", required=True)
     host.add_argument("--port", type=int, default=PORT)
+    host.add_argument("--mode", choices=("tenant", "per_job"), default="tenant")
+    host.add_argument("--per-job-settings", type=Path)
     helper = commands.add_parser("helper")
     helper.add_argument("--uid", type=int, required=True)
     helper.add_argument("--gid", type=int, required=True)
@@ -552,7 +568,7 @@ def main() -> int:
             print(remote_cache_report(read_record(TENANT_RECORD), load_provision()))
             return 0
         if args.command == "host":
-            value = host_config(args.host_id, args.port)
+            value = host_config(args.host_id, args.port, args.mode, args.per_job_settings)
         elif args.command == "helper":
             value = helper_config(args.uid, args.gid, args.uplink, args.public_ip,
                                   None if args.installed is None else read_record(args.installed))

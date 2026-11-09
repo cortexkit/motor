@@ -7,6 +7,7 @@
 #   install.sh --checkout DIR --host-id ID --tenant-sub SUB --uplink IFACE [--build]
 #              [--target-dir DIR] [--port N] [--public-ip IPV4]
 #              [--tenant-disk-quota-gib N] [--tenant-template FILE]
+#              [--mode tenant|per_job] [--per-job-settings FILE]
 #   install.sh --checkout DIR --check [--public-ip IPV4]
 #   install.sh --checkout DIR --start [--public-ip IPV4]
 #   install.sh --checkout DIR --stop
@@ -65,6 +66,7 @@ usage() {
 checkout='' target_dir=/srv/build/target build=0 mode=install
 port='' host_id='' public_ip='' tenant_sub='' tenant_quota='' tenant_image=''
 tenant_template='' uplink=''
+host_mode='' per_job_settings=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --checkout) checkout=${2:?}; shift 2 ;;
@@ -80,6 +82,8 @@ while [ $# -gt 0 ]; do
     --tenant-disk-quota-gib) tenant_quota=${2:?}; shift 2 ;;
     --tenant-template) tenant_template=${2:?}; shift 2 ;;
     --uplink) uplink=${2:?}; shift 2 ;;
+    --mode) host_mode=${2:?}; shift 2 ;;
+    --per-job-settings) per_job_settings=${2:?}; shift 2 ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
@@ -88,8 +92,14 @@ done
 if [ "$mode" = install ]; then
   [ -n "$host_id" ] && [ -n "$tenant_sub" ] || { echo "installing needs --host-id and --tenant-sub" >&2; exit 2; }
   [ -n "$uplink" ] || { echo "installing needs --uplink (no default)" >&2; exit 2; }
-elif [ "$build" = 1 ] || [ -n "$host_id$tenant_sub$tenant_quota$port$tenant_template$uplink" ]; then
-  echo "--$mode uses the installed configs; --build, --host-id, --tenant-sub, --tenant-disk-quota-gib, --tenant-template, --uplink and --port are install options" >&2
+  host_mode=${host_mode:-tenant}
+  case "$host_mode" in
+    tenant) [ -z "$per_job_settings" ] || { echo "--per-job-settings requires --mode per_job" >&2; exit 2; } ;;
+    per_job) [ -n "$per_job_settings" ] || { echo "per_job mode requires --per-job-settings (no defaults)" >&2; exit 2; } ;;
+    *) echo "--mode must be tenant or per_job" >&2; exit 2 ;;
+  esac
+elif [ "$build" = 1 ] || [ -n "$host_id$tenant_sub$tenant_quota$port$tenant_template$uplink$host_mode$per_job_settings" ]; then
+  echo "--$mode uses the installed configs; --build, --host-id, --tenant-sub, --tenant-disk-quota-gib, --tenant-template, --uplink, --port, --mode and --per-job-settings are install options" >&2
   exit 2
 fi
 # Changes are made only when installing; --start changes nothing until every
@@ -288,6 +298,18 @@ binaries() {
   place binary "$loader" "$LOADER" root:root 755
 }
 
+stage_host_config() {
+  local validator
+  local host_args=(host --host-id "$host_id" --port "$port" --mode "$host_mode")
+  [ -z "$per_job_settings" ] || host_args+=(--per-job-settings "$per_job_settings")
+  render "${host_args[@]}" > "$scratch/host.json"
+  if [ "$host_mode" = per_job ]; then
+    validator=$target_dir/release/motor-host
+    [ "$mode" = install ] || validator=$HOST_BINARY
+    "$validator" check-config "$scratch/host.json"
+  fi
+}
+
 configs() {
   local uid gid
   uid=$(id -u "$HOST_USER" 2>/dev/null) || { fail "cannot render configs without $HOST_USER"; return; }
@@ -296,7 +318,6 @@ configs() {
   directory /etc/motor-host/provision root:root 755
   directory "$KEY_DIR" "$HOST_USER:$HOST_USER" 700
   directory "$JOURNAL_DIR" "$HOST_USER:$HOST_USER" 700
-  render host --host-id "$host_id" --port "$port" > "$scratch/host.json" || { fail "cannot render host config"; return; }
   # Render once so the helper and tenant use the same cpuset, including a
   # first-install template override. Installed records still retain their values.
   render tenant ${tenant_sub:+--sub "$tenant_sub"} ${tenant_quota:+--disk-quota-gib "$tenant_quota"} \
@@ -447,6 +468,11 @@ if [ "$mode" != install ]; then
   done
   port=$(installed "$HOST_CONFIG" listen)
   host_id=$(installed "$HOST_CONFIG" host_id)
+  host_mode=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("mode", "tenant"))' "$HOST_CONFIG")
+  if [ "$mode" != stop ] && [ "$host_mode" = per_job ]; then
+    per_job_settings=$scratch/per-job.json
+    python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("per_job")))' "$HOST_CONFIG" > "$per_job_settings"
+  fi
   tenant_sub=$(installed "$TENANT_CONFIG" sub)
   if [ "$mode" != stop ]; then
     uplink=$(installed "$HELPER_CONFIG" uplink)
@@ -476,6 +502,9 @@ fi
 [ -n "$public_ip" ] || public_ip=$(render public-ip)
 echo "hosted host $host_id endpoint $public_ip:$port ($mode)"
 [ "$build" = 1 ] && build_binaries
+# Stage and validate per-job settings before installing binaries, accounts or
+# configs. The built host supplies the schema and the host's online CPU rule.
+stage_host_config
 preflight
 account
 binaries

@@ -14,6 +14,8 @@ pub mod images;
 pub mod recovery;
 pub mod storage;
 
+pub(super) const WARM_WORKSPACE_LIMIT: usize = 64;
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
     /// The helper's store may rotate while the kept tenant disk is unused.
@@ -64,6 +66,12 @@ pub struct WorkspaceDisk {
     /// Oldest-first mirror pins from runner reports, never caller candidates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub have: Vec<motor_protocol::MirrorRef>,
+}
+
+impl WorkspaceDisk {
+    fn holds_job_disk_slot(&self) -> bool {
+        !self.deleted && (self.attached_job.is_some() || !self.queue.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -169,7 +177,7 @@ impl Host {
         });
         entries
             .into_iter()
-            .take(64)
+            .take(WARM_WORKSPACE_LIMIT)
             .map(|(_, _, entry)| entry)
             .collect()
     }
@@ -278,6 +286,19 @@ impl Host {
             });
             if existing.is_some_and(|(_, disk)| disk.quarantined) {
                 return Err(RefusalCause::QuarantinedWorkspace.into());
+            }
+            // Reserve future attachments for queued jobs too, so concurrent
+            // claims cannot later hide a running workspace from the warm list.
+            // Another job on the same disk shares its existing slot.
+            if !existing.is_some_and(|(_, disk)| disk.holds_job_disk_slot())
+                && ledger
+                    .disks
+                    .values()
+                    .filter(|disk| disk.holds_job_disk_slot())
+                    .count()
+                    >= WARM_WORKSPACE_LIMIT
+            {
+                return Err(RefusalCause::WorkspaceDisks.into());
             }
             let sample = self
                 .fresh_host_resources(now_ms)

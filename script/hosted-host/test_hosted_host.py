@@ -124,6 +124,57 @@ class HostedHostConfigTests(CapacityConfigTests):
             with self.subTest(host_id=host_id), self.assertRaises(ValueError):
                 hosted.host_config(host_id)
 
+    def test_tenant_host_config_bytes_stay_unchanged(self):
+        expected = '''{
+  "host_id": "test-host",
+  "listen": "0.0.0.0:8443",
+  "certificate": "/etc/motor-host/keys/tls.crt",
+  "private_key": "/etc/motor-host/keys/tls.key",
+  "host_signing_key": "/etc/motor-host/keys/host-signing.key",
+  "journal_dir": "/var/lib/motor-host",
+  "helper_socket": "/run/motor-vm-helper.sock",
+  "registry_dir": "/etc/motor-vm-helper/tenants",
+  "bindings": "/etc/motor-host/tenants.json",
+  "resolvers": [
+    "1.1.1.1",
+    "9.9.9.9"
+  ],
+  "admin_socket": "/run/motor-host/admin.sock",
+  "storage": "/var/lib/motor-vm"
+}
+'''
+        for options in [[], ["--mode", "tenant"]]:
+            output = renderer_cli("host", "--host-id", HOST_ID, *options)
+            self.assertEqual(output.returncode, 0, output.stderr)
+            self.assertEqual(output.stdout, expected)
+
+    def test_per_job_settings_are_explicit_and_copied_without_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            # Leave one required field absent: the renderer must not fill it in.
+            # The built motor-host, not a second schema here, validates settings.
+            settings = {"permit_budget": 96, "host_reserve_mib": 4096}
+            path.write_text(json.dumps(settings))
+            output = renderer_cli("host", "--host-id", HOST_ID, "--mode", "per_job",
+                                  "--per-job-settings", path)
+            self.assertEqual(output.returncode, 0, output.stderr)
+            config = json.loads(output.stdout)
+            self.assertEqual(config["mode"], "per_job")
+            self.assertEqual(config["per_job"], settings)
+            del config["mode"], config["per_job"]
+            self.assertEqual(config, hosted.host_config(HOST_ID))
+            for options, message in [
+                (["--mode", "per_job"], "--per-job-settings"),
+                (["--per-job-settings", path], "--mode per_job"),
+                (["--mode", "per_job", "--per-job-settings", Path(directory) / "absent"], "absent"),
+            ]:
+                refused = renderer_cli("host", "--host-id", HOST_ID, *options)
+                self.assertEqual(refused.returncode, 2)
+                self.assertIn(message, refused.stderr)
+            path.write_text("not JSON")
+            self.assertEqual(renderer_cli("host", "--host-id", HOST_ID, "--mode", "per_job",
+                                          "--per-job-settings", path).returncode, 2)
+
     def test_helper_config_matches_the_helper_struct_and_admits_only_the_host_account(self):
         config = hosted.helper_config(998, 998, "enp6s0", "8.8.8.8")
         # The installer configures tenant hosts; `job_vms` is optional and only
@@ -803,6 +854,56 @@ class InstallScriptTests(CapacityConfigTests):
         if body is None:
             self.fail(name)
         return body[0]
+
+    def test_per_job_validator_refusal_stops_before_installation(self):
+        stage = self.function("stage_host_config")
+        for mode in ("install", "check", "start"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "release").mkdir()
+                validator = '''#!/usr/bin/env bash
+[ "$1" = check-config ] && [ -f "$2" ] || exit 99
+echo 'validator rejection' >&2
+exit 23
+'''
+                for binary in (root / "release/motor-host", root / "installed-host"):
+                    binary.write_text(validator)
+                    binary.chmod(0o755)
+                settings = {"vcpu_ceiling": 8, "permit_budget": 32}
+                (root / "settings.json").write_text(json.dumps(settings))
+                script = '''
+scratch=$1 target_dir=$1 HOST_BINARY=$1/installed-host here=$2 mode=$3
+host_id=test-host port=8443 host_mode=per_job per_job_settings=$1/settings.json
+render() { python3 "$here/hosted_host.py" "$@"; }
+''' + stage + '''
+stage_host_config
+echo installed > "$scratch/installed"
+'''
+                result = subprocess.run(["bash", "-ec", script, "_", directory, str(HERE), mode],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 23, result.stderr)
+                self.assertIn("validator rejection", result.stderr)
+                self.assertFalse((root / "installed").exists())
+                config = json.loads((root / "host.json").read_text())
+                self.assertEqual(config["per_job"], settings)
+        tail = self.script[self.script.index('[ "$build" = 1 ] && build_binaries'):]
+        self.assertLess(tail.index("\nstage_host_config\n"), tail.index("\naccount\n"))
+        self.assertLess(tail.index("\nstage_host_config\n"), tail.index("\nbinaries\n"))
+        self.assertLess(tail.index("\nstage_host_config\n"), tail.index("\nconfigs\n"))
+
+    def test_per_job_install_arguments_refuse_missing_settings(self):
+        base = ["bash", str(HERE / "install.sh"), "--checkout", str(REPO),
+                "--host-id", HOST_ID, "--tenant-sub", SUB, "--uplink", "eth0"]
+        for options, message in [
+            (["--mode", "per_job"], "--per-job-settings"),
+            (["--per-job-settings", "settings.json"], "--mode per_job"),
+            (["--mode", "unknown"], "--mode must be tenant or per_job"),
+        ]:
+            result = subprocess.run([*base, *options], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(message, result.stderr)
+        self.assertIn('host_mode=$(python3 -c', self.script)
+        self.assertIn('per_job_settings=$scratch/per-job.json', self.script)
 
     def test_units_are_enabled_and_started_only_by_start_and_stopped_only_by_stop(self):
         start, stop = self.function("start_units"), self.function("stop_units")

@@ -68,6 +68,83 @@ fn auth(result: Result<(u64, Admission), Error>) {
     );
 }
 
+fn disk_limit_host() -> Host {
+    let mut h = memory_host(100_000);
+    h.record_host_resources(HostResources {
+        at_ms: AT,
+        available_mem_mib: 100_000,
+        vcpu_ceiling: 64,
+        permit_budget: 256,
+    });
+    h
+}
+
+fn workspace_job(index: u8) -> Claims {
+    let mut c = job(&format!("00000000-0000-7000-8000-{index:012x}"));
+    c.vcpus = 1;
+    c.workspace_key_hash = Some(motor_lease::base64url(&[index; 32]));
+    c
+}
+
+#[test]
+fn job_disk_limit_admits_64th_refuses_new_and_queues_same_workspace() {
+    let mut h = disk_limit_host();
+    for i in 0..64 {
+        let c = workspace_job(i);
+        assert_eq!(h.claim(c.clone(), AT).unwrap().1, Admission::Ready);
+        h.begin_job_boot(&c.jti).unwrap().unwrap();
+    }
+    assert_eq!(h.snapshot.per_job.disks.len(), 64);
+    let before = h.snapshot.clone();
+    full(h.claim(workspace_job(64), AT));
+    assert_eq!(h.snapshot, before);
+    let warm = h.heartbeat(AT, 0, true).warm;
+    assert_eq!(warm.len(), 64);
+    assert!(h
+        .snapshot
+        .per_job
+        .disks
+        .keys()
+        .all(|id| warm.iter().any(|entry| &entry.vm == id && entry.busy)));
+
+    let mut queued = workspace_job(0);
+    queued.jti = workspace_job(65).jti;
+    assert_eq!(h.claim(queued.clone(), AT).unwrap().1, Admission::Ready);
+    assert!(h.begin_job_boot(&queued.jti).unwrap().is_none());
+    assert_eq!(h.snapshot.per_job.disks.len(), 64);
+
+    // An idle cached disk still needs a slot when it is used again. Stopping
+    // a disk with a queued successor, however, keeps its slot reserved.
+    h.job_stopped(&workspace_job(0).jti, false).unwrap();
+    full(h.claim(workspace_job(64), AT));
+    h.begin_job_boot(&queued.jti).unwrap().unwrap();
+    h.job_stopped(&workspace_job(1).jti, false).unwrap();
+    let new = workspace_job(64);
+    h.claim(new.clone(), AT).unwrap();
+    h.begin_job_boot(&new.jti).unwrap().unwrap();
+    let mut cached = workspace_job(1);
+    cached.jti = workspace_job(66).jti;
+    full(h.claim(cached, AT));
+}
+
+#[test]
+fn queued_workspaces_reserve_disk_slots_before_boot() {
+    let mut h = disk_limit_host();
+    for i in 0..64 {
+        h.claim(workspace_job(i), AT).unwrap();
+    }
+    assert!(h
+        .snapshot
+        .per_job
+        .disks
+        .values()
+        .all(|disk| disk.attached_job.is_none()));
+    full(h.claim(workspace_job(64), AT));
+    for i in 0..64 {
+        h.begin_job_boot(&workspace_job(i).jti).unwrap().unwrap();
+    }
+}
+
 #[test]
 fn disk_identity_uses_account_and_hash_ignoring_cold_and_foreign_hints() {
     let mut h = memory_host(10_000);
