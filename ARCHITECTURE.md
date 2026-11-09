@@ -103,75 +103,11 @@ capacity is free.
 
 ## Opt-in Linux fixed paths and build bases
 
-- **Stable path, not a shared checkout.** An enabled job starts under
-  `/w/<account>/<repo-key>/<name>` in its own mount namespace. The account is
-  the subject with `:` replaced by `-`, the key is the mirror's repository
-  identity and the name is the repository root's basename, not a worktree name.
-  The caller path remains an alias with the same protections;
-  `MOTOR_CALLER_WORKSPACE` gives the job its caller workspace path. Declared
-  siblings get read-only fixed aliases too; basename collisions fall back to
-  caller paths, with no rewrite or seed. Tests:
-  `fixed_paths_use_repository_identity_not_worktree_or_cwd`
-  (`crates/motor-runner/src/caller_path.rs`),
-  `isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts`,
-  `isolated_fixed_paths_preserve_read_only_and_writable_overlays`
-  (`crates/motor-runner/src/tests/isolated_caller_roots.rs`).
-- **Rewrite streams, not artifacts.** Before output paging and persistence,
-  stdout/stderr fixed checkout and sibling paths become caller paths. The saved
-  rewrite map also applies after reattach or restart. Files the job writes
-  (logs, test reports and returned files) and `workspace_changes` are not
-  rewritten and can contain the fixed path. Tests:
-  `rewrite_pipe_eof_and_reattach_preserve_bytes_sequences_and_map`,
-  `rewrite_durable_two_monitor_restarts_preserve_source_offsets`
-  (`crates/motor-runner/src/tests/monitoring.rs`),
-  `isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts` (compares file
-  contents with streamed output). Returned-file and `workspace_changes`
-  non-rewriting are not covered by a dedicated test.
-- **Trusted, host-local bases.** A successful default-branch fill whose
-  checkout stayed unchanged can atomically publish
-  `<state_dir>/build-bases/<repo-key>/current`, containing `target/` and
-  `base.json`. Bases are private to one host and account, never writable by
-  jobs. A missing, outdated or incompatible base is due for a fill at most once
-  per six hours, with the last start persisted across restarts; fill authority
-  and capacity constraints still apply. A tenant without a remote-cache write
-  key gets fixed paths and rewriting, but no base fill. Tests:
-  `isolated_base_fill_publishes_nested_uplift_links_and_replaces_current`
-  (`crates/motor-runner/src/tests/isolated_targets.rs`),
-  `source_only_tip_and_eviction_wait_six_hours_across_restart`,
-  `incompatible_or_unreadable_same_tip_records_refill_once_after_the_interval`,
-  `selector_is_ordered_and_keyless_tenant_has_no_candidates`
-  (`crates/motor-runner/src/tests.rs`).
-- **Seed only when compatible.** An eligible empty `target/` gets a reflink
-  clone, never a shared writable target. No siblings or unverified leftovers
-  are allowed; format, fixed path, device, toolchain and effective environment
-  must match. Only a newly seeded folder gets times derived from the verified
-  tree's content and modes: unchanged files and directories use the fill start,
-  changed ones the time step's start, never commit dates. A kept folder is not
-  time-set. The reuse guarantee covers the Cargo units warmed by the fill, not
-  arbitrary commands or non-Cargo artifacts. Tests:
-  `eligibility_refuses_incompatible_records_and_leftovers`
-  (`crates/motor-runner/src/seed.rs`),
-  `isolated_seed_base_is_warm_and_copy_on_write`,
-  `isolated_seed_old_dated_change_rebuilds_changed_crate_and_dependents_once`,
-  `isolated_seed_kept_folder_edit_and_revert_each_rebuild`
-  (`crates/motor-runner/src/tests/isolated_seed.rs`).
-- **Explicit rollout and disk budget.** The feature is off by default and
-  Linux-only. Provisioning's `fixed_path_repositories` list renders repeated
-  `--fixed-path-repository` options and `--account-subject` only when enabled;
-  subject validity and isolation are required then. Before deployment,
-  unprivileged Linux runners need the matching permissions helper and sudoers
-  rules reinstalled even if the list is empty (an operator step, not covered by
-  a test). Bases count against the job disk: the fourth pressure pass evicts
-  unleased bases after whole workspaces and staging. The build-folder cap and
-  stale-unit sweep never touch a base. Tests:
-  `test_fixed_path_disabled_runner_args_golden`,
-  `test_fixed_path_enabled_record_round_trips_and_renders`
-  (`script/tenant-provision/test_provision.py`),
-  `fixed_paths_require_subject_and_isolation_only_when_enabled`
-  (`crates/motor-runner/src/main.rs`),
-  `fourth_pass_evicts_oldest_base_after_workspaces_and_staging_before_refusal`,
-  `cap_stale_sweep_and_whole_workspace_pass_leave_base_untouched`
-  (`crates/motor-runner/src/tests.rs`).
+Fixed checkout paths are Linux-only, off by default and enabled per repository.
+Each enabled job uses a fixed path per account and repository without sharing
+a writable checkout. Streamed output is rewritten to the caller's path, but
+files the job writes are not. A trusted, host-local build base can seed empty
+build folders with copy-on-write data; bases can be evicted under disk pressure.
 
 The numbered contract is in
 [docs/job-isolation.md](docs/job-isolation.md#39-fixed-checkout-paths-and-build-bases),
