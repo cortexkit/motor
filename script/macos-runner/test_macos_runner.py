@@ -632,6 +632,8 @@ class InstallerTests(unittest.TestCase):
         record.write_text(json.dumps(installed))
         plist = plistlib.loads(self.plist.read_bytes())
         plist["WorkingDirectory"] = str(self.state)
+        plist["StandardOutPath"] = str(install.log_directory() / "daemon.stdout")
+        plist["StandardErrorPath"] = str(install.log_directory() / "daemon.stderr")
         self.plist.write_bytes(plistlib.dumps(plist))
         return {"FilesystemType": "apfs", "VolumeUUID": DATA_UUID, "GlobalPermissionsEnabled": True,
                 "RemovableMedia": False, "MountPoint": str(self.root), "Internal": False}
@@ -780,9 +782,12 @@ class DataVolumeTests(unittest.TestCase):
         self.assertEqual(plist["WorkingDirectory"], str(state))
         args = plist["ProgramArguments"]
         self.assertEqual(args[args.index("--state-root") + 1], str(state))
-        self.assertEqual(plist["StandardOutPath"], str(state / "daemon.stdout"))
-        self.assertEqual(plist["StandardErrorPath"], str(state / "daemon.stderr"))
-        self.assertNotIn("WorkingDirectory", install.agent(Path("/runner"), state, "macos", Path("/vm.toml")))
+        # launchd opens the logs itself and may not open files on an external volume.
+        self.assertEqual(plist["StandardOutPath"], "/Users/motor/Library/Logs/motor-runner/daemon.stdout")
+        self.assertEqual(plist["StandardErrorPath"], "/Users/motor/Library/Logs/motor-runner/daemon.stderr")
+        internal = install.agent(Path("/runner"), state, "macos", Path("/vm.toml"))
+        self.assertNotIn("WorkingDirectory", internal)
+        self.assertEqual(internal["StandardErrorPath"], str(state / "daemon.stderr"))
 
 
 class AutoLoginTests(unittest.TestCase):

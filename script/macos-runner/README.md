@@ -276,7 +276,11 @@ disks to mount at boot before a user logs in. A root-only
 or its absence across updates; uninstall restores it. Do not remove that backup
 while the installation is active.
 
-For a selected data volume, the LaunchAgent's `WorkingDirectory` is the absolute
+For a selected data volume, the LaunchAgent's standard output and error go to
+`/Users/motor/Library/Logs/motor-runner/` on the internal disk: launchd opens those
+files itself before the runner starts, and macOS privacy rules refuse launchd's
+open on an external volume even when the runner has Full Disk Access. The
+LaunchAgent's `WorkingDirectory` is the absolute
 state root. `Runner::open` can recursively create a missing state root, so startup
 must stop before that call when the disk is missing, rather than create state on
 the internal disk. This relies on launchd refusing to spawn when its working

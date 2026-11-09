@@ -141,6 +141,10 @@ def stage_metrics(endpoint, host_id):
                       "status": "staged for next planned LaunchAgent reload or host restart; LaunchAgent was not stopped or started"}, indent=2))
 
 
+def log_directory():
+    return HOME / "Library/Logs/motor-runner"
+
+
 def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metrics_host_id=None, data_volume=None):
     # Advertise 128 MiB returns with a shared 512 MiB disk budget for the two VMs.
     plist = {
@@ -161,6 +165,12 @@ def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metric
         # must stop launchd before that creation can fall back to the internal disk.
         # This launchd behavior still needs an unmounted-disk test on a real host.
         plist["WorkingDirectory"] = str(state_root)
+        # launchd opens these log files itself, before the runner starts, and
+        # macOS privacy rules refuse launchd's open on an external volume even
+        # when the runner has Full Disk Access ("Unable to open stdout path ...
+        # Operation not permitted", exit 78). Keep them on the internal disk.
+        plist["StandardOutPath"] = str(log_directory() / "daemon.stdout")
+        plist["StandardErrorPath"] = str(log_directory() / "daemon.stderr")
     return plist
 
 
@@ -775,6 +785,10 @@ def install(args, manifest):
         directory.mkdir(parents=True, exist_ok=True)
         os.chown(directory, account.pw_uid, account.pw_gid)
         directory.chmod(0o755)
+    if args.data_volume:
+        log_directory().mkdir(parents=True, exist_ok=True)
+        os.chown(log_directory(), account.pw_uid, account.pw_gid)
+        log_directory().chmod(0o700)
     login_changed = configure_login(account)
     if login_changed:
         print("Restart required: the auto-login user changed to motor. The installer will not restart the host.")
