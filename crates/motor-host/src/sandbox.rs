@@ -384,6 +384,12 @@ impl Control for LocalRunner {
     fn available_bytes(&self) -> Result<u64> {
         anyhow::bail!("sandbox lifecycle belongs to the broker")
     }
+    fn host_available_mib(&self) -> Result<u64> {
+        anyhow::bail!("sandbox lifecycle belongs to the broker")
+    }
+    fn online_cpus(&self) -> Result<u32> {
+        anyhow::bail!("sandbox lifecycle belongs to the broker")
+    }
 }
 
 pub fn runtime(config: Config) -> Result<Arc<Runtime>> {

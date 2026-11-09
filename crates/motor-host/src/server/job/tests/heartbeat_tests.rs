@@ -46,6 +46,38 @@ fn required_cpu_settings_validate_against_online_cpus_without_a_64_permit_cap() 
 }
 
 #[tokio::test]
+async fn storage_probe_uses_control_host_memory_and_online_cpus() {
+    let (runtime, fake, _) = fixture();
+    fake.capacity_available.store(true, Ordering::SeqCst);
+    runtime.host.lock().unwrap().enforce_storage();
+
+    runtime.probe_storage();
+    {
+        let host = runtime.host.lock().unwrap();
+        let now = unix_ms();
+        let sample = host.fresh_host_resources(now).unwrap();
+        assert_eq!(sample.available_mem_mib, 1000);
+        assert_eq!((sample.vcpu_ceiling, sample.permit_budget), (2, 4));
+        let heartbeat = host.heartbeat(now, host.job_free_mem_mib(now), true);
+        assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (4, 950));
+    }
+
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let crate::config::HostSettings::PerJob(settings) = &mut host.settings else {
+            unreachable!()
+        };
+        settings.vcpu_ceiling = 3;
+    }
+    runtime.probe_storage();
+    let host = runtime.host.lock().unwrap();
+    let now = unix_ms();
+    assert!(host.fresh_host_resources(now).is_none());
+    let heartbeat = host.heartbeat(now, host.job_free_mem_mib(now), true);
+    assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0));
+}
+
+#[tokio::test]
 async fn failed_host_probe_discards_a_previously_fresh_sample() {
     let (runtime, _, _) = fixture();
     {

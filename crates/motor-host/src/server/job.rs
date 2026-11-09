@@ -726,7 +726,7 @@ async fn failed<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-pub(super) fn host_available_mib(meminfo: &str) -> Result<u64> {
+pub(crate) fn host_available_mib(meminfo: &str) -> Result<u64> {
     let mut samples = meminfo
         .lines()
         .filter_map(|line| line.strip_prefix("MemAvailable:"));

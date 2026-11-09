@@ -253,6 +253,12 @@ fn isolated_tight_host_space_stops_admissions_and_publication_before_reflink_ove
         ordinary: Arc<Storage>,
     }
     impl Control for Space {
+        fn host_available_mib(&self) -> anyhow::Result<u64> {
+            Ok(100_000)
+        }
+        fn online_cpus(&self) -> anyhow::Result<u32> {
+            Ok(4)
+        }
         fn available_bytes(&self) -> anyhow::Result<u64> {
             Ok(free(&self.root))
         }

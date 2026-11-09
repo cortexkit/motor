@@ -519,11 +519,11 @@ impl Runtime {
         if let crate::config::HostSettings::PerJob(settings) = settings {
             let sample = (|| -> Result<_> {
                 capacity.as_ref().map_err(|e| anyhow::anyhow!(e.clone()))?;
-                settings.validate_cpus(crate::config::online_cpus()?)?;
-                let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+                settings.validate_cpus(self.control.online_cpus()?)?;
+                let available_mem_mib = self.control.host_available_mib()?;
                 Ok(crate::state::jobs::HostResources {
                     at_ms: unix_ms(),
-                    available_mem_mib: job::host_available_mib(&meminfo)?,
+                    available_mem_mib,
                     vcpu_ceiling: settings.vcpu_ceiling,
                     permit_budget: settings.permit_budget,
                 })
@@ -1550,6 +1550,7 @@ impl Runtime {
 }
 
 mod job;
+pub(crate) use job::host_available_mib;
 
 fn verified_lease(claims: &Claims, burst_enabled: bool) -> Value {
     let mut lease = json!({"type":"verified_lease", "jti":claims.jti, "purpose":claims.purpose, "sub":claims.sub, "vcpus":claims.vcpus, "mem_mib":claims.mem_mib, "platform":claims.platform, "net":claims.net, "max_s":claims.max_s, "exp":claims.exp});

@@ -501,6 +501,12 @@ struct Probe {
     statuses: Mutex<u32>,
 }
 impl Control for Probe {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn metrics(&self, _: &str) -> Result<motor_host::billing::Metrics> {
         Ok(motor_host::billing::Metrics {
             memory_bytes: 0,

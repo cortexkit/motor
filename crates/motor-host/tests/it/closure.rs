@@ -17,6 +17,12 @@ struct Helper {
     fail_removals: std::sync::atomic::AtomicUsize,
 }
 impl Control for Helper {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn adopt(&self, _: &str) -> Result<bool> {
         Ok(false)
     }

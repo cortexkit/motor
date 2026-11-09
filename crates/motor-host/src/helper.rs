@@ -97,6 +97,8 @@ pub trait Control: Send + Sync {
     fn admin(&self, tenant: &str, request: &Value) -> Result<Value>;
     fn suspend(&self, tenant: &str) -> Result<()>;
     fn available_bytes(&self) -> Result<u64>;
+    fn host_available_mib(&self) -> Result<u64>;
+    fn online_cpus(&self) -> Result<u32>;
     /// Reads the host capacity file. Without one, the storage refusal stays
     /// latched and free memory is advertised as 0.
     fn capacity(&self) -> Result<crate::capacity::Capacity> {
@@ -629,6 +631,17 @@ impl Control for Helper {
     }
     fn available_bytes(&self) -> Result<u64> {
         available_bytes(&self.storage)
+    }
+    fn host_available_mib(&self) -> Result<u64> {
+        crate::server::host_available_mib(&std::fs::read_to_string("/proc/meminfo")?)
+    }
+    fn online_cpus(&self) -> Result<u32> {
+        // CPU affinity can be narrower than the host's configured online CPUs.
+        let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        u32::try_from(online)
+            .ok()
+            .filter(|n| *n > 0)
+            .context("online CPUs unavailable")
     }
     fn capacity(&self) -> Result<crate::capacity::Capacity> {
         crate::capacity::read(&self.capacity, 0)

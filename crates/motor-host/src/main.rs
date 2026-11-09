@@ -37,9 +37,12 @@ struct Config {
 }
 
 impl Config {
-    fn startup_settings(&self) -> Result<motor_host::config::HostSettings> {
+    fn startup_settings(
+        &self,
+        control: &dyn motor_host::helper::Control,
+    ) -> Result<motor_host::config::HostSettings> {
         use motor_host::config::{HostMode, HostSettings};
-        let settings = HostSettings::from_config(self.mode, self.per_job.clone())?;
+        let settings = HostSettings::from_config(self.mode, self.per_job.clone(), control)?;
         // Do not serve a per-job configuration with tenant VMs while the job
         // VM lifecycle is not yet wired into this executable.
         ensure!(
@@ -87,7 +90,15 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("usage: motor-host <config.json>")?;
     let config: Config = serde_json::from_reader(File::open(&path)?)?;
-    let settings = config.startup_settings()?;
+    let mut helper = Helper {
+        socket: config.helper_socket.clone(),
+        storage: config.storage.clone(),
+        capacity: motor_host::capacity::CONFIG.into(),
+        vcpu_ceiling: BTreeMap::new(),
+        guest_init: BTreeMap::new(),
+        pressure_cgroups: BTreeMap::new(),
+    };
+    let settings = config.startup_settings(&helper)?;
     let (broker_endpoint, jwks_url) = if let Some(url) = &config.fake_broker_url {
         motor_host::broker::trusted_override_config(std::path::Path::new(&path))?;
         let endpoint = motor_host::broker::fake_broker_endpoint(url, &config.listen)?;
@@ -162,17 +173,13 @@ async fn main() -> Result<()> {
         .values()
         .map(|t| (t.tenant.clone(), t.vcpu_ceiling))
         .collect();
+    helper.vcpu_ceiling = vcpu_ceiling;
+    helper.guest_init = guest_init;
+    helper.pressure_cgroups = pressure_cgroups;
     let runtime = Runtime::with_broker(
         config.host_id,
         host,
-        Arc::new(Helper {
-            socket: config.helper_socket,
-            storage: config.storage.clone(),
-            capacity: motor_host::capacity::CONFIG.into(),
-            vcpu_ceiling,
-            guest_init,
-            pressure_cgroups,
-        }),
+        Arc::new(helper),
         broker_endpoint,
         jwks_url,
     );
@@ -371,6 +378,37 @@ mod config_tests {
     use super::*;
     use motor_host::config::{HostMode, HostSettings};
 
+    struct Control;
+    impl motor_host::helper::Control for Control {
+        fn adopt(&self, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+        fn wake(&self, _: &str, _: Option<u64>) -> Result<u64> {
+            unreachable!()
+        }
+        fn quota(&self, _: &str, _: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn relay(&self, _: &str, _: u32) -> Result<std::os::unix::net::UnixStream> {
+            unreachable!()
+        }
+        fn admin(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn suspend(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            unreachable!()
+        }
+        fn host_available_mib(&self) -> Result<u64> {
+            Ok(100_000)
+        }
+        fn online_cpus(&self) -> Result<u32> {
+            Ok(2)
+        }
+    }
+
     fn config() -> serde_json::Value {
         json!({
             "host_id": "host", "listen": "127.0.0.1:443",
@@ -401,7 +439,10 @@ mod config_tests {
             }
             let config: Config = serde_json::from_value(value.clone()).unwrap();
             assert_eq!(config.mode, HostMode::Tenant);
-            assert_eq!(config.startup_settings().unwrap(), HostSettings::Tenant);
+            assert_eq!(
+                config.startup_settings(&Control).unwrap(),
+                HostSettings::Tenant
+            );
         }
     }
 
@@ -415,7 +456,7 @@ mod config_tests {
             }
             let config: Config = serde_json::from_value(value.clone()).unwrap();
             assert_eq!(
-                config.startup_settings().unwrap_err().to_string(),
+                config.startup_settings(&Control).unwrap_err().to_string(),
                 "per_job settings are required"
             );
         }
@@ -454,7 +495,8 @@ mod config_tests {
         value["mode"] = json!("per_job");
         value["per_job"] = per_job();
         let config: Config = serde_json::from_value(value).unwrap();
-        let settings = HostSettings::from_config(config.mode, config.per_job.clone()).unwrap();
+        let settings =
+            HostSettings::from_config(config.mode, config.per_job.clone(), &Control).unwrap();
         assert_eq!(settings.mode(), HostMode::PerJob);
         let HostSettings::PerJob(settings) = settings else {
             panic!("per-job settings lost")
@@ -463,8 +505,21 @@ mod config_tests {
         assert_eq!(settings.boot_deadline_ms, 30000);
         assert_eq!(settings.workspace_disk_cap_bytes, 10737418240);
         assert_eq!(
-            config.startup_settings().unwrap_err().to_string(),
+            config.startup_settings(&Control).unwrap_err().to_string(),
             "per_job mode is not yet available"
+        );
+    }
+
+    #[test]
+    fn per_job_startup_validates_the_controls_online_cpu_count() {
+        let mut value = config();
+        value["mode"] = json!("per_job");
+        value["per_job"] = per_job();
+        value["per_job"]["vcpu_ceiling"] = json!(3);
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            config.startup_settings(&Control).unwrap_err().to_string(),
+            "per_job vcpu_ceiling must be between 1 and online CPUs"
         );
     }
 

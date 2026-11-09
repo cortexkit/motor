@@ -27,6 +27,12 @@ struct WakeGate {
     release: std::sync::mpsc::Receiver<()>,
 }
 impl Control for Fake {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn adopt(&self, _: &str) -> Result<bool> {
         Ok(false)
     }
@@ -1551,6 +1557,12 @@ impl SlowSuspend {
     }
 }
 impl Control for SlowSuspend {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn adopt(&self, tenant: &str) -> Result<bool> {
         if tenant == "tenant" && self.suspended.load(std::sync::atomic::Ordering::SeqCst) {
             self.probes_while_suspended

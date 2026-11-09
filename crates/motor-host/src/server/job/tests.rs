@@ -62,6 +62,7 @@ fn run(job: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    capacity_available: AtomicBool,
     fail_ensure: AtomicBool,
     ensured_caps: Mutex<Vec<u64>>,
     calls: Mutex<Vec<String>>,
@@ -98,6 +99,26 @@ impl Fake {
     }
 }
 impl Control for Fake {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(1000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(2)
+    }
+    fn capacity(&self) -> Result<crate::capacity::Capacity> {
+        ensure!(
+            self.capacity_available.load(Ordering::SeqCst),
+            "host capacity file unavailable"
+        );
+        Ok(crate::capacity::Capacity {
+            windows_vm_bytes: 0,
+            host_reserve_bytes: 0,
+            jobs_min_bytes: 1,
+            storage_margin_bytes: 0,
+            growth_allowance_bytes: 0,
+            tenant_memory_reserve_bytes: 0,
+        })
+    }
     fn ensure_workspace(&self, _: &str, _: &str, cap: u64) -> Result<()> {
         self.ensured_caps.lock().unwrap().push(cap);
         ensure!(

@@ -1197,6 +1197,12 @@ impl DiagnosticsControl {
     }
 }
 impl motor_host::helper::Control for DiagnosticsControl {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn adopt(&self, _: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -1706,6 +1712,12 @@ fn watchdog_runtime_stops_the_only_lease_once_and_clears_durable_stop_pending() 
     use motor_host::{helper::Control, server::Runtime};
     struct Stop(std::sync::atomic::AtomicUsize);
     impl Control for Stop {
+        fn host_available_mib(&self) -> anyhow::Result<u64> {
+            Ok(100_000)
+        }
+        fn online_cpus(&self) -> anyhow::Result<u32> {
+            Ok(4)
+        }
         fn adopt(&self, _: &str) -> Result<bool> {
             Ok(false)
         }

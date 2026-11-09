@@ -67,6 +67,12 @@ struct PrepareHold {
     release: std::sync::mpsc::Receiver<()>,
 }
 impl Control for Disk {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn ensure_workspace(&self, account: &str, disk_id: &str, size_bytes: u64) -> Result<()> {
         motor_vm_helper::job::validate_account(account)?;
         motor_vm_helper::job::validate_id(disk_id)?;

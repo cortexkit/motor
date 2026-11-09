@@ -8,6 +8,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 struct NoVm;
 impl Control for NoVm {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn adopt(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
@@ -359,6 +365,12 @@ impl DiskGuest {
     }
 }
 impl Control for DiskGuest {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn adopt(&self, tenant: &str) -> Result<bool> {
         NoVm.adopt(tenant)
     }

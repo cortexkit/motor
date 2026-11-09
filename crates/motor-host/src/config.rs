@@ -51,15 +51,6 @@ impl PerJobSettings {
     }
 }
 
-pub(crate) fn online_cpus() -> Result<u32> {
-    // CPU affinity can be narrower than the host's configured online CPUs.
-    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    u32::try_from(online)
-        .ok()
-        .filter(|n| *n > 0)
-        .context("online CPUs unavailable")
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum HostSettings {
     #[default]
@@ -68,12 +59,16 @@ pub enum HostSettings {
 }
 
 impl HostSettings {
-    pub fn from_config(mode: HostMode, per_job: Option<PerJobSettings>) -> Result<Self> {
+    pub fn from_config(
+        mode: HostMode,
+        per_job: Option<PerJobSettings>,
+        control: &dyn crate::helper::Control,
+    ) -> Result<Self> {
         Ok(match mode {
             HostMode::Tenant => Self::Tenant,
             HostMode::PerJob => {
                 let settings = per_job.context("per_job settings are required")?;
-                settings.validate_cpus(online_cpus()?)?;
+                settings.validate_cpus(control.online_cpus()?)?;
                 Self::PerJob(settings)
             }
         })

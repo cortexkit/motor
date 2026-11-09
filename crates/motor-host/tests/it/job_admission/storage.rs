@@ -61,6 +61,12 @@ impl Storage {
     }
 }
 impl Control for Storage {
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
     fn workspace_usage(&self, _: &str, disk: &str) -> anyhow::Result<Option<u64>> {
         Ok(self.exclusive.lock().unwrap().get(disk).copied())
     }
