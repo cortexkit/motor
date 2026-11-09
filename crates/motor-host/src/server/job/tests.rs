@@ -1242,3 +1242,35 @@ async fn disconnect_or_refusal_before_run_stops_an_already_ready_vm_and_releases
 
 mod balloon_tests;
 mod settlement_tests;
+
+#[test]
+fn mirror_report_is_recorded_before_lifecycle_ack() {
+    let (runtime, fake, _) = fixture();
+    let c = claims(JOB);
+    claim(&runtime, &c);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    let (host, mut guest) = UnixStream::pair().unwrap();
+    guest
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    *fake.lifecycle.lock().unwrap() = Some(host);
+    runtime.start_job_events(JOB.into());
+    write_json(&mut guest, &json!({"type":"event","event_seq":1,"event":"mirror_refs","mirror_refs":{
+        "imported":true,"refs":[{"repository":"/repo","reference":"refs/snapshots/held","commit":"held"}]
+    }})).unwrap();
+    assert_eq!(
+        read_json(&mut guest).unwrap(),
+        json!({"type":"ack","event_seq":1})
+    );
+    let mut host = runtime.host.lock().unwrap();
+    let disk = &host.snapshot.per_job.executions[JOB].disk_id;
+    assert_eq!(host.snapshot.per_job.disks[disk].have[0].commit, "held");
+    assert_eq!(host.snapshot.vms[JOB].event_seq, 1);
+    host.job_stopped(JOB, false).unwrap();
+}

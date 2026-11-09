@@ -90,6 +90,12 @@ fn full() -> Snapshot {
             queue: vec![JOB.into()],
             attached_job: Some(JOB.into()),
             quarantined: false,
+            have: vec![motor_protocol::MirrorRef {
+                repository: Some("/repo".into()),
+                dependency: None,
+                reference: "refs/snapshots/held".into(),
+                commit: "held".into(),
+            }],
         },
     );
     s.per_job.executions.insert(
@@ -133,6 +139,7 @@ fn full() -> Snapshot {
             boot_started: true,
             runner_hello: false,
             ended: false,
+            have_invalidated: true,
         },
     );
     s

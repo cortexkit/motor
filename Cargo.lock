@@ -1100,6 +1100,7 @@ dependencies = [
  "libc",
  "motor-lease",
  "motor-protocol",
+ "motor-runner",
  "motor-vm-helper",
  "rand 0.8.7",
  "rcgen",

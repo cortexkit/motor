@@ -8,6 +8,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub(crate) mod have;
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
     /// Disk ids are opaque VM names in placement hints, not account or workspace names.
@@ -28,6 +30,9 @@ pub struct WorkspaceDisk {
     pub queue: Vec<String>,
     pub attached_job: Option<String>,
     pub quarantined: bool,
+    /// Oldest-first mirror pins from runner reports, never caller candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub have: Vec<motor_protocol::MirrorRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -41,6 +46,9 @@ pub struct Execution {
     pub boot_started_at_ms: Option<u64>,
     pub runner_hello: bool,
     pub ended: bool,
+    /// Fence delayed imports from this VM after a refusal or an unclean stop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub have_invalidated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<super::settlement::Evidence>,
 }
@@ -233,6 +241,7 @@ impl Host {
                 boot_started_at_ms: None,
                 runner_hello: false,
                 ended: false,
+                have_invalidated: false,
                 evidence: None,
             };
             let mut next = self.snapshot.clone();
@@ -245,6 +254,7 @@ impl Host {
                     queue: Vec::new(),
                     attached_job: None,
                     quarantined: false,
+                    have: Vec::new(),
                 })
                 .queue
                 .push(claims.jti.clone());
@@ -360,6 +370,10 @@ impl Host {
         if disk.attached_job.as_deref() == Some(job) {
             disk.attached_job = None;
             disk.quarantined |= unclean;
+            if unclean {
+                disk.have.clear();
+                execution.have_invalidated = true;
+            }
         }
         let evidence = execution.evidence.get_or_insert_with(Default::default);
         // This path also releases claims whose helper launch never happened.
@@ -397,6 +411,7 @@ impl Host {
         now_ms: u64,
     ) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
+        have::transfer_terminal(&mut next, job, &frame);
         if next
             .leases
             .get(job)
