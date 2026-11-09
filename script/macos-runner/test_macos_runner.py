@@ -1566,6 +1566,24 @@ class ImageTests(unittest.TestCase):
                     patch.object(guest.subprocess, "check_output", return_value="Remote Login: On"):
                 with self.assertRaisesRegex(ValueError, "did not turn off"):
                     guest.drop_build_access("motorbuild", home, sudoers, users)
+            # The SSH route stays usable, so the builder can be inspected.
+            self.assertTrue((home / ".ssh/authorized_keys").exists())
+            self.assertTrue(sudoers.exists())
+
+    def test_sealing_keeps_build_access_when_remote_login_cannot_be_changed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            refused = subprocess.CalledProcessError(1, ["/usr/sbin/systemsetup"])
+
+            def run(*args, **kwargs):
+                if args[0] == "/usr/sbin/systemsetup":
+                    raise refused
+
+            with patch.object(guest, "run", side_effect=run), self.not_admin():
+                with self.assertRaises(subprocess.CalledProcessError):
+                    guest.drop_build_access("motorbuild", home, sudoers, users)
+            self.assertTrue((home / ".ssh/authorized_keys").exists())
+            self.assertTrue(sudoers.exists())
 
     def test_ipsw_digest_and_size_are_both_enforced(self):
         with tempfile.TemporaryDirectory() as directory:
