@@ -11281,8 +11281,8 @@ impl Runner {
             inner
                 .catalog
                 .repositories
-                .get_mut(&request.repository_root)
-                .expect("a fill has a repository catalog record")
+                .get_mut(paths::request(request).caller_repository_root.text())
+                .ok_or_else(|| io::Error::other("base fill has no repository catalog record"))?
                 .last_base_fill_started_ms = Some(now);
             self.catalog(inner)?;
         }

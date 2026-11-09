@@ -1500,7 +1500,7 @@ pub(crate) fn job_environment_in(
     Ok(env)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn compile_cache_environment(
     config: &Config,
     setup: &Setup,
@@ -1576,7 +1576,7 @@ fn compile_cache_environment_in(
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = setup;
+    let _ = (setup, repository);
     #[cfg(unix)]
     {
         remote_cache_environment(config, setup, prepared, env)
