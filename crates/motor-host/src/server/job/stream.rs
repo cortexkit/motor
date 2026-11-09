@@ -405,6 +405,20 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             {
                 write.write_all(&bytes).await?;
                 if value["type"] == "terminal" {
+                    // Billing acknowledgements are host metadata, not runner
+                    // output. Reuse their durable record after the stored
+                    // terminal on live streams and reattached streams alike.
+                    let hosted = runtime
+                        .host
+                        .lock()
+                        .expect("host lock")
+                        .snapshot
+                        .billing
+                        .get(&claims.jti)
+                        .and_then(|billing| billing.hosted_terminal.clone());
+                    if let Some(hosted) = hosted {
+                        write_frame(&mut write, &hosted).await?;
+                    }
                     return Ok(());
                 }
             }

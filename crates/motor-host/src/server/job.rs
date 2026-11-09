@@ -814,6 +814,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
             let r = runtime.clone();
             let job = claims.jti.clone();
             tokio::task::spawn_blocking(move || r.stop_job(&job, true, false)).await??;
+            if reason == "transfer_interrupted" {
+                return stream::serve(&runtime, claims, client, false, Reader::default(), true)
+                    .await;
+            }
             write_frame(client, &frame).await?;
             return Ok(());
         }

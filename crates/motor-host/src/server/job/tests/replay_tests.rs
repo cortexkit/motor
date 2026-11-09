@@ -469,3 +469,50 @@ async fn concurrent_controls_receive_only_their_own_runner_reply() {
     }
     runtime.stop_job(JOB, true, false).unwrap();
 }
+
+#[tokio::test]
+async fn undelivered_upload_eof_keeps_the_no_start_terminal_and_hosted_receipt_live() {
+    let (runtime, fake, _) = fixture();
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let disk = host.snapshot.per_job.executions[JOB].disk_id.clone();
+        host.snapshot
+            .per_job
+            .disks
+            .get_mut(&disk)
+            .unwrap()
+            .attached_job = Some("holder".into());
+    }
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    queued(&mut client, JOB).await;
+    write_frame(
+        &mut client,
+        &json!({"type":"bundle_chunk","index":0,"offset":0,"data":"YWJj"}),
+    )
+    .await
+    .unwrap();
+    client.shutdown().await.unwrap();
+    let terminal = next_type(&mut client, "terminal").await;
+    assert_eq!(terminal["outcome"]["type"], "refused_before_start");
+    assert_eq!(terminal["outcome"]["reason"], "transfer_interrupted");
+    assert_eq!(terminal["ran"], "none");
+    next_type(&mut client, "hosted_terminal").await;
+    task.await.unwrap().unwrap();
+    let stream = runtime.job_stream(JOB).unwrap();
+    assert_eq!(
+        stream
+            .with_store(|store| store.frame(0))
+            .unwrap()
+            .map(|frame| crate::replay::decode(&frame).unwrap()),
+        Some(terminal)
+    );
+    let host = runtime.host.lock().unwrap();
+    assert!(!host.snapshot.leases[JOB].delivered);
+    assert_eq!(
+        host.snapshot.zero_usage[JOB].started_at_ms,
+        host.snapshot.zero_usage[JOB].ended_at_ms
+    );
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
