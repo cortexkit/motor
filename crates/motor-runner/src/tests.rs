@@ -5723,6 +5723,338 @@ mod seeding {
 }
 
 #[cfg(target_os = "linux")]
+mod base_disk {
+    use super::*;
+    use crate::build_base::{self, CompatibleInputs, Record, Timestamp, ToolchainIdentity};
+    use crate::storage;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::thread;
+
+    fn config(f: &Fixture) -> Config {
+        let mut c = f.config();
+        c.manual_tick = true;
+        c.free_space_floor_bytes = 100;
+        c.free_space_eviction_bytes = Some(200);
+        c
+    }
+
+    fn record(fill_seconds: i64) -> Record {
+        Record {
+            format: 1,
+            commit: "commit".into(),
+            tree: "tree".into(),
+            inputs: CompatibleInputs {
+                toolchain: ToolchainIdentity {
+                    rustc_verbose: "rustc fixture".into(),
+                    rust_toolchain: None,
+                    rust_toolchain_toml: None,
+                    wrapper: None,
+                },
+                environment: "environment".into(),
+            },
+            fixed_path: "/w/account/repo/main".into(),
+            fill_start: Timestamp {
+                seconds: fill_seconds,
+                nanos: 0,
+            },
+            newest_mtime: Timestamp {
+                seconds: fill_seconds,
+                nanos: 0,
+            },
+        }
+    }
+
+    fn publish(state: &Path, repository: &str, fill_seconds: i64) -> PathBuf {
+        let staging = build_base::staging(state, repository, Uuid::now_v7());
+        fs::create_dir_all(staging.join("target/debug/incremental/unit")).unwrap();
+        fs::write(
+            staging.join("target/debug/incremental/unit/state.bin"),
+            [7; 8192],
+        )
+        .unwrap();
+        fs::create_dir_all(staging.join("target/debug/deps")).unwrap();
+        fs::write(
+            staging.join("target/debug/deps/libfoo-0123456789abcdef.rlib"),
+            [8; 8192],
+        )
+        .unwrap();
+        build_base::publish_record(&staging, &record(fill_seconds)).unwrap();
+        staging.parent().unwrap().to_path_buf()
+    }
+
+    fn usage(store: &Path, last_used_ms: u64) {
+        let stat = fs::metadata(store.join("current")).unwrap();
+        fs::write(
+            store.join("usage.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "generation": [stat.dev(), stat.ino()], "last_used_ms": last_used_ms
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn workspace(runner: &Runner, path: &Path) {
+        fs::create_dir_all(path.join("target")).unwrap();
+        fs::write(path.join("target/artifact"), [1; 8192]).unwrap();
+        runner.core.inner.lock().unwrap().catalog.workspaces.insert(
+            text(path).into(),
+            storage::Workspace {
+                used_ms: 1,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn fourth_pass_evicts_oldest_base_after_workspaces_and_staging_before_refusal() {
+        let f = Fixture::new();
+        let mut c = config(&f);
+        let state = c.state_dir();
+        let oldest = publish(&state, "oldest", 1);
+        let newer = publish(&state, "newer", 2);
+        let leased = publish(&state, "leased", 0);
+        usage(&oldest, 1000);
+        usage(&newer, 2000);
+        let pin = build_base::pin_current(&leased).unwrap();
+        let idle = f.scratch.join("remote/worktrees/idle");
+        let spool = state.join("spools").join(Uuid::now_v7().to_string());
+        fs::create_dir_all(&spool).unwrap();
+        fs::write(spool.join("upload"), [2; 8192]).unwrap();
+        let pressure = Arc::new(AtomicBool::new(false));
+        let active = pressure.clone();
+        let (base_probe, workspace_probe, spool_probe) =
+            (oldest.clone(), idle.clone(), spool.clone());
+        c.free_space_probe = Arc::new(move |_| {
+            if !active.load(Ordering::SeqCst) {
+                return Ok(200);
+            }
+            if !base_probe.join("current").exists() {
+                assert!(
+                    !workspace_probe.exists() && !spool_probe.exists(),
+                    "base evicted before the whole-workspace/staging pass"
+                );
+                Ok(200)
+            } else {
+                Ok(0)
+            }
+        });
+        let runner = Runner::open(c).unwrap();
+        workspace(&runner, &idle);
+        pressure.store(true, Ordering::SeqCst);
+        assert!(
+            runner.ensure_disk_space().unwrap().is_none(),
+            "base eviction must prevent runner_disk_full"
+        );
+        assert!(!oldest.join("current").exists());
+        assert!(newer.join("current").exists() && leased.join("current").exists());
+        assert_eq!(
+            fs::read(format!(
+                "/proc/self/fd/{}/target/debug/incremental/unit/state.bin",
+                std::os::fd::AsRawFd::as_raw_fd(&pin.directory)
+            ))
+            .unwrap(),
+            [7; 8192]
+        );
+        assert!(runner
+            .runner_status()
+            .disk
+            .unwrap()
+            .last_eviction
+            .unwrap()
+            .path
+            .ends_with("current"));
+    }
+
+    #[test]
+    fn seed_pin_racing_eviction_keeps_current_and_allows_cold_fallback_after_release() {
+        let f = Fixture::new();
+        let mut c = config(&f);
+        let state = c.state_dir();
+        let store = publish(&state, "race", 1);
+        let selected = build_base::eviction_candidates(&state).unwrap().remove(0);
+        let pressure = Arc::new(AtomicBool::new(false));
+        let active = pressure.clone();
+        let probe = store.join("current");
+        c.free_space_probe = Arc::new(move |_| {
+            Ok(if active.load(Ordering::SeqCst) && probe.exists() {
+                0
+            } else {
+                200
+            })
+        });
+        let runner = Runner::open(c).unwrap();
+        let pinned = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (thread_store, ready, done) = (store.clone(), pinned.clone(), release.clone());
+        let seed = thread::spawn(move || {
+            let pin = build_base::pin_current(&thread_store).unwrap();
+            ready.wait();
+            done.wait();
+            assert!(pin.directory.metadata().unwrap().is_dir());
+            assert_eq!(
+                fs::read(thread_store.join("current/target/debug/incremental/unit/state.bin"))
+                    .unwrap(),
+                [7; 8192]
+            );
+        });
+        pinned.wait();
+        pressure.store(true, Ordering::SeqCst);
+        assert!(build_base::claim_eviction(&selected).unwrap().is_none());
+        assert!(runner.ensure_disk_space().unwrap().is_some());
+        assert!(store.join("current").exists());
+        release.wait();
+        seed.join().unwrap();
+        assert!(runner.ensure_disk_space().unwrap().is_none());
+        assert!(!store.join("current").exists());
+        // The seed path treats a missing current as a cache miss, not an error.
+        assert_eq!(
+            build_base::pin_current(&store).err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn usage_missing_or_damaged_falls_back_to_fill_start_and_pin_repairs_it() {
+        let f = Fixture::new();
+        let state = f.config().state_dir();
+        let missing = publish(&state, "missing", 1);
+        let damaged = publish(&state, "damaged", 2);
+        let known = publish(&state, "known", 0);
+        fs::remove_file(missing.join("usage.json")).unwrap();
+        fs::write(damaged.join("usage.json"), "not json").unwrap();
+        usage(&known, 3000);
+        let expected = vec![missing.clone(), damaged.clone(), known.clone()];
+        let candidates = build_base::eviction_candidates(&state).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.store.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.last_used_ms)
+                .collect::<Vec<_>>(),
+            [1000, 2000, 3000]
+        );
+        for store in [&missing, &damaged] {
+            let before = fs::read(store.join("current/base.json")).unwrap();
+            drop(build_base::pin_current(store).unwrap());
+            let repaired: serde_json::Value =
+                serde_json::from_slice(&fs::read(store.join("usage.json")).unwrap()).unwrap();
+            assert!(repaired["last_used_ms"].as_u64().unwrap() > 3000);
+            assert_eq!(
+                fs::metadata(store.join("usage.json")).unwrap().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(fs::read(store.join("current/base.json")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn usage_unsafe_mode_or_symlink_is_not_trusted_and_never_breaks_pin() {
+        let f = Fixture::new();
+        let state = f.config().state_dir();
+        let store = publish(&state, "unsafe-usage", 7);
+        let path = store.join("usage.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            build_base::eviction_candidates(&state).unwrap()[0].last_used_ms,
+            7000
+        );
+        drop(build_base::pin_current(&store).unwrap());
+        let outside = f.scratch.join("outside-usage");
+        fs::write(&outside, "unchanged").unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert_eq!(
+            build_base::eviction_candidates(&state).unwrap()[0].last_used_ms,
+            7000
+        );
+        drop(build_base::pin_current(&store).unwrap());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "unchanged");
+        assert!(!fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn cap_stale_sweep_and_whole_workspace_pass_leave_base_untouched() {
+        let f = Fixture::new();
+        let mut c = config(&f);
+        c.build_folder_cap_bytes = 1;
+        let state = c.state_dir();
+        let store = publish(&state, "kept-base", 1);
+        let base = store.join("current");
+        let record = fs::read(base.join("base.json")).unwrap();
+        let idle = f.scratch.join("remote/worktrees/seeded");
+        let pressure = Arc::new(AtomicBool::new(false));
+        let active = pressure.clone();
+        let probe = idle.clone();
+        c.free_space_probe = Arc::new(move |_| {
+            Ok(if active.load(Ordering::SeqCst) && probe.exists() {
+                0
+            } else {
+                200
+            })
+        });
+        let runner = Runner::open(c).unwrap();
+        workspace(&runner, &idle);
+        fs::remove_dir_all(idle.join("target")).unwrap();
+        crate::platform::clone_target(&base.join("target"), &idle.join("target")).unwrap();
+        let dep = idle.join("target/debug/deps/libfoo-0123456789abcdef.rlib");
+        File::open(&dep)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(
+                UNIX_EPOCH + Duration::from_millis(runner.now() - 49 * 60 * 60 * 1000),
+            ))
+            .unwrap();
+        runner.guard_build_folder(text(&idle));
+        assert!(!idle.join("target/debug/incremental").exists());
+        assert!(dep.exists());
+        assert!(
+            runner.core.inner.lock().unwrap().build_folder_sizes[text(&idle)].target_bytes >= 8192,
+            "seeded outputs must count allocated bytes including shared extents"
+        );
+        runner.maintain_build_folders();
+        assert!(!dep.exists());
+        pressure.store(true, Ordering::SeqCst);
+        assert!(runner.ensure_disk_space().unwrap().is_none());
+        assert!(!idle.exists());
+        assert_eq!(fs::read(base.join("base.json")).unwrap(), record);
+        assert_eq!(
+            fs::read(base.join("target/debug/incremental/unit/state.bin")).unwrap(),
+            [7; 8192]
+        );
+        assert_eq!(
+            fs::read(base.join("target/debug/deps/libfoo-0123456789abcdef.rlib")).unwrap(),
+            [8; 8192]
+        );
+    }
+
+    #[test]
+    fn published_replacement_and_completed_pin_invalidate_eviction_selection() {
+        let f = Fixture::new();
+        let state = f.config().state_dir();
+        let store = publish(&state, "replacement", 1);
+        usage(&store, 1000);
+        let selected = build_base::eviction_candidates(&state).unwrap().remove(0);
+        drop(build_base::pin_current(&store).unwrap());
+        assert!(build_base::claim_eviction(&selected).unwrap().is_none());
+        let selected = build_base::eviction_candidates(&state).unwrap().remove(0);
+        let pin = build_base::pin_current(&store).unwrap();
+        publish(&state, "replacement", 2);
+        assert!(build_base::claim_eviction(&selected).unwrap().is_none());
+        let record: Record =
+            serde_json::from_slice(&fs::read(store.join("current/base.json")).unwrap()).unwrap();
+        assert_eq!(record.fill_start.seconds, 2);
+        assert!(pin.directory.metadata().unwrap().is_dir());
+        drop(pin);
+    }
+}
+
+#[cfg(target_os = "linux")]
 mod base_scheduling {
     use super::*;
     use crate::build_base::{self, Compatibility, Record, Timestamp, WrapperIdentity};

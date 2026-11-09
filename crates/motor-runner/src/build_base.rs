@@ -131,6 +131,7 @@ pub(crate) fn repository_store(state: &Path, repository: &str) -> std::path::Pat
 struct Leases {
     readers: BTreeMap<(u64, u64), usize>,
     retired: BTreeMap<(u64, u64), std::path::PathBuf>,
+    usage_warned: std::collections::BTreeSet<std::path::PathBuf>,
 }
 
 fn leases() -> &'static std::sync::Mutex<Leases> {
@@ -154,10 +155,242 @@ pub(crate) fn pin_current(store: &Path) -> io::Result<PinnedBase> {
     let stat = directory.metadata()?;
     let identity = (stat.dev(), stat.ino());
     *leases.readers.entry(identity).or_default() += 1;
+    if let Err(error) = read_usage(store, identity) {
+        warn_usage(store, &error, &mut leases);
+    }
+    touch_usage(store, identity, &mut leases);
     Ok(PinnedBase {
         directory,
         identity,
     })
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Usage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<(u64, u64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_ms: Option<u64>,
+}
+
+fn timestamp_ms(time: Timestamp) -> u64 {
+    (time.seconds.max(0) as u64)
+        .saturating_mul(1000)
+        .saturating_add(time.nanos.max(0) as u64 / 1_000_000)
+}
+
+fn usage_directory(store: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    let parent = crate::permissions::physical_root(store.parent().unwrap())?;
+    open_directory(&parent, store.file_name().unwrap())
+}
+
+fn usage_file(
+    directory: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    create: bool,
+) -> io::Result<fs::File> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::MetadataExt,
+    };
+    let flags = if create {
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
+    } else {
+        libc::O_RDONLY
+    };
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let stat = file.metadata()?;
+    if !stat.is_file()
+        || stat.uid() != unsafe { libc::geteuid() }
+        || stat.mode() & 0o777 != 0o600
+        || stat.nlink() != 1
+    {
+        return Err(io::Error::other(
+            "unsafe build base usage file owner or mode",
+        ));
+    }
+    Ok(file)
+}
+
+fn read_usage(store: &Path, identity: (u64, u64)) -> io::Result<u64> {
+    let directory = usage_directory(store)?;
+    let usage: Usage = serde_json::from_reader(usage_file(&directory, c"usage.json", false)?)?;
+    if usage.generation != Some(identity) {
+        return Err(io::Error::other("build base usage generation differs"));
+    }
+    usage
+        .last_used_ms
+        .ok_or_else(|| io::Error::other("build base last use unknown"))
+}
+
+fn write_usage(store: &Path, identity: (u64, u64), last_used_ms: u64) -> io::Result<()> {
+    use std::{io::Write, os::fd::AsRawFd};
+    let directory = usage_directory(store)?;
+    let temporary = cstring(std::ffi::OsStr::new(&format!(
+        ".usage-{}",
+        motor_protocol::Uuid::now_v7()
+    )))?;
+    let result = (|| {
+        let mut file = usage_file(&directory, &temporary, true)?;
+        file.write_all(&serde_json::to_vec(&Usage {
+            generation: Some(identity),
+            last_used_ms: Some(last_used_ms),
+        })?)?;
+        file.sync_all()?;
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                c"usage.json".as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        fs::File::from(directory.try_clone()?).sync_all()
+    })();
+    if result.is_err() {
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
+        }
+    }
+    result
+}
+
+fn warn_usage(store: &Path, error: &io::Error, leases: &mut Leases) {
+    if leases.usage_warned.insert(store.into()) {
+        tracing::warn!(repository = %store.display(), %error, "build base last use unavailable; using recorded fill start");
+    }
+}
+
+fn touch_usage(store: &Path, identity: (u64, u64), leases: &mut Leases) {
+    if let Err(error) = write_usage(store, identity, timestamp_ms(Timestamp::now())) {
+        warn_usage(store, &error, leases);
+    }
+}
+
+pub(crate) struct EvictionCandidate {
+    pub store: std::path::PathBuf,
+    pub last_used_ms: u64,
+    identity: (u64, u64),
+}
+
+/// Only published generations are candidates. Staging generations are removed
+/// after their fill stops; retired generations are removed after their last lease.
+pub(crate) fn eviction_candidates(state: &Path) -> io::Result<Vec<EvictionCandidate>> {
+    use std::os::unix::fs::MetadataExt;
+    let root = state.join("build-bases");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut leases = leases().lock().unwrap();
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let store = entry.path();
+        let parent = crate::permissions::physical_root(&store)?;
+        let directory = match open_directory(&parent, std::ffi::OsStr::new("current")) {
+            Ok(directory) => fs::File::from(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let stat = directory.metadata()?;
+        let identity = (stat.dev(), stat.ino());
+        if leases.readers.contains_key(&identity) {
+            continue;
+        }
+        let last_used_ms = read_usage(&store, identity).unwrap_or_else(|error| {
+            warn_usage(&store, &error, &mut leases);
+            // base.json is runner-authored and immutable, unlike filesystem times.
+            let record: io::Result<Record> = (|| {
+                use std::os::fd::AsFd;
+                let directory = directory.as_fd().try_clone_to_owned()?;
+                Ok(serde_json::from_reader(usage_record(&directory)?)?)
+            })();
+            record.map_or(0, |record| timestamp_ms(record.fill_start))
+        });
+        candidates.push(EvictionCandidate {
+            store,
+            last_used_ms,
+            identity,
+        });
+    }
+    candidates.sort_by(|a, b| {
+        a.last_used_ms
+            .cmp(&b.last_used_ms)
+            .then_with(|| a.store.cmp(&b.store))
+    });
+    Ok(candidates)
+}
+
+fn usage_record(directory: &std::os::fd::OwnedFd) -> io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"base.json".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("base record is not a file"));
+    }
+    Ok(file)
+}
+
+/// Claim the exact generation selected by the pressure pass while excluding
+/// seed pins and publication. A seed can no longer open it after retirement.
+pub(crate) fn claim_eviction(
+    candidate: &EvictionCandidate,
+) -> io::Result<Option<std::path::PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+    let leases = leases().lock().unwrap();
+    let current = candidate.store.join("current");
+    let stat = match fs::symlink_metadata(&current) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !stat.is_dir()
+        || (stat.dev(), stat.ino()) != candidate.identity
+        || leases.readers.contains_key(&candidate.identity)
+    {
+        return Ok(None);
+    }
+    // A pin may have completed between selection and claiming. Do not evict
+    // its newly warm base using the old LRU position.
+    if read_usage(&candidate.store, candidate.identity)
+        .is_ok_and(|used| used != candidate.last_used_ms)
+    {
+        return Ok(None);
+    }
+    let retired = candidate
+        .store
+        .join(format!("retired-{}", motor_protocol::Uuid::now_v7()));
+    fs::rename(&current, &retired)?;
+    Ok(Some(retired))
 }
 
 /// Published generations are runner-owned and can be removed directly once no
@@ -569,6 +802,9 @@ fn publish_after_link_check(
 /// Called only after the link, checkout, ownership and build-output checks.
 pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    let mut leases = leases().lock().unwrap();
+    let mut retired_path = None;
     let store = generation.parent().unwrap();
     let ancestor = crate::permissions::physical_root(store.parent().unwrap())?;
     let parent = open_directory(&ancestor, store.file_name().unwrap())?;
@@ -623,13 +859,8 @@ pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<(
             // runner-owned generation. Never route it to the staging helper.
             if let Err(error) = rename(&staging_name, &retired, libc::RENAME_NOREPLACE) {
                 tracing::error!(%error, "published base exchanged; old generation retirement deferred");
-            } else if let Err(error) = remove_retired(
-                &generation
-                    .parent()
-                    .unwrap()
-                    .join(retired.to_str().map_err(io::Error::other)?),
-            ) {
-                tracing::warn!(%error, "retired build base removal deferred to startup");
+            } else {
+                retired_path = Some(store.join(retired.to_str().map_err(io::Error::other)?));
             }
         }
         Err(e) => return Err(e),
@@ -638,6 +869,15 @@ pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<(
     // as a refusal that claims the previous generation remained current.
     if let Err(error) = fs::File::from(parent).sync_all() {
         tracing::warn!(%error, "published build base directory sync failed");
+    }
+    if let Ok(stat) = fs::symlink_metadata(store.join("current")) {
+        touch_usage(store, (stat.dev(), stat.ino()), &mut leases);
+    }
+    drop(leases);
+    if let Some(retired) = retired_path {
+        if let Err(error) = remove_retired(&retired) {
+            tracing::warn!(%error, "retired build base removal deferred to startup");
+        }
     }
     Ok(())
 }
