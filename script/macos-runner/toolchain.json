@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "platform": "macos",
-  "release_status": "pending review",
+  "release_status": "reviewed",
   "ipsw": {
     "version": "27.2",
     "build": "26B123",
@@ -15,13 +15,27 @@
   },
   "clt": {
     "package_id": "com.apple.pkg.CLTools_Executables",
-    "version": "pending measurement",
-    "softwareupdate_label": "pending measurement"
+    "version": "27.2.0.0.1792721180",
+    "softwareupdate_label": "Command Line Tools for Xcode 27.2-27.2"
   },
   "rustup": "1.29.1",
   "rust_profile": "minimal",
   "rust_default": "1.99.0-aarch64-apple-darwin",
   "rust_toolchains": {
+    "stable-aarch64-apple-darwin": {
+      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "targets": [
+        "aarch64-apple-darwin"
+      ],
+      "components": [
+        "cargo-aarch64-apple-darwin",
+        "llvm-tools-aarch64-apple-darwin",
+        "rust-std-aarch64-apple-darwin",
+        "rustc-aarch64-apple-darwin"
+      ],
+      "rustc_verbose": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+      "sha256": "85ae7d8d93c802be349a04e157d6855b7630be4a7159df9e30b9d275d06ee4b3"
+    },
     "1.91.0-aarch64-apple-darwin": {
       "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
       "targets": [
@@ -34,8 +48,8 @@
         "rustc-aarch64-apple-darwin",
         "rustfmt-aarch64-apple-darwin"
       ],
-      "rustc_verbose": "pending measurement",
-      "sha256": "pending measurement"
+      "rustc_verbose": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2",
+      "sha256": "ce3ad616769bc0a472afe101cf0dc5be94cbb106e0dbe814cc77c0b9439a0044"
     },
     "1.92.0-aarch64-apple-darwin": {
       "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
@@ -47,8 +61,8 @@
         "rust-std-aarch64-apple-darwin",
         "rustc-aarch64-apple-darwin"
       ],
-      "rustc_verbose": "pending measurement",
-      "sha256": "pending measurement"
+      "rustc_verbose": "rustc 1.92.0 (ded5c06cf 2025-12-08)\nbinary: rustc\ncommit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234\ncommit-date: 2025-12-08\nhost: aarch64-apple-darwin\nrelease: 1.92.0\nLLVM version: 21.1.3",
+      "sha256": "ad3ffda78433fc71250a52d31dadd495e22c7fcaa71b37667b52c635e42e3fc0"
     },
     "1.96.0-aarch64-apple-darwin": {
       "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
@@ -62,8 +76,8 @@
         "rustc-aarch64-apple-darwin",
         "rustfmt-aarch64-apple-darwin"
       ],
-      "rustc_verbose": "pending measurement",
-      "sha256": "pending measurement"
+      "rustc_verbose": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+      "sha256": "7890c8af81bea9ec87d510f4c7ae2a6e7946f48d441b6f0b9195c28acb50cc65"
     },
     "1.99.0-aarch64-apple-darwin": {
       "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
@@ -79,22 +93,8 @@
         "rustc-aarch64-apple-darwin",
         "rustfmt-aarch64-apple-darwin"
       ],
-      "rustc_verbose": "pending measurement",
-      "sha256": "pending measurement"
-    },
-    "stable-aarch64-apple-darwin": {
-      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
-      "targets": [
-        "aarch64-apple-darwin"
-      ],
-      "components": [
-        "cargo-aarch64-apple-darwin",
-        "llvm-tools-aarch64-apple-darwin",
-        "rust-std-aarch64-apple-darwin",
-        "rustc-aarch64-apple-darwin"
-      ],
-      "rustc_verbose": "pending measurement",
-      "sha256": "pending measurement"
+      "rustc_verbose": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+      "sha256": "cdbdb2429d6c9b8efdbda043f09c4ba507c93bb210a523de86669e92e1e692d0"
     }
   },
   "stable_copy_from": "1.99.0-aarch64-apple-darwin",
@@ -115,60 +115,60 @@
     },
     "cargo-nextest": {
       "version": "cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)",
-      "sha256": "pending measurement"
+      "sha256": "8cdc3c81c43bb0aa379785f23aecf3cc940e536e0bb7f195b9464a54e4408225"
     },
     "ckdev-mutate": {
       "matches": "ckdev-mutate-5d005f45",
       "version": "ckdev-mutate 0.12.7",
-      "sha256": "pending measurement"
+      "sha256": "34602a66df6b32db8bcab6e7f01597567d488b9dedff8ffc6686568678191a76"
     },
     "ckdev-mutate-0097d269": {
       "version": "ckdev-mutate 0.9.1",
-      "sha256": "pending measurement"
+      "sha256": "02817c0c4895f1dc429889540ad6f376d90d41a7a21bd6a00e38c5748a7c4bf5"
     },
     "ckdev-mutate-0b3bc096": {
       "version": "ckdev-mutate 0.12.6",
-      "sha256": "pending measurement"
+      "sha256": "9ca4674e6af2ed5530907f0a9664e7c009dd011e0754422162e0af79f93d8532"
     },
     "ckdev-mutate-0c99c7e1": {
       "version": "ckdev-mutate 0.9.8",
-      "sha256": "pending measurement"
+      "sha256": "bdd92b98bb4bc39e64fff4d04838f74f537fcf21cb8b25f47a6ffe7a71a5fa59"
     },
     "ckdev-mutate-46cc166b": {
       "version": "ckdev-mutate 0.8.0",
-      "sha256": "pending measurement"
+      "sha256": "317699cb075519c69b8ee4b54df45f2b82aaced55a06986ab25b9c0340368f4b"
     },
     "ckdev-mutate-5d005f45": {
       "version": "ckdev-mutate 0.12.7",
-      "sha256": "pending measurement"
+      "sha256": "34602a66df6b32db8bcab6e7f01597567d488b9dedff8ffc6686568678191a76"
     },
     "ckdev-mutate-73af60d1": {
       "version": "ckdev-mutate 0.12.10",
-      "sha256": "pending measurement"
+      "sha256": "86f21c8c7d4ad1f7920b499d0d7202ccdaa6ff77e0df0e83d0ba70df79e77644"
     },
     "ckdev-mutate-73c7e661": {
       "version": "ckdev-mutate 0.9.5",
-      "sha256": "pending measurement"
+      "sha256": "0cdffebf14cc90f019134c6aad53318a7fe009bcdda44c4caa4e67b5d87b2dac"
     },
     "ckdev-mutate-85c8b577": {
       "version": "ckdev-mutate 0.12.4",
-      "sha256": "pending measurement"
+      "sha256": "c70043cb90935f7f1779f75cd5217d31f86d0f8288ff6ee73f982df5d4d240eb"
     },
     "ckdev-mutate-9d6b663d": {
       "version": "ckdev-mutate 0.12.1",
-      "sha256": "pending measurement"
+      "sha256": "d01bc63950621395d69f45965a16f228bbc07e086039665900b97a7d44d247ab"
     },
     "ckdev-mutate-be120e92": {
       "version": "ckdev-mutate 0.12.0",
-      "sha256": "pending measurement"
+      "sha256": "744130cd72ba7dd4f3804cf79233a8f088fc030e26b71dc7e84a184c5a3f15fc"
     },
     "ckdev-mutate-c1591d4a": {
       "version": "ckdev-mutate 0.9.3",
-      "sha256": "pending measurement"
+      "sha256": "9a43e8f684db3dde331e7c47fc6e0862cf48c5c57c540c8775b0c02f3b5645b3"
     },
     "ckdev-mutate-dfdb1129": {
       "version": "ckdev-mutate 0.9.0",
-      "sha256": "pending measurement"
+      "sha256": "5447c4f1c0f0d980560d54582dc89e90bc7c5ae1f98a7ec66dbcfb903d5c230a"
     },
     "clippy-driver": {
       "proxy": true
@@ -198,27 +198,27 @@
       "proxy": true
     },
     "rustup": {
-      "sha256": "pending measurement"
+      "sha256": "ec1b9233e7f72990ecd8e62063fa7f6c3dfc2bec8e97f88bff165f9100ac696a"
     },
     "wasm-bindgen": {
       "version": "wasm-bindgen 0.2.126",
-      "sha256": "pending measurement"
+      "sha256": "9a5532131024378f79dd0c15d6c12a65871c8251399e017ce79061dbe010e54e"
     },
     "wasm-bindgen-test-runner": {
       "version": "wasm-bindgen-test-runner 0.2.126",
-      "sha256": "pending measurement"
+      "sha256": "406b2224a649819ad387b55192b9d4f9631eee2ae7b4a31b50a0249d9d305e6e"
     },
     "wasm2es6js": {
       "version": "wasm2es6js 0.2.126",
-      "sha256": "pending measurement"
+      "sha256": "795c99128aab72a36f1a4ec59302366ec010bda1b0206db590d3b81947bad6aa"
     },
     "worker-build": {
       "version": "0.8.7",
-      "sha256": "pending measurement"
+      "sha256": "53f27b12cef016db7cc3383eebc5bee56495aa4e72d09af5967f4ecf8ddaf5bc"
     },
     "worker-codegen": {
       "version": "worker-build 0.8.7",
-      "sha256": "pending measurement"
+      "sha256": "2997c9b7951b521560386720981eddddce1dbab737248bf42a09c7cad22d50cd"
     }
   },
   "cargo_installs": [
@@ -255,7 +255,7 @@
       "rev": "46cc166b0df2edcfd14b3eb54ed6eeac588fed69",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/46cc166b0df2edcfd14b3eb54ed6eeac588fed69.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "84c6ce41b72a2789bf385b3b15a3e614f2bae3f2f1545963a4f15a5680929a61"
       }
     },
     {
@@ -267,7 +267,7 @@
       "rev": "dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "271b78f8260ca961f186215b29ae19b11da40f497cd0d7213cf4a605736b6140"
       }
     },
     {
@@ -279,7 +279,7 @@
       "rev": "0097d269a4c409db13306a11fc2c504057629791",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/0097d269a4c409db13306a11fc2c504057629791.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "7d3cf2c8fabe67b9bb5380506578318cf479eff7eba17201012e66c971552a67"
       }
     },
     {
@@ -291,7 +291,7 @@
       "rev": "c1591d4a76fa3d3a7367237922b0bca5214dbf11",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/c1591d4a76fa3d3a7367237922b0bca5214dbf11.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "f15213ef0f2fd9c932ec2fac973626057c1045f1b769f2f4a932e017b5397da5"
       }
     },
     {
@@ -303,7 +303,7 @@
       "rev": "73c7e66145e131eadffdd874c82d93548868b668",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/73c7e66145e131eadffdd874c82d93548868b668.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "cbed2e42aeb90efdbc93c34d0fdca92fbde56bc9a6cc6bac9c7f94613c01faee"
       }
     },
     {
@@ -315,7 +315,7 @@
       "rev": "0c99c7e16d8ae22b6e114136b6b7b68be6f1394e",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/0c99c7e16d8ae22b6e114136b6b7b68be6f1394e.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "6f7533effbea3a402621518a8e2e7620727da7eccb464c5492777584d896845d"
       }
     },
     {
@@ -327,7 +327,7 @@
       "rev": "be120e9254c4972191b39b2e6814987918206afc",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/be120e9254c4972191b39b2e6814987918206afc.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "8545e2278ee643588e70bf28a7daadaa99a01b1ad65e9119984571ae49cb8e86"
       }
     },
     {
@@ -339,7 +339,7 @@
       "rev": "9d6b663dac487bb982c7bfd18a96eee2292164ad",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/9d6b663dac487bb982c7bfd18a96eee2292164ad.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "31dbca1bda8266f621c4f38e62aaa6137512467d39cfdc4328443f12fbdc5180"
       }
     },
     {
@@ -351,7 +351,7 @@
       "rev": "85c8b577795d556fb27e54b548f06ea913d8b337",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/85c8b577795d556fb27e54b548f06ea913d8b337.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "be87cb23ace24caec4502f892aff92c3a59d0d86091e87e8ee5c331111b81941"
       }
     },
     {
@@ -363,7 +363,7 @@
       "rev": "0b3bc096880e22ab43bec18eb6719a50fc59c270",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/0b3bc096880e22ab43bec18eb6719a50fc59c270.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "c4707ff84e8e4d968ad54db4dd3146b90f37a0af9f151033673f0b7014b1d878"
       }
     },
     {
@@ -376,7 +376,7 @@
       "rev": "5d005f453c892a09147ffb5e991c06966ff9b4a2",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/5d005f453c892a09147ffb5e991c06966ff9b4a2.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "f320958a1787d1aebee57f98466b40407a8cd9ba7d0362f46c10dc90227f835f"
       }
     },
     {
@@ -388,18 +388,18 @@
       "rev": "73af60d143d64fe874606ce73f22e02cb356a4bb",
       "source": {
         "url": "https://github.com/cortexkit/commons/archive/73af60d143d64fe874606ce73f22e02cb356a4bb.tar.gz",
-        "sha256": "pending measurement"
+        "sha256": "856a83c0caa9014e4544aa46577b603f8452e0947bf006e389f67b7d2a0923d8"
       }
     }
   ],
   "sources": {
     "rustup": {
       "url": "https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-apple-darwin/rustup-init",
-      "sha256": "pending measurement"
+      "sha256": "ec1b9233e7f72990ecd8e62063fa7f6c3dfc2bec8e97f88bff165f9100ac696a"
     },
     "bun": {
       "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-darwin-aarch64.zip",
-      "sha256": "pending measurement"
+      "sha256": "c240d7f0ccb90c263a849fcdb09b7ee62630d921348ed6aafda86b9d577bc510"
     },
     "git": {
       "url": "https://www.kernel.org/pub/software/scm/git/git-2.53.0.tar.xz",
@@ -415,39 +415,39 @@
     "bun": {
       "path": "/opt/motor/bun/bin/bun",
       "version": "1.4.4",
-      "sha256": "pending measurement"
+      "sha256": "0a2237cdcfa0d16ef501d9acca9f0026309ef348bea7393a64e8d1e3609565cc"
     },
     "git": {
       "path": "/opt/motor/bin/git",
       "version": "git version 2.53.0",
-      "sha256": "pending measurement"
+      "sha256": "ead5dc8846398ad44c5f9f6aa8a401af8593dc64ed5477e48103c7eb90c0f2eb"
     },
     "bash": {
       "path": "/opt/motor/bin/bash",
-      "version": "pending measurement",
-      "sha256": "pending measurement"
+      "version": "GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin27.2.0)",
+      "sha256": "0d5da652c6f2061a67b3d3653a4a59eb96f4732503a2d36ceaa05c6a37cad708"
     }
   },
   "agent": {
     "commit": "9e6dab5c99b3c5e8715dc731d4146a95878570a5",
-    "sha256": "pending measurement"
+    "sha256": "e10ebeb80a780eb7c7a7d06633fe7e0aa44d82b84fccc1cec57da421d0455e36"
   },
   "prep_tools": {
     "cargo": {
       "path": "bin/cargo",
-      "sha256": "pending measurement"
+      "sha256": "fc7aa5077deca8abc0651f329e8ec1d968f520e996a93b428f9935014362b382"
     },
     "rustc": {
       "path": "bin/rustc",
-      "sha256": "pending measurement"
+      "sha256": "dd6f58440b3418aa9157ae3f05d71eecff741ca41bc4eec120e7e8f2d933b9a0"
     },
     "bun": {
       "path": "bin/bun",
-      "sha256": "pending measurement"
+      "sha256": "0a2237cdcfa0d16ef501d9acca9f0026309ef348bea7393a64e8d1e3609565cc"
     },
     "git": {
       "path": "bin/git",
-      "sha256": "pending measurement"
+      "sha256": "ead5dc8846398ad44c5f9f6aa8a401af8593dc64ed5477e48103c7eb90c0f2eb"
     }
   },
   "job_environment_by_role": {
