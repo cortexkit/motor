@@ -5609,6 +5609,117 @@ fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
 }
 
 #[cfg(target_os = "linux")]
+mod seeding {
+    use super::*;
+    use crate::backend::{Backend, HostBackend};
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn disabled_fallback_sibling_and_fill_plans_never_start_a_seed() {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.manual_tick = true;
+        let runner = Runner::open(config.clone()).unwrap();
+        let (request, _) = f.run("true");
+        let siblings = request.siblings.clone();
+        let mut setup = Setup {
+            id: request.job_id,
+            request,
+            cpus: vec![0],
+            memory_mib: None,
+            base: false,
+            recorded: BTreeMap::new(),
+            snapshots: None,
+        };
+        config.isolate_jobs = true;
+        config.account_subject = Some("acct:00000000000000000000000000".into());
+        for case in ["disabled", "fallback", "siblings", "fill"] {
+            let mut config = config.clone();
+            setup.request.siblings = if matches!(case, "fallback" | "siblings") {
+                siblings.clone()
+            } else {
+                vec![]
+            };
+            if case != "disabled" {
+                config.fixed_path_repositories = vec![f.root.clone()];
+            }
+            if case == "fallback" {
+                setup.request.siblings[0].canonical_path = Path::new("/different")
+                    .join(Path::new(&f.root).file_name().unwrap())
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            setup.base = case == "fill";
+            let fixed = paths::fixed_paths(&config, &setup.request).ok().flatten();
+            if matches!(case, "disabled" | "fallback") {
+                assert!(fixed.is_none());
+            }
+            assert!(
+                !crate::seed::seed(
+                    &config,
+                    &runner.core.trees,
+                    &setup,
+                    fixed.as_ref(),
+                    &BTreeMap::new()
+                )
+                .unwrap(),
+                "{case}"
+            );
+        }
+        assert!(!config.state_dir().join("seed-intents").exists());
+    }
+
+    #[test]
+    fn setup_settles_swapped_seed_before_populate_and_tree_verification() {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.manual_tick = true;
+        let runner = Runner::open(config.clone()).unwrap();
+        let (request, bytes) = f.run("true");
+        f.submit(&runner, &request, &bytes);
+        let setup = Setup {
+            id: request.job_id,
+            request,
+            cpus: vec![0],
+            memory_mib: None,
+            base: false,
+            recorded: BTreeMap::new(),
+            snapshots: None,
+        };
+        HostBackend
+            .materialize(&config, &runner.core.trees, &setup)
+            .unwrap();
+        let request = &setup.request;
+        let workspace = Path::new(&request.workspace_key);
+        fs::create_dir_all(workspace.join("target")).unwrap();
+        fs::write(workspace.join("target/partial-artifact"), "partial clone").unwrap();
+        fs::create_dir(workspace.join(".motor-seed-recovery")).unwrap();
+        let identity = |path: &Path| {
+            let stat = fs::metadata(path).unwrap();
+            serde_json::json!({ "device": stat.dev(), "inode": stat.ino() })
+        };
+        let intents = config.state_dir().join("seed-intents");
+        fs::create_dir_all(&intents).unwrap();
+        let intent = intents.join(workspace::name(&request.workspace_key));
+        fs::write(&intent, serde_json::to_vec(&serde_json::json!({
+            "staging": ".motor-seed-recovery",
+            "directories": [identity(&workspace.join("target")), identity(&workspace.join(".motor-seed-recovery"))],
+        })).unwrap()).unwrap();
+        let prepared = HostBackend
+            .materialize(&config, &runner.core.trees, &setup)
+            .unwrap();
+        assert!(fs::read_dir(&prepared.target).unwrap().next().is_none());
+        assert!(!intent.exists());
+        assert!(!prepared
+            .target
+            .parent()
+            .unwrap()
+            .join(".motor-seed-recovery")
+            .exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
 mod base_scheduling {
     use super::*;
     use crate::build_base::{self, Compatibility, Record, Timestamp, WrapperIdentity};
