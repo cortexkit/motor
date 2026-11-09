@@ -516,7 +516,7 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     let claims: motor_lease::Claims = serde_json::from_value(serde_json::json!({
         "iss":motor_lease::ISSUER,"aud":"host","jti":job,"sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "purpose":"run","iat":1800000000,"exp":1800000300,"vcpus":1,"mem_mib":16384,
-        "platform":"linux-x64","net":false,"placement":{"host":"host"},"max_s":30,
+        "platform":"linux-x64","net":false,"placement":{"host":"host","vm":null},"max_s":30,
         "cnf":{"jkt":"key"},"workspace_key_hash":"hash"
     }))
     .unwrap();
