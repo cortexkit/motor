@@ -7,6 +7,7 @@ use std::io;
 
 mod advertise;
 pub mod jobs;
+pub mod settlement;
 pub use advertise::{MemoryCase, MEMORY_FRESH_MS, MEMORY_PROBE_MS, START_RETRY_MS};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -835,6 +836,17 @@ impl Host {
                 return refuse(Refusal::Auth);
             }
         } else if let Some(job) = event.jti.map(|j| j.to_string()) {
+            // The terminal body, host stop, or helper receipt already fixed this
+            // job's usage. Later lifecycle telemetry cannot change that body.
+            if next
+                .per_job
+                .executions
+                .get(&job)
+                .and_then(|e| e.evidence.as_ref())
+                .is_some_and(|e| e.winner.is_some())
+            {
+                return self.save(next);
+            }
             if event.event == TenantEventKind::Terminal
                 && next
                     .leases

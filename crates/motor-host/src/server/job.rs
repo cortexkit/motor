@@ -64,7 +64,8 @@ impl Runtime {
             return Ok(());
         };
         if !execution.ended {
-            if failed {
+            let delivered = self.host.lock().expect("host lock").snapshot.leases[job].delivered;
+            if failed && !delivered {
                 // End the lease before answering the caller. Host::delivered
                 // cannot authorize any Run once this durable record is ended.
                 self.host
@@ -89,7 +90,15 @@ impl Runtime {
                     .as_ref()
                     .is_none_or(|l| l.started.load(Ordering::Acquire))
             {
+                self.host
+                    .lock()
+                    .expect("host lock")
+                    .job_stop_intent(job, unclean)?;
                 self.control.stop_job(job)?;
+                self.collect_job_exits(unix_ms())?;
+                // A successful stop call alone is not the durable exit receipt.
+                // Retain reservations until receipt/ack, or the evidence bound.
+                return Ok(());
             }
             let mut host = self.host.lock().expect("host lock");
             host.job_stopped(job, unclean)?;
@@ -98,6 +107,7 @@ impl Runtime {
     }
 
     pub(super) fn recover_jobs(self: &Arc<Self>) -> Result<()> {
+        self.collect_job_exits(unix_ms())?;
         let executions: Vec<_> = self
             .host
             .lock()
@@ -130,8 +140,12 @@ impl Runtime {
                     .leases
                     .get(job)
                     .is_some_and(|lease| lease.state == LeaseState::Ended);
-                if !running
-                    || cancelled
+                if !running {
+                    self.host
+                        .lock()
+                        .expect("host lock")
+                        .job_vmm_gone(job, unix_ms())?;
+                } else if cancelled
                     || (!execution.runner_hello
                         && self.boot_remaining(&execution, unix_ms()).is_zero())
                 {
@@ -171,7 +185,18 @@ impl Runtime {
                     let mut observation = LifecycleStream::default();
                     loop {
                         let frame = read_json(&mut stream)?;
-                        if observation.boundary(&frame)? || frame["type"] == "memory_sample" {
+                        if frame["type"] == "memory_sample" {
+                            let sample: motor_protocol::MemorySample =
+                                serde_json::from_value(frame)?;
+                            ensure!(sample.jti.to_string() == job, "foreign job memory sample");
+                            runtime
+                                .host
+                                .lock()
+                                .expect("host lock")
+                                .job_memory_sample(sample)?;
+                            continue;
+                        }
+                        if observation.boundary(&frame)? {
                             continue;
                         }
                         ensure!(frame["type"] == "event", "invalid job lifecycle frame");
@@ -217,6 +242,10 @@ impl Runtime {
     }
 
     pub(super) fn tick_jobs(&self, now_ms: u64) -> Result<()> {
+        if !self.per_job() {
+            return Ok(());
+        }
+        let mut failure = self.collect_job_exits(now_ms).err();
         let due: Vec<_> = {
             let host = self.host.lock().expect("host lock");
             let crate::config::HostSettings::PerJob(settings) = &host.settings else {
@@ -239,7 +268,66 @@ impl Runtime {
                 .collect()
         };
         for job in due {
-            self.stop_job(&job, true, true)?;
+            if let Err(error) = self.stop_job(&job, true, true) {
+                failure.get_or_insert(error);
+            }
+        }
+        let active: Vec<_> = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .filter(|e| {
+                e.boot_started && !e.ended && e.evidence.as_ref().is_none_or(|e| e.exit.is_none())
+            })
+            .cloned()
+            .collect();
+        for execution in active {
+            let job = &execution.claims.jti;
+            let gone = if execution
+                .evidence
+                .as_ref()
+                .and_then(|e| e.gone_at_ms)
+                .is_some()
+            {
+                true
+            } else {
+                match self.control.adopt_job(job) {
+                    Ok(running) => !running,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        false
+                    }
+                }
+            };
+            if gone {
+                self.host
+                    .lock()
+                    .expect("host lock")
+                    .job_vmm_gone(job, now_ms)?;
+                let expired = {
+                    let host = self.host.lock().expect("host lock");
+                    let crate::config::HostSettings::PerJob(s) = &host.settings else {
+                        unreachable!()
+                    };
+                    host.snapshot.per_job.executions[job]
+                        .evidence
+                        .as_ref()
+                        .and_then(|e| e.gone_at_ms)
+                        .is_some_and(|first| {
+                            now_ms >= first.saturating_add(s.exit_evidence_bound_ms)
+                        })
+                };
+                if expired {
+                    self.host
+                        .lock()
+                        .expect("host lock")
+                        .job_stopped(job, true)?;
+                }
+            }
         }
         let ended: Vec<_> = self
             .host
@@ -258,7 +346,97 @@ impl Runtime {
             self.job_resources.release(&job)?;
         }
         self.host.lock().expect("host lock").billing_tick(now_ms)?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
         Ok(())
+    }
+
+    fn collect_job_exits(&self, now_ms: u64) -> Result<()> {
+        let _operation = self.job_exits.lock().expect("job exit collection");
+        for report in self.control.job_exits()? {
+            let accepted = self
+                .host
+                .lock()
+                .expect("host lock")
+                .job_exit_received(&report, now_ms)?;
+            if !accepted {
+                continue;
+            }
+            self.finish_job_exit(&report)?;
+        }
+        // A crash after helper acknowledgement can remove the report from its
+        // next poll. The host's durable receipt remains enough to finish release.
+        let receipts: Vec<_> = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .filter(|e| !e.ended)
+            .filter_map(|e| e.evidence.as_ref()?.exit.as_ref().map(|r| r.report()))
+            .collect();
+        for report in receipts {
+            self.finish_job_exit(&report)?;
+        }
+        Ok(())
+    }
+
+    fn finish_job_exit(&self, report: &motor_vm_helper::job::ExitReport) -> Result<()> {
+        let acknowledged = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions[&report.job_id]
+            .evidence
+            .as_ref()
+            .is_some_and(|e| e.acknowledged);
+        if !acknowledged {
+            self.control.ack_job_exit(report)?;
+            self.host
+                .lock()
+                .expect("host lock")
+                .job_exit_acknowledged(report)?;
+        }
+        {
+            let mut host = self.host.lock().expect("host lock");
+            let unclean = host.snapshot.per_job.executions[&report.job_id]
+                .evidence
+                .as_ref()
+                .and_then(|e| e.unclean_stop)
+                .unwrap_or(true);
+            host.job_stopped(&report.job_id, unclean)?;
+        }
+        self.job_resources.release(&report.job_id)
+    }
+
+    /// Record pressure before the helper can remove any VM evidence.
+    pub fn stop_job_pressure(&self, job: &str, now_ms: u64) -> Result<()> {
+        self.host.lock().expect("host lock").job_host_stop(
+            job,
+            crate::state::settlement::StopCause::HostPressure,
+            now_ms,
+        )?;
+        self.stop_job(job, false, true)
+    }
+
+    fn observe_job_frame(&self, job: &str, frame: &Value) -> Result<Option<Value>> {
+        let mut host = self.host.lock().expect("host lock");
+        match frame["type"].as_str() {
+            Some("started") => host.job_started(job, unix_ms())?,
+            Some("terminal") => {
+                host.receive_terminal(job, frame.clone(), unix_ms())?;
+                // Relay the recorded winner, including removal of unauthenticated
+                // host-stop claims, rather than a later guest terminal.
+                return Ok(host.snapshot.billing[job].terminal.clone());
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 }
 
@@ -383,6 +561,25 @@ async fn failed<S: AsyncWrite + Unpin>(
     let job = claims.jti.clone();
     let r = runtime.clone();
     tokio::task::spawn_blocking(move || r.stop_job(&job, true, true)).await??;
+    // A channel failure after delivery is not proof the command did not run.
+    // Wait for the helper receipt (or the first-gone evidence deadline).
+    loop {
+        let pending = {
+            let host = runtime.host.lock().expect("host lock");
+            host.snapshot.leases[&claims.jti].delivered
+                && host
+                    .snapshot
+                    .billing
+                    .get(&claims.jti)
+                    .is_none_or(|b| b.usage.is_none())
+        };
+        if !pending {
+            break;
+        }
+        let r = runtime.clone();
+        tokio::task::spawn_blocking(move || r.tick_jobs(unix_ms())).await??;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let frames = runtime
         .host
         .lock()
@@ -584,7 +781,16 @@ async fn live<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut gr, mut gw) = guest.split();
     tokio::select! {
         result = tokio::io::copy(&mut cr,&mut gw) => { result?; },
-        result = tokio::io::copy(&mut gr,&mut cw) => { result?; },
+        result = async {
+            loop {
+                let frame = raw(&mut gr).await?;
+                if let Some(terminal) = runtime.observe_job_frame(&claims.jti, &frame.value)? {
+                    write_frame(&mut cw, &terminal).await?;
+                    return Ok::<(),anyhow::Error>(());
+                }
+                cw.write_all(&frame.bytes).await?;
+            }
+        } => { result?; },
     }
     Ok(())
 }
@@ -787,16 +993,12 @@ async fn replay<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     suppress_accepted = false;
                     continue;
                 }
-                Some("terminal") => {
-                    // Retain the terminal in the existing billing record. Do
-                    // not acknowledge power-off without durable output storage.
-                    runtime.host.lock().expect("host lock").receive_terminal(
-                        &claims.jti,
-                        frame.value.clone(),
-                        unix_ms(),
-                    )?;
-                }
                 _ => {}
+            }
+            // Do not acknowledge power-off without durable output storage.
+            if let Some(terminal) = runtime.observe_job_frame(&claims.jti, &frame.value)? {
+                write_frame(&mut cw, &terminal).await?;
+                return Ok::<(), anyhow::Error>(());
             }
             cw.write_all(&frame.bytes).await?;
             if frame.value["type"] == "terminal" {

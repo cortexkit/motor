@@ -11,6 +11,12 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {
+        anyhow::bail!("job VM exit reports unavailable")
+    }
+    fn ack_job_exit(&self, _report: &motor_vm_helper::job::ExitReport) -> Result<()> {
+        anyhow::bail!("job VM exit acknowledgement unavailable")
+    }
     fn start_job(&self, _start: &motor_vm_helper::job::Start) -> Result<Value> {
         anyhow::bail!("job VM start unavailable")
     }
@@ -239,6 +245,21 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {
+        let (reply, _) = self.request(json!({"op":"job_exits"}))?;
+        ensure!(reply["result"] == "job_exits", "job VM exit poll refused");
+        Ok(serde_json::from_value(reply["exits"].clone())?)
+    }
+    fn ack_job_exit(&self, report: &motor_vm_helper::job::ExitReport) -> Result<()> {
+        let mut request = serde_json::to_value(report)?;
+        request["op"] = json!("ack_job_exit");
+        let (reply, _) = self.request(request)?;
+        ensure!(
+            reply["result"] == "ok",
+            "job VM exit acknowledgement refused"
+        );
+        Ok(())
+    }
     fn start_job(&self, start: &motor_vm_helper::job::Start) -> Result<Value> {
         let mut request = serde_json::to_value(start)?;
         request["op"] = json!("start_job");

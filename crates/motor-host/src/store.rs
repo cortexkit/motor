@@ -538,6 +538,15 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     snapshot.per_job.executions.insert(
         job.into(),
         crate::state::jobs::Execution {
+            evidence: Some(serde_json::from_value(serde_json::json!({
+                "winner":"host_stop", "stop":{"cause":"host_oom","at_ms":1800000000001u64,"future":true},
+                "exit":{"job_id":job,"oom_kill":3,"egress_bytes":12,"future":true},
+                "acknowledged":true,"unclean_stop":true,"gone_at_ms":1800000000000u64,
+                "usage_inputs":{"started_at_ms":1,"ended_at_ms":2,"outcome":"signal","mem_peak_mib":3,"mem_working_peak_mib":4,"mem_over_mib_ms":5,"oom_kill":"host_oom","future":true},
+                "evidence_expired":true,
+                "memory":{"jti":job,"mem_working_peak_mib":22,"mem_over_mib_ms":33},
+                "future":true
+            })).unwrap()),
             claims,
             disk_id: "ws-rollback".into(),
             memory_debit_mib: 16404,
