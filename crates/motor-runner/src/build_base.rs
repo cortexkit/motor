@@ -470,9 +470,12 @@ pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<(
     file.sync_all()?;
     fs::File::from(root.try_clone()?).sync_all()?;
     let staging_name = cstring(generation.file_name().unwrap())?;
-    let rename = |from: &std::ffi::CStr, to: &std::ffi::CStr, flags| {
+    // Call the syscall directly: the musl libc crate has no renameat2 wrapper,
+    // and the static musl runner is built from this same code.
+    let rename = |from: &std::ffi::CStr, to: &std::ffi::CStr, flags: libc::c_uint| {
         if unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 parent.as_raw_fd(),
                 from.as_ptr(),
                 parent.as_raw_fd(),
