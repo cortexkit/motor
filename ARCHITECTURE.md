@@ -1,7 +1,9 @@
 # Architecture
 
 Motor runs build and test commands for coding agents on remote machines,
-against a snapshot of the caller's checkout placed at the same absolute path.
+against a snapshot of the caller's checkout. The checkout stays available at
+the caller's absolute path; opted-in Linux repositories also use a fixed path
+inside each job, as described below.
 Linux jobs run in a tenant VM on a hosted server; Windows and macOS jobs each
 run in a fresh virtual machine. Output streams back as it is produced, a job
 survives dropped connections, and a command is never run twice: a job either
@@ -63,11 +65,11 @@ map and says where new code goes.
    the commits.
 6. **Queue.** The job waits for its workspace and for capacity. Heartbeats
    report queue time; past its budget the client asks to withdraw it.
-7. **Set up.** On Linux the runner checks the snapshot out at the caller's
-   absolute path inside the job, verifies the tree hash and prepares
-   dependencies as a trusted step; Windows and macOS stage the tree for the
-   VM. On every platform the job sees tracked files read-only; files named in
-   `return_paths` stay writable.
+7. **Set up.** On Linux the runner exposes the snapshot at the caller's
+   absolute path inside the job (and a fixed path when enabled), verifies the
+   tree hash and prepares dependencies as a trusted step; Windows and macOS
+   stage the tree for the VM. On every platform the job sees tracked files
+   read-only; files named in `return_paths` stay writable.
 8. **Start.** The runner records the job as started on disk, sends `started`,
    then releases the command: a one-byte gate on the systemd service's stdin on
    Linux, a start frame to the guest agent in a VM. A crash before the record
@@ -88,8 +90,9 @@ capacity is free.
 
 - **Runner.** An instance's own state lives under its state root: the job
   table, retained output, Git mirrors, the workspace catalog, sandbox runtime
-  directories and the compile cache. Workspaces live at the callers' paths
-  under the runner's workspace roots, on the same reflink-capable filesystem.
+  directories, the compile cache and opt-in local build bases. Workspaces live
+  at the callers' paths under the runner's workspace roots, on the same
+  reflink-capable filesystem.
   In a tenant VM that filesystem is the VM's persistent job disk.
 - **Host.** `motor-host` keeps leases, relay positions, billing records and
   revocation tombstones in a SQLite store; finished jobs are pruned after
@@ -97,6 +100,20 @@ capacity is free.
   image and records under its root-owned storage.
 - **Caller.** `ck-motor` keeps an append-only journal of job records with
   periodic checkpoints. [docs/module.md](docs/module.md)
+
+## Opt-in Linux fixed paths and build bases
+
+Fixed checkout paths are Linux-only, off by default and enabled per repository.
+Each enabled job uses a fixed path per account and repository without sharing
+a writable checkout. Streamed output is rewritten to the caller's path, but
+files the job writes are not. A trusted, host-local build base can seed empty
+build folders with copy-on-write data; bases can be evicted under disk pressure.
+
+The numbered contract is in
+[docs/job-isolation.md](docs/job-isolation.md#39-fixed-checkout-paths-and-build-bases),
+base compatibility and recovery in
+[docs/compile-cache.md](docs/compile-cache.md#fixed-paths-and-local-build-bases),
+and pressure ordering in [docs/scheduling.md](docs/scheduling.md#disk-admission).
 
 ## Rules that bite
 

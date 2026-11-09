@@ -214,6 +214,61 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   30-minute budget. A gate job does not shorten the budget of jobs behind it.
   Test: `worker_behind_gate_keeps_its_full_queue_wait_budget`.
 
+## Fixed-path build bases
+
+Linux repositories can opt into `fixed_path_repositories` (repeated runner
+`--fixed-path-repository` options with `--account-subject` and isolation).
+The setting is off by default; Windows and macOS are unchanged. Before
+deploying the runner on an unprivileged Linux host, reinstall its matching
+permissions helper and sudoers rules even with no repository enabled. The
+manual reinstall is not covered by a test. Option tests:
+`test_fixed_path_disabled_runner_args_golden`,
+`test_fixed_path_enabled_record_round_trips_and_renders`
+(`script/tenant-provision/test_provision.py`),
+`fixed_paths_require_subject_and_isolation_only_when_enabled`
+(`crates/motor-runner/src/main.rs`).
+
+Enabled jobs start at `/w/<account>/<repo-key>/<name>`, with the subject's `:`
+replaced by `-`, the repository mirror key, and the repository root's basename.
+Worktrees share the string, not the checkout. The caller alias remains;
+`MOTOR_CALLER_WORKSPACE` gives its path. Streamed stdout/stderr are rewritten to
+caller paths. Files the job writes, including logs, test reports and returned
+files, and `workspace_changes` are not rewritten and can contain fixed paths.
+Tests: `isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts`
+(`crates/motor-runner/src/tests/isolated_caller_roots.rs`, checks stream versus
+artifact paths), `rewrite_pipe_eof_and_reattach_preserve_bytes_sequences_and_map`
+(`crates/motor-runner/src/tests/monitoring.rs`). Returned-file and
+`workspace_changes` non-rewriting are not covered by a dedicated test.
+
+Trusted default-branch fills can publish a host- and account-local base at
+`<state_dir>/build-bases/<repo-key>/current`, holding `target/` and `base.json`,
+independent of the triggering worktree's parent. An eligible empty target gets
+a copy-on-write reflink seed. Only that new seed gets the content-based time
+step: unchanged tracked files and directories get the fill start time, changed
+ones the time step's start time. A kept folder is never time-set. Tests:
+`generation_store_ignores_triggering_worktree_parent`
+(`crates/motor-runner/src/tests/base_publication.rs`),
+`isolated_seed_base_is_warm_and_copy_on_write`,
+`isolated_seed_old_dated_change_rebuilds_changed_crate_and_dependents_once`,
+`isolated_seed_kept_folder_edit_and_revert_each_rebuild`
+(`crates/motor-runner/src/tests/isolated_seed.rs`).
+See [compile-cache.md](compile-cache.md#fixed-paths-and-local-build-bases) for
+publication, compatibility and recovery, and
+[job-isolation.md](job-isolation.md#39-fixed-checkout-paths-and-build-bases) for
+the path contract.
+
+An enabled repository with a desired default-branch tip gets a base fill when
+the base is missing, at another tip or incompatible, at most once per six hours
+since the last base fill started. The catalog persists that bound across
+restart and eviction; a due base bypasses descriptor reuse and the
+dependency-free shortcut, not fill authority or capacity rules. A tenant
+without a remote-cache write key queues no fill. Tests:
+`enabling_a_reusable_repository_and_dependency_free_graph_queues_one_fill`,
+`source_only_tip_and_eviction_wait_six_hours_across_restart`,
+`incompatible_or_unreadable_same_tip_records_refill_once_after_the_interval`,
+`selector_is_ordered_and_keyless_tenant_has_no_candidates`
+(`crates/motor-runner/src/tests.rs`).
+
 ## Disk admission
 
 The runner checks free space on the filesystem holding its state before it
@@ -274,12 +329,21 @@ Tests:
 `disk_stale_unit_maintenance_deletes_whole_units_and_runs_once_daily`,
 `cargo_units_group_hashes_outputs_and_scripts_without_following_symlinks`.
 
+The build-folder cap and stale-unit sweep never touch a published base, nor
+does whole-workspace eviction: bases live in the separate state-directory
+store. Seeded targets are measured like other targets; allocated bytes count
+shared reflink extents in full. Going over the build-folder cap drops only the
+workspace's incremental directories, not its base. Test:
+`cap_stale_sweep_and_whole_workspace_pass_leave_base_untouched`
+(`crates/motor-runner/src/tests.rs`).
+
 - The hard floor is `serve --free-space-floor-bytes N`, default 128 GiB
   (137438953472 bytes); 0 disables the check. The soft goal defaults to twice the
   floor; `--free-space-eviction-bytes N` explicitly sets a reclaim goal above it.
-- Below the soft goal, cleanup has three passes: stale Cargo units, incremental
-  state (largest cached incremental size first), then whole workspaces and staging
-  ordered by allocated bytes times idle milliseconds, descending. Workspace sizes
+- Below the soft goal, cleanup has four passes: stale Cargo units, incremental
+  state (largest cached incremental size first), whole workspaces and staging
+  ordered by allocated bytes times idle milliseconds, descending, then published
+  build bases (oldest last use first, skipping leased bases). Workspace sizes
   come from the in-memory cache; staging sizes are measured on each pass.
   Unreferenced sibling snapshots retain priority in the whole-tree pass.
   Each pass stops once the free-space
@@ -293,6 +357,13 @@ Tests:
   `disk_soft_pressure_evicts_only_candidates_used_over_30_minutes_ago`,
   `disk_hard_pressure_evicts_recent_candidates_in_lru_order_until_soft_goal`,
   `disk_soft_cleanup_does_nothing_at_twice_the_floor`.
+- The fourth pass runs before a `runner_disk_full` refusal, so reclaiming a
+  base can admit the job when it reaches the goal. A seed lease protects the
+  generation even if eviction already selected it; after release, a missing
+  base is a normal cold-build fallback. Tests:
+  `fourth_pass_evicts_oldest_base_after_workspaces_and_staging_before_refusal`,
+  `seed_pin_racing_eviction_keeps_current_and_allows_cold_fallback_after_release`
+  (`crates/motor-runner/src/tests.rs`).
 - If space is still under the floor, the job is refused before upload with
   `runner_disk_full`, with `free_bytes` and `floor_bytes` in the refusal. Tests:
   `disk_admission_refuses_typed_when_reflinks_reclaim_too_little`,

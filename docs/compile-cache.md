@@ -4,9 +4,10 @@ Linux jobs share one compiler cache per runner instance, so a job does not
 recompile dependencies that another job, or a background build, already
 compiled. Jobs only read the cache. A separate trusted account fills it from the
 repository's default-branch tip, never from a submitted branch. This document
-covers who reads and writes the cache, what goes into a fill, and the rules that
-keep a job from poisoning it. [ARCHITECTURE.md](../ARCHITECTURE.md) shows where the
-cache sits; [job-isolation.md](job-isolation.md) describes the reader's sandbox.
+covers who reads and writes the cache, what goes into a fill, and the local
+build bases that can seed private build folders.
+[ARCHITECTURE.md](../ARCHITECTURE.md) shows where the cache sits;
+[job-isolation.md](job-isolation.md) describes the reader's sandbox.
 
 The Windows backend has its own per-workspace cache disks, described in
 [windows-jobs.md](windows-jobs.md#cache-disks).
@@ -259,7 +260,7 @@ tests.
 - A fill's identity is its descriptor: a hash of the toolchain, the warm
   command, and every `Cargo.toml`, `Cargo.lock`, `rust-toolchain*` and
   `.cargo/config*` path and blob in the tip. A new tip with the same descriptor
-  reuses the previous fill. Tests:
+  reuses the previous fill unless a local build base is due (see below). Tests:
   `descriptor_reuses_source_only_tips_and_refills_manifest_and_config_changes`,
   `descriptor_changes_for_toolchain_and_command_without_lockfile_changes`.
 - At most one fill runs per instance (one writer slot), with a fixed 4 permits
@@ -280,7 +281,8 @@ tests.
   a fill. Tests: `cacheable_reader_misses_refill_the_successful_descriptor`,
   `miss_refill_bound_survives_runner_restart`,
   `branch_only_dependency_misses_never_queue_a_trusted_refill`.
-- A failed descriptor is not retried until it changes or the runner restarts.
+- A failed descriptor is not retried until it changes or the runner restarts,
+  except when a local build base is due.
   Test: `failed_descriptor_is_suppressed_until_change_or_restart`.
 
 ### After a fill
@@ -290,15 +292,239 @@ walking existing entries) and repairs their permissions so readers can open
 them. Overflowing the watch, or an unreadable entry, fails the fill rather than
 advertising it. Tests: `cache_fill_repairs_only_changed_entries_and_never_follows_symlinks`,
 `cache_fill_tracking_and_repair_fail_closed`. The writer's scratch target is
-discarded; it is never published as a shared target.
+discarded unless the repository is enabled for local build bases. An enabled
+fill may publish a protected base for copy-on-write seeding, never a target
+that jobs write in common; see below.
 
 ### Without a cache account
 
 If `motor-cache` is missing or invalid, fills and cache tracking are disabled;
 foreground jobs still run. Test: `unavailable_writer_account_disables_fills_and_cache_tracking`.
 
+## Fixed paths and local build bases
+
+### Enablement and paths
+
+This separate, Linux-only optimization is off by default. Provisioning's
+`fixed_path_repositories` list enables exact caller repository roots, or `*`
+alone. It renders repeated `--fixed-path-repository` options and
+`--account-subject`; roots must be absolute, distinct and whitespace-free, and
+the runner requires a valid subject and isolation when enabled. A record with
+no setting preserves its arguments. Tests:
+`test_fixed_path_disabled_runner_args_golden`,
+`test_fixed_path_enabled_record_round_trips_and_renders`,
+`test_fixed_path_records_refuse_malformed_roots`
+(`script/tenant-provision/test_provision.py`),
+`fixed_paths_require_subject_and_isolation_only_when_enabled`
+(`crates/motor-runner/src/main.rs`).
+
+Before deploying this runner on an unprivileged Linux host, reinstall its
+matching permissions helper and sudoers rules, even with the setting empty:
+base link checking and removal use `check-staging-links` and `remove-staging`.
+Root runners perform them in-process. The reinstall itself is not covered by
+a test; the installed contract and deployment refusal are checked by
+`install_contract_requires_matching_helper_and_both_staging_grants`
+(`crates/motor-runner/src/permissions/tests.rs`) and
+`test_missing_helper_grant_aborts_before_drain_or_stop`
+(`script/runner/test_deploy.py`). See
+[job-isolation.md](job-isolation.md#39-fixed-checkout-paths-and-build-bases).
+
+Enabled jobs and fills run at `/w/<account>/<repo-key>/<name>`. The account is
+the subject with `:` replaced by `-`; the key is the repository's mirror key
+and the name is its root basename, never the worktree name. Each job still has
+its own checkout and target, with the caller workspace as another alias.
+`MOTOR_CALLER_WORKSPACE` gives the job that caller path. Streamed stdout/stderr
+replace fixed paths with caller paths, but files the job writes (including
+logs, test reports and returned files) and `workspace_changes` are not
+rewritten and can contain fixed paths. Tests:
+`fixed_paths_use_repository_identity_not_worktree_or_cwd`
+(`crates/motor-runner/src/caller_path.rs`),
+`isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts`
+(`crates/motor-runner/src/tests/isolated_caller_roots.rs`),
+`rewrite_pipe_eof_and_reattach_preserve_bytes_sequences_and_map`
+(`crates/motor-runner/src/tests/monitoring.rs`). Returned-file and
+`workspace_changes` non-rewriting have no dedicated test.
+
+Basename collisions with siblings use the legacy path layout, without rewrite
+or seeding. Build-directory preparation keeps dep-info rooted at the fixed
+checkout and sibling aliases only when the fixed plan exists; otherwise it
+uses the legacy caller roots. Tests:
+`prepare_keeps_fixed_checkout_and_sibling_dep_info`,
+`disabled_and_colliding_jobs_use_only_legacy_prepare_roots`
+(`crates/motor-runner/src/cargo_build_dir.rs`),
+`rewrite_launch_map_pairs_checkout_and_siblings_and_omits_fallback`
+(`crates/motor-runner/src/tests/monitoring.rs`). Disabled systemd unit arguments
+remain byte-identical: `job_unit_commands_match_the_pinned_argv`
+(`crates/motor-runner/src/isolation/command_golden_tests.rs`).
+
+### Store and publication
+
+The store is `<state_dir>/build-bases/<repo-key>/`, independent of which
+worktree triggered a fill. It holds `current`, `staging-<fill-job-id>` and
+`retired-<UUID>` generations. Each generation holds `target/`; published
+generations also hold `base.json`, outside every job bind. Format 1 records the
+base commit and tree, toolchain identity, environment fingerprint, fixed path,
+fill start time and newest target mtime. Launch inputs are saved before the
+fill runs, so a fill surviving restart publishes with those same inputs.
+Tests: `generation_store_ignores_triggering_worktree_parent`,
+`startup_keeps_live_fill_generation_and_recorded_launch_inputs_and_deletes_retired`
+(`crates/motor-runner/src/tests/base_publication.rs`).
+
+Only a fill that ran, exited zero, was not cancelled or timed out and left a
+nonempty `bd/` may publish. Its checkout must still match the base tree, with
+no tracked inode change time later than the pre-launch reference. Changing
+then restoring a source, or creating an untracked root `Cargo.lock`, refuses
+publication. The previous base stays in place and the reason is logged. Tests:
+`failed_cancelled_timed_out_and_unrun_fills_keep_current_and_log_each_reason`,
+`tracked_change_and_restore_and_untracked_root_lock_are_refused_before_metadata_repair`
+(`crates/motor-runner/src/tests/base_publication.rs`).
+
+Publication checks for links outside the generation before changing any
+ownership, mode or ACL. The runner then owns the generation, removes job write
+access, creates `base.json` exclusively without following links, and atomically
+renames the generation to `current`. Replacement retires the old generation;
+an active seed lease delays its deletion. No job writes the base. Tests:
+`publication_is_exclusive_no_follow_and_atomically_replaces_the_generation`
+(`crates/motor-runner/src/tests/base_publication.rs`),
+`current_exchange_before_and_during_clone_stays_on_validated_generation`
+(`crates/motor-runner/src/seed.rs`),
+`isolated_base_fill_publishes_nested_uplift_links_and_replaces_current`,
+`isolated_base_fill_external_home_hardlink_preserves_outside_metadata`
+(`crates/motor-runner/src/tests/isolated_targets.rs`),
+`isolated_seed_base_is_warm_and_copy_on_write`
+(`crates/motor-runner/src/tests/isolated_seed.rs`).
+
+### Refresh
+
+An enabled repository's base is due when it is missing (including after
+eviction), at a different default-branch tip, unreadable, or incompatible in
+format, fixed path, toolchain or environment, and no base fill started in the
+last six hours. The last start is persisted in the catalog, so restart does
+not reset the bound. The scheduler revisits enabled repositories with a desired
+tip without needing another job request. A due base bypasses prior descriptor
+success or failure records, the dependency-free shortcut and remote-cache
+publication retry delays. It does not bypass repository authorization,
+workspace overlap checks, cleanup of an earlier fill, or the limits of one
+live fill per repository and queue depth.
+Tests: `enabling_a_reusable_repository_and_dependency_free_graph_queues_one_fill`,
+`source_only_tip_and_eviction_wait_six_hours_across_restart`,
+`incompatible_or_unreadable_same_tip_records_refill_once_after_the_interval`
+(`crates/motor-runner/src/tests.rs`).
+
+Base fills still require writer authority: a tenant without a remote-cache
+write key queues none, even when fixed paths and output rewriting are enabled.
+Test: `selector_is_ordered_and_keyless_tenant_has_no_candidates`
+(`crates/motor-runner/src/tests.rs`). A stale base costs rebuilds, not freshness:
+the seed's content comparison and Cargo's own fingerprints still apply.
+
+### Seeding and compatibility
+
+Seeding requires an enabled, non-fallback job with no siblings, an empty
+`target/`, and no entries outside the verified tree except `.git` and `target/`.
+Ignored leftovers, including previously prepared `node_modules`, prevent a
+seed. A symlink added, removed or retargeted relative to the base also prevents
+it. The base must be on the same device, at the same fixed path, with format 1
+and equal toolchain identity and environment fingerprint. An absent or
+incompatible base leaves the job to build normally. Tests:
+`eligibility_refuses_incompatible_records_and_leftovers`,
+`symlink_add_remove_and_retarget_refuse_seed`,
+`different_base_device_is_ineligible`
+(`crates/motor-runner/src/seed.rs`),
+`isolated_seed_ignored_watched_file_and_clean_keep_next_job_unseeded`
+(`crates/motor-runner/src/tests/isolated_seed.rs`).
+
+Toolchain identity covers the runner's `rustc -vV`, the snapshot's root
+`rust-toolchain` and `rust-toolchain.toml` blob ids (including absence), and
+runner-provided wrapper inputs. The environment fingerprint covers effective
+`CARGO_*`, `RUSTFLAGS`, `RUSTDOCFLAGS` and `RUSTC_WRAPPER`, excluding
+`CARGO_BUILD_JOBS` and `CARGO_INCREMENTAL`. Absent and empty variables differ;
+the encoding preserves variable names and values. Concurrency changes alone
+(`CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS`) and the writer's
+`CARGO_INCREMENTAL` do not prevent seeding. Tests:
+`identity_records_snapshot_root_blobs_absence_and_runner_verbose_version`,
+`identity_is_stable_before_supervisor_build_and_after_rebuild`,
+`sccache_identity_hashes_embedded_script_and_backend_not_generated_tools`
+(`crates/motor-runner/src/build_base.rs`),
+`environment_fingerprint_uses_sorted_length_framed_names_and_values`
+(`crates/motor-runner/src/compile_cache.rs`),
+`concurrency_and_incremental_environment_differences_still_seed`
+(`crates/motor-runner/src/seed.rs`).
+
+The job's effective launch environment must still match the seed's identity.
+For example, a tenant job losing its remote-cache socket cannot keep a seed
+prepared for that wrapper environment. Test:
+`remote_socket_loss_after_seed_launches_cold_and_matching_environment_keeps_seed`
+(`crates/motor-runner/src/seed.rs`). A command overriding `CARGO_TARGET_DIR` or
+`CARGO_BUILD_BUILD_DIR` bypasses the seeded layout and has no reuse guarantee;
+that override is not covered by a dedicated test.
+
+### Content-based time step
+
+After cloning, only a folder seeded in this setup gets its tracked file and
+directory times set. A blob or mode change, a changed directory tree id, or a
+path absent from the base gets the time step's start time; unchanged paths get
+the base's fill start time. The comparison uses the verified snapshot tree,
+including uncommitted content, never author or committer dates. Dating changed
+directories makes a build script watching `rerun-if-changed=<dir>` detect a
+deletion even when no remaining file is newer. Tests:
+`changed_mode_added_deleted_and_renamed_paths_stamp_their_trees_not_dates`
+(`crates/motor-runner/src/seed_times.rs`),
+`isolated_seed_old_dated_change_rebuilds_changed_crate_and_dependents_once`,
+`isolated_seed_mode_only_rebuilds_changed_crate_and_dependents_once`,
+`isolated_seed_added_file_rebuilds_changed_crate_and_dependents_once`,
+`isolated_seed_deleted_file_rebuilds_changed_crate_and_dependents_once`,
+`isolated_seed_deleted_watched_file_in_reused_workspace_reruns_script_once`
+(`crates/motor-runner/src/tests/isolated_seed.rs`).
+
+The Cargo reuse guarantee is limited to the units the fill warmed. At the base
+tree, the tested warm command compiles no local crate on the first seeded
+build. In the changed-file fixtures, changed crates and their dependents
+rebuild once and subsequent builds compile nothing; disabling the time step
+fails that assertion. A kept folder is never time-set, so edit/build/revert
+still rebuilds. Tests: `isolated_seed_base_is_warm_and_copy_on_write`,
+`isolated_seed_without_time_step_fails_the_changed_crate_assertion`,
+`isolated_seed_kept_folder_edit_and_revert_each_rebuild`
+(`crates/motor-runner/src/tests/isolated_seed.rs`). This is not a guarantee that
+every possible job command is warm or that non-Cargo outputs are validated.
+
+The no-follow walk sets a tracked symlink's own time, never its target's; a
+link planted after verification is refused. The step refuses a current time
+not strictly later than the base's newest target mtime. Launch-time source
+rematerialization preserves the seeded file and parent-directory times.
+Tests: `unchanged_root_and_tracked_symlink_receive_old_time_without_touching_target`,
+`file_symlink_planted_after_verification_is_refused_not_followed`,
+`time_not_strictly_after_newest_base_mtime_is_refused_before_any_stamp`
+(`crates/motor-runner/src/seed_times.rs`),
+`isolated_seed_launch_rematerialization_preserves_file_and_watched_directory_times`
+(`crates/motor-runner/src/tests/isolated_seed.rs`).
+
+### Failure and recovery
+
+Seeding pins one opened generation so the record and cloned files cannot come
+from different replacements. After writing a durable seed intent, the runner
+creates a staging directory and records its and the empty target's inodes in
+the intent. It then reflinks into staging, exchanges it with the empty
+`target/`, repairs ownership and sets times. Only then is the intent
+removed and the folder becomes an ordinary kept folder. A failure (including
+EXDEV, EOPNOTSUPP, a partial clone or time-step failure) settles the intent,
+empties the seeded target and logs one warning; there is no full-copy or
+hard-link fallback. The job builds normally. Recovery removes only entries
+authorized by the intent, never arbitrary `.motor-seed-*` files. Tests:
+`current_exchange_before_and_during_clone_stays_on_validated_generation`,
+`failures_settle_once_warn_once_and_job_builds_without_seed`,
+`killed_setups_recover_and_committed_seed_remains_kept`
+(`crates/motor-runner/src/seed.rs`).
+
 ## Eviction
 
 The runner's disk-pressure cleanup can evict the whole cache, but skips it while
 a fill is running; it never deletes individual entries. See
 [scheduling.md](scheduling.md#disk-admission).
+
+Local bases also count against the job disk. Their fourth pressure pass runs
+after whole workspaces and staging, evicts oldest last use first and skips
+leased bases. The build-folder cap, stale-unit sweep and whole-workspace pass
+never touch a base. Tests:
+`fourth_pass_evicts_oldest_base_after_workspaces_and_staging_before_refusal`,
+`cap_stale_sweep_and_whole_workspace_pass_leave_base_untouched`
+(`crates/motor-runner/src/tests.rs`).
