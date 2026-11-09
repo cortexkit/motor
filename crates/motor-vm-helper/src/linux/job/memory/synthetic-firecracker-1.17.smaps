@@ -1,0 +1,24 @@
+10000000-18000000 rw-p 00000000 00:00 0
+Size:             131072 kB
+Rss:               98304 kB
+VmFlags: rd wr mr mw me nr sd
+18000000-18001000 ---p 00000000 00:00 0
+Size:                  4 kB
+Rss:                   0 kB
+VmFlags: mr mw me nr sd
+20000000-28000000 rw-p 00000000 00:00 0
+Size:             131072 kB
+Rss:               32768 kB
+VmFlags: rd wr mr mw me nr sd
+30000000-70000000 r--s 00000000 08:01 123 /toolchain.ext4
+Size:            1048576 kB
+Rss:              900000 kB
+VmFlags: rd mr me ms nr sd
+70000000-70020000 rw-p 00000000 00:00 0 [heap]
+Size:                128 kB
+Rss:                 128 kB
+VmFlags: rd wr mr mw me ac sd
+80000000-80010000 rw-p 00000000 00:00 0
+Size:                 64 kB
+Rss:                  64 kB
+VmFlags: rd wr mr mw me ac sd

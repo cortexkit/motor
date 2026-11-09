@@ -11,6 +11,13 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    /// Resident bytes of the VMM's guest-RAM mappings, measured by the helper.
+    fn job_memory(&self, _job: &str) -> Result<u64> {
+        Err(BalloonUnavailable.into())
+    }
+    fn balloon_job(&self, _job: &str, _amount_mib: u64) -> Result<()> {
+        Err(BalloonUnavailable.into())
+    }
     fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {
         anyhow::bail!("job VM exit reports unavailable")
     }
@@ -78,6 +85,27 @@ pub trait Control: Send + Sync {
         let reply = self.admin(tenant, &json!({"op":"status"}))?;
         ensure!(reply["ok"] == true, "tenant runner status refused");
         Ok(RunnerSample::from_health(&reply["health"]))
+    }
+}
+
+#[derive(Debug)]
+pub struct BalloonUnavailable;
+impl std::fmt::Display for BalloonUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("helper balloon control unavailable")
+    }
+}
+impl std::error::Error for BalloonUnavailable {}
+
+fn balloon_reply(error: anyhow::Error) -> anyhow::Error {
+    // Older helpers reject the new operation at deserialization, before dispatch.
+    if error
+        .chain()
+        .any(|cause| cause.to_string().contains("unknown variant"))
+    {
+        BalloonUnavailable.into()
+    } else {
+        error
     }
 }
 
@@ -245,6 +273,22 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn job_memory(&self, job: &str) -> Result<u64> {
+        let (reply, _) = self
+            .request(json!({"op":"job_memory", "job_id":job}))
+            .map_err(balloon_reply)?;
+        ensure!(reply["result"] == "job_memory", "job memory refused");
+        reply["resident_bytes"]
+            .as_u64()
+            .context("job resident bytes")
+    }
+    fn balloon_job(&self, job: &str, amount_mib: u64) -> Result<()> {
+        let (reply, _) = self
+            .request(json!({"op":"balloon_job", "job_id":job, "amount_mib":amount_mib}))
+            .map_err(balloon_reply)?;
+        ensure!(reply["result"] == "ok", "job balloon refused");
+        Ok(())
+    }
     fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {
         let (reply, _) = self.request(json!({"op":"job_exits"}))?;
         ensure!(reply["result"] == "job_exits", "job VM exit poll refused");
@@ -729,6 +773,14 @@ fn available_bytes(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod helper_deadline_tests {
+    #[test]
+    fn older_helper_unknown_operation_is_distinct_from_a_transient_failure() {
+        let old = anyhow::anyhow!("helper refused: unknown variant `job_memory`")
+            .context("helper RPC context");
+        assert!(super::balloon_reply(old).is::<super::BalloonUnavailable>());
+        assert!(!super::balloon_reply(anyhow::anyhow!("proc read failed"))
+            .is::<super::BalloonUnavailable>());
+    }
     use super::*;
     use std::io::{BufRead, BufReader};
 

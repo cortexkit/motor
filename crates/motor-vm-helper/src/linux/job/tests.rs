@@ -6,6 +6,25 @@ mod network_tests;
 mod security_tests;
 
 #[test]
+fn balloon_refuses_target_above_recorded_ram_before_opening_any_process_or_socket() {
+    let base = scratch();
+    let mut jobs = machine(&base);
+    let record = record();
+    let id = record.start.job_id.clone();
+    let amount = record.start.memory_mib + 1;
+    jobs.records.insert(id.clone(), record);
+    assert!(jobs
+        .balloon(&id, amount)
+        .err()
+        .unwrap()
+        .0
+        .contains("target exceeds guest RAM"));
+    assert!(jobs.balloon("unknown", 0).is_err());
+    assert!(jobs.memory("unknown").is_err());
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
     let nonce = "0123456789abcdef0123456789abcdef";
     let requests = boot_requests(&start(), Some(17), Some(nonce));

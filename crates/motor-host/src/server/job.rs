@@ -356,6 +356,7 @@ impl Runtime {
             self.job_resources.release(&job)?;
         }
         self.host.lock().expect("host lock").billing_tick(now_ms)?;
+        self.tick_balloon(now_ms);
         if let Some(error) = failure {
             return Err(error);
         }
@@ -1113,5 +1114,6 @@ async fn cancel<S: AsyncWrite + Unpin>(
     Ok(true)
 }
 
+pub(super) mod balloon;
 #[cfg(test)]
 mod tests;

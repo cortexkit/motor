@@ -57,6 +57,13 @@ pub enum Request {
     StopJob {
         job_id: String,
     },
+    JobMemory {
+        job_id: String,
+    },
+    BalloonJob {
+        job_id: String,
+        amount_mib: u64,
+    },
     OpenJobRelay {
         job_id: String,
         port: u32,
@@ -202,6 +209,9 @@ pub enum SlotView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Reply {
+    JobMemory {
+        resident_bytes: u64,
+    },
     Job {
         running: bool,
         vmm_pid: Option<u32>,
@@ -374,6 +384,10 @@ impl<M: Machine> Helper<M> {
             ),
             Request::AdoptJob { job_id } => self.job(job::Operation::Adopt(job_id), peer),
             Request::StopJob { job_id } => self.job(job::Operation::Stop(job_id), peer),
+            Request::JobMemory { job_id } => self.job(job::Operation::Memory(job_id), peer),
+            Request::BalloonJob { job_id, amount_mib } => {
+                self.job(job::Operation::Balloon(job_id, amount_mib), peer)
+            }
             Request::OpenJobRelay { job_id, port } => {
                 self.job(job::Operation::Relay(job_id, port), peer)
             }

@@ -139,7 +139,7 @@ impl Host {
             )
     }
 
-    fn fresh_host_resources(&self, now_ms: u64) -> Option<HostResources> {
+    pub(crate) fn fresh_host_resources(&self, now_ms: u64) -> Option<HostResources> {
         self.host_resources.filter(|sample| {
             now_ms >= sample.at_ms && now_ms - sample.at_ms <= super::MEMORY_FRESH_MS
         })
