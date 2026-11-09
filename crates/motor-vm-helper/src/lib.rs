@@ -41,6 +41,7 @@ pub enum Kind {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    PerJobReadiness {},
     PrepareFill {
         fill: job::Fill,
     },
@@ -258,6 +259,11 @@ pub enum SlotView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Reply {
+    PerJobReadiness {
+        job_vms_configured: bool,
+        workspace_disk_max_bytes: Option<u64>,
+        published_generations: Vec<String>,
+    },
     FillFinished {
         published: bool,
     },
@@ -335,6 +341,12 @@ impl Response {
 /// Cleanup must include all slot-uid processes, mounts, chroots and cgroups.
 /// A failed cleanup is never evidence that the slot is free.
 pub trait Machine {
+    fn job_vms_configured(&self) -> bool {
+        false
+    }
+    fn workspace_disk_max_bytes(&self) -> Option<u64> {
+        None
+    }
     fn images(&mut self, _op: images::Operation) -> Result<Response> {
         Err(Error("job images are not configured".into()))
     }
@@ -413,6 +425,15 @@ impl<M: Machine> Helper<M> {
         }
     }
     #[cfg(target_os = "linux")]
+    pub(crate) fn readiness_work(&self, connection: u64) -> Result<images::Operation> {
+        let op = images::Operation::Readiness {
+            job_vms_configured: self.machine.job_vms_configured(),
+            workspace_disk_max_bytes: self.machine.workspace_disk_max_bytes(),
+        };
+        self.authorize_image_work(connection, &op)?;
+        Ok(op)
+    }
+    #[cfg(target_os = "linux")]
     pub(crate) fn authorize_image_work(
         &self,
         connection: u64,
@@ -432,6 +453,14 @@ impl<M: Machine> Helper<M> {
             return Err(Error("helper is stopping".into()));
         }
         match request {
+            Request::PerJobReadiness {} => {
+                let job_vms_configured = self.machine.job_vms_configured();
+                let workspace_disk_max_bytes = self.machine.workspace_disk_max_bytes();
+                self.machine.images(images::Operation::Readiness {
+                    job_vms_configured,
+                    workspace_disk_max_bytes,
+                })
+            }
             Request::InspectJobImages { generation } => {
                 self.machine.images(images::Operation::Inspect(generation))
             }

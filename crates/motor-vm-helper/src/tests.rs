@@ -23,6 +23,7 @@ const JOB: &str = "00000000-0000-7000-8000-000000000001";
 const NEXT: &str = "00000000-0000-7000-8000-000000000002";
 #[derive(Default)]
 struct Fake {
+    job_vms_configured: bool,
     running: bool,
     job_running: bool,
     dirty: bool,
@@ -31,6 +32,32 @@ struct Fake {
     calls: Vec<&'static str>,
 }
 impl Machine for Fake {
+    fn job_vms_configured(&self) -> bool {
+        self.job_vms_configured
+    }
+    fn workspace_disk_max_bytes(&self) -> Option<u64> {
+        self.job_vms_configured.then_some(4096)
+    }
+    fn images(&mut self, op: images::Operation) -> Result<Response> {
+        match op {
+            images::Operation::Readiness {
+                job_vms_configured,
+                workspace_disk_max_bytes,
+            } => {
+                self.calls.push("per_job_readiness");
+                Ok(Response::new(Reply::PerJobReadiness {
+                    job_vms_configured,
+                    workspace_disk_max_bytes,
+                    published_generations: if job_vms_configured {
+                        vec!["gen-1".into()]
+                    } else {
+                        vec![]
+                    },
+                }))
+            }
+            _ => Err(Error("unexpected image operation".into())),
+        }
+    }
     fn reconcile(&mut self) -> Result<()> {
         self.calls.push("reconcile");
         if self.fail_reconcile {
@@ -199,6 +226,38 @@ fn fixture() -> (Helper<Fake>, u64, u64) {
 }
 fn request(h: &mut Helper<Fake>, c: u64, s: serde_json::Value) -> Result<Response> {
     h.handle(c, serde_json::from_value(s).unwrap())
+}
+
+#[test]
+fn per_job_readiness_is_authorized_and_uses_helper_configuration() {
+    let (mut helper, connection, _) = fixture();
+    let value = serde_json::json!({"op":"per_job_readiness"});
+    assert!(request(&mut helper, u64::MAX, value.clone()).is_err());
+    assert!(!helper.machine.calls.contains(&"per_job_readiness"));
+    for configured in [false, true] {
+        helper.machine.job_vms_configured = configured;
+        let reply = request(&mut helper, connection, value.clone()).unwrap();
+        let Reply::PerJobReadiness {
+            job_vms_configured,
+            workspace_disk_max_bytes,
+            published_generations,
+        } = reply.reply
+        else {
+            panic!("wrong readiness reply");
+        };
+        assert_eq!(job_vms_configured, configured);
+        assert_eq!(workspace_disk_max_bytes, configured.then_some(4096));
+        assert_eq!(
+            published_generations,
+            if configured { vec!["gen-1"] } else { vec![] }
+        );
+    }
+    assert!(serde_json::from_value::<Request>(
+        serde_json::json!({"op":"per_job_readiness","job_vms_configured":true})
+    )
+    .is_err());
+    helper.shutdown().unwrap();
+    assert!(request(&mut helper, connection, value).is_err());
 }
 fn acquire(h: &mut Helper<Fake>, c: u64, instance: &str, job: &str) -> Option<usize> {
     match request(

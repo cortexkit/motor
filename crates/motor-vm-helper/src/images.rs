@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub const STAGING: &str = "/var/lib/motor-vm/job-image-staging";
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Readiness {
+    pub job_vms_configured: bool,
+    pub workspace_disk_max_bytes: Option<u64>,
+    pub published_generations: Vec<String>,
+}
+
 pub fn validate_generation(id: &str) -> Result<()> {
     job::validate_id(id)?;
     if matches!(id, "locks" | "pins") {
@@ -63,15 +70,23 @@ impl Manifest {
 
 #[derive(Debug)]
 pub enum Operation {
+    Readiness {
+        job_vms_configured: bool,
+        workspace_disk_max_bytes: Option<u64>,
+    },
     Inspect(String),
     Publish(String),
-    Prepare { generation: String, account: String },
+    Prepare {
+        generation: String,
+        account: String,
+    },
     Remove(String),
 }
 
 impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::Readiness { .. } => Ok(()),
             Self::Inspect(id) | Self::Publish(id) | Self::Remove(id) => validate_generation(id),
             Self::Prepare {
                 generation,

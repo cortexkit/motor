@@ -109,11 +109,13 @@ capacity is free.
 ## Per-job Linux VM mode
 
 `motor-host` accepts `tenant` (the default) or `per_job` in its JSON `mode`
-setting, but the executable currently refuses per-job startup. The implemented
-per-job scheduler cold-boots one Firecracker VM per job, with no memory snapshot
-or warm VM hold. The image/provisioning path does not yet produce the job
-`rootfs.ext4`/`toolchain.ext4` or the guest's `/run/motor/runner-args`, so this mode
-is not ready for an end-to-end operator switch.
+setting. Per-job startup wires the image manager and existing scheduler into the
+executable, cold-booting one Firecracker VM per job with no memory snapshot or
+warm VM hold. The tenant image build produces job `rootfs.ext4`/`toolchain.ext4`;
+the helper supplies guest runner arguments on the boot line. Startup requires a
+configured helper and an active published, verified generation. There is a
+[drained switch procedure](docs/hosted-host.md#switch-a-drained-host-between-modes),
+but per-job mode has not served production jobs yet.
 
 Each VM uses a shared read-only root, a full physical toolchain copy private to
 its account on read-only virtio-pmem with DAX, and a writable workspace disk on

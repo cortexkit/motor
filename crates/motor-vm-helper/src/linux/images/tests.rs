@@ -88,6 +88,50 @@ mod root {
     use super::*;
     use crate::linux::root_test_support::ReflinkStore;
 
+    #[test]
+    fn isolated_readiness_lists_only_published_verified_generations() {
+        let scratch = root_scratch("motor-image-readiness");
+        let staging = scratch.join("staging");
+        let root = scratch.join("images");
+        directory(&staging.join("gen-1")).unwrap();
+        directory(&root).unwrap();
+        for name in ["kernel", "rootfs.ext4", "toolchain.ext4"] {
+            std::fs::write(staging.join("gen-1").join(name), name.as_bytes()).unwrap();
+        }
+        let artifact = |name: &str| {
+            digest(&mut File::open(staging.join("gen-1").join(name)).unwrap()).unwrap()
+        };
+        let pinned = Manifest {
+            kernel: artifact("kernel"),
+            rootfs: artifact("rootfs.ext4"),
+            toolchain: artifact("toolchain.ext4"),
+            hello: serde_json::json!({"type":"hello"}),
+            guest_init: serde_json::json!({}),
+        };
+        std::fs::write(
+            staging.join("gen-1/manifest.json"),
+            serde_json::to_vec(&pinned).unwrap(),
+        )
+        .unwrap();
+        assert!(published_generations(&root).unwrap().is_empty());
+        publish(&staging, &root, "gen-1", |_, _| Ok(())).unwrap();
+        assert_eq!(published_generations(&root).unwrap(), ["gen-1"]);
+        directory(&root.join(".gen-2.partial")).unwrap();
+        for name in ["kernel", "rootfs.ext4", "toolchain.ext4"] {
+            let path = root.join("gen-1").join(name);
+            std::fs::write(&path, b"corrupt").unwrap();
+            assert!(published_generations(&root).unwrap().is_empty());
+            std::fs::remove_file(&path).unwrap();
+            assert!(published_generations(&root).unwrap().is_empty());
+            std::os::unix::fs::symlink(staging.join("gen-1").join(name), &path).unwrap();
+            assert!(published_generations(&root).unwrap().is_empty());
+            std::fs::remove_file(&path).unwrap();
+            std::fs::copy(staging.join("gen-1").join(name), &path).unwrap();
+            seal(&path).unwrap();
+            assert_eq!(published_generations(&root).unwrap(), ["gen-1"]);
+        }
+    }
+
     fn root_scratch(name: &str) -> ScratchDir {
         assert_eq!(
             unsafe { libc::geteuid() },

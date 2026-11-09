@@ -8,6 +8,7 @@ use std::sync::Condvar;
 
 mod heartbeat_tests;
 mod recovery_tests;
+mod startup_tests;
 #[path = "upload_tests.rs"]
 mod upload_tests;
 
@@ -62,6 +63,7 @@ fn run(job: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    readiness: Mutex<Option<motor_vm_helper::images::Readiness>>,
     fill_export: Mutex<Option<UnixStream>>,
     capacity_available: AtomicBool,
     fail_ensure: AtomicBool,
@@ -100,6 +102,41 @@ impl Fake {
     }
 }
 impl Control for Fake {
+    fn per_job_readiness(&self) -> Result<motor_vm_helper::images::Readiness> {
+        self.calls.lock().unwrap().push("readiness".into());
+        self.readiness
+            .lock()
+            .unwrap()
+            .clone()
+            .context("helper does not support per-job readiness")
+    }
+    fn inspect_job_images(&self, _: &str) -> Result<motor_vm_helper::images::Manifest> {
+        let artifact = motor_vm_helper::images::Artifact {
+            bytes: 4096,
+            sha256: "a".repeat(64),
+        };
+        Ok(motor_vm_helper::images::Manifest {
+            kernel: artifact.clone(),
+            rootfs: artifact.clone(),
+            toolchain: artifact,
+            hello: hello(),
+            guest_init: json!({"resolvers":["1.1.1.1"],"hostname":"job","machine_id":"0123456789abcdef0123456789abcdef"}),
+        })
+    }
+    fn publish_job_images(&self, generation: &str) -> Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("publish:{generation}"));
+        Ok(())
+    }
+    fn prepare_job_images(&self, generation: &str, _: &str) -> Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("prepare:{generation}"));
+        Ok(())
+    }
     fn host_available_mib(&self) -> anyhow::Result<u64> {
         Ok(1000)
     }
@@ -423,10 +460,9 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
 fn claim(runtime: &Arc<Runtime>, c: &Claims) -> u64 {
     let mut host = runtime.host.lock().unwrap();
     let id = host.claim(c.clone(), unix_ms()).unwrap().0;
-    runtime
-        .job_resources
-        .acquire(&host.snapshot.per_job.executions[&c.jti])
-        .unwrap();
+    let execution = host.snapshot.per_job.executions[&c.jti].clone();
+    drop(host);
+    runtime.job_resources.acquire(&execution).unwrap();
     id
 }
 async fn start(

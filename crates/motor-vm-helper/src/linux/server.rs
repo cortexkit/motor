@@ -158,6 +158,7 @@ fn connection_loop<M: crate::Machine>(
                 // Image copies must not hold the helper mutex: admission probes
                 // and stops must remain responsive during a publication.
                 let op = match request {
+                    Request::PerJobReadiness {} => helper.lock().unwrap().readiness_work(id)?,
                     Request::RemoveJobImages { generation } => {
                         let response = helper.lock().unwrap().handle(
                             id,

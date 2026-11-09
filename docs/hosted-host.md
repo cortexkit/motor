@@ -273,10 +273,10 @@ host-level admission and VM settings rather than a snapshot slot pool; see
 ## Per-job mode settings
 
 The closed host JSON object accepts `mode: "tenant"` (default) or `"per_job"`.
-The executable currently refuses per-job startup with `per_job mode is not yet
-available`; the following settings describe the implemented scheduler, not an
-enablement procedure. Every field of `per_job` is required, with no missing,
-null or defaulted values.
+Per-job startup requires a configured helper and an active, published and
+verified job image generation. Missing prerequisites refuse startup before
+serving leases. Every field of `per_job` is required, with no missing, null or
+defaulted values. See [switching modes](#switch-a-drained-host-between-modes).
 
 The installer accepts `--mode per_job --per-job-settings /path/to/per-job.json`.
 The file is the complete `per_job` object, with explicit operator values for
@@ -310,7 +310,7 @@ out of memory.
 | `teardown_timeout_ms` | milliseconds | Bound on failed guest-channel teardown before the VM is stopped. |
 
 `per_job_mode_refuses_each_unset_setting_without_defaults`,
-`complete_per_job_config_is_typed_but_startup_refuses_unavailable_runtime`
+`complete_per_job_config_selects_image_managed_runtime`
 (`crates/motor-host/src/main.rs`) and the configuration tests in
 `crates/motor-host/src/config.rs` cover parsing and CPU validation. These are
 not real-VM qualification. No server-specific values belong in this document.
@@ -330,6 +330,115 @@ can still queue if the other admission checks pass. Idle cached disks take no
 attachment slot until admitted again.
 Warm heartbeat entries describe workspace disks, busy while attached or
 quarantined; `tenant_disk` is omitted. Recovery and fills consume capacity too.
+
+### Switch a drained host between modes
+
+Per-job mode can now start through the executable, but has not served production
+jobs yet. Portable tests cover the wiring; they are not an end-to-end production
+qualification. Keep placement drained through the switch and a binding canary.
+
+Before switching:
+
+1. Install matching `motor-host` and `motor-vm-helper` binaries. An older helper
+   without `per_job_readiness` is refused, never treated as ready. Retain the
+   tenant disks, registry entries, account bindings in `tenants.json`, keys and
+   host journal for rollback. Each registry's `account` must match its binding's
+   `sub` (the broker account subject). Install the helper's current remote-cache credential set for that account
+   using the [root credential command](#root-remote-cache-credential-command).
+2. Build the tenant image using the [image build procedure](../script/tenant-image/README.md),
+   adding `--job-generation GENERATION` to `build.py build IMAGE_VERSION --runner ...`.
+   Use the normal tenant image-switch procedure to install that image first, so
+   the retained tenant image and job generation come from the same build. A
+   completed build places `kernel`, `rootfs.ext4`, `toolchain.ext4` and its pinned
+   manifest under `/var/lib/motor-vm/job-image-staging/GENERATION`. Do not rename an
+   old generation or overwrite its files. The guest runner arguments are supplied
+   by the helper on `motor.runner_args=`, not by a second host-side runner.
+3. Prepare two operator-owned JSON files: the complete `per_job` settings object
+   above, and the helper's `job_vms` object. The latter requires `uid_base`,
+   `uid_count`, `memory_max_bytes` and `workspace_disk_max_bytes`; use an unused
+   UID range and the host's actual memory budget. Its workspace maximum must
+   cover `workspace_disk_cap_bytes`. No resource values are supplied by the
+   switching script. Helper startup validates its resource ranges and isolation
+   prerequisites; a refusal leaves the host stopped and drained.
+4. [Drain the host](#drain-the-host-for-an-update), wait for `draining: true`, then
+   run from the installed checkout:
+
+   ```sh
+   sudo python3 script/hosted-host/switch_mode.py per_job \
+     --per-job-settings /absolute/path/per-job.json \
+     --job-vms-settings /absolute/path/job-vms.json --generation GENERATION
+   ```
+
+The script validates staged host settings with `motor-host check-config`, obtains
+a fresh broker drain acknowledgement, and waits up to `--timeout` seconds (300 by
+default) for work to finish. In per-job mode, `host-status` additionally reports
+`active_job_vms` (including pending teardown), `active_fills` and
+`active_recoveries`; all must be zero along with `active_leases`. A timeout names
+the remaining work, exits nonzero and leaves placement drained. Missing counts
+are not treated as zero.
+
+Before stopping services it publishes the generation through the helper's
+existing `publish_job_images` operation, which verifies the staged artifacts and
+creates a read-only, hash-pinned publication. Then it stops `motor-host`, explicitly sends the
+helper's clean `stop_tenant` operation for each retained tenant, checks that both
+the stop reply and the helper's subsequent `adopt` inspection both report
+`running: false`. It also refuses if the tenant home's `running.json` (a VM that
+has not completed a clean stop) or `unclean-stop.json` (a recorded failed guest
+flush) remains. **Only after that proof does it stop the helper service.**
+Never kill the helper or its cgroup while a tenant VM runs. A timeout or dirty
+stop leaves the helper running and the host drained; investigate rather than
+continuing the switch.
+
+After installing the mode settings, the script starts the helper, then selects
+the initial generation while `motor-host` is stopped:
+
+```sh
+sudo -u motor-host /usr/local/bin/motor-host select-job-images \
+  /etc/motor-host/host.json GENERATION
+sudo /usr/local/bin/motor-host check-config /etc/motor-host/host.json
+```
+
+These commands are shown for diagnosis; the script runs them itself. Selection
+takes the server's exclusive journal lease and uses the same durable image
+publication path as running admin publication. It refuses unknown or unverified
+generations and cannot replace an established active generation. Subsequent image
+rollouts use the running `publish_job_images` admin operation without restart or
+drain; a restart never selects an older generation from a config file. Startup
+requires helper `job_vms` configuration, a helper `workspace_disk_max_bytes`
+at least as large as the host's workspace cap, an active generation in the
+journal, and that generation still published with verifying files.
+
+The script rechecks host config, starts `motor-host` and waits for its drained
+admin socket. It does not undrain or manufacture a canary. Run a real lease from
+the caller with `placement_hint.host` explicitly set to the installed host id;
+check command output, returned files and successful completion. Only after that
+canary succeeds:
+
+```sh
+sudo python3 script/hosted-host/hosted_host.py undrain-host
+```
+
+To return to tenant mode, drain again and run:
+
+```sh
+sudo python3 script/hosted-host/switch_mode.py tenant
+```
+
+This selects tenant configuration and restarts into the existing
+[tenant rollback path](#per-job-mode-rollback), not a second cleanup procedure.
+Helper `job_vms` settings remain available while old job records reconcile.
+Tenant startup must complete recovery and install the helper's current
+credentials before its admin socket becomes ready. Keep the host drained until
+a binding tenant-mode canary succeeds, then undrain explicitly. Any failed step
+leaves the drain in place; never delete a tenant disk or the journal to retry.
+The mode-switch script uses `check-config` plus helper readiness; the installer's
+tenant-only helper renderer is not the validator for this per-job configuration.
+
+Tests: `script/hosted-host/test_switch_mode.py`,
+`server::job::tests::startup_tests` in `motor-host`, and the root-only filesystem
+test `isolated_readiness_lists_only_published_verified_generations` in
+`motor-vm-helper`. The filesystem test starts no VM or services; it does not
+replace the live canary.
 
 ### Per-job fill sources
 
@@ -771,8 +880,9 @@ the pending marker, never the operator's drain. Tests:
 `failed_rollback_install_and_restart_keep_placement_fenced`
 (`crates/motor-host/tests/it/rollback.rs`), and the root-only
 `isolated_rotate_then_rollback_delivers_current_read_and_write_sets`
-(`crates/motor-vm-helper/src/linux/cache/tests.rs`). No mode switch is prescribed
-here while the per-job startup gate remains closed.
+(`crates/motor-vm-helper/src/linux/cache/tests.rs`). Use the
+[drained mode-switch procedure](#switch-a-drained-host-between-modes); it restarts
+into this same rollback path and never clears the drain automatically.
 
 ### Recovery timeouts
 

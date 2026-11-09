@@ -59,15 +59,7 @@ impl Config {
         &self,
         control: &dyn motor_host::helper::Control,
     ) -> Result<motor_host::config::HostSettings> {
-        use motor_host::config::HostMode;
-        let settings = self.checked_settings(control)?;
-        // Do not serve a per-job configuration with tenant VMs while the job
-        // VM lifecycle is not yet wired into this executable.
-        ensure!(
-            settings.mode() != HostMode::PerJob,
-            "per_job mode is not yet available"
-        );
-        Ok(settings)
+        self.checked_settings(control)
     }
 }
 #[derive(Deserialize)]
@@ -92,6 +84,31 @@ async fn main() -> Result<()> {
             );
             check_config(std::path::Path::new(&args[0]))?;
             println!("host config settings valid");
+            return Ok(());
+        }
+        Some("select-job-images") => {
+            let args: Vec<_> = std::env::args_os().skip(2).collect();
+            ensure!(
+                args.len() == 2,
+                "usage: motor-host select-job-images <config.json> <generation>"
+            );
+            let config: Config = serde_json::from_reader(File::open(&args[0])?)?;
+            let helper = config.helper();
+            let settings = config.checked_settings(&helper)?;
+            ensure!(
+                settings.mode() == motor_host::config::HostMode::PerJob,
+                "select-job-images requires per_job mode"
+            );
+            // Opening the journal takes the same exclusive lock as the server.
+            let (journal, snapshot) = SqliteJournal::open(&config.journal_dir)?;
+            let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
+            host.settings = settings;
+            let runtime = Runtime::with_image_generations(config.host_id, host, Arc::new(helper));
+            runtime.select_initial_job_images(
+                args[1].to_str().context("generation must be UTF-8")?,
+                unix_ms(),
+            )?;
+            println!("initial job image generation selected");
             return Ok(());
         }
         Some("export-journal") => {
@@ -197,7 +214,7 @@ async fn main() -> Result<()> {
     helper.vcpu_ceiling = vcpu_ceiling;
     helper.guest_init = guest_init;
     helper.pressure_cgroups = pressure_cgroups;
-    let runtime = Runtime::with_broker(
+    let runtime = configured_runtime(
         config.host_id,
         host,
         Arc::new(helper),
@@ -209,6 +226,7 @@ async fn main() -> Result<()> {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let startup = runtime.clone();
     tokio::task::spawn_blocking(move || {
+        startup.prepare_job_startup()?;
         startup.refresh_keys(0);
         startup.recover()
     })
@@ -286,6 +304,26 @@ async fn main() -> Result<()> {
                 Err(_) => ingress.tls_closed(peer, "timed out"),
             }
         });
+    }
+}
+
+fn configured_runtime(
+    host_id: String,
+    host: Host,
+    control: Arc<dyn motor_host::helper::Control>,
+    broker_endpoint: String,
+    jwks_url: String,
+) -> Arc<Runtime> {
+    if host.settings.mode() == motor_host::config::HostMode::PerJob {
+        Runtime::with_broker_and_image_generations(
+            host_id,
+            host,
+            control,
+            broker_endpoint,
+            jwks_url,
+        )
+    } else {
+        Runtime::with_broker(host_id, host, control, broker_endpoint, jwks_url)
     }
 }
 
@@ -519,23 +557,38 @@ mod config_tests {
     }
 
     #[test]
-    fn complete_per_job_config_is_typed_but_startup_refuses_unavailable_runtime() {
+    fn complete_per_job_config_selects_image_managed_runtime() {
         let mut value = config();
         value["mode"] = json!("per_job");
         value["per_job"] = per_job();
         let config: Config = serde_json::from_value(value).unwrap();
-        let settings =
-            HostSettings::from_config(config.mode, config.per_job.clone(), &Control).unwrap();
+        let settings = config.startup_settings(&Control).unwrap();
         assert_eq!(settings.mode(), HostMode::PerJob);
-        let HostSettings::PerJob(settings) = settings else {
+        let HostSettings::PerJob(ref per_job) = settings else {
             panic!("per-job settings lost")
         };
-        assert_eq!(settings.host_reserve_mib, 1024);
-        assert_eq!(settings.boot_deadline_ms, 30000);
-        assert_eq!(settings.workspace_disk_cap_bytes, 10737418240);
+        assert_eq!(per_job.host_reserve_mib, 1024);
+        assert_eq!(per_job.boot_deadline_ms, 30000);
+        assert_eq!(per_job.workspace_disk_cap_bytes, 10737418240);
+        let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let (journal, snapshot) = motor_host::journal::FileJournal::open(dir.path()).unwrap();
+        let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
+        host.settings = settings;
+        let runtime = configured_runtime(
+            "host".into(),
+            host,
+            Arc::new(Control),
+            "http://broker".into(),
+            "http://keys".into(),
+        );
+        assert_eq!(runtime.broker_endpoint, "http://broker");
+        assert_eq!(runtime.jwks_url, "http://keys");
         assert_eq!(
-            config.startup_settings(&Control).unwrap_err().to_string(),
-            "per_job mode is not yet available"
+            runtime
+                .publish_job_images("gen-1", 0)
+                .unwrap_err()
+                .to_string(),
+            "image publication unavailable"
         );
     }
 
@@ -583,14 +636,10 @@ mod config_tests {
         value["per_job"]["permit_budget"] = json!(1);
         write(&value);
         check_config(&path).unwrap();
-        assert_eq!(
-            serde_json::from_value::<Config>(value.clone())
-                .unwrap()
-                .startup_settings(&Control)
-                .unwrap_err()
-                .to_string(),
-            "per_job mode is not yet available"
-        );
+        assert!(serde_json::from_value::<Config>(value.clone())
+            .unwrap()
+            .startup_settings(&Control)
+            .is_ok());
         for (ceiling, permits, field) in [
             (0, 1, "vcpu_ceiling"),
             (u32::MAX, u32::MAX, "vcpu_ceiling"),

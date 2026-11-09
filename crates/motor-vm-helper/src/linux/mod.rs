@@ -203,6 +203,15 @@ impl Machine for LinuxMachine {
     fn images(&mut self, op: crate::images::Operation) -> Result<crate::Response> {
         self.jobs.images(op)
     }
+    fn job_vms_configured(&self) -> bool {
+        self.config.job_vms.is_some()
+    }
+    fn workspace_disk_max_bytes(&self) -> Option<u64> {
+        self.config
+            .job_vms
+            .as_ref()
+            .and_then(|settings| settings.workspace_disk_max_bytes)
+    }
     fn maintain_jobs(&mut self) -> Result<()> {
         self.jobs.maintain()
     }

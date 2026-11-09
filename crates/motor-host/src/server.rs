@@ -215,7 +215,23 @@ impl Runtime {
         host: Host,
         control: Arc<dyn Control>,
     ) -> Arc<Self> {
-        let mut runtime = Self::new(host_id, host, control);
+        Self::with_broker_and_image_generations(
+            host_id,
+            host,
+            control,
+            motor_lease::ISSUER.into(),
+            motor_lease::JWKS_URL.into(),
+        )
+    }
+
+    pub fn with_broker_and_image_generations(
+        host_id: String,
+        host: Host,
+        control: Arc<dyn Control>,
+        broker_endpoint: String,
+        jwks_url: String,
+    ) -> Arc<Self> {
+        let mut runtime = Self::with_broker(host_id, host, control, broker_endpoint, jwks_url);
         let images = Arc::new(crate::jobs::images::Images::new(
             runtime.host.clone(),
             runtime.control.clone(),
@@ -232,8 +248,98 @@ impl Runtime {
             .context("image manager unavailable")?
             .publish(generation, now_ms)
     }
-    /// Per-job storage and image managers are injected explicitly. The executable
-    /// keeps startup disabled until production managers are available.
+
+    fn ready_job_images(&self) -> Result<Vec<String>> {
+        let readiness = self.control.per_job_readiness()?;
+        ensure!(
+            readiness.job_vms_configured,
+            "helper job_vms is not configured"
+        );
+        let maximum = readiness
+            .workspace_disk_max_bytes
+            .context("helper workspace_disk_max_bytes is not configured")?;
+        let host = self.host.lock().expect("host lock");
+        let crate::config::HostSettings::PerJob(settings) = &host.settings else {
+            bail!("per-job readiness requires per_job mode")
+        };
+        ensure!(
+            maximum >= settings.workspace_disk_cap_bytes,
+            "helper workspace_disk_max_bytes is below host workspace_disk_cap_bytes"
+        );
+        Ok(readiness.published_generations)
+    }
+
+    /// Check before recovery or opening ingress, so a misconfigured host cannot
+    /// advertise capacity and then reject every job at boot.
+    pub fn validate_job_startup(&self) -> Result<()> {
+        if !self.per_job() {
+            return Ok(());
+        }
+        let published = self.ready_job_images()?;
+        ensure!(
+            self.image_generations.is_some(),
+            "per-job image manager unavailable"
+        );
+        let host = self.host.lock().expect("host lock");
+        let active = host
+            .snapshot
+            .per_job
+            .images
+            .iter()
+            .find(|(_, image)| {
+                image.current && !image.pending && !image.deleting && image.artifacts_ready
+            })
+            .map(|(id, _)| id);
+        let active = active.context(
+            "no active job image generation; run motor-host select-job-images while stopped",
+        )?;
+        ensure!(published.contains(active), "active job image generation {active} is no longer published and verified by the helper");
+        Ok(())
+    }
+
+    pub fn prepare_job_startup(&self) -> Result<()> {
+        self.validate_job_startup()?;
+        if self.per_job() {
+            let root = self
+                .host
+                .lock()
+                .expect("host lock")
+                .journal_directory()
+                .context("per-job runtime requires a journal directory")?;
+            // Assignments reserve exclusive spool files; create their shared
+            // parent before recovery or a first admission can open one.
+            std::fs::create_dir_all(root.join("job-spool"))
+                .context("create per-job upload spool directory")?;
+        }
+        Ok(())
+    }
+
+    /// Bootstrap only. Later rollouts use the running admin publication path;
+    /// a stale offline command must not change an established active generation.
+    pub fn select_initial_job_images(&self, generation: &str, now_ms: u64) -> Result<()> {
+        ensure!(self.per_job(), "select-job-images requires per_job mode");
+        motor_vm_helper::images::validate_generation(generation)?;
+        let published = self.ready_job_images()?;
+        ensure!(
+            published.iter().any(|id| id == generation),
+            "job image generation {generation} is not published and verified by the helper"
+        );
+        {
+            let host = self.host.lock().expect("host lock");
+            if let Some((active, _)) = host
+                .snapshot
+                .per_job
+                .images
+                .iter()
+                .find(|(_, image)| image.current)
+            {
+                ensure!(active == generation, "an active job image generation already exists; use the running publish_job_images admin command for rollouts");
+                return Ok(());
+            }
+        }
+        self.publish_job_images(generation, now_ms)
+    }
+    /// Inject storage and image managers, for example for an isolated test runtime.
     pub fn with_job_resources(
         host_id: String,
         host: Host,
@@ -1407,14 +1513,30 @@ impl Runtime {
             }
             _ => None,
         };
-        Ok(
-            json!({"ok":true,"draining":host.snapshot.draining,"active_leases":active_leases(&host),
+        let mut reply = json!({"ok":true,"draining":host.snapshot.draining,"active_leases":active_leases(&host),
             "broker_draining":host.broker_draining,
             "broker_heartbeat_at_ms":host.broker_heartbeat_at_ms,"set_at_ms":set_at_ms,
             "accept_until_ms":host.snapshot.accept_until_ms,"no_op":no_op,
             "bounded_drain_started":bounded_drain_started,
-            "bounded_drain_cancelled":bounded_drain_cancelled}),
-        )
+            "bounded_drain_cancelled":bounded_drain_cancelled});
+        if op == "host_status" && host.settings.mode() == crate::config::HostMode::PerJob {
+            reply["active_fills"] = json!(host.snapshot.per_job.fills.len());
+            reply["active_recoveries"] = json!(host
+                .snapshot
+                .per_job
+                .disks
+                .values()
+                .filter(|disk| disk.recovery.is_some())
+                .count());
+            reply["active_job_vms"] = json!(host
+                .snapshot
+                .per_job
+                .executions
+                .values()
+                .filter(|execution| !execution.ended)
+                .count());
+        }
+        Ok(reply)
     }
     pub fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         ensure!(

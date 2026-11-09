@@ -258,10 +258,13 @@ The host JSON's required `per_job` settings have no compiled-in defaults:
 | `exit_evidence_bound_ms` | Bound from observing a gone VMM to missing-evidence settlement. |
 | `teardown_timeout_ms` | Failed guest-channel teardown bound. |
 
-Time settings are milliseconds. Parsing and the startup refusal are covered by
+Time settings are milliseconds. Parsing and runtime selection are covered by
 `per_job_mode_refuses_each_unset_setting_without_defaults` and
-`complete_per_job_config_is_typed_but_startup_refuses_unavailable_runtime`
-(`crates/motor-host/src/main.rs`). The executable still refuses per-job startup.
+`complete_per_job_config_selects_image_managed_runtime`
+(`crates/motor-host/src/main.rs`). Per-job startup requires helper readiness and
+an active published, verified image generation; missing prerequisites refuse
+before ingress opens. The executable can start in this mode, but it has not
+served production jobs yet.
 
 The helper owns the account credential store. Root's `motor-vm-helper
 set-remote-cache` installs a complete set atomically; only future starts see a
@@ -276,8 +279,8 @@ drained; saved tenant-disk keys never override a rotation. Tests:
 `rotate_then_rollback_installs_all_current_sets_before_undrain` and
 `failed_rollback_install_and_restart_keep_placement_fenced`
 (`crates/motor-host/tests/it/rollback.rs`). See
-[hosted-host.md](hosted-host.md#per-job-mode-rollback); it does not prescribe
-enabling per-job mode while its startup gate is closed.
+[hosted-host.md](hosted-host.md#per-job-mode-rollback) and the
+[drained mode-switch procedure](hosted-host.md#switch-a-drained-host-between-modes).
 
 ## motor-vm-loader
 

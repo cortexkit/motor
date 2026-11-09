@@ -179,9 +179,25 @@ fn seal(path: &Path) -> Result<()> {
 
 pub fn handle(op: Operation) -> Result<Response> {
     op.validate()?;
+    if let Operation::Readiness {
+        job_vms_configured,
+        workspace_disk_max_bytes,
+    } = op
+    {
+        return Ok(Response::new(Reply::PerJobReadiness {
+            job_vms_configured,
+            workspace_disk_max_bytes,
+            published_generations: if job_vms_configured {
+                published_generations(Path::new(job::IMAGES))?
+            } else {
+                Vec::new()
+            },
+        }));
+    }
     let id = match &op {
         Operation::Inspect(id) | Operation::Publish(id) | Operation::Remove(id) => id,
         Operation::Prepare { generation, .. } => generation,
+        Operation::Readiness { .. } => unreachable!(),
     };
     let root = Path::new(job::IMAGES);
     let _lock = lock(root, id)?;
@@ -216,9 +232,64 @@ pub fn handle(op: Operation) -> Result<Response> {
             }
             File::open(root)?.sync_all()?;
         }
-        Operation::Inspect(_) => unreachable!(),
+        Operation::Inspect(_) | Operation::Readiness { .. } => unreachable!(),
     }
     Ok(Response::new(Reply::Ok))
+}
+
+fn published_generations(root: &Path) -> Result<Vec<String>> {
+    if !root.try_exists()? {
+        return Ok(Vec::new());
+    }
+    fs::trusted(root, &std::fs::symlink_metadata(root)?)?;
+    let mut ready = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if crate::images::validate_generation(&id).is_err() || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let verified = (|| -> Result<()> {
+            let _lock = lock(root, &id)?;
+            let manifest = manifest(&entry.path())?;
+            let source: Manifest =
+                serde_json::from_reader(fs::trusted_file(&entry.path().join("source.json"))?)
+                    .map_err(|e| Error(e.to_string()))?;
+            let pinned: Manifest = serde_json::from_reader(fs::trusted_file(
+                &root.join("pins").join(format!("{id}.json")),
+            )?)
+            .map_err(|e| Error(e.to_string()))?;
+            source.validate()?;
+            if source != pinned
+                || source.kernel != manifest.kernel
+                || source.rootfs != manifest.rootfs
+                || source.hello != manifest.hello
+                || source.guest_init != manifest.guest_init
+            {
+                return Err(Error("published generation does not match its pins".into()));
+            }
+            for (name, artifact) in [
+                ("kernel", &manifest.kernel),
+                ("rootfs.ext4", &manifest.rootfs),
+                ("toolchain.ext4", &manifest.toolchain),
+            ] {
+                let file = verify(&entry.path().join(name), artifact)?;
+                if file.metadata()?.mode() & 0o222 != 0 || file.metadata()?.mode() & 0o004 == 0 {
+                    return Err(Error(
+                        "published image is not sealed for jailed VMMs".into(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if verified.is_ok() {
+            ready.push(id);
+        }
+    }
+    ready.sort();
+    Ok(ready)
 }
 
 pub(super) fn finish_remove(id: &str) -> Result<()> {

@@ -43,6 +43,56 @@ fn rollback_helper_requests_carry_only_tenant_and_account_not_credentials() {
 }
 
 #[test]
+fn per_job_readiness_has_no_fallback_for_old_helpers_and_decodes_verified_generations() {
+    let directory = scratch();
+    let path = directory.path().join("ready.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let worker = std::thread::spawn(move || {
+        for reply in [
+            json!({"result":"error","message":"unknown variant `per_job_readiness`"}),
+            json!({"result":"ok"}),
+            json!({"result":"per_job_readiness","job_vms_configured":false,"workspace_disk_max_bytes":null,"published_generations":[]}),
+            json!({"result":"per_job_readiness","job_vms_configured":true,"workspace_disk_max_bytes":2048,"published_generations":["gen-1"]}),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap(),
+                json!({"op":"per_job_readiness"})
+            );
+            writeln!(stream, "{reply}").unwrap();
+        }
+    });
+    let helper = Helper {
+        socket: path,
+        storage: directory.path().to_owned(),
+        capacity: directory.path().join("capacity.json"),
+        guest_init: BTreeMap::new(),
+        vcpu_ceiling: BTreeMap::new(),
+        pressure_cgroups: BTreeMap::new(),
+    };
+    for _ in 0..2 {
+        assert!(helper
+            .per_job_readiness()
+            .unwrap_err()
+            .to_string()
+            .starts_with("helper does not support per-job readiness"));
+    }
+    let not_configured = helper.per_job_readiness().unwrap();
+    assert!(!not_configured.job_vms_configured);
+    assert_eq!(not_configured.workspace_disk_max_bytes, None);
+    assert!(not_configured.published_generations.is_empty());
+    let ready = helper.per_job_readiness().unwrap();
+    assert!(ready.job_vms_configured);
+    assert_eq!(ready.workspace_disk_max_bytes, Some(2048));
+    assert_eq!(ready.published_generations, ["gen-1"]);
+    worker.join().unwrap();
+}
+
+#[test]
 fn remote_cache_credentials_cross_only_the_helper_relay_and_fail_without_logging_bytes() {
     let directory = scratch();
     let path = directory.path().join("helper.sock");

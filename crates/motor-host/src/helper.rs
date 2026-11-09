@@ -11,6 +11,9 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    fn per_job_readiness(&self) -> Result<motor_vm_helper::images::Readiness> {
+        anyhow::bail!("helper does not support per-job readiness")
+    }
     fn discard_tenant_snapshot(&self, _tenant: &str) -> Result<()> {
         anyhow::bail!("tenant snapshot discard unavailable")
     }
@@ -262,7 +265,9 @@ const ORDINARY_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 const SNAPSHOT_HELPER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn helper_reply_deadline(request: &Value) -> Duration {
-    if request["op"] == "install_tenant_cache" {
+    if request["op"] == "per_job_readiness" {
+        Duration::from_secs(300)
+    } else if request["op"] == "install_tenant_cache" {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE + Duration::from_secs(150)
     } else if request["op"] == "publish_job_images" || request["op"] == "prepare_job_images" {
         Duration::from_secs(3600)
@@ -322,6 +327,23 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn per_job_readiness(&self) -> Result<motor_vm_helper::images::Readiness> {
+        let (reply, fds) = self
+            .request(json!({"op":"per_job_readiness"}))
+            .map_err(|error| {
+                if format!("{error:#}").contains("unknown variant") {
+                    anyhow!("helper does not support per-job readiness: {error:#}")
+                } else {
+                    error.context("per-job helper readiness failed")
+                }
+            })?;
+        ensure!(
+            reply["result"] == "per_job_readiness",
+            "helper does not support per-job readiness"
+        );
+        ensure!(fds.is_empty(), "unexpected per-job readiness descriptors");
+        Ok(serde_json::from_value(reply)?)
+    }
     fn discard_tenant_snapshot(&self, tenant: &str) -> Result<()> {
         let (reply, _) = self.request(json!({"op":"discard_tenant_snapshot", "tenant":tenant}))?;
         ensure!(reply["result"] == "ok", "tenant snapshot discard failed");
