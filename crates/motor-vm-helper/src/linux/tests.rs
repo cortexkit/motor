@@ -1,8 +1,16 @@
 use super::*;
 use crate::{Identity, Peer};
-use std::os::unix::fs::symlink;
+#[cfg(feature = "linux-root-tests")]
+use std::{ffi::CString, os::unix::fs::PermissionsExt};
+use std::{
+    io::{Read, Write},
+    os::{fd::AsRawFd, unix::fs::symlink},
+};
 #[cfg(feature = "linux-service-tests")]
-use std::os::unix::{fs::MetadataExt, process::CommandExt};
+use std::{
+    os::unix::{fs::MetadataExt, process::CommandExt},
+    process::Command,
+};
 
 fn scratch(name: &str) -> PathBuf {
     let p = cortexkit_test_support::scratch_root()
@@ -55,10 +63,9 @@ fn job_path(base: &Path) -> PathBuf {
     base.join(format!("test/jobs/{}", identity().job_id))
 }
 
-fn capacity_machine(base: &Path) -> LinuxMachine {
-    let mut config: crate::config::Config =
+fn legacy_machine(base: &Path) -> LinuxMachine {
+    let config: crate::config::Config =
         serde_json::from_str(include_str!("../../fixtures/helper.json")).unwrap();
-    config.hugepages_per_slot = 4;
     let tenants =
         crate::tenant::Controller(tenant::LinuxTenants::new(&config, base.join("cgroups")));
     let jobs = job::LinuxJobs::new(&config);
@@ -69,93 +76,30 @@ fn capacity_machine(base: &Path) -> LinuxMachine {
         cgroups: cgroup::Cgroups {
             root: base.join("cgroups"),
         },
-        running: BTreeMap::new(),
         tenants,
         jobs,
     }
 }
 
-// The capacity gate is the one start() uses. Only the privileged continuation
-// is replaced: it creates real directories and a marker without needing KVM,
-// mounts, root-owned snapshots, cgroup delegation or reserved hugepages.
-fn capacity_preparation(machine: &LinuxMachine) -> Result<()> {
-    std::fs::create_dir_all(machine.boundary(0).parent().unwrap())?;
-    create_boundary(&machine.boundary(0))?;
-    std::fs::create_dir_all(machine.root(0))?;
-    std::fs::create_dir_all(machine.cgroups.slot(0))?;
-    std::fs::write(machine.base_path.join("prepared"), "prepared")?;
-    Ok(())
-}
-
 #[test]
-fn hugepage_shortage_refuses_before_vm_preparation() {
-    let base = scratch("hugepage-shortage");
-    let machine = capacity_machine(&base);
-    let reads = std::cell::Cell::new(0);
-    let result = machine.prepare(
-        || {
-            reads.set(reads.get() + 1);
-            Ok(3)
-        },
-        || capacity_preparation(&machine),
-    );
-    let entries = std::fs::read_dir(&base).unwrap().count();
-    let jail = machine.boundary(0).exists();
-    let chroot = machine.root(0).exists();
-    let cgroup = machine.cgroups.slot(0).exists();
-    let prepared = base.join("prepared").exists();
-    std::fs::remove_dir_all(base).unwrap();
-    assert_eq!(
-        result.unwrap_err().0,
-        "vm_capacity: not enough HugePages_Free"
-    );
-    assert_eq!(reads.get(), 1);
-    assert_eq!(
-        entries, 0,
-        "shortage must not create any preparation output"
-    );
-    assert!(!jail && !chroot && !cgroup && !prepared);
-}
-
-#[test]
-fn sufficient_hugepages_proceed_with_vm_preparation() {
-    for free in [4, 5] {
-        let base = scratch(&format!("hugepage-sufficient-{free}"));
-        let machine = capacity_machine(&base);
-        let reads = std::cell::Cell::new(0);
-        machine
-            .prepare(
-                || {
-                    reads.set(reads.get() + 1);
-                    Ok(free)
-                },
-                || capacity_preparation(&machine),
-            )
-            .unwrap();
-        assert_eq!(reads.get(), 1);
-        assert!(machine.boundary(0).is_dir());
-        assert!(machine.root(0).is_dir());
-        assert!(machine.cgroups.slot(0).is_dir());
+fn legacy_slot_start_is_refused_before_preparation() {
+    let base = scratch("retired-slot");
+    let mut machine = legacy_machine(&base);
+    let lease = Lease {
+        identity: identity(),
+        peer: peer(),
+        connection: 1,
+        running: None,
+    };
+    for kind in [Kind::Job, Kind::Warm, Kind::Fetch, Kind::Scan] {
         assert_eq!(
-            std::fs::read_to_string(base.join("prepared")).unwrap(),
-            "prepared"
+            machine.start(0, &lease, kind).unwrap_err().0,
+            "legacy slot starts are retired; use start_job or tenant operations"
         );
-        std::fs::remove_dir_all(base).unwrap();
+        assert!(!machine.alive(0));
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
     }
-}
-
-#[test]
-fn unreadable_hugepage_pool_refuses_before_vm_preparation() {
-    let base = scratch("hugepage-unreadable");
-    let machine = capacity_machine(&base);
-    let result = machine.prepare(
-        || Err(Error("HugePages_Free missing".into())),
-        || capacity_preparation(&machine),
-    );
-    let entries = std::fs::read_dir(&base).unwrap().count();
-    std::fs::remove_dir_all(base).unwrap();
-    assert_eq!(result.unwrap_err().0, "HugePages_Free missing");
-    assert_eq!(entries, 0, "an unreadable pool must not use a fallback");
+    std::fs::remove_dir(base).unwrap();
 }
 
 #[test]
@@ -520,7 +464,6 @@ fn cgroup_placement_service() {
         base: File::open(&base).unwrap(),
         base_path: base.clone(),
         cgroups: groups,
-        running: BTreeMap::new(),
         tenants,
         jobs,
     };

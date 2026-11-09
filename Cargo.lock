@@ -1255,18 +1255,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "motor-vm-guest"
-version = "0.1.0"
-dependencies = [
- "cortexkit-test-support",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "toml",
-]
-
-[[package]]
 name = "motor-vm-helper"
 version = "0.1.0"
 dependencies = [

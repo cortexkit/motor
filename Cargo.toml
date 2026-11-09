@@ -8,7 +8,6 @@ members = [
     "crates/motor-lease",
     "crates/motor-protocol",
     "crates/motor-runner",
-    "crates/motor-vm-guest",
     "crates/motor-vm-loader",
     "crates/motor-module",
     "crates/motor-vm-helper",

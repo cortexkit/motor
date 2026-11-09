@@ -163,8 +163,9 @@ class UnreachableModulesTest(unittest.TestCase):
 
     def test_existing_repository_binaries_are_discovered_from_manifests(self) -> None:
         inventory = runpy.run_path(str(SCRIPT))["discover_crates"]()
-        existing = {"motor-module", "motor-runner", "motor-vm-helper", "motor-vm-guest", "motor-vm-loader", "prefrontal-build-slot"}
+        existing = {"motor-module", "motor-runner", "motor-vm-helper", "motor-vm-loader", "prefrontal-build-slot"}
         self.assertTrue(existing.issubset(inventory))
+        self.assertNotIn("motor-vm-guest", inventory)
         for crate in existing | {"motor-winagent", "motor-lease"}:
             with self.subTest(crate=crate):
                 self.assertTrue(inventory[crate].binaries, crate)
@@ -481,8 +482,8 @@ impl Store {
                 )
                 self.assertIn("motor-protocol/feature", unlinked.stderr)
 
-    def test_vm_guest_binary_links_its_own_production_library(self) -> None:
-        self.check_vm_binary_links_its_own_production_library("motor-vm-guest")
+    def test_new_binary_links_its_own_production_library(self) -> None:
+        self.check_vm_binary_links_its_own_production_library("new-worker")
 
     def test_vm_loader_binary_links_its_own_production_library(self) -> None:
         self.check_vm_binary_links_its_own_production_library("motor-vm-loader")

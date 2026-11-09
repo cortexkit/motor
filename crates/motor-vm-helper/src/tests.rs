@@ -534,6 +534,32 @@ fn config_refuses_uid_overlap_invalid_limits_and_paths() {
     config.slots[0].cpu_max = "max 100000".into();
     assert!(config.validate().is_err());
     let mut config = original.clone();
-    config.loader = "relative".into();
+    config.firecracker = "relative".into();
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn installed_slot_config_remains_accepted_but_optional() {
+    let mut installed: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();
+    let config: config::Config = serde_json::from_value(installed.clone()).unwrap();
+    config.validate().unwrap();
+    let fields = [
+        "loader",
+        "job_snapshot",
+        "scan_snapshot",
+        "hugepages_per_slot",
+        "agent_port",
+        "proxy_port",
+        "proxy_for_jobs",
+    ];
+    assert_eq!(config.deprecated_slot_fields(), fields);
+    for field in fields {
+        installed.as_object_mut().unwrap().remove(field);
+    }
+    let config: config::Config = serde_json::from_value(installed.clone()).unwrap();
+    config.validate().unwrap();
+    assert!(config.deprecated_slot_fields().is_empty());
+    installed["unknown_setting"] = true.into();
+    assert!(serde_json::from_value::<config::Config>(installed).is_err());
 }

@@ -247,6 +247,7 @@ pub fn load_config(path: &Path) -> Result<crate::config::Config> {
     let config: crate::config::Config =
         serde_json::from_reader(file).map_err(|e| Error(e.to_string()))?;
     config.validate_resources()?;
+    config.warn_deprecated_slot_fields();
     Ok(config)
 }
 

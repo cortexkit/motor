@@ -1,15 +1,7 @@
 use crate::{Error, Result};
-use serde::Deserialize;
-use std::{collections::BTreeMap, net::Ipv4Addr, path::PathBuf};
+use serde::{de::IgnoredAny, Deserialize};
+use std::{net::Ipv4Addr, path::PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Snapshot {
-    pub vmstate: PathBuf,
-    pub rootfs: PathBuf,
-    pub memory: PathBuf,
-    pub record: PathBuf,
-}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlotConfig {
@@ -57,14 +49,15 @@ pub struct Config {
     pub slots: Vec<SlotConfig>,
     pub jailer: PathBuf,
     pub firecracker: PathBuf,
-    pub loader: PathBuf,
-    pub job_snapshot: Snapshot,
-    pub scan_snapshot: Snapshot,
-    pub hugepages_per_slot: u64,
-    pub agent_port: u32,
-    pub proxy_port: u32,
-    #[serde(default)]
-    pub proxy_for_jobs: bool,
+    // Installed tenant-host configs still contain these retired slot settings.
+    // Accept and discard them so an upgrade needs no config rewrite or loader.
+    pub loader: Option<IgnoredAny>,
+    pub job_snapshot: Option<IgnoredAny>,
+    pub scan_snapshot: Option<IgnoredAny>,
+    pub hugepages_per_slot: Option<IgnoredAny>,
+    pub agent_port: Option<IgnoredAny>,
+    pub proxy_port: Option<IgnoredAny>,
+    pub proxy_for_jobs: Option<IgnoredAny>,
 }
 fn missing_public_ipv4() -> Ipv4Addr {
     Ipv4Addr::UNSPECIFIED
@@ -141,13 +134,6 @@ impl Config {
         {
             return Err(Error("invalid or overlapping slot uid range".into()));
         }
-        if self.hugepages_per_slot == 0
-            || self.agent_port == 0
-            || self.proxy_port == 0
-            || self.agent_port == self.proxy_port
-        {
-            return Err(Error("invalid capacity or vsock ports".into()));
-        }
         for slot in &self.slots {
             if !cpu_list(&slot.cpus)
                 || !cpu_list(&slot.mems)
@@ -161,24 +147,42 @@ impl Config {
                 return Err(Error("cpu_max must be numeric quota and period".into()));
             }
         }
-        for path in [
-            &self.jailer,
-            &self.firecracker,
-            &self.loader,
-            &self.job_snapshot.vmstate,
-            &self.job_snapshot.rootfs,
-            &self.job_snapshot.memory,
-            &self.job_snapshot.record,
-            &self.scan_snapshot.vmstate,
-            &self.scan_snapshot.rootfs,
-            &self.scan_snapshot.memory,
-            &self.scan_snapshot.record,
-        ] {
+        for path in [&self.jailer, &self.firecracker] {
             if !path.is_absolute() {
                 return Err(Error("helper config paths must be absolute".into()));
             }
         }
         Ok(())
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn deprecated_slot_fields(&self) -> Vec<&'static str> {
+        [
+            ("loader", self.loader),
+            ("job_snapshot", self.job_snapshot),
+            ("scan_snapshot", self.scan_snapshot),
+            ("hugepages_per_slot", self.hugepages_per_slot),
+            ("agent_port", self.agent_port),
+            ("proxy_port", self.proxy_port),
+            ("proxy_for_jobs", self.proxy_for_jobs),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|_| name))
+        .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn warn_deprecated_slot_fields(&self) {
+        static WARNING: std::sync::Once = std::sync::Once::new();
+        let fields = self.deprecated_slot_fields();
+        if !fields.is_empty() {
+            WARNING.call_once(|| {
+                eprintln!(
+                    "motor-vm-helper: deprecated legacy slot config fields ignored: {}",
+                    fields.join(", ")
+                );
+            });
+        }
     }
 }
 pub(crate) fn valid_uplink(value: &str) -> bool {
@@ -221,10 +225,4 @@ pub(crate) fn cpu_list(s: &str) -> bool {
                 _ => false,
             }
         })
-}
-/// Only fixed image sizes are consumed here; the runner validates the complete
-/// snapshot settings and manifest before submitting a job.
-#[derive(Debug, Deserialize)]
-pub struct SnapshotRecord {
-    pub image_sizes: BTreeMap<String, u64>,
 }
