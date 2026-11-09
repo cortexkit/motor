@@ -4,7 +4,31 @@ use super::isolated_targets::{
 use super::*;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
-const BUILD: &str = "printf 'seed proof cwd=%s build-dir=%s target=%s\\n' \"$PWD\" \"$CARGO_BUILD_BUILD_DIR\" \"$CARGO_TARGET_DIR\"; printf 'seed proof bd-entry=%s\\n' \"$CARGO_TARGET_DIR\"/bd/*; CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build -vv --workspace --locked --offline --message-format=json";
+const BUILD: &str = r#"seed_probe() {
+    printf 'seed proof phase=%s cwd=%s build-dir=%s target=%s\n' "$1" "$PWD" "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"
+    printf 'seed proof physical-cwd='; readlink /proc/self/cwd
+    printf 'seed proof bd-entry=%s\n' "$CARGO_TARGET_DIR"/bd/*
+    printf 'seed proof wrapper=%s rustflags=%s incremental=%s encoded=%s\n' "${RUSTC_WRAPPER-unset}" "${RUSTFLAGS-unset}" "${CARGO_INCREMENTAL-unset}" "${CARGO_ENCODED_RUSTFLAGS-unset}"
+    stat -c 'seed proof source %y %n' stable/src/lib.rs stable/src stable/Cargo.toml
+    if test -d "$CARGO_TARGET_DIR/bd"; then
+        find "$CARGO_TARGET_DIR/bd" -type d -path '*/.fingerprint/seed-stable-*' -exec sh -c '
+            for folder do
+                printf "seed proof fingerprint=%s\n" "$folder"
+                ls -la "$folder"
+                for file in "$folder"/lib-seed_stable "$folder"/lib-seed_stable.json; do
+                    test ! -f "$file" || { printf "seed proof contents=%s\n" "$file"; cat "$file"; printf "\n"; }
+                done
+                stat -c "seed proof dep-info %y %n" "$folder"/dep-lib-seed_stable "$folder"/invoked.timestamp
+            done
+        ' sh {} +
+        find "$CARGO_TARGET_DIR/bd" -type f -name 'seed_stable-*.d' -exec stat -c 'seed proof rustc-dep-info %y %n' {} +
+    fi
+}
+seed_probe before
+CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build -vv --workspace --locked --offline --message-format=json
+result=$?
+seed_probe after
+test "$result" -eq 0"#;
 const REBUILT: &[&str] = &["seed-dependent", "seed-leaf"];
 
 fn save(root: &Path, name: &str, bytes: &str) {
