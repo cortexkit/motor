@@ -69,6 +69,7 @@ struct Fake {
     gone: Mutex<BTreeSet<String>>,
     fail_ack: AtomicBool,
     fail_poll: AtomicBool,
+    disconnect_on_run: AtomicBool,
     acknowledgements: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
     balloon_supported: AtomicBool,
     resident: Mutex<BTreeMap<String, u64>>,
@@ -174,6 +175,7 @@ impl Control for Fake {
         self.peers.lock().unwrap().push(b.try_clone()?);
         let reply = self.hello.lock().unwrap().clone().unwrap_or_else(hello);
         let inputs = self.inputs.clone();
+        let disconnect_on_run = self.disconnect_on_run.load(Ordering::SeqCst);
         std::thread::spawn(move || {
             let read = |stream: &mut UnixStream| -> Result<(Vec<u8>, Value)> {
                 use std::io::Read;
@@ -205,6 +207,11 @@ impl Control for Fake {
                         );
                     }
                     Some("run") => {
+                        if disconnect_on_run {
+                            // A missing guest acknowledgment cannot undo Run delivery.
+                            b.shutdown(std::net::Shutdown::Both).unwrap();
+                            return;
+                        }
                         let _ = write_json(
                             &mut b,
                             &json!({"type":"accepted","job_id":frame["job_id"],"queue_position":0,"env_not_forwarded":[]}),
@@ -1242,6 +1249,59 @@ async fn disconnect_or_refusal_before_run_stops_an_already_ready_vm_and_releases
 
 mod balloon_tests;
 mod settlement_tests;
+
+#[tokio::test]
+async fn delivered_run_without_guest_acceptance_replays_unknown_after_disconnect() {
+    let (runtime, fake, _) = fixture();
+    fake.disconnect_on_run.store(true, Ordering::SeqCst);
+    let mut c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c.clone(), id).await;
+    queued(&mut client, JOB).await;
+    let output = tokio::time::timeout(Duration::from_secs(10), next_type(&mut client, "output"))
+        .await
+        .expect("helper exit settles the delivered Run");
+    assert_eq!(output["bytes"], "");
+    assert_eq!(output["truncated_before_seq"], output["seq"]);
+    let terminal = next_type(&mut client, "terminal").await;
+    assert_eq!(terminal["outcome"]["type"], "outcome_unknown");
+    assert_eq!(terminal["ran"], "remote");
+    next_type(&mut client, "hosted_terminal").await;
+    task.await.unwrap().unwrap();
+    drop(client);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.leases[JOB].delivered);
+        assert!(host.snapshot.leases[JOB].started_at_ms.is_none());
+        assert!(!host.snapshot.zero_usage.contains_key(JOB));
+        host.close(id).unwrap();
+    }
+
+    c.purpose = Purpose::Attach;
+    let id = runtime
+        .host
+        .lock()
+        .unwrap()
+        .claim(c.clone(), unix_ms())
+        .unwrap()
+        .0;
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(
+        &mut client,
+        &json!({"type":"attach","job_id":JOB,"from_seq":0}),
+    )
+    .await
+    .unwrap();
+    next_type(&mut client, "output").await;
+    assert_eq!(next_type(&mut client, "terminal").await, terminal);
+    next_type(&mut client, "hosted_terminal").await;
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.host.lock().unwrap().close(id).unwrap();
+}
 
 #[test]
 fn mirror_report_is_recorded_before_lifecycle_ack() {

@@ -602,6 +602,16 @@ impl Host {
         let withdrawn = l.started_at_ms.is_none()
             && l.refusal == Some(crate::state::Refusal::Capacity)
             && self.snapshot.zero_usage.contains_key(job);
+        // A queued upload cut before Run delivery has a host-owned no-start
+        // terminal, not a guest result to retrieve from a VM on reattach.
+        let undelivered_transfer = !l.delivered
+            && l.started_at_ms.is_none()
+            && self.snapshot.zero_usage.contains_key(job)
+            && b.terminal.as_ref().is_some_and(|terminal| {
+                terminal["outcome"]["type"] == "refused_before_start"
+                    && terminal["outcome"]["reason"] == "transfer_interrupted"
+                    && terminal["ran"] == "none"
+            });
         let host_stop = self
             .snapshot
             .per_job
@@ -609,7 +619,7 @@ impl Host {
             .get(job)
             .and_then(|e| e.evidence.as_ref())
             .is_some_and(|e| e.winner == Some(crate::state::settlement::Winner::HostStop));
-        if !b.host_settled && !withdrawn && !host_stop {
+        if !b.host_settled && !withdrawn && !host_stop && !undelivered_transfer {
             return None;
         }
         let mut frames = Vec::new();

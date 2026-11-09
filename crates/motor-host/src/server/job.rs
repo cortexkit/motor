@@ -526,7 +526,13 @@ impl Reader {
             }
             let mut buffer = [0; 8192];
             let n = stream.read(&mut buffer).await?;
-            ensure!(n > 0, "client closed before delivery");
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed before delivery",
+                )
+                .into());
+            }
             self.buffered.extend_from_slice(&buffer[..n]);
         }
     }
@@ -775,7 +781,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         tracing::warn!(jti = claims.jti, %error, "job_boot_or_delivery_failed");
         if matches!(
             error.to_string().as_str(),
-            "assigned image capabilities changed" | "queued upload exceeds reserved spool"
+            "assigned image capabilities changed"
+                | "queued upload exceeds reserved spool"
+                | "queued upload interrupted"
         ) {
             let reason = if error.to_string() == "assigned image capabilities changed" {
                 "request_rejected"
@@ -921,7 +929,15 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             },
             _ = tokio::time::sleep_until(expires), if !accepted => anyhow::bail!("queued lease expired"),
             frame = reader.next(client) => {
-                let frame = frame?;
+                let frame = match frame {
+                    Err(error) if accepted && error.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) => {
+                        // Run is still in the host spool, so EOF here proves
+                        // that the runner could not have started the command.
+                        anyhow::bail!("queued upload interrupted");
+                    },
+                    result => result?,
+                };
                 if spool.append(&frame).await.is_err() {
                     anyhow::bail!("queued upload exceeds reserved spool");
                 }
