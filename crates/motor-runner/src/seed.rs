@@ -513,6 +513,10 @@ pub(crate) fn seed(
                 repair
             },
             times: &|record| {
+                #[cfg(test)]
+                if config.seed_without_times {
+                    return Ok(());
+                }
                 crate::seed_times::apply(&workspace, &mirror, &request.tree_hash, record)
                     .map(|_| ())
             },

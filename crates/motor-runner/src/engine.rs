@@ -62,6 +62,9 @@ mod mirror_reports;
 mod remote_cache_engine;
 #[path = "retirement.rs"]
 mod retirement;
+#[cfg(target_os = "linux")]
+#[path = "seed_build_log.rs"]
+mod seed_build_log;
 #[path = "sibling_eviction.rs"]
 mod sibling_eviction;
 #[path = "terminal_evidence.rs"]
@@ -294,6 +297,14 @@ pub struct Config {
     pub(crate) before_gate: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pub(crate) fail_materialize: bool,
+    /// Only the negative control proving that a seed without source time-setting
+    /// can build stale may disable the time step. No production switch exists.
+    #[cfg(test)]
+    pub(crate) seed_without_times: bool,
+    #[cfg(test)]
+    pub(crate) before_seed_launch: Option<JobWriteHook>,
+    #[cfg(test)]
+    pub(crate) after_seed: Option<JobWriteHook>,
     #[cfg(test)]
     pub(crate) cpu_topology: Option<CpuTopology>,
     #[cfg(test)]
@@ -645,6 +656,12 @@ impl Config {
             before_gate: None,
             #[cfg(test)]
             fail_materialize: false,
+            #[cfg(test)]
+            seed_without_times: false,
+            #[cfg(test)]
+            before_seed_launch: None,
+            #[cfg(test)]
+            after_seed: None,
             #[cfg(test)]
             cpu_topology: None,
             #[cfg(test)]
@@ -1842,6 +1859,8 @@ struct JobLog {
     cancels_admitted: std::sync::Condvar,
     retention: Mutex<ReplayRetention>,
     output_streams: Mutex<[crate::output_rewrite::Stream; 2]>,
+    #[cfg(target_os = "linux")]
+    seed_build: Mutex<Option<seed_build_log::FirstBuild>>,
 }
 
 #[derive(Default)]
@@ -8783,6 +8802,16 @@ impl Runner {
         let Ok(prepared) = prepared else {
             unreachable!("a failed setup returned above");
         };
+        #[cfg(target_os = "linux")]
+        if prepared
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.seeded())
+        {
+            *log.seed_build.lock().unwrap() = Some(seed_build_log::FirstBuild::new(
+                paths::caller_checkout(&r).to_owned(),
+            ));
+        }
         let catalog = self.catalog_snapshot(&inner);
         let mut job = inner.jobs[&id].clone();
         drop(inner);
@@ -8844,6 +8873,16 @@ impl Runner {
                         tracing::warn!(job_id = %id, %reason, "build base publication unavailable at launch")
                     }
                 }
+            }
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if prepared
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.seeded())
+        {
+            if let Some(hook) = &self.core.config.before_seed_launch {
+                hook(&prepared.host_cwd)?;
             }
         }
         let launch = match self.core.backend.launch(
@@ -9825,6 +9864,15 @@ impl Runner {
                 // durable stream offsets. A failed index save leaves an unreferenced
                 // tail, never a visible cursor pointing at uncommitted data.
                 self.save(&job)?;
+                #[cfg(target_os = "linux")]
+                if stream == OutputStream::Stdout {
+                    if let Some(build) = log.seed_build.lock().unwrap().as_mut() {
+                        if let Some(count) = build.push(&page.bytes) {
+                            tracing::info!(job_id = %id, compiled_local_crates = count,
+                                "seeded job first Cargo build completed");
+                        }
+                    }
+                }
                 let previous = self.core.inner.lock().unwrap().jobs.insert(id, job);
                 drop(previous);
                 log.retire(retired);

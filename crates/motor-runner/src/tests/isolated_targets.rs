@@ -399,7 +399,7 @@ fn isolated_access_repair_rescues_a_directory_a_job_made_unreadable() {
     crate::isolation::restore_runner_access(&f.scratch).unwrap();
 }
 
-fn base_store_config(f: &Fixture, command: &str) -> Config {
+pub(super) fn base_store_config(f: &Fixture, command: &str) -> Config {
     // Worker threads need a process-wide subscriber, just like the real daemon.
     let _ = motor_protocol::logging::init("[base-store-test]");
     let mut config = f.config();
@@ -420,12 +420,12 @@ fn base_store_config(f: &Fixture, command: &str) -> Config {
     config
 }
 
-fn base_store_runner(config: Config) -> Runner {
+pub(super) fn base_store_runner(config: Config) -> Runner {
     let authority = crate::source_seal::authority::Authority::for_fixture(&config);
     Runner::open_with_fixture_authority(config, authority).unwrap()
 }
 
-async fn drive_base_store(runner: &Runner, condition: impl Fn() -> bool) {
+pub(super) async fn drive_base_store(runner: &Runner, condition: impl Fn() -> bool) {
     for _ in 0..2000 {
         runner.tick().unwrap();
         if condition() {
@@ -439,7 +439,7 @@ async fn drive_base_store(runner: &Runner, condition: impl Fn() -> bool) {
     );
 }
 
-async fn settle_base_store(f: &Fixture, runner: &Runner) -> Job {
+pub(super) async fn settle_base_store(f: &Fixture, runner: &Runner) -> Job {
     let (run, bytes) = f.run("true");
     f.submit(runner, &run, &bytes);
     drive_base_store(runner, || {

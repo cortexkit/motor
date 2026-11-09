@@ -1,6 +1,8 @@
 //! Linux-only maintenance for Cargo's per-workspace intermediate folders.
 //! Each folder also holds registry and Git dependency outputs. Keep it if any
-//! dep-info file names a source under the job's workspace or a declared sibling.
+//! dependency-information (.d) file names a relative source or a source under
+//! the job's workspace or a declared sibling. Unknown folders are not proven
+//! foreign and are kept.
 use crate::{caller_path as paths, Config};
 use motor_protocol::Run;
 use std::{
@@ -12,11 +14,9 @@ use std::{
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
 };
 
 const MARKER: &str = ".motor-build-dir-v1";
-const UNIDENTIFIED_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn prepare(config: &Config, request: &Run, target: &Path) {
     let fixed = paths::fixed_paths(config, request).ok().flatten();
@@ -35,7 +35,7 @@ pub(crate) fn prepare(config: &Config, request: &Run, target: &Path) {
                 .flat_map(|fixed| fixed.siblings.iter().map(PathBuf::as_path)),
         )
         .collect();
-    let result = maintain(target, &roots, SystemTime::now(), |path| {
+    let result = maintain(target, &roots, |path| {
         if !config.boat_profile {
             crate::isolation::reclaim_runtime(path)?;
         }
@@ -140,7 +140,6 @@ fn remove(
 fn maintain(
     target: &Path,
     roots: &[&Path],
-    now: SystemTime,
     mut before_remove: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let root = match paths::owner::directory(target) {
@@ -174,7 +173,7 @@ fn maintain(
         )?
         .ok_or_else(|| io::Error::other("Cargo migration marker is not a regular file"))?;
     }
-    cleanup(target, &root, roots, now, &mut before_remove)
+    cleanup(target, &root, roots, &mut before_remove)
 }
 
 fn hex(name: &OsStr, length: usize) -> bool {
@@ -186,7 +185,6 @@ fn cleanup(
     target: &Path,
     root: &File,
     roots: &[&Path],
-    now: SystemTime,
     before_remove: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let Some(bd) = directory(root, OsStr::new("bd"))? else {
@@ -200,14 +198,7 @@ fn cleanup(
             let Some(folder) = directory(&parent, &hash)? else {
                 continue;
             };
-            let keep = match dependency(&folder, roots)? {
-                Dependency::Checkout => true,
-                Dependency::Foreign => false,
-                Dependency::Unidentified => now
-                    .duration_since(folder.metadata()?.modified()?)
-                    .map_or(true, |age| age <= UNIDENTIFIED_AGE),
-            };
-            if !keep {
+            if matches!(dependency(&folder, roots)?, Dependency::Foreign) {
                 remove(
                     target,
                     &Path::new("bd").join(&prefix).join(&hash),
@@ -229,10 +220,13 @@ enum Dependency {
 
 /// Scan dep-info files until any source matches the workspace or a sibling.
 /// Registry and Git dependencies can sort before local crates, so an earlier
-/// foreign source does not identify the whole folder as foreign. Without any
-/// readable source path, leave retention to the folder's age.
+/// foreign source does not identify the whole folder as foreign. Cargo emits
+/// relative paths for workspace members; those belong to the checkout that owns
+/// the build directory. Unreadable or unknown dependency information cannot
+/// prove it foreign.
 fn dependency(folder: &File, roots: &[&Path]) -> io::Result<Dependency> {
     let mut dependency = Dependency::Unidentified;
+    let mut unknown = false;
     for (_, profile) in profiles(folder)? {
         let Some(deps) = directory(&profile, OsStr::new("deps"))? else {
             continue;
@@ -242,21 +236,33 @@ fn dependency(folder: &File, roots: &[&Path]) -> io::Result<Dependency> {
             .filter(|name| Path::new(name).extension() == Some(OsStr::new("d")))
         {
             let Ok(Some(file)) = file(&deps, &name, libc::O_RDONLY) else {
+                unknown = true;
                 continue;
             };
             let mut bytes = Vec::new();
             if file.take(64 * 1024).read_to_end(&mut bytes).is_err() {
+                unknown = true;
+                continue;
+            }
+            if bytes.len() == 64 * 1024 {
+                unknown = true;
                 continue;
             }
             if let Some(path) = dependency_path(&bytes) {
-                if roots.iter().any(|root| path.starts_with(root)) {
+                if path.is_relative() || roots.iter().any(|root| path.starts_with(root)) {
                     return Ok(Dependency::Checkout);
                 }
                 dependency = Dependency::Foreign;
+            } else {
+                unknown = true;
             }
         }
     }
-    Ok(dependency)
+    Ok(if unknown {
+        Dependency::Unidentified
+    } else {
+        dependency
+    })
 }
 
 fn dependency_path(bytes: &[u8]) -> Option<PathBuf> {
