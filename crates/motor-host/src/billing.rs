@@ -637,6 +637,8 @@ impl Host {
             // vCPUs are advertised and the broker places no new work here.
             free_vcpus: if self.storage_refusing() {
                 0
+            } else if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
+                self.job_free_vcpus(now_ms)
             } else {
                 self.tenants
                     .values()

@@ -163,7 +163,8 @@ impl LinuxJobs {
     }
 
     pub fn reconcile(&mut self) -> Result<()> {
-        self.reconcile_records(network::read_records(&self.records_path)?)
+        self.reconcile_records(network::read_records(&self.records_path)?)?;
+        workspace::finish_deletions(&self.workspaces)
     }
 
     fn reconcile_records(&mut self, records: Vec<Record>) -> Result<()> {
@@ -486,6 +487,17 @@ impl LinuxJobs {
             self.collect_exits()?;
         }
         match op {
+            Operation::DeleteWorkspace { account, disk_id } => {
+                if self
+                    .records
+                    .values()
+                    .any(|r| !r.released && r.start.workspace_disk_id == disk_id)
+                {
+                    return Err(Error("workspace disk still held by a VM".into()));
+                }
+                workspace::delete(&self.workspaces, &account, &disk_id)?;
+                Ok(Response::new(Reply::Ok))
+            }
             Operation::Start(start) => self.start(start, peer),
             Operation::Adopt(id) => self.status(&id),
             Operation::Memory(id) => self.memory(&id),
@@ -934,9 +946,19 @@ fn boot_requests(
     tap_index: Option<u8>,
     nonce: Option<&str>,
 ) -> Vec<(&'static str, Value)> {
+    let (tap_index, nonce) = if start.kind == job::VmKind::Recovery {
+        (None, None)
+    } else {
+        (tap_index, nonce)
+    };
+    let args = if start.kind == job::VmKind::Recovery {
+        format!("{JOB_BOOT_ARGS} motor.recovery=1")
+    } else {
+        JOB_BOOT_ARGS.into()
+    };
     let boot_args = match nonce {
-        Some(nonce) => format!("{JOB_BOOT_ARGS} {REMOTE_CACHE_NONCE_CMDLINE_KEY}={nonce}"),
-        None => JOB_BOOT_ARGS.to_owned(),
+        Some(nonce) => format!("{args} {REMOTE_CACHE_NONCE_CMDLINE_KEY}={nonce}"),
+        None => args,
     };
     let mut requests = vec![
         (

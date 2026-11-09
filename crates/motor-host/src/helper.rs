@@ -27,6 +27,9 @@ pub trait Control: Send + Sync {
     fn start_job(&self, _start: &motor_vm_helper::job::Start) -> Result<Value> {
         anyhow::bail!("job VM start unavailable")
     }
+    fn delete_workspace(&self, _account: &str, _disk_id: &str) -> Result<()> {
+        anyhow::bail!("workspace deletion unavailable")
+    }
     fn adopt_job(&self, _job: &str) -> Result<bool> {
         anyhow::bail!("job VM adoption unavailable")
     }
@@ -273,6 +276,10 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn delete_workspace(&self, account: &str, disk_id: &str) -> Result<()> {
+        self.request(json!({"op":"delete_workspace", "account":account, "disk_id":disk_id}))?;
+        Ok(())
+    }
     fn job_memory(&self, job: &str) -> Result<u64> {
         let (reply, _) = self
             .request(json!({"op":"job_memory", "job_id":job}))
@@ -607,6 +614,10 @@ fn check_start_reply(reply: &Value) -> Result<()> {
 pub fn control_read_deadline(request: &Value) -> Duration {
     if request["op"] == "job_status" {
         Duration::from_millis(crate::billing::LOST_GUEST_CHECK_MS)
+    } else if request["op"] == "recover_workspace" {
+        Duration::from_millis(request["budget_ms"].as_u64().unwrap_or(0))
+            .min(motor_protocol::TENANT_RECOVERY_ALLOWANCE)
+            + motor_protocol::TENANT_RECOVERY_REPLY_MARGIN
     } else if request["recovery_required"] == true {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE + motor_protocol::TENANT_RECOVERY_ALLOWANCE
     } else if request["op"] == "set_remote_cache" {

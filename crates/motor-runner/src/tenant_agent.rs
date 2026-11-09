@@ -19,6 +19,7 @@ pub(crate) mod dns;
 mod network;
 mod paths;
 mod per_job;
+mod recovery;
 mod remote_cache;
 mod resize;
 mod runner_socket;
@@ -46,7 +47,9 @@ pub async fn serve_agent() -> io::Result<()> {
     let attach = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut tasks = tokio::task::JoinSet::new();
     let trim_lock = attach.clone();
-    tasks.spawn(async move { trim::watch(trim_lock).await });
+    if !recovery::enabled()? {
+        tasks.spawn(async move { trim::watch(trim_lock).await });
+    }
     loop {
         let socket = tokio::select! {
             socket = listener.accept() => socket?,
@@ -191,7 +194,17 @@ async fn dispatch(
     request: TenantAgentRequest,
     attach: &tokio::sync::Mutex<()>,
 ) -> io::Result<Value> {
+    let recovering = recovery::enabled()?;
+    if recovering != matches!(request, TenantAgentRequest::RecoverWorkspace { .. }) {
+        return Err(io::Error::other("operation does not match VM boot kind"));
+    }
     match request {
+        TenantAgentRequest::RecoverWorkspace { budget_ms } => {
+            let _guard = attach.lock().await;
+            tokio::task::spawn_blocking(move || recovery::run(budget_ms))
+                .await
+                .map_err(io::Error::other)?
+        }
         request @ TenantAgentRequest::AttachTenant { .. } => {
             let _guard = attach.lock().await;
             tokio::task::spawn_blocking(move || attach_tenant(request))
@@ -809,42 +822,44 @@ fn recover_tenant_disk(deadline: Instant) -> io::Result<()> {
         ),
         "unmount" => recovery_command(deadline, step, "umount", &["/tenant"]),
         "xfs_check" => recovery_command(deadline, step, "xfs_repair", &["-n", "/dev/vdb"]),
-        "stores" => {
-            let mirrors = Path::new("/tenant/state/main/mirrors");
-            let entries = match fs::read_dir(mirrors) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => return Err(e),
-            };
-            for entry in entries {
-                let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    return Err(io::Error::other("bare store is not a directory"));
-                }
-                let path = entry.path();
-                recovery_step("git_fsck", || {
-                    recovery_command(
-                        deadline,
-                        "git_fsck",
-                        "git",
-                        &[
-                            "--no-optional-locks",
-                            "-c",
-                            "safe.directory=*",
-                            "-C",
-                            path.to_str()
-                                .ok_or_else(|| io::Error::other("non-UTF8 bare store"))?,
-                            "fsck",
-                            "--full",
-                            "--no-dangling",
-                        ],
-                    )
-                })?;
-            }
-            Ok(())
-        }
+        "stores" => check_tenant_stores(deadline),
         _ => unreachable!(),
     })
+}
+
+fn check_tenant_stores(deadline: Instant) -> io::Result<()> {
+    let mirrors = Path::new("/tenant/state/main/mirrors");
+    let entries = match fs::read_dir(mirrors) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            return Err(io::Error::other("bare store is not a directory"));
+        }
+        let path = entry.path();
+        recovery_step("git_fsck", || {
+            recovery_command(
+                deadline,
+                "git_fsck",
+                "git",
+                &[
+                    "--no-optional-locks",
+                    "-c",
+                    "safe.directory=*",
+                    "-C",
+                    path.to_str()
+                        .ok_or_else(|| io::Error::other("non-UTF8 bare store"))?,
+                    "fsck",
+                    "--full",
+                    "--no-dangling",
+                ],
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn recovery_steps(mut run: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {

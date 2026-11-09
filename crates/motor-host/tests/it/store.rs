@@ -90,6 +90,9 @@ fn full() -> Snapshot {
             queue: vec![JOB.into()],
             attached_job: Some(JOB.into()),
             quarantined: false,
+            recovery: None,
+            recovery_result: None,
+            deleted: false,
             have: vec![motor_protocol::MirrorRef {
                 repository: Some("/repo".into()),
                 dependency: None,

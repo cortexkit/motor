@@ -369,6 +369,9 @@ impl Runtime {
             self.job_resources.release(&job)?;
         }
         self.host.lock().expect("host lock").billing_tick(now_ms)?;
+        if let Err(error) = self.tick_recoveries(now_ms) {
+            failure.get_or_insert(error);
+        }
         self.tick_balloon(now_ms);
         if let Some(error) = failure {
             return Err(error);
@@ -1079,6 +1082,7 @@ async fn cancel<S: AsyncWrite + Unpin>(
 }
 
 pub(super) mod balloon;
+pub(super) mod recovery;
 pub(super) mod stream;
 #[cfg(test)]
 mod tests;

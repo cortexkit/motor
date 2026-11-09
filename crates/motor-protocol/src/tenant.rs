@@ -313,6 +313,9 @@ pub struct TenantReplayBoundary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum TenantAgentRequest {
+    RecoverWorkspace {
+        budget_ms: u64,
+    },
     AttachTenant {
         generation: u64,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

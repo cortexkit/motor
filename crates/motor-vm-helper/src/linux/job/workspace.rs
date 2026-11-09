@@ -1,6 +1,58 @@
 use super::*;
 use std::{ffi::CString, io::Write};
 
+// Only helper-created trash names are visited. A synced rename is the deletion
+// decision; startup can finish removing its contents without opening guest data.
+pub(super) fn finish_deletions(root: &Path) -> Result<()> {
+    if !root.try_exists()? {
+        return Ok(());
+    }
+    trusted_directory(root)?;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_prefix(".trash-")) else {
+            continue;
+        };
+        job::validate_id(id)?;
+        trusted_directory(&entry.path())?;
+        std::fs::remove_dir_all(entry.path())?;
+    }
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+pub(super) fn delete(root: &Path, account: &str, disk_id: &str) -> Result<()> {
+    job::validate_account(account)?;
+    job::validate_id(disk_id)?;
+    trusted_directory(root)?;
+    let path = root.join(disk_id);
+    let trash = root.join(format!(".trash-{disk_id}"));
+    if path.try_exists()? {
+        trusted_directory(&path)?;
+        let registry: Workspace =
+            serde_json::from_reader(fs::trusted_file(&path.join("registry.json"))?)
+                .map_err(|e| Error(e.to_string()))?;
+        if registry.account != account
+            || registry.workspace_disk_id != disk_id
+            || registry.role != job::WorkspaceRole::Job
+        {
+            return Err(Error("workspace deletion identity or role mismatch".into()));
+        }
+        if trash.try_exists()? {
+            return Err(Error("workspace trash collision".into()));
+        }
+        std::fs::rename(&path, &trash)?;
+        File::open(root)?.sync_all()?;
+    }
+    if trash.try_exists()? {
+        trusted_directory(&trash)?;
+        std::fs::remove_dir_all(trash)?;
+        File::open(root)?.sync_all()?;
+    }
+    Ok(())
+}
+
 // Fill/base creation is deliberately unexposed to host requests. A future
 // root-controlled fill provisioner must select the account/repository's trusted
 // reusable checkout for cache fills and base builds, not accept a disk name
@@ -106,10 +158,61 @@ mod tests {
         let mut host = request();
         host.workspace_disk_id = "disk-3".into();
         jobs.create_workspace(host).unwrap();
+        let disk = root.join("disk-3/workspace.img");
+        assert_eq!(std::fs::read(&disk).unwrap(), vec![0; 4096]);
+        assert_eq!(std::fs::metadata(&disk).unwrap().blocks(), 0);
         let host: Workspace =
             serde_json::from_slice(&std::fs::read(root.join("disk-3/registry.json")).unwrap())
                 .unwrap();
         assert_eq!(host.role, job::WorkspaceRole::Job);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn isolated_workspace_deletion_refuses_attached_recovery_foreign_and_fill_disks_and_resumes_trash(
+    ) {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let base = super::super::tests::scratch();
+        let mut jobs = super::super::tests::machine(&base);
+        let root = jobs.workspaces.clone();
+        let mut record = super::super::tests::record();
+        record.start.kind = job::VmKind::Recovery;
+        let account = record.start.account.clone();
+        let disk_id = record.start.workspace_disk_id.clone();
+        let request = || job::CreateWorkspace {
+            account: account.clone(),
+            workspace_disk_id: disk_id.clone(),
+            size_bytes: 4096,
+        };
+        create(&root, request(), job::WorkspaceRole::Job).unwrap();
+        assert!(delete(&root, "other", &disk_id).is_err());
+        assert!(delete(&root, &account, "../escape").is_err());
+        jobs.records
+            .insert(record.start.job_id.clone(), record.clone());
+        assert!(jobs
+            .handle(
+                Operation::DeleteWorkspace {
+                    account: account.clone(),
+                    disk_id: disk_id.clone()
+                },
+                Peer { uid: 0, gid: 0 }
+            )
+            .is_err());
+        assert!(root.join(&disk_id).exists());
+        jobs.records.clear();
+        // Simulate death after the durable rename but before recursive removal.
+        std::fs::rename(root.join(&disk_id), root.join(format!(".trash-{disk_id}"))).unwrap();
+        finish_deletions(&root).unwrap();
+        delete(&root, &account, &disk_id).unwrap();
+        assert!(!root.join(&disk_id).exists());
+        for role in [job::WorkspaceRole::Fill, job::WorkspaceRole::Base] {
+            create(&root, request(), role).unwrap();
+            assert!(delete(&root, &account, &disk_id).is_err());
+            std::fs::remove_dir_all(root.join(&disk_id)).unwrap();
+        }
+        create(&root, request(), job::WorkspaceRole::Job).unwrap();
+        delete(&root, &account, &disk_id).unwrap();
+        delete(&root, &account, &disk_id).unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
 }

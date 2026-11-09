@@ -69,6 +69,10 @@ pub enum Request {
         port: u32,
     },
     JobExits {},
+    DeleteWorkspace {
+        account: String,
+        disk_id: String,
+    },
     AckJobExit {
         job_id: String,
         oom_kill: u64,
@@ -392,6 +396,9 @@ impl<M: Machine> Helper<M> {
                 self.job(job::Operation::Relay(job_id, port), peer)
             }
             Request::JobExits {} => self.job(job::Operation::Exits, peer),
+            Request::DeleteWorkspace { account, disk_id } => {
+                self.job(job::Operation::DeleteWorkspace { account, disk_id }, peer)
+            }
             Request::AckJobExit {
                 job_id,
                 oom_kill,

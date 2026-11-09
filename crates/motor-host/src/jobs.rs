@@ -29,6 +29,18 @@ pub trait Resources: Send + Sync {
     /// Idempotent durable release, called only after stop confirmation or when
     /// no launch was authorized. It also removes any abandoned spool file.
     fn release(&self, job: &str) -> Result<()>;
+    /// Reserve the quarantined disk and return a boot-ready image, including
+    /// its full account copy. Recovery has no job token, client connection or
+    /// upload spool. Reopening a recovery returns its same image. Preparation
+    /// precedes the VM's clock.
+    fn acquire_recovery(
+        &self,
+        _disk_id: &str,
+        _disk: &crate::state::jobs::WorkspaceDisk,
+        _recovery: &crate::state::jobs::recovery::Recovery,
+    ) -> Result<Assignment> {
+        anyhow::bail!("recovery images unavailable")
+    }
 }
 
 pub struct Unavailable;

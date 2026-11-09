@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::sync::Condvar;
 
+mod recovery_tests;
+
 const JOB: &str = "00000000-0000-7000-8000-000000000001";
 const JOB2: &str = "00000000-0000-7000-8000-000000000002";
 struct Journal;
@@ -75,6 +77,8 @@ struct Fake {
     resident: Mutex<BTreeMap<String, u64>>,
     balloons: Mutex<Vec<(String, u64)>>,
     scripted: Mutex<std::collections::VecDeque<UnixStream>>,
+    recovery_reply: Mutex<Option<Value>>,
+    recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
 }
 impl Fake {
     fn wait(&self, stage: &str) {
@@ -135,9 +139,22 @@ impl Control for Fake {
             .unwrap()
             .push(format!("start:{}", start.job_id));
         self.wait("boot");
+        if start.kind == motor_vm_helper::job::VmKind::Recovery {
+            self.recovery_starts.lock().unwrap().push(start.clone());
+            return Ok(json!({"result":"job","running":true}));
+        }
         Ok(json!({"result":"job","running":true,"tap_index":1}))
     }
     fn job_admin(&self, _: &str, request: &Value) -> Result<Value> {
+        if request["op"] == "recover_workspace" {
+            self.wait("recovery");
+            return Ok(self
+                .recovery_reply
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(json!({"ok":true,"recovery":"repaired"})));
+        }
         assert_eq!(request["op"], "attach_tenant");
         assert!(request.get("recovery_required").is_none());
         self.wait("runner");
@@ -146,6 +163,10 @@ impl Control for Fake {
     fn adopt_job(&self, job: &str) -> Result<bool> {
         self.calls.lock().unwrap().push(format!("adopt:{job}"));
         Ok(!self.gone.lock().unwrap().contains(job))
+    }
+    fn delete_workspace(&self, _: &str, disk_id: &str) -> Result<()> {
+        self.calls.lock().unwrap().push(format!("delete:{disk_id}"));
+        Ok(())
     }
     fn stop_job(&self, job: &str) -> Result<()> {
         self.calls.lock().unwrap().push(format!("stop:{job}"));
@@ -260,6 +281,7 @@ struct Storage {
     releases: Mutex<BTreeMap<String, usize>>,
     fail_prepare: AtomicBool,
     released: tokio::sync::Notify,
+    recovery_available: AtomicBool,
 }
 impl Storage {
     fn new() -> Arc<Self> {
@@ -271,6 +293,7 @@ impl Storage {
             releases: Mutex::new(BTreeMap::new()),
             fail_prepare: AtomicBool::new(false),
             released: tokio::sync::Notify::new(),
+            recovery_available: AtomicBool::new(false),
         })
     }
     fn spool(&self, job: &str) -> std::path::PathBuf {
@@ -278,6 +301,24 @@ impl Storage {
     }
 }
 impl Resources for Storage {
+    fn acquire_recovery(
+        &self,
+        _: &str,
+        _: &crate::state::jobs::WorkspaceDisk,
+        r: &crate::state::jobs::recovery::Recovery,
+    ) -> Result<Assignment> {
+        ensure!(
+            self.recovery_available.load(Ordering::Acquire),
+            "images unavailable"
+        );
+        self.held.lock().unwrap().insert(r.id.clone());
+        Ok(Assignment {
+            image_generation_id: "gen-1".into(),
+            hello: hello(),
+            spool: self.spool(&r.id),
+            guest_init: json!({}),
+        })
+    }
     fn acquire(&self, e: &Execution) -> Result<Assignment> {
         self.held.lock().unwrap().insert(e.claims.jti.clone());
         Ok(Assignment {

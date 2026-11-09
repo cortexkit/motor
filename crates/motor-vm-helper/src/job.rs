@@ -155,7 +155,7 @@ impl WorkspaceRole {
     pub fn permits(self, kind: VmKind) -> bool {
         matches!(
             (self, kind),
-            (_, VmKind::Recovery)
+            (Self::Job, VmKind::Recovery)
                 | (Self::Job, VmKind::Job)
                 | (Self::Fill, VmKind::Fill)
                 | (Self::Base, VmKind::BaseBuild)
@@ -181,6 +181,7 @@ pub struct ExitReport {
 }
 
 pub enum Operation {
+    DeleteWorkspace { account: String, disk_id: String },
     Start(Start),
     Adopt(String),
     Stop(String),
@@ -194,6 +195,10 @@ pub enum Operation {
 impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::DeleteWorkspace { account, disk_id } => {
+                validate_account(account)?;
+                validate_id(disk_id)
+            }
             Self::Start(start) => start.validate(),
             Self::Adopt(id) | Self::Stop(id) | Self::Memory(id) | Self::Balloon(id, _) => {
                 validate_job_id(id)
@@ -290,8 +295,8 @@ mod tests {
         use WorkspaceRole::*;
         for (role, allowed) in [
             (Job, [true, false, false, true]),
-            (Fill, [false, true, false, true]),
-            (Base, [false, false, true, true]),
+            (Fill, [false, true, false, false]),
+            (Base, [false, false, true, false]),
         ] {
             for (kind, expected) in [
                 VmKind::Job,

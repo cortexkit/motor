@@ -455,6 +455,9 @@ mod rollback_tests {
                 queue: vec![],
                 attached_job: None,
                 quarantined: false,
+                recovery: None,
+                recovery_result: None,
+                deleted: false,
                 have: Vec::new(),
             },
         );
@@ -494,6 +497,9 @@ mod rollback_tests {
                 queue: vec![],
                 attached_job: None,
                 quarantined: false,
+                recovery: None,
+                recovery_result: None,
+                deleted: false,
                 have: Vec::new(),
             },
         );
@@ -550,6 +556,9 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
             queue: vec![],
             attached_job: None,
             quarantined: false,
+            recovery: None,
+            recovery_result: None,
+            deleted: false,
             have: vec![motor_protocol::MirrorRef {
                 repository: Some("/repo".into()),
                 dependency: None,
@@ -586,4 +595,28 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     let conn = Connection::open(dir.path().join("store.db")).unwrap();
     assert_eq!(load(&conn).unwrap(), legacy);
     assert_eq!(load_snapshot(&conn).unwrap(), snapshot);
+    drop(conn);
+    for phase in [
+        crate::state::jobs::recovery::Phase::Reserved,
+        crate::state::jobs::recovery::Phase::Running,
+        crate::state::jobs::recovery::Phase::Stopping,
+        crate::state::jobs::recovery::Phase::Deleting,
+    ] {
+        let (mut journal, mut current) = SqliteJournal::open(dir.path()).unwrap();
+        let disk = current.per_job.disks.get_mut("ws-rollback").unwrap();
+        disk.quarantined = true;
+        disk.recovery_result = Some("reformatted".into());
+        disk.recovery = Some(crate::state::jobs::recovery::Recovery {
+            id: job.into(),
+            memory_debit_mib: 10,
+            guest_ram_mib: 20,
+            started_at_ms: Some(123),
+            phase,
+        });
+        journal.store(&current).unwrap();
+        drop(journal);
+        let conn = Connection::open(dir.path().join("store.db")).unwrap();
+        assert_eq!(load(&conn).unwrap(), legacy);
+        assert_eq!(load_snapshot(&conn).unwrap(), current);
+    }
 }

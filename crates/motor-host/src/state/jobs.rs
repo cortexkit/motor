@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub(crate) mod have;
+pub mod recovery;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
@@ -30,6 +31,12 @@ pub struct WorkspaceDisk {
     pub queue: Vec<String>,
     pub attached_job: Option<String>,
     pub quarantined: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<recovery::Recovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_result: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
     /// Oldest-first mirror pins from runner reports, never caller candidates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub have: Vec<motor_protocol::MirrorRef>,
@@ -87,6 +94,7 @@ impl Host {
             .per_job
             .disks
             .iter()
+            .filter(|(_, disk)| !disk.deleted)
             .map(|(id, disk)| {
                 let busy =
                     disk.quarantined || disk.attached_job.is_some() || !disk.queue.is_empty();
@@ -134,7 +142,8 @@ impl Host {
         let Some(sample) = self.fresh_host_resources(now_ms) else {
             return 0;
         };
-        self.snapshot
+        let free = self
+            .snapshot
             .per_job
             .executions
             .values()
@@ -144,7 +153,13 @@ impl Host {
                     .available_mem_mib
                     .saturating_sub(settings.host_reserve_mib),
                 |free, job| free.saturating_sub(job.memory_debit_mib),
-            )
+            );
+        self.snapshot
+            .per_job
+            .disks
+            .values()
+            .filter_map(|d| d.recovery.as_ref())
+            .fold(free, |free, r| free.saturating_sub(r.memory_debit_mib))
     }
 
     pub(crate) fn fresh_host_resources(&self, now_ms: u64) -> Option<HostResources> {
@@ -190,6 +205,12 @@ impl Host {
             let HostSettings::PerJob(settings) = &self.settings else {
                 return Err(Refusal::Auth.into());
             };
+            let existing = ledger.disks.iter().find(|(_, disk)| {
+                !disk.deleted && disk.sub == claims.sub && &disk.workspace_key_hash == hash
+            });
+            if existing.is_some_and(|(_, disk)| disk.quarantined) {
+                return Err(RefusalCause::QuarantinedWorkspace.into());
+            }
             let sample = self
                 .fresh_host_resources(now_ms)
                 .ok_or(RefusalCause::Memory)?;
@@ -197,7 +218,9 @@ impl Host {
                 .executions
                 .values()
                 .filter(|job| !job.ended)
-                .try_fold(0u32, |used, job| used.checked_add(job.claims.vcpus));
+                .try_fold(self.recovery_permits(), |used, job| {
+                    used.checked_add(job.claims.vcpus)
+                });
             if claims.vcpus > sample.vcpu_ceiling
                 || used
                     .and_then(|used| used.checked_add(claims.vcpus))
@@ -217,13 +240,6 @@ impl Host {
             }
             // A host has one disk per account/workspace pair. Cold or foreign
             // hints never bypass that disk's queue or attach another pair's data.
-            let existing = ledger
-                .disks
-                .iter()
-                .find(|(_, disk)| disk.sub == claims.sub && &disk.workspace_key_hash == hash);
-            if existing.is_some_and(|(_, disk)| disk.quarantined) {
-                return Err(RefusalCause::QuarantinedWorkspace.into());
-            }
             let disk_id = existing.map(|(id, _)| id.clone()).unwrap_or_else(|| loop {
                 let mut random = [0u8; 16];
                 rand::thread_rng().fill_bytes(&mut random);
@@ -254,6 +270,9 @@ impl Host {
                     queue: Vec::new(),
                     attached_job: None,
                     quarantined: false,
+                    recovery: None,
+                    recovery_result: None,
+                    deleted: false,
                     have: Vec::new(),
                 })
                 .queue

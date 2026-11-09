@@ -2,6 +2,27 @@ use motor_protocol::*;
 use serde_json::json;
 
 #[test]
+fn recovery_operation_is_additive_and_existing_agent_bytes_are_unchanged() {
+    for bytes in [
+        r#"{"op":"attach_tenant","generation":1,"unix_ms":2,"seed":"seed","address":"10.200.1.2/30","gateway":"10.200.1.1","resolvers":["1.1.1.1"],"hostname":"host","machine_id":"id"}"#,
+        r#"{"op":"post_restore","unix_ms":2,"seed":"seed"}"#,
+        r#"{"op":"cancel","job_id":"00000000-0000-4000-8000-000000000001"}"#,
+        r#"{"op":"drain","deadline_s":4,"exit_after":true}"#,
+        r#"{"op":"resume"}"#,
+        r#"{"op":"status"}"#,
+        r#"{"op":"diagnostics"}"#,
+        r#"{"op":"args_status"}"#,
+        r#"{"op":"prepare_snapshot","kind":"stop"}"#,
+        r#"{"op":"thaw"}"#,
+        r#"{"op":"recovery_status","generation":1}"#,
+        r#"{"op":"recover_workspace","budget_ms":1000}"#,
+    ] {
+        let request: TenantAgentRequest = serde_json::from_str(bytes).unwrap();
+        assert_eq!(serde_json::to_string(&request).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn verified_lease_memory_is_optional_for_older_hosts() {
     let value = json!({
         "type":"verified_lease", "jti":"019e4567-89ab-7cde-8012-3456789abcde",

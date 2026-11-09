@@ -48,7 +48,14 @@ fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
         .as_str()
         .unwrap()
         .contains("motor.cache_nonce"));
-    let recovery = boot_requests(&start(), None, None);
+    let mut recovery_start = start();
+    recovery_start.kind = job::VmKind::Recovery;
+    let recovery = boot_requests(&recovery_start, Some(17), Some(nonce));
+    assert_eq!(
+        recovery[1].1["boot_args"],
+        format!("{JOB_BOOT_ARGS} motor.recovery=1")
+    );
+    assert!(!recovery.iter().any(|r| r.0 == "/drives/remote-cache"));
     assert!(!recovery
         .iter()
         .any(|request| request.0.starts_with("/network-interfaces/")));
@@ -150,7 +157,7 @@ fn start() -> Start {
     }
 }
 
-fn record() -> Record {
+pub(super) fn record() -> Record {
     Record {
         start: start(),
         uid: unsafe { libc::geteuid() },

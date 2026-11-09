@@ -144,6 +144,7 @@ impl Host {
             .get_or_insert(unclean);
         if unclean {
             super::jobs::have::invalidate(&mut next, job);
+            super::jobs::recovery::quarantine(&mut next, job);
         }
         self.save(next)
     }
@@ -184,6 +185,7 @@ impl Host {
             defer_usage(&mut next, job);
         }
         super::jobs::have::invalidate(&mut next, job);
+        super::jobs::recovery::quarantine(&mut next, job);
         self.save(next)?;
         tracing::warn!(jti = job, cause = cause.as_str(), "job_host_stop");
         Ok(())
@@ -228,6 +230,7 @@ impl Host {
             && report.oom_kill == 0;
         if !clean {
             super::jobs::have::invalidate(&mut next, &report.job_id);
+            super::jobs::recovery::quarantine(&mut next, &report.job_id);
         }
         self.save(next)?;
         if report.oom_kill > 0 {
@@ -289,6 +292,7 @@ impl Host {
             finalize_usage(&mut next, job);
         }
         super::jobs::have::invalidate(&mut next, job);
+        super::jobs::recovery::quarantine(&mut next, job);
         self.save(next)?;
         if new_gap {
             tracing::warn!(jti = job, first_gone_ms = first, "job_exit_evidence_gap");
