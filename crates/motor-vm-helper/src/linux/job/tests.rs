@@ -236,6 +236,25 @@ fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
 }
 
 #[test]
+fn jailer_enters_the_job_namespace_before_starting_firecracker() {
+    let netns = namespace::path(&start().job_id).unwrap();
+    let command = jailer_command(
+        Path::new("/binaries"),
+        Path::new("/jail"),
+        &netns,
+        &start().job_id,
+        500000,
+    );
+    let args: Vec<_> = command.get_args().map(|s| s.to_str().unwrap()).collect();
+    let end = args.iter().position(|s| *s == "--").unwrap();
+    let option = args.iter().position(|s| *s == "--netns").unwrap();
+    assert!(option < end);
+    assert_eq!(args[option + 1], netns.to_str().unwrap());
+    assert_eq!(args[end + 1..], ["--api-sock", "/api.sock"]);
+    assert!(!args.contains(&"--cgroup-version"));
+}
+
+#[test]
 fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
     let requests = boot_requests(&start(), Some(17), None);
     let paths: Vec<_> = requests.iter().map(|r| r.0).collect();

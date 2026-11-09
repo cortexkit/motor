@@ -4,9 +4,12 @@ use crate::linux::tenant_network::{self, Tap};
 pub(super) trait Access: Send {
     fn tenants(&self) -> Result<Vec<Tap>>;
     fn install(&mut self, taps: &[Tap]) -> Result<()>;
-    fn ensure(&mut self, tap: &Tap) -> Result<()>;
+    fn create_namespace(&mut self, id: &str) -> Result<PathBuf>;
+    fn reconcile_namespaces(&mut self, retained: &BTreeSet<String>) -> Result<()>;
+    fn remove_namespace(&mut self, id: &str) -> Result<()>;
+    fn ensure(&mut self, id: &str, tap: &Tap) -> Result<()>;
     fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>>;
-    fn remove(&mut self, tap: &Tap) -> Result<()>;
+    fn remove(&mut self, id: &str, tap: &Tap) -> Result<()>;
 }
 
 pub(super) struct System(pub Config);
@@ -19,16 +22,26 @@ impl Access for System {
         tenant_network::validate_taps(taps)?;
         tenant_network::install_taps(taps, &self.0)?.require_ready()
     }
-    fn ensure(&mut self, tap: &Tap) -> Result<()> {
-        tenant_network::ensure(tap, tap.uid)
+    fn create_namespace(&mut self, id: &str) -> Result<PathBuf> {
+        namespace::create(id)
+    }
+    fn reconcile_namespaces(&mut self, retained: &BTreeSet<String>) -> Result<()> {
+        namespace::reconcile(retained)
+    }
+    fn remove_namespace(&mut self, id: &str) -> Result<()> {
+        namespace::remove(id)
+    }
+    fn ensure(&mut self, id: &str, tap: &Tap) -> Result<()> {
+        namespace::connect(id, tap)
     }
     fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>> {
         tenant_network::optional_egress_bytes(tap)
     }
-    fn remove(&mut self, tap: &Tap) -> Result<()> {
+    fn remove(&mut self, id: &str, tap: &Tap) -> Result<()> {
+        namespace::disconnect(id, tap)?;
         tenant_network::remove_allocated(tap)?;
-        // With the TAP gone no guest can create a new flow. Conntrack owns NAT
-        // mappings too; retire both before the durable allocation is released.
+        // The host owns the NAT mapping; the job namespace tracks forwarding
+        // too. Retire both before the durable allocation can be reused.
         super::conntrack::flush(tap.tap_index)
     }
 }

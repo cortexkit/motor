@@ -217,6 +217,21 @@ pub(super) fn flush(index: u8) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, feature = "linux-root-tests"))]
+pub(super) fn count(index: u8) -> Result<usize> {
+    let mut netlink = Netlink::open()?;
+    netlink.request(CT_GET, 0x300, &[libc::AF_INET as u8, 0, 0, 0])?;
+    let mut count = 0;
+    netlink.receive(
+        |entry| {
+            count += usize::from(deletion(entry, [10, 200, index, 2])?.is_some());
+            Ok(())
+        },
+        false,
+    )?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,141 +275,15 @@ mod tests {
     #[cfg(feature = "linux-root-tests")]
     mod root {
         use super::*;
-        use std::{
-            fs::File,
-            io::{BufRead, BufReader, Write},
-            process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+        use crate::linux::job::namespace::{
+            self,
+            root_tests::{job_link, public_link, Fixture, Node},
         };
+        use crate::linux::tenant_network::Tap;
 
-        struct Namespace(File);
-        impl Namespace {
-            fn enter() -> Self {
-                assert_eq!(unsafe { libc::geteuid() }, 0);
-                let original = File::open("/proc/thread-self/ns/net").unwrap();
-                assert_eq!(
-                    unsafe { libc::unshare(libc::CLONE_NEWNET) },
-                    0,
-                    "requires CAP_SYS_ADMIN"
-                );
-                Self(original)
-            }
-        }
-        impl Drop for Namespace {
-            fn drop(&mut self) {
-                assert_eq!(
-                    unsafe { libc::setns(self.0.as_raw_fd(), libc::CLONE_NEWNET) },
-                    0
-                );
-            }
-        }
-        struct Node {
-            child: Child,
-            input: ChildStdin,
-            output: BufReader<ChildStdout>,
-        }
-        impl Node {
-            fn new(script: &str) -> Self {
-                let mut child = Command::new("/usr/bin/unshare")
-                    .args(["--net", "/usr/bin/python3", "-u", "-c", script])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .unwrap();
-                let mut node = Self {
-                    input: child.stdin.take().unwrap(),
-                    output: BufReader::new(child.stdout.take().unwrap()),
-                    child,
-                };
-                assert_eq!(node.line(), "ready");
-                node
-            }
-            fn send(&mut self, text: &str) {
-                writeln!(self.input, "{text}").unwrap();
-                self.input.flush().unwrap();
-            }
-            fn line(&mut self) -> String {
-                let mut line = String::new();
-                assert!(
-                    self.output.read_line(&mut line).unwrap() > 0,
-                    "network fixture exited"
-                );
-                line.trim().to_string()
-            }
-            fn ip(&self, args: &[&str]) {
-                command(
-                    "/usr/bin/nsenter",
-                    &[
-                        &[
-                            &format!("--net=/proc/{}/ns/net", self.child.id()),
-                            "--",
-                            "/usr/sbin/ip",
-                        ][..],
-                        args,
-                    ]
-                    .concat(),
-                );
-            }
-        }
-        impl Drop for Node {
-            fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-        }
-        fn command(program: &str, args: &[&str]) {
-            let output = Command::new(program).args(args).output().unwrap();
-            assert!(
-                output.status.success(),
-                "{program} {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        fn guest_link(guest: &Node) {
-            command(
-                "/usr/sbin/ip",
-                &[
-                    "link", "add", "mtap17", "type", "veth", "peer", "name", "guest0",
-                ],
-            );
-            command(
-                "/usr/sbin/ip",
-                &[
-                    "link",
-                    "set",
-                    "guest0",
-                    "netns",
-                    &guest.child.id().to_string(),
-                ],
-            );
-            command(
-                "/usr/sbin/ip",
-                &["addr", "add", "10.200.17.1/30", "dev", "mtap17"],
-            );
-            command("/usr/sbin/ip", &["link", "set", "mtap17", "up"]);
-            guest.ip(&["addr", "add", "10.200.17.2/30", "dev", "guest0"]);
-            guest.ip(&["link", "set", "guest0", "up"]);
-            guest.ip(&["route", "replace", "default", "via", "10.200.17.1"]);
-        }
         #[test]
         fn isolated_delayed_udp_reply_is_not_delivered_after_tap_index_reuse() {
-            let _namespace = Namespace::enter();
-            let mut guest = Node::new(
-                r#"
-import socket,sys
-print('ready')
-sys.stdin.readline()
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(5)
-s.bind(('10.200.17.2',41000)); s.sendto(b'job-A',('8.8.4.2',42000))
-assert s.recv(64)==b'warmup'; print('warmed')
-sys.stdin.readline(); s.close(); print('closed')
-sys.stdin.readline()
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2)
-s.bind(('10.200.17.2',41000)); print('job-B-listening')
-try: print(s.recv(64).decode())
-except socket.timeout: print('no-delayed-reply')
-"#,
-            );
+            let _fixture = Fixture::new();
             let mut remote = Node::new(
                 r#"
 import socket,sys
@@ -406,77 +295,62 @@ s.sendto(b'warmup',peer); print('flow-established')
 sys.stdin.readline(); s.sendto(b'delayed-job-A',peer); print('sent-delayed')
 "#,
             );
-            command(
-                "/usr/sbin/ip",
-                &[
-                    "link", "add", "public0", "type", "veth", "peer", "name", "remote0",
-                ],
-            );
-            command(
-                "/usr/sbin/ip",
-                &[
-                    "link",
-                    "set",
-                    "remote0",
-                    "netns",
-                    &remote.child.id().to_string(),
-                ],
-            );
-            command(
-                "/usr/sbin/ip",
-                &["addr", "add", "8.8.4.1/24", "dev", "public0"],
-            );
-            command("/usr/sbin/ip", &["link", "set", "public0", "up"]);
-            remote.ip(&["addr", "add", "8.8.4.2/24", "dev", "remote0"]);
-            remote.ip(&["link", "set", "remote0", "up"]);
-            guest_link(&guest);
-            std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
-            let policy = crate::linux::tenant_network::test_job_policy("public0", 17);
-            let mut nft = Command::new("/usr/sbin/nft")
-                .args(["-f", "-"])
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap();
-            nft.stdin
-                .take()
-                .unwrap()
-                .write_all(policy.as_bytes())
-                .unwrap();
-            assert!(nft.wait().unwrap().success());
+            public_link(&remote);
+            let a = "udp-predecessor";
+            job_link(a);
+            let mut guest = Node::guest(a);
             remote.send("serve");
             assert_eq!(remote.line(), "bound");
-            guest.send("send-A");
+            guest.send("send 8.8.4.2 job-A");
             assert_eq!(remote.line(), "flow-established");
-            assert_eq!(guest.line(), "warmed");
-            guest.send("close-A");
-            assert_eq!(guest.line(), "closed");
-            command("/usr/sbin/ip", &["link", "delete", "mtap17"]);
-            // Masquerade belongs to the still-live uplink, so deleting the old
-            // guest link alone must leave the vulnerable reverse-NAT mapping.
-            let mut netlink = Netlink::open().unwrap();
-            netlink
-                .request(CT_GET, 0x300, &[libc::AF_INET as u8, 0, 0, 0])
-                .unwrap();
-            let mut matches = 0;
-            netlink
-                .receive(
-                    |entry| {
-                        matches += usize::from(deletion(entry, [10, 200, 17, 2])?.is_some());
-                        Ok(())
-                    },
-                    false,
-                )
-                .unwrap();
+            assert_eq!(guest.line(), "warmup");
+            assert!(
+                namespace::in_namespace(a, || count(17)).unwrap() > 0,
+                "fixture did not track guest forwarding inside namespace"
+            );
+            drop(guest);
+            let tap = Tap {
+                tap_index: 17,
+                uid: 500000,
+            };
+            namespace::disconnect(a, &tap).unwrap();
+            assert_eq!(
+                namespace::in_namespace(a, || count(17)).unwrap(),
+                0,
+                "namespace retained predecessor conntrack state"
+            );
+            // The job namespace is retired, but the live host uplink retains
+            // the reverse-NAT mapping until the host is flushed separately.
+            let matches = count(17).unwrap();
             assert!(matches > 0, "fixture did not retain predecessor NAT state");
             flush(17).unwrap();
-            guest_link(&guest);
-            guest.send("listen-B");
-            assert_eq!(guest.line(), "job-B-listening");
+            assert_eq!(count(17).unwrap(), 0, "host retained predecessor NAT state");
+            namespace::remove(a).unwrap();
+            let b = "udp-successor";
+            job_link(b);
+            let mut guest = Node::guest(b);
+            // Resolve the successor's ARP before the delayed packet is sent.
+            namespace::root_tests::command(
+                "/usr/bin/nsenter",
+                &[
+                    &format!("--net={}", namespace::path(b).unwrap().display()),
+                    "--",
+                    "/usr/sbin/ip",
+                    "neigh",
+                    "replace",
+                    "10.200.17.2",
+                    "lladdr",
+                    "02:fc:00:00:11:02",
+                    "dev",
+                    "mtap17",
+                ],
+            );
+            guest.send("receive");
             remote.send("reply-to-A");
             assert_eq!(remote.line(), "sent-delayed");
             assert_eq!(
                 guest.line(),
-                "no-delayed-reply",
+                "timeout",
                 "successor received predecessor traffic"
             );
         }
