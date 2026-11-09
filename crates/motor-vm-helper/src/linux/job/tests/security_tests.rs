@@ -93,6 +93,7 @@ mod root {
     fn settings(jobs: &mut LinuxJobs) {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         jobs.settings = Some(JobVms {
+            workspace_disk_max_bytes: Some(1073741824),
             uid_base: 600001,
             uid_count: 1,
             memory_max_bytes: 1048576,

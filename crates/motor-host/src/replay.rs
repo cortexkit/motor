@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 
-const SEGMENT_BYTES: u64 = 1024 * 1024;
+pub(crate) const SEGMENT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct Index {
@@ -138,6 +138,33 @@ fn data_files(directory: &File) -> Result<Vec<String>> {
         libc::closedir(dir);
     }
     Ok(files)
+}
+
+/// Allocation only: admission never parses a guest frame or creates a replay.
+pub(crate) fn allocated_bytes(journal: &Path, job: &str) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        uuid::Uuid::parse_str(job)?.to_string() == job,
+        "invalid replay identity"
+    );
+    let root = File::open(journal)?;
+    let replay = open(&root, "replay", libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let directory = open(&replay, job, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let mut files = data_files(&directory)?;
+    files.push("index.json".into());
+    let mut allocated = 0u64;
+    for name in files {
+        let file = open(&directory, &name, libc::O_RDONLY)?;
+        let bytes = file
+            .metadata()?
+            .blocks()
+            .checked_mul(512)
+            .context("replay allocation overflow")?;
+        allocated = allocated
+            .checked_add(bytes)
+            .context("replay allocation overflow")?;
+    }
+    Ok(allocated)
 }
 
 impl Store {

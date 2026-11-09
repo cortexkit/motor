@@ -122,7 +122,26 @@ pub struct LinuxJobs {
 
 impl LinuxJobs {
     pub fn create_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
+        self.check_workspace_size(request.size_bytes)?;
         workspace::create(&self.workspaces, request, job::WorkspaceRole::Job)
+    }
+    fn check_workspace_size(&self, size: u64) -> Result<()> {
+        let maximum = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.workspace_disk_max_bytes)
+            .ok_or_else(|| Error("workspace disk maximum is required".into()))?;
+        if size == 0 || !size.is_multiple_of(512) || size > maximum {
+            return Err(Error(
+                "workspace disk size exceeds configured maximum or is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// A seed/clone holds this shared lease until it has synced its new disk.
+    /// Base eviction takes the exclusive lease under the same helper mutex.
+    pub fn lease_base(&self, account: &str, disk_id: &str) -> Result<File> {
+        workspace::base_lease(&self.workspaces, account, disk_id, false)
     }
     pub fn new(config: &Config) -> Self {
         Self {
@@ -487,14 +506,63 @@ impl LinuxJobs {
             self.collect_exits()?;
         }
         match op {
-            Operation::DeleteWorkspace { account, disk_id } => {
-                if self
-                    .records
-                    .values()
-                    .any(|r| !r.released && r.start.workspace_disk_id == disk_id)
-                {
-                    return Err(Error("workspace disk still held by a VM".into()));
+            Operation::WorkspaceUsage { account, disk_id } => {
+                let exclusive_bytes = (|| -> Result<u64> {
+                    let (_, disk) = workspace::open_disk(&self.workspaces, &account, &disk_id)?;
+                    let meta = disk.metadata()?;
+                    if let Some(record) = self
+                        .records
+                        .values()
+                        .find(|r| !r.released && r.start.workspace_disk_id == disk_id)
+                    {
+                        if record.start.account != account
+                            || (meta.dev(), meta.ino()) != (record.disk_device, record.disk_inode)
+                            || ![0, record.uid].contains(&meta.uid())
+                        {
+                            return Err(Error("workspace usage identity changed".into()));
+                        }
+                    } else if meta.uid() != 0 {
+                        return Err(Error("idle workspace is not root owned".into()));
+                    }
+                    workspace::exclusive_bytes(&disk)
+                })()
+                .ok();
+                Ok(Response::new(Reply::WorkspaceUsage { exclusive_bytes }))
+            }
+            Operation::EnsureWorkspace {
+                account,
+                disk_id,
+                size_bytes,
+            } => {
+                self.check_workspace_size(size_bytes)?;
+                self.disk_available_identity(&disk_id)?;
+                workspace::ensure(
+                    &self.workspaces,
+                    job::CreateWorkspace {
+                        account,
+                        workspace_disk_id: disk_id,
+                        size_bytes,
+                    },
+                )?;
+                Ok(Response::new(Reply::Ok))
+            }
+            Operation::EvictBase { account, disk_id } => {
+                self.disk_available_identity(&disk_id)?;
+                if self.workspaces.join(&disk_id).try_exists()? {
+                    let _lease = workspace::base_lease(&self.workspaces, &account, &disk_id, true)?;
+                    workspace::delete_role(
+                        &self.workspaces,
+                        &account,
+                        &disk_id,
+                        job::WorkspaceRole::Base,
+                    )?;
+                } else {
+                    workspace::finish_deletions(&self.workspaces)?;
                 }
+                Ok(Response::new(Reply::Ok))
+            }
+            Operation::DeleteWorkspace { account, disk_id } => {
+                self.disk_available_identity(&disk_id)?;
                 workspace::delete(&self.workspaces, &account, &disk_id)?;
                 Ok(Response::new(Reply::Ok))
             }
@@ -530,6 +598,17 @@ impl LinuxJobs {
             }
             Operation::AckExit(_) => unreachable!(),
         }
+    }
+
+    fn disk_available_identity(&self, disk_id: &str) -> Result<()> {
+        if self
+            .records
+            .values()
+            .any(|r| !r.released && r.start.workspace_disk_id == disk_id)
+        {
+            return Err(Error("workspace disk still held by a VM".into()));
+        }
+        Ok(())
     }
 
     fn status(&self, id: &str) -> Result<Response> {

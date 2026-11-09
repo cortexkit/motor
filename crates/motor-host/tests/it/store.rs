@@ -85,6 +85,7 @@ fn full() -> Snapshot {
     s.per_job.disks.insert(
         "ws-test".into(),
         motor_host::state::jobs::WorkspaceDisk {
+            storage: Some(motor_host::state::jobs::storage::Disk::new(1024, 123)),
             sub: claims(JOB).sub,
             workspace_key_hash: claims(JOB).workspace_key_hash.unwrap(),
             queue: vec![JOB.into()],
@@ -104,6 +105,11 @@ fn full() -> Snapshot {
     s.per_job.executions.insert(
         JOB.into(),
         motor_host::state::jobs::Execution {
+            final_replay_reservation_bytes: None,
+            replay_completion: Some(motor_host::state::jobs::storage::ReplayCompletion::Terminal),
+            replay_reservation_bytes: Some(
+                motor_host::state::jobs::storage::REPLAY_RESERVATION_BYTES,
+            ),
             evidence: Some(motor_host::state::settlement::Evidence {
                 winner: Some(motor_host::state::settlement::Winner::HostStop),
                 stop: Some(motor_host::state::settlement::Stop {

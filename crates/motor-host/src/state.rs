@@ -230,6 +230,7 @@ pub struct Host {
     pub(crate) broker_heartbeat_at_ms: Option<u64>,
     pub(crate) lost_checks: BTreeMap<String, crate::billing::LostCheck>,
     host_resources: Option<jobs::HostResources>,
+    job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
 }
 impl Host {
     pub(crate) fn journal_directory(&self) -> Option<std::path::PathBuf> {
@@ -261,6 +262,7 @@ impl Host {
             broker_heartbeat_at_ms: None,
             lost_checks: BTreeMap::new(),
             host_resources: None,
+            job_storage: None,
         }
     }
     /// Replaces the journal, so tests can make writes fail the way a full

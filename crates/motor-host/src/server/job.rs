@@ -101,7 +101,7 @@ impl Runtime {
                 return Ok(());
             }
             let mut host = self.host.lock().expect("host lock");
-            host.job_stopped(job, unclean)?;
+            host.job_stopped_at(job, unclean, unix_ms())?;
         }
         self.job_resources.release(job)
     }
@@ -121,6 +121,13 @@ impl Runtime {
         for execution in executions {
             let job = &execution.claims.jti;
             if execution.ended {
+                if execution.final_replay_reservation_bytes.is_some() {
+                    if let Ok(stream) = self.job_stream(job) {
+                        if let Err(error) = stream::publish_settlement(self, job, &stream) {
+                            tracing::warn!(jti = job, %error, "job_final_replay_unavailable");
+                        }
+                    }
+                }
                 self.job_resources.release(job)?;
                 continue;
             }
@@ -348,7 +355,7 @@ impl Runtime {
                     self.host
                         .lock()
                         .expect("host lock")
-                        .job_stopped(job, true)?;
+                        .job_stopped_at(job, true, now_ms)?;
                 }
             }
         }
@@ -436,7 +443,7 @@ impl Runtime {
                 .as_ref()
                 .and_then(|e| e.unclean_stop)
                 .unwrap_or(true);
-            host.job_stopped(&report.job_id, unclean)?;
+            host.job_stopped_at(&report.job_id, unclean, unix_ms())?;
         }
         self.job_resources.release(&report.job_id)
     }
@@ -667,7 +674,21 @@ async fn boot(
     let launch = runtime.launch_phase(&execution.claims.jti, false)?;
     let r = runtime.clone();
     tokio::task::spawn_blocking(move || {
-        let result = resources.prepare(&e);
+        let result = (|| -> Result<()> {
+            let cap = r.host.lock().expect("host lock").snapshot.per_job.disks[&e.disk_id]
+                .storage
+                .as_ref()
+                .context("workspace cap missing")?
+                .cap_bytes;
+            if let Err(error) = r.control.ensure_workspace(&e.claims.sub, &e.disk_id, cap) {
+                r.host
+                    .lock()
+                    .expect("host lock")
+                    .quarantine_workspace(&e.claims.jti)?;
+                return Err(error);
+            }
+            resources.prepare(&e)
+        })();
         launch.in_flight.store(false, Ordering::SeqCst);
         if launch.cancelled.load(Ordering::SeqCst) {
             r.stop_job(&e.claims.jti, true, false)?;

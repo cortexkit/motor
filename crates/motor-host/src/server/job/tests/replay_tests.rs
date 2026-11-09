@@ -66,6 +66,10 @@ async fn ack(runtime: &Arc<Runtime>, guest: &mut tokio::net::UnixStream) {
     let store = runtime.job_stream(JOB).unwrap();
     assert!(store.with_store(|s| Ok(s.ended())).unwrap());
     assert_eq!(
+        runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].replay_completion,
+        Some(crate::state::jobs::storage::ReplayCompletion::Terminal)
+    );
+    assert_eq!(
         runtime.host.lock().unwrap().snapshot.leases[JOB].highest_seq,
         4
     );
@@ -138,6 +142,97 @@ fn usage(runtime: &Arc<Runtime>) -> Vec<u8> {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn restart_releases_final_record_hold_when_terminal_already_committed() {
+    use crate::state::jobs::storage::{ReplayCompletion, REPLAY_RECORD_BYTES};
+    let (runtime, fake, storage) = fixture();
+    let c = claims(JOB);
+    claim(&runtime, &c);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .job_stopped(JOB, false)
+        .unwrap();
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.per_job.executions[JOB]
+            .final_replay_reservation_bytes,
+        Some(REPLAY_RECORD_BYTES)
+    );
+    // Reproduce a crash after the file commit but before the host state save.
+    let mut store = crate::replay::Store::open(storage.root.path(), JOB).unwrap();
+    store.append(records().last().unwrap()).unwrap();
+    drop(store);
+    let restarted = reopen(&runtime, fake, storage.clone());
+    restarted.recover().unwrap();
+    let execution = &restarted.host.lock().unwrap().snapshot.per_job.executions[JOB];
+    assert_eq!(execution.final_replay_reservation_bytes, None);
+    assert_eq!(
+        execution.replay_completion,
+        Some(ReplayCompletion::Terminal)
+    );
+    let (_, saved) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+    assert_eq!(
+        saved.per_job.executions[JOB].final_replay_reservation_bytes,
+        None
+    );
+}
+
+#[test]
+fn replay_quarantine_releases_final_hold_and_survives_restart() {
+    use crate::state::jobs::storage::{ReplayCompletion, REPLAY_RECORD_BYTES};
+    let (runtime, fake, storage) = fixture();
+    claim(&runtime, &claims(JOB));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .job_stopped(JOB, false)
+        .unwrap();
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.per_job.executions[JOB]
+            .final_replay_reservation_bytes,
+        Some(REPLAY_RECORD_BYTES)
+    );
+    let mut store = crate::replay::Store::open(storage.root.path(), JOB).unwrap();
+    store.append(&records()[1]).unwrap();
+    drop(store);
+    let index = storage
+        .root
+        .path()
+        .join("replay")
+        .join(JOB)
+        .join("index.json");
+    std::fs::write(&index, b"damaged index").unwrap();
+    let restarted = reopen(&runtime, fake.clone(), storage.clone());
+    restarted.recover().unwrap();
+    assert_eq!(
+        restarted.host.lock().unwrap().snapshot.per_job.executions[JOB]
+            .final_replay_reservation_bytes,
+        None
+    );
+    assert_eq!(
+        restarted.host.lock().unwrap().snapshot.per_job.executions[JOB].replay_completion,
+        Some(ReplayCompletion::Quarantined)
+    );
+    // Replacing the damaged file cannot resurrect a quarantined writer.
+    std::fs::write(
+        index,
+        br#"{"version":1,"entries":[],"last_seq":null,"terminal":false}"#,
+    )
+    .unwrap();
+    let again = reopen(&restarted, fake, storage);
+    assert!(again
+        .job_stream(JOB)
+        .unwrap()
+        .with_store(|_| Ok(()))
+        .is_err());
+    assert_eq!(
+        again.host.lock().unwrap().snapshot.per_job.executions[JOB].final_replay_reservation_bytes,
+        None
+    );
 }
 
 #[tokio::test]

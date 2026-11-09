@@ -1,5 +1,83 @@
 use super::*;
 use std::{ffi::CString, io::Write};
+mod usage;
+pub(super) use usage::exclusive_bytes;
+
+pub(super) fn open_disk(root: &Path, account: &str, disk_id: &str) -> Result<(Workspace, File)> {
+    job::validate_account(account)?;
+    job::validate_id(disk_id)?;
+    for ancestor in root.ancestors() {
+        fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
+    }
+    let root = File::open(root)?;
+    let directory = fs::beneath(
+        root.as_raw_fd(),
+        disk_id,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )?;
+    let meta = directory.metadata()?;
+    if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        return Err(Error("insecure workspace directory".into()));
+    }
+    let registry = fs::beneath(directory.as_raw_fd(), "registry.json", libc::O_RDONLY, 0)?;
+    let meta = registry.metadata()?;
+    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        return Err(Error("insecure workspace registry".into()));
+    }
+    let registry: Workspace =
+        serde_json::from_reader(registry).map_err(|e| Error(e.to_string()))?;
+    if registry.account != account || registry.workspace_disk_id != disk_id {
+        return Err(Error("workspace identity mismatch".into()));
+    }
+    let disk = fs::beneath(
+        directory.as_raw_fd(),
+        "workspace.img",
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )?;
+    if !disk.metadata()?.is_file() {
+        return Err(Error("workspace disk must be regular".into()));
+    }
+    Ok((registry, disk))
+}
+
+pub(super) fn ensure(root: &Path, request: job::CreateWorkspace) -> Result<()> {
+    if root.join(&request.workspace_disk_id).try_exists()? {
+        let (registry, disk) = open_disk(root, &request.account, &request.workspace_disk_id)?;
+        if registry.role != job::WorkspaceRole::Job
+            || disk.metadata()?.uid() != 0
+            || disk.metadata()?.len() != request.size_bytes
+        {
+            return Err(Error(
+                "workspace role, owner or size mismatch; quarantine required".into(),
+            ));
+        }
+        return Ok(());
+    }
+    create(root, request, job::WorkspaceRole::Job)
+}
+
+pub(super) fn base_lease(
+    root: &Path,
+    account: &str,
+    disk_id: &str,
+    exclusive: bool,
+) -> Result<File> {
+    let (registry, disk) = open_disk(root, account, disk_id)?;
+    if registry.role != job::WorkspaceRole::Base || disk.metadata()?.uid() != 0 {
+        return Err(Error("base lease requires a root-owned base".into()));
+    }
+    let mode = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if unsafe { libc::flock(disk.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
+        return Err(Error("base is held by a seed or clone".into()));
+    }
+    Ok(disk)
+}
 
 // Only helper-created trash names are visited. A synced rename is the deletion
 // decision; startup can finish removing its contents without opening guest data.
@@ -23,6 +101,15 @@ pub(super) fn finish_deletions(root: &Path) -> Result<()> {
 }
 
 pub(super) fn delete(root: &Path, account: &str, disk_id: &str) -> Result<()> {
+    delete_role(root, account, disk_id, job::WorkspaceRole::Job)
+}
+
+pub(super) fn delete_role(
+    root: &Path,
+    account: &str,
+    disk_id: &str,
+    role: job::WorkspaceRole,
+) -> Result<()> {
     job::validate_account(account)?;
     job::validate_id(disk_id)?;
     trusted_directory(root)?;
@@ -35,7 +122,7 @@ pub(super) fn delete(root: &Path, account: &str, disk_id: &str) -> Result<()> {
                 .map_err(|e| Error(e.to_string()))?;
         if registry.account != account
             || registry.workspace_disk_id != disk_id
-            || registry.role != job::WorkspaceRole::Job
+            || registry.role != role
         {
             return Err(Error("workspace deletion identity or role mismatch".into()));
         }
@@ -154,7 +241,13 @@ mod tests {
         let mut partial = request();
         partial.workspace_disk_id = "disk-2".into();
         assert!(create(&root, partial, job::WorkspaceRole::Job).is_err());
-        let jobs = super::super::tests::machine(&base);
+        let mut jobs = super::super::tests::machine(&base);
+        jobs.settings = Some(JobVms {
+            uid_base: 500000,
+            uid_count: 1,
+            memory_max_bytes: 1048576,
+            workspace_disk_max_bytes: Some(4096),
+        });
         let mut host = request();
         host.workspace_disk_id = "disk-3".into();
         jobs.create_workspace(host).unwrap();
@@ -174,6 +267,12 @@ mod tests {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         let base = super::super::tests::scratch();
         let mut jobs = super::super::tests::machine(&base);
+        jobs.settings = Some(JobVms {
+            uid_base: 500000,
+            uid_count: 1,
+            memory_max_bytes: 1048576,
+            workspace_disk_max_bytes: Some(4096),
+        });
         let root = jobs.workspaces.clone();
         let mut record = super::super::tests::record();
         record.start.kind = job::VmKind::Recovery;
@@ -213,6 +312,137 @@ mod tests {
         create(&root, request(), job::WorkspaceRole::Job).unwrap();
         delete(&root, &account, &disk_id).unwrap();
         delete(&root, &account, &disk_id).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn isolated_workspace_ensure_enforces_helper_cap_exact_size_and_identity() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let base = super::super::tests::scratch();
+        let mut jobs = super::super::tests::machine(&base);
+        jobs.settings = Some(JobVms {
+            uid_base: 500000,
+            uid_count: 1,
+            memory_max_bytes: 1048576,
+            workspace_disk_max_bytes: Some(8192),
+        });
+        let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let op = |size_bytes| Operation::EnsureWorkspace {
+            account: account.into(),
+            disk_id: "disk-1".into(),
+            size_bytes,
+        };
+        let peer = Peer { uid: 0, gid: 0 };
+        assert!(jobs.handle(op(12288), peer).is_err());
+        assert!(!jobs.workspaces.join("disk-1").exists());
+        jobs.handle(op(8192), peer).unwrap();
+        let disk = jobs.workspaces.join("disk-1/workspace.img");
+        let before = std::fs::metadata(&disk).unwrap();
+        assert_eq!(before.len(), 8192);
+        assert_eq!(before.blocks(), 0);
+        jobs.handle(op(8192), peer).unwrap();
+        assert_eq!(std::fs::metadata(&disk).unwrap().ino(), before.ino());
+        assert!(jobs.handle(op(4096), peer).is_err());
+        assert_eq!(std::fs::metadata(&disk).unwrap().len(), 8192);
+        assert!(jobs
+            .handle(
+                Operation::EnsureWorkspace {
+                    account: "other".into(),
+                    disk_id: "disk-1".into(),
+                    size_bytes: 8192
+                },
+                peer
+            )
+            .is_err());
+        let reply = jobs
+            .handle(
+                Operation::WorkspaceUsage {
+                    account: account.into(),
+                    disk_id: "disk-1".into(),
+                },
+                peer,
+            )
+            .unwrap();
+        assert!(matches!(
+            reply.reply,
+            Reply::WorkspaceUsage {
+                exclusive_bytes: Some(0)
+            }
+        ));
+        for (owner, id) in [(account, "missing"), ("other", "disk-1")] {
+            let reply = jobs
+                .handle(
+                    Operation::WorkspaceUsage {
+                        account: owner.into(),
+                        disk_id: id.into(),
+                    },
+                    peer,
+                )
+                .unwrap();
+            assert!(matches!(
+                reply.reply,
+                Reply::WorkspaceUsage {
+                    exclusive_bytes: None
+                }
+            ));
+        }
+        std::fs::remove_file(&disk).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &disk).unwrap();
+        let reply = jobs
+            .handle(
+                Operation::WorkspaceUsage {
+                    account: account.into(),
+                    disk_id: "disk-1".into(),
+                },
+                peer,
+            )
+            .unwrap();
+        assert!(matches!(
+            reply.reply,
+            Reply::WorkspaceUsage {
+                exclusive_bytes: None
+            }
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn isolated_base_eviction_refuses_vm_seed_clone_job_and_fill_holders() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let base = super::super::tests::scratch();
+        let mut jobs = super::super::tests::machine(&base);
+        let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let peer = Peer { uid: 0, gid: 0 };
+        let op = || Operation::EvictBase {
+            account: account.into(),
+            disk_id: "disk-1".into(),
+        };
+        let request = || job::CreateWorkspace {
+            account: account.into(),
+            workspace_disk_id: "disk-1".into(),
+            size_bytes: 8192,
+        };
+        for role in [job::WorkspaceRole::Job, job::WorkspaceRole::Fill] {
+            create(&jobs.workspaces, request(), role).unwrap();
+            assert!(jobs.handle(op(), peer).is_err());
+            std::fs::remove_dir_all(jobs.workspaces.join("disk-1")).unwrap();
+        }
+        create(&jobs.workspaces, request(), job::WorkspaceRole::Base).unwrap();
+        let seed = jobs.lease_base(account, "disk-1").unwrap();
+        let clone = jobs.lease_base(account, "disk-1").unwrap();
+        assert!(jobs.handle(op(), peer).is_err());
+        drop(seed);
+        assert!(jobs.handle(op(), peer).is_err());
+        drop(clone);
+        let mut record = super::super::tests::record();
+        record.start.workspace_disk_id = "disk-1".into();
+        record.start.kind = job::VmKind::BaseBuild;
+        jobs.records.insert(record.start.job_id.clone(), record);
+        assert!(jobs.handle(op(), peer).is_err());
+        jobs.records.clear();
+        jobs.handle(op(), peer).unwrap();
+        jobs.handle(op(), peer).unwrap();
+        assert!(!jobs.workspaces.join("disk-1").exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 }

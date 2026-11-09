@@ -73,6 +73,19 @@ pub enum Request {
         account: String,
         disk_id: String,
     },
+    EvictBase {
+        account: String,
+        disk_id: String,
+    },
+    WorkspaceUsage {
+        account: String,
+        disk_id: String,
+    },
+    EnsureWorkspace {
+        account: String,
+        disk_id: String,
+        size_bytes: u64,
+    },
     AckJobExit {
         job_id: String,
         oom_kill: u64,
@@ -213,6 +226,9 @@ pub enum SlotView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Reply {
+    WorkspaceUsage {
+        exclusive_bytes: Option<u64>,
+    },
     JobMemory {
         resident_bytes: u64,
     },
@@ -399,6 +415,24 @@ impl<M: Machine> Helper<M> {
             Request::DeleteWorkspace { account, disk_id } => {
                 self.job(job::Operation::DeleteWorkspace { account, disk_id }, peer)
             }
+            Request::EvictBase { account, disk_id } => {
+                self.job(job::Operation::EvictBase { account, disk_id }, peer)
+            }
+            Request::WorkspaceUsage { account, disk_id } => {
+                self.job(job::Operation::WorkspaceUsage { account, disk_id }, peer)
+            }
+            Request::EnsureWorkspace {
+                account,
+                disk_id,
+                size_bytes,
+            } => self.job(
+                job::Operation::EnsureWorkspace {
+                    account,
+                    disk_id,
+                    size_bytes,
+                },
+                peer,
+            ),
             Request::AckJobExit {
                 job_id,
                 oom_kill,

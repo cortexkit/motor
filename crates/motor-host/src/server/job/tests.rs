@@ -59,6 +59,8 @@ fn run(job: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    fail_ensure: AtomicBool,
+    ensured_caps: Mutex<Vec<u64>>,
     calls: Mutex<Vec<String>>,
     inputs: Arc<Mutex<Vec<Vec<u8>>>>,
     gate: (Mutex<bool>, Condvar),
@@ -92,6 +94,14 @@ impl Fake {
     }
 }
 impl Control for Fake {
+    fn ensure_workspace(&self, _: &str, _: &str, cap: u64) -> Result<()> {
+        self.ensured_caps.lock().unwrap().push(cap);
+        ensure!(
+            !self.fail_ensure.load(Ordering::SeqCst),
+            "workspace size mismatch"
+        );
+        Ok(())
+    }
     fn job_memory(&self, job: &str) -> Result<u64> {
         ensure!(
             self.balloon_supported.load(Ordering::Acquire),
@@ -508,6 +518,10 @@ async fn hung_boot_and_runner_start_time_out_without_delivery_and_release_all() 
         assert!(!host.snapshot.leases[JOB].delivered);
         assert!(host.snapshot.zero_usage.contains_key(JOB));
         assert!(host.snapshot.per_job.executions[JOB].ended);
+        assert_eq!(
+            host.snapshot.per_job.executions[JOB].replay_reservation_bytes,
+            None
+        );
         drop(host);
         assert!(storage.held.lock().unwrap().is_empty());
         assert!(!storage.spool(JOB).exists());
@@ -516,6 +530,35 @@ async fn hung_boot_and_runner_start_time_out_without_delivery_and_release_all() 
         later.workspace_key_hash = Some(motor_lease::base64url(&[6; 32]));
         claim(&runtime, &later);
     }
+}
+
+#[tokio::test]
+async fn workspace_size_mismatch_is_quarantined_before_vm_start() {
+    let (runtime, fake, storage) = fixture();
+    fake.fail_ensure.store(true, Ordering::SeqCst);
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    queued(&mut client, JOB).await;
+    next_type(&mut client, "lease_refused").await;
+    task.await.unwrap().unwrap();
+    let mut host = runtime.host.lock().unwrap();
+    let execution = &host.snapshot.per_job.executions[JOB];
+    let disk = &host.snapshot.per_job.disks[&execution.disk_id];
+    assert!(execution.ended);
+    assert_eq!(execution.replay_reservation_bytes, None);
+    assert!(disk.quarantined);
+    assert_eq!(
+        *fake.ensured_caps.lock().unwrap(),
+        [disk.storage.as_ref().unwrap().cap_bytes]
+    );
+    assert!(!host.snapshot.leases[JOB].delivered);
+    assert!(matches!(
+        host.claim(claims(JOB2), unix_ms()),
+        Err(Error::Refused(Refusal::HostFull))
+    ));
+    assert!(fake.calls.lock().unwrap().is_empty());
+    assert!(!storage.spool(JOB).exists());
 }
 
 #[tokio::test]

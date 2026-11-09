@@ -69,6 +69,7 @@ fn isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse(
     let base = scratch();
     let mut jobs = machine(&base);
     jobs.settings = Some(JobVms {
+        workspace_disk_max_bytes: Some(1073741824),
         uid_base: 600001,
         uid_count: 1,
         memory_max_bytes: 1048576,
@@ -341,6 +342,7 @@ fn attached_disk_is_refused_by_identity_and_inode_until_released() {
     let base = scratch();
     let mut jobs = machine(&base);
     jobs.settings = Some(JobVms {
+        workspace_disk_max_bytes: Some(1073741824),
         uid_base: 500000,
         uid_count: 1,
         memory_max_bytes: 1048576,
@@ -558,6 +560,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         jobs.remove_test_group = None;
         jobs.groups = SLICE.into();
         jobs.settings = Some(JobVms {
+            workspace_disk_max_bytes: Some(1073741824),
             uid_base: 600000,
             uid_count: 254,
             memory_max_bytes: 268435456,
@@ -806,6 +809,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     restarted.groups = SLICE.into();
     restarted.remove_test_group = None;
     restarted.settings = Some(JobVms {
+        workspace_disk_max_bytes: Some(1073741824),
         uid_base: 600000,
         uid_count: 254,
         memory_max_bytes: 268435456,
