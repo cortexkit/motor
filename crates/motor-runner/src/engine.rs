@@ -3692,7 +3692,7 @@ impl Runner {
         };
         crate::fill_source::export(
             &self.core.trees,
-            &request.repository_root,
+            paths::request(&request).caller_repository_root.text(),
             &request.integration_tip,
             directory,
             cap,
@@ -3706,11 +3706,11 @@ impl Runner {
         directory: &Path,
     ) -> io::Result<Option<Uuid>> {
         crate::fill_source::require_fill_boot()?;
-        self.validate_writer_paths(paths::host_str(&source.repository_root), None, &[])?;
+        self.validate_writer_paths(paths::fill_source(source).host, None, &[])?;
         crate::fill_source::import(&self.core.trees, source, directory)?;
         tracing::info!(
             tip = source.integration_tip,
-            repository_key = workspace::name(&source.repository_root),
+            repository_key = workspace::name(paths::fill_source(source).caller.text()),
             dependencies = source.git_dependencies.len(),
             "fill_source_imported"
         );
@@ -3719,17 +3719,13 @@ impl Runner {
 
     #[cfg(target_os = "linux")]
     fn queue_imported_fill(&self, source: &motor_protocol::FillSource) -> io::Result<Option<Uuid>> {
-        let plan = self.base_plan(&source.repository_root, &source.integration_tip, true);
+        let repository = paths::fill_source(source).caller;
+        let plan = self.base_plan(repository.text(), &source.integration_tip, true);
         let mut inner = self.core.inner.lock().unwrap();
         if !self.warm_builds_enabled(&source.integration_tip) {
             return Err(invalid("fill writer unavailable"));
         }
-        self.queue_base_planned(
-            &mut inner,
-            &source.repository_root,
-            &source.repository_root,
-            plan,
-        )?;
+        self.queue_base_planned(&mut inner, repository.text(), repository.text(), plan)?;
         let id = inner
             .jobs
             .values()
@@ -3739,14 +3735,14 @@ impl Runner {
                     && job
                         .request
                         .as_ref()
-                        .is_some_and(|r| r.repository_root == source.repository_root)
+                        .is_some_and(|r| paths::request(r).caller_repository_root == repository)
             })
             .map(|job| job.id);
         if id.is_none()
             && inner
                 .catalog
                 .repositories
-                .get(&source.repository_root)
+                .get(repository.text())
                 .is_none_or(|repo| repo.result != Some(RebuildResult::Ok))
         {
             return Err(invalid("fill was not queued"));

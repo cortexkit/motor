@@ -46,16 +46,17 @@ pub(crate) fn run_refusal_for_boot(
 
 pub(crate) fn import(trees: &Trees, source: &FillSource, directory: &Path) -> io::Result<()> {
     source.validate(FILL_SOURCE_MAX_BYTES)?;
+    let repository = crate::caller_path::fill_source(source).caller.text();
     verify_files(source, directory)?;
     trees.fetch_fill(
         directory,
         &source.bundles[0],
-        &source.repository_root,
+        repository,
         &source.integration_tip,
     )?;
-    refuse_replacements(&trees.mirror(&source.repository_root))?;
+    refuse_replacements(&trees.mirror(repository))?;
     let expected: std::collections::BTreeSet<_> =
-        crate::writer::fill::locked_git(trees, &source.repository_root, &source.integration_tip)?
+        crate::writer::fill::locked_git(trees, repository, &source.integration_tip)?
             .into_iter()
             .flat_map(|dependency| {
                 dependency
@@ -83,7 +84,7 @@ pub(crate) fn import(trees: &Trees, source: &FillSource, directory: &Path) -> io
         refuse_replacements(&trees.dependency_mirror(&dependency.url))?;
     }
     trees.pin(
-        &source.repository_root,
+        repository,
         &source.integration_tip,
         &source.integration_tip,
         &[],
@@ -112,14 +113,19 @@ pub(crate) fn pins(
         format!("refs/tips/{}", source.integration_tip),
     ] {
         let commit = workspace::git(
-            &trees.mirror(&source.repository_root),
+            &trees.mirror(crate::caller_path::fill_source(source).caller.text()),
             &["rev-parse", &format!("{reference}^{{commit}}")],
         )?;
         if commit != source.integration_tip {
             return Err(invalid("fill pin changed after import"));
         }
         pins.push(motor_protocol::MirrorRef {
-            repository: Some(source.repository_root.clone()),
+            repository: Some(
+                crate::caller_path::fill_source(source)
+                    .caller
+                    .text()
+                    .clone(),
+            ),
             dependency: None,
             reference,
             commit,
@@ -392,7 +398,9 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     // Wait for publication and ownership repair to finish before
                     // reporting success and allowing this VM to power off.
-                    if !runner.fill_settled(id, &source.repository_root)? {
+                    if !runner
+                        .fill_settled(id, crate::caller_path::fill_source(&source).caller.text())?
+                    {
                         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                         continue;
                     }
@@ -400,7 +408,9 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
                         .config()
                         .state_dir()
                         .join("build-bases")
-                        .join(workspace::name(&source.repository_root))
+                        .join(workspace::name(
+                            crate::caller_path::fill_source(&source).caller.text(),
+                        ))
                         .join("current/base.json");
                     tracing::info!(
                         tip = source.integration_tip,
@@ -415,7 +425,10 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
                     };
                     let mut reply =
                         serde_json::json!({"ok":true,"base_published":base.is_file(),"have":have});
-                    if let Some(samples) = runner.fill_write_samples(id, &source.repository_root) {
+                    if let Some(samples) = runner.fill_write_samples(
+                        id,
+                        crate::caller_path::fill_source(&source).caller.text(),
+                    ) {
                         reply["cache_write_keys"] = serde_json::json!(samples);
                     }
                     crate::tenant_agent::write_json(socket, &reply).await?;

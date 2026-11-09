@@ -297,6 +297,13 @@ pub(crate) fn drop_request(request: &motor_protocol::DropRequest) -> PathPlan<'_
     identity(&request.workspace_key)
 }
 
+/// The default-branch checkout a fill source was exported from. Fill VMs keep
+/// it at the caller's own path, like any mirror key.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn fill_source(source: &motor_protocol::FillSource) -> PathPlan<'_> {
+    identity(&source.repository_root)
+}
+
 pub(crate) fn job_key(job: &Job) -> &str {
     match job.request.as_ref() {
         Some(request) => match run(request).workspace {
