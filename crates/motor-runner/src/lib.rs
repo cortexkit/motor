@@ -23,6 +23,13 @@ mod engine;
 mod filesystem;
 #[cfg(target_os = "linux")]
 mod isolation;
+
+/// Image publication tests use the same access-control-list predicate as per-job guest startup.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn image_source_tree_already_readable(root: &std::path::Path, uid: u32, inherit: bool) -> bool {
+    crate::isolation::readable::already_readable(root, uid, inherit)
+}
 mod javascript;
 pub mod local_transport;
 #[cfg(unix)]

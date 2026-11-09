@@ -5,6 +5,8 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::PathBuf;
 
+pub mod images;
+
 pub const SPOOL_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]

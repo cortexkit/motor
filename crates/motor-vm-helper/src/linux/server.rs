@@ -154,7 +154,37 @@ fn connection_loop<M: crate::Machine>(
         }
         let result = serde_json::from_slice::<Request>(&line)
             .map_err(|e| Error(e.to_string()))
-            .and_then(|request| helper.lock().unwrap().handle(id, request));
+            .and_then(|request| {
+                // Image copies must not hold the helper mutex: admission probes
+                // and stops must remain responsive during a publication.
+                let op = match request {
+                    Request::RemoveJobImages { generation } => {
+                        let response = helper.lock().unwrap().handle(
+                            id,
+                            Request::RemoveJobImages {
+                                generation: generation.clone(),
+                            },
+                        )?;
+                        // The helper fenced starts by renaming the generation
+                        // under its mutex. Unlinking large files happens here.
+                        super::images::finish_remove(&generation)?;
+                        return Ok(response);
+                    }
+                    Request::PublishJobImages { generation } => {
+                        crate::images::Operation::Publish(generation)
+                    }
+                    Request::PrepareJobImages {
+                        generation,
+                        account,
+                    } => crate::images::Operation::Prepare {
+                        generation,
+                        account,
+                    },
+                    request => return helper.lock().unwrap().handle(id, request),
+                };
+                helper.lock().unwrap().authorize_image_work(id, &op)?;
+                super::images::handle(op)
+            });
         let response = match result {
             Ok(r) => r,
             Err(e) => {

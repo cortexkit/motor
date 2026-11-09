@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, fmt, os::fd::OwnedFd};
 use uuid::Uuid;
 
 pub mod config;
+pub mod images;
 pub mod job;
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -40,6 +41,19 @@ pub enum Kind {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    InspectJobImages {
+        generation: String,
+    },
+    PublishJobImages {
+        generation: String,
+    },
+    PrepareJobImages {
+        generation: String,
+        account: String,
+    },
+    RemoveJobImages {
+        generation: String,
+    },
     StartJob {
         #[serde(default)]
         kind: job::VmKind,
@@ -226,6 +240,9 @@ pub enum SlotView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Reply {
+    JobImages {
+        manifest: images::Manifest,
+    },
     WorkspaceUsage {
         exclusive_bytes: Option<u64>,
     },
@@ -297,6 +314,9 @@ impl Response {
 /// Cleanup must include all slot-uid processes, mounts, chroots and cgroups.
 /// A failed cleanup is never evidence that the slot is free.
 pub trait Machine {
+    fn images(&mut self, _op: images::Operation) -> Result<Response> {
+        Err(Error("job images are not configured".into()))
+    }
     fn reconcile(&mut self) -> Result<()>;
     fn start(&mut self, slot: usize, lease: &Lease, kind: Kind) -> Result<Vec<OwnedFd>>;
     fn stop(&mut self, slot: usize, lease: &Lease, export: bool) -> Result<()>;
@@ -371,6 +391,17 @@ impl<M: Machine> Helper<M> {
             _ => Err(Error("lease identity or connection does not match".into())),
         }
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn authorize_image_work(
+        &self,
+        connection: u64,
+        op: &images::Operation,
+    ) -> Result<()> {
+        if self.stopping || !self.connections.contains_key(&connection) {
+            return Err(Error("connection is not authorised for image work".into()));
+        }
+        op.validate()
+    }
     pub fn handle(&mut self, connection: u64, request: Request) -> Result<Response> {
         let peer = *self
             .connections
@@ -380,6 +411,22 @@ impl<M: Machine> Helper<M> {
             return Err(Error("helper is stopping".into()));
         }
         match request {
+            Request::InspectJobImages { generation } => {
+                self.machine.images(images::Operation::Inspect(generation))
+            }
+            Request::PublishJobImages { generation } => {
+                self.machine.images(images::Operation::Publish(generation))
+            }
+            Request::PrepareJobImages {
+                generation,
+                account,
+            } => self.machine.images(images::Operation::Prepare {
+                generation,
+                account,
+            }),
+            Request::RemoveJobImages { generation } => {
+                self.machine.images(images::Operation::Remove(generation))
+            }
             Request::StartJob {
                 kind,
                 job_id,

@@ -341,6 +341,7 @@ fn write_job_ledger(
     )?;
     diff_job_entries(tx, "disk", &old.disks, &new.disks)?;
     diff_job_entries(tx, "base", &old.bases, &new.bases)?;
+    diff_job_entries(tx, "image", &old.images, &new.images)?;
     diff_job_entries(tx, "execution", &old.executions, &new.executions)
 }
 
@@ -383,6 +384,7 @@ fn load_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
             match kind.as_str() {
                 "disk" => drop(snapshot.per_job.disks.insert(key, from_json(&value)?)),
                 "base" => drop(snapshot.per_job.bases.insert(key, from_json(&value)?)),
+                "image" => drop(snapshot.per_job.images.insert(key, from_json(&value)?)),
                 "execution" => drop(snapshot.per_job.executions.insert(key, from_json(&value)?)),
                 _ => return Err(unknown("job VM entry kind", &kind)),
             }
@@ -449,6 +451,15 @@ mod rollback_tests {
         snapshot.counter = 17;
         journal.store(&snapshot).unwrap();
         let legacy = snapshot.clone();
+        snapshot.per_job.images.insert("gen-rollback".into(), serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "kernel": {"bytes":4096,"sha256":"a".repeat(64)},
+                "rootfs": {"bytes":4096,"sha256":"b".repeat(64)},
+                "toolchain": {"bytes":8192,"sha256":"c".repeat(64)},
+                "hello":{}, "guest_init":{}
+            },
+            "current":true, "accounts":{"account":false}, "recovery_holders":{"recovery":"account"}
+        })).unwrap());
         snapshot.per_job.disks.insert(
             "ws-rollback".into(),
             crate::state::jobs::WorkspaceDisk {
@@ -580,6 +591,7 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     snapshot.per_job.executions.insert(
         job.into(),
         crate::state::jobs::Execution {
+            image_generation: Some("gen-rollback".into()),
             replay_reservation_bytes: Some(crate::state::jobs::storage::REPLAY_RESERVATION_BYTES),
             final_replay_reservation_bytes: Some(crate::state::jobs::storage::REPLAY_RECORD_BYTES),
             replay_completion: None,

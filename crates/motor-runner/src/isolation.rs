@@ -29,7 +29,7 @@ mod javascript_tools;
 pub(crate) use javascript_tools::ToolchainRole;
 pub(crate) use javascript_tools::{JavascriptTools, JOB_BUN_DIR};
 pub(crate) mod pid_init;
-mod readable;
+pub(crate) mod readable;
 
 const USER: &str = "motor-job";
 pub(crate) const WRITER_USER: &str = "motor-cache";

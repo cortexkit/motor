@@ -105,6 +105,7 @@ fn full() -> Snapshot {
     s.per_job.executions.insert(
         JOB.into(),
         motor_host::state::jobs::Execution {
+            image_generation: None,
             final_replay_reservation_bytes: None,
             replay_completion: Some(motor_host::state::jobs::storage::ReplayCompletion::Terminal),
             replay_reservation_bytes: Some(

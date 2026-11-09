@@ -11,6 +11,18 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    fn inspect_job_images(&self, _generation: &str) -> Result<motor_vm_helper::images::Manifest> {
+        anyhow::bail!("image publication unavailable")
+    }
+    fn publish_job_images(&self, _generation: &str) -> Result<()> {
+        anyhow::bail!("image publication unavailable")
+    }
+    fn prepare_job_images(&self, _generation: &str, _account: &str) -> Result<()> {
+        anyhow::bail!("account images unavailable")
+    }
+    fn remove_job_images(&self, _generation: &str) -> Result<()> {
+        anyhow::bail!("image GC unavailable")
+    }
     /// Exclusive extents only; unavailable measurements must not become zero.
     fn workspace_usage(&self, _account: &str, _disk_id: &str) -> Result<Option<u64>> {
         Ok(None)
@@ -233,7 +245,9 @@ const ORDINARY_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 const SNAPSHOT_HELPER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn helper_reply_deadline(request: &Value) -> Duration {
-    if request["op"] == "suspend" || request["op"] == "stop_tenant" {
+    if request["op"] == "publish_job_images" || request["op"] == "prepare_job_images" {
+        Duration::from_secs(3600)
+    } else if request["op"] == "suspend" || request["op"] == "stop_tenant" {
         SNAPSHOT_HELPER_REPLY_TIMEOUT
     } else {
         ORDINARY_HELPER_TIMEOUT
@@ -286,6 +300,31 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn inspect_job_images(&self, generation: &str) -> Result<motor_vm_helper::images::Manifest> {
+        let (reply, _) =
+            self.request(json!({"op":"inspect_job_images", "generation":generation}))?;
+        ensure!(reply["result"] == "job_images", "image inspection refused");
+        Ok(serde_json::from_value(reply["manifest"].clone())?)
+    }
+    fn publish_job_images(&self, generation: &str) -> Result<()> {
+        let (reply, _) =
+            self.request(json!({"op":"publish_job_images", "generation":generation}))?;
+        ensure!(reply["result"] == "ok", "image publication refused");
+        Ok(())
+    }
+    fn prepare_job_images(&self, generation: &str, account: &str) -> Result<()> {
+        let (reply, _) = self.request(
+            json!({"op":"prepare_job_images", "generation":generation, "account":account}),
+        )?;
+        ensure!(reply["result"] == "ok", "account image refused");
+        Ok(())
+    }
+    fn remove_job_images(&self, generation: &str) -> Result<()> {
+        let (reply, _) =
+            self.request(json!({"op":"remove_job_images", "generation":generation}))?;
+        ensure!(reply["result"] == "ok", "image removal refused");
+        Ok(())
+    }
     fn workspace_usage(&self, account: &str, disk_id: &str) -> Result<Option<u64>> {
         let (reply, _) =
             self.request(json!({"op":"workspace_usage", "account":account, "disk_id":disk_id}))?;

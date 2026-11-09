@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub(crate) mod have;
+pub mod images;
 pub mod recovery;
 pub mod storage;
 
@@ -19,11 +20,16 @@ pub struct Ledger {
     pub executions: BTreeMap<String, Execution>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bases: BTreeMap<String, storage::Base>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub images: BTreeMap<String, images::Generation>,
 }
 
 impl Ledger {
     pub fn is_empty(&self) -> bool {
-        self.disks.is_empty() && self.executions.is_empty() && self.bases.is_empty()
+        self.disks.is_empty()
+            && self.executions.is_empty()
+            && self.bases.is_empty()
+            && self.images.is_empty()
     }
 }
 
@@ -49,6 +55,8 @@ pub struct WorkspaceDisk {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Execution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_reservation_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +265,7 @@ impl Host {
                 }
             });
             let execution = Execution {
+                image_generation: images::next_generation(&self.snapshot.per_job)?,
                 replay_reservation_bytes: Some(storage::REPLAY_RESERVATION_BYTES),
                 final_replay_reservation_bytes: None,
                 replay_completion: None,
@@ -295,6 +304,7 @@ impl Host {
             next.per_job
                 .executions
                 .insert(claims.jti.clone(), execution);
+            images::reserve_account(&mut next.per_job, &claims.jti);
             next.leases.insert(
                 claims.jti.clone(),
                 super::Lease {
