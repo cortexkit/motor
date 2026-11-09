@@ -342,6 +342,7 @@ fn write_job_ledger(
     diff_job_entries(tx, "disk", &old.disks, &new.disks)?;
     diff_job_entries(tx, "base", &old.bases, &new.bases)?;
     diff_job_entries(tx, "image", &old.images, &new.images)?;
+    diff_job_entries(tx, "fill", &old.fills, &new.fills)?;
     diff_job_entries(tx, "execution", &old.executions, &new.executions)
 }
 
@@ -385,6 +386,7 @@ fn load_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
                 "disk" => drop(snapshot.per_job.disks.insert(key, from_json(&value)?)),
                 "base" => drop(snapshot.per_job.bases.insert(key, from_json(&value)?)),
                 "image" => drop(snapshot.per_job.images.insert(key, from_json(&value)?)),
+                "fill" => drop(snapshot.per_job.fills.insert(key, from_json(&value)?)),
                 "execution" => drop(snapshot.per_job.executions.insert(key, from_json(&value)?)),
                 _ => return Err(unknown("job VM entry kind", &kind)),
             }
@@ -625,6 +627,23 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
             have: Vec::new(),
             last_used_ms: 456,
             evicting: true,
+        },
+    );
+    snapshot.per_job.fills.insert(
+        "00000000-0000-7000-8000-000000000002".into(),
+        crate::state::jobs::fills::Reservation {
+            fill: motor_vm_helper::job::Fill {
+                account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                repository_key: "repo".into(),
+                fill_id: "00000000-0000-7000-8000-000000000002".into(),
+                size_bytes: 1024,
+            },
+            vcpus: 4,
+            memory_debit_mib: 120,
+            guest_ram_mib: 134,
+            runner_hello: true,
+            image_generation: Some("gen-rollback".into()),
+            publication: Some(snapshot.per_job.disks["ws-rollback"].have.clone()),
         },
     );
     journal.store(&snapshot).unwrap();

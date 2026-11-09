@@ -187,7 +187,9 @@ fn fills_wait_for_queued_claims_and_capacity_refusals_then_require_fresh_memory(
         .reserve_fill(&job(JOB).sub, "repo", 100, AT)
         .unwrap()
         .is_none());
-    let later = AT + motor_host::state::jobs::fills::CAPACITY_QUIET_MS;
+    let later = AT
+        + motor_host::state::MEMORY_FRESH_MS.max(motor_host::state::jobs::fills::CAPACITY_QUIET_MS)
+        + 1;
     assert!(h
         .reserve_fill(&job(JOB).sub, "repo", 100, later)
         .unwrap()
@@ -283,9 +285,33 @@ fn new_disks_are_empty_and_seeded_disks_start_with_only_the_same_accounts_base_h
 
 #[test]
 fn unavailable_guest_is_disabled_once_and_reserves_nothing() {
+    struct Unavailable(AtomicUsize);
+    impl FillGuest for Unavailable {
+        fn candidates(&self) -> anyhow::Result<Vec<Candidate>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(motor_host::jobs::fills::GuestUnavailable.into())
+        }
+        fn initialize(
+            &self,
+            _: &motor_host::state::jobs::fills::Reservation,
+            _: &Assignment,
+            _: &dyn Control,
+            _: &Value,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn run(
+            &self,
+            _: &motor_host::state::jobs::fills::Reservation,
+            _: &dyn Control,
+        ) -> anyhow::Result<Publication> {
+            unreachable!()
+        }
+    }
     let host = Arc::new(Mutex::new(memory_host(10_000)));
     let helper = Arc::new(Helper::default());
-    let mut scheduler = Scheduler::default();
+    let guest = Arc::new(Unavailable(AtomicUsize::new(0)));
+    let mut scheduler = Scheduler::new(guest.clone());
     for _ in 0..3 {
         scheduler
             .tick(host.clone(), helper.clone(), Arc::new(Images), AT)
@@ -293,6 +319,7 @@ fn unavailable_guest_is_disabled_once_and_reserves_nothing() {
     }
     assert!(host.lock().unwrap().snapshot.per_job.is_empty());
     assert!(helper.starts.lock().unwrap().is_empty());
+    assert_eq!(guest.0.load(Ordering::SeqCst), 1);
     assert!(motor_host::jobs::fills::FillGuest::candidates(
         &motor_host::jobs::fills::UnavailableFillGuest
     )
