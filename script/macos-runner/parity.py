@@ -23,8 +23,8 @@ ENVIRONMENT = {
 
 def build_account_lock_problem(user, name="motorbuild"):
     """Why a local account record (a dslocal users/<name>.plist) is not locked,
-    or None. The guest seal checks its own record with this before turning
-    Remote Login off, and the host checks the stopped image's record with it."""
+    or None. `image.py` checks the stopped image's build account with this after
+    finalize or the offline guest-agent update disables it."""
     if user.get("name") != [name] or user.get("shell") != ["/usr/bin/false"]:
         return "name/shell must identify " + name + " with /usr/bin/false"
     if user.get("passwd") != ["*"]:

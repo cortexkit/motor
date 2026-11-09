@@ -114,26 +114,30 @@ inside the checkout, for example `target/scratch/macos-image`.
      --known-hosts "$GUEST_KNOWN_HOSTS"
    ```
 
-   The guest rechecks its installed tools against the reviewed pin lock
-   (`toolchain.json`), then locks the build account: a
-   non-login shell, a `;DisabledUser;` authority with its password hash deleted,
-   the unusable `*` password marker, and no admin membership. It reads the
-   account record back and refuses unless it is locked (the same check that
-   finalize and the offline guest-agent update below apply to the stopped image). Only then does it delete the account's
-   `.ssh` and temporary sudoers entry, turn Remote Login off, verify it is off,
-   remove build sources, and acknowledge sealing before shutdown. The account
-   itself stays: Setup Assistant made it the Data volume's only Secure Token
-   holder, and macOS refuses to delete that account (`eDSPermissionError`).
-   Because the lock is checked while Remote Login is still on, a failed check
-   leaves the builder reachable for investigation. The
+   The seal uploads this commit's guest code, then the guest rechecks its
+   installed tools against the reviewed pin lock (`toolchain.json`), removes the
+   build account from the admin group and checks it is no longer a member, turns
+   Remote Login off and verifies it is off, and only then deletes the account's
+   `.ssh` and temporary sudoers entry, removes build sources, and acknowledges
+   sealing before shutdown. Every step that can be refused runs while the build
+   key and sudo still work, so a failure leaves the builder reachable for
+   investigation. The
    host requires that acknowledgement even if SSH is disconnected
    by shutdown, and deletes its private/public build key. If Remote Login shutdown
    severs SSH before acknowledgement on a particular macOS release, sealing fails
    closed and requires operator investigation; it is not counted as success.
 
+   The account itself stays, and the running guest can't lock it: Setup
+   Assistant made it the Data volume's only Secure Token holder, and macOS
+   refuses to delete that account or change its authentication authority, even
+   as root (`eDSPermissionError`). Finalize disables it offline instead (next step).
+
 6. After the image-build helper has exited, finalize. Every disk must be closed
    (`lsof` must prove this). Finalization mounts only the stopped image's APFS Data
-   volume, refuses unless its `motorbuild` record is locked, grants the installed
+   volume, disables the `motorbuild` account in its record (a non-login shell, a
+   `;DisabledUser;` authority with its password hash deleted, the unusable `*`
+   password marker, no admin membership), refuses unless the record then passes
+   the locked-account check below, grants the installed
    guest agent macOS TCC access to network volumes
    and all files, then unmounts and detaches before hashing the bundle. The grants
    use the installed agent's code-signing requirement, not a build output: macOS

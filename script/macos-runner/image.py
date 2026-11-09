@@ -82,14 +82,20 @@ def agent_requirement(mount):
     return requirements[0].strip()
 
 
-def grant_agent_access(disk):
+def grant_agent_access(disk, lock_build_account=False):
     # macOS treats virtiofs as a network volume. Without TCC grants, file reads
     # and directory listings fail for the agent and its job children, even as root.
     # SIP protects TCC.db in a running guest, so bind offline grants to the installed signature.
     with mounted_data(disk, writable=True) as mount:
-        # The guest seal locked the build account; check the stopped image's
-        # own record too before granting anything in it.
-        require_locked_build_account(mount)
+        if lock_build_account:
+            # The build account is the volume's Secure Token holder, so the
+            # running guest can't change its authentication authority; finalize
+            # disables it here in the stopped image and checks the record
+            # before granting anything. Without the flag the account is left as
+            # it is: `agent-swap` (the offline guest-agent update) checks it
+            # separately and changes it only when asked to.
+            disable_build_account(mount)
+            require_locked_build_account(mount)
         requirement = agent_requirement(mount)
         database = mount / "Library/Application Support/com.apple.TCC/TCC.db"
         if not database.is_file():
@@ -189,6 +195,10 @@ def seal(args, manifest):
     if candidate != reviewed:
         raise ValueError("reviewed lock does not match this VM's measured candidate")
     run("/usr/bin/scp", *options, args.manifest, args.guest + ":" + REMOTE + "/recipe/toolchain.json")
+    # Seal with this commit's guest code, not the copy uploaded when the guest
+    # was provisioned, so a seal fix doesn't need a new measurement.
+    run("/usr/bin/scp", *options, *(HERE / name for name in ("guest.py", "parity.py", "pinlock.py")),
+        args.guest + ":" + REMOTE + "/recipe/")
     result = subprocess.run(["/usr/bin/ssh", *options, args.guest,
                              "sudo -n /usr/bin/python3 " + REMOTE + "/recipe/guest.py seal --scratch " + REMOTE],
                             text=True, capture_output=True)
@@ -229,7 +239,7 @@ def finalize(args, manifest):
     if receipt != {"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"} or (args.work / "build_key").exists():
         raise ValueError("missing guest seal acknowledgement or build key still exists")
     require_stopped(args.image)
-    tcc = grant_agent_access(args.image / "disk.img")
+    tcc = grant_agent_access(args.image / "disk.img", lock_build_account=True)
     require_stopped(args.image)
     write_seal(args.image, parity.digest(args.manifest), manifest["ipsw"], manifest["agent"], tcc)
     print("Sealed read-only image; installed-daemon qualification is still required.")

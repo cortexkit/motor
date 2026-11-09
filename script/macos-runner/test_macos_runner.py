@@ -1155,6 +1155,24 @@ class OfflineImageTests(unittest.TestCase):
             self.fail("unexpected native command: " + str(args))
         return subprocess.CompletedProcess(args, 0, output, b"")
 
+    def test_finalize_disables_and_checks_the_build_account_before_granting(self):
+        order = []
+        with patch.object(image, "disable_build_account", side_effect=lambda mount: order.append("disable")), \
+                patch.object(image, "require_locked_build_account", side_effect=lambda mount: order.append("check")):
+            image.grant_agent_access(self.disk, lock_build_account=True)
+            self.assertEqual(order, ["disable", "check"])
+            # The grant follows the check, so a refused check grants nothing.
+            self.assertEqual(sum(args[0] == "/usr/bin/sqlite3" for args in self.commands), 1)
+            order.clear()
+            image.grant_agent_access(self.disk)
+            self.assertEqual(order, [])
+        with patch.object(image, "disable_build_account"), \
+                patch.object(image, "require_locked_build_account", side_effect=ValueError("not provably locked")):
+            before = sum(args[0] == "/usr/bin/sqlite3" for args in self.commands)
+            with self.assertRaisesRegex(ValueError, "not provably locked"):
+                image.grant_agent_access(self.disk, lock_build_account=True)
+            self.assertEqual(sum(args[0] == "/usr/bin/sqlite3" for args in self.commands), before)
+
     def test_offline_grants_use_installed_signature_and_both_services(self):
         record = image.grant_agent_access(self.disk)
         self.assertEqual(record, {"services": ["kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolicyAllFiles"],
@@ -1499,80 +1517,60 @@ class OfflineImageTests(unittest.TestCase):
 
 
 class ImageTests(unittest.TestCase):
-    LOCKED = {"name": ["motorbuild"], "shell": ["/usr/bin/false"], "passwd": ["*"],
-              "authentication_authority": [";DisabledUser;"], "home": ["/Users/motorbuild"]}
-
-    def seal_fixture(self, directory, record):
+    def seal_fixture(self, directory):
         home = Path(directory)
         (home / ".ssh").mkdir()
         (home / ".ssh/authorized_keys").write_text("build-only public key")
         sudoers = home / "sudoers"
         sudoers.write_text("temporary bootstrap permission")
-        users = home / "users"
-        users.mkdir()
-        (users / "motorbuild.plist").write_bytes(plistlib.dumps(record))
-        return home, sudoers, users
+        return home, sudoers
 
     def not_admin(self):
         return patch.object(guest.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", ""))
 
-    def test_sealing_locks_the_build_account_then_disables_remote_login(self):
+    def test_sealing_leaves_admin_then_disables_remote_login_then_access(self):
         with tempfile.TemporaryDirectory() as directory:
-            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            home, sudoers = self.seal_fixture(directory)
             with patch.object(guest, "run") as run, self.not_admin(), \
                     patch.object(guest.subprocess, "check_output", return_value="Remote Login: Off"):
-                guest.drop_build_access("motorbuild", home, sudoers, users)
+                guest.drop_build_access("motorbuild", home, sudoers)
             self.assertFalse((home / ".ssh").exists())
             self.assertFalse(sudoers.exists())
             calls = [call.args for call in run.call_args_list]
-            self.assertIn(("/usr/bin/dscl", ".", "-create", "/Users/motorbuild", "UserShell", "/usr/bin/false"), calls)
-            self.assertIn(("/usr/bin/dscl", ".", "-create", "/Users/motorbuild", "AuthenticationAuthority", ";DisabledUser;"), calls)
-            self.assertIn(("/usr/bin/dscl", ".", "-delete", "/Users/motorbuild", "ShadowHashData"), calls)
-            self.assertIn(("/usr/sbin/dseditgroup", "-o", "edit", "-d", "motorbuild", "-t", "user", "admin"), calls)
-            # The account is the volume's Secure Token holder; it is never deleted.
-            self.assertNotIn(("/usr/bin/dscl", ".", "-delete", "/Users/motorbuild"), calls)
-            # Remote Login goes off only after the lock is verified.
-            self.assertEqual(calls[-1], ("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off"))
-
-    def test_sealing_keeps_build_access_when_the_account_is_not_locked(self):
-        for change in (lambda user: user.update(authentication_authority=[";ShadowHash;"]),
-                       lambda user: user.update(shell=["/bin/zsh"]),
-                       lambda user: user.update(passwd=["********"])):
-            record = dict(self.LOCKED)
-            change(record)
-            with tempfile.TemporaryDirectory() as directory:
-                home, sudoers, users = self.seal_fixture(directory, record)
-                with patch.object(guest, "run") as run, self.not_admin():
-                    with self.assertRaisesRegex(ValueError, "not locked"):
-                        guest.drop_build_access("motorbuild", home, sudoers, users)
-                self.assertTrue((home / ".ssh/authorized_keys").exists())
-                self.assertTrue(sudoers.exists())
-                self.assertNotIn(("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off"),
-                                 [call.args for call in run.call_args_list])
+            self.assertEqual(calls, [
+                ("/usr/sbin/dseditgroup", "-o", "edit", "-d", "motorbuild", "-t", "user", "admin"),
+                ("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off"),
+            ])
+            # The Secure Token holder's record is never edited online: macOS refuses
+            # it, and a non-login shell would end the SSH route before the seal ends.
+            self.assertFalse(any(call[0] == "/usr/bin/dscl" for call in calls))
 
     def test_sealing_keeps_build_access_while_the_account_is_still_admin(self):
         with tempfile.TemporaryDirectory() as directory:
-            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            home, sudoers = self.seal_fixture(directory)
             member = subprocess.CompletedProcess([], 0, "yes motorbuild is a member of admin", "")
-            with patch.object(guest, "run"), patch.object(guest.subprocess, "run", return_value=member):
+            with patch.object(guest, "run") as run, patch.object(guest.subprocess, "run", return_value=member):
                 with self.assertRaisesRegex(ValueError, "still an admin member"):
-                    guest.drop_build_access("motorbuild", home, sudoers, users)
+                    guest.drop_build_access("motorbuild", home, sudoers)
             self.assertTrue(sudoers.exists())
+            self.assertTrue((home / ".ssh/authorized_keys").exists())
+            self.assertNotIn(("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off"),
+                             [call.args for call in run.call_args_list])
 
     def test_sealing_refuses_if_remote_login_stays_on(self):
         with tempfile.TemporaryDirectory() as directory:
-            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            home, sudoers = self.seal_fixture(directory)
             with patch.object(guest, "run"), self.not_admin(), \
                     patch.object(guest.subprocess, "check_output", return_value="Remote Login: On"):
                 with self.assertRaisesRegex(ValueError, "did not turn off"):
-                    guest.drop_build_access("motorbuild", home, sudoers, users)
+                    guest.drop_build_access("motorbuild", home, sudoers)
             # The SSH route stays usable, so the builder can be inspected.
             self.assertTrue((home / ".ssh/authorized_keys").exists())
             self.assertTrue(sudoers.exists())
 
     def test_sealing_keeps_build_access_when_remote_login_cannot_be_changed(self):
         with tempfile.TemporaryDirectory() as directory:
-            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            home, sudoers = self.seal_fixture(directory)
             refused = subprocess.CalledProcessError(1, ["/usr/sbin/systemsetup"])
 
             def run(*args, **kwargs):
@@ -1581,7 +1579,7 @@ class ImageTests(unittest.TestCase):
 
             with patch.object(guest, "run", side_effect=run), self.not_admin():
                 with self.assertRaises(subprocess.CalledProcessError):
-                    guest.drop_build_access("motorbuild", home, sudoers, users)
+                    guest.drop_build_access("motorbuild", home, sudoers)
             self.assertTrue((home / ".ssh/authorized_keys").exists())
             self.assertTrue(sudoers.exists())
 

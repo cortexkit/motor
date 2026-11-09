@@ -205,29 +205,19 @@ def provision(manifest, scratch, measure):
     print("Candidate measured. Review and commit its pins before sealing.")
 
 
-def drop_build_access(build_user, home, sudoers=Path("/etc/sudoers.d/motorbuild"),
-                      record=Path("/private/var/db/dslocal/nodes/Default/users")):
+def drop_build_access(build_user, home, sudoers=Path("/etc/sudoers.d/motorbuild")):
     # The build account is the one Setup Assistant created, so it is the Data
-    # volume's only Secure Token holder, and macOS refuses to delete it
-    # (eDSPermissionError). It stays in the image with every way in removed,
-    # the same end state `image.py finalize` and `image.py agent-swap` (the
-    # offline guest-agent update) check in the stopped image.
+    # volume's only Secure Token holder: macOS refuses to delete it or change
+    # its authentication authority, even as root (eDSPermissionError). Its
+    # password is disabled offline instead, when `image.py finalize` edits the
+    # stopped image (the same edit the offline guest-agent update makes), and
+    # finalize then checks the record is locked. Its login shell is changed
+    # there too, because a non-login shell here would end this SSH route.
     # Every step that can fail runs before the build key and sudo entry are
-    # removed: a failed lock check or a refused Remote Login change leaves this
-    # SSH route working, so the builder can be inspected, not lost. Turning
-    # Remote Login off keeps the current session, which then removes them.
-    user = "/Users/" + build_user
-    run("/usr/bin/dscl", ".", "-create", user, "UserShell", "/usr/bin/false")
-    run("/usr/bin/dscl", ".", "-create", user, "AuthenticationAuthority", ";DisabledUser;")
-    # The DisabledUser authority alone leaves the hash; remove it so no
-    # password from Setup Assistant survives in the image.
-    run("/usr/bin/dscl", ".", "-delete", user, "ShadowHashData")
-    run("/usr/bin/dscl", ".", "-create", user, "Password", "*")
+    # removed: a refused change leaves this SSH route working, so the builder
+    # can be inspected, not lost. Turning Remote Login off keeps the current
+    # session, which then removes them.
     run("/usr/sbin/dseditgroup", "-o", "edit", "-d", build_user, "-t", "user", "admin")
-    problem = parity.build_account_lock_problem(
-        plistlib.loads((record / (build_user + ".plist")).read_bytes()), build_user)
-    if problem:
-        raise ValueError("build account is not locked: " + problem)
     member = subprocess.run(["/usr/sbin/dseditgroup", "-o", "checkmember", "-m", build_user, "admin"],
                             capture_output=True, text=True)
     if member.returncode == 0:
