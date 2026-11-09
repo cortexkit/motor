@@ -5,9 +5,9 @@ This recipe uses the repository's `motor-macvm image-build` command, which calls
 mode. Production jobs use neither networking nor graphics. No third-party VM
 manager is used.
 
-## Pin-lock status: not deployable yet
+## Pin lock
 
-`toolchain.json` is deliberately a **pending measurement** lock. The restore pin
+`toolchain.json` is a **reviewed** lock (`release_status`). The restore pin
 is measured: macOS 27.2, build **26B123**, 25,595,669,503 bytes, SHA-256
 `6613b34e8589db2202a01ec37a2648afb141ece13428175183f8f3e38438534f`.
 The file is Apple's `UniversalMac_27.2_26B123_Restore.ipsw` from Apple's macOS
@@ -24,7 +24,7 @@ Motor commit in the `agent.commit` value in `toolchain.json`; `git archive` expo
 working tree. The guest build records the installed agent's SHA-256.
 
 The CLT receipt version and native binary hashes cannot be inferred from Linux
-artifacts. They remain explicitly pending, never fabricated. `--measure` is the
+artifacts; a new lock starts with them pending, never fabricated. `--measure` is the
 only path allowed to bootstrap pending inputs. It writes a **candidate**, does not
 mark it reviewed, and cannot seal or install an image. Normal provisioning,
 sealing, installation and parity checking fail until every pending field is
