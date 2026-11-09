@@ -69,7 +69,7 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 
 | Path inside the job | Access | Source |
 | --- | --- | --- |
-| The workspace, at the caller's absolute path | Read-write | The runner's checkout of the snapshot |
+| The workspace, at the caller's absolute path (and the fixed path when enabled; see 3.9) | Read-write | The runner's checkout of the snapshot |
 | The workspace's `.git` | Read-only | Same checkout |
 | Each sibling, at its own absolute path (and next to the workspace under its directory name) | Read-only | Its immutable per-commit sibling snapshot; the host checkout only in legacy in-place mode |
 | `/run/motor/target` and the per-workspace target path | Read-write | The workspace's private build output |
@@ -114,7 +114,9 @@ Linux Rust jobs and cache fills also get
 the template to give each workspace path its own intermediate outputs under
 `target/bd/<hash>/<profile>/`. Final binaries stay in `target/<profile>/`.
 A copy built at another path gets its own intermediates, and a later build in
-the checkout copies its own final binaries back into the target folder.
+the checkout copies its own final binaries back into the target folder. The
+opt-in fixed path in 3.9 gives a repository's worktrees the same Cargo path
+without sharing a writable checkout or build folder.
 
 3.1. A job cannot read the runner's state, mirrors, other workspaces or other
 jobs' sandboxes. Tests: `isolated_job_cannot_access_runner_or_other_jobs` and
@@ -181,9 +183,10 @@ sandbox. A *caller root* therefore pairs one caller prefix with a host
 directory the runner owns, `PREFIX=HOST` for short, for example
 `--caller-root /home=/srv/build/callers/e2e/home`. The runner stores the
 checkout under the host directory and binds it, read-write, at the caller's
-`/home` path. Every path in the job, its output, `pwd`, `$PWD`, git's
-`safe.directory` entries, `WorkingDirectory` and its compiler diagnostics reads
-`/home/...`.
+`/home` path. Without fixed paths enabled, `pwd`, `$PWD`, git's
+`safe.directory` entries, `WorkingDirectory` and compiler diagnostics use that
+caller path. With fixed paths enabled, the caller alias remains available but
+the job starts at the fixed path and streamed diagnostics are rewritten (3.9).
 
 The guarantee is that the job cannot reach the host directory, not that it
 cannot learn its name. A job can read its own mount table in
@@ -347,6 +350,136 @@ understands `--caller-root` but serves no caller root, then the units that carry
 the flag. No binary that predates mapping may run against mapped state. The
 operator procedure is in
 [runner-install.md](runner-install.md#9-optional-caller-roots-for-home-checkouts).
+
+## 3.9 Fixed checkout paths and build bases
+
+3.9.1. **Opt-in, Linux only.** Fixed paths are off by default. The runner takes
+repeated `--fixed-path-repository <root>` options, matching the request's caller
+repository root exactly, or `--fixed-path-repository '*'` alone for every
+repository. Roots must be absolute, distinct and contain no whitespace; `*`
+cannot be mixed with roots. Enabling any repository requires isolation and a
+valid `--account-subject <sub>` (`acct:` or `org:` followed by 26 Crockford
+base-32 characters). Without the opt-in, neither subject nor isolation is
+required by these options. Windows and macOS runners are unchanged. Tests:
+`accepts_fixed_path_roots_and_wildcard_without_tenant_mode`,
+`refuses_malformed_fixed_path_roots`,
+`fixed_paths_require_subject_and_isolation_only_when_enabled`
+(`crates/motor-runner/src/main.rs`).
+
+Provisioning uses the list setting `fixed_path_repositories` with the same
+grammar. A missing or empty list preserves the old runner arguments; changing
+only the list in a resize re-renders them. The helper and guest parsers must
+accept the options before enablement. Tests:
+`test_fixed_path_disabled_runner_args_golden`,
+`test_fixed_path_enabled_record_round_trips_and_renders`,
+`test_fixed_path_records_refuse_malformed_roots`
+(`script/tenant-provision/test_provision.py`),
+`test_fixed_path_only_resize_rerenders_args_without_registry_field`
+(`script/tenant-provision/test_resize.py`),
+`fixed_path_arguments_accept_opt_in_and_preserve_legacy`,
+`fixed_path_arguments_reject_malformed_values`
+(`crates/motor-vm-helper/src/tenant/activation.rs`),
+`fixed_path_options_round_trip_to_runner_command`,
+`fixed_path_options_reject_malformed_values`
+(`crates/motor-runner/src/tenant_agent.rs`).
+
+3.9.2. **One path string, private checkouts.** An enabled job starts at
+`/w/<account>/<repo-key>/<name>` plus its requested relative working directory.
+`<account>` is the subject with `:` replaced by `-`; `<repo-key>` is the
+repository's mirror key; `<name>` is the basename of the repository root, not
+the worktree folder. Worktrees of one repository get the same string, but each
+job's mount namespace binds only its own snapshot there. The caller's absolute
+workspace path remains an alias of the same checkout. A job uses
+`MOTOR_CALLER_WORKSPACE` to find that caller path; Git reads work through both
+aliases. Tests: `fixed_paths_use_repository_identity_not_worktree_or_cwd`
+(`crates/motor-runner/src/caller_path.rs`),
+`isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts`
+(`crates/motor-runner/src/tests/isolated_caller_roots.rs`).
+
+3.9.3. **Protections apply to every alias.** Every checkout overlay is repeated
+at the same relative location under the fixed path with its original mode and
+source. The read-only `.git` overlay and the
+[source seal](#read-only-source) prevent writes to their protected files through
+either alias; writes to `target/` and other job-writable files are visible
+through both aliases. Each declared
+sibling snapshot remains read-only at its canonical path, its alias next to the
+caller workspace, and `/w/<account>/<repo-key>/<sibling-basename>`. Git's
+`safe.directory` covers both checkouts and all sibling paths. Tests:
+`repeats_every_checkout_overlay_with_its_original_mode_and_source`,
+`fixed_siblings_use_snapshots_at_all_three_safe_directories`
+(`crates/motor-runner/src/isolation.rs`),
+`isolated_fixed_paths_preserve_read_only_and_writable_overlays`
+(`crates/motor-runner/src/tests/isolated_caller_roots.rs`).
+
+3.9.4. **Collisions use caller paths.** A sibling with the repository's basename,
+or two siblings with one basename, makes that job use the legacy mounts, unit
+arguments and build-directory preparation roots, with one warning, no rewrite
+and no seed. Tests: `fixed_paths_reject_basename_collisions_and_keep_sibling_order`
+(`crates/motor-runner/src/caller_path.rs`),
+`rewrite_launch_map_pairs_checkout_and_siblings_and_omits_fallback`
+(`crates/motor-runner/src/tests/monitoring.rs`),
+`disabled_and_colliding_jobs_use_only_legacy_prepare_roots`
+(`crates/motor-runner/src/cargo_build_dir.rs`). Disabled unit arguments are
+checked by `job_unit_commands_match_the_pinned_argv`
+(`crates/motor-runner/src/isolation/command_golden_tests.rs`); the collision
+warning and complete fallback unit arguments have no dedicated test.
+
+3.9.5. **Only streamed output is rewritten.** Before persistence and paging,
+stdout and stderr replace the fixed checkout path with the caller workspace
+path, and fixed sibling paths with their canonical caller paths. The saved map
+also governs replay after reattach or restart. Files the job writes, including
+logs and test reports, are not rewritten. Returned files and `workspace_changes`
+are not rewritten either: they can contain the fixed path. Tests:
+`rewrite_pipe_eof_and_reattach_preserve_bytes_sequences_and_map`
+(`crates/motor-runner/src/tests/monitoring.rs`),
+`isolated_fixed_paths_share_pwd_but_not_concurrent_checkouts`
+(`crates/motor-runner/src/tests/isolated_caller_roots.rs`, compares an artifact
+with streamed output). Returned-file and `workspace_changes` non-rewriting are
+not covered by a dedicated test.
+
+3.9.6. **Streaming boundaries preserve bytes.** The longest match wins, even
+across reads or a 1 MiB page boundary. A match must end at EOF or be followed by
+`/`, `:`, whitespace (space, tab, CR or LF), one of `"` `'` `` ` `` `)` `]` `}`
+`>` `,` `;`, or ESC. Other bytes, including `+`, `@`, `~` and non-ASCII bytes,
+continue a path and prevent replacement. Inserted bytes are not rescanned;
+unmatched bytes stay byte-identical. A complete path at EOF is rewritten, but a
+partial suffix is emitted unchanged, once, before the terminal record. Tests:
+`longest_match_across_every_write_split_and_page_boundary`,
+`only_listed_boundary_bytes_or_eof_allow_rewriting`,
+`eof_resolves_complete_and_partial_paths_without_rescanning_insertions`
+(`crates/motor-runner/src/output_rewrite.rs`),
+`rewrite_durable_two_monitor_restarts_preserve_source_offsets`,
+`rewrite_durable_partial_path_survives_quiet_passes_and_exit_once`
+(`crates/motor-runner/src/tests/monitoring.rs`).
+
+3.9.7. **Bases are not shared writable targets.** Trusted default-branch fills
+can publish a base at `<state_dir>/build-bases/<repo-key>/current`, shared by
+worktrees on this host and account only. An eligible empty `target/` receives a
+copy-on-write reflink clone. Only a newly seeded folder gets the content-based
+time step: unchanged tracked files and directories get the fill start time,
+changed ones get the time step's start time. A kept folder is never time-set.
+Jobs with siblings are not seeded. Publication, the six-hour refresh bound,
+compatibility checks and recovery are described with their tests in
+[compile-cache.md](compile-cache.md#fixed-paths-and-local-build-bases).
+Tests: `isolated_seed_base_is_warm_and_copy_on_write`,
+`isolated_seed_old_dated_change_rebuilds_changed_crate_and_dependents_once`,
+`isolated_seed_kept_folder_edit_and_revert_each_rebuild`
+(`crates/motor-runner/src/tests/isolated_seed.rs`),
+`eligibility_refuses_incompatible_records_and_leftovers`
+(`crates/motor-runner/src/seed.rs`).
+
+3.9.8. **Install the matching permissions helper before deployment.** Base
+publication and removal use fixed no-follow `check-staging-links` and
+`remove-staging` helper operations. On an unprivileged Linux runner, reinstall the matching
+`/usr/local/libexec/motor-runner-permissions` and its sudoers rules before
+deploying the runner, even if no repository is enabled. A root runner performs
+the operations in-process. See [runner-install.md](runner-install.md) for helper
+installation. Tests: `install_contract_requires_matching_helper_and_both_staging_grants`
+(`crates/motor-runner/src/permissions/tests.rs`),
+`test_only_fixed_native_operations_are_granted_to_the_trusted_operator`,
+`test_missing_helper_grant_aborts_before_drain_or_stop`
+(`script/runner/test_deploy.py`). The operator's reinstall itself is not covered
+by a test.
 
 ## 4. Processes
 
