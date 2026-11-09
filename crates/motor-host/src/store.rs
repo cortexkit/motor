@@ -506,3 +506,51 @@ mod rollback_tests {
         assert_eq!(SqliteJournal::open(dir.path()).unwrap().1, snapshot);
     }
 }
+#[test]
+fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
+    let root = cortexkit_test_support::scratch_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = tempfile::tempdir_in(root).unwrap();
+    let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+    let job = "00000000-0000-7000-8000-000000000001";
+    let claims: motor_lease::Claims = serde_json::from_value(serde_json::json!({
+        "iss":motor_lease::ISSUER,"aud":"host","jti":job,"sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "purpose":"run","iat":1800000000,"exp":1800000300,"vcpus":1,"mem_mib":16384,
+        "platform":"linux-x64","net":false,"placement":{"host":"host"},"max_s":30,
+        "cnf":{"jkt":"key"},"workspace_key_hash":"hash"
+    }))
+    .unwrap();
+    snapshot.leases.insert(
+        job.into(),
+        crate::state::Lease {
+            claims: claims.clone(),
+            tenant: job.into(),
+            state: crate::state::LeaseState::Reserved,
+            delivered: false,
+            replacing: false,
+            started_at_ms: None,
+            ended_at_ms: None,
+            highest_seq: 0,
+            refusal: None,
+        },
+    );
+    let legacy = snapshot.clone();
+    snapshot.per_job.executions.insert(
+        job.into(),
+        crate::state::jobs::Execution {
+            claims,
+            disk_id: "ws-rollback".into(),
+            memory_debit_mib: 16404,
+            guest_ram_mib: 21846,
+            boot_started: true,
+            boot_started_at_ms: Some(1800000000000),
+            runner_hello: false,
+            ended: false,
+        },
+    );
+    journal.store(&snapshot).unwrap();
+    drop(journal);
+    let conn = Connection::open(dir.path().join("store.db")).unwrap();
+    assert_eq!(load(&conn).unwrap(), legacy);
+    assert_eq!(load_snapshot(&conn).unwrap(), snapshot);
+}

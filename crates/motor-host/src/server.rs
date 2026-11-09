@@ -180,6 +180,9 @@ fn log_refusal(stage: &'static str, reason: Refusal, check: &str, jti: Option<&s
 }
 
 pub struct Runtime {
+    job_resources: Arc<dyn crate::jobs::Resources>,
+    job_stops: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    job_launches: Mutex<BTreeMap<String, Arc<job::Launch>>>,
     pub broker_endpoint: String,
     pub jwks_url: String,
     pub host_id: String,
@@ -200,6 +203,20 @@ pub struct Runtime {
     pub(crate) sandbox_identity: Option<crate::sandbox::IdentityFile>,
 }
 impl Runtime {
+    /// Per-job storage and image managers are injected explicitly. The executable
+    /// keeps startup disabled until production managers are available.
+    pub fn with_job_resources(
+        host_id: String,
+        host: Host,
+        control: Arc<dyn Control>,
+        resources: Arc<dyn crate::jobs::Resources>,
+    ) -> Arc<Self> {
+        let mut runtime = Self::new(host_id, host, control);
+        Arc::get_mut(&mut runtime)
+            .expect("new runtime")
+            .job_resources = resources;
+        runtime
+    }
     pub fn new(host_id: String, host: Host, control: Arc<dyn Control>) -> Arc<Self> {
         Self::with_broker(
             host_id,
@@ -252,6 +269,9 @@ impl Runtime {
             .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
             .collect();
         Arc::new(Self {
+            job_resources: Arc::new(crate::jobs::Unavailable),
+            job_stops: Mutex::new(BTreeMap::new()),
+            job_launches: Mutex::new(BTreeMap::new()),
             broker_endpoint,
             jwks_url,
             host_id,
@@ -301,6 +321,9 @@ impl Runtime {
             .refresh(fetched.map_err(|_| AuthError::Auth));
     }
     pub fn recover(self: &Arc<Self>) -> Result<()> {
+        if self.per_job() {
+            return self.recover_jobs();
+        }
         if self.sandbox_identity.is_none() {
             self.host
                 .lock()
@@ -399,6 +422,20 @@ impl Runtime {
             return Err(refuse("placement_vm"));
         }
         bind_requester(&claims, jwk).map_err(|_| refuse("requester_key"))?;
+        if self.per_job() {
+            if uuid::Uuid::parse_str(&claims.jti)
+                .map(|id| id.to_string())
+                .ok()
+                .as_deref()
+                != Some(&claims.jti)
+            {
+                return Err(refuse("jti"));
+            }
+            if claims.workspace_key_hash.is_none() {
+                return Err(refuse("workspace_key_hash"));
+            }
+            return Ok(claims);
+        }
         self.probe_storage();
         let host = self.host.lock().expect("host lock");
         let tenant = host.binding(&claims).map_err(|error| AuthRefusal {
@@ -751,6 +788,9 @@ impl Runtime {
         });
     }
     pub fn tick(self: &Arc<Self>, now_ms: u64) -> Result<()> {
+        if self.per_job() {
+            return self.tick_jobs(now_ms);
+        }
         if self.sandbox_identity.is_none() {
             self.fetch_detached_terminals();
         }
@@ -1206,6 +1246,21 @@ impl Runtime {
         result
     }
     fn close_connection(&self, id: u64, tenant: &str) -> Result<()> {
+        if self.per_job() {
+            self.host.lock().expect("host lock").close(id)?;
+            let before_delivery = self
+                .host
+                .lock()
+                .expect("host lock")
+                .snapshot
+                .leases
+                .get(tenant)
+                .is_some_and(|lease| !lease.delivered);
+            if before_delivery {
+                self.stop_job(tenant, true, false)?;
+            }
+            return Ok(());
+        }
         let update = {
             let mut host = self.host.lock().expect("host lock");
             host.close(id)?;
@@ -1429,12 +1484,19 @@ impl Runtime {
             host.delivered(id)?;
         }
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        write_json(
-            &mut stream,
-            &json!({"type":"verified_lease", "jti":claims.jti, "purpose":claims.purpose, "sub":claims.sub, "vcpus":claims.vcpus, "mem_mib":claims.mem_mib, "platform":claims.platform, "net":claims.net, "max_s":claims.max_s, "exp":claims.exp}),
-        )?;
+        write_json(&mut stream, &verified_lease(claims, false))?;
         Ok(stream)
     }
+}
+
+mod job;
+
+fn verified_lease(claims: &Claims, burst_enabled: bool) -> Value {
+    let mut lease = json!({"type":"verified_lease", "jti":claims.jti, "purpose":claims.purpose, "sub":claims.sub, "vcpus":claims.vcpus, "mem_mib":claims.mem_mib, "platform":claims.platform, "net":claims.net, "max_s":claims.max_s, "exp":claims.exp});
+    if let Some(burst) = claims.mem_burst_mib.filter(|_| burst_enabled) {
+        lease["mem_burst_mib"] = json!(burst);
+    }
+    lease
 }
 
 struct ConnectionGuard {
@@ -1563,14 +1625,18 @@ where
         }
         Err(AuthRefusal { error, .. }) => return Err(error).at(Side::Host, "authenticate"),
     };
-    let tenant = runtime
-        .host
-        .lock()
-        .expect("host lock")
-        .binding(&claims)
-        .at(Side::Host, "binding")?
-        .tenant
-        .clone();
+    let tenant = if runtime.per_job() {
+        claims.jti.clone()
+    } else {
+        runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .binding(&claims)
+            .at(Side::Host, "binding")?
+            .tenant
+            .clone()
+    };
     runtime
         .host
         .lock()
@@ -1622,6 +1688,20 @@ where
         let (id, _) = host
             .claim(claims.clone(), unix_ms())
             .map_err(|error| (error, "admission"))?;
+        if matches!(host.settings, crate::config::HostSettings::PerJob(_))
+            && claims.purpose == Purpose::Run
+        {
+            let execution = host.snapshot.per_job.executions[&claims.jti].clone();
+            if let Err(error) = runtime.job_resources.acquire(&execution) {
+                tracing::error!(jti = claims.jti, %error, "job_resources_refused");
+                host.job_boot_failed(&claims.jti, unix_ms())
+                    .map_err(|error| (error, "admission"))?;
+                host.job_stopped(&claims.jti, false)
+                    .map_err(|error| (error, "admission"))?;
+                host.close(id).map_err(|error| (error, "admission"))?;
+                return Err((Error::Refused(Refusal::HostFull), "job_resources"));
+            }
+        }
         Ok((
             id,
             host.watch_connection(id)
@@ -1667,6 +1747,11 @@ where
         armed: true,
     };
     drop(prelude_guard);
+    if runtime.per_job() {
+        let outcome = job::serve(runtime.clone(), &claims, id, &mut client).await;
+        connection.finish().await;
+        return outcome;
+    }
     // Set once the connection enters the relay or a stored replay; from then
     // on it ends with a graceful drain.
     let streamed = AtomicBool::new(false);

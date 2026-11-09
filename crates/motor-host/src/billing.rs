@@ -1045,7 +1045,12 @@ pub(crate) fn observe_settled_terminal(
     }
 }
 
-fn settle_lost(lease: &mut crate::state::Lease, b: &mut JobBilling, end: u64, observed: u64) {
+pub(crate) fn settle_lost(
+    lease: &mut crate::state::Lease,
+    b: &mut JobBilling,
+    end: u64,
+    observed: u64,
+) {
     lease.state = LeaseState::Ended;
     lease.ended_at_ms = Some(end);
     b.ended_observed_ms = Some(observed);

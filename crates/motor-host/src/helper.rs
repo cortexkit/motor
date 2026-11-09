@@ -11,6 +11,27 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    fn start_job(&self, _start: &motor_vm_helper::job::Start) -> Result<Value> {
+        anyhow::bail!("job VM start unavailable")
+    }
+    fn adopt_job(&self, _job: &str) -> Result<bool> {
+        anyhow::bail!("job VM adoption unavailable")
+    }
+    /// Success proves the VM has stopped, not merely that a signal was sent.
+    fn stop_job(&self, _job: &str) -> Result<()> {
+        anyhow::bail!("job VM stop unavailable")
+    }
+    fn job_relay(&self, _job: &str, _port: u32) -> Result<UnixStream> {
+        anyhow::bail!("job VM relay unavailable")
+    }
+    fn job_admin(&self, job: &str, request: &Value) -> Result<Value> {
+        exchange_control(
+            self.job_relay(job, 54)?,
+            job,
+            request,
+            control_read_deadline(request),
+        )
+    }
     fn metrics(&self, _tenant: &str) -> Result<crate::billing::Metrics> {
         anyhow::bail!("tenant metrics unavailable")
     }
@@ -218,6 +239,38 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn start_job(&self, start: &motor_vm_helper::job::Start) -> Result<Value> {
+        let mut request = serde_json::to_value(start)?;
+        request["op"] = json!("start_job");
+        let (reply, _) = self.request(request)?;
+        ensure!(
+            reply["result"] == "job" && reply["running"] == true,
+            "job VM start refused"
+        );
+        Ok(reply)
+    }
+    fn adopt_job(&self, job: &str) -> Result<bool> {
+        let (reply, _) = self.request(json!({"op":"adopt_job", "job_id":job}))?;
+        ensure!(reply["result"] == "job", "job VM adoption refused");
+        Ok(reply["running"] == true)
+    }
+    fn stop_job(&self, job: &str) -> Result<()> {
+        let (reply, _) = self.request(json!({"op":"stop_job", "job_id":job}))?;
+        ensure!(
+            reply["result"] == "job" && reply["running"] == false,
+            "job VM stop unconfirmed"
+        );
+        Ok(())
+    }
+    fn job_relay(&self, job: &str, port: u32) -> Result<UnixStream> {
+        let (reply, mut fds) =
+            self.request(json!({"op":"open_job_relay", "job_id":job, "port":port}))?;
+        ensure!(
+            reply["result"] == "relay" && fds.len() == 1,
+            "job VM relay refused"
+        );
+        Ok(UnixStream::from(fds.remove(0)))
+    }
     fn pressure_cgroup(&self, tenant: &str) -> Option<&Path> {
         self.pressure_cgroups.get(tenant).map(PathBuf::as_path)
     }
