@@ -166,16 +166,6 @@ pub(super) fn connect(id: &str, tap: &Tap) -> Result<()> {
             UPLINK,
         ],
     )?;
-    ns_ip(
-        id,
-        &[
-            "route",
-            "add",
-            "default",
-            "via",
-            &format!("10.201.{index}.1"),
-        ],
-    )?;
     // No NAT in the job namespace: the host's source guard, UFW route rule,
     // named counter and masquerade must all see 10.200.N.2, not the transit IP.
     apply(
@@ -191,6 +181,23 @@ pub(super) fn connect(id: &str, tap: &Tap) -> Result<()> {
         ],
     )?;
     ip(&["addr", "add", &format!("10.201.{index}.1/30"), "dev", &dev])?;
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+    for link in [&dev, UPLINK] {
+        ns_ip(id, &["link", "set", link, "mtu", "1500", "up"])?;
+    }
+    ip(&["link", "set", &dev, "mtu", "1500", "up"])?;
+    // Connected transit routes appear only after both veth ends are up. Add
+    // gateway routes afterwards so the kernel can validate each next hop.
+    ns_ip(
+        id,
+        &[
+            "route",
+            "add",
+            "default",
+            "via",
+            &format!("10.201.{index}.1"),
+        ],
+    )?;
     ip(&[
         "route",
         "add",
@@ -199,12 +206,7 @@ pub(super) fn connect(id: &str, tap: &Tap) -> Result<()> {
         &format!("10.201.{index}.2"),
         "dev",
         &dev,
-    ])?;
-    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
-    for link in [&dev, UPLINK] {
-        ns_ip(id, &["link", "set", link, "mtu", "1500", "up"])?;
-    }
-    ip(&["link", "set", &dev, "mtu", "1500", "up"])
+    ])
 }
 
 fn links() -> Result<Vec<Value>> {
