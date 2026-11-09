@@ -4,7 +4,7 @@ use super::isolated_targets::{
 use super::*;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
-const BUILD: &str = "cargo build --workspace --locked --offline --message-format=json";
+const BUILD: &str = "printf 'seed proof cwd=%s build-dir=%s target=%s\\n' \"$PWD\" \"$CARGO_BUILD_BUILD_DIR\" \"$CARGO_TARGET_DIR\"; printf 'seed proof bd-entry=%s\\n' \"$CARGO_TARGET_DIR\"/bd/*; CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build -vv --workspace --locked --offline --message-format=json";
 const REBUILT: &[&str] = &["seed-dependent", "seed-leaf"];
 
 fn save(root: &Path, name: &str, bytes: &str) {
@@ -141,6 +141,11 @@ async fn run(f: &Fixture, runner: &Runner, key: &str, command: &str) -> (Uuid, S
 
 async fn fill(f: &Fixture, runner: &Runner) -> PathBuf {
     let job = settle_base_store(f, runner).await;
+    eprintln!(
+        "base fill {} Cargo diagnostics:\n{}",
+        job.id,
+        job_output(runner, job.id)
+    );
     assert_eq!(
         job.terminal.unwrap().outcome,
         Outcome::Exit { code: 0 },
