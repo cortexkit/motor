@@ -121,6 +121,9 @@ pub(super) fn connect(id: &str, tap: &Tap) -> Result<()> {
         return Err(Error("invalid job network index".into()));
     }
     let dev = tap.tap();
+    if links()?.iter().any(|link| link["ifname"] == dev) {
+        return Err(Error("job network index still has a host interface".into()));
+    }
     // iproute2 can ignore add-time aliases. Keep both peers inside the job
     // namespace until the alias is set, then move the tagged peer to the host.
     // A crash before the move leaves no unidentifiable host interface; deleting
@@ -225,6 +228,32 @@ fn owned(link: &Value, id: &str, tap: &Tap) -> Result<bool> {
         && link["ifalias"] == name(id)?)
 }
 
+fn namespace_links(id: &str) -> Result<Vec<Value>> {
+    let output = inside(id, "/usr/sbin/ip")?
+        .args(["-j", "-d", "link"])
+        .output()?;
+    if !output.status.success() {
+        return Err(Error("cannot inspect job namespace links".into()));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| Error(format!("invalid job namespace links: {e}")))
+}
+
+fn remove_uplink(id: &str) -> Result<()> {
+    if let Some(link) = namespace_links(id)?
+        .iter()
+        .find(|link| link["ifname"] == UPLINK)
+    {
+        if link["linkinfo"]["info_kind"] != "veth" {
+            return Err(Error("foreign job namespace uplink".into()));
+        }
+        // Namespace destruction runs asynchronously. Explicit link deletion
+        // removes both peers before the index can be released or reused.
+        ns_ip(id, &["link", "delete", UPLINK])?;
+    }
+    Ok(())
+}
+
 fn flush_inside(id: &str, index: u8) -> Result<()> {
     in_namespace(id, move || super::conntrack::flush(index))
 }
@@ -277,6 +306,7 @@ pub(super) fn disconnect(id: &str, tap: &Tap) -> Result<()> {
         // Legacy host TAPs are checked and removed by tenant_network below.
     }
     if mounted(id)? {
+        remove_uplink(id)?;
         // A dead VMM cannot inject packets. Lower the persistent TAP before
         // retiring namespace state, and retain the mount on any flush failure.
         let mut command = inside(id, "/usr/sbin/ip")?;
@@ -291,6 +321,7 @@ pub(super) fn disconnect(id: &str, tap: &Tap) -> Result<()> {
 
 pub(super) fn remove(id: &str) -> Result<()> {
     if mounted(id)? {
+        remove_uplink(id)?;
         ip(&["netns", "delete", &name(id)?])?;
     } else if path(id)?.try_exists()? {
         std::fs::remove_file(path(id)?)?;
@@ -348,14 +379,7 @@ pub(super) fn reconcile(retained: &BTreeSet<String>) -> Result<()> {
                     remove(id)?;
                     continue;
                 }
-                let mut command = inside(id, "/usr/sbin/ip")?;
-                let output = command.args(["-j", "link"]).output()?;
-                if !output.status.success() {
-                    return Err(Error("cannot inspect orphan namespace".into()));
-                }
-                let links: Vec<Value> = serde_json::from_slice(&output.stdout)
-                    .map_err(|e| Error(format!("invalid orphan namespace links: {e}")))?;
-                for link in links {
+                for link in namespace_links(id)? {
                     if let Some(index) = link["ifname"]
                         .as_str()
                         .and_then(|n| n.strip_prefix("mtap"))

@@ -417,6 +417,21 @@ fn isolated_startup_reclaims_aliasless_veths_after_interrupted_creation() {
         .find(|link| link["ifname"] == "mtap17")
         .unwrap();
     assert!(host["ifalias"].is_null());
+    create("collision-job").unwrap();
+    assert!(connect(
+        "collision-job",
+        &Tap {
+            tap_index: 17,
+            uid: 500000
+        }
+    )
+    .unwrap_err()
+    .0
+    .contains("host interface"));
+    assert!(links()
+        .unwrap()
+        .iter()
+        .any(|link| link["ifname"] == "mtap17"));
     reconcile(&BTreeSet::new()).unwrap();
     assert!(!path(id).unwrap().exists());
     assert!(!links()
