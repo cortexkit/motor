@@ -133,8 +133,39 @@ pub struct Workspace {
     pub role: WorkspaceRole,
 }
 
-/// Internal request for the future disk-reservation caller. A host request has
-/// no role selector: host-created disks are always ordinary job workspaces.
+/// Helper-owned provenance, stored separately from the guest-written image.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fill {
+    pub account: String,
+    pub repository_key: String,
+    pub fill_id: String,
+    pub size_bytes: u64,
+}
+
+impl Fill {
+    pub fn validate(&self) -> Result<()> {
+        validate_account(&self.account)?;
+        validate_id(&self.repository_key)?;
+        validate_job_id(&self.fill_id)
+    }
+
+    pub fn disk_id(&self) -> String {
+        format!("fill-{}", self.fill_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seed {
+    pub account: String,
+    pub repository_key: String,
+    pub base_id: String,
+    pub disk_id: String,
+}
+
+/// Internal sparse-disk request. The provisioning operation chooses the role;
+/// ordinary workspace requests cannot select the Fill or Base role.
 pub struct CreateWorkspace {
     pub account: String,
     pub workspace_disk_id: String,
@@ -181,6 +212,12 @@ pub struct ExitReport {
 }
 
 pub enum Operation {
+    PrepareFill(Fill),
+    FinishFill {
+        fill: Fill,
+        published: bool,
+    },
+    SeedWorkspace(Seed),
     DeleteWorkspace {
         account: String,
         disk_id: String,
@@ -211,6 +248,13 @@ pub enum Operation {
 impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::PrepareFill(fill) | Self::FinishFill { fill, .. } => fill.validate(),
+            Self::SeedWorkspace(seed) => {
+                validate_account(&seed.account)?;
+                validate_id(&seed.repository_key)?;
+                validate_id(&seed.base_id)?;
+                validate_id(&seed.disk_id)
+            }
             Self::DeleteWorkspace { account, disk_id }
             | Self::EvictBase { account, disk_id }
             | Self::WorkspaceUsage { account, disk_id }

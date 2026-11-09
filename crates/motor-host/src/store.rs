@@ -621,6 +621,8 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
         "base-test".into(),
         crate::state::jobs::storage::Base {
             sub: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            repository_key: None,
+            have: Vec::new(),
             last_used_ms: 456,
             evicting: true,
         },

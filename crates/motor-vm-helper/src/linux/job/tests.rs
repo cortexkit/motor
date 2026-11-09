@@ -169,6 +169,49 @@ pub(super) fn record() -> Record {
         exit_acknowledged: false,
         tap_index: None,
         egress_bytes: None,
+        fill_exit_success: None,
+    }
+}
+
+#[test]
+fn legacy_job_records_have_no_clean_fill_exit_evidence() {
+    let mut value = serde_json::to_value(record()).unwrap();
+    value.as_object_mut().unwrap().remove("fill_exit_success");
+    let restored: Record = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.fill_exit_success, None);
+    assert!(serde_json::to_value(restored)
+        .unwrap()
+        .get("fill_exit_success")
+        .is_none());
+}
+
+#[test]
+fn fill_process_exit_success_is_durable_and_failure_never_becomes_success() {
+    for (program, success) in [("/bin/true", true), ("/bin/false", false)] {
+        let base = scratch();
+        let mut jobs = machine(&base);
+        std::fs::create_dir_all(&jobs.records_path).unwrap();
+        let mut record = record();
+        record.start.kind = job::VmKind::Fill;
+        let id = record.start.job_id.clone();
+        jobs.records.insert(id.clone(), record);
+        jobs.children
+            .insert(id.clone(), Command::new(program).spawn().unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !jobs.children.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture child did not exit"
+            );
+            jobs.reap();
+            std::thread::yield_now();
+        }
+        let durable: Record = serde_json::from_slice(
+            &std::fs::read(jobs.records_path.join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable.fill_exit_success, Some(success));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
 

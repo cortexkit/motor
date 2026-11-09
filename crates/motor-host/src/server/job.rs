@@ -409,6 +409,14 @@ impl Runtime {
         if let Err(error) = self.tick_recoveries(now_ms) {
             failure.get_or_insert(error);
         }
+        if let Err(error) = self.job_fills.lock().expect("fill scheduler").tick(
+            self.host.clone(),
+            self.control.clone(),
+            self.job_resources.clone(),
+            now_ms,
+        ) {
+            failure.get_or_insert(error);
+        }
         self.tick_balloon(now_ms);
         if let Some(error) = failure {
             return Err(error);

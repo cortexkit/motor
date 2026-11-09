@@ -230,6 +230,7 @@ pub struct Host {
     pub(crate) broker_heartbeat_at_ms: Option<u64>,
     pub(crate) lost_checks: BTreeMap<String, crate::billing::LostCheck>,
     host_resources: Option<jobs::HostResources>,
+    fill_capacity_refused_at_ms: Option<u64>,
     host_resources_failed: std::cell::Cell<bool>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
 }
@@ -263,6 +264,7 @@ impl Host {
             broker_heartbeat_at_ms: None,
             lost_checks: BTreeMap::new(),
             host_resources: None,
+            fill_capacity_refused_at_ms: None,
             host_resources_failed: std::cell::Cell::new(false),
             job_storage: None,
         }
@@ -524,6 +526,14 @@ impl Host {
     }
     pub fn claim(&mut self, claims: Claims, now_ms: u64) -> Result<(u64, Admission), Error> {
         let result = self.claim_inner(&claims, now_ms);
+        if claims.purpose == Purpose::Run
+            && self.settings.mode() == crate::config::HostMode::PerJob
+            && result
+                .as_ref()
+                .is_err_and(|e| matches!(e.cause.reason(), Refusal::HostFull | Refusal::Capacity))
+        {
+            self.fill_capacity_refused_at_ms = Some(now_ms);
+        }
         crate::claim_log::record(
             self.settings.mode(),
             &claims,

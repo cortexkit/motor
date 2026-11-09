@@ -41,6 +41,16 @@ pub enum Kind {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    PrepareFill {
+        fill: job::Fill,
+    },
+    FinishFill {
+        fill: job::Fill,
+        published: bool,
+    },
+    SeedWorkspace {
+        seed: job::Seed,
+    },
     InspectJobImages {
         generation: String,
     },
@@ -240,6 +250,9 @@ pub enum SlotView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Reply {
+    FillFinished {
+        published: bool,
+    },
     JobImages {
         manifest: images::Manifest,
     },
@@ -462,6 +475,11 @@ impl<M: Machine> Helper<M> {
             Request::DeleteWorkspace { account, disk_id } => {
                 self.job(job::Operation::DeleteWorkspace { account, disk_id }, peer)
             }
+            Request::PrepareFill { fill } => self.job(job::Operation::PrepareFill(fill), peer),
+            Request::FinishFill { fill, published } => {
+                self.job(job::Operation::FinishFill { fill, published }, peer)
+            }
+            Request::SeedWorkspace { seed } => self.job(job::Operation::SeedWorkspace(seed), peer),
             Request::EvictBase { account, disk_id } => {
                 self.job(job::Operation::EvictBase { account, disk_id }, peer)
             }

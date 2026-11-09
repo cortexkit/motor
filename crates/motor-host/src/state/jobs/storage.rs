@@ -45,6 +45,10 @@ impl Disk {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Base {
     pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub have: Vec<motor_protocol::MirrorRef>,
     pub last_used_ms: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub evicting: bool,
@@ -153,6 +157,17 @@ impl Host {
         loop {
             let mut reserved =
                 super::images::reserved_bytes(&next.per_job).ok_or(RefusalCause::Storage)?;
+            for fill in next.per_job.fills.values() {
+                let exclusive = control
+                    .workspace_usage(&fill.fill.account, &fill.fill.disk_id())
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+                    .min(fill.fill.size_bytes);
+                reserved = reserved
+                    .checked_add(fill.fill.size_bytes - exclusive)
+                    .ok_or(RefusalCause::Storage)?;
+            }
             for (id, disk) in &mut next.per_job.disks {
                 let active = !disk.deleted
                     && (disk.attached_job.is_some()
