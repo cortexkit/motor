@@ -79,22 +79,19 @@ def tree_digest(directory):
     return result.hexdigest()
 
 
-# Build-server components the current macOS image does not carry yet. Each one
-# reaches macOS with the next macOS image build, and is removed from this set
-# then. llvm-tools was added to the build server on 27 Oct 2026 for iOS cross
-# builds, which macOS VMs build with Xcode's own tools instead. rust-analyzer
-# was added on 30 Oct 2026 for a Linux job that runs it.
-PENDING_MACOS_COMPONENTS = {"llvm-tools", "rust-analyzer"}
+# Build-server components the current macOS image does not carry yet. A
+# component added to the build server goes here until the next macOS image
+# build installs it, and is removed from this set then. Empty while the image
+# carries every build-server component.
+PENDING_MACOS_COMPONENTS = set()
 
-# Build-server toolchains the current macOS image does not carry yet, removed
-# here with the next macOS image build. 1.92.0 was added to the build server on
-# 30 Oct 2026 for a Linux minimum-supported-Rust-version check.
-PENDING_MACOS_TOOLCHAINS = {"1.92.0"}
+# Build-server toolchains the current macOS image does not carry yet, with the
+# same lifetime as the components above.
+PENDING_MACOS_TOOLCHAINS = set()
 
-# The sealed macOS image still carries Bun 1.4.2 while Linux uses 1.4.4 for
-# workspace lockfile handling. Remove this entry with the next macOS image
-# build, which takes the build server's tool version.
-PENDING_MACOS_TOOL_VERSIONS = {("bun", "1.4.2")}
+# (tool, version) pairs the sealed macOS image may carry while the build server
+# has moved to a newer version, with the same lifetime as the sets above.
+PENDING_MACOS_TOOL_VERSIONS = set()
 
 
 def macos_components(server_components):

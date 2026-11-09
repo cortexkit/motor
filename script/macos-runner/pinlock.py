@@ -10,7 +10,7 @@ import parity
 
 HERE = Path(__file__).resolve().parent
 PENDING = "pending measurement"
-AGENT_COMMIT = "27b3c6cecc2d4f1b439434d246fc41d6a6249804"
+AGENT_COMMIT = "9e6dab5c99b3c5e8715dc731d4146a95878570a5"
 
 
 def seed(server):
@@ -36,10 +36,10 @@ def seed(server):
             spec["source"] = {"url": spec["git"] + "/archive/" + spec["rev"] + ".tar.gz", "sha256": PENDING}
     return {
         "schema": 1, "platform": "macos", "release_status": "pending review",
-        "ipsw": {"version": "27.0.1", "build": "26A434", "file": "macos-27.0.1-26A434.ipsw",
-                 "size": 26637307067,
-                 "sha256": "2f016638293c3e641b8b25391a76fbc16563b3711915a5551cf8aa0f5598a5c1"},
-        "observed_host": {"version": "27.0", "build": "26A425"},
+        "ipsw": {"version": "27.2", "build": "26B123", "file": "macos-27.2-26B123.ipsw",
+                 "size": 25595669503,
+                 "sha256": "6613b34e8589db2202a01ec37a2648afb141ece13428175183f8f3e38438534f"},
+        "observed_host": {"version": "27.2", "build": "26B123"},
         "clt": {"package_id": "com.apple.pkg.CLTools_Executables", "version": PENDING,
                 "softwareupdate_label": PENDING},
         "rustup": server["rustup"], "rust_profile": server["rust_profile"],

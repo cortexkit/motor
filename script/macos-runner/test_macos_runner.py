@@ -78,9 +78,9 @@ class ParityTests(unittest.TestCase):
 
     def test_pending_lock_cannot_be_deployed_or_checked(self):
         manifest = pending()
-        self.assertEqual(manifest["ipsw"]["build"], "26A434")
-        self.assertEqual(manifest["ipsw"]["size"], 26637307067)
-        self.assertEqual(manifest["ipsw"]["sha256"], "2f016638293c3e641b8b25391a76fbc16563b3711915a5551cf8aa0f5598a5c1")
+        self.assertEqual(manifest["ipsw"]["build"], "26B123")
+        self.assertEqual(manifest["ipsw"]["size"], 25595669503)
+        self.assertEqual(manifest["ipsw"]["sha256"], "6613b34e8589db2202a01ec37a2648afb141ece13428175183f8f3e38438534f")
         with self.assertRaisesRegex(ValueError, "not reviewed"):
             pinlock.require_ready(manifest)
         with self.assertRaisesRegex(ValueError, "pending"):
@@ -117,9 +117,9 @@ class ParityTests(unittest.TestCase):
     def test_pending_component_is_skipped_but_any_other_new_component_is_not(self):
         server = copy.deepcopy(SERVER)
         components = server["rust_toolchains"]["1.99.0-x86_64-unknown-linux-gnu"]["components"]
-        components.append("llvm-tools-x86_64-unknown-linux-gnu")
-        parity.validate(self.manifest, server)
-        components.append("rust-src")
+        components.append("miri-x86_64-unknown-linux-gnu")
+        with patch.object(parity, "PENDING_MACOS_COMPONENTS", {"miri"}):
+            parity.validate(self.manifest, server)
         with self.assertRaisesRegex(ValueError, "differ from build-server"):
             parity.validate(self.manifest, server)
 
@@ -127,9 +127,9 @@ class ParityTests(unittest.TestCase):
         server = copy.deepcopy(SERVER)
         chains = server["rust_toolchains"]
         base = chains["1.99.0-x86_64-unknown-linux-gnu"]
-        chains["1.92.0-x86_64-unknown-linux-gnu"] = dict(base, rustc="rustc 1.92.0 (ded5c06cf 2025-12-08)")
-        parity.validate(self.manifest, server)
         chains["1.93.0-x86_64-unknown-linux-gnu"] = dict(base, rustc="rustc 1.93.0 (aaaaaaaaa 2026-01-22)")
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.93.0"}):
+            parity.validate(self.manifest, server)
         with self.assertRaisesRegex(ValueError, "differ from build-server"):
             parity.validate(self.manifest, server)
 
