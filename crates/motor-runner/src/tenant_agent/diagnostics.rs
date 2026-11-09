@@ -80,6 +80,51 @@ pub(super) async fn collect(https: bool, query: JournalQuery) -> io::Result<Valu
     Ok(result)
 }
 
+pub(super) async fn attach_result(result: io::Result<()>) -> io::Result<()> {
+    attach_result_with(result, journal(JournalQuery::default())).await
+}
+
+async fn attach_result_with(
+    result: io::Result<()>,
+    read_journal: impl std::future::Future<Output = io::Result<Value>>,
+) -> io::Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    let message = error.to_string();
+    if !message.starts_with("tenant_runner_exited:") {
+        return Err(error);
+    }
+    // A dead runner has no MainPID to inspect. Its unit journal is still
+    // available, and must pass the same redactor as normal diagnostics.
+    let journal = read_journal.await.ok();
+    let tail = journal
+        .as_ref()
+        .and_then(|value| value["entries"].as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "[journal unavailable or empty]".into());
+    let mut end = message.len().min(512);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = format!("{}\nrunner journal (redacted):\n", &message[..end]);
+    let mut start = tail.len().saturating_sub(2048 - prefix.len());
+    while !tail.is_char_boundary(start) {
+        start += 1;
+    }
+    Err(io::Error::new(
+        error.kind(),
+        format!("{prefix}{}", &tail[start..]),
+    ))
+}
+
 pub(super) fn bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     fs::File::open(path)?.take(limit).read_to_end(&mut bytes)?;
@@ -298,6 +343,17 @@ fn flocks(proc: &Path, state: &Path) -> io::Result<(Vec<Value>, bool)> {
 fn journal_message(message: &str) -> String {
     // Journal entries and subprocess errors can quote uploaded text. Only the
     // runner's fixed setup messages and numeric/allowlisted fields cross vsock.
+    let startup = message.strip_prefix("Error: ").unwrap_or(message);
+    if let Some(rest) = startup.strip_prefix("immutable Cargo source ACL check failed: ") {
+        if let Some((path, _)) = rest.split_once(';') {
+            if matches!(
+                path,
+                "/usr/local/lib/motor/cargo/registry" | "/usr/local/lib/motor/cargo/git"
+            ) {
+                return format!("immutable Cargo source ACL check failed: {path}");
+            }
+        }
+    }
     let Some((_, rest)) = message.split_once("motor_runner::") else {
         return "[message omitted]".into();
     };
@@ -496,6 +552,78 @@ fn journal_entries(bytes: &[u8], limit: u64, query: &JournalQuery) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn attach_exit_returns_bounded_redacted_journal_without_a_live_pid() {
+        let line = |message: &str| {
+            json!({"__REALTIME_TIMESTAMP":"1800000000000000", "MESSAGE":message}).to_string()
+        };
+        let mut lines = vec![line("motor_runner::setup_log: materialize started")];
+        lines.extend((0..60).map(|_| line("motor_runner::server: runner_channel_closed direction=read reason=eof kind=ConnectionReset bytes=12345")));
+        lines.push(line("untrusted command TOP_SECRET"));
+        lines.push(line("Error: immutable Cargo source ACL check failed: /usr/local/lib/motor/cargo/registry; require ACLs TOP_SECRET"));
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' \"$1\"",
+            "journal-fixture",
+            &lines.join("\n"),
+        ]);
+        let result = attach_result_with(
+            Err(io::Error::other(
+                "tenant_runner_exited: no MainPID after start",
+            )),
+            journal_command(command, JournalQuery::default()),
+        )
+        .await;
+        let reply = super::super::agent_result(result.map(|()| json!({"ok":true})));
+        let error = reply["error"].as_str().unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(error.starts_with("tenant_runner_exited:"));
+        assert!(error.len() <= 2048);
+        assert!(error.ends_with(
+            "immutable Cargo source ACL check failed: /usr/local/lib/motor/cargo/registry"
+        ));
+        assert!(!error.contains("materialize started"));
+        assert!(!error.contains("TOP_SECRET"));
+        assert_eq!(
+            journal_message(
+                "Error: immutable Cargo source ACL check failed: /tenant/TOP_SECRET; bad"
+            ),
+            "[message omitted]"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_journal_failure_does_not_expose_subprocess_stderr() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf TOP_SECRET >&2; exit 7"]);
+        let result = attach_result_with(
+            Err(io::Error::other("tenant_runner_exited: runner stopped")),
+            journal_command(command, JournalQuery::default()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(result.contains("journal unavailable or empty"));
+        assert!(!result.contains("TOP_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn attach_only_queries_the_journal_for_runner_exit_errors() {
+        for result in [Ok(()), Err(io::Error::other("workspace mount failed"))] {
+            let read = std::cell::Cell::new(false);
+            let result = attach_result_with(result, async {
+                read.set(true);
+                Ok(json!({"entries":[]}))
+            })
+            .await;
+            assert!(!read.get());
+            if let Err(error) = result {
+                assert_eq!(error.to_string(), "workspace mount failed");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn journal_command_failure_reports_status_and_bounded_stderr_not_empty_entries() {

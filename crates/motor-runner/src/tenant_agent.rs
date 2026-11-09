@@ -37,9 +37,14 @@ pub async fn serve_agent() -> io::Result<()> {
     // Validate immutable boot inputs before accepting even the first account
     // frame. Keep a typed refusal available to the host if validation fails.
     let preflight = if per_job::enabled()? {
-        per_job::preflight()
-            .err()
-            .map(|error| agent_result(Err(error)))
+        (if recovery::enabled()? {
+            Ok(())
+        } else {
+            per_job::install_args()
+        })
+        .and_then(|()| per_job::preflight())
+        .err()
+        .map(|error| agent_result(Err(error)))
     } else {
         None
     };
@@ -207,9 +212,10 @@ async fn dispatch(
         }
         request @ TenantAgentRequest::AttachTenant { .. } => {
             let _guard = attach.lock().await;
-            tokio::task::spawn_blocking(move || attach_tenant(request))
+            let result = tokio::task::spawn_blocking(move || attach_tenant(request))
                 .await
-                .map_err(io::Error::other)??;
+                .map_err(io::Error::other)?;
+            diagnostics::attach_result(result).await?;
             Ok(json!({"ok":true}))
         }
         TenantAgentRequest::PostRestore { unix_ms, seed } => {

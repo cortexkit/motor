@@ -318,7 +318,7 @@ mod root {
         assert_eq!(config["prefix"], "tenant/acct-01ARZ3NDEKTSV4RRFFQ69G5FAV/");
         assert!(value.get("write_key").is_none());
         assert!(
-            boot_requests(&request, Some(17), Some(&nonce))[1].1["boot_args"]
+            boot_requests(&request, Some(17), Some(&nonce), 4 << 30).unwrap()[1].1["boot_args"]
                 .as_str()
                 .unwrap()
                 .ends_with(&format!("motor.cache_nonce={nonce}"))

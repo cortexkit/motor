@@ -13,6 +13,7 @@ import signal
 import subprocess
 
 from build_storage import DiskMeter, FREE_FLOOR, GIB, assert_unmounted, choose_budget, read_mountinfo, unmount_tree
+import job_images
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -132,10 +133,12 @@ def build_artifacts(stage, pins, runner, jobs, run=subprocess.run):
     env = kernel_env(pins, jobs)
     run(["bash", str(HERE / "build-kernel.sh"), str(stage / "kernel")], check=True, env=env)
     run(["unshare", "--mount", "--propagation", "private", "--", "bash", str(HERE / "build-rootfs.sh"), str(stage)], check=True, env=env)
+    assert_unmounted(stage, read_mountinfo)
+    run(["python3", str(HERE / "job_images.py"), str(stage), str(pins["rootfs_gib"])], check=True, env=env)
 
 
 def recipe_digest(pins, runner, jobs):
-    files = [HERE / name for name in ("build.py", "build_storage.py", "build-kernel.sh", "build-rootfs.sh", "install-guest.py", "debian_mirror.py", "kernel-options.txt")]
+    files = [HERE / name for name in ("build.py", "build_storage.py", "build-kernel.sh", "build-rootfs.sh", "install-guest.py", "debian_mirror.py", "kernel-options.txt", "job_images.py")]
     files.extend(path for path in (HERE / "guest").iterdir() if path.is_file())
     recipe = dict(pins=pins, runner_sha256=digest(runner), jobs=jobs,
                   sources={str(path.relative_to(HERE)): digest(path) for path in sorted(files)})
@@ -143,9 +146,13 @@ def recipe_digest(pins, runner, jobs):
 
 
 def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
-          build_budget=None, peak_profile=None, free_floor=FREE_FLOOR, mountinfo_reader=read_mountinfo):
+          build_budget=None, peak_profile=None, free_floor=FREE_FLOOR, mountinfo_reader=read_mountinfo,
+          job_generation=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", version) or jobs < 1:
         raise ValueError("version must be one safe path component and jobs must be positive")
+    generation = version if job_generation is None else job_generation
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", generation) or generation in ("locks", "pins"):
+        raise ValueError("job generation must be a helper-compatible identity; set --job-generation explicitly")
     output.mkdir(parents=True, exist_ok=True)
     target = output / version
     # mkdir is the reservation: simultaneous builders cannot replace each other.
@@ -153,8 +160,12 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
     reservation = target.stat()
     stage = target / ".work"
     meter = None
+    job_reservation = None
+    job_target = output.parent / "job-image-staging" / generation
     try:
         stage.mkdir()
+        job_target.mkdir(parents=True, mode=0o755)
+        job_reservation = job_target.stat()
         shutil.copy2(versions, stage / "versions.txt")
         pins = load_versions(stage / "versions.txt")
         recipe = recipe_digest(pins, runner, jobs)
@@ -179,6 +190,7 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
             "rootfs_sha256": digest(stage / "rootfs"),
             "runner_sha256": digest(stage / "motor-runner"),
         }
+        job_manifest = job_images.publish(stage, job_target)
         for source, name in (("kernel/vmlinux", "vmlinux"), ("rootfs", "rootfs"),
                              ("kernel/kernel.config", "kernel.config"),
                              ("packages.txt", "packages.txt"), ("tools.json", "tools.json")):
@@ -195,6 +207,7 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
             path.chmod(0o444)
             with path.open("rb") as source:
                 os.fsync(source.fileno())
+        job_images.complete(job_target, job_manifest)
         fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(fd)
@@ -214,7 +227,14 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
             if (current.st_dev, current.st_ino) != (reservation.st_dev, reservation.st_ino):
                 raise RuntimeError("build reservation was replaced")
             assert_unmounted(target, mountinfo_reader)
+            if job_reservation is not None:
+                current_job = job_target.lstat()
+                if (current_job.st_dev, current_job.st_ino) != (job_reservation.st_dev, job_reservation.st_ino):
+                    raise RuntimeError("job image reservation was replaced")
+                assert_unmounted(job_target, mountinfo_reader)
             shutil.rmtree(target)
+            if job_reservation is not None:
+                shutil.rmtree(job_target)
         except Exception as error:
             print(f"incomplete version retained at {target}; cleanup refused: {error}", flush=True)
         raise
@@ -263,6 +283,7 @@ def main():
     create.add_argument("--output-root", type=Path, default=Path("/var/lib/motor-vm/tenant-images"))
     create.add_argument("--runner", type=Path, required=True)
     create.add_argument("--jobs", type=int, default=4)
+    create.add_argument("--job-generation", help="helper generation identity; defaults to version (no dots)")
     storage = create.add_mutually_exclusive_group(required=True)
     storage.add_argument("--build-budget-gib", type=int, help="explicit first-build cap, not a measured requirement")
     storage.add_argument("--peak-profile", type=Path, help="matching successful disk-usage.json; adds 25%% plus 4 GiB")
@@ -285,7 +306,7 @@ def main():
         try:
             build(args.version, args.output_root.resolve(), args.versions.resolve(), args.runner.resolve(), args.jobs,
                   build_budget=args.build_budget_gib * GIB if args.build_budget_gib is not None else None,
-                  peak_profile=args.peak_profile)
+                  peak_profile=args.peak_profile, job_generation=args.job_generation)
         finally:
             signal.signal(signal.SIGTERM, previous)
     elif args.command == "inventory":

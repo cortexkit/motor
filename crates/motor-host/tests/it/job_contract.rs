@@ -219,7 +219,7 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let lease = json!({"type":"verified_lease", "jti":id, "purpose":"run", "sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", "vcpus":2, "mem_mib":2048, "platform":"linux-x64", "net":false, "max_s":60, "exp":now+120});
+    let lease = json!({"type":"verified_lease", "jti":id, "purpose":"run", "sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", "vcpus":2, "mem_mib":4096, "platform":"linux-x64", "net":false, "max_s":60, "exp":now+120});
     let write = motor_protocol::write_frame_async;
     write(&mut socket, &serde_json::from_value(lease).unwrap())
         .await
@@ -228,13 +228,14 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
     assert!(matches!(next(&mut socket).await, Frame::Hello { .. }));
     let workspace = "/home/motor-contract";
     let request = json!({"type":"run", "job_id":id, "workspace_key":workspace, "repository_root":workspace, "cwd":workspace,
-        "command":"python3 probe.py", "env":{}, "weight_hint":1, "timeout":60, "queue_wait_limit_s":10,
+        "command":"python3 probe.py", "env":{}, "weight_hint":2, "timeout":60, "queue_wait_limit_s":10,
         "snapshot_commit":commit, "integration_tip":commit, "tree_hash":tree, "siblings":[],
         "bundles":[{"index":0, "repository":workspace, "length":bytes.len(), "sha256":format!("{:x}", Sha256::digest(&bytes))}]});
     write(&mut socket, &serde_json::from_value(request).unwrap())
         .await
         .unwrap();
-    assert!(matches!(next(&mut socket).await, Frame::Accepted(_)));
+    let admitted = next(&mut socket).await;
+    assert!(matches!(admitted, Frame::Accepted(_)), "run not accepted: {admitted:?}");
     write(
         &mut socket,
         &Frame::BundleChunk {
@@ -280,7 +281,10 @@ async fn next(socket: &mut tokio::net::UnixStream) -> Frame {
 
 /// Root-only qualification of docs/job-isolation.md 4.4.2 in one real job VM.
 /// Set MOTOR_VM_TEST_FIRECRACKER, MOTOR_VM_TEST_JAILER and
-/// MOTOR_VM_TEST_JOB_{KERNEL,ROOTFS,TOOLCHAIN} to absolute, readable artifacts.
+/// MOTOR_VM_TEST_JOB_{KERNEL,ROOTFS,TOOLCHAIN} to the absolute kernel,
+/// rootfs.ext4 and toolchain.ext4 emitted by script/tenant-image/build.py build
+/// under /var/lib/motor-vm/job-image-staging/<generation>. No image edits or
+/// separately provisioned argument files are needed.
 /// Uses the helper's production boot requests and the image's production guest
 /// agent/runner. A disconnected TAP exists only in a private network namespace
 /// because guest attach requires eth0; this does not qualify network enforcement.
@@ -418,7 +422,14 @@ fn isolated_job_vm_preserves_full_sandbox_contract() {
             memory_mib: 3072,
             burst_mib: None,
         };
-        for (path, mut body) in boot_requests(&start, Some(tap), None) {
+        for (path, mut body) in boot_requests(
+            &start,
+            Some(tap),
+            None,
+            File::open(&workspace).unwrap().metadata().unwrap().len(),
+        )
+        .unwrap()
+        {
             // Only the host-side device name is fixture-specific; the guest
             // interface and every boot/drive/vsock request stay production's.
             if path == "/network-interfaces/eth0" {
@@ -450,7 +461,7 @@ fn isolated_job_vm_preserves_full_sandbox_contract() {
         .unwrap();
         assert_eq!(
             reply["ok"], true,
-            "production guest initialization: {reply}; job artifacts must provide root-owned /run/motor/runner-args (0600 or 0644) and /toolchain/usr/local/lib/motor/cargo/{{bin,registry,git}}; check MOTOR_VM_TEST_JOB_ROOTFS and MOTOR_VM_TEST_JOB_TOOLCHAIN"
+            "production guest initialization: {reply}; production boot arguments must install root-owned /run/motor/runner-args (0600) and job artifacts must provide /toolchain/usr/local/lib/motor/cargo/{{bin,registry,git}}; check MOTOR_VM_TEST_JOB_ROOTFS and MOTOR_VM_TEST_JOB_TOOLCHAIN"
         );
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
