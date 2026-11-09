@@ -4,9 +4,22 @@ use std::os::unix::{fs::symlink, net::UnixListener};
 
 // Synthetic, not an operator capture. RAM flags follow Firecracker v1.17.0
 // src/vmm/src/vstate/memory.rs:884-960,261-296; the read-only shared pmem
-// mapping follows src/vmm/src/devices/virtio/pmem/device.rs:181-255. An actual
-// smaps capture is still required to validate deployment's kernel VMA layout.
+// mapping follows src/vmm/src/devices/virtio/pmem/device.rs:181-255.
 const SYNTHETIC: &str = include_str!("synthetic-firecracker-1.17.smaps");
+
+// A real capture: /proc/<pid>/smaps of the Firecracker 1.17.0 process of a
+// production-booted job VM (3072 MiB guest RAM, 2 vCPUs, the toolchain image
+// on pmem) while a job ran, on a Linux 7.0 hosted server.
+const CAPTURED: &str = include_str!("captured-firecracker-1.17.smaps");
+
+#[test]
+fn captured_smaps_counts_one_guest_ram_mapping_not_pmem_heap_or_memfd() {
+    // Exactly one MAP_NORESERVE anonymous private mapping of the configured RAM;
+    // the 32 GiB shared toolchain mapping, heap and memfd are not guest RAM.
+    assert_eq!(guest_resident_bytes(CAPTURED, 3072).unwrap(), 782_636 * 1024);
+    assert!(guest_resident_bytes(CAPTURED, 3071).is_err());
+    assert!(guest_resident_bytes(CAPTURED, 4096).is_err());
+}
 
 #[test]
 fn synthetic_smaps_counts_only_guest_ram_never_resident_pmem_or_heap() {
