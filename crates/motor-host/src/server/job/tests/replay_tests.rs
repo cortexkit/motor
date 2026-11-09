@@ -423,3 +423,49 @@ async fn authoritative_terminals_are_byte_identical_live_and_on_replay_after_res
         assert_eq!(usage(&restarted), body);
     }
 }
+
+#[tokio::test]
+async fn concurrent_controls_receive_only_their_own_runner_reply() {
+    let (runtime, fake, _) = fixture();
+    let (client, task, mut guest) = launched(&runtime, &fake).await;
+    let mut clients = vec![client];
+    let mut tasks = vec![task];
+    {
+        let mut c = claims(JOB);
+        c.purpose = Purpose::Attach;
+        let id = runtime
+            .host
+            .lock()
+            .unwrap()
+            .claim(c.clone(), unix_ms())
+            .unwrap()
+            .0;
+        let (mut client, task) = start(runtime.clone(), c, id).await;
+        next_type(&mut client, "lease_ok").await;
+        write_frame(&mut client, &hello()).await.unwrap();
+        next_type(&mut client, "hello").await;
+        clients.push(client);
+        tasks.push(task);
+    }
+    for client in &mut clients {
+        write_frame(client, &json!({"type":"job_status","job_id":JOB}))
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "job_status");
+    }
+    for ordinal in [1, 2] {
+        write_frame(
+            &mut guest,
+            &json!({"type":"job_status_reply","job_id":JOB,"state":"running","ordinal":ordinal}),
+        )
+        .await
+        .unwrap();
+    }
+    for (index, mut client) in clients.into_iter().enumerate() {
+        assert_eq!(next_record(&mut client).await.value["ordinal"], index + 1);
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    runtime.stop_job(JOB, true, false).unwrap();
+}

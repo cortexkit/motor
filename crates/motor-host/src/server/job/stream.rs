@@ -3,10 +3,16 @@
 use super::*;
 use crate::replay::Store;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+struct Input {
+    bytes: Vec<u8>,
+    reply: Option<oneshot::Sender<Vec<u8>>>,
+}
 
 pub(crate) struct Stream {
     store: Mutex<std::result::Result<Store, String>>,
-    input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    input: Mutex<Option<mpsc::Sender<Input>>>,
     running: AtomicBool,
     upload_detached: AtomicBool,
     #[cfg(test)]
@@ -152,7 +158,7 @@ async fn collect(
     store: &Arc<Stream>,
     guest: Option<std::os::unix::net::UnixStream>,
     mut prelude: Option<(u64, Replay)>,
-    mut commands: mpsc::Receiver<Vec<u8>>,
+    mut commands: mpsc::Receiver<Input>,
 ) -> Result<()> {
     let resume = guest.is_none();
     let guest = match guest {
@@ -184,6 +190,10 @@ async fn collect(
     let write = tokio::sync::Mutex::new(write);
     let mut have_replies = prelude.as_ref().map_or(0, |(_, p)| p.have_replies);
     let mut withdraw_replies = prelude.as_ref().map_or(0, |(_, p)| p.withdraw_replies);
+    let pending = Mutex::new(BTreeMap::<
+        String,
+        std::collections::VecDeque<oneshot::Sender<Vec<u8>>>,
+    >::new());
     let upload = async {
         let mut upload = Upload::default();
         if let Some((id, p)) = &mut prelude {
@@ -218,9 +228,14 @@ async fn collect(
             }
             tokio::select! {
                 biased;
-                Some(bytes) = commands.recv() => {
-                    upload.observe(&crate::replay::decode(&bytes)?)?;
-                    write.lock().await.write_all(&bytes).await?;
+                Some(input) = commands.recv() => {
+                    let frame = crate::replay::decode(&input.bytes)?;
+                    upload.observe(&frame)?;
+                    if let Some(reply) = input.reply {
+                        let kind = format!("{}_reply", frame["type"].as_str().context("control type")?);
+                        pending.lock().expect("pending replies").entry(kind).or_default().push_back(reply);
+                    }
+                    write.lock().await.write_all(&input.bytes).await?;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
@@ -242,6 +257,7 @@ async fn collect(
                 _ => {}
             }
             let terminal = frame.value["type"] == "terminal";
+            let response = is_reply(&frame.value).then(|| frame.clone());
             let s = store.clone();
             let r = runtime.clone();
             let job = claims.jti.clone();
@@ -273,6 +289,16 @@ async fn collect(
                 Ok(())
             })
             .await??;
+            if let Some(response) = response {
+                let reply = pending
+                    .lock()
+                    .expect("pending replies")
+                    .get_mut(response.value["type"].as_str().context("reply type")?)
+                    .and_then(std::collections::VecDeque::pop_front);
+                if let Some(reply) = reply {
+                    let _ = reply.send(response.bytes);
+                }
+            }
             if terminal {
                 write_frame(
                     &mut *write.lock().await,
@@ -373,11 +399,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(bytes) = frame {
             let value = crate::replay::decode(&bytes)?;
             position += 1;
-            let reply = matches!(
-                value["type"].as_str(),
-                Some("cancel_reply" | "withdraw_reply" | "job_status_reply")
-            );
-            if (attached || reply) && value["seq"].as_u64().is_none_or(|seq| seq >= minimum) {
+            if attached
+                && !is_reply(&value)
+                && value["seq"].as_u64().is_none_or(|seq| seq >= minimum)
+            {
                 write.write_all(&bytes).await?;
                 if value["type"] == "terminal" {
                     return Ok(());
@@ -402,24 +427,26 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     Some("cancel" | "withdraw" | "job_status") => {
                         let ended = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.terminal.clone());
-                        if let Some(mut terminal) = ended {
-                            let reply = match request.value["type"].as_str().unwrap() {
-                                "cancel" => json!({"type":"cancel_reply","job_id":claims.jti}),
-                                "withdraw" => json!({"type":"withdraw_reply","outcome":if terminal["ran"] == "none" { "withdrawn" } else { "started" }}),
-                                _ => {
-                                    terminal.as_object_mut().context("stored terminal")?.remove("type");
-                                    json!({"type":"job_status_reply","job_id":claims.jti,"state":"ended","terminal":terminal,"unit":null,"unit_alive":false})
-                                }
-                            };
+                        let kind = request.value["type"].as_str().context("control type")?;
+                        if let Some(terminal) = ended {
+                            let reply = stored_reply(kind, &claims.jti, terminal)?;
                             write_frame(&mut write, &reply).await?;
                         } else {
                             let tx = stream.input.lock().expect("job input").clone().context("runner disconnected")?;
-                            tx.send(request.bytes).await?;
+                            let (reply, response) = oneshot::channel();
+                            tx.send(Input { bytes: request.bytes, reply: Some(reply) }).await?;
+                            match response.await {
+                                Ok(bytes) => write.write_all(&bytes).await?,
+                                Err(_) => {
+                                    let terminal = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.terminal.clone()).context("runner disconnected")?;
+                                    write_frame(&mut write, &stored_reply(kind, &claims.jti, terminal)?).await?;
+                                }
+                            }
                         }
                     }
                     Some("bundle_chunk") if attached => {
                         let tx = stream.input.lock().expect("job input").clone().context("runner disconnected")?;
-                        tx.send(request.bytes).await?;
+                        tx.send(Input { bytes: request.bytes, reply: None }).await?;
                     }
                     _ => anyhow::bail!("operation_refused"),
                 }
@@ -427,6 +454,29 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
+}
+
+fn is_reply(frame: &Value) -> bool {
+    matches!(
+        frame["type"].as_str(),
+        Some("cancel_reply" | "withdraw_reply" | "job_status_reply")
+    )
+}
+
+fn stored_reply(kind: &str, job: &str, mut terminal: Value) -> Result<Value> {
+    Ok(match kind {
+        "cancel" => json!({"type":"cancel_reply","job_id":job}),
+        "withdraw" => {
+            json!({"type":"withdraw_reply","outcome":if terminal["ran"] == "none" { "withdrawn" } else { "started" }})
+        }
+        _ => {
+            terminal
+                .as_object_mut()
+                .context("stored terminal")?
+                .remove("type");
+            json!({"type":"job_status_reply","job_id":job,"state":"ended","terminal":terminal,"unit":null,"unit_alive":false})
+        }
+    })
 }
 
 struct UploadOwner(Arc<Stream>);
