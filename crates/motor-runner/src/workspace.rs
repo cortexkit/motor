@@ -1188,6 +1188,8 @@ impl Trees {
         )
     }
 
+    // Only the fill-source import calls this, and that module is Linux-only.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn fetch_fill(
         &self,
         directory: &Path,

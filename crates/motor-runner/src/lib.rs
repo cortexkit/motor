@@ -58,11 +58,12 @@ mod source_seal;
 mod remote_cache;
 mod server;
 mod setup_log;
-// Nothing in a production build uses sibling snapshots yet: production builds
-// keep sibling snapshot mode off, so only tests reach this module.
+// Fill sources move repository objects between Linux job and Fill VMs.
 #[cfg(any(target_os = "linux", test))]
 mod fill_source;
 mod job_memory_budget;
+// Nothing in a production build uses sibling snapshots yet: production builds
+// keep sibling snapshot mode off, so only tests reach this module.
 #[cfg_attr(not(test), allow(dead_code))]
 mod sibling_snapshots;
 mod spool;
