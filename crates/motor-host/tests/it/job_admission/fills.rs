@@ -81,6 +81,12 @@ impl Control for Helper {
     fn available_bytes(&self) -> anyhow::Result<u64> {
         Ok(u64::MAX)
     }
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(4)
+    }
 }
 struct Images;
 impl Resources for Images {
