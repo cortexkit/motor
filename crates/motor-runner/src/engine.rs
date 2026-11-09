@@ -299,11 +299,12 @@ pub struct Config {
     pub(crate) fail_materialize: bool,
     /// Only the negative control proving that a seed without source time-setting
     /// can build stale may disable the time step. No production switch exists.
-    #[cfg(test)]
+    /// Seeding runs only on Linux, so these hooks exist only in Linux tests.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) seed_without_times: bool,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) before_seed_launch: Option<JobWriteHook>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) after_seed: Option<JobWriteHook>,
     #[cfg(test)]
     pub(crate) cpu_topology: Option<CpuTopology>,
@@ -656,11 +657,11 @@ impl Config {
             before_gate: None,
             #[cfg(test)]
             fail_materialize: false,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             seed_without_times: false,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             before_seed_launch: None,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             after_seed: None,
             #[cfg(test)]
             cpu_topology: None,
