@@ -864,9 +864,46 @@ fn prepare_javascript_advisory(
             }
             Err(error) => return Err(error),
         }
+        raise_javascript_directory_times(workspace, tracked, &entry)?;
         prepared.directories.push(entry.directory);
     }
     Ok(prepared)
+}
+
+fn raise_javascript_directory_times(
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let root = crate::caller_path::owner::directory(workspace)?;
+    for (path, object) in &tracked.objects {
+        if object.kind != "tree" || !path.starts_with(&install.directory) {
+            continue;
+        }
+        let directory = crate::caller_path::owner::directory_at(&root, path)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                c"node_modules".as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(error);
+        }
+        // Cached dependency trees can carry old times. A tracked parent must
+        // advertise preparation's new contents to directory-watching scripts.
+        let time = std::time::SystemTime::now().max(directory.metadata()?.modified()?);
+        directory.set_times(fs::FileTimes::new().set_modified(time))?;
+    }
+    Ok(())
 }
 
 fn prepare_javascript_checkouts(
@@ -4332,6 +4369,78 @@ impl Sandbox {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod seed_time_tests {
+    use super::*;
+    use std::{
+        os::unix::fs::symlink,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn old_time(path: &Path) -> SystemTime {
+        let old = UNIX_EPOCH + Duration::new(1_000_000_000, 123_456_789);
+        File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        old
+    }
+
+    #[test]
+    fn javascript_preparation_raises_each_tracked_parent_of_recreated_modules() {
+        let scratch = cortexkit_test_support::ScratchDir::new("javascript-seed-times");
+        let root = scratch.join("repo");
+        let tools_dir = scratch.join("tools");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&tools_dir).unwrap();
+        for name in ["npm", "node"] {
+            symlink("/bin/true", tools_dir.join(name)).unwrap();
+        }
+        for path in [
+            "package.json",
+            "package-lock.json",
+            "member/source",
+            "untouched/source",
+        ] {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), "{}").unwrap();
+        }
+        workspace::git(&root, &["init", "-q"]).unwrap();
+        workspace::git(&root, &["add", "."]).unwrap();
+        let tree = workspace::git(&root, &["write-tree"]).unwrap();
+        let tracked = javascript_tracked_tree(&root, tree.trim()).unwrap();
+        let old = old_time(&root.join("untouched"));
+        let tools = JavascriptTools::at(ToolchainRole::BuildServer, &tools_dir, &tools_dir);
+        let prepared = prepare_javascript_advisory(&root, "repo", &tracked, &tools, |_, _| {
+            for directory in [PathBuf::new(), PathBuf::from("member")] {
+                fs::create_dir(root.join(&directory).join("node_modules")).unwrap();
+                // Emulate a restored dependency tree carrying older metadata.
+                old_time(&root.join(directory));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(prepared.warnings.is_empty());
+        for directory in ["", "member"] {
+            assert!(
+                fs::metadata(root.join(directory))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    > old,
+                "{directory}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(root.join("untouched"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            old
+        );
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_cache_mounts(

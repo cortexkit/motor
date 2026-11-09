@@ -40,6 +40,8 @@ mod platform;
 mod privilege;
 mod return_paths;
 #[cfg(target_os = "linux")]
+mod seed_times;
+#[cfg(target_os = "linux")]
 mod source_seal;
 // Cache records and publication policy are portable; the sandbox transport is
 // Unix-only.
