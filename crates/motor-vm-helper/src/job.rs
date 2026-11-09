@@ -1,6 +1,12 @@
 //! Connection-independent job VMs. Callers name identities, never host paths.
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// Starts expire before the helper's 48-hour tombstone retention ends, so a
+// pruned identity can never become eligible to boot a second time.
+const MAX_START_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_START_FUTURE: Duration = Duration::from_secs(5 * 60);
 
 pub const WORKSPACES: &str = "/var/lib/motor-vm/workspaces";
 pub const IMAGES: &str = "/var/lib/motor-vm/job-images";
@@ -34,11 +40,12 @@ pub struct Start {
 impl Start {
     pub fn validate(&self) -> Result<()> {
         validate_job_id(&self.job_id)?;
-        for id in [
-            &self.account,
-            &self.workspace_disk_id,
-            &self.image_generation_id,
-        ] {
+        let id = uuid::Uuid::parse_str(&self.job_id).unwrap();
+        if id.get_version_num() != 7 || id.get_variant() != uuid::Variant::RFC4122 {
+            return Err(Error("job start requires a UUIDv7".into()));
+        }
+        validate_account(&self.account)?;
+        for id in [&self.workspace_disk_id, &self.image_generation_id] {
             validate_id(id)?;
         }
         if !(1..=32).contains(&self.vcpus) || self.memory_mib == 0 {
@@ -48,6 +55,32 @@ impl Start {
         self.memory_mib
             .checked_mul(1048576)
             .ok_or_else(|| Error("job VM RAM overflow".into()))?;
+        Ok(())
+    }
+
+    pub fn validate_fresh_at(&self, now: SystemTime) -> Result<()> {
+        self.validate()?;
+        let id = uuid::Uuid::parse_str(&self.job_id).unwrap();
+        let millis = u64::from_be_bytes([
+            0,
+            0,
+            id.as_bytes()[0],
+            id.as_bytes()[1],
+            id.as_bytes()[2],
+            id.as_bytes()[3],
+            id.as_bytes()[4],
+            id.as_bytes()[5],
+        ]);
+        let created = UNIX_EPOCH + Duration::from_millis(millis);
+        if now
+            .duration_since(created)
+            .is_ok_and(|age| age > MAX_START_AGE)
+            || created
+                .duration_since(now)
+                .is_ok_and(|ahead| ahead > MAX_START_FUTURE)
+        {
+            return Err(Error("job UUIDv7 timestamp outside start window".into()));
+        }
         Ok(())
     }
 }
@@ -60,6 +93,25 @@ pub fn validate_id(id: &str) -> Result<()> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
     {
         return Err(Error("invalid job resource identity".into()));
+    }
+    Ok(())
+}
+
+/// Account subjects remain byte-for-byte identical in RPCs, registries and the
+/// credential store. Only the object-store prefix replaces ':' with '-'.
+pub fn validate_account(account: &str) -> Result<()> {
+    if !account.contains(':') {
+        return validate_id(account);
+    }
+    let (kind, ulid) = account.split_once(':').unwrap();
+    if !matches!(kind, "acct" | "org")
+        || ulid.len() != 26
+        || !ulid
+            .bytes()
+            .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
+        || ulid.as_bytes()[0] > b'7'
+    {
+        return Err(Error("invalid job account subject".into()));
     }
     Ok(())
 }
@@ -77,6 +129,38 @@ pub fn validate_job_id(id: &str) -> Result<()> {
 pub struct Workspace {
     pub account: String,
     pub workspace_disk_id: String,
+    #[serde(default)]
+    pub role: WorkspaceRole,
+}
+
+/// Internal request for the future disk-reservation caller. A host request has
+/// no role selector: host-created disks are always ordinary job workspaces.
+pub struct CreateWorkspace {
+    pub account: String,
+    pub workspace_disk_id: String,
+    pub size_bytes: u64,
+}
+
+/// Fixed by root when provisioning the disk, never by a start request.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRole {
+    #[default]
+    Job,
+    Fill,
+    Base,
+}
+
+impl WorkspaceRole {
+    pub fn permits(self, kind: VmKind) -> bool {
+        matches!(
+            (self, kind),
+            (_, VmKind::Recovery)
+                | (Self::Job, VmKind::Job)
+                | (Self::Fill, VmKind::Fill)
+                | (Self::Base, VmKind::BaseBuild)
+        )
+    }
 }
 
 /// Immutable evidence for one job VMM exit. The helper proves the cgroup empty
@@ -84,9 +168,8 @@ pub struct Workspace {
 /// TAP evidence or releasing the disk. Polls
 /// replay it until the host acknowledges durable receipt. Released, acknowledged
 /// tombstones reject start_job replays for 48 hours after their last record
-/// update. This outlasts the longest job plus the remaining validity of its lease
-/// token: job ids are fresh UUIDv7 values per lease and the host refuses expired
-/// tokens before helper calls.
+/// update. The helper accepts starts only for UUIDv7 timestamps in its 24-hour
+/// start window, so removing a tombstone cannot make that identity reusable.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExitReport {
@@ -122,8 +205,111 @@ impl Operation {
 }
 
 #[cfg(test)]
+pub(crate) fn test_id(number: u64) -> String {
+    static MILLIS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let millis = *MILLIS.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    });
+    uuid::Uuid::from_u128(
+        (u128::from(millis) << 80)
+            | (0x7000u128 << 64)
+            | (0x8000_0000_0000_0000u128 | u128::from(number)),
+    )
+    .to_string()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_uuidv7_freshness_edges_and_non_v7_refusal() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let mut start = Start {
+            kind: VmKind::Job,
+            job_id: test_id(1),
+            account: "account-1".into(),
+            workspace_disk_id: "disk-1".into(),
+            image_generation_id: "gen-1".into(),
+            vcpus: 1,
+            memory_mib: 1,
+            burst_mib: None,
+        };
+        for (offset_ms, accepted) in [
+            (-86_400_000i64, true),
+            (-86_400_001, false),
+            (300_000, true),
+            (300_001, false),
+        ] {
+            let millis = (2_000_000_000_000i64 + offset_ms) as u128;
+            start.job_id = uuid::Uuid::from_u128(
+                (millis << 80) | (0x7000u128 << 64) | 0x8000_0000_0000_0001u128,
+            )
+            .to_string();
+            assert_eq!(
+                start.validate_fresh_at(now).is_ok(),
+                accepted,
+                "offset={offset_ms}"
+            );
+        }
+        start.job_id = "00000000-0000-4000-8000-000000000001".into();
+        assert!(start.validate().unwrap_err().0.contains("UUIDv7"));
+    }
+
+    #[test]
+    fn workspace_role_authorizes_only_its_kind_and_legacy_is_job() {
+        use WorkspaceRole::*;
+        for (role, allowed) in [
+            (Job, [true, false, false, true]),
+            (Fill, [false, true, false, true]),
+            (Base, [false, false, true, true]),
+        ] {
+            for (kind, expected) in [
+                VmKind::Job,
+                VmKind::Fill,
+                VmKind::BaseBuild,
+                VmKind::Recovery,
+            ]
+            .into_iter()
+            .zip(allowed)
+            {
+                assert_eq!(role.permits(kind), expected, "{role:?} {kind:?}");
+            }
+        }
+        let legacy: Workspace =
+            serde_json::from_str(r#"{"account":"account-1","workspace_disk_id":"disk-1"}"#)
+                .unwrap();
+        assert_eq!(legacy.role, Job);
+        assert!(!legacy.role.permits(VmKind::Fill));
+    }
+
+    #[test]
+    fn exact_account_subjects_are_safe_path_components() {
+        for account in [
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "org:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "account-1",
+        ] {
+            validate_account(account).unwrap();
+        }
+        for account in [
+            "acct:../secret",
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV/other",
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV:more",
+            "other:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "acct:01arz3ndektsv4rrffq69g5fav",
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAI",
+            "acct:81ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "acct:short",
+            "..",
+            "a/b",
+        ] {
+            assert!(validate_account(account).is_err(), "{account}");
+        }
+    }
 
     #[test]
     fn vm_kind_defaults_to_job_and_never_accepts_key_material_or_store_paths() {

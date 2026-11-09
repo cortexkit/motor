@@ -36,14 +36,10 @@ impl Access for Fake {
             .push(format!("ensure:{}", tap.tap_index));
         Ok(())
     }
-    fn egress_bytes(&mut self, tap: &Tap) -> Result<u64> {
+    fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>> {
         let mut state = self.0.lock().unwrap();
         state.events.push(format!("read:{}", tap.tap_index));
-        state
-            .bytes
-            .get(&tap.tap_index)
-            .copied()
-            .ok_or_else(|| Error("counter unavailable".into()))
+        Ok(state.bytes.get(&tap.tap_index).copied())
     }
     fn remove(&mut self, tap: &Tap) -> Result<()> {
         let mut state = self.0.lock().unwrap();
@@ -51,7 +47,6 @@ impl Access for Fake {
             let record: Record = serde_json::from_slice(&std::fs::read(path)?).unwrap();
             assert_eq!(record.tap_index, Some(tap.tap_index));
             assert!(record.oom_kill.is_some());
-            assert!(record.egress_bytes.is_some());
         }
         state.events.push(format!("remove:{}", tap.tap_index));
         if state.fail_remove {
@@ -201,7 +196,8 @@ fn startup_removes_leftover_job_network_only_after_durable_final_counters() {
 fn failed_removal_replays_frozen_egress_and_ack_matches_the_entire_report() {
     let (base, mut jobs, fake) = fixture();
     fake.0.lock().unwrap().fail_remove = true;
-    assert!(jobs.collect_exits().is_err());
+    jobs.collect_exits().unwrap();
+    assert!(jobs.collection_failures[&start().job_id].contains(&CollectionFailure::Network));
     let saved = persisted(&jobs);
     assert_eq!(saved.tap_index, Some(17));
     assert_eq!(saved.egress_bytes, Some(1234));
@@ -230,16 +226,30 @@ fn failed_removal_replays_frozen_egress_and_ack_matches_the_entire_report() {
 }
 
 #[test]
-fn missing_counter_cannot_persist_partial_evidence_or_remove_network() {
+fn missing_counter_records_absent_egress_once_and_releases_network_without_retry() {
     let (base, mut jobs, fake) = fixture();
     fake.0.lock().unwrap().bytes.remove(&17);
-    assert!(jobs.collect_exits().is_err());
+    jobs.collect_exits().unwrap();
     let saved = persisted(&jobs);
-    assert_eq!(saved.oom_kill, None);
+    assert_eq!(saved.oom_kill, Some(3));
     assert_eq!(saved.egress_bytes, None);
-    assert_eq!(saved.tap_index, Some(17));
-    assert!(jobs.group(&start().job_id).exists());
-    assert_eq!(fake.0.lock().unwrap().events, ["read:17"]);
+    assert_eq!(saved.tap_index, None);
+    assert!(!jobs.group(&start().job_id).exists());
+    assert!(serde_json::to_value(saved.pending_exit().unwrap())
+        .unwrap()
+        .get("egress_bytes")
+        .is_none());
+    assert_eq!(
+        jobs.collection_failures[&start().job_id],
+        BTreeSet::from([CollectionFailure::MissingEgress])
+    );
+    assert!(!jobs.log_collection_failure(
+        &start().job_id,
+        CollectionFailure::MissingEgress,
+        &"same missing counter"
+    ));
+    jobs.collect_exits().unwrap();
+    assert_eq!(fake.0.lock().unwrap().events, ["read:17", "remove:17"]);
     std::fs::remove_dir_all(base).unwrap();
 }
 

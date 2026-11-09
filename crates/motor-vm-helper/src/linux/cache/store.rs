@@ -34,7 +34,7 @@ fn open_store(path: &Path, create: bool) -> Result<Option<File>> {
 
 pub(super) fn load(path: &Path, account: &str) -> Result<Option<RemoteCacheRequest>> {
     root_only()?;
-    crate::job::validate_id(account)?;
+    crate::job::validate_account(account)?;
     let Some(store) = open_store(path, false)? else {
         return Ok(None);
     };

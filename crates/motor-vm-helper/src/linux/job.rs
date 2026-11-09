@@ -9,7 +9,7 @@ use motor_protocol::REMOTE_CACHE_NONCE_CMDLINE_KEY;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     os::{
         fd::AsRawFd,
@@ -30,7 +30,9 @@ const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 // the command line, adding only the flag that selects the one-job guest mode.
 const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1";
 
+mod conntrack;
 mod network;
+mod workspace;
 use super::tenant_network::Tap;
 
 pub(super) fn network_allocations() -> Result<Vec<Tap>> {
@@ -88,6 +90,16 @@ enum ExitStep {
     Delivery,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CollectionFailure {
+    Reap,
+    Cgroup,
+    Credentials,
+    Evidence,
+    Network,
+    MissingEgress,
+}
+
 pub struct LinuxJobs {
     settings: Option<JobVms>,
     groups: PathBuf,
@@ -97,6 +109,7 @@ pub struct LinuxJobs {
     workspaces: PathBuf,
     records: BTreeMap<String, Record>,
     children: BTreeMap<String, Child>,
+    collection_failures: BTreeMap<String, BTreeSet<CollectionFailure>>,
     next_prune: Option<SystemTime>,
     network: Box<dyn network::Access>,
     #[cfg(test)]
@@ -106,6 +119,9 @@ pub struct LinuxJobs {
 }
 
 impl LinuxJobs {
+    pub fn create_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
+        workspace::create(&self.workspaces, request, job::WorkspaceRole::Job)
+    }
     pub fn new(config: &Config) -> Self {
         Self {
             settings: config.job_vms.clone(),
@@ -116,6 +132,7 @@ impl LinuxJobs {
             workspaces: job::WORKSPACES.into(),
             records: BTreeMap::new(),
             children: BTreeMap::new(),
+            collection_failures: BTreeMap::new(),
             next_prune: None,
             network: Box::new(network::System(config.clone())),
             #[cfg(test)]
@@ -220,35 +237,57 @@ impl LinuxJobs {
         Ok(Some(pid))
     }
 
-    fn reap(&mut self) -> Result<()> {
+    fn reap(&mut self) {
         let mut ended = Vec::new();
+        let mut failed = Vec::new();
         for (id, child) in &mut self.children {
-            if child.try_wait()?.is_some() {
-                ended.push(id.clone());
+            match child.try_wait() {
+                Ok(Some(_)) => ended.push(id.clone()),
+                Ok(None) => (),
+                Err(error) => failed.push((id.clone(), error)),
             }
         }
         for id in ended {
             self.children.remove(&id);
         }
-        Ok(())
+        for (id, error) in failed {
+            self.log_collection_failure(&id, CollectionFailure::Reap, &error);
+        }
+    }
+
+    fn log_collection_failure(
+        &mut self,
+        id: &str,
+        kind: CollectionFailure,
+        error: &dyn std::fmt::Display,
+    ) -> bool {
+        if self
+            .collection_failures
+            .entry(id.into())
+            .or_default()
+            .insert(kind)
+        {
+            eprintln!("job {id} exit evidence {kind:?}: {error}");
+            true
+        } else {
+            false
+        }
     }
 
     pub fn collect_exits(&mut self) -> Result<()> {
-        self.reap()?;
+        self.reap();
         let ids: Vec<_> = self
             .records
             .values()
             .filter(|record| !record.is_tombstone())
             .map(|record| record.start.job_id.clone())
             .collect();
-        let mut result = Ok(());
         for id in ids {
-            if let Err(error) = self.collect_exit(&id) {
-                eprintln!("job {id} exit evidence: {error}");
-                result = Err(error);
-            }
+            // A failed record stays reserved and retries independently. It must
+            // never disable another VM's stop, relay, start or exit delivery.
+            let _ = self.collect_exit(&id);
         }
-        result
+        Ok(())
     }
 
     pub fn maintain(&mut self) -> Result<()> {
@@ -288,16 +327,28 @@ impl LinuxJobs {
                 std::fs::remove_file(&path)?;
                 File::open(&self.records_path)?.sync_all()?;
                 self.records.remove(&id);
+                self.collection_failures.remove(&id);
             }
         }
         Ok(())
     }
 
     fn collect_exit(&mut self, id: &str) -> Result<()> {
+        let mut kind = CollectionFailure::Cgroup;
+        let result = self.collect_exit_inner(id, &mut kind);
+        if let Err(error) = &result {
+            self.log_collection_failure(id, kind, error);
+        }
+        result
+    }
+
+    fn collect_exit_inner(&mut self, id: &str, kind: &mut CollectionFailure) -> Result<()> {
         let group = self.group(id);
         if !group.try_exists()? {
             // A reboot can erase cgroups. No count is better than an invented 0.
+            *kind = CollectionFailure::Credentials;
             self.remove_credentials(id)?;
+            *kind = CollectionFailure::Network;
             return self.remove_network(id);
         }
         if !std::fs::read_to_string(group.join("cgroup.procs"))?
@@ -306,22 +357,34 @@ impl LinuxJobs {
         {
             return Ok(());
         }
+        *kind = CollectionFailure::Credentials;
         self.remove_credentials(id)?;
         let mut record = self.records.get(id).unwrap().clone();
         if record.oom_kill.is_none() {
+            *kind = CollectionFailure::Evidence;
             record.oom_kill = Some(read_oom_kill(&group)?);
             // No live VMM can add traffic after the empty-cgroup proof. Capture
             // both counters in one durable write before destroying either one.
             record.egress_bytes = record
                 .tap()
                 .map(|tap| self.network.egress_bytes(&tap))
-                .transpose()?;
+                .transpose()?
+                .flatten();
+            if record.tap_index.is_some() && record.egress_bytes.is_none() {
+                self.log_collection_failure(
+                    id,
+                    CollectionFailure::MissingEgress,
+                    &"counter missing; egress unmeasured",
+                );
+            }
             self.exit_checkpoint(ExitStep::Captured)?;
             self.save(&record)?;
             self.records.insert(id.into(), record);
             self.exit_checkpoint(ExitStep::Recorded)?;
         }
+        *kind = CollectionFailure::Network;
         self.remove_network(id)?;
+        *kind = CollectionFailure::Cgroup;
         self.remove_empty_group(&group)?;
         self.exit_checkpoint(ExitStep::Removed)
     }
@@ -406,7 +469,10 @@ impl LinuxJobs {
         if let Operation::AckExit(report) = op {
             return self.acknowledge_exit(report);
         }
-        self.collect_exits()?;
+        // Stop must not even wait for collection of an unrelated record.
+        if !matches!(op, Operation::Stop(_)) {
+            self.collect_exits()?;
+        }
         match op {
             Operation::Start(start) => self.start(start, peer),
             Operation::Adopt(id) => self.status(&id),
@@ -424,7 +490,7 @@ impl LinuxJobs {
                 }
                 Ok(Response {
                     reply: Reply::Relay { fd_count: 1 },
-                    fds: vec![tenant::connect_relay(&self.root(&id), port)?],
+                    fds: vec![tenant::connect_relay(&self.root(&id), record.uid, port)?],
                 })
             }
             Operation::Exits => {
@@ -495,7 +561,7 @@ impl LinuxJobs {
     }
 
     fn start(&mut self, start: Start, peer: Peer) -> Result<Response> {
-        start.validate()?;
+        start.validate_fresh_at(SystemTime::now())?;
         let settings = self
             .settings
             .clone()
@@ -515,17 +581,25 @@ impl LinuxJobs {
         let registry: Workspace =
             serde_json::from_reader(fs::trusted_file(&workspace.join("registry.json"))?)
                 .map_err(|e| Error(format!("invalid workspace registry: {e}")))?;
+        job::validate_account(&registry.account)?;
+        job::validate_id(&registry.workspace_disk_id)?;
         if registry.account != start.account
             || registry.workspace_disk_id != start.workspace_disk_id
         {
             return Err(Error("workspace disk identity or account mismatch".into()));
         }
+        if !registry.role.permits(start.kind) {
+            return Ok(Response::new(Reply::StartRefused {
+                case: crate::tenant::StartRefusalCase::WorkspaceRole,
+                message: "workspace disk role does not permit requested VM kind".into(),
+            }));
+        }
         let disk = fs::trusted_file(&workspace.join("workspace.img"))?;
         let meta = disk.metadata()?;
         self.disk_available(&start, meta.dev(), meta.ino())?;
-        if unsafe { libc::flock(disk.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(Error("workspace disk already attached".into()));
-        }
+        // The helper is a singleton; its serialized requests and durable intent
+        // records exclude concurrent use by both workspace id and device/inode.
+        // A local flock would expire when start returns, not when the VM exits.
         let image = Path::new(job::IMAGES).join(&start.image_generation_id);
         let inputs = [
             (fs::trusted_file(&image.join("kernel"))?, "kernel", true),
@@ -608,13 +682,7 @@ impl LinuxJobs {
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&boundary)?;
-            let nonce = cache::stage(
-                &self.cache_store,
-                &start.account,
-                start.kind,
-                &boundary_fd,
-                uid,
-            )?;
+            let nonce = self.stage_start_cache(&start, &boundary_fd, uid)?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             fs::chown(&File::open(&root)?, uid)?;
@@ -634,6 +702,10 @@ impl LinuxJobs {
                 .write(true)
                 .open(group.join("cgroup.procs"))?;
             let mut command = Command::new(binaries.join("jailer"));
+            // v1.17.0 keeps inherited membership with its default cgroup-version
+            // 1 and no --cgroup arguments (jailer/src/env.rs:213-270, 658-661).
+            // Do not add --cgroup-version 2: its no-argument branch can move the
+            // jailer out of this job group, invalidating the empty-group proof.
             command
                 .args(["--id", &format!("job-{id}"), "--exec-file"])
                 .arg(binaries.join("firecracker"))
@@ -682,6 +754,15 @@ impl LinuxJobs {
         tenants.extend(self.records.values().filter_map(Record::tap));
         self.network.install(&tenants)?;
         self.network.ensure(&tap)
+    }
+
+    fn stage_start_cache(
+        &self,
+        start: &Start,
+        boundary: &File,
+        uid: u32,
+    ) -> Result<Option<String>> {
+        cache::stage(&self.cache_store, &start.account, start.kind, boundary, uid)
     }
 
     fn stop(&mut self, id: &str) -> Result<()> {

@@ -1,0 +1,10 @@
+{
+  "generation": "1",
+  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "endpoint": "https://cache.example.com",
+  "region": "test",
+  "bucket": "motor-cache",
+  "prefix": "tenant/acct-01ARZ3NDEKTSV4RRFFQ69G5FAV/",
+  "storage_class": "STANDARD",
+  "enabled": true
+}

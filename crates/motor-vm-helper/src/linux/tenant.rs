@@ -18,7 +18,7 @@ use std::{
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::{
-            fs::{OpenOptionsExt, PermissionsExt},
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::UnixStream,
             process::CommandExt,
         },
@@ -30,6 +30,7 @@ use std::{
 
 struct Running {
     child: Child,
+    uid: u32,
     disk: File,
     root: PathBuf,
     group: PathBuf,
@@ -611,6 +612,7 @@ impl Backend for LinuxTenants {
             tenant.into(),
             Running {
                 child,
+                uid,
                 disk,
                 root: root.clone(),
                 group,
@@ -813,8 +815,8 @@ impl Backend for LinuxTenants {
     }
     fn relay(&mut self, tenant: &str, port: u32) -> Result<OwnedFd> {
         crate::tenant::validate_port(port)?;
-        let root = self.vm(tenant)?.root.clone();
-        connect_relay(&root, port)
+        let vm = self.vm(tenant)?;
+        connect_relay(&vm.root, vm.uid, port)
     }
     fn vm_present(&mut self, tenant: &str) -> Result<bool> {
         crate::tenant::validate_name(tenant)?;
@@ -903,7 +905,7 @@ pub(crate) fn protect_vmm_with(
     check().map_err(|error| crate::tenant::start_refused(StartRefusalCase::Oom, error))
 }
 
-pub(super) fn connect_relay(root: &Path, port: u32) -> Result<OwnedFd> {
+pub(super) fn connect_relay(root: &Path, uid: u32, port: u32) -> Result<OwnedFd> {
     crate::tenant::validate_port(port)?;
     let context = |step: &str, error: &dyn std::fmt::Display| {
         Error(format!(
@@ -911,9 +913,24 @@ pub(super) fn connect_relay(root: &Path, port: u32) -> Result<OwnedFd> {
             root.display()
         ))
     };
-    let root_fd = File::open(root).map_err(|e| context("open_jail_root", &e))?;
-    let socket_root = PathBuf::from(format!("/proc/self/fd/{}", root_fd.as_raw_fd()));
-    let mut stream = super::wait_socket(&socket_root.join("vsock.sock"), Duration::from_secs(10))
+    let root_fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)
+        .map_err(|e| context("open_jail_root", &e))?;
+    // Pin the socket inode, not a name that the jailed VMM can replace with a
+    // symlink. The descriptor remains alive through connect and the handshake.
+    let socket = fs::beneath(root_fd.as_raw_fd(), "vsock.sock", libc::O_PATH, 0)
+        .map_err(|e| context("open_vsock", &e))?;
+    let metadata = socket.metadata()?;
+    if !metadata.file_type().is_socket() || metadata.uid() != uid {
+        return Err(context(
+            "validate_vsock",
+            &"vsock must be a socket owned by the VM jail uid",
+        ));
+    }
+    let socket_path = PathBuf::from(format!("/proc/self/fd/{}", socket.as_raw_fd()));
+    let mut stream = super::wait_socket(&socket_path, Duration::from_secs(10))
         .map_err(|e| context("connect_uds", &e))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))

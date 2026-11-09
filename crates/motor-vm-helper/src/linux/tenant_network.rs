@@ -488,6 +488,20 @@ fn policy_rules(
     Ok(text)
 }
 
+#[cfg(all(test, feature = "linux-root-tests"))]
+pub(super) fn test_job_policy(uplink: &str, index: u8) -> String {
+    policy_rules(
+        uplink,
+        &[Tap {
+            tap_index: index,
+            uid: 600001,
+        }],
+        None,
+        &Default::default(),
+    )
+    .unwrap()
+}
+
 fn managed_tap(name: &str, suffix: &str) -> Option<String> {
     let digits = name.strip_prefix("tenant_mtap")?.strip_suffix(suffix)?;
     let index: u8 = digits.parse().ok()?;
@@ -1037,6 +1051,28 @@ pub fn egress_bytes(registry: &Tap) -> Result<u64> {
     forward_bytes(&value, &registry.tap())
 }
 
+pub(super) fn optional_egress_bytes(registry: &Tap) -> Result<Option<u64>> {
+    // Listing counters succeeds even when a policy reload removed our table.
+    // Query/parse errors remain errors; only an absent counter is unmeasured.
+    optional_forward_bytes(&nft_json(&["-j", "list", "counters"])?, &registry.tap())
+}
+
+fn optional_forward_bytes(value: &serde_json::Value, tap: &str) -> Result<Option<u64>> {
+    let name = format!("tenant_{tap}_egress");
+    let objects = value["nftables"]
+        .as_array()
+        .ok_or_else(|| Error("missing nft counters".into()))?;
+    if objects.iter().any(|item| {
+        item["counter"]["family"] == "inet"
+            && item["counter"]["table"] == "motor_tenant"
+            && item["counter"]["name"] == name
+    }) {
+        forward_bytes(value, tap).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn nft_table(tables: &serde_json::Value, name: &str) -> Result<Option<serde_json::Value>> {
     let exists = tables["nftables"]
         .as_array()
@@ -1086,6 +1122,23 @@ fn forward_bytes(value: &serde_json::Value, tap: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_job_counter_is_absent_not_zero_and_malformed_counter_is_an_error() {
+        use super::*;
+        use serde_json::json;
+        assert_eq!(
+            optional_forward_bytes(&json!({"nftables":[]}), "mtap17").unwrap(),
+            None
+        );
+        let mut document = json!({"nftables":[{"counter":{"family":"inet","table":"motor_tenant","name":"tenant_mtap17_egress","bytes":0}}]});
+        assert_eq!(
+            optional_forward_bytes(&document, "mtap17").unwrap(),
+            Some(0)
+        );
+        document["nftables"][0]["counter"]["bytes"] = json!("broken");
+        assert!(optional_forward_bytes(&document, "mtap17").is_err());
+        assert!(optional_forward_bytes(&json!({}), "mtap17").is_err());
+    }
     use super::*;
     #[test]
     fn job_taps_use_the_exact_tenant_denies_and_their_own_public_counter() {

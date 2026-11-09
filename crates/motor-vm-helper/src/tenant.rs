@@ -275,6 +275,9 @@ pub(crate) const SNAPSHOT_CREATE_UNCERTAIN: &str = "suspend_create_uncertain";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartRefusalCase {
+    // Only per-job start_job emits this case, never the deployed tenant path.
+    // motor-host retains refusal cases as strings for rolling compatibility.
+    WorkspaceRole,
     Uplink,
     CapacityJson,
     Fit,

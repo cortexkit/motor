@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod exit_tests;
 mod network_tests;
+mod security_tests;
 
 #[test]
 fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
@@ -120,7 +121,7 @@ fn isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse(
 fn start() -> Start {
     Start {
         kind: job::VmKind::Job,
-        job_id: "00000000-0000-4000-8000-000000000001".into(),
+        job_id: job::test_id(1),
         account: "account-1".into(),
         workspace_disk_id: "disk-1".into(),
         image_generation_id: "generation-1".into(),
@@ -144,7 +145,7 @@ fn record() -> Record {
     }
 }
 
-fn scratch() -> PathBuf {
+pub(super) fn scratch() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = cortexkit_test_support::scratch_root().join(format!(
         "helper-job-{}-{}",
@@ -155,7 +156,7 @@ fn scratch() -> PathBuf {
     path
 }
 
-fn machine(base: &Path) -> LinuxJobs {
+pub(super) fn machine(base: &Path) -> LinuxJobs {
     LinuxJobs {
         settings: None,
         groups: base.join("groups"),
@@ -165,6 +166,7 @@ fn machine(base: &Path) -> LinuxJobs {
         workspaces: base.join("workspaces"),
         records: BTreeMap::new(),
         children: BTreeMap::new(),
+        collection_failures: BTreeMap::new(),
         next_prune: None,
         network: Box::<network_tests::Fake>::default(),
         exit_fault: None,
@@ -300,7 +302,7 @@ fn attached_disk_is_refused_by_identity_and_inode_until_released() {
     });
     jobs.adopt_record(record()).unwrap();
     let mut next = start();
-    next.job_id = "00000000-0000-4000-8000-000000000002".into();
+    next.job_id = job::test_id(2);
     let error = jobs
         .handle(
             Operation::Start(next),
