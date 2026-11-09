@@ -87,6 +87,38 @@ fn image_requests_are_identity_only_and_reject_paths_and_unknown_fields() {
 mod root {
     use super::*;
 
+    struct ReflinkStore(PathBuf);
+    impl ReflinkStore {
+        fn new(scratch: &Path) -> Self {
+            let image = scratch.join("image-store.xfs");
+            File::create(&image)
+                .unwrap()
+                .set_len(512 * 1024 * 1024)
+                .unwrap();
+            assert!(Command::new("/usr/sbin/mkfs.xfs")
+                .args(["-q", "-f", "-m", "reflink=1"])
+                .arg(&image)
+                .status()
+                .unwrap()
+                .success());
+            let mount = scratch.join("image-store");
+            std::fs::create_dir(&mount).unwrap();
+            assert!(Command::new("/usr/bin/mount")
+                .args(["-o", "loop,nodev,nosuid,noexec"])
+                .arg(&image)
+                .arg(&mount)
+                .status()
+                .unwrap()
+                .success());
+            Self(mount)
+        }
+    }
+    impl Drop for ReflinkStore {
+        fn drop(&mut self) {
+            fs::unmount(&self.0).expect("unmount disposable XFS image store");
+        }
+    }
+
     fn root_scratch(name: &str) -> ScratchDir {
         assert_eq!(
             unsafe { libc::geteuid() },
@@ -163,7 +195,10 @@ mod root {
     #[test]
     fn isolated_publication_verifies_pins_and_seals_acl_ready_physical_account_images() {
         let scratch = root_scratch("motor-image-publication");
-        let (staging, root, pinned) = stage(scratch.path());
+        // The shared scratch root may be ext4. A disposable XFS store makes
+        // the shared-extent rejection case exercise real reflinks everywhere.
+        let store = ReflinkStore::new(scratch.path());
+        let (staging, root, pinned) = stage(&store.0);
         publish(&staging, &root, "gen-1", provision).unwrap();
         let image = root.join("gen-1");
         let sealed = manifest(&image).unwrap();
