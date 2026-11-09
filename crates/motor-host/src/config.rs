@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -22,6 +22,8 @@ impl HostMode {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PerJobSettings {
+    pub vcpu_ceiling: u32,
+    pub permit_budget: u32,
     pub host_reserve_mib: u64,
     pub boot_reserve_mib: u64,
     pub per_vm_overhead_mib: u64,
@@ -32,6 +34,30 @@ pub struct PerJobSettings {
     pub recovery_timeout_ms: u64,
     pub exit_evidence_bound_ms: u64,
     pub teardown_timeout_ms: u64,
+}
+
+impl PerJobSettings {
+    pub(crate) fn validate_cpus(&self, online: u32) -> Result<()> {
+        ensure!(
+            self.vcpu_ceiling >= 1 && self.vcpu_ceiling <= online,
+            "per_job vcpu_ceiling must be between 1 and online CPUs"
+        );
+        ensure!(
+            self.permit_budget >= self.vcpu_ceiling
+                && u64::from(self.permit_budget) <= 4 * u64::from(online),
+            "per_job permit_budget must be between vcpu_ceiling and 4 * online CPUs"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn online_cpus() -> Result<u32> {
+    // CPU affinity can be narrower than the host's configured online CPUs.
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    u32::try_from(online)
+        .ok()
+        .filter(|n| *n > 0)
+        .context("online CPUs unavailable")
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,7 +71,11 @@ impl HostSettings {
     pub fn from_config(mode: HostMode, per_job: Option<PerJobSettings>) -> Result<Self> {
         Ok(match mode {
             HostMode::Tenant => Self::Tenant,
-            HostMode::PerJob => Self::PerJob(per_job.context("per_job settings are required")?),
+            HostMode::PerJob => {
+                let settings = per_job.context("per_job settings are required")?;
+                settings.validate_cpus(online_cpus()?)?;
+                Self::PerJob(settings)
+            }
         })
     }
 

@@ -353,6 +353,9 @@ impl Host {
     }
 
     pub(crate) fn tenant_disk(&self, now_ms: u64) -> Vec<motor_lease::TenantDisk> {
+        if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
+            return Vec::new();
+        }
         let mut entries = std::collections::BTreeMap::new();
         for binding in self.tenants.values() {
             if !self.is_ready(&binding.tenant) || self.placement_stopping(&binding.tenant) {

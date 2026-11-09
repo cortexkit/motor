@@ -383,6 +383,7 @@ mod config_tests {
 
     fn per_job() -> serde_json::Value {
         json!({
+            "vcpu_ceiling": 1, "permit_budget": 4,
             "host_reserve_mib": 1024, "boot_reserve_mib": 256,
             "per_vm_overhead_mib": 128, "reclaim_timeout_ms": 5000,
             "hysteresis_mib": 512, "workspace_disk_cap_bytes": 10737418240_u64,

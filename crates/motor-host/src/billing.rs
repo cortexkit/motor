@@ -636,7 +636,7 @@ impl Host {
         Heartbeat {
             // While host storage is low, new leases are refused, so no free
             // vCPUs are advertised and the broker places no new work here.
-            free_vcpus: if self.storage_refusing() {
+            free_vcpus: if self.storage_refusing() || self.snapshot.per_job.dax_failed {
                 0
             } else if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
                 self.job_free_vcpus(now_ms)
@@ -647,7 +647,11 @@ impl Host {
                     .max()
                     .unwrap_or(0)
             },
-            free_mem_mib,
+            free_mem_mib: if self.snapshot.per_job.dax_failed {
+                0
+            } else {
+                free_mem_mib
+            },
             queued: self
                 .snapshot
                 .leases
@@ -674,7 +678,7 @@ impl Host {
                     }),
                 })
                 .collect(),
-            healthy,
+            healthy: healthy && !self.snapshot.per_job.dax_failed,
             draining: self.snapshot.draining,
             accept_until_ms: None,
             tenant_disk: self.tenant_disk(now_ms),

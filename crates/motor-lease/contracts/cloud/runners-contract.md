@@ -877,6 +877,38 @@ within one heartbeat interval don't all pass against the same values. The figure
 snapshot, not a lock: the host's own admission is the real limit, and a lease it can't take is
 refused before Run with a fast `hosted_host_full`, which clients retry like `no_capacity`.
 
+#### Hosts in per-job mode
+
+A host may run each job in its own VM instead of one tenant VM. The heartbeat's wire shape is the
+same; only the meaning of the capacity, disk and warm members changes, and the broker reads them
+the same way. A host in tenant-VM mode keeps the meanings above. In per-job mode:
+
+- `free_vcpus` is the host's lease budget minus the requested `vcpus` of every VM it counts: job
+  VMs, and also its own cache-fill and disk-recovery VMs. It is 0 while the host refuses new work
+  for lack of storage.
+- `free_mem_mib` is the host's real available memory, floored to MiB, minus its configured reserve
+  (rounded up to MiB), minus the `mem_mib` of every admitted job whose VM has not finished booting,
+  and 0 if that would be negative. A booted VM uses host memory only as its guest touches it, so
+  the host deliberately overcommits job memory limits, as one shared tenant VM does today. The host
+  enforces this itself: its admission uses the same figure, it reclaims memory first from the VMs
+  furthest over their stated memory, and a VM that cannot give memory back is stopped and reported
+  with `oom_kill: "host_pressure"`. The broker's in-flight ledger still holds a placed job's memory
+  until the job is `admitted` or `started`, which is where the host's booting-job subtraction
+  takes over.
+- `tenant_disk` is omitted, since disk space is held per workspace disk. Placement then applies
+  no disk rule to the host, and the storage refusal in `free_vcpus` is the guard.
+- `warm` lists the workspace disks on the host, one per tenant and `workspace_key_hash`. `vm` is
+  the disk's opaque id, which matches the warm `vm` grammar. `busy` is `true` while the disk is
+  attached to a running job's VM or held for recovery. Busy disks are always listed first, then
+  idle disks by most recent use, at most 64 in total, so a workspace in use never looks free.
+- A run token whose `placement.vm` names a disk bound to the token's `sub` and
+  `workspace_key_hash` uses that disk. If the disk is busy, the job is admitted and queued behind
+  the job using it, as in tenant-VM mode. A `placement.vm` that names no such disk gets a fresh
+  disk; a host never attaches another workspace's disk because of a token or hint.
+
+Registered ceilings, the revocation fence, the usage report and the `mem_burst_mib` claim are the
+same in both modes.
+
 Running entries are processed in order. An unknown, claim-only or other-host job is listed in
 `ignored` without failing siblings or writing `TenantDO` storage. That includes a job
 [replaced](#post-v1leasesjob_idreplace) away from this host. A host must stop a job its reply

@@ -15,6 +15,9 @@ pub mod storage;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
+    /// A DAX-less boot requires operator intervention, not an automatic retry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dax_failed: bool,
     /// Disk ids are opaque VM names in placement hints, not account or workspace names.
     pub disks: BTreeMap<String, WorkspaceDisk>,
     pub executions: BTreeMap<String, Execution>,
@@ -26,7 +29,8 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn is_empty(&self) -> bool {
-        self.disks.is_empty()
+        !self.dax_failed
+            && self.disks.is_empty()
             && self.executions.is_empty()
             && self.bases.is_empty()
             && self.images.is_empty()
@@ -111,6 +115,12 @@ pub fn guest_ram_mib(claims: &Claims) -> Option<u64> {
 }
 
 impl Host {
+    pub(crate) fn set_dax_failed(&mut self, failed: bool) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        next.per_job.dax_failed = failed;
+        self.save(next)
+    }
+
     pub(super) fn job_warm_workspaces(&self) -> Vec<motor_lease::WarmVm> {
         let mut entries: Vec<_> = self
             .snapshot
@@ -119,19 +129,20 @@ impl Host {
             .iter()
             .filter(|(_, disk)| !disk.deleted)
             .map(|(id, disk)| {
-                let busy =
-                    disk.quarantined || disk.attached_job.is_some() || !disk.queue.is_empty();
-                let used = self
-                    .snapshot
-                    .per_job
-                    .executions
-                    .values()
-                    .filter(|e| &e.disk_id == id)
-                    .map(|e| e.claims.iat)
-                    .max()
-                    .unwrap_or(0);
+                let priority = if disk.attached_job.is_some() {
+                    3
+                } else if !disk.queue.is_empty() {
+                    2
+                } else if disk.quarantined || disk.recovery.is_some() {
+                    1
+                } else {
+                    0
+                };
+                let busy = priority > 0;
+                // Disk recency survives retention of the jobs that used it.
+                let used = disk.storage.as_ref().map_or(0, |s| s.last_used_ms);
                 (
-                    busy,
+                    priority,
                     used,
                     motor_lease::WarmVm {
                         tenant: disk.sub.clone(),
@@ -156,6 +167,14 @@ impl Host {
 
     pub fn record_host_resources(&mut self, resources: HostResources) {
         self.host_resources = Some(resources);
+        self.host_resources_failed.set(false);
+    }
+
+    pub(crate) fn host_resources_unavailable(&mut self, detail: &str) {
+        self.host_resources = None;
+        if !self.host_resources_failed.replace(true) {
+            tracing::warn!(detail, "host_resources_unavailable");
+        }
     }
 
     pub fn job_free_mem_mib(&self, now_ms: u64) -> u64 {
@@ -186,9 +205,13 @@ impl Host {
     }
 
     pub(crate) fn fresh_host_resources(&self, now_ms: u64) -> Option<HostResources> {
-        self.host_resources.filter(|sample| {
+        let fresh = self.host_resources.filter(|sample| {
             now_ms >= sample.at_ms && now_ms - sample.at_ms <= super::MEMORY_FRESH_MS
-        })
+        });
+        if fresh.is_none() && !self.host_resources_failed.replace(true) {
+            tracing::warn!("host_resources_missing_or_stale");
+        }
+        fresh
     }
 
     pub(super) fn claim_job(
@@ -227,6 +250,9 @@ impl Host {
         } else {
             if claims.purpose == Purpose::Attach {
                 return Err(Refusal::Auth.into());
+            }
+            if ledger.dax_failed {
+                return Err(RefusalCause::DaxRequired.into());
             }
             let HostSettings::PerJob(settings) = &self.settings else {
                 return Err(Refusal::Auth.into());
@@ -332,6 +358,16 @@ impl Host {
             // Identity, queue position, memory and storage debits become visible together,
             // before lease_ok and before any launch authorization is returned.
             self.save(next)?;
+            if let Some(hinted_vm) = &claims.placement.vm {
+                if hinted_vm != &disk_id {
+                    tracing::info!(
+                        jti = %claims.jti,
+                        hinted_vm,
+                        actual_disk = %disk_id,
+                        "workspace_placement_hint_stale"
+                    );
+                }
+            }
         }
         self.next_connection += 1;
         let id = self.next_connection;

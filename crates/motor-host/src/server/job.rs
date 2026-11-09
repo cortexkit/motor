@@ -265,6 +265,7 @@ impl Runtime {
         if !self.per_job() {
             return Ok(());
         }
+        self.probe_storage();
         let mut failure = self.collect_job_exits(now_ms).err();
         let due: Vec<_> = {
             let host = self.host.lock().expect("host lock");
@@ -725,6 +726,24 @@ async fn failed<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+pub(super) fn host_available_mib(meminfo: &str) -> Result<u64> {
+    let mut samples = meminfo
+        .lines()
+        .filter_map(|line| line.strip_prefix("MemAvailable:"));
+    let value = samples.next().context("host MemAvailable missing")?;
+    ensure!(samples.next().is_none(), "duplicate host MemAvailable");
+    let mut fields = value.split_whitespace();
+    let kib: u64 = fields
+        .next()
+        .context("host MemAvailable value missing")?
+        .parse()?;
+    ensure!(
+        fields.next() == Some("kB") && fields.next().is_none(),
+        "invalid host MemAvailable units"
+    );
+    Ok(kib / 1024)
+}
+
 async fn boot(
     runtime: &Arc<Runtime>,
     execution: &Execution,
@@ -807,6 +826,19 @@ async fn boot(
     let job = execution.claims.jti.clone();
     let initialized =
         tokio::task::spawn_blocking(move || control.job_admin(&job, &request)).await??;
+    if initialized["ok"] != true && initialized["error"] == "job_vm_dax_required" {
+        runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .set_dax_failed(true)?;
+        tracing::error!(
+            jti = %execution.claims.jti,
+            reason = "job_vm_dax_required",
+            image_generation = %assignment.image_generation_id,
+            "job_boot_dax_failure"
+        );
+    }
     ensure!(
         initialized["ok"] == true,
         "job runner initialization refused"

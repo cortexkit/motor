@@ -15,6 +15,7 @@ pub enum RefusalCause {
     Suspending,
     StopPending,
     QuarantinedWorkspace,
+    DaxRequired,
 }
 
 impl RefusalCause {
@@ -38,6 +39,7 @@ impl RefusalCause {
             Self::Suspending => "suspending",
             Self::StopPending => "stop_pending",
             Self::QuarantinedWorkspace => "quarantined_workspace",
+            Self::DaxRequired => "dax_required",
         }
     }
 }
