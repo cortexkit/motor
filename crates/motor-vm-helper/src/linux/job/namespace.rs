@@ -214,8 +214,8 @@ fn links() -> Result<Vec<Value>> {
     if !output.status.success() {
         return Err(Error("cannot inspect job veth ownership".into()));
     }
-    Ok(serde_json::from_slice(&output.stdout)
-        .map_err(|e| Error(format!("invalid link inventory: {e}")))?)
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| Error(format!("invalid link inventory: {e}")))
 }
 
 fn owned(link: &Value, id: &str, tap: &Tap) -> Result<bool> {
