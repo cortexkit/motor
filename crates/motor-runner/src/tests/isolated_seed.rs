@@ -239,6 +239,13 @@ fn artifacts(output: &str) -> BTreeSet<String> {
 }
 
 fn assert_build(runner: &Runner, id: Uuid, output: &str, expected: &[&str], seeded: bool) {
+    let log = runner.job_log(id);
+    let build = log.seed_build.lock().unwrap();
+    assert_eq!(
+        build.is_some(),
+        seeded,
+        "seeded state must reach launch: {output}"
+    );
     assert!(
         output
             .lines()
@@ -251,9 +258,6 @@ fn assert_build(runner: &Runner, id: Uuid, output: &str, expected: &[&str], seed
         expected.iter().map(|s| (*s).to_owned()).collect(),
         "{output}"
     );
-    let log = runner.job_log(id);
-    let build = log.seed_build.lock().unwrap();
-    assert_eq!(build.is_some(), seeded, "seeded state must reach launch");
     if seeded {
         assert_eq!(
             build.as_ref().unwrap().count(),
@@ -345,6 +349,7 @@ async fn changed_case(kind: &str) {
         let runner = base_store_runner(config.clone());
         run(&f, &runner, kind, "true").await;
         drop(runner);
+        evict_unbuilt_target(&f, kind);
         config.disable_warm_builds = false;
     }
     let runner = base_store_runner(config);
@@ -426,6 +431,7 @@ async fn old_dated_change(without_times: bool) {
     let runner = base_store_runner(config.clone());
     run(&f, &runner, "old-dated", "true").await;
     drop(runner);
+    evict_unbuilt_target(&f, "old-dated");
     let path = f
         .scratch
         .join("remote/worktrees/old-dated/leaf/src/watched/value");
@@ -570,7 +576,9 @@ async fn isolated_seed_ignored_watched_file_and_clean_keep_next_job_unseeded() {
     )
     .await;
     assert_build(&runner, id, &output, &[], true);
-    run(&f, &runner, "ignored", "cargo clean").await;
+    // The target is a mountpoint. Full `cargo clean` tries to unlink that root,
+    // so clean the profile, then remove only its contents, never the mount.
+    run(&f, &runner, "ignored", "cargo clean --profile dev && find \"$CARGO_TARGET_DIR\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +").await;
     let workspace = f.scratch.join("remote/worktrees/ignored");
     assert!(workspace.join("leaf/src/watched/ignored").is_file());
     assert!(fs::read_dir(workspace.join("target"))
@@ -592,6 +600,39 @@ async fn isolated_seed_ignored_watched_file_and_clean_keep_next_job_unseeded() {
     );
     let (id, output) = run(&f, &runner, "ignored", BUILD).await;
     assert_build(&runner, id, &output, &[], false);
+}
+
+fn evict_unbuilt_target(f: &Fixture, key: &str) {
+    let target = f.scratch.join(format!("remote/worktrees/{key}/target"));
+    assert!(
+        !target.join("bd").exists(),
+        "the preparation job must not compile anything"
+    );
+    // Even a no-op setup leaves a marker saying legacy Cargo outputs were
+    // cleaned. Evict that otherwise unbuilt folder so the later reused-workspace
+    // job has an empty seed target.
+    fs::remove_dir_all(&target).unwrap();
+    fs::create_dir(&target).unwrap();
+    assert!(fs::read_dir(target).unwrap().next().is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires root, systemd, motor-cache/motor-job accounts and reflink scratch"]
+async fn isolated_seed_baseline_bare_clean_cannot_unlink_ordinary_job_target_mount() {
+    let (f, mut config, _) = fixture();
+    config.fixed_path_repositories.clear();
+    config.disable_warm_builds = true;
+    let runner = base_store_runner(config);
+    let (_, output) = run(
+        &f,
+        &runner,
+        "ordinary-clean",
+        "cargo clean; result=$?; test \"$result\" -eq 101",
+    )
+    .await;
+    assert!(output.contains("failed to remove directory"), "{output}");
+    assert!(output.contains("/run/motor/target"), "{output}");
+    assert!(output.contains("Permission denied"), "{output}");
 }
 
 #[tokio::test]
