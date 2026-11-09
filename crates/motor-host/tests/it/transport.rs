@@ -1082,9 +1082,18 @@ async fn host_drain_admin_socket_ops_are_host_level_and_durable() {
     assert_eq!(drain["draining"], true);
     assert!(drain["set_at_ms"].as_u64().unwrap() >= before);
     assert!(disk_host(dir.path()).snapshot.draining);
+    let no_op = exchange(&socket, json!({"op":"begin_bounded_drain"})).await;
+    assert_eq!(no_op["bounded_drain_started"], false);
+    assert_eq!(no_op["no_op"], "already_draining");
+    let no_op = exchange(&socket, json!({"op":"cancel_bounded_drain"})).await;
+    assert_eq!(no_op["bounded_drain_cancelled"], false);
+    assert_eq!(no_op["no_op"], "fully_drained; use undrain-host");
+    assert_eq!(no_op["draining"], true);
     for invalid in [
         json!({"op":"drain_host","tenant":"tenant"}),
         json!({"op":"drain_host","extra":true}),
+        json!({"op":"begin_bounded_drain","extra":true}),
+        json!({"op":"cancel_bounded_drain","extra":true}),
         json!({"op":"resume"}),
         json!({"op":"status"}),
     ] {
@@ -1095,6 +1104,30 @@ async fn host_drain_admin_socket_ops_are_host_level_and_durable() {
     assert_eq!(cleared["ok"], true);
     assert_eq!(cleared["draining"], false);
     assert!(!disk_host(dir.path()).snapshot.draining);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .claim(claims(JOB), NOW * 1000)
+        .unwrap();
+    let bounded = exchange(&socket, json!({"op":"begin_bounded_drain"})).await;
+    assert_eq!(bounded["bounded_drain_started"], true);
+    assert_eq!(bounded["draining"], false);
+    let bound = bounded["accept_until_ms"].as_u64().unwrap();
+    assert!(bound >= before + 30_000);
+    assert_eq!(disk_host(dir.path()).snapshot.accept_until_ms, Some(bound));
+    let repeat = exchange(&socket, json!({"op":"begin_bounded_drain"})).await;
+    assert_eq!(repeat["no_op"], "already_bounded");
+    assert_eq!(repeat["accept_until_ms"], bound);
+    let status = exchange(&socket, json!({"op":"host_status"})).await;
+    assert_eq!(status["accept_until_ms"], bound);
+    let cancel = exchange(&socket, json!({"op":"cancel_bounded_drain"})).await;
+    assert_eq!(cancel["bounded_drain_cancelled"], true);
+    assert_eq!(cancel["draining"], false);
+    assert_eq!(cancel["accept_until_ms"], Value::Null);
+    assert_eq!(disk_host(dir.path()).snapshot.accept_until_ms, None);
+    let repeat = exchange(&socket, json!({"op":"cancel_bounded_drain"})).await;
+    assert_eq!(repeat["no_op"], "not_bounded");
     assert!(fake.calls.lock().unwrap().is_empty());
     server.abort();
 }

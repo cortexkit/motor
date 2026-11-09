@@ -632,14 +632,38 @@ the status request follow this same restart fallback.
 
 ## Drain the host for an update
 
-From the checkout on the host, pause fleet placement before stopping or switching
-any service:
+Normally, start a **bounded drain** from the checkout on the host:
+
+```sh
+sudo python3 script/hosted-host/hosted_host.py bounded-drain-host
+sudo python3 script/hosted-host/hosted_host.py host-status
+```
+
+The host fixes `accept_until_ms` once, at the latest host-observed start time
+plus runtime cap among unfinished leases. A lease that has not started counts
+as now plus its full cap; the deadline is never earlier than now. The bound
+survives a motor-host restart and repeated starts cannot extend it. Keep host
+and broker clocks synchronized: the heartbeat deadline is Unix milliseconds on
+the broker's clock.
+
+While bounded, the broker still places short jobs that fit before the deadline,
+including 300 seconds for token lifetime. The host independently refuses a Run
+token if now plus its runtime cap exceeds the bound, using retryable `capacity`
+so the client can request another placement. Attach remains available. A bounded
+drain does not cancel work or force-stop a job at the deadline.
+
+When no unfinished lease remains, the host atomically clears the bound and sets
+the durable full drain. **Wait for `host-status` to show `draining: true` and
+`active_leases: 0`**, then obtain a fresh broker acknowledgement before swapping:
 
 ```sh
 sudo python3 script/hosted-host/hosted_host.py drain-host --timeout 120
 ```
 
-The command sets the durable host drain, then waits until the broker echoes
+As a fallback, run `drain-host` immediately to hard-drain placement instead of
+waiting for bounded acceptance. It clears any bound and sets the durable full
+drain without cancelling existing jobs. This fallback can leave the server idle
+beside its longest-running job. In either case, `drain-host` waits until the broker echoes
 `draining: true` in a heartbeat reply received strictly after the set. A timeout
 exits nonzero, leaves the drain set, and stops the update: do not switch binaries
 without that acknowledgement. Inspect the local state and latest reply with:
@@ -648,10 +672,24 @@ without that acknowledgement. Inspect the local state and latest reply with:
 sudo python3 script/hosted-host/hosted_host.py host-status
 ```
 
-`draining` is what the host sends; `broker_draining` is the latest valid heartbeat
+`accept_until_ms` is the fixed bound, or null when not bounded. `draining` is what
+the host sends; `broker_draining` is the latest valid heartbeat
 reply's echo, and `broker_heartbeat_at_ms` is its receipt time in Unix milliseconds
 (null before a reply in the current host process). The drain survives motor-host
-and helper restarts. It does not cancel leases or refuse local admission.
+and helper restarts. Full drain does not refuse local admission, so binding
+canaries remain possible after the swap. Starting a bounded drain on a fully
+drained host is a reported no-op, not an undrain.
+
+To abandon a bounded drain before it becomes a full drain:
+
+```sh
+sudo python3 script/hosted-host/hosted_host.py cancel-bounded-drain-host
+```
+
+Cancellation removes the bound and normal placement resumes on the next accepted
+heartbeat. Once fully drained, cancellation is a reported no-op: use
+`undrain-host` explicitly instead. It must not accidentally clear an operator's
+hard drain.
 
 After the echo, wait for all existing leases to end, checking each tenant's normal
 admin `status` for queued and running jobs. Then stop the services, switch the
@@ -667,8 +705,10 @@ sudo python3 script/hosted-host/hosted_host.py undrain-host
 
 Clearing takes effect at the broker on the next accepted heartbeat. If the canary
 or update fails, leave the drain set while investigating or rolling back. A binary
-older than host self-drain ignores the journal field, so coordinate placement with
-the broker before rolling back to such a version.
+older than bounded drain may not read the new journal value: stop motor-host and
+use the newer binary's `motor-host export-journal <journal-directory>` before
+replacing it. A binary older than host self-drain ignores the drain field, so
+coordinate placement with the broker before rolling back to such a version.
 
 ## Roll back
 

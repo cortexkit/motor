@@ -303,6 +303,7 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
         last_alive,
         closed,
         draining,
+        accept_until_ms,
         per_job,
     } = new;
     diff_entries(tx, REVOCATION, &old.revocations, revocations)?;
@@ -319,6 +320,7 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
     diff_value(tx, "counter", &old.counter, counter)?;
     diff_value(tx, "last_alive", &old.last_alive, last_alive)?;
     diff_value(tx, "draining", &old.draining, draining)?;
+    diff_value(tx, "accept_until_ms", &old.accept_until_ms, accept_until_ms)?;
     write_job_ledger(tx, &old.per_job, per_job)
 }
 
@@ -444,6 +446,7 @@ fn load(conn: &Connection) -> rusqlite::Result<Snapshot> {
             "counter" => snapshot.counter = from_json(&value)?,
             "last_alive" => snapshot.last_alive = from_json(&value)?,
             "draining" => snapshot.draining = from_json(&value)?,
+            "accept_until_ms" => snapshot.accept_until_ms = from_json(&value)?,
             IMPORTED => {}
             _ => return Err(unknown("value", &name)),
         }

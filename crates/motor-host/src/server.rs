@@ -1357,12 +1357,42 @@ impl Runtime {
         ensure!(
             matches!(
                 op,
-                "drain_host" | "undrain_host" | "host_status" | "clear_dax_failure"
+                "drain_host"
+                    | "undrain_host"
+                    | "host_status"
+                    | "clear_dax_failure"
+                    | "begin_bounded_drain"
+                    | "cancel_bounded_drain"
             ) && request == &json!({"op": op}),
             "invalid host admin operation"
         );
         let mut host = self.host.lock().expect("host lock");
+        let mut no_op = None;
+        let mut bounded_drain_started = false;
+        let mut bounded_drain_cancelled = false;
         let set_at_ms = match op {
+            "begin_bounded_drain" => {
+                bounded_drain_started = host.begin_bounded_drain(unix_ms())?;
+                if !bounded_drain_started {
+                    no_op = Some(if host.snapshot.draining {
+                        "already_draining"
+                    } else {
+                        "already_bounded"
+                    });
+                }
+                bounded_drain_started.then(unix_ms)
+            }
+            "cancel_bounded_drain" => {
+                bounded_drain_cancelled = host.cancel_bounded_drain()?;
+                if !bounded_drain_cancelled {
+                    no_op = Some(if host.snapshot.draining {
+                        "fully_drained; use undrain-host"
+                    } else {
+                        "not_bounded"
+                    });
+                }
+                bounded_drain_cancelled.then(unix_ms)
+            }
             "clear_dax_failure" => {
                 host.set_dax_failed(false)?;
                 tracing::info!("host_dax_failure_cleared");
@@ -1377,7 +1407,10 @@ impl Runtime {
         Ok(
             json!({"ok":true,"draining":host.snapshot.draining,"active_leases":active_leases(&host),
             "broker_draining":host.broker_draining,
-            "broker_heartbeat_at_ms":host.broker_heartbeat_at_ms,"set_at_ms":set_at_ms}),
+            "broker_heartbeat_at_ms":host.broker_heartbeat_at_ms,"set_at_ms":set_at_ms,
+            "accept_until_ms":host.snapshot.accept_until_ms,"no_op":no_op,
+            "bounded_drain_started":bounded_drain_started,
+            "bounded_drain_cancelled":bounded_drain_cancelled}),
         )
     }
     pub fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {

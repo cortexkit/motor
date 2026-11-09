@@ -457,6 +457,22 @@ def drain_host(timeout_s: float = 120, path: Path = ADMIN_SOCKET) -> dict:
                      "do not switch binaries; the host drain has not been cleared")
 
 
+def bounded_drain_host(path: Path = ADMIN_SOCKET) -> dict:
+    """Fix the host's acceptance deadline; host-status reports when it is fully drained."""
+    reply = admin_exchange({"op": "begin_bounded_drain"}, path)
+    if reply.get("ok") is not True:
+        raise ValueError(f"motor-host refused begin_bounded_drain: {reply}")
+    return reply
+
+
+def cancel_bounded_drain_host(path: Path = ADMIN_SOCKET) -> dict:
+    """Cancel only an active bound, never an operator's full drain."""
+    reply = admin_exchange({"op": "cancel_bounded_drain"}, path)
+    if reply.get("ok") is not True:
+        raise ValueError(f"motor-host refused cancel_bounded_drain: {reply}")
+    return reply
+
+
 def undrain_host(path: Path = ADMIN_SOCKET) -> dict:
     """Resume fleet placement on the next accepted heartbeat."""
     reply = admin_exchange({"op": "undrain_host"}, path)
@@ -520,14 +536,20 @@ def main() -> int:
     drain = commands.add_parser("drain-host", help="persist host drain and wait for the broker echo")
     drain.add_argument("--timeout", type=float, default=120, help="seconds to wait (default: 120)")
     commands.add_parser("undrain-host", help="clear the durable host drain")
-    commands.add_parser("host-status", help="show the local drain and latest broker echo")
+    commands.add_parser("bounded-drain-host", help="empty the host while accepting jobs that fit its fixed deadline")
+    commands.add_parser("cancel-bounded-drain-host", help="cancel an active bound; full drain requires undrain-host")
+    commands.add_parser("host-status", help="show the bounded/full drain and latest broker echo")
     args = parser.parse_args()
     try:
-        if args.command in {"drain-host", "undrain-host", "host-status"}:
+        if args.command in {"drain-host", "undrain-host", "host-status", "bounded-drain-host", "cancel-bounded-drain-host"}:
             if args.command == "drain-host":
                 reply = drain_host(args.timeout)
             elif args.command == "undrain-host":
                 reply = undrain_host()
+            elif args.command == "bounded-drain-host":
+                reply = bounded_drain_host()
+            elif args.command == "cancel-bounded-drain-host":
+                reply = cancel_bounded_drain_host()
             else:
                 reply = admin_exchange({"op": "host_status"})
                 if reply.get("ok") is not True:

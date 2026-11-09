@@ -7,6 +7,31 @@ guide explains the drain it relies on and how to reverse a deploy.
 
 Install the runner first; see [runner-install.md](runner-install.md).
 
+## Hosted servers: bounded drain before an update
+
+For `motor-host` and its tenant VM, normally empty the server with a bounded
+drain rather than immediately stopping fleet placement:
+
+```sh
+sudo python3 script/hosted-host/hosted_host.py bounded-drain-host
+sudo python3 script/hosted-host/hosted_host.py host-status
+```
+
+The deadline is fixed from the unfinished leases and persists across host
+restarts. Short jobs can still be placed if their full runtime fits, with the
+broker's token-lifetime slack; host admission checks the bound too. The host
+automatically switches to full drain when the last unfinished lease ends. Wait
+for `draining: true` and `active_leases: 0`, then run `drain-host --timeout 120`
+to obtain a fresh broker echo before stopping services. The hard-drain fallback
+is to run that command immediately, then wait for all existing leases to end.
+Neither drain cancels running work.
+
+`cancel-bounded-drain-host` removes an active bound, but never clears a full
+drain. After the swap and canary, use `undrain-host` to resume normal placement.
+See [the hosted update procedure](hosted-host.md#drain-the-host-for-an-update)
+for acknowledgement, image switching and rollback details. The runner commands
+below apply to standalone runner instances, not the host's fleet placement.
+
 ## How drain works
 
 Drain closes admission and waits for accepted work to reach a state that
