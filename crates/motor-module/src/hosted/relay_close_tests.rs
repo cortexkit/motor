@@ -73,6 +73,12 @@ impl motor_host::helper::Control for TenantVm {
     fn available_bytes(&self) -> anyhow::Result<u64> {
         Ok(u64::MAX)
     }
+    fn host_available_mib(&self) -> anyhow::Result<u64> {
+        Ok(u64::MAX)
+    }
+    fn online_cpus(&self) -> anyhow::Result<u32> {
+        Ok(u32::MAX)
+    }
 }
 
 #[derive(Default)]
