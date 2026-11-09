@@ -346,9 +346,10 @@ rewritten and can contain fixed paths. Tests:
 `workspace_changes` non-rewriting have no dedicated test.
 
 Basename collisions with siblings use the legacy path layout, without rewrite
-or seeding. Build-directory preparation keeps dep-info rooted at the fixed
-checkout and sibling aliases only when the fixed plan exists; otherwise it
-uses the legacy caller roots. Tests:
+or seeding. Build-directory preparation treats Cargo's dependency-information
+(`.d`) files as belonging to this checkout when they name the fixed checkout
+or sibling aliases, and only when the fixed plan exists; otherwise it uses the
+legacy caller roots. Tests:
 `prepare_keeps_fixed_checkout_and_sibling_dep_info`,
 `disabled_and_colliding_jobs_use_only_legacy_prepare_roots`
 (`crates/motor-runner/src/cargo_build_dir.rs`),
@@ -506,7 +507,8 @@ creates a staging directory and records its and the empty target's inodes in
 the intent. It then reflinks into staging, exchanges it with the empty
 `target/`, repairs ownership and sets times. Only then is the intent
 removed and the folder becomes an ordinary kept folder. A failure (including
-EXDEV, EOPNOTSUPP, a partial clone or time-step failure) settles the intent,
+a base on another filesystem (`EXDEV`), a filesystem without reflinks
+(`EOPNOTSUPP`), a partial clone or time-step failure) settles the intent,
 empties the seeded target and logs one warning; there is no full-copy or
 hard-link fallback. The job builds normally. Recovery removes only entries
 authorized by the intent, never arbitrary `.motor-seed-*` files. Tests:
