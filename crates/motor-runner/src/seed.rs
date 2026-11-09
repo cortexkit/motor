@@ -172,6 +172,41 @@ pub(crate) fn settle(state: &Path, workspace: &Path) -> io::Result<()> {
     remove_intent(&parent, &entry)
 }
 
+pub(crate) fn pin_target(workspace: &Path) -> io::Result<File> {
+    directory(&root(workspace)?, c"target")
+}
+
+/// Sandbox preparation can lose a cache transport after seeding. Check the
+/// environment launch actually uses and discard incompatible artifacts through
+/// the still-pinned seeded directory, never a workspace pathname.
+pub(crate) fn confirm_environment(
+    target: &File,
+    planned: &std::collections::BTreeMap<String, String>,
+    prepared: &std::collections::BTreeMap<String, String>,
+    job: motor_protocol::Uuid,
+) -> io::Result<bool> {
+    use crate::compile_cache::environment_fingerprint;
+    if environment_fingerprint(planned) == environment_fingerprint(prepared) {
+        return Ok(true);
+    }
+    let names: std::collections::BTreeSet<_> = planned.keys().chain(prepared.keys()).collect();
+    let differed: Vec<_> = names
+        .into_iter()
+        .filter(|name| {
+            let single = |env: &std::collections::BTreeMap<String, String>| {
+                env.get(*name)
+                    .map(|value| ((*name).clone(), value.clone()))
+                    .into_iter()
+                    .collect()
+            };
+            environment_fingerprint(&single(planned)) != environment_fingerprint(&single(prepared))
+        })
+        .collect();
+    tracing::warn!(job_id = %job, inputs = ?differed, "build base seed environment changed during sandbox preparation; building without seed");
+    clear(target, Identity::of(target)?.device)?;
+    Ok(false)
+}
+
 fn exchange(parent: &File, staging: &CStr) -> io::Result<()> {
     if unsafe {
         libc::syscall(
@@ -890,6 +925,199 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct SocketState {
+        generation: Option<crate::remote_cache::provisioning::ActiveGeneration>,
+        forwarders: Vec<crate::remote_cache::transport::Forwarder>,
+        launched: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+    }
+
+    impl crate::backend::IsolationLauncher for SocketState {
+        fn cache_generation(
+            &self,
+        ) -> Option<(
+            &crate::remote_cache::provisioning::ActiveGeneration,
+            &[crate::remote_cache::transport::Forwarder],
+        )> {
+            self.generation
+                .as_ref()
+                .map(|generation| (generation, self.forwarders.as_slice()))
+        }
+
+        fn launch(
+            &self,
+            command: &str,
+            cwd: &Path,
+            env: &[(String, String)],
+            _cpus: &[u32],
+            _resources: crate::backend::JobResources,
+            _sources: crate::source_seal::Sources<'_>,
+        ) -> io::Result<crate::platform::Launch> {
+            *self.launched.lock().unwrap() = env.iter().cloned().collect();
+            crate::platform::launch(command, cwd, env)
+        }
+    }
+
+    #[test]
+    fn remote_socket_loss_after_seed_launches_cold_and_matching_environment_keeps_seed() {
+        use crate::backend::{self, Backend, EnvironmentInputs, HostBackend, Prepared, Setup};
+        use crate::remote_cache::{gateway::Tool, transport::Forwarder};
+        use std::collections::BTreeMap;
+        for sockets_survive in [false, true] {
+            let mut fixture = Fixture::new();
+            fs::write(fixture.workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            fixture.record.tree = fixture.snapshot();
+            let mut config = crate::Config::new(fixture.scratch.join("state"), "seed-test");
+            config.isolate_jobs = true;
+            config.tenant_vm = true;
+            let trees = workspace::Trees {
+                mirrors: config.state_dir().join("mirrors"),
+                state: config.state_dir(),
+                compacting: Default::default(),
+                mirror_locks: Default::default(),
+            };
+            let id = motor_protocol::Uuid::now_v7();
+            let cwd = fixture.workspace.to_string_lossy().into_owned();
+            let setup = Setup {
+                id,
+                cpus: vec![0],
+                memory_mib: None,
+                base: false,
+                recorded: BTreeMap::new(),
+                snapshots: None,
+                request: motor_protocol::Run {
+                    job_id: id,
+                    workspace_key: cwd.clone(),
+                    repository_root: cwd.clone(),
+                    cwd,
+                    command: if sockets_survive {
+                        "test -f target/artifact && printf kept > target/job-output".into()
+                    } else {
+                        "test -z \"$(ls -A target)\" && printf cold > target/job-output".into()
+                    },
+                    env: BTreeMap::new(),
+                    weight_hint: None,
+                    timeout: None,
+                    queue_wait_limit_s: 300,
+                    snapshot_commit: fixture.record.tree.clone(),
+                    tree_hash: fixture.record.tree.clone(),
+                    integration_tip: fixture.record.tree.clone(),
+                    base_commit: Some("source".into()),
+                    siblings: vec![],
+                    bundles: vec![],
+                    git_dependencies: vec![],
+                    return_paths: vec![],
+                    return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+                    return_chunked: false,
+                    gate_job: false,
+                    network: None,
+                    platform: None,
+                    workspace_kind: None,
+                },
+            };
+            let generation = crate::remote_cache::gateway::tests::generation("test", "tenant");
+            let forwarders = vec![Forwarder::new(Tool::Sccache, 4181)];
+            let target = fixture.workspace.join("target");
+            let planned = backend::job_environment(
+                &config,
+                &trees,
+                &setup,
+                &EnvironmentInputs::before_setup(
+                    &config,
+                    &setup,
+                    &fixture.workspace,
+                    &target,
+                    Some((&generation, &forwarders)),
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap();
+            fixture.record.inputs.environment =
+                crate::compile_cache::environment_fingerprint(&planned);
+            fixture.compatibility = Compatibility::Available(fixture.record.inputs.clone());
+            fixture.save_record();
+            assert!(run(&fixture.attempt(), &fixture.ops()).unwrap());
+            let pin = pin_target(&fixture.workspace).unwrap();
+            let launched = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+            // A prepared sandbox reports no generation if socket setup failed.
+            // The portable launcher exercises dispatch without starting a VM.
+            let prepared = Prepared {
+                host_cwd: fixture.workspace.clone(),
+                target,
+                wrapper: None,
+                vm: None,
+                sandbox: Some(Box::new(SocketState {
+                    generation: sockets_survive.then_some(generation),
+                    forwarders,
+                    launched: launched.clone(),
+                })),
+            };
+            let actual = backend::job_environment(
+                &config,
+                &trees,
+                &setup,
+                &prepared.environment_inputs(),
+                1,
+            )
+            .unwrap();
+            let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Log(bytes.clone());
+            let kept = tracing::subscriber::with_default(
+                motor_protocol::logging::LineSubscriber::new("[runner]", log),
+                || confirm_environment(&pin, &planned, &actual, id).unwrap(),
+            );
+            assert_eq!(kept, sockets_survive);
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                logs.matches("build base seed environment changed").count(),
+                usize::from(!sockets_survive)
+            );
+            if !sockets_survive {
+                assert!(logs.contains("RUSTC_WRAPPER"));
+                assert!(
+                    !logs.contains("/motor-tools/sccache"),
+                    "only input names may be logged"
+                );
+            }
+            let mut job = HostBackend
+                .launch(&config, &trees, &setup, &prepared, 1)
+                .unwrap();
+            assert_eq!(*launched.lock().unwrap(), actual);
+            job.process.take();
+            job.execution.release().unwrap();
+            let status = job.execution.wait().unwrap();
+            assert!(status.success());
+            assert_eq!(
+                fs::read_to_string(fixture.workspace.join("target/job-output")).unwrap(),
+                if sockets_survive { "kept" } else { "cold" }
+            );
+        }
+    }
+
+    #[test]
+    fn post_prepare_discard_uses_held_directory_not_replacement_path() {
+        let fixture = Fixture::new();
+        assert!(run(&fixture.attempt(), &fixture.ops()).unwrap());
+        let pin = pin_target(&fixture.workspace).unwrap();
+        let detached = fixture.workspace.join("detached");
+        fs::rename(fixture.workspace.join("target"), &detached).unwrap();
+        fs::create_dir(fixture.workspace.join("target")).unwrap();
+        fs::write(fixture.workspace.join("target/replacement"), "untouched").unwrap();
+        let planned = [("RUSTC_WRAPPER".into(), "old".into())].into();
+        assert!(!confirm_environment(
+            &pin,
+            &planned,
+            &Default::default(),
+            motor_protocol::Uuid::now_v7()
+        )
+        .unwrap());
+        assert!(fs::read_dir(detached).unwrap().next().is_none());
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join("target/replacement")).unwrap(),
+            "untouched"
+        );
     }
 
     #[test]

@@ -929,7 +929,13 @@ impl Backend for HostBackend {
             None
         };
         #[cfg(target_os = "linux")]
-        let seeded = if config.isolate_jobs && !s.base && fixed.is_some() && r.siblings.is_empty() {
+        let mut seeded_environment = None;
+        #[cfg(target_os = "linux")]
+        let mut seeded = if config.isolate_jobs
+            && !s.base
+            && fixed.is_some()
+            && r.siblings.is_empty()
+        {
             let forwarders: Vec<_> = remote_plan
                 .as_ref()
                 .zip(remote.as_ref())
@@ -947,7 +953,13 @@ impl Backend for HostBackend {
                 .map(|(generation, _)| (generation.as_ref(), forwarders.as_slice()));
             let inputs = EnvironmentInputs::before_setup(config, s, &cwd, &target, selected)?;
             match job_environment(config, trees, s, &inputs, s.cpus.len() as u32) {
-                Ok(env) => crate::seed::seed(config, trees, s, fixed.as_ref(), &env)?,
+                Ok(env) => {
+                    let seeded = crate::seed::seed(config, trees, s, fixed.as_ref(), &env)?;
+                    if seeded {
+                        seeded_environment = Some(env);
+                    }
+                    seeded
+                }
                 Err(error) => {
                     tracing::warn!(job_id = %s.id, %error, "build base seed identity unavailable; building without seed");
                     false
@@ -956,6 +968,8 @@ impl Backend for HostBackend {
         } else {
             false
         };
+        #[cfg(target_os = "linux")]
+        let seed_target = seeded.then(|| crate::seed::pin_target(&path)).transpose()?;
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && rust_job(config, s) {
             // Materialization holds the workspace reservation, not the global
@@ -1148,6 +1162,26 @@ impl Backend for HostBackend {
                     })
                 }),
             )?;
+            if let Some(target_pin) = &seed_target {
+                let actual = job_environment(
+                    config,
+                    trees,
+                    s,
+                    &EnvironmentInputs {
+                        host_cwd: &cwd,
+                        target: &target,
+                        wrapper: sandbox.wrapper.as_deref(),
+                        remote: sandbox.cache_generation(),
+                    },
+                    s.cpus.len() as u32,
+                )?;
+                seeded = crate::seed::confirm_environment(
+                    target_pin,
+                    seeded_environment.as_ref().unwrap(),
+                    &actual,
+                    s.id,
+                )?;
+            }
             let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());
             let sandbox = if config.boat_profile {
                 let sandbox = sandbox.with_boat_temporary_paths()?;
