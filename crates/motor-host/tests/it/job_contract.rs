@@ -280,7 +280,10 @@ async fn next(socket: &mut tokio::net::UnixStream) -> Frame {
 
 /// Root-only qualification of docs/job-isolation.md 4.4.2 in one real job VM.
 /// Set MOTOR_VM_TEST_FIRECRACKER, MOTOR_VM_TEST_JAILER and
-/// MOTOR_VM_TEST_JOB_{KERNEL,ROOTFS,TOOLCHAIN} to absolute, readable artifacts.
+/// MOTOR_VM_TEST_JOB_{KERNEL,ROOTFS,TOOLCHAIN} to the absolute kernel,
+/// rootfs.ext4 and toolchain.ext4 emitted by script/tenant-image/build.py build
+/// under /var/lib/motor-vm/job-image-staging/<generation>. No image edits or
+/// separately provisioned argument files are needed.
 /// Uses the helper's production boot requests and the image's production guest
 /// agent/runner. A disconnected TAP exists only in a private network namespace
 /// because guest attach requires eth0; this does not qualify network enforcement.
@@ -418,7 +421,14 @@ fn isolated_job_vm_preserves_full_sandbox_contract() {
             memory_mib: 3072,
             burst_mib: None,
         };
-        for (path, mut body) in boot_requests(&start, Some(tap), None) {
+        for (path, mut body) in boot_requests(
+            &start,
+            Some(tap),
+            None,
+            File::open(&workspace).unwrap().metadata().unwrap().len(),
+        )
+        .unwrap()
+        {
             // Only the host-side device name is fixture-specific; the guest
             // interface and every boot/drive/vsock request stay production's.
             if path == "/network-interfaces/eth0" {
@@ -450,7 +460,7 @@ fn isolated_job_vm_preserves_full_sandbox_contract() {
         .unwrap();
         assert_eq!(
             reply["ok"], true,
-            "production guest initialization: {reply}; job artifacts must provide root-owned /run/motor/runner-args (0600 or 0644) and /toolchain/usr/local/lib/motor/cargo/{{bin,registry,git}}; check MOTOR_VM_TEST_JOB_ROOTFS and MOTOR_VM_TEST_JOB_TOOLCHAIN"
+            "production guest initialization: {reply}; production boot arguments must install root-owned /run/motor/runner-args (0600) and job artifacts must provide /toolchain/usr/local/lib/motor/cargo/{{bin,registry,git}}; check MOTOR_VM_TEST_JOB_ROOTFS and MOTOR_VM_TEST_JOB_TOOLCHAIN"
         );
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

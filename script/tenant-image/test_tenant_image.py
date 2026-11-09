@@ -142,12 +142,57 @@ class ImageTests(unittest.TestCase):
         (stage / "kernel/kernel.config").write_text(resolved_config())
         (stage / "kernel/vmlinux").write_bytes(b"kernel")
         (stage / "rootfs").write_bytes(b"root filesystem")
+        (stage / "job").mkdir()
+        (stage / "job/rootfs.ext4").write_bytes(b"job root filesystem")
+        (stage / "job/toolchain.ext4").write_bytes(b"job toolchain")
         (stage / "packages.txt").write_text("test-package\t1.0\n")
         (stage / "tools.json").write_text('{"fixture": true}\n')
 
     def build(self, version="test-1"):
         return image.build(version, self.root / "images", self.versions, self.runner, builder=self.builder,
                            build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+
+    def test_build_emits_helper_ready_job_staging_and_explicit_generation_for_dotted_version(self):
+        target = image.build("v1.2", self.root / "images", self.versions, self.runner, builder=self.builder,
+                             build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO,
+                             job_generation="v1_2")
+        job = self.root / "job-image-staging/v1_2"
+        self.assertEqual({path.name for path in job.iterdir()},
+                         {"kernel", "rootfs.ext4", "toolchain.ext4", "manifest.json"})
+        self.assertEqual((target / "rootfs").read_bytes(), b"root filesystem")
+        self.assertEqual((job / "kernel").read_bytes(), (target / "vmlinux").read_bytes())
+        before = {path.name: path.read_bytes() for path in job.iterdir()}
+        with self.assertRaises(FileExistsError):
+            image.build("other", self.root / "images", self.versions, self.runner, builder=self.builder,
+                        build_budget=1024**3, free_floor=0, job_generation="v1_2")
+        self.assertEqual({path.name: path.read_bytes() for path in job.iterdir()}, before)
+
+    def test_failed_build_does_not_delete_replaced_job_staging_reservation(self):
+        job = self.root / "job-image-staging/replaced"
+        def fail(*_args):
+            job.rename(job.with_name("original"))
+            job.mkdir()
+            (job / "not-ours").write_text("keep")
+            raise RuntimeError("replacement")
+        with self.assertRaisesRegex(RuntimeError, "replacement"):
+            image.build("replaced", self.root / "images", self.versions, self.runner, builder=fail,
+                        build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+        self.assertEqual((job / "not-ours").read_text(), "keep")
+
+    def test_failed_build_retains_job_staging_mounts(self):
+        job = self.root / "job-image-staging/mounted"
+        def fail(*_args):
+            (job / "mounted").mkdir()
+            raise RuntimeError("mount failure")
+        def mountinfo():
+            return ROOT_MOUNTINFO + (f'2 1 0:2 / {job / "mounted"} rw - tmpfs stub rw\n'
+                                    if (job / "mounted").exists() else '')
+        with mock.patch.object(image.shutil, "rmtree") as remove:
+            with self.assertRaisesRegex(RuntimeError, "mount failure"):
+                image.build("mounted", self.root / "images", self.versions, self.runner, builder=fail,
+                            build_budget=1024**3, free_floor=0, mountinfo_reader=mountinfo)
+            remove.assert_not_called()
+        self.assertTrue((job / "mounted").is_dir())
 
     def change_pin(self, key, value):
         pins = json.loads(self.versions.read_text())
@@ -419,6 +464,8 @@ class ImageTests(unittest.TestCase):
         with mock.patch.object(image.platform, "system", return_value="Linux"), mock.patch.object(image.platform, "machine", return_value="x86_64"), mock.patch.object(image.os, "geteuid", return_value=0):
             image.build_artifacts(stage, image.load_versions(self.versions), self.runner, 4, run=execute)
         self.assertEqual(execute.call_args_list[1].args[0][:6], ["unshare", "--mount", "--propagation", "private", "--", "bash"])
+        self.assertEqual(execute.call_args_list[2].args[0],
+                         ["python3", str(HERE / "job_images.py"), str(stage), "32"])
 
     def test_storage_preflight_refuses_before_builder(self):
         builder = mock.Mock()

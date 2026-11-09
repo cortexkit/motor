@@ -5,7 +5,7 @@ use crate::{
     job::{self, ExitReport, Operation, Start, Workspace},
     Error, Peer, Reply, Response, Result,
 };
-use motor_protocol::REMOTE_CACHE_NONCE_CMDLINE_KEY;
+use motor_protocol::{REMOTE_CACHE_DRIVE_NONCE_BYTES, REMOTE_CACHE_NONCE_CMDLINE_KEY};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -24,6 +24,7 @@ use std::{
 };
 
 const JOB_OOM_SCORE: i32 = 1000;
+const JOB_BOOT_CMDLINE_MAX_BYTES: usize = 1536;
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 // Keep the tenant image's boot contract until published image manifests carry
@@ -863,6 +864,7 @@ impl LinuxJobs {
         }
         let disk = fs::trusted_file(&workspace.join("workspace.img"))?;
         let meta = disk.metadata()?;
+        early_boot_command_line(&start, meta.len())?;
         self.disk_available(&start, meta.dev(), meta.ino())?;
         // The helper is a singleton; its serialized requests and durable intent
         // records exclude concurrent use by both workspace id and device/inode.
@@ -957,6 +959,7 @@ impl LinuxJobs {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&boundary)?;
             let nonce = self.stage_start_cache(&start, &boundary_fd, uid)?;
+            let requests = boot_requests(&start, tap_index, nonce.as_deref(), meta.len())?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             fs::chown(&File::open(&root)?, uid)?;
@@ -994,7 +997,7 @@ impl LinuxJobs {
                 Duration::from_secs(10),
             )?);
             set_job_oom_score(pid, host_score, helper_score)?;
-            for (path, body) in boot_requests(&start, tap_index, nonce.as_deref()) {
+            for (path, body) in requests {
                 tenant::api(&short_root, "PUT", path, &body)?;
             }
             Ok(())
@@ -1185,28 +1188,100 @@ fn set_job_oom_score(pid: u32, host_score: i32, helper_score: i32) -> Result<()>
     Ok(())
 }
 
-/// Git source bundles uploaded by the client use the runner channel, not a
-/// drive. Credentials use a read-only drive,
-/// bound to this boot by a nonce rather than a device letter or virtio serial.
+// These arguments are deliberately not secret: job code can read /proc/cmdline.
+// Disk policy matches tenant provisioning; the parity test pins its constants.
+fn runner_args(start: &Start, disk_bytes: u64, remote_cache: bool) -> Result<String> {
+    start.validate()?;
+    if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
+        return Err(Error("invalid job workspace disk length".into()));
+    }
+    let cache = (disk_bytes / (4 * 1024_u64.pow(3))).min(200);
+    let floor = disk_bytes / 10;
+    let eviction = disk_bytes / 100 * 35 + disk_bytes % 100 * 35 / 100;
+    let remote = if remote_cache {
+        "--remote-cache true "
+    } else {
+        ""
+    };
+    let text = format!(
+        "--backend host --tenant-vm --job-network veth --state-root /tenant/state \
+         --max-weight {0} --rustc-slots {0} \
+         --return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648 \
+         --sccache-size-gib {cache} --free-space-floor-bytes {floor} \
+         --free-space-eviction-bytes {eviction} {remote}\
+         --workspace-root /Users --owned-workspace-root /Users \
+         --workspace-root /home --owned-workspace-root /home",
+        start.vcpus
+    );
+    crate::tenant::activation::validate_runner_args(&text)?;
+    Ok(text)
+}
+
+fn early_boot_command_line(start: &Start, workspace_bytes: u64) -> Result<String> {
+    // Credential staging happens later. Budget for its longest possible line
+    // now so command-line refusal precedes any namespace, cgroup or VM work.
+    let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
+    boot_command_line(start, Some(&nonce), workspace_bytes)
+}
+
+fn checked_boot_command_line(line: String) -> Result<String> {
+    // Both Firecracker and x86 Linux allow 2048 bytes including NUL. Reserve
+    // 512 bytes for Firecracker's appended virtio-mmio device declarations.
+    if line.len() >= JOB_BOOT_CMDLINE_MAX_BYTES {
+        return Err(Error(
+            "job VM boot arguments exceed command-line budget".into(),
+        ));
+    }
+    Ok(line)
+}
+
+fn boot_command_line(start: &Start, nonce: Option<&str>, workspace_bytes: u64) -> Result<String> {
+    if nonce.is_some_and(|nonce| {
+        nonce.len() != REMOTE_CACHE_DRIVE_NONCE_BYTES * 2
+            || !nonce
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }) {
+        return Err(Error("invalid job cache nonce".into()));
+    }
+    let nonce = if start.kind == job::VmKind::Recovery {
+        None
+    } else {
+        nonce
+    };
+    let args = if start.kind == job::VmKind::Recovery {
+        format!("{JOB_BOOT_ARGS} motor.recovery=1")
+    } else {
+        let text = runner_args(start, workspace_bytes, nonce.is_some())?;
+        let encoded: String = text
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("{JOB_BOOT_ARGS} motor.runner_args={encoded}")
+    };
+    let boot_args = match nonce {
+        Some(nonce) => format!("{args} {REMOTE_CACHE_NONCE_CMDLINE_KEY}={nonce}"),
+        None => args,
+    };
+    checked_boot_command_line(boot_args)
+}
+
+/// Client Git bundles stream to the guest runner over vsock, never a drive.
+/// Credentials use a read-only drive, bound to this boot by a nonce rather
+/// than a device letter or virtio serial.
 #[doc(hidden)]
 pub fn boot_requests(
     start: &Start,
     tap_index: Option<u8>,
     nonce: Option<&str>,
-) -> Vec<(&'static str, Value)> {
+    workspace_bytes: u64,
+) -> Result<Vec<(&'static str, Value)>> {
+    let boot_args = boot_command_line(start, nonce, workspace_bytes)?;
     let (tap_index, nonce) = if start.kind == job::VmKind::Recovery {
         (None, None)
     } else {
         (tap_index, nonce)
-    };
-    let args = if start.kind == job::VmKind::Recovery {
-        format!("{JOB_BOOT_ARGS} motor.recovery=1")
-    } else {
-        JOB_BOOT_ARGS.into()
-    };
-    let boot_args = match nonce {
-        Some(nonce) => format!("{args} {REMOTE_CACHE_NONCE_CMDLINE_KEY}={nonce}"),
-        None => args,
     };
     let mut requests = vec![
         (
@@ -1245,7 +1320,7 @@ pub fn boot_requests(
         requests.push(("/drives/remote-cache", json!({"drive_id":"remote-cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})));
     }
     requests.push(("/actions", json!({"action_type":"InstanceStart"})));
-    requests
+    Ok(requests)
 }
 
 #[cfg(test)]
