@@ -92,12 +92,15 @@ pub(crate) fn prepare_target(
     }
     use std::os::unix::fs::DirBuilderExt;
     let state = config.state_dir();
-    let store = repository_store(&state, &request.repository_root);
+    let repository = crate::caller_path::request(request)
+        .caller_repository_root
+        .text();
+    let store = repository_store(&state, repository);
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&store)?;
-    let generation = staging(&state, &request.repository_root, request.job_id);
+    let generation = staging(&state, repository, request.job_id);
     fs::DirBuilder::new().mode(0o700).create(&generation)?;
     let target = generation.join("target");
     fs::create_dir(&target)?;
@@ -173,7 +176,11 @@ pub(crate) fn verify_unchanged(
             "tracked directory inode changed: workspace root",
         ));
     }
-    let mirror = trees.mirror(&request.repository_root);
+    let mirror = trees.mirror(
+        crate::caller_path::request(request)
+            .caller_repository_root
+            .text(),
+    );
     let entries = workspace::snapshot_tree(&mirror, &request.tree_hash)?;
     let mut files = Vec::new();
     for entry in entries.split(|byte| *byte == 0).filter(|s| !s.is_empty()) {
@@ -404,9 +411,12 @@ fn publish_after_link_check(
         .request
         .as_ref()
         .ok_or_else(|| io::Error::other("fill request missing"))?;
-    let generation = staging(state, &request.repository_root, job.id);
+    let repository = crate::caller_path::request(request)
+        .caller_repository_root
+        .text();
+    let generation = staging(state, repository, job.id);
     // No metadata repair, including an ACL restore, may precede this check.
-    check_links(&request.repository_root)?;
+    check_links(repository)?;
     verify_unchanged(trees, request, checkout, launch.reference)?;
     crate::isolation::reclaim_build_base(&generation)?;
     let root = crate::permissions::physical_root(&generation)?;

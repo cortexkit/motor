@@ -8667,7 +8667,10 @@ impl Runner {
                 .map(|env| {
                     crate::build_base::compatibility(
                         &self.core.base_toolchain,
-                        &self.core.trees.mirror(&r.repository_root),
+                        &self
+                            .core
+                            .trees
+                            .mirror(paths::request(&r).caller_repository_root.text()),
                         &r.tree_hash,
                         &env,
                         &PathBuf::from(std::env::var_os("CARGO_HOME").unwrap_or_default())
@@ -10954,8 +10957,11 @@ impl Runner {
     fn publish_build_base(&self, id: Uuid, success: bool) {
         let job = self.core.inner.lock().unwrap().jobs[&id].clone();
         let Some(request) = &job.request else { return };
-        let generation =
-            crate::build_base::staging(&self.core.trees.state, &request.repository_root, id);
+        let generation = crate::build_base::staging(
+            &self.core.trees.state,
+            paths::request(request).caller_repository_root.text(),
+            id,
+        );
         if fs::symlink_metadata(&generation).is_err() {
             return;
         }
@@ -11021,15 +11027,21 @@ impl Runner {
         let Some(request) = job.request else {
             return Ok(());
         };
-        let generation =
-            crate::build_base::staging(&self.core.trees.state, &request.repository_root, id);
+        let generation = crate::build_base::staging(
+            &self.core.trees.state,
+            paths::request(&request).caller_repository_root.text(),
+            id,
+        );
         if fs::symlink_metadata(generation).is_ok() {
             if !self.base_unit_stopped(id)? {
                 return Err(io::Error::other(
                     "cannot remove staging: fill unit not proven stopped",
                 ));
             }
-            self.remove_base_generation(&workspace::name(&request.repository_root), id)?;
+            self.remove_base_generation(
+                &workspace::name(paths::request(&request).caller_repository_root.text()),
+                id,
+            )?;
         }
         Ok(())
     }
