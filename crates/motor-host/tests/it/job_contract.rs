@@ -219,7 +219,7 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let lease = json!({"type":"verified_lease", "jti":id, "purpose":"run", "sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", "vcpus":2, "mem_mib":2048, "platform":"linux-x64", "net":false, "max_s":60, "exp":now+120});
+    let lease = json!({"type":"verified_lease", "jti":id, "purpose":"run", "sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", "vcpus":2, "mem_mib":4096, "platform":"linux-x64", "net":false, "max_s":60, "exp":now+120});
     let write = motor_protocol::write_frame_async;
     write(&mut socket, &serde_json::from_value(lease).unwrap())
         .await
@@ -228,13 +228,14 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
     assert!(matches!(next(&mut socket).await, Frame::Hello { .. }));
     let workspace = "/home/motor-contract";
     let request = json!({"type":"run", "job_id":id, "workspace_key":workspace, "repository_root":workspace, "cwd":workspace,
-        "command":"python3 probe.py", "env":{}, "weight_hint":1, "timeout":60, "queue_wait_limit_s":10,
+        "command":"python3 probe.py", "env":{}, "weight_hint":2, "timeout":60, "queue_wait_limit_s":10,
         "snapshot_commit":commit, "integration_tip":commit, "tree_hash":tree, "siblings":[],
         "bundles":[{"index":0, "repository":workspace, "length":bytes.len(), "sha256":format!("{:x}", Sha256::digest(&bytes))}]});
     write(&mut socket, &serde_json::from_value(request).unwrap())
         .await
         .unwrap();
-    assert!(matches!(next(&mut socket).await, Frame::Accepted(_)));
+    let admitted = next(&mut socket).await;
+    assert!(matches!(admitted, Frame::Accepted(_)), "run not accepted: {admitted:?}");
     write(
         &mut socket,
         &Frame::BundleChunk {
