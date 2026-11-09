@@ -985,7 +985,14 @@ class AutoLoginTests(unittest.TestCase):
         self.plist.parent.mkdir()
         self.plist.touch()
         self.legacy.touch()
+        local_items = self.keychain.parent / "5EE0ADC4-0666-5049-9475-81CC1E6A9984"
+        local_items.mkdir()
+        (local_items / "user.kb").write_bytes(b"bound to the revoked password")
+        other = self.keychain.parent / "not-a-uuid"
+        other.mkdir()
         install.uninstall()
+        self.assertFalse(local_items.exists())
+        self.assertTrue(other.exists())
         self.assertEqual(self.user, "operator")
         self.assertEqual(self.kc.read_bytes(), b"original obfuscated password")
         self.assertEqual(self.keychain.read_bytes(), b"original keychain")

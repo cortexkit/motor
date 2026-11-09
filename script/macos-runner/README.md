@@ -342,8 +342,12 @@ setup), uninstall instead turns auto-login off and removes `/etc/kcpassword`:
 restoring motor auto-login with a revoked password would leave a broken login.
 The operator can re-enable auto-login for their own account. Uninstall retains
 the account, image, pinned tools and runner state;
-it is not a destructive data/account cleanup command. Restart afterwards to leave
-the motor login session. Repeated uninstall is safe.
+it is not a destructive data/account cleanup command. It does remove motor's
+data-protection keychain folder (`~/Library/Keychains/<host UUID>/`), which stays
+bound to the revoked password and would make a later install's keychain unlock
+fail. Restart afterwards to leave the motor login session, and before installing
+again: macOS keeps motor's old keychain binding in memory until a restart.
+Repeated uninstall is safe.
 
 `--check` requires internal APFS state and image volumes unless `install.json`
 records a data-volume UUID. With a recorded UUID, both resolved paths must be on

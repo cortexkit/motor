@@ -380,6 +380,14 @@ def restore_login():
             run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s"))
     # Revoke the installed credential without setting a guessable password or disabling the account.
     secret_run("/usr/bin/dscl", ".", "-passwd", "/Users/motor", secrets.token_urlsafe(32))
+    # The data-protection keychain in Keychains/<host UUID>/ stays bound to the
+    # password it was first unlocked with. After the rotation above nothing can
+    # unlock it, and on macOS 27.2 a later install's keychain unlock then fails
+    # ("passphrase ... not correct") even with the right password. It held only
+    # VM signing keys made at each VM start, so remove it with the credential.
+    for entry in (HOME / "Library/Keychains").glob("*"):
+        if entry.is_dir() and not entry.is_symlink() and re.fullmatch(r"[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}", entry.name):
+            shutil.rmtree(entry)
     if login_managed():
         record = CONFIG / "install.json"
         installed = json.loads(record.read_text())
@@ -409,7 +417,8 @@ def uninstall():
         SSHD.write_text(original)
         raise
     print("Removed runner jobs and managed SSH block; restored login settings/keychain and revoked the saved motor password. "
-          "Account, image and runner state are retained. Restart to leave the auto-login session.")
+          "Account, image and runner state are retained. Restart to leave the auto-login session; "
+          "also restart before installing again, because macOS keeps motor's old keychain binding until then.")
 
 
 def entitlement(binary):
