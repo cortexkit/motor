@@ -160,7 +160,7 @@ impl<'a> EnvironmentInputs<'a> {
             && paths::host_run(config, &setup.request)
                 .host_workspace
                 .join("crates/prefrontal-build-slot/src/main.rs")
-                .try_exists()?;
+                .is_file();
         Ok(Self {
             host_cwd,
             target,
@@ -882,7 +882,7 @@ impl Backend for HostBackend {
             wrapper
         };
         let source = path.join("crates/prefrontal-build-slot/src/main.rs");
-        let mut wrapper = if config.shared_compile_cache() && source.exists() {
+        let mut wrapper = if config.shared_compile_cache() && source.is_file() {
             #[cfg(target_os = "linux")]
             let source = if config.isolate_jobs {
                 // Uploaded Rust compiled as the daemon could use include_str!
@@ -975,39 +975,7 @@ impl Backend for HostBackend {
                 (&remote_plan, &config.remote_cache_runtime)
             {
                 let cargo = path.join("Cargo.toml").is_file();
-                let declaration = if s.base && config.base_commands.is_empty() {
-                    crate::writer::declaration::read(
-                        &trees.mirror(paths::request(r).caller_repository_root.text()),
-                        &r.snapshot_commit,
-                    )
-                    .ok()
-                    .flatten()
-                } else {
-                    None
-                };
-                let tools: Vec<_> = forwarders
-                    .iter()
-                    .map(|f| f.tool())
-                    .filter(|tool| match tool {
-                        crate::remote_cache::gateway::Tool::Sccache => {
-                            cargo
-                                || (s.base
-                                    && declaration.as_ref().is_some_and(|d| {
-                                        d.fills.iter().any(|f| {
-                                            f.tool == crate::writer::declaration::Tool::Sccache
-                                        })
-                                    }))
-                        }
-                        crate::remote_cache::gateway::Tool::Ccache => {
-                            !s.base
-                                || declaration.as_ref().is_some_and(|d| {
-                                    d.fills
-                                        .iter()
-                                        .any(|f| f.tool == crate::writer::declaration::Tool::Ccache)
-                                })
-                        }
-                    })
-                    .collect();
+                let tools = cache_tools(config, trees, s, cargo, forwarders);
                 if !tools.is_empty() {
                     remote = runtime.transport(&generation.tenant, &tools).ok();
                 }
@@ -1378,6 +1346,49 @@ impl Execution for platform::Launch {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn cache_tools(
+    config: &Config,
+    trees: &Trees,
+    setup: &Setup,
+    cargo: bool,
+    forwarders: &[crate::remote_cache::transport::Forwarder],
+) -> Vec<crate::remote_cache::gateway::Tool> {
+    let declaration = if setup.base && config.base_commands.is_empty() {
+        crate::writer::declaration::read(
+            &trees.mirror(paths::request(&setup.request).caller_repository_root.text()),
+            &setup.request.snapshot_commit,
+        )
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    forwarders
+        .iter()
+        .map(|f| f.tool())
+        .filter(|tool| match tool {
+            crate::remote_cache::gateway::Tool::Sccache => {
+                cargo
+                    || (setup.base
+                        && declaration.as_ref().is_some_and(|d| {
+                            d.fills
+                                .iter()
+                                .any(|f| f.tool == crate::writer::declaration::Tool::Sccache)
+                        }))
+            }
+            crate::remote_cache::gateway::Tool::Ccache => {
+                !setup.base
+                    || declaration.as_ref().is_some_and(|d| {
+                        d.fills
+                            .iter()
+                            .any(|f| f.tool == crate::writer::declaration::Tool::Ccache)
+                    })
+            }
+        })
+        .collect()
+}
+
 /// Assemble the effective environment before seeding and again for launch.
 /// The caller supplies the same selected wrapper and remote transport to both;
 /// no generated wrapper executable is needed to compute these values.
@@ -1387,6 +1398,26 @@ pub(crate) fn job_environment(
     s: &Setup,
     prepared: &EnvironmentInputs<'_>,
     weight: u32,
+) -> io::Result<BTreeMap<String, String>> {
+    job_environment_in(
+        config,
+        trees,
+        s,
+        prepared,
+        weight,
+        &paths::host_run(config, &s.request).host_workspace,
+    )
+}
+
+/// Use the same environment assembly for a checkout and a mirror-only fill
+/// plan. Profile settings always come from the requested immutable Git tree.
+pub(crate) fn job_environment_in(
+    config: &Config,
+    trees: &Trees,
+    s: &Setup,
+    prepared: &EnvironmentInputs<'_>,
+    weight: u32,
+    repository: &Path,
 ) -> io::Result<BTreeMap<String, String>> {
     let r = &s.request;
     let mut env = BTreeMap::new();
@@ -1459,7 +1490,7 @@ pub(crate) fn job_environment(
         "CARGO_TARGET_DIR".to_string(),
         job_path(prepared.target).to_string_lossy().to_string(),
     );
-    compile_cache_environment(config, s, prepared, &mut env)?;
+    compile_cache_environment_in(config, s, prepared, &mut env, repository)?;
     // Sandbox::command enforces these even when the local compiler cache is off.
     #[cfg(target_os = "linux")]
     if config.isolate_jobs {
@@ -1469,12 +1500,29 @@ pub(crate) fn job_environment(
     Ok(env)
 }
 
-#[cfg(unix)]
+#[cfg(test)]
 fn compile_cache_environment(
     config: &Config,
     setup: &Setup,
     prepared: &EnvironmentInputs<'_>,
     env: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    compile_cache_environment_in(
+        config,
+        setup,
+        prepared,
+        env,
+        &paths::host_run(config, &setup.request).host_workspace,
+    )
+}
+
+#[cfg(unix)]
+fn compile_cache_environment_in(
+    config: &Config,
+    setup: &Setup,
+    prepared: &EnvironmentInputs<'_>,
+    env: &mut BTreeMap<String, String>,
+    repository: &Path,
 ) -> io::Result<()> {
     #[cfg(unix)]
     scrub_inherited_cache_environment(config, setup, prepared, env);
@@ -1486,11 +1534,7 @@ fn compile_cache_environment(
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && rust_job(config, setup) {
             crate::compile_cache::target_environment(env);
-            crate::compile_cache::profile_environment(
-                env,
-                &paths::host_run(config, &setup.request).host_workspace,
-                &setup.request.tree_hash,
-            );
+            crate::compile_cache::profile_environment(env, repository, &setup.request.tree_hash);
         }
         #[cfg(unix)]
         return remote_cache_environment(config, setup, prepared, env);
@@ -1509,7 +1553,7 @@ fn compile_cache_environment(
     if config.isolate_jobs && rust_job(config, setup) {
         crate::compile_cache::reader_environment(
             env,
-            &paths::host_run(config, &setup.request).host_workspace,
+            repository,
             &setup.request.tree_hash,
             config.sccache_size_gib,
         );
@@ -1544,11 +1588,12 @@ fn compile_cache_environment(
 }
 
 #[cfg(not(unix))]
-fn compile_cache_environment(
+fn compile_cache_environment_in(
     _config: &Config,
     _setup: &Setup,
     _prepared: &EnvironmentInputs<'_>,
     _env: &mut BTreeMap<String, String>,
+    _repository: &Path,
 ) -> io::Result<()> {
     Ok(())
 }

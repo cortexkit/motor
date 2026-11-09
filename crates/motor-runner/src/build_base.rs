@@ -30,6 +30,64 @@ pub(crate) struct Record {
     pub newest_mtime: Timestamp,
 }
 
+pub(crate) const REFILL_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Match checkout file-presence checks using only immutable tree entries.
+/// Resolving a link could depend on files outside the snapshot, so a link at
+/// any path component makes compatibility unavailable.
+pub(crate) fn snapshot_file(repository: &Path, tree: &str, path: &str) -> io::Result<bool> {
+    let components: Vec<_> = path.split('/').collect();
+    let mut prefix = String::new();
+    for (index, component) in components.iter().enumerate() {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        let entry = workspace::git(repository, &["ls-tree", "-z", tree, "--", &prefix])?;
+        if entry.is_empty() {
+            return Ok(false);
+        }
+        let mode = entry
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| io::Error::other(format!("invalid presence entry: {prefix}")))?;
+        if mode == "120000" {
+            return Err(io::Error::other(format!(
+                "symlink in build-base presence path: {prefix}"
+            )));
+        }
+        if index + 1 == components.len() {
+            return Ok(matches!(mode, "100644" | "100755"));
+        }
+        if mode != "040000" {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
+/// Read only the published record: an absent or unreadable generation needs a
+/// replacement, but unavailable current identity is not itself a difference.
+pub(crate) fn needs_fill(
+    state: &Path,
+    repository: &str,
+    tip: &str,
+    fixed_path: &Path,
+    current: &Compatibility,
+) -> bool {
+    let record = fs::read(repository_store(state, repository).join("current/base.json"))
+        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).map_err(io::Error::other));
+    match record {
+        Ok(record) => {
+            record.format != 1
+                || record.commit != tip
+                || record.fixed_path != fixed_path
+                || current.differs_for_due(&record.inputs)
+        }
+        Err(_) => true,
+    }
+}
+
 impl Timestamp {
     pub(crate) fn now() -> Self {
         let now = std::time::SystemTime::now()
@@ -603,6 +661,8 @@ pub(crate) fn compatibility(
     sccache_backend: &Path,
 ) -> Compatibility {
     let collect = || -> io::Result<CompatibleInputs> {
+        snapshot_file(repository, tree, "Cargo.toml")?;
+        snapshot_file(repository, tree, "crates/prefrontal-build-slot/src/main.rs")?;
         let rustc_verbose = runner
             .0
             .as_ref()

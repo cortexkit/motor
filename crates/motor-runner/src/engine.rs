@@ -1353,6 +1353,8 @@ struct BasePlan {
     explicit_command: bool,
     descriptor: io::Result<String>,
     dependency_free: bool,
+    #[cfg(target_os = "linux")]
+    base: Option<(PathBuf, crate::build_base::Compatibility)>,
     /// `None` until read; `queue_base_planned` then reads it itself if it
     /// queues a fill job.
     fill: Option<FillInputs>,
@@ -1363,6 +1365,42 @@ struct FillInputs {
     git_dependencies: io::Result<Vec<GitDependency>>,
     /// Read only when `git_dependencies` is `Ok`.
     tree: Option<io::Result<String>>,
+}
+
+fn fill_request(
+    id: Uuid,
+    root: &str,
+    checkout: &Path,
+    tip: &str,
+    tree: String,
+    command: String,
+    git_dependencies: Vec<GitDependency>,
+) -> Run {
+    Run {
+        return_paths: Vec::new(),
+        return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+        return_chunked: false,
+        gate_job: false,
+        network: None,
+        platform: None,
+        workspace_kind: None,
+        job_id: id,
+        workspace_key: format!("base:{root}"),
+        repository_root: root.to_string(),
+        cwd: checkout.to_string_lossy().to_string(),
+        command,
+        env: BTreeMap::new(),
+        weight_hint: Some(4),
+        timeout: None,
+        queue_wait_limit_s: u64::MAX,
+        snapshot_commit: tip.to_string(),
+        tree_hash: tree,
+        integration_tip: tip.to_string(),
+        siblings: vec![],
+        bundles: vec![],
+        git_dependencies,
+        base_commit: Some(tip.to_string()),
+    }
 }
 
 /// The change tracking of a warm build's compiler cache fill, begun when the
@@ -5447,6 +5485,8 @@ impl Runner {
         let explicit_command = overridden || declared;
         let (descriptor, dependency_free) = self.fill_identity(&mirror, tip, &command, overridden);
         BasePlan {
+            #[cfg(target_os = "linux")]
+            base: self.planned_build_base(&self.core.config, root, tip, &command),
             tip: tip.to_owned(),
             command,
             explicit_command,
@@ -5454,6 +5494,83 @@ impl Runner {
             dependency_free,
             fill: with_fill.then(|| self.fill_inputs(root, tip)),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn planned_build_base(
+        &self,
+        config: &Config,
+        root: &str,
+        tip: &str,
+        command: &str,
+    ) -> Option<(PathBuf, crate::build_base::Compatibility)> {
+        let request = fill_request(
+            Uuid::nil(),
+            root,
+            Path::new(root),
+            tip,
+            tip.to_owned(),
+            command.into(),
+            vec![],
+        );
+        let fixed = paths::fixed_paths(config, &request).ok().flatten()?;
+        let setup = Setup {
+            id: request.job_id,
+            request,
+            cpus: vec![],
+            memory_mib: None,
+            base: true,
+            recorded: BTreeMap::new(),
+            snapshots: None,
+        };
+        let mirror = self.core.trees.mirror(root);
+        let identity = match self.planned_fill_environment(config, &setup, &mirror) {
+            Ok(env) => crate::build_base::compatibility(
+                &self.core.base_toolchain,
+                &mirror,
+                tip,
+                &env,
+                &PathBuf::from(std::env::var_os("CARGO_HOME").unwrap_or_default())
+                    .join("bin/sccache"),
+            ),
+            Err(error) => crate::build_base::Compatibility::Unavailable(error.to_string()),
+        };
+        Some((fixed.checkout, identity))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn planned_fill_environment(
+        &self,
+        config: &Config,
+        setup: &Setup,
+        mirror: &Path,
+    ) -> io::Result<BTreeMap<String, String>> {
+        let tip = &setup.request.snapshot_commit;
+        let supervisor = crate::build_base::snapshot_file(
+            mirror,
+            tip,
+            "crates/prefrontal-build-slot/src/main.rs",
+        )? && config.shared_compile_cache();
+        let cargo = crate::build_base::snapshot_file(mirror, tip, "Cargo.toml")?;
+        let mut remote = config.unit_remote_cache(true);
+        if let Some((_, forwarders)) = &mut remote {
+            let tools = backend::cache_tools(config, &self.core.trees, setup, cargo, forwarders);
+            forwarders.retain(|f| tools.contains(&f.tool()));
+        }
+        let prepared = backend::EnvironmentInputs {
+            host_cwd: mirror,
+            target: Path::new(crate::compile_cache::TARGET),
+            wrapper: supervisor.then(|| Path::new("/motor-tools/prefrontal-build-slot")),
+            remote: remote.as_ref().map(|(g, f)| (g.as_ref(), f.as_slice())),
+        };
+        backend::job_environment_in(
+            config,
+            &self.core.trees,
+            setup,
+            &prepared,
+            WARM_BUILD_VCPUS,
+            mirror,
+        )
     }
     /// The tip's fill descriptor and whether the dependency-free shortcut may
     /// stand in for a fill.
@@ -5563,6 +5680,8 @@ impl Runner {
                 mapped_nested_detail(inner, &self.core.config, &checkout.to_string_lossy(), true)
             });
         let settling = Self::base_settlement_pending(inner, root);
+        #[cfg(target_os = "linux")]
+        let base = plan.base;
         let BasePlan {
             tip,
             command,
@@ -5570,6 +5689,7 @@ impl Runner {
             descriptor,
             dependency_free,
             fill,
+            ..
         } = plan;
         let tip = tip.as_str();
         let repository = inner
@@ -5604,7 +5724,27 @@ impl Runner {
             // the previous attempt's result and cleanup have been settled.
             return Ok(true);
         }
-        if !explicit_command && dependency_free {
+        #[cfg(target_os = "linux")]
+        let base_due = base.is_some_and(|(fixed, identity)| {
+            let now = self.now();
+            // Clamp once and persist the correction. A clock rollback must
+            // delay the next refill by one interval, not until the old date.
+            if let Some(last) = &mut repository.last_base_fill_started_ms {
+                *last = (*last).min(now);
+            }
+            repository.last_base_fill_started_ms.is_none_or(|last| {
+                now.saturating_sub(last) >= crate::build_base::REFILL_INTERVAL_MS
+            }) && crate::build_base::needs_fill(
+                &self.core.trees.state,
+                root,
+                tip,
+                &fixed,
+                &identity,
+            )
+        });
+        #[cfg(not(target_os = "linux"))]
+        let base_due = false;
+        if !base_due && !explicit_command && dependency_free {
             // With no dependency units to cache, recording success is the fill.
             // Remember no-op records so a later explicit command with identical
             // text cannot mistake them for an executed fill.
@@ -5624,7 +5764,7 @@ impl Runner {
             return Ok(true);
         }
         #[cfg(unix)]
-        {
+        if !base_due {
             // One policy decides reuse, the publication gate and the retry cap,
             // and it changes nothing while the remote cache is not publishing.
             let publishing = self.publishing_policy();
@@ -5732,31 +5872,7 @@ impl Runner {
         };
         let tree = tree.expect("the tree is read whenever the git dependencies are usable")?;
         inner.order += 1;
-        let request = Run {
-            return_paths: Vec::new(),
-            return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
-            return_chunked: false,
-            gate_job: false,
-            network: None,
-            platform: None,
-            workspace_kind: None,
-            job_id: id,
-            workspace_key: format!("base:{root}"),
-            repository_root: root.to_string(),
-            cwd: cwd.to_string_lossy().to_string(),
-            command: command.clone(),
-            env: BTreeMap::new(),
-            weight_hint: Some(4),
-            timeout: None,
-            queue_wait_limit_s: u64::MAX,
-            snapshot_commit: tip.to_string(),
-            tree_hash: tree,
-            integration_tip: tip.to_string(),
-            siblings: vec![],
-            bundles: vec![],
-            git_dependencies,
-            base_commit: Some(tip.to_string()),
-        };
+        let request = fill_request(id, root, &cwd, tip, tree, command.clone(), git_dependencies);
         // Warm builds use 4 vCPUs, or the whole allocatable set on a smaller
         // host, where a fixed 4 would be refused and the target never warmed.
         let claim = WARM_BUILD_VCPUS.min(self.core.cpus.capacity());
@@ -7815,6 +7931,12 @@ impl Runner {
             .into_iter()
             .filter(|(_, desired)| self.warm_builds_enabled(&desired.tip))
             .collect();
+        #[cfg(target_os = "linux")]
+        for (root, desired) in self.build_base_candidates(&inner, &self.core.config) {
+            if !wanted.iter().any(|(queued, _)| *queued == root) {
+                wanted.push((root, desired));
+            }
+        }
         #[cfg(unix)]
         if refresh_due {
             // A refresh is a fill like any other: a runner that may not fill
@@ -7852,6 +7974,8 @@ impl Runner {
             }
             #[cfg_attr(not(unix), allow(unused_mut))]
             let mut current = Self::desired_bases(&inner);
+            #[cfg(target_os = "linux")]
+            current.extend(self.build_base_candidates(&inner, &self.core.config));
             #[cfg(unix)]
             if refresh_due {
                 current.extend(self.refresh_bases(&inner, &self.publishing_policy(), now));
@@ -7925,6 +8049,25 @@ impl Runner {
                     .desired
                     .clone()
                     .map(|desired| (root.clone(), desired))
+            })
+            .collect()
+    }
+
+    /// Base storage is independent of descriptor reuse and publication state.
+    /// In particular, enabling a previously warmed repository needs no request.
+    #[cfg(target_os = "linux")]
+    fn build_base_candidates(&self, inner: &Inner, config: &Config) -> Vec<(String, BaseRequest)> {
+        crate::caller_path::entries(&inner.catalog.repositories)
+            .filter(|(path, _)| {
+                config
+                    .fixed_path_repositories
+                    .iter()
+                    .any(|root| root == "*" || root == path.caller.text())
+            })
+            .filter_map(|(path, record)| {
+                let desired = record.desired.as_ref()?;
+                self.warm_builds_enabled(&desired.tip)
+                    .then(|| (path.caller.text().to_owned(), desired.clone()))
             })
             .collect()
     }
@@ -8191,6 +8334,10 @@ impl Runner {
                 self.finish_base(inner, &r, false, None)?;
             }
             return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if job.base {
+            self.record_build_base_start(inner, &self.core.config, &r, self.now())?;
         }
         if job.base {
             inner.writer = Some(id);
@@ -8798,6 +8945,13 @@ impl Runner {
         // Started that is not durable.
         let saved = self.save(&job);
         let mut inner = self.core.inner.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        let saved = saved.and_then(|()| {
+            if job.base {
+                self.record_build_base_start(&mut inner, &self.core.config, &r, started_ms)?;
+            }
+            Ok(())
+        });
         // The start is settled either way: the job is published Running, or
         // `failed_launch` stops its process and refuses it.
         pending.settled();
@@ -11098,6 +11252,29 @@ impl Runner {
             );
         }
         crate::permissions::staging_operation("remove-staging", &self.core.trees.state, key, id)
+    }
+
+    /// Persist the attempt before setup can start, then advance it to the
+    /// command's actual start before releasing execution. Failed setup attempts
+    /// are bounded too; a queued job that has not reserved resources is not.
+    #[cfg(target_os = "linux")]
+    fn record_build_base_start(
+        &self,
+        inner: &mut Inner,
+        config: &Config,
+        request: &Run,
+        now: u64,
+    ) -> io::Result<()> {
+        if paths::fixed_paths(config, request).ok().flatten().is_some() {
+            inner
+                .catalog
+                .repositories
+                .get_mut(&request.repository_root)
+                .expect("a fill has a repository catalog record")
+                .last_base_fill_started_ms = Some(now);
+            self.catalog(inner)?;
+        }
+        Ok(())
     }
 
     /// Record a settled warm build in memory, from `clean_base`'s results:

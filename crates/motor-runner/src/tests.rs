@@ -5607,3 +5607,709 @@ fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
     assert_eq!(terminal.ran, Some(Ran::None));
     assert_eq!(terminal.retry_after_ms(), None);
 }
+
+#[cfg(target_os = "linux")]
+mod base_scheduling {
+    use super::*;
+    use crate::build_base::{self, Compatibility, Record, Timestamp, WrapperIdentity};
+    use crate::remote_cache::publication as policy;
+
+    fn config(f: &Fixture) -> Config {
+        let mut config = f.config();
+        config.manual_tick = true;
+        config.isolate_jobs = true;
+        config.fixed_path_repositories = vec![f.root.clone()];
+        config.account_subject = Some("acct:00000000000000000000000000".into());
+        config
+    }
+
+    fn fixture() -> Fixture {
+        let f = Fixture::new();
+        let supervisor = f.main.join("crates/prefrontal-build-slot/src");
+        fs::create_dir_all(&supervisor).unwrap();
+        fs::write(supervisor.join("main.rs"), "fn main() {}\n").unwrap();
+        commit(&f.main, "supervisor input\n");
+        f
+    }
+
+    fn open(mut config: Config) -> Runner {
+        // Plans keep fixed-path repositories enabled. Opening the runner clears
+        // that setting and disables isolation, without bypassing account or
+        // permission checks.
+        config.fixed_path_repositories.clear();
+        config.isolate_jobs = false;
+        let runner = Runner::open(config).unwrap();
+        runner.core.inner.lock().unwrap().writer = Some(Uuid::nil());
+        runner
+    }
+
+    fn pass(runner: &Runner, config: &Config) {
+        let candidates = runner.build_base_candidates(&runner.core.inner.lock().unwrap(), config);
+        for (root, desired) in candidates {
+            let mut plan = runner.base_plan(&root, &desired.tip, true);
+            plan.base = runner.planned_build_base(config, &root, &desired.tip, &plan.command);
+            let mut inner = runner.core.inner.lock().unwrap();
+            runner
+                .queue_base_planned(&mut inner, &root, &desired.workspace, plan)
+                .unwrap();
+            runner.catalog(&inner).unwrap();
+        }
+    }
+
+    fn desired(f: &Fixture, runner: &Runner) -> String {
+        let (request, bytes) = f.run("true");
+        let upload = f.spool(runner, &request, &bytes);
+        let mut prepare = prepare_for(&request);
+        prepare.bundles = request.bundles.clone();
+        runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+        let plan = runner.base_plan(&f.root, &request.integration_tip, true);
+        let descriptor = plan.descriptor.unwrap();
+        let mut inner = runner.core.inner.lock().unwrap();
+        let record = inner
+            .catalog
+            .repositories
+            .entry(f.root.clone())
+            .or_default();
+        record.desired = Some(BaseRequest {
+            tip: request.integration_tip.clone(),
+            workspace: f.key.clone(),
+            siblings: vec![],
+            git_dependencies: vec![],
+            command: None,
+        });
+        record
+            .filled_descriptors
+            .insert(descriptor.clone(), runner.now());
+        record.filled_descriptor = Some(descriptor.clone());
+        record.requested_descriptor = Some(descriptor);
+        runner.catalog(&inner).unwrap();
+        request.integration_tip
+    }
+
+    fn count(runner: &Runner) -> usize {
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .values()
+            .filter(|job| job.base)
+            .count()
+    }
+
+    fn published(f: &Fixture, runner: &Runner, tip: &str) -> Record {
+        let (fixed_path, identity) = runner
+            .planned_build_base(&config(f), &f.root, tip, "true")
+            .unwrap();
+        Record {
+            format: 1,
+            commit: tip.into(),
+            tree: git(&f.main, &["rev-parse", &format!("{tip}^{{tree}}")]),
+            inputs: identity.for_publication().unwrap().clone(),
+            fixed_path,
+            fill_start: Timestamp::now(),
+            newest_mtime: Timestamp::now(),
+        }
+    }
+
+    fn store(f: &Fixture, runner: &Runner, record: &Record) {
+        let current =
+            build_base::repository_store(&runner.core.trees.state, &f.root).join("current");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(
+            current.join("base.json"),
+            serde_json::to_vec(record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn last_start(f: &Fixture, runner: &Runner) -> Option<u64> {
+        runner.core.inner.lock().unwrap().catalog.repositories[&f.root].last_base_fill_started_ms
+    }
+
+    fn settle_attempt(f: &Fixture, runner: &Runner) {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let jobs: Vec<_> = inner
+            .jobs
+            .values()
+            .filter(|job| job.base && job.terminal.is_none())
+            .cloned()
+            .collect();
+        assert_eq!(jobs.len(), 1);
+        for mut job in jobs {
+            let request = job.request.clone().unwrap();
+            runner
+                .record_build_base_start(&mut inner, &config(f), &request, runner.now())
+                .unwrap();
+            refuse_before_start(
+                &runner.core.health,
+                &mut job,
+                RefusalReason::WorkspaceSetupFailed,
+                "scheduling-only fixture",
+                None,
+                None,
+                runner.now(),
+            );
+            runner.save(&job).unwrap();
+            inner.jobs.insert(job.id, job);
+        }
+    }
+
+    #[test]
+    fn old_catalog_bytes_are_unchanged_without_base_fill_start() {
+        let bytes = br#"{"workspaces":{},"repositories":{"/repo":{"failure_detail":null,"filled_descriptor":"old","filled_descriptors":{"old":123},"recorded_without_writer":[],"miss_refills":[],"failed_descriptor":null,"requested_descriptor":"old","commit":"tip","finished_ms":123,"result":"ok","desired":null,"publications":{},"publish_failures":{}}},"legacy_generations_pending":true,"generation_migration_complete":false,"sibling_commits":{},"transferred":{}}"#;
+        let catalog: Catalog = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(
+            catalog.repositories["/repo"].last_base_fill_started_ms,
+            None
+        );
+        assert_eq!(serde_json::to_vec(&catalog).unwrap(), bytes);
+    }
+
+    #[test]
+    fn enabling_a_reusable_repository_and_dependency_free_graph_queues_one_fill() {
+        for dependency_free in [false, true] {
+            let f = fixture();
+            let mut disabled = config(&f);
+            disabled.fixed_path_repositories.clear();
+            if dependency_free {
+                disabled.base_commands.clear();
+            }
+            let runner = open(disabled.clone());
+            desired(&f, &runner);
+            pass(&runner, &disabled);
+            assert_eq!(count(&runner), 0);
+            drop(runner);
+            disabled.fixed_path_repositories = vec![f.root.clone()];
+            let runner = open(disabled.clone());
+            pass(&runner, &disabled);
+            pass(&runner, &disabled);
+            assert_eq!(count(&runner), 1, "dependency_free={dependency_free}");
+        }
+    }
+
+    #[test]
+    fn source_only_tip_and_eviction_wait_six_hours_across_restart() {
+        let f = fixture();
+        let config = config(&f);
+        let runner = open(config.clone());
+        let tip = desired(&f, &runner);
+        let record = published(&f, &runner, &tip);
+        store(&f, &runner, &record);
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 0);
+        let started = runner.now();
+        let request = fill_request(
+            Uuid::nil(),
+            &f.root,
+            Path::new(&f.key),
+            &tip,
+            record.tree.clone(),
+            "true".into(),
+            vec![],
+        );
+        runner
+            .record_build_base_start(
+                &mut runner.core.inner.lock().unwrap(),
+                &config,
+                &request,
+                started,
+            )
+            .unwrap();
+        commit(&f.main, "source-only change\n");
+        let next = desired(&f, &runner);
+        assert_ne!(tip, next);
+        f.clock.store(
+            started + build_base::REFILL_INTERVAL_MS - 1,
+            Ordering::SeqCst,
+        );
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 0);
+        drop(runner);
+        let runner = open(config.clone());
+        assert_eq!(last_start(&f, &runner), Some(started));
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 0);
+        f.clock.fetch_add(1, Ordering::SeqCst);
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 1);
+        settle_attempt(&f, &runner);
+        let started = last_start(&f, &runner).unwrap();
+        store(&f, &runner, &published(&f, &runner, &next));
+        fs::remove_dir_all(
+            build_base::repository_store(&runner.core.trees.state, &f.root).join("current"),
+        )
+        .unwrap();
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 1);
+        drop(runner);
+        let runner = open(config.clone());
+        f.clock.store(
+            started + build_base::REFILL_INTERVAL_MS - 1,
+            Ordering::SeqCst,
+        );
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 1);
+        f.clock.fetch_add(1, Ordering::SeqCst);
+        pass(&runner, &config);
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 2);
+    }
+
+    #[test]
+    fn incompatible_or_unreadable_same_tip_records_refill_once_after_the_interval() {
+        for difference in [
+            "format",
+            "rustc",
+            "wrapper",
+            "account",
+            "environment",
+            "unreadable",
+        ] {
+            let f = fixture();
+            let config = config(&f);
+            let runner = open(config.clone());
+            let tip = desired(&f, &runner);
+            let mut record = published(&f, &runner, &tip);
+            match difference {
+                "format" => record.format = 2,
+                "rustc" => record.inputs.toolchain.rustc_verbose.push_str(" changed"),
+                "wrapper" => {
+                    record.inputs.toolchain.wrapper = Some(WrapperIdentity::Supervisor {
+                        source_sha256: "old digest".into(),
+                    })
+                }
+                "account" => record.fixed_path = "/w/acct-other/repo/main".into(),
+                "environment" => record.inputs.environment = "old fingerprint".into(),
+                "unreadable" => {}
+                _ => unreachable!(),
+            }
+            store(&f, &runner, &record);
+            if difference == "unreadable" {
+                fs::write(
+                    build_base::repository_store(&runner.core.trees.state, &f.root)
+                        .join("current/base.json"),
+                    b"{",
+                )
+                .unwrap();
+            }
+            let start = runner.now();
+            {
+                let mut inner = runner.core.inner.lock().unwrap();
+                inner
+                    .catalog
+                    .repositories
+                    .get_mut(&f.root)
+                    .unwrap()
+                    .last_base_fill_started_ms = Some(start);
+            }
+            f.clock
+                .store(start + build_base::REFILL_INTERVAL_MS - 1, Ordering::SeqCst);
+            pass(&runner, &config);
+            assert_eq!(count(&runner), 0, "{difference}");
+            f.clock.fetch_add(1, Ordering::SeqCst);
+            pass(&runner, &config);
+            assert_eq!(count(&runner), 1, "{difference}");
+            settle_attempt(&f, &runner);
+            pass(&runner, &config);
+            assert_eq!(count(&runner), 1, "{difference}");
+        }
+    }
+
+    #[test]
+    fn future_start_is_clamped_and_the_corrected_interval_survives_restart() {
+        let f = fixture();
+        let config = config(&f);
+        let runner = open(config.clone());
+        desired(&f, &runner);
+        let now = runner.now();
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .catalog
+            .repositories
+            .get_mut(&f.root)
+            .unwrap()
+            .last_base_fill_started_ms = Some(now + 100 * build_base::REFILL_INTERVAL_MS);
+        pass(&runner, &config);
+        assert_eq!(last_start(&f, &runner), Some(now));
+        assert_eq!(count(&runner), 0);
+        drop(runner);
+        let runner = open(config.clone());
+        assert_eq!(last_start(&f, &runner), Some(now));
+        f.clock
+            .store(now + build_base::REFILL_INTERVAL_MS, Ordering::SeqCst);
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 1);
+    }
+
+    #[test]
+    fn selector_is_ordered_and_keyless_tenant_has_no_candidates() {
+        let f = fixture();
+        let mut config = config(&f);
+        config.tenant_vm = true;
+        config.tenant_write_key = Some(false);
+        let runner = open(config.clone());
+        desired(&f, &runner);
+        pass(&runner, &config);
+        assert!(runner
+            .build_base_candidates(&runner.core.inner.lock().unwrap(), &config)
+            .is_empty());
+        assert_eq!(count(&runner), 0);
+        drop(runner);
+        config.tenant_vm = false;
+        config.fixed_path_repositories = vec!["*".into()];
+        let runner = open(config.clone());
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let record = inner.catalog.repositories[&f.root].clone();
+            inner
+                .catalog
+                .repositories
+                .insert("/a-repo".into(), record.clone());
+            inner.catalog.repositories.insert("/z-repo".into(), record);
+        }
+        let roots: Vec<_> = runner
+            .build_base_candidates(&runner.core.inner.lock().unwrap(), &config)
+            .into_iter()
+            .map(|(root, _)| root)
+            .collect();
+        let mut ordered = roots.clone();
+        ordered.sort();
+        assert_eq!(roots, ordered);
+        assert_eq!(roots.len(), 3);
+    }
+
+    #[test]
+    fn unavailable_identity_does_not_invent_a_same_tip_difference() {
+        let f = fixture();
+        let runner = open(config(&f));
+        let tip = desired(&f, &runner);
+        let record = published(&f, &runner, &tip);
+        store(&f, &runner, &record);
+        let mut plan = runner.base_plan(&f.root, &tip, true);
+        plan.base = Some((
+            record.fixed_path,
+            Compatibility::Unavailable("missing compiler input".into()),
+        ));
+        runner
+            .queue_base_planned(
+                &mut runner.core.inner.lock().unwrap(),
+                &f.root,
+                &f.key,
+                plan,
+            )
+            .unwrap();
+        assert_eq!(count(&runner), 0);
+    }
+
+    #[test]
+    fn due_base_bypasses_held_descriptor_and_wait_or_held_publication_gate() {
+        use crate::remote_cache::publishing::State;
+        use crate::storage::PublishFailure;
+        for attempts in [0, 1, policy::PUBLISH_RETRY_ATTEMPTS] {
+            let f = fixture();
+            let config = config(&f);
+            let runner = open(config.clone());
+            desired(&f, &runner);
+            let identity = crate::remote_cache::gateway::tests::generation("1", "tenant")
+                .identity()
+                .recorded();
+            *runner.core.publishing.lock().unwrap() = State::publishing_in(identity);
+            {
+                let mut inner = runner.core.inner.lock().unwrap();
+                let record = inner.catalog.repositories.get_mut(&f.root).unwrap();
+                let descriptor = record.requested_descriptor.clone().unwrap();
+                // Do not let reusable success mask the gate under test.
+                record.filled_descriptors.clear();
+                if attempts == 0 {
+                    record.failed_descriptor = Some(descriptor);
+                } else {
+                    record.publish_failures.insert(
+                        descriptor.clone(),
+                        PublishFailure {
+                            started_ms: runner.now(),
+                            attempts,
+                        },
+                    );
+                    assert!(matches!(
+                        policy::gate(
+                            &runner.publishing_policy(),
+                            record,
+                            &descriptor,
+                            runner.now()
+                        ),
+                        policy::Gate::Wait | policy::Gate::Held
+                    ));
+                }
+            }
+            pass(&runner, &config);
+            pass(&runner, &config);
+            assert_eq!(count(&runner), 1, "attempts={attempts}");
+        }
+    }
+
+    struct CaptureEnvironment {
+        values: Arc<Mutex<BTreeMap<String, String>>>,
+        generation: Option<Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
+        forwarders: Vec<crate::remote_cache::transport::Forwarder>,
+    }
+
+    impl backend::IsolationLauncher for CaptureEnvironment {
+        fn cache_generation(
+            &self,
+        ) -> Option<(
+            &crate::remote_cache::provisioning::ActiveGeneration,
+            &[crate::remote_cache::transport::Forwarder],
+        )> {
+            self.generation
+                .as_ref()
+                .map(|generation| (generation.as_ref(), self.forwarders.as_slice()))
+        }
+        fn launch(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            env: &[(String, String)],
+            _cpus: &[u32],
+            _resources: backend::JobResources,
+            _sources: crate::source_seal::Sources<'_>,
+        ) -> io::Result<platform::Launch> {
+            *self.values.lock().unwrap() = env.iter().cloned().collect();
+            Err(io::Error::other("launch environment captured"))
+        }
+    }
+
+    fn configure_remote(f: &Fixture, config: &mut Config) {
+        use crate::remote_cache::{
+            gateway::{
+                tests::{generation, FakeConnector, FakeStore},
+                Gateway, Limits, Tool,
+            },
+            provisioning::{HostRole, Layout, Watch},
+            runtime::Runtime,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let layout = Layout::new(f.scratch.join("cache-provisioning"), HostRole::BuildServer);
+        layout.prepare().unwrap();
+        let generation = generation("1", "tenant");
+        for (name, key) in [
+            ("read-key", &generation.read_key),
+            ("write-key", generation.write_key.as_ref().unwrap()),
+        ] {
+            let path = layout.directory().join(name);
+            fs::write(&path, serde_json::json!({"generation":"1", "access_key_id":key.access_key_id, "secret_access_key":key.secret_access_key}).to_string()).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        fs::write(layout.config_path(), serde_json::json!({"generation":"1", "tenant":generation.tenant, "endpoint":generation.endpoint, "region":generation.region, "bucket":generation.bucket, "prefix":generation.prefix, "storage_class":generation.storage_class, "enabled":true}).to_string()).unwrap();
+        fs::set_permissions(layout.config_path(), fs::Permissions::from_mode(0o444)).unwrap();
+        let watch = Watch::new(layout);
+        let gateway = Gateway::with_connector(
+            Limits::default(),
+            Arc::new(watch.clone()),
+            Arc::new(FakeConnector(Arc::new(FakeStore::default()))),
+        );
+        let runtime = Runtime::with_gateway(watch, gateway, vec![(Tool::Sccache, 3893)]).unwrap();
+        runtime.watch.reread();
+        config.remote_cache = true;
+        config.tenant_write_key = Some(true);
+        config.remote_cache_runtime = Some(runtime);
+    }
+
+    #[test]
+    fn mirror_due_environment_matches_checkout_launch_and_pins_existing_cargo_values() {
+        for tenant in [false, true] {
+            let f = fixture();
+            declare(&f, "[workspace]\n[profile.dev]\ndebug = 2\n");
+            let runner = open(config(&f));
+            let tip = desired(&f, &runner);
+            let mut config = config(&f);
+            config.tenant_vm = tenant;
+            if tenant {
+                configure_remote(&f, &mut config);
+            }
+            let setup = Setup {
+                id: Uuid::now_v7(),
+                cpus: vec![],
+                memory_mib: None,
+                base: true,
+                request: fill_request(
+                    Uuid::nil(),
+                    &f.root,
+                    &f.main,
+                    &tip,
+                    tip.clone(),
+                    "true".into(),
+                    vec![],
+                ),
+                recorded: BTreeMap::new(),
+                snapshots: None,
+            };
+            let planned = runner
+                .planned_fill_environment(&config, &setup, &runner.core.trees.mirror(&f.root))
+                .unwrap();
+            let values = Arc::new(Mutex::new(BTreeMap::new()));
+            let remote = config.unit_remote_cache(true);
+            assert_eq!(remote.is_some(), tenant);
+            let prepared = Prepared {
+                host_cwd: f.main.clone(),
+                target: PathBuf::from(crate::compile_cache::TARGET),
+                wrapper: (!tenant).then(|| PathBuf::from("/motor-tools/prefrontal-build-slot")),
+                sandbox: Some(Box::new(CaptureEnvironment {
+                    values: values.clone(),
+                    generation: remote.as_ref().map(|(g, _)| g.clone()),
+                    forwarders: remote.map(|(_, f)| f).unwrap_or_default(),
+                })),
+                vm: None,
+            };
+            let result =
+                backend::HostBackend.launch(&config, &runner.core.trees, &setup, &prepared, 4);
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "launch environment captured"
+            );
+            let launched = values.lock().unwrap();
+            assert_eq!(*launched, planned);
+            assert_eq!(
+                crate::compile_cache::environment_fingerprint(&launched),
+                crate::compile_cache::environment_fingerprint(&planned)
+            );
+            let mut expected = BTreeMap::from([
+                ("CARGO_BUILD_JOBS".into(), "4".into()),
+                (
+                    "CARGO_BUILD_BUILD_DIR".into(),
+                    "/run/motor/target/bd/{workspace-path-hash}".into(),
+                ),
+                ("CARGO_HOME".into(), "/motor-home/cargo".into()),
+                ("CARGO_NET_OFFLINE".into(), "true".into()),
+                ("CARGO_TARGET_DIR".into(), "/run/motor/target".into()),
+            ]);
+            if !tenant {
+                expected.insert("CARGO_INCREMENTAL".into(), "1".into());
+            }
+            let cargo: BTreeMap<_, _> = launched
+                .iter()
+                .filter(|(key, _)| key.starts_with("CARGO_"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(cargo, expected);
+        }
+    }
+
+    #[test]
+    fn cargo_manifest_tree_matches_launch_presence_and_queues_no_refill() {
+        let f = fixture();
+        fs::create_dir_all(f.main.join("Cargo.toml")).unwrap();
+        fs::write(f.main.join("Cargo.toml/not-a-manifest"), "directory\n").unwrap();
+        commit(&f.main, "manifest is a directory\n");
+        let mut config = config(&f);
+        config.tenant_vm = true;
+        configure_remote(&f, &mut config);
+        let runner = open(config.clone());
+        let tip = desired(&f, &runner);
+        let setup = Setup {
+            id: Uuid::nil(),
+            cpus: vec![],
+            memory_mib: None,
+            base: true,
+            request: fill_request(
+                Uuid::nil(),
+                &f.root,
+                &f.main,
+                &tip,
+                tip.clone(),
+                "true".into(),
+                vec![],
+            ),
+            recorded: BTreeMap::new(),
+            snapshots: None,
+        };
+        assert!(!f.main.join("Cargo.toml").is_file());
+        let launched = backend::job_environment(
+            &config,
+            &runner.core.trees,
+            &setup,
+            &backend::EnvironmentInputs {
+                host_cwd: &f.main,
+                target: Path::new(crate::compile_cache::TARGET),
+                wrapper: None,
+                remote: None,
+            },
+            4,
+        )
+        .unwrap();
+        let mirror = runner.core.trees.mirror(&f.root);
+        let planned = runner
+            .planned_fill_environment(&config, &setup, &mirror)
+            .unwrap();
+        assert_eq!(
+            planned, launched,
+            "a Cargo.toml directory must not select a cache transport"
+        );
+        let (fixed_path, identity) = runner
+            .planned_build_base(&config, &f.root, &tip, "true")
+            .unwrap();
+        let record = Record {
+            format: 1,
+            commit: tip.clone(),
+            tree: tip.clone(),
+            inputs: identity.for_publication().unwrap().clone(),
+            fixed_path,
+            fill_start: Timestamp::now(),
+            newest_mtime: Timestamp::now(),
+        };
+        store(&f, &runner, &record);
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 0);
+    }
+
+    #[test]
+    fn symlinked_supervisor_presence_is_unavailable_and_queues_no_refill() {
+        let f = fixture();
+        let config = config(&f);
+        let runner = open(config.clone());
+        let tip = desired(&f, &runner);
+        let mut record = published(&f, &runner, &tip);
+        let source = f.main.join("crates/prefrontal-build-slot/src/main.rs");
+        fs::remove_file(&source).unwrap();
+        std::os::unix::fs::symlink("missing.rs", &source).unwrap();
+        commit(&f.main, "supervisor is a broken link\n");
+        let tip = desired(&f, &runner);
+        record.commit = tip.clone();
+        record
+            .inputs
+            .toolchain
+            .rustc_verbose
+            .push_str(" old compiler");
+        store(&f, &runner, &record);
+        let (_, planned) = runner
+            .planned_build_base(&config, &f.root, &tip, "true")
+            .unwrap();
+        assert!(matches!(planned, Compatibility::Unavailable(_)));
+        let launched = build_base::compatibility(
+            &runner.core.base_toolchain,
+            &runner.core.trees.mirror(&f.root),
+            &tip,
+            &BTreeMap::new(),
+            Path::new("unused-sccache-backend"),
+        );
+        assert!(launched.for_publication().unwrap_err().contains("symlink"));
+        pass(&runner, &config);
+        assert_eq!(count(&runner), 0);
+    }
+
+    #[test]
+    #[ignore = "requires motor-job account, ACL tools and systemd"]
+    fn isolated_tick_queues_due_base_for_an_enabled_reusable_repository() {
+        let f = fixture();
+        let runner = Runner::open(config(&f)).unwrap();
+        runner.core.inner.lock().unwrap().writer = Some(Uuid::nil());
+        desired(&f, &runner);
+        runner.tick().unwrap();
+        runner.tick().unwrap();
+        assert_eq!(count(&runner), 1);
+    }
+}
