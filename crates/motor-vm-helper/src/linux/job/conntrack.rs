@@ -326,8 +326,7 @@ mod tests {
                     "/usr/bin/nsenter",
                     &[
                         &[
-                            "--net",
-                            &format!("/proc/{}/ns/net", self.child.id()),
+                            &format!("--net=/proc/{}/ns/net", self.child.id()),
                             "--",
                             "/usr/sbin/ip",
                         ][..],
