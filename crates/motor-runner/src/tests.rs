@@ -4471,6 +4471,9 @@ async fn live_isolated_runner_wire_smoke() {
 #[path = "tests/isolated_caller_roots.rs"]
 mod isolated_caller_roots;
 #[cfg(target_os = "linux")]
+#[path = "tests/isolated_seed.rs"]
+mod isolated_seed;
+#[cfg(target_os = "linux")]
 #[path = "tests/isolated_shm.rs"]
 mod isolated_shm;
 #[cfg(target_os = "linux")]

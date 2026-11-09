@@ -203,6 +203,10 @@ impl JobResources {
 /// Owns the prepared service and mount configuration. Tests can substitute a
 /// launcher to observe dispatch without requiring systemd or a job account.
 pub(crate) trait IsolationLauncher: Send + Sync {
+    #[cfg(target_os = "linux")]
+    fn seeded(&self) -> bool {
+        false
+    }
     fn prepared_javascript_directories(&self) -> &[PathBuf] {
         &[]
     }
@@ -257,6 +261,9 @@ struct SeededSandbox(crate::isolation::Sandbox);
 
 #[cfg(target_os = "linux")]
 impl IsolationLauncher for SeededSandbox {
+    fn seeded(&self) -> bool {
+        true
+    }
     fn prepared_javascript_directories(&self) -> &[PathBuf] {
         self.0.prepared_javascript_directories()
     }
