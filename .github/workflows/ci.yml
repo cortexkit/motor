@@ -77,6 +77,12 @@ jobs:
         run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo check --workspace --all-targets --locked
       - name: Clippy
         run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Hosts build these one package at a time, without dev-dependencies, so a
+      # feature only a test dependency turns on must not hide a missing one.
+      - name: Server binaries build on their own
+        run: |
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo check -p motor-host --lib --bins --locked
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo check -p motor-vm-helper --lib --bins --locked
       # Check the Windows runner without linking, so Ubuntu needs no MinGW linker.
       - name: Windows runner Clippy
         run: |

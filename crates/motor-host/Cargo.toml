@@ -30,7 +30,7 @@ tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 zeroize.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-uuid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
 motor-runner = { path = "../motor-runner" }

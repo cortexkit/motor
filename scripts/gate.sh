@@ -10,6 +10,7 @@
 #   Nothing tracked outside .cortexkit allowlist      -> fast
 #   Formatting                                       -> fast
 #   All-target workspace check, Clippy                -> linux-lint
+#   Server binaries build on their own                -> linux-lint
 #   Windows runner Clippy (cross-check, not Windows)  -> windows-clippy (Linux)
 #   Prepare SSH fixture + XFS reflink scratch         -> linux-tests (runner setup)
 #   Workspace tests, pinned client compatibility     -> linux-tests
@@ -132,7 +133,10 @@ command_for() {
       rustc --version
       cargo --version
       cargo check --workspace --all-targets --locked
-      cargo clippy --workspace --all-targets --locked -- -D warnings' ;;
+      cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Hosts build these one package at a time, without dev-dependencies.
+      cargo check -p motor-host --lib --bins --locked
+      cargo check -p motor-vm-helper --lib --bins --locked' ;;
     linux-tests) printf '%s\n' '
       node --version; npm --version; bun --version; pnpm --version
       /usr/local/bin/node --version
