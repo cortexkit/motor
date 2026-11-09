@@ -50,6 +50,22 @@ pub fn hello_covers(actual: &Value, promised: &Value) -> bool {
     if actual["type"] != "hello" || promised["type"] != "hello" {
         return false;
     }
+    if !matches!(
+        serde_json::from_value::<motor_protocol::Frame>(actual.clone()),
+        Ok(motor_protocol::Frame::Hello { .. })
+    ) {
+        return false;
+    }
+    if promised["return_chunked"] == true {
+        let ceiling = |hello: &Value| {
+            hello["return_chunked_max_bytes"]
+                .as_u64()
+                .unwrap_or(motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP)
+        };
+        if ceiling(actual) < ceiling(promised) {
+            return false;
+        }
+    }
     let Some(fields) = promised.as_object() else {
         return false;
     };

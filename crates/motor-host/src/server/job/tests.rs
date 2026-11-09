@@ -303,10 +303,16 @@ fn hello_promises_cannot_outgrow_the_assigned_runner() {
     let mut old = promised.clone();
     old.as_object_mut().unwrap().remove("return_chunked");
     assert!(!hello_covers(&old, &promised));
+    let mut small = promised.clone();
+    small["return_chunked_max_bytes"] = json!(motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP - 1);
+    assert!(!hello_covers(&small, &promised));
+    let mut malformed = promised.clone();
+    malformed["return_chunked_max_bytes"] = json!("not a byte count");
+    assert!(!hello_covers(&malformed, &promised));
 }
 
 #[tokio::test]
-async fn no_boot_until_first_frame_and_run_and_busy_disk_has_queue_frames() {
+async fn no_boot_before_first_frame_and_busy_disk_has_queue_frames() {
     let (runtime, fake, storage) = fixture();
     let first = claims(JOB);
     claim(&runtime, &first);
@@ -424,7 +430,9 @@ async fn capability_mismatch_never_delivers_run_and_guest_refusal_cannot_rewrite
                 .unwrap();
         }
         let (mut client, task) = start(runtime.clone(), c, id).await;
-        queued(&mut client, JOB).await;
+        next_type(&mut client, "lease_ok").await;
+        write_frame(&mut client, &hello()).await.unwrap();
+        next_type(&mut client, "hello").await;
         let terminal = next_type(&mut client, "terminal").await;
         assert_eq!(terminal["ran"], "none");
         assert_eq!(terminal["outcome"]["reason"], "request_rejected");
@@ -479,13 +487,13 @@ async fn copy_failure_and_queued_cancel_withdraw_release_every_reservation() {
         next_type(&mut client, "lease_ok").await;
         write_frame(&mut client, &hello()).await.unwrap();
         next_type(&mut client, "hello").await;
-        let mut request = run(JOB);
-        request["queue_wait_limit_s"] = json!(0);
-        write_frame(&mut client, &request).await.unwrap();
-        next_type(&mut client, "accepted").await;
         if control == "copy" {
             next_type(&mut client, "lease_refused").await;
         } else {
+            let mut request = run(JOB);
+            request["queue_wait_limit_s"] = json!(0);
+            write_frame(&mut client, &request).await.unwrap();
+            next_type(&mut client, "accepted").await;
             write_frame(&mut client, &json!({"type":control,"job_id":JOB}))
                 .await
                 .unwrap();
@@ -1068,4 +1076,111 @@ fn guest_disconnect_before_or_after_capability_refusal_leaves_identical_records_
         Some(&terminal)
     );
     runtime.stop_job(JOB, true, false).unwrap();
+}
+
+async fn wait_for_runner_hello(runtime: &Arc<Runtime>, job: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.host.lock().unwrap().snapshot.per_job.executions[job].runner_hello {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn free_disk_boots_on_hello_and_ready_vm_waits_for_validated_run() {
+    let (runtime, fake, storage) = fixture();
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    assert!(fake.calls.lock().unwrap().is_empty());
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    wait_for_runner_hello(&runtime, JOB).await;
+    assert_eq!(
+        fake.calls.lock().unwrap().as_slice(),
+        [format!("start:{JOB}")]
+    );
+    assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    assert_eq!(fake.inputs.lock().unwrap().len(), 1);
+    write_frame(
+        &mut client,
+        &json!({"type":"have","repositories":[],"git_dependencies":[]}),
+    )
+    .await
+    .unwrap();
+    next_type(&mut client, "have_reply").await;
+    assert_eq!(fake.inputs.lock().unwrap().len(), 1);
+    write_frame(&mut client, &run(JOB)).await.unwrap();
+    next_type(&mut client, "accepted").await;
+    next_type(&mut client, "output").await;
+    assert!(runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    assert!(!storage.spool(JOB).exists());
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn run_validated_before_vm_ready_remains_spooled_until_hello() {
+    let (runtime, fake, storage) = fixture();
+    *fake.hang.lock().unwrap() = "runner";
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    fake.entered.notified().await;
+    write_frame(&mut client, &run(JOB)).await.unwrap();
+    next_type(&mut client, "accepted").await;
+    assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    assert!(fake.inputs.lock().unwrap().is_empty());
+    assert!(storage.spool(JOB).exists());
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    next_type(&mut client, "output").await;
+    assert!(runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    assert!(!storage.spool(JOB).exists());
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn disconnect_or_refusal_before_run_stops_an_already_ready_vm_and_releases_admission() {
+    for disconnect in [true, false] {
+        let (runtime, fake, storage) = fixture();
+        let c = claims(JOB);
+        let id = claim(&runtime, &c);
+        let (mut client, task) = start(runtime.clone(), c, id).await;
+        next_type(&mut client, "lease_ok").await;
+        write_frame(&mut client, &hello()).await.unwrap();
+        next_type(&mut client, "hello").await;
+        wait_for_runner_hello(&runtime, JOB).await;
+        if disconnect {
+            drop(client);
+            assert!(task.await.unwrap().is_err());
+        } else {
+            let mut invalid = run(JOB);
+            invalid["weight_hint"] = json!(2);
+            write_frame(&mut client, &invalid).await.unwrap();
+            next_type(&mut client, "lease_refused").await;
+            task.await.unwrap().unwrap();
+        }
+        let host = runtime.host.lock().unwrap();
+        assert!(!host.snapshot.leases[JOB].delivered);
+        assert!(host.snapshot.zero_usage.contains_key(JOB));
+        assert!(host.snapshot.per_job.executions[JOB].ended);
+        drop(host);
+        assert_eq!(fake.inputs.lock().unwrap().len(), 1);
+        assert_eq!(
+            fake.calls.lock().unwrap().as_slice(),
+            [format!("start:{JOB}"), format!("stop:{JOB}")]
+        );
+        assert!(!storage.spool(JOB).exists());
+        assert_eq!(storage.releases.lock().unwrap()[JOB], 1);
+    }
 }
