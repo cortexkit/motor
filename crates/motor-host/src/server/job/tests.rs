@@ -7,6 +7,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::Condvar;
 
 mod recovery_tests;
+#[path = "upload_tests.rs"]
+mod upload_tests;
 
 const JOB: &str = "00000000-0000-7000-8000-000000000001";
 const JOB2: &str = "00000000-0000-7000-8000-000000000002";
