@@ -54,6 +54,12 @@ fn hello() -> Value {
 struct Disk {
     root: PathBuf,
     handle: tokio::runtime::Handle,
+    prepare_hold: Mutex<Option<PrepareHold>>,
+    released: tokio::sync::Notify,
+}
+struct PrepareHold {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 impl Control for Disk {
     fn start_job(&self, _: &motor_vm_helper::job::Start) -> Result<Value> {
@@ -137,9 +143,16 @@ impl Resources for Disk {
         })
     }
     fn prepare(&self, _: &Execution) -> Result<()> {
+        let hold = self.prepare_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _ = hold.entered.send(());
+            // Dropping the release channel's sender unblocks recv if a test panics.
+            let _ = hold.release.recv();
+        }
         Ok(())
     }
     fn release(&self, _: &str) -> Result<()> {
+        self.released.notify_one();
         Ok(())
     }
 }
@@ -147,6 +160,7 @@ impl Resources for Disk {
 struct Fixture {
     root: tempfile::TempDir,
     runtime: Arc<Runtime>,
+    disk: Arc<Disk>,
     broker: SigningKey,
     requester: SigningKey,
     repositories: Vec<PathBuf>,
@@ -178,6 +192,8 @@ impl Fixture {
         let disk = Arc::new(Disk {
             root: root.path().into(),
             handle: tokio::runtime::Handle::current(),
+            prepare_hold: Mutex::new(None),
+            released: tokio::sync::Notify::new(),
         });
         let (journal, snapshot) = SqliteJournal::open(&root.path().join("host")).unwrap();
         let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
@@ -188,7 +204,7 @@ impl Fixture {
             vcpu_ceiling: 4,
             permit_budget: 4,
         });
-        let runtime = Runtime::with_job_resources("host".into(), host, disk.clone(), disk);
+        let runtime = Runtime::with_job_resources("host".into(), host, disk.clone(), disk.clone());
         let broker = SigningKey::from_bytes(&[7; 32]);
         let requester = SigningKey::from_bytes(&[8; 32]);
         runtime
@@ -202,6 +218,7 @@ impl Fixture {
         Self {
             root,
             runtime,
+            disk,
             broker,
             requester,
             repositories,
@@ -286,6 +303,22 @@ impl Fixture {
             .collect();
         write_frame(client, &json!({"type":"have","repositories":repositories,"git_dependencies":["https://example.com/dependency"]})).await.unwrap();
         next(client, "have_reply").await
+    }
+    async fn reattach_terminal(&self, claims: &Claims) -> Value {
+        let mut claims = claims.clone();
+        claims.purpose = Purpose::Attach;
+        let (mut client, task) = self.connect(&claims).await;
+        write_frame(
+            &mut client,
+            &json!({"type":"attach","job_id":claims.jti,"from_seq":0}),
+        )
+        .await
+        .unwrap();
+        let terminal = next(&mut client, "terminal").await;
+        next(&mut client, "hosted_terminal").await;
+        drop(client);
+        task.await.unwrap().unwrap();
+        terminal
     }
     fn request(&self, c: &Claims, have: &Value) -> (Value, Vec<Vec<u8>>) {
         let mut bundles = Vec::new();
@@ -584,19 +617,31 @@ async fn interrupted_upload_at_each_bundle_boundary_adds_no_have_entries() {
         let (request, bytes) = f.request(&c, &have);
         write_frame(&mut client, &request).await.unwrap();
         next(&mut client, "accepted").await;
-        let record = f
-            .root
-            .path()
-            .join("disk/runner/jobs")
-            .join(&c.jti)
-            .join("record.json");
+        // The host acknowledges its queued Run before the guest accepts it.
+        // The guest creates record.json before writing Accepted and can remove
+        // it if admission fails. Wait for this job's durable admitted event so
+        // every cut below interrupts an admitted upload.
+        let events = f.root.path().join("disk/runner/tenant-events.json");
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !record.exists() {
+            loop {
+                let admitted = std::fs::read(&events)
+                    .ok()
+                    .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
+                    .is_some_and(|state| {
+                        state["pending"].as_array().is_some_and(|pending| {
+                            pending
+                                .iter()
+                                .any(|event| event["event"] == "admitted" && event["jti"] == c.jti)
+                        })
+                    });
+                if admitted {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("runner accepts the relayed Run before interruption");
+        .expect("runner durably admits the relayed Run before interruption");
         let lengths = match boundary {
             "before_bytes" => [0, 0],
             "partial_first" => [bytes[0].len() / 2, 0],
@@ -620,7 +665,7 @@ async fn interrupted_upload_at_each_bundle_boundary_adds_no_have_entries() {
         task.await.unwrap().unwrap();
         // The runner persists its no-start outcome after seeing EOF, independently
         // of the disconnected host relay. Wait on that outcome, not on timing.
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let terminal = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let record = f
                     .root
@@ -628,20 +673,23 @@ async fn interrupted_upload_at_each_bundle_boundary_adds_no_have_entries() {
                     .join("disk/runner/jobs")
                     .join(&c.jti)
                     .join("record.json");
-                let found = std::fs::read(record)
+                let terminal = std::fs::read(record)
                     .ok()
                     .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
-                    .is_some_and(|job| {
-                        job["terminal"]["outcome"]["reason"] == "transfer_interrupted"
+                    .and_then(|job| {
+                        (job["terminal"]["outcome"]["reason"] == "transfer_interrupted")
+                            .then(|| job["terminal"].clone())
                     });
-                if found {
-                    break;
+                if let Some(terminal) = terminal {
+                    break terminal;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("runner records interrupted upload");
+        assert_eq!(terminal["outcome"]["type"], "refused_before_start");
+        assert_eq!(terminal["ran"], "none");
         let events = f.harvest(&c.jti);
         assert!(
             events.iter().all(|event| event.mirror_refs.is_none()),
@@ -651,6 +699,80 @@ async fn interrupted_upload_at_each_bundle_boundary_adds_no_have_entries() {
         state_tests::reopen(&f);
         assert!(f.held(&c.jti).is_empty(), "restart at {boundary}");
     }
+}
+
+#[tokio::test]
+async fn interrupted_upload_before_delivery_replays_no_start_and_keeps_have_empty() {
+    let mut f = Fixture::new();
+    let c = f.claims();
+    let (entered, preparing) = tokio::sync::oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    *f.disk.prepare_hold.lock().unwrap() = Some(PrepareHold {
+        entered,
+        release: resume,
+    });
+    let (mut client, task) = f.connect(&c).await;
+    tokio::time::timeout(Duration::from_secs(10), preparing)
+        .await
+        .expect("host begins preparing the job")
+        .unwrap();
+    let have = f.have(&mut client).await;
+    let (request, bytes) = f.request(&c, &have);
+    write_frame(&mut client, &request).await.unwrap();
+    next(&mut client, "accepted").await;
+    write_frame(
+        &mut client,
+        &serde_json::to_value(Frame::BundleChunk {
+            index: 0,
+            offset: 0,
+            data: motor_protocol::BytePayload(bytes[0][..bytes[0].len() / 2].into()),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(!f.runtime.host.lock().unwrap().snapshot.leases[&c.jti].delivered);
+    drop(client);
+    assert!(tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("host settles the disconnected queued upload")
+        .unwrap()
+        .is_err());
+
+    let terminal = {
+        let host = f.runtime.host.lock().unwrap();
+        let terminal = host.snapshot.billing[&c.jti]
+            .terminal
+            .clone()
+            .expect("host durably records the interrupted upload's no-start terminal");
+        assert_eq!(terminal["outcome"]["type"], "refused_before_start");
+        assert_eq!(terminal["outcome"]["reason"], "transfer_interrupted");
+        assert_eq!(terminal["ran"], "none");
+        let usage = &host.snapshot.zero_usage[&c.jti];
+        assert_eq!(usage.started_at_ms, usage.ended_at_ms);
+        assert!(!host.snapshot.leases[&c.jti].delivered);
+        terminal
+    };
+    // Finish the cancelled preparation before replaying the retained result.
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(10), f.disk.released.notified())
+        .await
+        .expect("cancelled preparation releases its resources");
+    assert!(!f
+        .root
+        .path()
+        .join("disk/runner/tenant-events.json")
+        .exists());
+    assert!(f.held(&c.jti).is_empty());
+    assert_eq!(f.reattach_terminal(&c).await, terminal);
+    state_tests::reopen(&f);
+    assert!(f.held(&c.jti).is_empty());
+    assert_eq!(f.reattach_terminal(&c).await, terminal);
+    let host = f.runtime.host.lock().unwrap();
+    assert_eq!(
+        host.snapshot.zero_usage[&c.jti].started_at_ms,
+        host.snapshot.zero_usage[&c.jti].ended_at_ms
+    );
 }
 
 #[tokio::test]
