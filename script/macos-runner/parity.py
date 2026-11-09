@@ -21,6 +21,29 @@ ENVIRONMENT = {
 }
 
 
+def build_account_lock_problem(user, name="motorbuild"):
+    """Why a local account record (a dslocal users/<name>.plist) is not locked,
+    or None. The guest seal checks its own record with this before turning
+    Remote Login off, and the host checks the stopped image's record with it."""
+    if user.get("name") != [name] or user.get("shell") != ["/usr/bin/false"]:
+        return "name/shell must identify " + name + " with /usr/bin/false"
+    if user.get("passwd") != ["*"]:
+        return "passwd must be the unusable '*' marker"
+    authorities = user.get("authentication_authority", [])
+    hashes = user.get("ShadowHashData", [])
+    if (not isinstance(authorities, list) or not all(isinstance(value, str) for value in authorities)
+            or not isinstance(hashes, list) or not all(isinstance(value, bytes) for value in hashes)):
+        return "malformed authentication_authority or ShadowHashData"
+    # The password marker alone does not disable ShadowHash or other authentication methods.
+    # Without an authority or stored hash, only the unusable '*' password remains.
+    if authorities:
+        if not all(value.startswith(";DisabledUser;") for value in authorities):
+            return "authentication_authority contains an enabled or unknown method"
+    elif hashes:
+        return "ShadowHashData remains without a DisabledUser authority"
+    return None
+
+
 def digest(path):
     value = hashlib.sha256()
     with Path(path).open("rb") as stream:

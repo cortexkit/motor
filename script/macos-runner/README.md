@@ -60,7 +60,9 @@ inside the checkout, for example `target/scratch/macos-image`.
    ```
 
    Do the one Setup Assistant pass. Create the temporary admin `motorbuild`,
-   enable guest Remote Login, authorize only `build_key.pub` for that account,
+   enable guest Remote Login with "Allow full disk access for remote users" on
+   (sealing turns Remote Login off from SSH, which macOS refuses without it),
+   authorize only `build_key.pub` for that account,
    and temporarily allow its passwordless sudo in `/etc/sudoers.d/motorbuild`.
    Obtain the guest sshd host key from its console and put it in a dedicated
    known-hosts file; do not use an unchecked `ssh-keyscan` result as trust.
@@ -112,11 +114,18 @@ inside the checkout, for example `target/scratch/macos-image`.
      --known-hosts "$GUEST_KNOWN_HOSTS"
    ```
 
-   The guest rechecks the installed pins, turns Remote Login off, verifies it is
-   off, deletes the build account's `.ssh` and temporary sudoers entry, disables
-   its shell/password, removes its admin membership and Directory Services account,
-   verifies the account is gone, removes build sources, and acknowledges sealing
-   before shutdown. Deletion is synchronous, not deferred to a shutdown job. The
+   The guest rechecks its installed tools against the reviewed pin lock
+   (`toolchain.json`), then locks the build account: a
+   non-login shell, a `;DisabledUser;` authority with its password hash deleted,
+   the unusable `*` password marker, and no admin membership. It reads the
+   account record back and refuses unless it is locked (the same check that
+   finalize and the offline guest-agent update below apply to the stopped image). Only then does it delete the account's
+   `.ssh` and temporary sudoers entry, turn Remote Login off, verify it is off,
+   remove build sources, and acknowledge sealing before shutdown. The account
+   itself stays: Setup Assistant made it the Data volume's only Secure Token
+   holder, and macOS refuses to delete that account (`eDSPermissionError`).
+   Because the lock is checked while Remote Login is still on, a failed check
+   leaves the builder reachable for investigation. The
    host requires that acknowledgement even if SSH is disconnected
    by shutdown, and deletes its private/public build key. If Remote Login shutdown
    severs SSH before acknowledgement on a particular macOS release, sealing fails
@@ -124,7 +133,8 @@ inside the checkout, for example `target/scratch/macos-image`.
 
 6. After the image-build helper has exited, finalize. Every disk must be closed
    (`lsof` must prove this). Finalization mounts only the stopped image's APFS Data
-   volume, grants the installed guest agent macOS TCC access to network volumes
+   volume, refuses unless its `motorbuild` record is locked, grants the installed
+   guest agent macOS TCC access to network volumes
    and all files, then unmounts and detaches before hashing the bundle. The grants
    use the installed agent's code-signing requirement, not a build output: macOS
    treats virtiofs workspaces as network volumes and otherwise denies reads and
@@ -176,9 +186,8 @@ There is no full-copy fallback.
    tests cannot prove APFS cloning, code-signing/TCC behavior, or guest startup.
 
 Earlier sealing code set a non-login shell and `*` password marker for
-`motorbuild` but did not delete its local account or admin membership. Older
-sealed images may retain the account record; there was no scheduled deletion
-to remove it later.
+`motorbuild` but kept its password hash, enabled authority and admin
+membership. Older sealed images may retain that account in this weaker state.
 The swap never deletes or repairs that account: it accepts an absent account, or
 checks the local account plist at
 `/private/var/db/dslocal/nodes/Default/users/motorbuild.plist` offline for

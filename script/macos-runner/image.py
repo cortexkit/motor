@@ -87,6 +87,9 @@ def grant_agent_access(disk):
     # and directory listings fail for the agent and its job children, even as root.
     # SIP protects TCC.db in a running guest, so bind offline grants to the installed signature.
     with mounted_data(disk, writable=True) as mount:
+        # The guest seal locked the build account; check the stopped image's
+        # own record too before granting anything in it.
+        require_locked_build_account(mount)
         requirement = agent_requirement(mount)
         database = mount / "Library/Application Support/com.apple.TCC/TCC.db"
         if not database.is_file():
@@ -290,22 +293,9 @@ def require_locked_build_account(mount):
     def refuse(reason):
         raise ValueError("source motorbuild is not provably locked: " + reason)
 
-    if user.get("name") != ["motorbuild"] or user.get("shell") != ["/usr/bin/false"]:
-        refuse("name/shell must identify motorbuild with /usr/bin/false")
-    if user.get("passwd") != ["*"]:
-        refuse("passwd must be the unusable '*' marker")
-    authorities = user.get("authentication_authority", [])
-    hashes = user.get("ShadowHashData", [])
-    if (not isinstance(authorities, list) or not all(isinstance(value, str) for value in authorities)
-            or not isinstance(hashes, list) or not all(isinstance(value, bytes) for value in hashes)):
-        refuse("malformed authentication_authority or ShadowHashData")
-    # The password marker alone does not disable ShadowHash or other authentication methods.
-    # Without an authority or stored hash, only the unusable '*' password remains.
-    if authorities:
-        if not all(value.startswith(";DisabledUser;") for value in authorities):
-            refuse("authentication_authority contains an enabled or unknown method")
-    elif hashes:
-        refuse("ShadowHashData remains without a DisabledUser authority")
+    problem = parity.build_account_lock_problem(user)
+    if problem:
+        refuse(problem)
     if user.get("home") != ["/Users/motorbuild"]:
         refuse("home must be /Users/motorbuild so SSH keys can be checked")
     ssh = guest_path(mount, "Users/motorbuild/.ssh")

@@ -205,25 +205,42 @@ def provision(manifest, scratch, measure):
     print("Candidate measured. Review and commit its pins before sealing.")
 
 
-def drop_build_access(build_user, home, sudoers=Path("/etc/sudoers.d/motorbuild")):
-    run("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off")
-    status = subprocess.check_output(["/usr/sbin/systemsetup", "-getremotelogin"], text=True)
-    if "Off" not in status:
-        raise ValueError("Remote Login did not turn off")
+def drop_build_access(build_user, home, sudoers=Path("/etc/sudoers.d/motorbuild"),
+                      record=Path("/private/var/db/dslocal/nodes/Default/users")):
+    # The build account is the one Setup Assistant created, so it is the Data
+    # volume's only Secure Token holder, and macOS refuses to delete it
+    # (eDSPermissionError). It stays in the image with every way in removed,
+    # the same end state `image.py finalize` and `image.py agent-swap` (the
+    # offline guest-agent update) check in the stopped image.
+    # Lock it while Remote Login is still on: a failed check below leaves the
+    # build key and sudo working, so the builder can be inspected, not lost.
+    user = "/Users/" + build_user
+    run("/usr/bin/dscl", ".", "-create", user, "UserShell", "/usr/bin/false")
+    run("/usr/bin/dscl", ".", "-create", user, "AuthenticationAuthority", ";DisabledUser;")
+    # The DisabledUser authority alone leaves the hash; remove it so no
+    # password from Setup Assistant survives in the image.
+    run("/usr/bin/dscl", ".", "-delete", user, "ShadowHashData")
+    run("/usr/bin/dscl", ".", "-create", user, "Password", "*")
+    run("/usr/sbin/dseditgroup", "-o", "edit", "-d", build_user, "-t", "user", "admin")
+    problem = parity.build_account_lock_problem(
+        plistlib.loads((record / (build_user + ".plist")).read_bytes()), build_user)
+    if problem:
+        raise ValueError("build account is not locked: " + problem)
+    member = subprocess.run(["/usr/sbin/dseditgroup", "-o", "checkmember", "-m", build_user, "admin"],
+                            capture_output=True, text=True)
+    if member.returncode == 0:
+        raise ValueError("build account is still an admin member")
+    sudoers.unlink(missing_ok=True)
     if (home / ".ssh").is_symlink():
         raise ValueError("build account .ssh is a symlink")
     if (home / ".ssh").exists():
         shutil.rmtree(home / ".ssh")
-    run("/usr/bin/dscl", ".", "-create", "/Users/" + build_user, "UserShell", "/usr/bin/false")
-    run("/usr/bin/dscl", ".", "-create", "/Users/" + build_user, "Password", "*")
-    sudoers.unlink(missing_ok=True)
-    # Locking a shell/password leaves the local account and its admin membership behind.
-    # Delete both before acknowledging the seal; the existing SSH process can finish shutdown.
-    run("/usr/sbin/dseditgroup", "-o", "edit", "-d", build_user, "-t", "user", "admin")
-    run("/usr/bin/dscl", ".", "-delete", "/Users/" + build_user)
-    users = subprocess.check_output(["/usr/bin/dscl", ".", "-list", "/Users"], text=True)
-    if build_user in users.splitlines():
-        raise ValueError("build account still exists after deletion")
+    # Turning Remote Login off from an SSH session needs "Allow full disk
+    # access for remote users" in the guest's Remote Login settings.
+    run("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off")
+    status = subprocess.check_output(["/usr/sbin/systemsetup", "-getremotelogin"], text=True)
+    if "Off" not in status:
+        raise ValueError("Remote Login did not turn off")
 
 
 def seal(manifest, build_user, scratch):

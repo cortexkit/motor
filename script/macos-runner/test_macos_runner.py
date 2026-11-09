@@ -1499,33 +1499,73 @@ class OfflineImageTests(unittest.TestCase):
 
 
 class ImageTests(unittest.TestCase):
-    def test_sealing_disables_remote_login_and_deletes_build_access(self):
+    LOCKED = {"name": ["motorbuild"], "shell": ["/usr/bin/false"], "passwd": ["*"],
+              "authentication_authority": [";DisabledUser;"], "home": ["/Users/motorbuild"]}
+
+    def seal_fixture(self, directory, record):
+        home = Path(directory)
+        (home / ".ssh").mkdir()
+        (home / ".ssh/authorized_keys").write_text("build-only public key")
+        sudoers = home / "sudoers"
+        sudoers.write_text("temporary bootstrap permission")
+        users = home / "users"
+        users.mkdir()
+        (users / "motorbuild.plist").write_bytes(plistlib.dumps(record))
+        return home, sudoers, users
+
+    def not_admin(self):
+        return patch.object(guest.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", ""))
+
+    def test_sealing_locks_the_build_account_then_disables_remote_login(self):
         with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            (home / ".ssh").mkdir()
-            (home / ".ssh/authorized_keys").write_text("build-only public key")
-            sudoers = home / "sudoers"
-            sudoers.write_text("temporary bootstrap permission")
-            with patch.object(guest, "run") as run, patch.object(guest.subprocess, "check_output", side_effect=["Remote Login: Off", "root\nmotorjob\n"]):
-                guest.drop_build_access("motorbuild", home, sudoers)
+            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            with patch.object(guest, "run") as run, self.not_admin(), \
+                    patch.object(guest.subprocess, "check_output", return_value="Remote Login: Off"):
+                guest.drop_build_access("motorbuild", home, sudoers, users)
             self.assertFalse((home / ".ssh").exists())
             self.assertFalse(sudoers.exists())
-            run.assert_any_call("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off")
-            run.assert_any_call("/usr/bin/dscl", ".", "-create", "/Users/motorbuild", "UserShell", "/usr/bin/false")
-            run.assert_any_call("/usr/sbin/dseditgroup", "-o", "edit", "-d", "motorbuild", "-t", "user", "admin")
-            run.assert_any_call("/usr/bin/dscl", ".", "-delete", "/Users/motorbuild")
+            calls = [call.args for call in run.call_args_list]
+            self.assertIn(("/usr/bin/dscl", ".", "-create", "/Users/motorbuild", "UserShell", "/usr/bin/false"), calls)
+            self.assertIn(("/usr/bin/dscl", ".", "-create", "/Users/motorbuild", "AuthenticationAuthority", ";DisabledUser;"), calls)
+            self.assertIn(("/usr/bin/dscl", ".", "-delete", "/Users/motorbuild", "ShadowHashData"), calls)
+            self.assertIn(("/usr/sbin/dseditgroup", "-o", "edit", "-d", "motorbuild", "-t", "user", "admin"), calls)
+            # The account is the volume's Secure Token holder; it is never deleted.
+            self.assertNotIn(("/usr/bin/dscl", ".", "-delete", "/Users/motorbuild"), calls)
+            # Remote Login goes off only after the lock is verified.
+            self.assertEqual(calls[-1], ("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off"))
 
-    def test_sealing_refuses_if_build_account_survives_deletion(self):
+    def test_sealing_keeps_build_access_when_the_account_is_not_locked(self):
+        for change in (lambda user: user.update(authentication_authority=[";ShadowHash;"]),
+                       lambda user: user.update(shell=["/bin/zsh"]),
+                       lambda user: user.update(passwd=["********"])):
+            record = dict(self.LOCKED)
+            change(record)
+            with tempfile.TemporaryDirectory() as directory:
+                home, sudoers, users = self.seal_fixture(directory, record)
+                with patch.object(guest, "run") as run, self.not_admin():
+                    with self.assertRaisesRegex(ValueError, "not locked"):
+                        guest.drop_build_access("motorbuild", home, sudoers, users)
+                self.assertTrue((home / ".ssh/authorized_keys").exists())
+                self.assertTrue(sudoers.exists())
+                self.assertNotIn(("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off"),
+                                 [call.args for call in run.call_args_list])
+
+    def test_sealing_keeps_build_access_while_the_account_is_still_admin(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(guest, "run"), patch.object(guest.subprocess, "check_output", side_effect=["Remote Login: Off", "root\nmotorbuild\n"]):
-                with self.assertRaisesRegex(ValueError, "still exists after deletion"):
-                    guest.drop_build_access("motorbuild", Path(directory), Path(directory) / "sudoers")
+            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            member = subprocess.CompletedProcess([], 0, "yes motorbuild is a member of admin", "")
+            with patch.object(guest, "run"), patch.object(guest.subprocess, "run", return_value=member):
+                with self.assertRaisesRegex(ValueError, "still an admin member"):
+                    guest.drop_build_access("motorbuild", home, sudoers, users)
+            self.assertTrue(sudoers.exists())
 
     def test_sealing_refuses_if_remote_login_stays_on(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(guest, "run"), patch.object(guest.subprocess, "check_output", return_value="Remote Login: On"):
+            home, sudoers, users = self.seal_fixture(directory, self.LOCKED)
+            with patch.object(guest, "run"), self.not_admin(), \
+                    patch.object(guest.subprocess, "check_output", return_value="Remote Login: On"):
                 with self.assertRaisesRegex(ValueError, "did not turn off"):
-                    guest.drop_build_access("motorbuild", Path(directory), Path(directory) / "sudoers")
+                    guest.drop_build_access("motorbuild", home, sudoers, users)
 
     def test_ipsw_digest_and_size_are_both_enforced(self):
         with tempfile.TemporaryDirectory() as directory:
