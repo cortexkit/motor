@@ -187,13 +187,17 @@ pub enum Operation {
     Relay(String, u32),
     Exits,
     AckExit(ExitReport),
+    Memory(String),
+    Balloon(String, u64),
 }
 
 impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Start(start) => start.validate(),
-            Self::Adopt(id) | Self::Stop(id) => validate_job_id(id),
+            Self::Adopt(id) | Self::Stop(id) | Self::Memory(id) | Self::Balloon(id, _) => {
+                validate_job_id(id)
+            }
             Self::Exits => Ok(()),
             Self::AckExit(report) => validate_job_id(&report.job_id),
             Self::Relay(id, port) => {
@@ -223,6 +227,28 @@ pub(crate) fn test_id(number: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_operations_accept_only_valid_job_id_and_never_host_paths_or_pids() {
+        for op in ["job_memory", "balloon_job"] {
+            let mut request =
+                serde_json::json!({"op":op, "job_id":"00000000-0000-7000-8000-000000000001"});
+            if op == "balloon_job" {
+                request["amount_mib"] = serde_json::json!(1);
+            }
+            assert!(serde_json::from_value::<crate::Request>(request.clone()).is_ok());
+            request["pid"] = serde_json::json!(1);
+            assert!(serde_json::from_value::<crate::Request>(request.clone()).is_err());
+            request.as_object_mut().unwrap().remove("pid");
+            request["path"] = serde_json::json!("/proc/1/smaps");
+            assert!(serde_json::from_value::<crate::Request>(request).is_err());
+        }
+        assert!(super::Operation::Memory("../escape".into())
+            .validate()
+            .is_err());
+        assert!(super::Operation::Balloon("../escape".into(), 0)
+            .validate()
+            .is_err());
+    }
     use super::*;
 
     #[test]

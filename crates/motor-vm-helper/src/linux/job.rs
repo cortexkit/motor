@@ -31,6 +31,7 @@ const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1";
 
 mod conntrack;
+mod memory;
 mod namespace;
 mod network;
 mod workspace;
@@ -487,6 +488,8 @@ impl LinuxJobs {
         match op {
             Operation::Start(start) => self.start(start, peer),
             Operation::Adopt(id) => self.status(&id),
+            Operation::Memory(id) => self.memory(&id),
+            Operation::Balloon(id, amount_mib) => self.balloon(&id, amount_mib),
             Operation::Stop(id) => {
                 self.stop(&id)?;
                 self.status(&id)

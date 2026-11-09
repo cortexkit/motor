@@ -70,6 +70,9 @@ struct Fake {
     fail_ack: AtomicBool,
     fail_poll: AtomicBool,
     acknowledgements: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
+    balloon_supported: AtomicBool,
+    resident: Mutex<BTreeMap<String, u64>>,
+    balloons: Mutex<Vec<(String, u64)>>,
 }
 impl Fake {
     fn wait(&self, stage: &str) {
@@ -83,6 +86,29 @@ impl Fake {
     }
 }
 impl Control for Fake {
+    fn job_memory(&self, job: &str) -> Result<u64> {
+        ensure!(
+            self.balloon_supported.load(Ordering::Acquire),
+            crate::helper::BalloonUnavailable
+        );
+        self.resident
+            .lock()
+            .unwrap()
+            .get(job)
+            .copied()
+            .context("missing host RAM sample")
+    }
+    fn balloon_job(&self, job: &str, amount_mib: u64) -> Result<()> {
+        ensure!(
+            self.balloon_supported.load(Ordering::Acquire),
+            crate::helper::BalloonUnavailable
+        );
+        self.balloons
+            .lock()
+            .unwrap()
+            .push((job.to_owned(), amount_mib));
+        Ok(())
+    }
     fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {
         ensure!(
             !self.fail_poll.load(Ordering::Acquire),
@@ -1214,4 +1240,5 @@ async fn disconnect_or_refusal_before_run_stops_an_already_ready_vm_and_releases
     }
 }
 
+mod balloon_tests;
 mod settlement_tests;
