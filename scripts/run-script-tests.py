@@ -71,6 +71,7 @@ TEST_FILES = [
     "scripts/tests/test_safety_fences.py",
     "scripts/tests/test_test_binary_fold.py",
     "scripts/tests/test_unreachable_modules.py",
+    "scripts/test_per_job_rates.py",
 ]
 
 
