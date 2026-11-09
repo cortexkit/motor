@@ -141,9 +141,15 @@ fn physical_copy(source: &mut File, target: &Path) -> Result<()> {
         out.write_all(&buffer[..n])?;
     }
     out.sync_all()?;
-    if super::job::image_copy_exclusive_bytes(&out)? < out.metadata()?.len() {
+    require_physical_copy(&out)?;
+    Ok(())
+}
+
+fn require_physical_copy(file: &File) -> Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.nlink() != 1 || super::job::image_copy_exclusive_bytes(file)? < metadata.len() {
         return Err(Error(
-            "physical image copy has sparse or shared extents".into(),
+            "physical image copy has hard links, sparse or shared extents".into(),
         ));
     }
     Ok(())
@@ -305,7 +311,8 @@ fn prepare(root: &Path, id: &str, account: &str) -> Result<()> {
     directory(&accounts)?;
     let target = accounts.join(account);
     if target.try_exists()? {
-        verify(&target.join("toolchain.ext4"), &pinned.toolchain)?;
+        let copy = verify(&target.join("toolchain.ext4"), &pinned.toolchain)?;
+        require_physical_copy(&copy)?;
         return Ok(());
     }
     let mut source = verify(&image.join("toolchain.ext4"), &pinned.toolchain)?;

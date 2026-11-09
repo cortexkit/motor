@@ -32,7 +32,7 @@ const READ_SEARCH: u32 = 0o5;
 /// True only when every entry under `root` is already readable (directories
 /// also searchable) by `uid`, and, with `inherit`, every directory's default
 /// ACL already passes that read access to new entries.
-pub(super) fn already_readable(root: &Path, uid: u32, inherit: bool) -> bool {
+pub(crate) fn already_readable(root: &Path, uid: u32, inherit: bool) -> bool {
     matches!(walk(root, uid, inherit), Ok(true))
 }
 

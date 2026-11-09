@@ -391,6 +391,7 @@ impl<M: Machine> Helper<M> {
             _ => Err(Error("lease identity or connection does not match".into())),
         }
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn authorize_image_work(
         &self,
         connection: u64,

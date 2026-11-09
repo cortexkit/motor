@@ -1,10 +1,7 @@
 use super::*;
 use cortexkit_test_support::ScratchDir;
 
-// Compile the runner's actual startup predicate, so changes to its ACL contract
-// also change the publication test rather than two independent expected lists.
-#[path = "../../../../motor-runner/src/isolation/readable.rs"]
-mod runner_readable;
+use motor_runner::image_source_tree_already_readable as runner_readable;
 
 #[test]
 fn account_copies_have_full_private_extents_even_when_source_is_reflinked() {
@@ -20,6 +17,7 @@ fn account_copies_have_full_private_extents_even_when_source_is_reflinked() {
         super::super::job::image_copy_exclusive_bytes(&cloned).unwrap(),
         0
     );
+    assert!(require_physical_copy(&cloned).is_err());
     cloned = File::open(&clone).unwrap();
     for name in ["account-a", "account-b"] {
         let path = scratch.join(name);
@@ -36,6 +34,8 @@ fn account_copies_have_full_private_extents_even_when_source_is_reflinked() {
             cloned.metadata().unwrap().ino()
         );
     }
+    std::fs::hard_link(scratch.join("account-a"), scratch.join("linked-account")).unwrap();
+    assert!(require_physical_copy(&File::open(scratch.join("account-a")).unwrap()).is_err());
 }
 
 #[test]
@@ -46,13 +46,13 @@ fn publication_acl_provisioner_satisfies_the_runners_actual_startup_check() {
         let root = scratch.join(name);
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("nested/source"), b"crate").unwrap();
-        assert!(!runner_readable::already_readable(&root, uid, true));
+        assert!(!runner_readable(&root, uid, true));
         provision_tree(&root, uid).unwrap();
-        assert!(runner_readable::already_readable(&root, uid, true));
+        assert!(runner_readable(&root, uid, true));
         // A newly fetched source must inherit the same read/search grant.
         std::fs::create_dir(root.join("new")).unwrap();
         std::fs::write(root.join("new/entry"), b"new source").unwrap();
-        assert!(runner_readable::already_readable(&root, uid, true));
+        assert!(runner_readable(&root, uid, true));
     }
 }
 
@@ -181,7 +181,7 @@ mod root {
             );
             let mounted = Mount::open(&path, &scratch.join("check-mount"), true).unwrap();
             for name in ["registry", "git"] {
-                assert!(runner_readable::already_readable(
+                assert!(runner_readable(
                     &mounted.0.join("usr/local/lib/motor/cargo").join(name),
                     12345,
                     true
@@ -189,6 +189,20 @@ mod root {
             }
             mounted.close().unwrap();
         }
+        let shared = image.join("accounts/account-shared");
+        directory(&shared).unwrap();
+        let file = File::create(shared.join("toolchain.ext4")).unwrap();
+        fs::reflink(&File::open(image.join("toolchain.ext4")).unwrap(), &file).unwrap();
+        seal(&shared.join("toolchain.ext4")).unwrap();
+        assert!(prepare(&root, "gen-1", "account-shared").is_err());
+        let linked = image.join("accounts/account-linked");
+        directory(&linked).unwrap();
+        std::fs::hard_link(
+            image.join("accounts/account-a/toolchain.ext4"),
+            linked.join("toolchain.ext4"),
+        )
+        .unwrap();
+        assert!(prepare(&root, "gen-1", "account-linked").is_err());
         // Publication is idempotent, but an identity cannot be overwritten.
         publish(&staging, &root, "gen-1", provision).unwrap();
         let mut changed = pinned;
