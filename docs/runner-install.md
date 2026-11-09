@@ -65,13 +65,15 @@ the root-owned `/etc/motor-runner/source-seal.json`, including for an in-process
 root runner. `build-bases` and its repository directory must belong to the runner
 or root and permit no group or other write. Every staging inode must belong to
 the validated `motor-cache` fill account, which must differ from the runner,
-root and `motor-job`; staging directories permit no group or other write.
-The walks refuse mount boundaries, repeated directory inodes and nesting beyond
-128 directories below the staging root. Removal validates the complete tree
-before unlinking and changes no owner, mode or ACL. The link check accepts only
+root and `motor-job`; publication requires staging directories to permit no group
+or other write. Both walks refuse mount boundaries and repeated directory inodes;
+publication also refuses nesting beyond 128 directories below the staging root.
+Removal of a stopped fill validates the complete tree before unlinking, accepts
+any depth and repairs directory modes to 0700 through held descriptors, but
+changes no non-directory owner, mode or ACL. The link check accepts only
 non-directory inodes whose link counts equal the names found inside the tree.
-Tests: `staging_security_preflights_all_directory_modes_before_removal`,
-`staging_security_bounds_depth_before_any_removal`, and the
+Tests: `staging_publication_refuses_writable_directory_modes`,
+`staging_publication_bounds_depth`, and the
 `isolated_staging_security_*` tests in `permissions::tests`.
 
 The caller must stop the fill unit and prevent the fill account from writing

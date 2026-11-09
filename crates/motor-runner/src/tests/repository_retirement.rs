@@ -73,6 +73,8 @@ async fn unused_repository_retires_after_thirty_days_with_its_derived_state_acro
     let main_install = javascript_entry(&runner, "js-installs", 'a', &f.root);
     let other_install = javascript_entry(&runner, "js-installs", 'b', "/elsewhere/repository");
     let sibling_manager = javascript_entry(&runner, "js-manager-caches", 'c', &f.canonical);
+    #[cfg(target_os = "linux")]
+    let intent = seed_intent(&runner, Path::new(&f.root));
 
     // A restart twenty days later is neither use nor a reset of the clock.
     drop(runner);
@@ -100,6 +102,8 @@ async fn unused_repository_retires_after_thirty_days_with_its_derived_state_acro
     assert!(!main_install.exists());
     assert!(!sibling_manager.exists());
     assert!(other_install.exists());
+    #[cfg(target_os = "linux")]
+    assert!(!intent.exists());
     let inner = runner.core.inner.lock().unwrap();
     assert!(!inner.catalog.workspaces.contains_key(&f.root));
     assert!(inner.catalog.sibling_commits.is_empty());

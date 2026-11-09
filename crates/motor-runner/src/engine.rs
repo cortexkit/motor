@@ -3885,6 +3885,13 @@ impl Runner {
     /// (hundreds of thousands of files) takes minutes, and holding the lock
     /// that long stalls every other job, transfer and status request.
     fn discard(&self, path: &Path) -> io::Result<()> {
+        self.discard_tree(path)?;
+        #[cfg(target_os = "linux")]
+        crate::seed::forget(&self.core.trees.state, path)?;
+        Ok(())
+    }
+
+    fn discard_tree(&self, path: &Path) -> io::Result<()> {
         if path.parent() == Some(self.core.trees.mirrors.as_path()) {
             self.report_retired_mirror(path)?;
         }
@@ -6995,6 +7002,10 @@ impl Runner {
             runner.validate_destinations(host_path, None, &[])?;
             let mut inner = runner.core.inner.lock().unwrap();
             let dropped = inner.catalog.workspaces.contains_key(&key);
+            #[cfg(target_os = "linux")]
+            if !dropped {
+                crate::seed::forget(&runner.core.trees.state, host_path.as_path())?;
+            }
             let catalog = if dropped {
                 runner.discard(host_path.as_path())?;
                 inner.catalog.workspaces.remove(&key);

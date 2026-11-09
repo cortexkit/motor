@@ -30,6 +30,12 @@ pub(crate) struct Record {
     pub newest_mtime: Timestamp,
 }
 
+impl Record {
+    pub(crate) fn times_valid(&self) -> bool {
+        self.fill_start <= self.newest_mtime && self.newest_mtime <= Timestamp::now()
+    }
+}
+
 pub(crate) const REFILL_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// Match checkout file-presence checks using only immutable tree entries.
@@ -83,6 +89,7 @@ pub(crate) fn needs_fill(
                 || record.commit != tip
                 || record.fixed_path != fixed_path
                 || current.differs_for_due(&record.inputs)
+                || !record.times_valid()
         }
         Err(_) => true,
     }
@@ -600,7 +607,8 @@ pub(crate) fn verify_unchanged(
             ));
         }
         let name_c = cstring(name)?;
-        let bytes = if mode == "120000" {
+        let expected = workspace::snapshot_blob(&mirror, &oid)?;
+        let matches = if mode == "120000" {
             if stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
                 return Err(io::Error::other("tracked symlink type changed"));
             }
@@ -622,7 +630,7 @@ pub(crate) fn verify_unchanged(
                 return Err(io::Error::last_os_error());
             }
             bytes.truncate(len as usize);
-            bytes
+            bytes == expected
         } else {
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG
                 || (stat.st_mode & 0o100 != 0) != (mode == "100755")
@@ -647,12 +655,9 @@ pub(crate) fn verify_unchanged(
                     "tracked inode replaced during verification",
                 ));
             }
-            let mut bytes = Vec::new();
-            use std::io::Read;
-            file.read_to_end(&mut bytes)?;
-            bytes
+            contents_match(&mut file, &expected)?
         };
-        if bytes != workspace::snapshot_blob(&mirror, &oid)? {
+        if !matches {
             return Err(io::Error::other(format!(
                 "fill checkout no longer verifies against base tree: {}",
                 name.to_string_lossy()
@@ -660,6 +665,22 @@ pub(crate) fn verify_unchanged(
         }
     }
     Ok(())
+}
+
+fn contents_match(reader: &mut impl io::Read, expected: &[u8]) -> io::Result<bool> {
+    // Bound reads of writer-owned files, including an oversized replacement.
+    let mut buffer = [0; 8192];
+    for chunk in expected.chunks(buffer.len()) {
+        match reader.read_exact(&mut buffer[..chunk.len()]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        if &buffer[..chunk.len()] != chunk {
+            return Ok(false);
+        }
+    }
+    Ok(reader.read(&mut buffer[..1])? == 0)
 }
 
 fn newest_mtime(root: &std::os::fd::OwnedFd) -> io::Result<Timestamp> {
@@ -801,6 +822,28 @@ fn publish_after_link_check(
 
 /// Called only after the link, checkout, ownership and build-output checks.
 pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<()> {
+    publish_record_synced(
+        generation,
+        record,
+        #[cfg(test)]
+        sync_generation,
+    )
+}
+
+fn sync_generation(root: &std::os::fd::OwnedFd) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::syncfs(root.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn publish_record_synced(
+    generation: &Path,
+    record: &Record,
+    #[cfg(test)] sync: impl FnOnce(&std::os::fd::OwnedFd) -> io::Result<()>,
+) -> io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
     let mut leases = leases().lock().unwrap();
@@ -811,6 +854,12 @@ pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<(
     // physical_root returns O_PATH; fsync needs an ordinary directory handle.
     // Open both directories through their entries, without following links.
     let root = open_directory(&parent, generation.file_name().unwrap())?;
+    // The writer has stopped. Persist its artifacts before making a record that
+    // can certify this generation after a crash; Cargo does not fsync outputs.
+    #[cfg(test)]
+    sync(&root)?;
+    #[cfg(not(test))]
+    sync_generation(&root)?;
     let fd = unsafe {
         libc::openat(
             root.as_raw_fd(),
@@ -1092,6 +1141,87 @@ mod tests {
             workspace::git(&self.scratch, &["add", path]).unwrap();
             self.tree = workspace::git(&self.scratch, &["write-tree"]).unwrap();
         }
+    }
+
+    #[test]
+    fn publication_barrier_precedes_record_and_failure_keeps_current() {
+        use std::{cell::Cell, os::unix::fs::MetadataExt};
+        let f = Fixture::new();
+        let store = repository_store(&f.scratch, "/repo");
+        let current = store.join("current");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("base.json"), b"old record").unwrap();
+        fs::write(current.join("artifact"), b"old artifact").unwrap();
+        let old_inode = fs::metadata(&current).unwrap().ino();
+        let generation = staging(&f.scratch, "/repo", motor_protocol::Uuid::now_v7());
+        fs::create_dir_all(generation.join("target/bd")).unwrap();
+        fs::write(generation.join("target/bd/artifact"), b"new artifact").unwrap();
+        let record = Record {
+            format: 1,
+            commit: "new".into(),
+            tree: f.tree.trim().into(),
+            inputs: f.identity(None).for_seed().unwrap().clone(),
+            fixed_path: "/w/account/key/repo".into(),
+            fill_start: Timestamp {
+                seconds: 1,
+                nanos: 0,
+            },
+            newest_mtime: Timestamp {
+                seconds: 2,
+                nanos: 0,
+            },
+        };
+        let called = Cell::new(false);
+        let error = publish_record_synced(&generation, &record, |fd| {
+            called.set(true);
+            assert_eq!(
+                fs::File::from(fd.try_clone()?).metadata()?.ino(),
+                fs::metadata(&generation)?.ino()
+            );
+            assert!(!generation.join("base.json").exists());
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert!(called.get());
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(!generation.join("base.json").exists());
+        assert_eq!(fs::metadata(&current).unwrap().ino(), old_inode);
+        assert_eq!(fs::read(current.join("base.json")).unwrap(), b"old record");
+        assert_eq!(fs::read(current.join("artifact")).unwrap(), b"old artifact");
+        publish_record_synced(&generation, &record, |fd| {
+            assert!(!generation.join("base.json").exists());
+            sync_generation(fd)
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read(current.join("target/bd/artifact")).unwrap(),
+            b"new artifact"
+        );
+    }
+
+    #[test]
+    fn source_comparison_bounds_reads_and_stops_at_expected_length() {
+        struct Oversized {
+            read: usize,
+        }
+        impl io::Read for Oversized {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                assert!(buffer.len() <= 8192, "unbounded read");
+                self.read += buffer.len();
+                assert!(self.read <= 20_001, "read beyond trusted blob length");
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+        let expected = vec![b'x'; 20_000];
+        let mut oversized = Oversized { read: 0 };
+        assert!(!contents_match(&mut oversized, &expected).unwrap());
+        assert_eq!(oversized.read, 20_001);
+        assert!(contents_match(&mut expected.as_slice(), &expected).unwrap());
+        assert!(!contents_match(&mut &expected[..19_999], &expected).unwrap());
+        let mut different = expected.clone();
+        different[16_384] = b'y';
+        assert!(!contents_match(&mut different.as_slice(), &expected).unwrap());
     }
 
     #[test]

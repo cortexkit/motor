@@ -204,6 +204,23 @@ pub(super) fn register_runner(runner: &Runner) {
     });
 }
 
+#[cfg(target_os = "linux")]
+fn seed_intent(runner: &Runner, workspace: &Path) -> PathBuf {
+    let path = runner
+        .core
+        .trees
+        .state
+        .join("seed-intents")
+        .join(workspace::name(workspace.to_str().unwrap()));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        br#"{"staging":".motor-seed-test","directories":null}"#,
+    )
+    .unwrap();
+    path
+}
+
 struct Fixture {
     cleanup: crate::test_cleanup::Cleanup,
     scratch: std::mem::ManuallyDrop<ScratchDir>,

@@ -132,6 +132,21 @@ fn remove_intent(parent: &File, entry: &CStr) -> io::Result<()> {
     parent.sync_all()
 }
 
+/// Forget recovery state after the workspace path is absent or moved to trash,
+/// so an old intent cannot affect a later checkout at the same path.
+pub(crate) fn forget(state: &Path, workspace: &Path) -> io::Result<()> {
+    let path = intent_path(state, workspace);
+    let parent = match root(path.parent().unwrap()) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match remove_intent(&parent, &name(path.file_name().unwrap())?) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 /// Before populate, and after any failed seed, remove only directories the
 /// transaction recorded. In particular, EEXIST never grants cleanup authority.
 pub(crate) fn settle(state: &Path, workspace: &Path) -> io::Result<()> {
@@ -153,19 +168,41 @@ pub(crate) fn settle(state: &Path, workspace: &Path) -> io::Result<()> {
     {
         return Err(io::Error::other("invalid seed intent staging name"));
     }
-    if let Some([new, empty]) = intent.directories {
-        let workspace = root(workspace)?;
-        if let Some(target) = existing_directory(&workspace, c"target")? {
-            if Identity::of(&target)? == new {
-                clear(&target, new.device)?;
-            }
+    let workspace = match root(workspace) {
+        Ok(workspace) => Some(workspace),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            None
         }
+        Err(error) => return Err(error),
+    };
+    if let Some(workspace) = workspace {
         let staging = name(OsStr::new(&intent.staging))?;
-        if let Some(staged) = existing_directory(&workspace, &staging)? {
-            let identity = Identity::of(&staged)?;
-            if identity == new || identity == empty {
-                clear(&staged, identity.device)?;
-                unlink(&workspace, &staging, libc::AT_REMOVEDIR)?;
+        if let Some([new, empty]) = intent.directories {
+            if let Some(target) = existing_directory(&workspace, c"target")? {
+                if Identity::of(&target)? == new {
+                    clear(&target, new.device)?;
+                }
+            }
+            if let Some(staged) = existing_directory(&workspace, &staging)? {
+                let identity = Identity::of(&staged)?;
+                if identity == new || identity == empty {
+                    clear(&staged, identity.device)?;
+                    unlink(&workspace, &staging, libc::AT_REMOVEDIR)?;
+                }
+            }
+        } else {
+            // The mkdir may have completed before its identity was saved. Only
+            // rmdir is safe here: never recurse into an unrecorded directory.
+            if let Err(error) = unlink(&workspace, &staging, libc::AT_REMOVEDIR) {
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT | libc::ENOTDIR | libc::ENOTEMPTY | libc::EEXIST)
+                ) {
+                    return Err(error);
+                }
             }
         }
     }
@@ -317,6 +354,7 @@ fn record_matches(
 ) -> io::Result<bool> {
     let compatible = attempt.compatibility.for_seed().map_err(io::Error::other)?;
     Ok(record.format == 1
+        && record.times_valid()
         && record.fixed_path == attempt.fixed
         && record.inputs == *compatible
         && base_device == target_device)
@@ -398,6 +436,12 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
         Identity::of(&base.directory)?.device,
         Identity::of(&target)?.device,
     )? {
+        tracing::info!(
+            workspace = %attempt.workspace.display(),
+            inputs_match = attempt.compatibility.for_seed().is_ok_and(|inputs| record.inputs == *inputs),
+            times_valid = record.times_valid(),
+            "build base seed refused: record mismatch"
+        );
         return Ok(false);
     }
     let old = tree(attempt.mirror, &record.tree)?;
@@ -671,6 +715,132 @@ mod tests {
         assert!(source.starts_with("/proc/self/fd"));
         fs::create_dir_all(target)?;
         fs::write(target.join("artifact"), fs::read(source.join("artifact"))?)
+    }
+
+    #[test]
+    fn impossible_base_times_are_refused_before_intent_or_clone_and_due_for_refill() {
+        for future in [false, true] {
+            let mut fixture = Fixture::new();
+            if future {
+                fixture.record.newest_mtime = Timestamp {
+                    seconds: i64::MAX,
+                    nanos: 0,
+                };
+            } else {
+                fixture.record.fill_start = fixture.record.newest_mtime;
+                fixture.record.fill_start.nanos += 1;
+            }
+            fixture.save_record();
+            let mut ops = fixture.ops();
+            ops.clone = &|_, _| panic!("invalid base must not be cloned");
+            ops.repair = &|_| panic!("invalid base must not be repaired");
+            ops.hook = &|_| panic!("invalid base must not create an intent");
+            let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                motor_protocol::logging::LineSubscriber::new("[runner]", Log(bytes.clone()));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !execute(&fixture.attempt(), &ops, motor_protocol::Uuid::now_v7()).unwrap()
+                );
+            });
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(logs.matches("build base seed refused").count(), 1, "{logs}");
+            assert!(logs.contains("times_valid=false"), "{logs}");
+            assert!(!intent_path(&fixture.scratch, &fixture.workspace).exists());
+            assert!(std::process::Command::new("sh")
+                .args(["-c", "echo built > target/job-output"])
+                .current_dir(&fixture.workspace)
+                .status()
+                .unwrap()
+                .success());
+            assert_eq!(
+                fs::read_to_string(fixture.workspace.join("target/job-output")).unwrap(),
+                "built\n"
+            );
+            let published = build_base::repository_store(&fixture.scratch, "/repo").join("current");
+            fs::create_dir_all(&published).unwrap();
+            fs::write(
+                published.join("base.json"),
+                serde_json::to_vec(&fixture.record).unwrap(),
+            )
+            .unwrap();
+            assert!(build_base::needs_fill(
+                &fixture.scratch,
+                "/repo",
+                &fixture.record.commit,
+                &fixture.record.fixed_path,
+                &fixture.compatibility
+            ));
+        }
+    }
+
+    #[test]
+    fn settle_forgets_identity_intent_for_missing_or_nondirectory_workspace() {
+        for replacement in [false, true] {
+            let fixture = Fixture::new();
+            let staged = fixture.workspace.join(".motor-seed-test");
+            fs::create_dir(&staged).unwrap();
+            fs::create_dir(fixture.workspace.join("target")).unwrap();
+            let intent = Intent {
+                staging: ".motor-seed-test".into(),
+                directories: Some([
+                    Identity::of(&root(&staged).unwrap()).unwrap(),
+                    Identity::of(&root(&fixture.workspace.join("target")).unwrap()).unwrap(),
+                ]),
+            };
+            let path = intent_path(&fixture.scratch, &fixture.workspace);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec(&intent).unwrap()).unwrap();
+            fs::remove_dir_all(&fixture.workspace).unwrap();
+            if replacement {
+                fs::write(&fixture.workspace, b"not a workspace").unwrap();
+            }
+            settle(&fixture.scratch, &fixture.workspace).unwrap();
+            assert!(!path.exists());
+            if replacement {
+                fs::remove_file(&fixture.workspace).unwrap();
+            }
+            fs::create_dir(&fixture.workspace).unwrap();
+            settle(&fixture.scratch, &fixture.workspace).unwrap();
+        }
+    }
+
+    #[test]
+    fn unrecorded_intent_removes_only_empty_recorded_name() {
+        for kind in ["empty", "nonempty", "link", "absent"] {
+            let fixture = Fixture::new();
+            let staged = fixture.workspace.join(".motor-seed-test");
+            match kind {
+                "empty" => fs::create_dir(&staged).unwrap(),
+                "nonempty" => {
+                    fs::create_dir(&staged).unwrap();
+                    fs::write(staged.join("keep"), b"keep").unwrap();
+                }
+                "link" => symlink(fixture.workspace.join(".motor-seed-a"), &staged).unwrap(),
+                _ => {}
+            }
+            let path = intent_path(&fixture.scratch, &fixture.workspace);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::to_vec(&Intent {
+                    staging: ".motor-seed-test".into(),
+                    directories: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            settle(&fixture.scratch, &fixture.workspace).unwrap();
+            assert!(!path.exists());
+            assert_eq!(
+                staged.symlink_metadata().is_ok(),
+                matches!(kind, "nonempty" | "link")
+            );
+            assert_eq!(
+                fs::read(fixture.workspace.join(".motor-seed-a/tracked")).unwrap(),
+                b"keep"
+            );
+        }
     }
 
     #[test]
@@ -1139,16 +1309,11 @@ mod tests {
             "removed",
             "ownership",
             "times",
-            "future",
             "identity",
         ] {
             let mut fixture = Fixture::new();
             if case == "identity" {
                 fixture.compatibility = Compatibility::Unavailable("unreadable compiler".into());
-            }
-            if case == "future" {
-                fixture.record.newest_mtime.seconds = i64::MAX;
-                fixture.save_record();
             }
             let calls = Cell::new(0);
             let clone = |source: &Path, target: &Path| {
@@ -1412,15 +1577,6 @@ mod tests {
                 ops.times = &|_| panic!("kept folder must not be time-set");
                 assert!(!run(&fixture.attempt(), &ops).unwrap());
                 assert!(fixture.workspace.join("target/artifact").exists());
-            } else if boundary == "mkdir" {
-                assert!(children(&root(&fixture.workspace.join("target")).unwrap())
-                    .unwrap()
-                    .is_empty());
-                assert!(
-                    fixture.workspace.join(".motor-seed-test").is_dir(),
-                    "unrecorded directory has no cleanup authority"
-                );
-                assert!(!intent_path(&fixture.scratch, &fixture.workspace).exists());
             } else {
                 fixture.assert_settled();
             }

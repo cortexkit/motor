@@ -566,12 +566,12 @@ impl StagingWalk {
         }
         let key = (metadata.dev(), metadata.ino());
         if metadata.is_dir() {
-            if metadata.mode() & 0o022 != 0 {
+            if !self.removing && metadata.mode() & 0o022 != 0 {
                 return Err(io::Error::other(
                     "staging directories must not be group/other-writable",
                 ));
             }
-            if depth > MAX_STAGING_DEPTH {
+            if !self.removing && depth > MAX_STAGING_DEPTH {
                 return Err(io::Error::other("staging walk exceeds maximum depth"));
             }
             if !self.directories.insert(key) {
@@ -650,46 +650,107 @@ fn remove_staging(
     name: &std::ffi::OsStr,
     owners: StagingOwners,
 ) -> io::Result<()> {
-    // Validate the entire tree before the first unlink, so a foreign owner,
-    // writable directory, mount or excessive depth cannot cause partial removal.
-    inspect_staging(root.try_clone()?, owners, false)?;
+    preflight_removal(root.try_clone()?, owners)?;
     let mut walk = StagingWalk::new(&root, owners)?;
-    // Preflight checked link counts. Unlinking legitimately decreases them,
-    // so deletion rechecks ownership, mounts and directories, not link totals.
+    // Removal never changes non-directory metadata, including external hard
+    // links. A stopped writer's hostile modes and depth must not block cleanup.
     walk.track_links = false;
     walk.removing = true;
     walk.visit(&root, 0)?;
-    let mut stack = vec![(
-        Frame {
-            entries: directory_entries(&root)?,
-            fd: root,
-        },
-        name.to_owned(),
-    )];
-    while !stack.is_empty() {
-        let depth = stack.len();
-        let (parent, _) = stack.last_mut().unwrap();
-        if let Some(entry) = parent.entries.next() {
-            let name = entry?.file_name();
-            let child = open_at(parent.fd.as_raw_fd(), &name, false)?;
-            if walk.visit(&child, depth)? {
-                stack.push((
-                    Frame {
-                        entries: directory_entries(&child)?,
-                        fd: child,
-                    },
-                    name,
-                ));
+    removal_directory(&root)?;
+    let mut current = root;
+    let mut ancestors = Vec::new();
+    loop {
+        // Reopen the pinned directory on each pass. Do not retain a ReadDir or
+        // descriptor per ancestor: a fill can exceed both PATH_MAX and RLIMIT_NOFILE.
+        let next = directory_entries(&current)?.next().transpose()?;
+        if let Some(entry) = next {
+            let name = entry.file_name();
+            let child = open_at(current.as_raw_fd(), &name, false)?;
+            if walk.visit(&child, ancestors.len() + 1)? {
+                removal_directory(&child)?;
+                ancestors.push((name, directory_identity(&current)?));
+                current = child;
             } else {
-                unlink_at(parent.fd.as_raw_fd(), &name, false)?;
+                unlink_at(current.as_raw_fd(), &name, false)?;
             }
         } else {
-            let (_, name) = stack.pop().unwrap();
-            let parent = stack
-                .last()
-                .map_or(repository.as_raw_fd(), |(frame, _)| frame.fd.as_raw_fd());
-            unlink_at(parent, &name, true)?;
+            let Some((child_name, identity)) = ancestors.pop() else {
+                confirm_directory_entry(&repository, name, &current)?;
+                return unlink_at(repository.as_raw_fd(), name, true);
+            };
+            let parent = open_at(current.as_raw_fd(), std::ffi::OsStr::new(".."), true)?;
+            if directory_identity(&parent)? != identity || mount_id(&parent)? != walk.mount {
+                return Err(io::Error::other("staging parent replaced during removal"));
+            }
+            confirm_directory_entry(&parent, &child_name, &current)?;
+            unlink_at(parent.as_raw_fd(), &child_name, true)?;
+            current = parent;
         }
+    }
+}
+
+fn preflight_removal(mut current: OwnedFd, owners: StagingOwners) -> io::Result<()> {
+    let mut walk = StagingWalk::new(&current, owners)?;
+    walk.removing = true;
+    walk.track_links = false;
+    walk.visit(&current, 0)?;
+    removal_directory(&current)?;
+    let entries = |fd: &OwnedFd| -> io::Result<_> {
+        Ok(directory_entries(fd)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter())
+    };
+    let mut pending = entries(&current)?;
+    let mut ancestors = Vec::new();
+    loop {
+        if let Some(name) = pending.next() {
+            let child = open_at(current.as_raw_fd(), &name, false)?;
+            if walk.visit(&child, ancestors.len() + 1)? {
+                removal_directory(&child)?;
+                ancestors.push((pending, directory_identity(&current)?));
+                current = child;
+                pending = entries(&current)?;
+            }
+        } else if let Some((remaining, identity)) = ancestors.pop() {
+            let parent = open_at(current.as_raw_fd(), std::ffi::OsStr::new(".."), true)?;
+            if directory_identity(&parent)? != identity || mount_id(&parent)? != walk.mount {
+                return Err(io::Error::other("staging parent replaced during preflight"));
+            }
+            current = parent;
+            pending = remaining;
+        } else {
+            return Ok(());
+        }
+    }
+}
+
+fn directory_identity(fd: &OwnedFd) -> io::Result<(u64, u64)> {
+    let metadata = fs::File::from(fd.try_clone()?).metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn confirm_directory_entry(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    fd: &OwnedFd,
+) -> io::Result<()> {
+    let entry = open_at(parent.as_raw_fd(), name, true)?;
+    if directory_identity(&entry)? != directory_identity(fd)? {
+        return Err(io::Error::other(
+            "staging directory replaced during removal",
+        ));
+    }
+    Ok(())
+}
+
+fn removal_directory(fd: &OwnedFd) -> io::Result<()> {
+    // Only directories are chmodded, through the pinned kernel handle. Never
+    // repair a file that may also be hard-linked outside the generation.
+    let directory = fs::File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

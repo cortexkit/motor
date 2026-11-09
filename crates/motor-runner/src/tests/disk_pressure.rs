@@ -654,6 +654,10 @@ fn disk_soft_pressure_evicts_only_candidates_used_over_30_minutes_ago() {
     let now = runner.now();
     workspace(&runner, &old, now - 2 * 60 * 60 * 1000);
     workspace(&runner, &recent, now - 5 * 60 * 1000);
+    #[cfg(target_os = "linux")]
+    let old_intent = seed_intent(&runner, &old);
+    #[cfg(target_os = "linux")]
+    let recent_intent = seed_intent(&runner, &recent);
 
     let (request, _) = f.run("true");
     assert!(matches!(
@@ -668,6 +672,11 @@ fn disk_soft_pressure_evicts_only_candidates_used_over_30_minutes_ago() {
         recent.exists(),
         "the five-minute-old candidate should survive"
     );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(!old_intent.exists());
+        assert!(recent_intent.exists());
+    }
 }
 
 #[test]

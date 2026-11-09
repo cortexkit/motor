@@ -546,7 +546,7 @@ fn staging_security_refuses_wrong_owner_without_removing_any_entry() {
 }
 
 #[test]
-fn staging_security_preflights_all_directory_modes_before_removal() {
+fn staging_publication_refuses_writable_directory_modes() {
     let scratch = ScratchDir::new("staging-mode-refusal");
     let fill = motor_protocol::Uuid::nil();
     let generation = staging_fixture(&scratch, fill);
@@ -554,17 +554,28 @@ fn staging_security_preflights_all_directory_modes_before_removal() {
     fs::write(&file, b"keep").unwrap();
     for path in [&generation, &generation.join("target/nested/deeper")] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o770)).unwrap();
-        for action in ["check-staging-links", "remove-staging"] {
-            let error = fixture_staging_apply(action, &scratch, REPOSITORY, fill).unwrap_err();
-            assert!(
-                error.to_string().contains("group/other-writable"),
-                "{error}"
-            );
-            assert_eq!(fs::read(&file).unwrap(), b"keep");
-            assert_eq!(mode(path), 0o770);
-        }
+        let error =
+            fixture_staging_apply("check-staging-links", &scratch, REPOSITORY, fill).unwrap_err();
+        assert!(
+            error.to_string().contains("group/other-writable"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+        assert_eq!(mode(path), 0o770);
         fs::set_permissions(path, fs::Permissions::from_mode(0o750)).unwrap();
     }
+}
+
+#[test]
+fn staging_removal_accepts_writable_directory_modes() {
+    let scratch = ScratchDir::new("staging-mode-removal");
+    let fill = motor_protocol::Uuid::nil();
+    let generation = staging_fixture(&scratch, fill);
+    for path in [&generation, &generation.join("target/nested/deeper")] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    fixture_staging_apply("remove-staging", &scratch, REPOSITORY, fill).unwrap();
+    assert!(!generation.exists());
 }
 
 #[test]
@@ -643,7 +654,7 @@ fn staging_security_refuses_a_different_device_or_mount_before_entering() {
 }
 
 #[test]
-fn staging_security_bounds_depth_before_any_removal() {
+fn staging_publication_bounds_depth() {
     let scratch = ScratchDir::new("staging-depth-refusal");
     let fill = motor_protocol::Uuid::nil();
     let generation = staging_fixture(&scratch, fill);
@@ -654,12 +665,81 @@ fn staging_security_bounds_depth_before_any_removal() {
         deep.push("d");
         fs::create_dir(&deep).unwrap();
     }
-    for action in ["check-staging-links", "remove-staging"] {
-        let error = fixture_staging_apply(action, &scratch, REPOSITORY, fill).unwrap_err();
-        assert!(error.to_string().contains("maximum depth"), "{error}");
-        assert_eq!(fs::read(&file).unwrap(), b"keep");
-        assert!(deep.is_dir());
+    let error =
+        fixture_staging_apply("check-staging-links", &scratch, REPOSITORY, fill).unwrap_err();
+    assert!(error.to_string().contains("maximum depth"), "{error}");
+    assert_eq!(fs::read(&file).unwrap(), b"keep");
+    assert!(deep.is_dir());
+}
+
+#[test]
+fn staging_removal_accepts_excess_publication_depth() {
+    let scratch = ScratchDir::new("staging-depth-removal");
+    let fill = motor_protocol::Uuid::nil();
+    let generation = staging_fixture(&scratch, fill);
+    let mut deep = generation.clone();
+    for _ in 0..=MAX_STAGING_DEPTH {
+        deep.push("d");
+        fs::create_dir(&deep).unwrap();
     }
+    fixture_staging_apply("remove-staging", &scratch, REPOSITORY, fill).unwrap();
+    assert!(!generation.exists());
+}
+
+#[test]
+#[ignore = "requires root and provisioned motor-cache/motor-job accounts"]
+fn isolated_staging_removal_hostile_modes_and_depth_has_bounded_descriptors() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let scratch = ScratchDir::new("staging-hostile-removal");
+    let fill = motor_protocol::Uuid::nil();
+    let generation = staging_fixture(&scratch, fill);
+    let owners = StagingOwners::current().unwrap();
+    let mut current = physical_root(&generation).unwrap();
+    for depth in 0..600 {
+        let handle = fs::File::open(format!("/proc/self/fd/{}", current.as_raw_fd())).unwrap();
+        assert_eq!(
+            unsafe { libc::fchown(handle.as_raw_fd(), owners.writer, u32::MAX) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fchmod(handle.as_raw_fd(), if depth % 2 == 0 { 0o777 } else { 0 }) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::mkdirat(current.as_raw_fd(), c"directory".as_ptr(), 0o700) },
+            0
+        );
+        current = open_at(current.as_raw_fd(), std::ffi::OsStr::new("directory"), true).unwrap();
+    }
+    drop(current);
+    let outside = scratch.join("outside");
+    fs::write(&outside, b"unchanged").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::hard_link(&outside, generation.join("external-link")).unwrap();
+    let before = fs::metadata(&outside).unwrap();
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let low = libc::rlimit {
+        rlim_cur: 32,
+        ..limit
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
+    let removed = staging_execute("remove-staging", &scratch, REPOSITORY, fill, owners);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    removed.unwrap();
+    assert!(!generation.exists());
+    let after = fs::metadata(&outside).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    assert_eq!(fs::read(outside).unwrap(), b"unchanged");
 }
 
 #[test]

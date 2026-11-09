@@ -6,6 +6,11 @@ compiled. Jobs only read the cache. A separate trusted account fills it from the
 repository's default-branch tip, never from a submitted branch. This document
 covers who reads and writes the cache, what goes into a fill, and the local
 build bases that can seed private build folders.
+The repository's default branch and its locked dependencies are trusted; code
+on other branches is untrusted. A malicious default branch can poison both the
+shared compile cache and its build bases. A default-branch fill's output may
+seed later jobs of the same account and repository.
+A repository-configured rustc wrapper disables seeding for that job.
 [ARCHITECTURE.md](../ARCHITECTURE.md) shows where the cache sits;
 [job-isolation.md](job-isolation.md) describes the reader's sandbox.
 

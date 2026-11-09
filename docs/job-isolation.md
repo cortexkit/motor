@@ -454,7 +454,11 @@ partial suffix is emitted unchanged, once, before the terminal record. Tests:
 
 3.9.7. **Bases are not shared writable targets.** Trusted default-branch fills
 can publish a base at `<state_dir>/build-bases/<repo-key>/current`, shared by
-worktrees on this host and account only. An eligible empty `target/` receives a
+worktrees on this host and account only. The repository's default branch and
+its locked dependencies are trusted, just as for the shared compile cache;
+code on other branches is untrusted. A malicious default branch can poison
+both the shared compile cache and its build bases, whose output may seed later
+jobs of the same account and repository. An eligible empty `target/` receives a
 copy-on-write reflink clone. Only a newly seeded folder gets the content-based
 time step: unchanged tracked files and directories get the fill start time,
 changed ones get the time step's start time. A kept folder is never time-set.
