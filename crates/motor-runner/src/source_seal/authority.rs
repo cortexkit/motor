@@ -9,6 +9,14 @@ pub(crate) struct Authority {
 }
 
 impl Authority {
+    #[cfg(test)]
+    /// A concrete fixture policy, not an exemption from state/root checks.
+    pub(crate) fn for_fixture(config: &Config) -> Self {
+        Self {
+            states: BTreeMap::from([(config.state_dir(), roots(config))]),
+        }
+    }
+
     pub(crate) fn load() -> io::Result<Self> {
         Self::read(Path::new(CONFIG))
     }

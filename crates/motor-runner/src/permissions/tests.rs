@@ -522,11 +522,24 @@ fn staging_security_refuses_wrong_owner_without_removing_any_entry() {
     fs::write(generation.join("target/keep"), b"keep").unwrap();
     let uid = unsafe { libc::geteuid() };
     let owners = StagingOwners {
-        runner: uid,
+        runner: uid + 2,
         writer: uid + 1,
     };
     for action in ["check-staging-links", "remove-staging"] {
-        let error = staging_apply(action, &scratch, REPOSITORY, fill, owners).unwrap_err();
+        // Exercise the inode preflight directly: the store-directory owner
+        // checks are covered separately and would reject this fixture first.
+        let root = physical_root(&generation).unwrap();
+        let error = if action == "check-staging-links" {
+            inspect_staging(root, owners, true)
+        } else {
+            remove_staging(
+                root,
+                physical_root(generation.parent().unwrap()).unwrap(),
+                generation.file_name().unwrap(),
+                owners,
+            )
+        }
+        .unwrap_err();
         assert!(error.to_string().contains("fill writer"), "{error}");
         assert_eq!(fs::read(generation.join("target/keep")).unwrap(), b"keep");
     }
@@ -672,7 +685,12 @@ fn isolated_staging_security_checks_every_owner_before_removing_anything() {
     let scratch = ScratchDir::new("staging-foreign-owner");
     let fill = motor_protocol::Uuid::nil();
     let generation = staging_fixture(&scratch, fill);
-    let owners = StagingOwners::current().unwrap();
+    // Model a delegated non-root runner even though this fixture needs root
+    // to plant each foreign owner. Root is then foreign to both identities.
+    let owners = StagingOwners {
+        runner: 65533,
+        ..StagingOwners::current().unwrap()
+    };
     let job = crate::isolation::job_identity().unwrap().uid;
     let keep = generation.join("target/keep");
     let foreign = generation.join("target/nested/deeper/foreign");
@@ -715,6 +733,36 @@ fn isolated_staging_security_checks_every_owner_before_removing_anything() {
     }
     staging_execute("check-staging-links", &scratch, REPOSITORY, fill, owners).unwrap();
     staging_execute("remove-staging", &scratch, REPOSITORY, fill, owners).unwrap();
+    assert!(!generation.exists());
+}
+
+#[test]
+#[ignore = "requires root and provisioned motor-cache/motor-job accounts"]
+fn isolated_staging_removal_accepts_partial_runner_chown_but_link_check_does_not() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let scratch = ScratchDir::new("staging-partial-chown");
+    let fill = motor_protocol::Uuid::nil();
+    let generation = staging_fixture(&scratch, fill);
+    let owners = StagingOwners {
+        runner: 65533,
+        ..StagingOwners::current().unwrap()
+    };
+    let artifact = generation.join("target/nested/deeper/artifact");
+    fs::write(&artifact, b"artifact").unwrap();
+    for path in [
+        &generation,
+        &generation.join("target"),
+        &generation.join("target/nested"),
+        &generation.join("target/nested/deeper"),
+        &artifact,
+    ] {
+        set_fixture_owner(path, owners.writer);
+    }
+    set_fixture_owner(&generation, owners.runner);
+    set_fixture_owner(&artifact, owners.runner);
+    assert!(staging_apply("check-staging-links", &scratch, REPOSITORY, fill, owners).is_err());
+    assert!(artifact.exists());
+    staging_apply("remove-staging", &scratch, REPOSITORY, fill, owners).unwrap();
     assert!(!generation.exists());
 }
 
@@ -948,4 +996,38 @@ fn mount_id_matches_the_kernels_fdinfo_mount_id() {
             .unwrap();
         assert_eq!(mount_id(&fd).unwrap(), expected, "{}", path.display());
     }
+}
+
+#[test]
+#[ignore = "requires root and provisioned motor-cache/motor-job accounts"]
+fn isolated_staging_in_process_ignores_inherited_sudo_uid() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    const CHILD: &str = "MOTOR_STAGING_IDENTITY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert_ne!(std::env::var("SUDO_UID").unwrap(), "0");
+        assert_eq!(StagingOwners::current().unwrap().runner, 0);
+        return;
+    }
+    // Use a child process so this identity test never mutates another test's
+    // environment. A real non-root account makes the delegated path distinguishable.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "permissions::tests::isolated_staging_in_process_ignores_inherited_sudo_uid",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env(
+            "SUDO_UID",
+            crate::isolation::job_identity().unwrap().uid.to_string(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

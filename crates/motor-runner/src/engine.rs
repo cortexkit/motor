@@ -24,6 +24,18 @@ use std::{
 // Rotation alone lets a stream of new workspaces starve a recently used one.
 const BACKFILL_GRACE_MS: u64 = 60_000;
 
+fn resumable_base(job: &Job) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        job.base && job.base_launch.is_some() && job.durable_output
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = job;
+        false
+    }
+}
+
 /// How long the refs a have reply pins (`workspace::HELD_REFS`) outlive the
 /// reply. The bundle built from the reply arrives after the sender builds and
 /// uploads it and, on a tenant, after the lease is admitted; all of that is
@@ -1704,6 +1716,14 @@ struct Core {
     background_deletes: Arc<std::sync::atomic::AtomicUsize>,
     _lock: File,
     rustc_version: String,
+    #[cfg(target_os = "linux")]
+    base_toolchain: crate::build_base::RunnerToolchain,
+    #[cfg(target_os = "linux")]
+    base_removal_logged: Mutex<BTreeSet<Uuid>>,
+    #[cfg(all(test, target_os = "linux"))]
+    /// Privileged integration tests authorize only their own scratch instance.
+    /// Production Core has no policy override and loads the installed authority.
+    fixture_base_authority: Option<Arc<crate::source_seal::authority::Authority>>,
     /// Build server compiler versions a declared fill's descriptor extends. They
     /// are read once, at startup, so one runner's descriptors do not move under
     /// a host whose tools change.
@@ -2110,7 +2130,31 @@ impl Runner {
         let backend = backend::select(&config)?;
         Self::open_with_backend(config, backend)
     }
-    fn open_with_backend(mut config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
+    fn open_with_backend(config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
+        Self::open_body(
+            config,
+            backend,
+            #[cfg(all(test, target_os = "linux"))]
+            None,
+        )
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn open_with_fixture_authority(
+        config: Config,
+        authority: crate::source_seal::authority::Authority,
+    ) -> io::Result<Self> {
+        let backend = backend::select(&config)?;
+        Self::open_body(config, backend, Some(Arc::new(authority)))
+    }
+
+    fn open_body(
+        mut config: Config,
+        backend: Box<dyn Backend>,
+        #[cfg(all(test, target_os = "linux"))] fixture_base_authority: Option<
+            Arc<crate::source_seal::authority::Authority>,
+        >,
+    ) -> io::Result<Self> {
         config.check_options()?;
         paths::owner::check(&config)?;
         #[cfg(target_os = "linux")]
@@ -2516,7 +2560,10 @@ impl Runner {
         // Dependency-writer services may outlive the daemon. Stop their entire
         // process group before removing active build files or starting another
         // cache-writing service; foreground services still use normal recovery.
-        for job in interrupted.iter().filter(|job| job.base) {
+        for job in interrupted
+            .iter()
+            .filter(|job| job.base && !resumable_base(job))
+        {
             if let Some(unit) = job.process.and_then(|p| p.unit) {
                 #[cfg(any(target_os = "linux", test))]
                 {
@@ -2543,7 +2590,11 @@ impl Runner {
                 return Err(io::Error::other("dependency writer survived startup stop"));
             }
         }
-        for mut job in interrupted.iter().filter(|job| job.base).cloned() {
+        for mut job in interrupted
+            .iter()
+            .filter(|job| job.base && !resumable_base(job))
+            .cloned()
+        {
             refuse_before_start(
                 &health,
                 &mut job,
@@ -2573,11 +2624,14 @@ impl Runner {
         }
         let foreground: Vec<_> = interrupted
             .iter()
-            .filter(|job| !job.base)
+            .filter(|job| !job.base || resumable_base(job))
             .cloned()
             .collect();
         let reattached = backend.reconcile(&config, &foreground)?;
-        for mut job in interrupted.into_iter().filter(|job| !job.base) {
+        for mut job in interrupted
+            .into_iter()
+            .filter(|job| !job.base || resumable_base(job))
+        {
             let record = state
                 .join("jobs")
                 .join(job.id.to_string())
@@ -2806,7 +2860,10 @@ impl Runner {
                     #[cfg(target_os = "linux")]
                     source_seals,
                     restoring_reserve: false,
-                    writer: None,
+                    writer: jobs
+                        .values()
+                        .find(|job| job.base && job.terminal.is_none() && resumable_base(job))
+                        .map(|job| job.id),
                     #[cfg(target_os = "linux")]
                     cache_fills: BTreeMap::new(),
                     #[cfg(unix)]
@@ -2882,6 +2939,12 @@ impl Runner {
                 ),
                 _lock: lock,
                 rustc_version,
+                #[cfg(target_os = "linux")]
+                base_toolchain: crate::build_base::RunnerToolchain::probe(),
+                #[cfg(target_os = "linux")]
+                base_removal_logged: Mutex::new(BTreeSet::new()),
+                #[cfg(all(test, target_os = "linux"))]
+                fixture_base_authority,
                 compilers: Compilers::probe(&["cc", "c++", "ccache"]),
                 cpus,
             }),
@@ -2918,6 +2981,10 @@ impl Runner {
             runner.migrate_legacy_storage()?;
         }
         let scratch = runner.core.config.writer_scratch_dir();
+        #[cfg(target_os = "linux")]
+        if runner.core.quarantined.is_empty() {
+            runner.clean_build_base_leftovers()?;
+        }
         if scratch.exists() && runner.core.quarantined.is_empty() {
             #[cfg(target_os = "linux")]
             if runner.core.config.isolate_jobs {
@@ -8587,6 +8654,48 @@ impl Runner {
         // job can exist that the job does not name yet.
         self.core.inner.lock().unwrap().launching.insert(id);
         tracing::info!(job_id = %id, cache_fill = s.base, "handing materialized job to execution");
+        #[cfg(target_os = "linux")]
+        if s.base {
+            if let Some(fixed) = paths::fixed_paths(&self.core.config, &r).ok().flatten() {
+                let identity = backend::job_environment(
+                    &self.core.config,
+                    &self.core.trees,
+                    &s,
+                    &prepared.environment_inputs(),
+                    job.weight,
+                )
+                .map(|env| {
+                    crate::build_base::compatibility(
+                        &self.core.base_toolchain,
+                        &self.core.trees.mirror(&r.repository_root),
+                        &r.tree_hash,
+                        &env,
+                        &PathBuf::from(std::env::var_os("CARGO_HOME").unwrap_or_default())
+                            .join("bin/sccache"),
+                    )
+                });
+                match identity
+                    .as_ref()
+                    .map_err(ToString::to_string)
+                    .and_then(|value| value.for_publication().map_err(str::to_owned))
+                    .and_then(|inputs| {
+                        crate::build_base::Timestamp::reference()
+                            .map(|reference| (inputs, reference))
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok((inputs, reference)) => {
+                        job.base_launch = Some(crate::build_base::FillLaunch {
+                            inputs: inputs.clone(),
+                            fixed_path: fixed.checkout,
+                            reference,
+                        })
+                    }
+                    Err(reason) => {
+                        tracing::warn!(job_id = %id, %reason, "build base publication unavailable at launch")
+                    }
+                }
+            }
+        }
         let launch = match self.core.backend.launch(
             &self.core.config,
             &self.core.trees,
@@ -9979,7 +10088,12 @@ impl Runner {
             let checkout = paths::host_run(&self.core.config, r).host_cwd;
             (|| -> io::Result<()> {
                 #[cfg(target_os = "linux")]
-                if self.core.config.isolate_jobs {
+                if self.core.config.isolate_jobs && job.base_launch.is_none() {
+                    // Fills with saved launch inputs got runner read/search
+                    // access during sandbox preparation. Publication compares
+                    // source ctimes with the saved pre-launch time, so changing
+                    // their ACLs now would falsely look like source changes.
+                    // Unreadable sources must refuse publication, not be repaired.
                     crate::isolation::restore_runner_access(&checkout)?;
                 }
                 for (path, bytes) in crate::writer::fill::lockfiles(
@@ -10043,6 +10157,13 @@ impl Runner {
                 fill
             };
             self.long_work("base_cleanup");
+            #[cfg(target_os = "linux")]
+            self.publish_build_base(
+                id,
+                status.as_ref().is_ok_and(|status| status.success())
+                    && lock_check.is_ok()
+                    && writer_stats.is_ok(),
+            );
             let cleanup = self.clean_base(id, fill);
             #[cfg(unix)]
             let cleanup = {
@@ -10699,7 +10820,13 @@ impl Runner {
                 let Err(error) = &cleanup.scratch else {
                     break;
                 };
-                tracing::warn!(job_id = %id, %error, "warm build scratch cleanup will be retried");
+                #[cfg(target_os = "linux")]
+                let already_logged = self.core.base_removal_logged.lock().unwrap().contains(&id);
+                #[cfg(not(target_os = "linux"))]
+                let already_logged = false;
+                if !already_logged {
+                    tracing::warn!(job_id = %id, %error, "warm build scratch cleanup will be retried");
+                }
                 std::thread::park_timeout(delay);
                 delay = (delay * 2).min(Duration::from_secs(5));
                 self.long_work("base_scratch_retry");
@@ -10770,6 +10897,8 @@ impl Runner {
         let fill = fill.map(|fill| match fill {});
         let scratch = self.core.config.writer_scratch_dir().join(id.to_string());
         let scratch = (|| {
+            #[cfg(target_os = "linux")]
+            self.remove_build_base_staging(id)?;
             if scratch.exists() {
                 #[cfg(target_os = "linux")]
                 if self.core.config.isolate_jobs {
@@ -10785,6 +10914,190 @@ impl Runner {
             #[cfg(unix)]
             publication: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn base_unit_stopped(&self, id: Uuid) -> io::Result<bool> {
+        // Enabled fills use their runner-minted job ID as the durable unit ID,
+        // including the crash window before the process record is saved.
+        let unit = self.core.backend.unit_name(&self.core.config, id);
+        let output = backend::systemctl(
+            &self.core.config,
+            &[
+                "show",
+                "--property=LoadState",
+                "--property=ActiveState",
+                &unit,
+            ],
+        )?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.lines().any(|line| {
+            matches!(
+                line,
+                "ActiveState=active" | "ActiveState=activating" | "ActiveState=deactivating"
+            )
+        }) {
+            return Ok(false);
+        }
+        if text.lines().any(|line| line == "LoadState=not-found") {
+            return Ok(true);
+        }
+        if output.status.success() && text.lines().any(|line| line == "ActiveState=inactive") {
+            return Ok(true);
+        }
+        Err(io::Error::other(format!(
+            "cannot prove fill unit stopped: {text}"
+        )))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_build_base(&self, id: Uuid, success: bool) {
+        let job = self.core.inner.lock().unwrap().jobs[&id].clone();
+        let Some(request) = &job.request else { return };
+        let generation =
+            crate::build_base::staging(&self.core.trees.state, &request.repository_root, id);
+        if fs::symlink_metadata(&generation).is_err() {
+            return;
+        }
+        let result = (|| {
+            crate::build_base::publication_eligible(&job, success)?;
+            if !self.base_unit_stopped(id)? {
+                return Err(io::Error::other("fill unit not proven stopped"));
+            }
+            #[cfg(test)]
+            if let Some(authority) = &self.core.fixture_base_authority {
+                return crate::build_base::publish_with_authority(
+                    &self.core.trees.state,
+                    &self.core.trees,
+                    &paths::job_workspace(&self.core.config, &job),
+                    &job,
+                    success,
+                    authority,
+                );
+            }
+            crate::build_base::publish(
+                &self.core.trees.state,
+                &self.core.trees,
+                &paths::job_workspace(&self.core.config, &job),
+                &job,
+                success,
+            )
+        })();
+        if let Err(reason) = result {
+            tracing::warn!(job_id = %id, %reason, "build base publication refused");
+            if let Err(error) = self.output(
+                id,
+                OutputStream::Stderr,
+                format!("runner: build base publication refused: {reason}\n").as_bytes(),
+            ) {
+                tracing::warn!(job_id = %id, %error, "build base refusal could not be persisted to fill output");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_build_base_staging(&self, id: Uuid) -> io::Result<()> {
+        let result = self.try_remove_build_base_staging(id);
+        if let Err(reason) = &result {
+            if self.core.base_removal_logged.lock().unwrap().insert(id) {
+                tracing::warn!(job_id = %id, %reason, "build base staging removal failed");
+                if let Err(error) = self.output(
+                    id,
+                    OutputStream::Stderr,
+                    format!("runner: build base staging removal failed: {reason}\n").as_bytes(),
+                ) {
+                    tracing::warn!(job_id = %id, %error, "build base removal error could not be persisted to fill output");
+                }
+            }
+        } else {
+            self.core.base_removal_logged.lock().unwrap().remove(&id);
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_remove_build_base_staging(&self, id: Uuid) -> io::Result<()> {
+        let job = self.core.inner.lock().unwrap().jobs[&id].clone();
+        let Some(request) = job.request else {
+            return Ok(());
+        };
+        let generation =
+            crate::build_base::staging(&self.core.trees.state, &request.repository_root, id);
+        if fs::symlink_metadata(generation).is_ok() {
+            if !self.base_unit_stopped(id)? {
+                return Err(io::Error::other(
+                    "cannot remove staging: fill unit not proven stopped",
+                ));
+            }
+            self.remove_base_generation(&workspace::name(&request.repository_root), id)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clean_build_base_leftovers(&self) -> io::Result<()> {
+        let root = self.core.trees.state.join("build-bases");
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for repository in entries {
+            let repository = repository?;
+            if !repository.file_type()?.is_dir() {
+                continue;
+            }
+            let key = repository.file_name().to_string_lossy().into_owned();
+            for generation in fs::read_dir(repository.path())? {
+                let generation = generation?;
+                let name = generation.file_name().to_string_lossy().into_owned();
+                if name.starts_with("retired-") {
+                    // Retired generations already passed the link check and
+                    // belong to the runner; no privileged metadata repair.
+                    fs::remove_dir_all(generation.path())?;
+                } else if let Some(id) = name
+                    .strip_prefix("staging-")
+                    .and_then(|s| s.parse::<Uuid>().ok())
+                {
+                    let terminal_or_unknown = self
+                        .core
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .jobs
+                        .get(&id)
+                        .is_none_or(|job| job.terminal.is_some());
+                    let stopped = match self.base_unit_stopped(id) {
+                        Ok(stopped) => stopped,
+                        Err(reason) => {
+                            tracing::warn!(job_id = %id, %reason, "build base startup unit proof unavailable; staging retained");
+                            false
+                        }
+                    };
+                    if terminal_or_unknown && stopped {
+                        if let Err(reason) = self.remove_base_generation(&key, id) {
+                            tracing::warn!(job_id = %id, %reason, "build base startup removal deferred");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_base_generation(&self, key: &str, id: Uuid) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(authority) = &self.core.fixture_base_authority {
+            return crate::permissions::staging_authorized(
+                authority,
+                "remove-staging",
+                &self.core.trees.state,
+                key,
+                id,
+            );
+        }
+        crate::permissions::staging_operation("remove-staging", &self.core.trees.state, key, id)
     }
 
     /// Record a settled warm build in memory, from `clean_base`'s results:

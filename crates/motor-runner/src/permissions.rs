@@ -371,12 +371,10 @@ fn delegated_runner_uid() -> io::Result<u32> {
 
 impl StagingOwners {
     fn current() -> io::Result<Self> {
-        let uid = unsafe { libc::geteuid() };
-        let runner = if uid == 0 && std::env::var_os("SUDO_UID").is_some() {
-            delegated_runner_uid()?
-        } else {
-            uid
-        };
+        Self::for_runner(unsafe { libc::geteuid() })
+    }
+
+    fn for_runner(runner: u32) -> io::Result<Self> {
         let writer = crate::isolation::validate_writer_account()?.uid;
         if writer == runner {
             return Err(io::Error::other("fill writer must differ from the runner"));
@@ -412,8 +410,33 @@ pub(crate) fn staging_operation(
     fill: motor_protocol::Uuid,
 ) -> io::Result<()> {
     validate_staging_form(action, state, repository)?;
-    crate::source_seal::authority::Authority::load()?.roots(state)?;
-    let owners = StagingOwners::current()?;
+    let authority = crate::source_seal::authority::Authority::load()?;
+    staging_authorized(&authority, action, state, repository, fill)
+}
+
+/// Use an already trusted policy, still enforcing its state allowlist on every
+/// operation. Production callers obtain that policy only from Authority::load.
+pub(crate) fn staging_authorized(
+    authority: &crate::source_seal::authority::Authority,
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+) -> io::Result<()> {
+    staging_authorized_as(authority, action, state, repository, fill, None)
+}
+
+fn staging_authorized_as(
+    authority: &crate::source_seal::authority::Authority,
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+    runner: Option<u32>,
+) -> io::Result<()> {
+    validate_staging_form(action, state, repository)?;
+    authority.roots(state)?;
+    let owners = runner.map_or_else(StagingOwners::current, StagingOwners::for_runner)?;
     staging_execute(action, state, repository, fill, owners)
 }
 
@@ -450,11 +473,14 @@ pub(crate) fn staging_helper(action: &str, args: &[String]) -> io::Result<()> {
         .map_err(io::Error::other)?;
     let state = Path::new(&args[2]);
     validate_staging_form(action, state, repository)?;
-    delegated_runner_uid()?;
+    let runner = delegated_runner_uid()?;
     // Keep short-lived helper walks expendable without changing a root
     // daemon's protected score on the in-process path.
     fs::write("/proc/self/oom_score_adj", "900")?;
-    staging_operation(action, state, repository, fill)
+    // Only this explicit sudo-helper entry point delegates ownership. A root
+    // daemon's in-process path must not interpret inherited SUDO_UID as identity.
+    let authority = crate::source_seal::authority::Authority::load()?;
+    staging_authorized_as(&authority, action, state, repository, fill, Some(runner))
 }
 
 fn directory_entries(fd: &OwnedFd) -> io::Result<fs::ReadDir> {
@@ -508,6 +534,7 @@ struct StagingWalk {
     directories: HashSet<(u64, u64)>,
     inodes: HashMap<(u64, u64), (u64, u64)>,
     track_links: bool,
+    removing: bool,
 }
 
 impl StagingWalk {
@@ -519,12 +546,15 @@ impl StagingWalk {
             directories: HashSet::new(),
             inodes: HashMap::new(),
             track_links: true,
+            removing: false,
         })
     }
 
     fn visit(&mut self, fd: &OwnedFd, depth: usize) -> io::Result<bool> {
         let metadata = fs::File::from(fd.try_clone()?).metadata()?;
-        if metadata.uid() != self.owners.writer {
+        if metadata.uid() != self.owners.writer
+            && !(self.removing && metadata.uid() == self.owners.runner)
+        {
             return Err(io::Error::other(
                 "staging inode must be owned by the fill writer",
             ));
@@ -564,6 +594,10 @@ impl StagingWalk {
 
 fn inspect_staging(root: OwnedFd, owners: StagingOwners, check_links: bool) -> io::Result<()> {
     let mut walk = StagingWalk::new(&root, owners)?;
+    // Publication may have crashed partway through chown. Removal can unlink
+    // the runner's own entries as well, but link inspection still requires every
+    // entry to belong to the fill writer.
+    walk.removing = !check_links;
     if !walk.visit(&root, 0)? {
         return Err(io::Error::other("staging root must be a directory"));
     }
@@ -623,6 +657,7 @@ fn remove_staging(
     // Preflight checked link counts. Unlinking legitimately decreases them,
     // so deletion rechecks ownership, mounts and directories, not link totals.
     walk.track_links = false;
+    walk.removing = true;
     walk.visit(&root, 0)?;
     let mut stack = vec![(
         Frame {
