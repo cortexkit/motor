@@ -16,7 +16,10 @@ const CAPTURED: &str = include_str!("captured-firecracker-1.17.smaps");
 fn captured_smaps_counts_one_guest_ram_mapping_not_pmem_heap_or_memfd() {
     // Exactly one MAP_NORESERVE anonymous private mapping of the configured RAM;
     // the 32 GiB shared toolchain mapping, heap and memfd are not guest RAM.
-    assert_eq!(guest_resident_bytes(CAPTURED, 3072).unwrap(), 782_636 * 1024);
+    assert_eq!(
+        guest_resident_bytes(CAPTURED, 3072).unwrap(),
+        782_636 * 1024
+    );
     assert!(guest_resident_bytes(CAPTURED, 3071).is_err());
     assert!(guest_resident_bytes(CAPTURED, 4096).is_err());
 }

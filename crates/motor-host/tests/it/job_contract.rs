@@ -235,7 +235,10 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
         .await
         .unwrap();
     let admitted = next(&mut socket).await;
-    assert!(matches!(admitted, Frame::Accepted(_)), "run not accepted: {admitted:?}");
+    assert!(
+        matches!(admitted, Frame::Accepted(_)),
+        "run not accepted: {admitted:?}"
+    );
     write(
         &mut socket,
         &Frame::BundleChunk {
