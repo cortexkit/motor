@@ -230,6 +230,7 @@ pub struct Host {
     pub(crate) broker_heartbeat_at_ms: Option<u64>,
     pub(crate) lost_checks: BTreeMap<String, crate::billing::LostCheck>,
     host_resources: Option<jobs::HostResources>,
+    host_resources_failed: std::cell::Cell<bool>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
 }
 impl Host {
@@ -262,6 +263,7 @@ impl Host {
             broker_heartbeat_at_ms: None,
             lost_checks: BTreeMap::new(),
             host_resources: None,
+            host_resources_failed: std::cell::Cell::new(false),
             job_storage: None,
         }
     }

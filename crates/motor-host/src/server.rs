@@ -515,6 +515,25 @@ impl Runtime {
             .control
             .available_bytes()
             .map_err(|error| format!("{error:#}"));
+        let settings = self.host.lock().expect("host lock").settings.clone();
+        if let crate::config::HostSettings::PerJob(settings) = settings {
+            let sample = (|| -> Result<_> {
+                capacity.as_ref().map_err(|e| anyhow::anyhow!(e.clone()))?;
+                settings.validate_cpus(crate::config::online_cpus()?)?;
+                let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+                Ok(crate::state::jobs::HostResources {
+                    at_ms: unix_ms(),
+                    available_mem_mib: job::host_available_mib(&meminfo)?,
+                    vcpu_ceiling: settings.vcpu_ceiling,
+                    permit_budget: settings.permit_budget,
+                })
+            })();
+            let mut host = self.host.lock().expect("host lock");
+            match sample {
+                Ok(sample) => host.record_host_resources(sample),
+                Err(error) => host.host_resources_unavailable(&format!("{error:#}")),
+            }
+        }
         self.host
             .lock()
             .expect("host lock")
@@ -1308,12 +1327,19 @@ impl Runtime {
     pub fn host_admin(&self, request: &Value) -> Result<Value> {
         let op = request["op"].as_str().context("admin operation")?;
         ensure!(
-            matches!(op, "drain_host" | "undrain_host" | "host_status")
-                && request == &json!({"op": op}),
+            matches!(
+                op,
+                "drain_host" | "undrain_host" | "host_status" | "clear_dax_failure"
+            ) && request == &json!({"op": op}),
             "invalid host admin operation"
         );
         let mut host = self.host.lock().expect("host lock");
         let set_at_ms = match op {
+            "clear_dax_failure" => {
+                host.set_dax_failed(false)?;
+                tracing::info!("host_dax_failure_cleared");
+                Some(unix_ms())
+            }
             "drain_host" | "undrain_host" => {
                 host.set_draining(op == "drain_host")?;
                 Some(unix_ms())

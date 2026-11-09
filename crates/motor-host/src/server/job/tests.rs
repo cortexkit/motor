@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::sync::Condvar;
 
+mod heartbeat_tests;
 mod recovery_tests;
 #[path = "upload_tests.rs"]
 mod upload_tests;
@@ -82,6 +83,7 @@ struct Fake {
     balloons: Mutex<Vec<(String, u64)>>,
     scripted: Mutex<std::collections::VecDeque<UnixStream>>,
     recovery_reply: Mutex<Option<Value>>,
+    init_reply: Mutex<Option<Value>>,
     recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
 }
 impl Fake {
@@ -170,7 +172,12 @@ impl Control for Fake {
         assert_eq!(request["op"], "attach_tenant");
         assert!(request.get("recovery_required").is_none());
         self.wait("runner");
-        Ok(json!({"ok":true}))
+        Ok(self
+            .init_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(json!({"ok":true})))
     }
     fn adopt_job(&self, job: &str) -> Result<bool> {
         self.calls.lock().unwrap().push(format!("adopt:{job}"));
@@ -357,6 +364,8 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
     let (journal, snapshot) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
     let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
     host.settings = crate::config::HostSettings::PerJob(crate::config::PerJobSettings {
+        vcpu_ceiling: 2,
+        permit_budget: 4,
         host_reserve_mib: 50,
         boot_reserve_mib: 20,
         per_vm_overhead_mib: 10,

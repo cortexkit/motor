@@ -45,6 +45,8 @@ impl Host {
         let Some(sample) = self.fresh_host_resources(now_ms) else {
             return 0;
         };
+        // Cache-fill VMs must debit job_free_vcpus alongside job and recovery VMs
+        // when their host-side admission path is connected.
         let used = self
             .snapshot
             .per_job

@@ -2,6 +2,7 @@ use super::*;
 use motor_host::state::jobs::{guest_ram_mib, memory_limit_mib, HostResources};
 use motor_host::state::{Admission, Error, Refusal};
 use motor_host::store::SqliteJournal;
+mod heartbeats;
 mod storage;
 
 const AT: u64 = NOW * 1000;
