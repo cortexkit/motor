@@ -127,6 +127,70 @@ pub(crate) fn repository_store(state: &Path, repository: &str) -> std::path::Pat
     state.join("build-bases").join(workspace::name(repository))
 }
 
+#[derive(Default)]
+struct Leases {
+    readers: BTreeMap<(u64, u64), usize>,
+    retired: BTreeMap<(u64, u64), std::path::PathBuf>,
+}
+
+fn leases() -> &'static std::sync::Mutex<Leases> {
+    static LEASES: std::sync::OnceLock<std::sync::Mutex<Leases>> = std::sync::OnceLock::new();
+    LEASES.get_or_init(Default::default)
+}
+
+/// Registers the open directory's device and inode to delay retired-generation
+/// removal, even while publication exchanges its name. Keep this reader alive
+/// until cloning has finished.
+pub(crate) struct PinnedBase {
+    pub directory: fs::File,
+    identity: (u64, u64),
+}
+
+pub(crate) fn pin_current(store: &Path) -> io::Result<PinnedBase> {
+    use std::os::unix::fs::MetadataExt;
+    let mut leases = leases().lock().unwrap();
+    let parent = crate::permissions::physical_root(store)?;
+    let directory = fs::File::from(open_directory(&parent, std::ffi::OsStr::new("current"))?);
+    let stat = directory.metadata()?;
+    let identity = (stat.dev(), stat.ino());
+    *leases.readers.entry(identity).or_default() += 1;
+    Ok(PinnedBase {
+        directory,
+        identity,
+    })
+}
+
+/// Published generations are runner-owned and can be removed directly once no
+/// seed holds their inode open.
+pub(crate) fn remove_retired(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mut leases = leases().lock().unwrap();
+    let stat = fs::symlink_metadata(path)?;
+    let identity = (stat.dev(), stat.ino());
+    if leases.readers.contains_key(&identity) {
+        leases.retired.insert(identity, path.into());
+        Ok(())
+    } else {
+        fs::remove_dir_all(path)
+    }
+}
+
+impl Drop for PinnedBase {
+    fn drop(&mut self) {
+        let mut leases = leases().lock().unwrap();
+        let count = leases.readers.get_mut(&self.identity).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            leases.readers.remove(&self.identity);
+            if let Some(path) = leases.retired.remove(&self.identity) {
+                if let Err(error) = fs::remove_dir_all(path) {
+                    tracing::warn!(%error, "retired build base removal deferred to startup");
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn staging(
     state: &Path,
     repository: &str,
@@ -559,8 +623,8 @@ pub(crate) fn publish_record(generation: &Path, record: &Record) -> io::Result<(
             // runner-owned generation. Never route it to the staging helper.
             if let Err(error) = rename(&staging_name, &retired, libc::RENAME_NOREPLACE) {
                 tracing::error!(%error, "published base exchanged; old generation retirement deferred");
-            } else if let Err(error) = fs::remove_dir_all(
-                generation
+            } else if let Err(error) = remove_retired(
+                &generation
                     .parent()
                     .unwrap()
                     .join(retired.to_str().map_err(io::Error::other)?),
@@ -643,7 +707,8 @@ pub(crate) struct RunnerToolchain(Result<String, String>);
 
 impl RunnerToolchain {
     pub(crate) fn probe() -> Self {
-        Self(Self::read())
+        static IDENTITY: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+        Self(IDENTITY.get_or_init(Self::read).clone())
     }
 
     fn read() -> Result<String, String> {

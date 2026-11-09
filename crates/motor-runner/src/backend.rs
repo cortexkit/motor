@@ -142,7 +142,6 @@ impl<'a> EnvironmentInputs<'a> {
     /// selecting its remote transport, but before compiling any wrapper. The
     /// same transport must be passed to sandbox preparation; failed preparation
     /// must not seed or publish using a different environment.
-    #[allow(dead_code)] // The seeding lifecycle consumes this pre-setup API.
     pub(crate) fn before_setup(
         config: &Config,
         setup: &Setup,
@@ -250,6 +249,42 @@ impl IsolationLauncher for crate::isolation::Sandbox {
         sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch> {
         self.launch_durable_for_resources(command, cwd, env, cpus, resources, sources)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SeededSandbox(crate::isolation::Sandbox);
+
+#[cfg(target_os = "linux")]
+impl IsolationLauncher for SeededSandbox {
+    fn prepared_javascript_directories(&self) -> &[PathBuf] {
+        self.0.prepared_javascript_directories()
+    }
+    fn cache_generation(
+        &self,
+    ) -> Option<(
+        &crate::remote_cache::provisioning::ActiveGeneration,
+        &[crate::remote_cache::transport::Forwarder],
+    )> {
+        self.0.cache_generation()
+    }
+    fn launch(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        cpus: &[u32],
+        resources: JobResources,
+        sources: crate::source_seal::Sources<'_>,
+    ) -> io::Result<platform::Launch> {
+        self.0.launch_durable_for_resources(
+            command,
+            cwd,
+            env,
+            cpus,
+            resources,
+            sources.preserve_seed_times(),
+        )
     }
 }
 
@@ -773,6 +808,13 @@ impl Backend for HostBackend {
                 })?;
             }
         }
+        #[cfg(target_os = "linux")]
+        if !s.base {
+            setup_step(
+                "settle seed intent",
+                crate::seed::settle(&config.state_dir(), &path),
+            )?;
+        }
         if s.base {
             setup_step(
                 "checkout workspace",
@@ -862,6 +904,72 @@ impl Backend for HostBackend {
         } else {
             path.join("target")
         };
+        #[cfg(target_os = "linux")]
+        let remote_plan = config
+            .isolate_jobs
+            .then(|| config.unit_remote_cache(s.base))
+            .flatten();
+        #[cfg(target_os = "linux")]
+        let remote = if let (Some((generation, forwarders)), Some(runtime)) =
+            (&remote_plan, &config.remote_cache_runtime)
+        {
+            let tools = cache_tools(
+                config,
+                trees,
+                s,
+                path.join("Cargo.toml").is_file(),
+                forwarders,
+            );
+            if tools.is_empty() {
+                None
+            } else {
+                runtime.transport(&generation.tenant, &tools).ok()
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let mut seeded_environment = None;
+        #[cfg(target_os = "linux")]
+        let mut seeded = if config.isolate_jobs
+            && !s.base
+            && fixed.is_some()
+            && r.siblings.is_empty()
+        {
+            let forwarders: Vec<_> = remote_plan
+                .as_ref()
+                .zip(remote.as_ref())
+                .into_iter()
+                .flat_map(|((_, forwarders), transport)| {
+                    forwarders
+                        .iter()
+                        .filter(|f| transport.has_tool(f.tool()))
+                        .cloned()
+                })
+                .collect();
+            let selected = remote_plan
+                .as_ref()
+                .filter(|_| !forwarders.is_empty())
+                .map(|(generation, _)| (generation.as_ref(), forwarders.as_slice()));
+            let inputs = EnvironmentInputs::before_setup(config, s, &cwd, &target, selected)?;
+            match job_environment(config, trees, s, &inputs, s.cpus.len() as u32) {
+                Ok(env) => {
+                    let seeded = crate::seed::seed(config, trees, s, fixed.as_ref(), &env)?;
+                    if seeded {
+                        seeded_environment = Some(env);
+                    }
+                    seeded
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = %s.id, %error, "build base seed identity unavailable; building without seed");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(target_os = "linux")]
+        let seed_target = seeded.then(|| crate::seed::pin_target(&path)).transpose()?;
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && rust_job(config, s) {
             // Materialization holds the workspace reservation, not the global
@@ -969,17 +1077,6 @@ impl Backend for HostBackend {
                         config,
                         siblings: snapshots.mounts(),
                     });
-            let remote_plan = config.unit_remote_cache(s.base);
-            let mut remote = None;
-            if let (Some((generation, forwarders)), Some(runtime)) =
-                (&remote_plan, &config.remote_cache_runtime)
-            {
-                let cargo = path.join("Cargo.toml").is_file();
-                let tools = cache_tools(config, trees, s, cargo, forwarders);
-                if !tools.is_empty() {
-                    remote = runtime.transport(&generation.tenant, &tools).ok();
-                }
-            }
             let sandbox = setup_step(
                 "prepare isolated job sandbox",
                 crate::setup_log::phase("prepare isolated sandbox", || {
@@ -1065,6 +1162,26 @@ impl Backend for HostBackend {
                     })
                 }),
             )?;
+            if let Some(target_pin) = &seed_target {
+                let actual = job_environment(
+                    config,
+                    trees,
+                    s,
+                    &EnvironmentInputs {
+                        host_cwd: &cwd,
+                        target: &target,
+                        wrapper: sandbox.wrapper.as_deref(),
+                        remote: sandbox.cache_generation(),
+                    },
+                    s.cpus.len() as u32,
+                )?;
+                seeded = crate::seed::confirm_environment(
+                    target_pin,
+                    seeded_environment.as_ref().unwrap(),
+                    &actual,
+                    s.id,
+                )?;
+            }
             let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());
             let sandbox = if config.boat_profile {
                 let sandbox = sandbox.with_boat_temporary_paths()?;
@@ -1085,7 +1202,11 @@ impl Backend for HostBackend {
                 sandbox
             };
             wrapper = sandbox.wrapper.clone();
-            Some(Box::new(sandbox) as Box<dyn IsolationLauncher>)
+            Some(if seeded {
+                Box::new(SeededSandbox(sandbox)) as Box<dyn IsolationLauncher>
+            } else {
+                Box::new(sandbox) as Box<dyn IsolationLauncher>
+            })
         } else {
             None
         };

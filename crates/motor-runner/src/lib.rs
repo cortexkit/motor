@@ -40,6 +40,8 @@ mod platform;
 mod privilege;
 mod return_paths;
 #[cfg(target_os = "linux")]
+mod seed;
+#[cfg(target_os = "linux")]
 mod seed_times;
 #[cfg(target_os = "linux")]
 mod source_seal;
