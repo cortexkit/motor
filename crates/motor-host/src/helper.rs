@@ -11,6 +11,16 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    /// Exclusive extents only; unavailable measurements must not become zero.
+    fn workspace_usage(&self, _account: &str, _disk_id: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    fn evict_base(&self, _account: &str, _disk_id: &str) -> Result<()> {
+        anyhow::bail!("base eviction unavailable")
+    }
+    fn ensure_workspace(&self, _account: &str, _disk_id: &str, _size_bytes: u64) -> Result<()> {
+        anyhow::bail!("workspace creation unavailable")
+    }
     /// Resident bytes of the VMM's guest-RAM mappings, measured by the helper.
     fn job_memory(&self, _job: &str) -> Result<u64> {
         Err(BalloonUnavailable.into())
@@ -276,6 +286,26 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn workspace_usage(&self, account: &str, disk_id: &str) -> Result<Option<u64>> {
+        let (reply, _) =
+            self.request(json!({"op":"workspace_usage", "account":account, "disk_id":disk_id}))?;
+        ensure!(
+            reply["result"] == "workspace_usage",
+            "workspace usage refused"
+        );
+        Ok(serde_json::from_value(reply["exclusive_bytes"].clone())?)
+    }
+    fn evict_base(&self, account: &str, disk_id: &str) -> Result<()> {
+        let (reply, _) =
+            self.request(json!({"op":"evict_base", "account":account, "disk_id":disk_id}))?;
+        ensure!(reply["result"] == "ok", "base eviction refused");
+        Ok(())
+    }
+    fn ensure_workspace(&self, account: &str, disk_id: &str, size_bytes: u64) -> Result<()> {
+        let (reply, _) = self.request(json!({"op":"ensure_workspace", "account":account, "disk_id":disk_id, "size_bytes":size_bytes}))?;
+        ensure!(reply["result"] == "ok", "workspace creation refused");
+        Ok(())
+    }
     fn delete_workspace(&self, account: &str, disk_id: &str) -> Result<()> {
         self.request(json!({"op":"delete_workspace", "account":account, "disk_id":disk_id}))?;
         Ok(())

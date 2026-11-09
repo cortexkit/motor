@@ -10,22 +10,27 @@ use std::collections::BTreeMap;
 
 pub(crate) mod have;
 pub mod recovery;
+pub mod storage;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
     /// Disk ids are opaque VM names in placement hints, not account or workspace names.
     pub disks: BTreeMap<String, WorkspaceDisk>,
     pub executions: BTreeMap<String, Execution>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bases: BTreeMap<String, storage::Base>,
 }
 
 impl Ledger {
     pub fn is_empty(&self) -> bool {
-        self.disks.is_empty() && self.executions.is_empty()
+        self.disks.is_empty() && self.executions.is_empty() && self.bases.is_empty()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct WorkspaceDisk {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<storage::Disk>,
     pub sub: String,
     pub workspace_key_hash: String,
     pub queue: Vec<String>,
@@ -44,6 +49,12 @@ pub struct WorkspaceDisk {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Execution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_reservation_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_replay_reservation_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_completion: Option<storage::ReplayCompletion>,
     pub claims: Claims,
     pub disk_id: String,
     pub memory_debit_mib: u64,
@@ -235,9 +246,6 @@ impl Host {
             if self.job_free_mem_mib(now_ms) < debit {
                 return Err(RefusalCause::Memory.into());
             }
-            if self.storage_refusing() {
-                return Err(RefusalCause::Storage.into());
-            }
             // A host has one disk per account/workspace pair. Cold or foreign
             // hints never bypass that disk's queue or attach another pair's data.
             let disk_id = existing.map(|(id, _)| id.clone()).unwrap_or_else(|| loop {
@@ -249,6 +257,9 @@ impl Host {
                 }
             });
             let execution = Execution {
+                replay_reservation_bytes: Some(storage::REPLAY_RESERVATION_BYTES),
+                final_replay_reservation_bytes: None,
+                replay_completion: None,
                 claims: claims.clone(),
                 disk_id: disk_id.clone(),
                 memory_debit_mib: debit,
@@ -263,8 +274,12 @@ impl Host {
             let mut next = self.snapshot.clone();
             next.per_job
                 .disks
-                .entry(disk_id)
+                .entry(disk_id.clone())
                 .or_insert_with(|| WorkspaceDisk {
+                    storage: Some(storage::Disk::new(
+                        settings.workspace_disk_cap_bytes,
+                        now_ms,
+                    )),
                     sub: claims.sub.clone(),
                     workspace_key_hash: hash.clone(),
                     queue: Vec::new(),
@@ -294,7 +309,8 @@ impl Host {
                     refusal: None,
                 },
             );
-            // Identity, queue position and memory debit become visible together,
+            self.reserve_job_storage(&mut next, &disk_id, now_ms)?;
+            // Identity, queue position, memory and storage debits become visible together,
             // before lease_ok and before any launch authorization is returned.
             self.save(next)?;
         }
@@ -374,6 +390,10 @@ impl Host {
     /// Releases admission only after the lifecycle has confirmed the VM stopped
     /// (or that a queued execution never booted). Retain identity for reconnects.
     pub fn job_stopped(&mut self, job: &str, unclean: bool) -> Result<(), Error> {
+        self.job_stopped_at(job, unclean, self.observed_at_ms)
+    }
+
+    pub fn job_stopped_at(&mut self, job: &str, unclean: bool, now_ms: u64) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
         let execution = next
             .per_job
@@ -384,6 +404,13 @@ impl Host {
             return Ok(());
         }
         execution.ended = true;
+        execution.replay_reservation_bytes = None;
+        // A virtual machine can exit before its synthetic terminal is committed. Retain
+        // only the record allowance until replay is durable or quarantined.
+        execution.final_replay_reservation_bytes = execution
+            .replay_completion
+            .is_none()
+            .then_some(storage::REPLAY_RECORD_BYTES);
         let disk = next.per_job.disks.get_mut(&execution.disk_id).unwrap();
         disk.queue.retain(|queued| queued != job);
         if disk.attached_job.as_deref() == Some(job) {
@@ -392,6 +419,12 @@ impl Host {
             if unclean {
                 disk.have.clear();
                 execution.have_invalidated = true;
+            }
+        }
+        if let Some(storage) = &mut disk.storage {
+            storage.last_used_ms = storage.last_used_ms.max(now_ms);
+            if disk.queue.is_empty() && disk.attached_job.is_none() && disk.recovery.is_none() {
+                storage.growth_reservation_bytes = 0;
             }
         }
         let evidence = execution.evidence.get_or_insert_with(Default::default);

@@ -2,6 +2,7 @@
 //! caller socket. Callers read committed frames and submit input to that owner.
 use super::*;
 use crate::replay::Store;
+use crate::state::jobs::storage::ReplayCompletion;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -11,6 +12,8 @@ struct Input {
 }
 
 pub(crate) struct Stream {
+    job: String,
+    host: Arc<Mutex<Host>>,
     store: Mutex<std::result::Result<Store, String>>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
     running: AtomicBool,
@@ -21,12 +24,26 @@ pub(crate) struct Stream {
 impl Stream {
     pub(super) fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<T> {
         let mut store = self.store.lock().expect("replay store");
+        let already_quarantined = store.is_err();
         let result = match &mut *store {
             Ok(store) => f(store),
-            Err(error) => anyhow::bail!("quarantined job replay: {error}"),
+            Err(error) => Err(anyhow::anyhow!("quarantined job replay: {error}")),
         };
-        if let Err(error) = &result {
-            *store = Err(error.to_string());
+        let completion = if let Err(error) = &result {
+            if !already_quarantined {
+                *store = Err(error.to_string());
+            }
+            Some(ReplayCompletion::Quarantined)
+        } else if store.as_ref().is_ok_and(|store| store.ended()) {
+            Some(ReplayCompletion::Terminal)
+        } else {
+            None
+        };
+        if let Some(completion) = completion {
+            self.host
+                .lock()
+                .expect("host lock")
+                .job_replay_closed(&self.job, completion)?;
         }
         result
     }
@@ -52,35 +69,61 @@ impl Runtime {
             .expect("host lock")
             .journal_directory()
             .context("job replay requires a journal directory")?;
-        let store = Store::open(&directory, job)
-            .and_then(|store| {
-                let host = self.host.lock().expect("host lock");
-                ensure!(
-                    store.ended()
-                        || !host.snapshot.per_job.executions[job].ended
-                        || host.host_settled_frames(job, 0).is_some(),
-                    "finished job is missing its replay terminal"
-                );
-                drop(host);
-                // A file commit can outlive its following state transaction. Restore
-                // observations and the watermark before exposing any committed bytes.
-                for position in 0..store.len() {
-                    let frame =
-                        crate::replay::decode(&store.frame(position)?.context("replay frame")?)?;
-                    if matches!(frame["type"].as_str(), Some("started" | "terminal")) {
-                        self.observe_job_frame(job, &frame)?;
-                    }
+        let quarantined = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions[job]
+            .replay_completion
+            == Some(ReplayCompletion::Quarantined);
+        let store = (if quarantined {
+            Err(anyhow::anyhow!("job replay is durably quarantined"))
+        } else {
+            Store::open(&directory, job)
+        })
+        .and_then(|store| {
+            let host = self.host.lock().expect("host lock");
+            ensure!(
+                store.ended()
+                    || !host.snapshot.per_job.executions[job].ended
+                    || host.host_settled_frames(job, 0).is_some(),
+                "finished job is missing its replay terminal"
+            );
+            drop(host);
+            // A file commit can outlive its following state transaction. Restore
+            // observations and the watermark before exposing any committed bytes.
+            for position in 0..store.len() {
+                let frame =
+                    crate::replay::decode(&store.frame(position)?.context("replay frame")?)?;
+                if matches!(frame["type"].as_str(), Some("started" | "terminal")) {
+                    self.observe_job_frame(job, &frame)?;
                 }
-                if let Some(seq) = store.last_seq() {
-                    self.host.lock().expect("host lock").watermark(job, seq)?;
-                }
-                Ok(store)
-            })
-            .map_err(|error| {
-                tracing::error!(jti = job, %error, "job_replay_quarantined");
-                error.to_string()
-            });
+            }
+            if let Some(seq) = store.last_seq() {
+                self.host.lock().expect("host lock").watermark(job, seq)?;
+            }
+            Ok(store)
+        })
+        .map_err(|error| {
+            tracing::error!(jti = job, %error, "job_replay_quarantined");
+            error.to_string()
+        });
+        let completion = match &store {
+            Err(_) => Some(ReplayCompletion::Quarantined),
+            Ok(store) if store.ended() => Some(ReplayCompletion::Terminal),
+            _ => None,
+        };
+        if let Some(completion) = completion {
+            self.host
+                .lock()
+                .expect("host lock")
+                .job_replay_closed(job, completion)?;
+        }
         let stream = Arc::new(Stream {
+            job: job.to_owned(),
+            host: self.host.clone(),
             store: Mutex::new(store),
             input: Mutex::new(None),
             running: AtomicBool::new(false),
@@ -320,7 +363,7 @@ async fn collect(
     tokio::select! { result = upload => result, result = receive => result, _ = crashed => Ok(()) }
 }
 
-fn publish_settlement(runtime: &Runtime, job: &str, stream: &Stream) -> Result<()> {
+pub(super) fn publish_settlement(runtime: &Runtime, job: &str, stream: &Stream) -> Result<()> {
     stream.with_store(|store| {
         if store.ended() {
             return Ok(());

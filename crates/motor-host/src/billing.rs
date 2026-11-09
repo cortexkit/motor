@@ -1008,6 +1008,11 @@ impl Host {
         next.closed
             .retain(|_, c| c.removed_ms.is_none_or(|removed| removed >= cutoff));
         for job in &expired {
+            if let Some(execution) = next.per_job.executions.get_mut(job) {
+                execution.final_replay_reservation_bytes = None;
+                execution.replay_completion =
+                    Some(crate::state::jobs::storage::ReplayCompletion::Quarantined);
+            }
             next.leases.remove(job);
             next.billing.remove(job);
             next.zero_usage.remove(job);

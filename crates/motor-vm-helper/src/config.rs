@@ -35,6 +35,10 @@ pub struct JobVms {
     /// deliberately have no memory limit, so account-shared persistent-memory
     /// (virtio-pmem) image pages are not reclaimed against one VM's limit.
     pub memory_max_bytes: u64,
+    /// Root-controlled ceiling for sparse workspace provisioning. Missing means
+    /// creation is disabled, rather than accepting an unbounded host request.
+    #[serde(default)]
+    pub workspace_disk_max_bytes: Option<u64>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

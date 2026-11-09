@@ -190,7 +190,7 @@ pub struct Runtime {
     pub broker_endpoint: String,
     pub jwks_url: String,
     pub host_id: String,
-    pub host: Mutex<Host>,
+    pub host: Arc<Mutex<Host>>,
     pub keys: RwLock<KeySet>,
     pub control: Arc<dyn Control>,
     pub fetch_keys: AtomicBool,
@@ -261,12 +261,13 @@ impl Runtime {
     }
     fn build(
         host_id: String,
-        host: Host,
+        mut host: Host,
         control: Arc<dyn Control>,
         broker_endpoint: String,
         jwks_url: String,
         sandbox_identity: Option<crate::sandbox::IdentityFile>,
     ) -> Arc<Self> {
+        host.set_job_storage(control.clone());
         let tenant_operations = host
             .tenants
             .values()
@@ -283,7 +284,7 @@ impl Runtime {
             broker_endpoint,
             jwks_url,
             host_id,
-            host: Mutex::new(host),
+            host: Arc::new(Mutex::new(host)),
             keys: RwLock::new(KeySet::default()),
             control,
             event_workers: Mutex::new(BTreeSet::new()),
@@ -1704,7 +1705,7 @@ where
                 tracing::error!(jti = claims.jti, %error, "job_resources_refused");
                 host.job_boot_failed(&claims.jti, unix_ms())
                     .map_err(|error| (error, "admission"))?;
-                host.job_stopped(&claims.jti, false)
+                host.job_stopped_at(&claims.jti, false, unix_ms())
                     .map_err(|error| (error, "admission"))?;
                 host.close(id).map_err(|error| (error, "admission"))?;
                 return Err((Error::Refused(Refusal::HostFull), "job_resources"));

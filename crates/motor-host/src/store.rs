@@ -340,6 +340,7 @@ fn write_job_ledger(
     ) WITHOUT ROWID;",
     )?;
     diff_job_entries(tx, "disk", &old.disks, &new.disks)?;
+    diff_job_entries(tx, "base", &old.bases, &new.bases)?;
     diff_job_entries(tx, "execution", &old.executions, &new.executions)
 }
 
@@ -381,6 +382,7 @@ fn load_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
                 (row.get(0)?, row.get(1)?, row.get(2)?);
             match kind.as_str() {
                 "disk" => drop(snapshot.per_job.disks.insert(key, from_json(&value)?)),
+                "base" => drop(snapshot.per_job.bases.insert(key, from_json(&value)?)),
                 "execution" => drop(snapshot.per_job.executions.insert(key, from_json(&value)?)),
                 _ => return Err(unknown("job VM entry kind", &kind)),
             }
@@ -450,6 +452,7 @@ mod rollback_tests {
         snapshot.per_job.disks.insert(
             "ws-rollback".into(),
             crate::state::jobs::WorkspaceDisk {
+                storage: Some(crate::state::jobs::storage::Disk::new(1024, 17)),
                 sub: "account".into(),
                 workspace_key_hash: "hash".into(),
                 queue: vec![],
@@ -492,6 +495,7 @@ mod rollback_tests {
         snapshot.per_job.disks.insert(
             "ws-rollback".into(),
             crate::state::jobs::WorkspaceDisk {
+                storage: None,
                 sub: "account".into(),
                 workspace_key_hash: "hash".into(),
                 queue: vec![],
@@ -551,6 +555,12 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     snapshot.per_job.disks.insert(
         "ws-rollback".into(),
         crate::state::jobs::WorkspaceDisk {
+            storage: Some(crate::state::jobs::storage::Disk {
+                cap_bytes: 1024,
+                last_used_ms: 123,
+                growth_reservation_bytes: 512,
+                evicting: true,
+            }),
             sub: claims.sub.clone(),
             workspace_key_hash: "hash".into(),
             queue: vec![],
@@ -570,6 +580,9 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     snapshot.per_job.executions.insert(
         job.into(),
         crate::state::jobs::Execution {
+            replay_reservation_bytes: Some(crate::state::jobs::storage::REPLAY_RESERVATION_BYTES),
+            final_replay_reservation_bytes: Some(crate::state::jobs::storage::REPLAY_RECORD_BYTES),
+            replay_completion: None,
             evidence: Some(serde_json::from_value(serde_json::json!({
                 "winner":"host_stop", "stop":{"cause":"host_oom","at_ms":1800000000001u64,"future":true},
                 "exit":{"job_id":job,"oom_kill":3,"egress_bytes":12,"future":true},
@@ -588,6 +601,14 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
             runner_hello: false,
             ended: false,
             have_invalidated: true,
+        },
+    );
+    snapshot.per_job.bases.insert(
+        "base-test".into(),
+        crate::state::jobs::storage::Base {
+            sub: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            last_used_ms: 456,
+            evicting: true,
         },
     );
     journal.store(&snapshot).unwrap();

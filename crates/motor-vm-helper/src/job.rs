@@ -181,7 +181,23 @@ pub struct ExitReport {
 }
 
 pub enum Operation {
-    DeleteWorkspace { account: String, disk_id: String },
+    DeleteWorkspace {
+        account: String,
+        disk_id: String,
+    },
+    EvictBase {
+        account: String,
+        disk_id: String,
+    },
+    WorkspaceUsage {
+        account: String,
+        disk_id: String,
+    },
+    EnsureWorkspace {
+        account: String,
+        disk_id: String,
+        size_bytes: u64,
+    },
     Start(Start),
     Adopt(String),
     Stop(String),
@@ -195,7 +211,12 @@ pub enum Operation {
 impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::DeleteWorkspace { account, disk_id } => {
+            Self::DeleteWorkspace { account, disk_id }
+            | Self::EvictBase { account, disk_id }
+            | Self::WorkspaceUsage { account, disk_id }
+            | Self::EnsureWorkspace {
+                account, disk_id, ..
+            } => {
                 validate_account(account)?;
                 validate_id(disk_id)
             }
@@ -232,6 +253,40 @@ pub(crate) fn test_id(number: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_storage_operations_accept_identities_never_paths_or_roles() {
+        for op in ["workspace_usage", "evict_base", "ensure_workspace"] {
+            let mut request = serde_json::json!({"op":op, "account":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", "disk_id":"ws-1"});
+            if op == "ensure_workspace" {
+                request["size_bytes"] = serde_json::json!(4096);
+            }
+            assert!(serde_json::from_value::<crate::Request>(request.clone()).is_ok());
+            for forbidden in ["path", "role", "root", "source"] {
+                let mut bad = request.clone();
+                bad[forbidden] = serde_json::json!("base");
+                assert!(serde_json::from_value::<crate::Request>(bad).is_err());
+            }
+        }
+        for account in ["../other", "a/b"] {
+            for op in [
+                super::Operation::WorkspaceUsage {
+                    account: account.into(),
+                    disk_id: "ws-1".into(),
+                },
+                super::Operation::EvictBase {
+                    account: account.into(),
+                    disk_id: "ws-1".into(),
+                },
+                super::Operation::EnsureWorkspace {
+                    account: account.into(),
+                    disk_id: "ws-1".into(),
+                    size_bytes: 4096,
+                },
+            ] {
+                assert!(op.validate().is_err());
+            }
+        }
+    }
     #[test]
     fn memory_operations_accept_only_valid_job_id_and_never_host_paths_or_pids() {
         for op in ["job_memory", "balloon_job"] {

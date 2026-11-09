@@ -157,6 +157,7 @@ fn job_vm_settings_require_a_separate_uid_range_and_a_slice_ceiling() {
     let mut config: config::Config =
         serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();
     config.job_vms = Some(config::JobVms {
+        workspace_disk_max_bytes: Some(1073741824),
         uid_base: 500000,
         uid_count: 128,
         memory_max_bytes: 1073741824,
@@ -172,6 +173,7 @@ fn job_vm_settings_require_a_separate_uid_range_and_a_slice_ceiling() {
         (u32::MAX, 2, 1073741824),
     ] {
         config.job_vms = Some(config::JobVms {
+            workspace_disk_max_bytes: Some(1073741824),
             uid_base: base,
             uid_count: count,
             memory_max_bytes: ceiling,

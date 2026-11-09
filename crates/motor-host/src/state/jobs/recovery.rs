@@ -89,6 +89,8 @@ impl Host {
         let disk = next.per_job.disks.get_mut(disk_id).unwrap();
         disk.have.clear();
         disk.recovery = Some(recovery);
+        self.reserve_job_storage(&mut next, disk_id, now_ms)
+            .map_err(|e| e.error)?;
         self.save(next)
     }
 
@@ -135,11 +137,22 @@ impl Host {
         disk.recovery = None;
         disk.quarantined = false;
         disk.deleted = deleted;
+        if let Some(storage) = &mut disk.storage {
+            if disk.queue.is_empty() {
+                storage.growth_reservation_bytes = 0;
+            }
+        }
         if deleted && !disk.queue.is_empty() {
             let mut fresh = disk.clone();
             fresh.deleted = false;
             fresh.recovery_result = None;
+            if let Some(storage) = &mut fresh.storage {
+                storage.growth_reservation_bytes = storage.cap_bytes;
+            }
             let queued = std::mem::take(&mut disk.queue);
+            if let Some(storage) = &mut disk.storage {
+                storage.growth_reservation_bytes = 0;
+            }
             let fresh_id = format!("ws-{:032x}", rand::random::<u128>());
             for job in queued {
                 next.per_job.executions.get_mut(&job).unwrap().disk_id = fresh_id.clone();
