@@ -314,6 +314,7 @@ disk. They never mount a job-written filesystem. Current per-job settings have
 no root-owned fixed-path repository allowlist, so per-job fills write the shared
 compiler cache only; their disks are deleted, not promoted to local build bases
 that seed later jobs.
+Promotion requires fixed paths, which per-job hosts do not have yet.
 See [per-job fill sources](hosted-host.md#per-job-fill-sources) for export limits,
 storage accounting and VM lifetime.
 

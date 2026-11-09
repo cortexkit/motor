@@ -47,22 +47,59 @@ pub(crate) fn run_refusal_for_boot(
 pub(crate) fn import(trees: &Trees, source: &FillSource, directory: &Path) -> io::Result<()> {
     source.validate(FILL_SOURCE_MAX_BYTES)?;
     verify_files(source, directory)?;
-    trees.validate_dependency_bundles(directory, &source.git_dependencies)?;
-    trees.fetch(
+    trees.fetch_fill(
         directory,
-        &source.bundles[..1],
+        &source.bundles[0],
         &source.repository_root,
         &source.integration_tip,
-        &source.integration_tip,
-        &[],
     )?;
+    refuse_replacements(&trees.mirror(&source.repository_root))?;
+    let expected: std::collections::BTreeSet<_> =
+        crate::writer::fill::locked_git(trees, &source.repository_root, &source.integration_tip)?
+            .into_iter()
+            .flat_map(|dependency| {
+                dependency
+                    .commits
+                    .into_iter()
+                    .map(move |commit| (dependency.url.clone(), commit))
+            })
+            .collect();
+    let declared: std::collections::BTreeSet<_> = source
+        .git_dependencies
+        .iter()
+        .flat_map(|dependency| {
+            dependency
+                .commits
+                .iter()
+                .map(|commit| (dependency.url.clone(), commit.clone()))
+        })
+        .collect();
+    if declared != expected {
+        return Err(invalid("fill dependency bundles do not match tip lockfile"));
+    }
+    trees.validate_dependency_bundles(directory, &source.git_dependencies)?;
     trees.import_dependencies(directory, &source.git_dependencies)?;
+    for dependency in &source.git_dependencies {
+        refuse_replacements(&trees.dependency_mirror(&dependency.url))?;
+    }
     trees.pin(
         &source.repository_root,
         &source.integration_tip,
         &source.integration_tip,
         &[],
     )
+}
+
+fn refuse_replacements(mirror: &Path) -> io::Result<()> {
+    if !workspace::git(
+        mirror,
+        &["for-each-ref", "--format=%(refname)", "refs/replace/"],
+    )?
+    .is_empty()
+    {
+        return Err(invalid("fill mirror contains replacement refs"));
+    }
+    Ok(())
 }
 
 pub(crate) fn pins(
@@ -195,7 +232,7 @@ pub(crate) fn export(
         source.bundles.push(bundle(
             &mirror,
             tip,
-            "refs/ck-motor/fill-export",
+            workspace::FILL_BUNDLE_REF,
             root,
             directory,
             0,

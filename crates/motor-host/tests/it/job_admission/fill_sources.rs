@@ -128,6 +128,129 @@ fn response(source: &FillSource, bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn an_export_cancelled_after_all_bytes_arrive_leaves_no_unreserved_generation() {
+    let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+    let host = std::sync::Arc::new(Mutex::new(durable_host(scratch.path(), 10000)));
+    let mut original = Incoming::new(
+        fill_source::directory(scratch.path(), "incoming-old"),
+        source(b"old", 'a'),
+    )
+    .unwrap();
+    original.chunk(chunk(b"old", 0)).unwrap();
+    original.publish(scratch.path(), "old").unwrap();
+    let old = Slot {
+        request: request('a', 1),
+        generation: "old".into(),
+        source: source(b"old", 'a'),
+        bytes: 3,
+        last_fill_started_ms: None,
+    };
+    let key = fill_source::key(&old.request.account, &old.request.repository_root);
+    host.lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .fill_sources
+        .insert(key.clone(), old.clone());
+    host.lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .export_tips
+        .insert(JOB.into(), request('b', 2));
+    let helper = SourceHelper {
+        reply: Mutex::new(response(&source(b"new", 'b'), b"new")),
+    };
+    let mut finalized = false;
+    let error = fill_source::export_before_commit(
+        &host,
+        &helper,
+        JOB,
+        Instant::now() + Duration::from_secs(10),
+        || {
+            finalized = true;
+            host.lock()
+                .unwrap()
+                .snapshot
+                .per_job
+                .export_tips
+                .remove(JOB);
+        },
+    )
+    .unwrap_err();
+    assert!(
+        finalized,
+        "the complete source must reach the finalization boundary"
+    );
+    assert!(error.to_string().contains("expired"), "{error}");
+    assert_eq!(
+        host.lock().unwrap().snapshot.per_job.fill_sources[&key],
+        old
+    );
+    let entries: Vec<_> = std::fs::read_dir(scratch.path().join("fill-sources"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from("old")]);
+    assert_eq!(
+        std::fs::read(fill_source::directory(scratch.path(), "old").join("0")).unwrap(),
+        b"old"
+    );
+}
+
+#[test]
+fn a_failed_journal_swap_removes_the_renamed_source_generation() {
+    struct FailingJournal(std::path::PathBuf);
+    impl motor_host::journal::Journal for FailingJournal {
+        fn directory(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.clone())
+        }
+        fn store(&mut self, _: &motor_host::state::Snapshot) -> std::io::Result<()> {
+            Err(std::io::Error::other("journal unavailable"))
+        }
+    }
+    let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+    let host = std::sync::Arc::new(Mutex::new(configure(
+        Host::new(
+            BTreeMap::new(),
+            Default::default(),
+            Box::new(FailingJournal(scratch.path().into())),
+        ),
+        10000,
+    )));
+    host.lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .export_tips
+        .insert(JOB.into(), request('b', 2));
+    let helper = SourceHelper {
+        reply: Mutex::new(response(&source(b"new", 'b'), b"new")),
+    };
+    let error = fill_source::export(
+        &host,
+        &helper,
+        JOB,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("journal unavailable"), "{error}");
+    assert_eq!(
+        std::fs::read_dir(scratch.path().join("fill-sources"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .fill_sources
+        .is_empty());
+}
+
+#[test]
 fn newer_tip_replaces_a_slot_atomically_and_a_corrupt_successor_keeps_it_across_restart() {
     let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
     let host = std::sync::Arc::new(Mutex::new(durable_host(scratch.path(), 10000)));

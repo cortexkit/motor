@@ -236,7 +236,8 @@ never from a host-supplied start kind alone. Job VMs refuse the Fill operation,
 and Fill VMs refuse Run admission. Fill VMs import verified bundles on a fresh
 disk, never a filesystem written by a job VM. Current per-job fills are
 cache-only and delete their disks instead of promoting
-[build bases](compile-cache.md#fixed-paths-and-local-build-bases) that seed later jobs; see
+[build bases](compile-cache.md#fixed-paths-and-local-build-bases) that seed later jobs.
+Promotion requires fixed paths, which per-job hosts do not have yet. See
 [per-job fill sources](hosted-host.md#per-job-fill-sources) for the byte and time
 limits and VM resource lifetime.
 

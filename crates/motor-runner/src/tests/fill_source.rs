@@ -1,5 +1,180 @@
 use super::*;
 
+fn rewrite_heads(
+    directory: &Path,
+    source: &mut motor_protocol::FillSource,
+    heads: &[(&str, &str)],
+) {
+    use sha2::{Digest, Sha256};
+    let path = directory.join("0");
+    let bytes = fs::read(&path).unwrap();
+    let version_end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let pack_start = bytes.windows(2).position(|bytes| bytes == b"\n\n").unwrap() + 2;
+    let mut edited = bytes[..version_end].to_vec();
+    for (oid, reference) in heads {
+        edited.extend_from_slice(format!("{oid} {reference}\n").as_bytes());
+    }
+    edited.push(b'\n');
+    edited.extend_from_slice(&bytes[pack_start..]);
+    fs::write(&path, &edited).unwrap();
+    source.bundles[0].length = edited.len() as u64;
+    source.bundles[0].sha256 = format!("{:x}", Sha256::digest(&edited));
+}
+
+fn refuse_adversarial_heads(glob: bool) {
+    let (f, _, _, directory, mut source) = source_fixture();
+    let payload = git(&f.main, &["rev-parse", "HEAD^"]);
+    let injected = if glob {
+        "refs/ck-motor/*".into()
+    } else {
+        format!(
+            "refs/ck-motor/payload:refs/replace/{}",
+            source.integration_tip
+        )
+    };
+    rewrite_heads(
+        &directory,
+        &mut source,
+        &[(&payload, "refs/ck-motor/payload"), (&payload, &injected)],
+    );
+    let heads = git(
+        &f.main,
+        &["bundle", "list-heads", text(&directory.join("0"))],
+    );
+    assert!(
+        heads.contains(&injected),
+        "Git must expose the hand-edited bundle header: {heads}"
+    );
+    let mut config = f.config();
+    config.state_root = f.scratch.join("adversarial-state");
+    config.manual_tick = true;
+    let fresh = Runner::open(config).unwrap();
+    let result = crate::fill_source::import(&fresh.core.trees, &source, &directory);
+    assert!(
+        result.is_err(),
+        "accepted adversarial bundle head {injected}"
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.to_string().contains("invalid bundle refs"),
+        "malformed bundle heads must be refused before Git fetch: {error}"
+    );
+    let mirror = fresh.core.trees.mirror(&source.repository_root);
+    if mirror.exists() {
+        assert!(git(&mirror, &["for-each-ref", "--format=%(refname)"]).is_empty());
+    }
+    assert!(!fresh.config().state_dir().join("build-bases").exists());
+}
+
+#[test]
+fn colon_bearing_fill_bundle_header_is_refused_without_creating_refs() {
+    refuse_adversarial_heads(false);
+}
+
+#[test]
+fn glob_bearing_fill_bundle_header_is_refused_without_creating_refs() {
+    refuse_adversarial_heads(true);
+}
+
+#[test]
+fn fill_bundle_requires_one_fixed_head_at_the_expected_tip_and_no_replace_refs() {
+    let (f, _, _, directory, source) = source_fixture();
+    let original = fs::read(directory.join("0")).unwrap();
+    let parent = git(&f.main, &["rev-parse", "HEAD^"]);
+    for (case, heads) in [
+        (
+            "wrong-tip",
+            vec![(parent.as_str(), "refs/ck-motor/fill-export")],
+        ),
+        (
+            "wrong-name",
+            vec![(source.integration_tip.as_str(), "refs/ck-motor/other")],
+        ),
+        (
+            "two-heads",
+            vec![
+                (source.integration_tip.as_str(), "refs/ck-motor/fill-export"),
+                (parent.as_str(), "refs/ck-motor/other"),
+            ],
+        ),
+    ] {
+        fs::write(directory.join("0"), &original).unwrap();
+        let mut edited = source.clone();
+        rewrite_heads(&directory, &mut edited, &heads);
+        let mut config = f.config();
+        config.state_root = f.scratch.join(case);
+        config.manual_tick = true;
+        let fresh = Runner::open(config).unwrap();
+        assert!(
+            crate::fill_source::import(&fresh.core.trees, &edited, &directory).is_err(),
+            "{case}"
+        );
+    }
+    fs::write(directory.join("0"), original).unwrap();
+    let mut config = f.config();
+    config.state_root = f.scratch.join("replacement-state");
+    config.manual_tick = true;
+    let fresh = Runner::open(config).unwrap();
+    crate::fill_source::import(&fresh.core.trees, &source, &directory).unwrap();
+    git(
+        &fresh.core.trees.mirror(&source.repository_root),
+        &[
+            "update-ref",
+            &format!("refs/replace/{}", source.integration_tip),
+            &parent,
+        ],
+    );
+    let error = crate::fill_source::import(&fresh.core.trees, &source, &directory).unwrap_err();
+    assert!(error.to_string().contains("replacement refs"), "{error}");
+}
+
+#[test]
+fn unlocked_dependency_urls_and_commits_are_refused_before_any_dependency_import() {
+    use sha2::{Digest, Sha256};
+    let (f, _, _, directory, source) = source_fixture();
+    let dependency = f.scratch.join("dependency");
+    let (unlocked, _) = commit(&dependency, "unlocked");
+    for extra_url in [true, false] {
+        let mut edited = source.clone();
+        let mut extra = edited.git_dependencies[0].clone();
+        let bundle = if extra_url {
+            extra.url = "https://example.invalid/unlocked".into();
+            fs::read(directory.join("1")).unwrap()
+        } else {
+            extra.commits = vec![unlocked.clone()];
+            let reference = format!("refs/ck-motor/dep/{unlocked}");
+            git(&dependency, &["update-ref", &reference, &unlocked]);
+            let path = f.scratch.join("unlocked.bundle");
+            git(&dependency, &["bundle", "create", text(&path), &reference]);
+            fs::read(path).unwrap()
+        };
+        let manifest = BundleManifest {
+            index: 2,
+            repository: extra.url.clone(),
+            length: bundle.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bundle)),
+        };
+        fs::write(directory.join("2"), bundle).unwrap();
+        extra.bundle = Some(manifest.clone());
+        edited.git_dependencies.push(extra.clone());
+        edited.bundles.push(manifest);
+        let mut config = f.config();
+        config.state_root = f.scratch.join(if extra_url {
+            "extra-url"
+        } else {
+            "extra-commit"
+        });
+        config.manual_tick = true;
+        let fresh = Runner::open(config).unwrap();
+        let error = crate::fill_source::import(&fresh.core.trees, &edited, &directory).unwrap_err();
+        assert!(error.to_string().contains("tip lockfile"), "{error}");
+        for dependency in &edited.git_dependencies {
+            assert!(!fresh.core.trees.dependency_mirror(&dependency.url).exists());
+        }
+        assert!(!fresh.config().state_dir().join("build-bases").exists());
+    }
+}
+
 fn source_fixture() -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSource) {
     let f = Fixture::new();
     let dependency = f.scratch.join("dependency");

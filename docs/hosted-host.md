@@ -349,6 +349,7 @@ refuse it, and Fill VMs refuse Run admission. Current per-job settings have no
 root-owned fixed-path repository allowlist, so these fills write the shared
 compiler cache only and their disks are deleted, not promoted to
 [build bases](compile-cache.md#fixed-paths-and-local-build-bases) that seed later jobs.
+Promotion requires fixed paths, which per-job hosts do not have yet.
 
 ### Root remote-cache credential command
 

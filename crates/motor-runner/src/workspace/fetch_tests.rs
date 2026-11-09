@@ -421,3 +421,101 @@ fn different_repository_fetches_make_progress_in_parallel() {
         result.unwrap();
     }
 }
+#[test]
+fn client_bundle_headers_cannot_supply_colon_or_glob_refspecs() {
+    for glob in [false, true] {
+        let scratch = ScratchDir::new("bundle-refspecs");
+        let trees = trees(&scratch);
+        let (directory, manifest, commit) = bundle(&scratch, "repository");
+        let path = directory.join("0");
+        let bytes = fs::read(&path).unwrap();
+        let header_end = bytes.windows(2).position(|bytes| bytes == b"\n\n").unwrap() + 2;
+        let version_end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let injected = if glob {
+            "refs/ck-motor/*".into()
+        } else {
+            format!("refs/ck-motor/payload:refs/replace/{commit}")
+        };
+        let mut edited = bytes[..version_end].to_vec();
+        edited.extend_from_slice(
+            format!("{commit} refs/ck-motor/payload\n{commit} {injected}\n\n").as_bytes(),
+        );
+        edited.extend_from_slice(&bytes[header_end..]);
+        fs::write(&path, edited).unwrap();
+        let heads = git(&scratch, &["bundle", "list-heads", path.to_str().unwrap()]).unwrap();
+        assert!(heads.contains(&injected));
+        let error = trees
+            .fetch(
+                &directory,
+                std::slice::from_ref(&manifest),
+                &manifest.repository,
+                &commit,
+                &commit,
+                &[],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid bundle refs"), "{error}");
+        assert!(git(
+            &trees.mirror(&manifest.repository),
+            &["for-each-ref", "--format=%(refname)"]
+        )
+        .unwrap()
+        .is_empty());
+    }
+}
+
+#[test]
+fn git_reads_and_transfer_commands_ignore_replacement_objects() {
+    let scratch = ScratchDir::new("git-replacements");
+    let (_, manifest, original) = bundle(&scratch, "repository");
+    let repo = Path::new(&manifest.repository);
+    let original_tree = git(repo, &["rev-parse", &format!("{original}^{{tree}}")]).unwrap();
+    fs::write(repo.join("source"), "replacement").unwrap();
+    git(repo, &["add", "source"]).unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "replacement",
+        ],
+    )
+    .unwrap();
+    let replacement = git(repo, &["rev-parse", "HEAD"]).unwrap();
+    let replacement_tree = git(repo, &["rev-parse", "HEAD^{tree}"]).unwrap();
+    assert_ne!(original_tree, replacement_tree);
+    git(
+        repo,
+        &[
+            "update-ref",
+            &format!("refs/replace/{original}"),
+            &replacement,
+        ],
+    )
+    .unwrap();
+    let control = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", &format!("{original}^{{tree}}")])
+        .env_remove("GIT_NO_REPLACE_OBJECTS")
+        .output()
+        .unwrap();
+    assert!(control.status.success());
+    assert_eq!(
+        String::from_utf8(control.stdout).unwrap().trim(),
+        replacement_tree
+    );
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{original}^{{tree}}")]).unwrap(),
+        original_tree
+    );
+    // Exercise the transfer's actual command wrapper. Without replacement
+    // suppression Git would see these two trees as identical and exit zero.
+    assert!(
+        super::transfer::fetch(repo, &["diff", "--exit-code", &original, &replacement]).is_err()
+    );
+}

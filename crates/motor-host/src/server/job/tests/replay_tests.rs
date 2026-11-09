@@ -995,9 +995,18 @@ async fn failed_export_starts_after_caller_terminal_and_does_not_extend_billing_
         .ended_at_ms
         .unwrap();
     let usage_before = runtime.host.lock().unwrap().snapshot.billing[JOB].clone();
+    let at_export = runtime.clone();
     let request = tokio::task::spawn_blocking(move || {
         let request = crate::helper::read_json(&mut export_guest).unwrap();
         assert_eq!(request["op"], "export_tip");
+        {
+            let mut host = at_export.host.lock().unwrap();
+            assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(end));
+            assert_eq!(host.snapshot.billing[JOB].terminal_received_ms, Some(end));
+            assert_eq!(host.snapshot.billing[JOB].ended_observed_ms, Some(end));
+            host.billing_tick(end + 300_000).unwrap();
+            assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(end));
+        }
         crate::helper::write_json(
             &mut export_guest,
             &json!({"ok":false,"error":"export failure"}),
@@ -1025,6 +1034,13 @@ async fn failed_export_starts_after_caller_terminal_and_does_not_extend_billing_
             usage_before.ended_observed_ms
         );
         assert!(host.snapshot.per_job.fill_sources.is_empty());
+        let billing = &host.snapshot.billing[JOB];
+        let usage = billing.usage.as_ref().unwrap();
+        assert_eq!(usage.ended_at_ms, end);
+        assert_eq!(
+            billing.hosted_terminal.as_ref().unwrap()["billed_vcpu_ms"],
+            u64::from(claims(JOB).vcpus) * (end - usage.started_at_ms)
+        );
     }
     assert_eq!(replayed(&runtime).await, frames);
 }

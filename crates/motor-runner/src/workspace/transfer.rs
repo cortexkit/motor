@@ -117,6 +117,7 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
         .arg("-C")
         .arg(path)
         .args(args)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")

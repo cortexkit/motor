@@ -155,8 +155,16 @@ impl Incoming {
     pub fn publish(self, journal: &Path, generation: &str) -> Result<()> {
         ensure!(self.complete(), "incomplete source");
         File::open(&self.path)?.sync_all()?;
-        fs::rename(&self.path, directory(journal, generation))?;
-        File::open(journal.join("fill-sources"))?.sync_all()?;
+        let published = directory(journal, generation);
+        fs::rename(&self.path, &published)?;
+        if let Err(error) =
+            File::open(journal.join("fill-sources")).and_then(|file| file.sync_all())
+        {
+            if let Err(cleanup) = fs::remove_dir_all(&published) {
+                tracing::error!(%cleanup, "fill_source_failed_publish_cleanup");
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 }
@@ -233,6 +241,38 @@ pub fn export(
     job: &str,
     deadline: Instant,
 ) -> Result<()> {
+    export_with(host, control, job, deadline, || {})
+}
+
+#[cfg(test)]
+pub fn export_before_commit(
+    host: &Arc<Mutex<Host>>,
+    control: &dyn Control,
+    job: &str,
+    deadline: Instant,
+    before_commit: impl FnOnce(),
+) -> Result<()> {
+    export_with(host, control, job, deadline, before_commit)
+}
+
+struct UncommittedGeneration(Option<PathBuf>);
+impl Drop for UncommittedGeneration {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            if let Err(error) = fs::remove_dir_all(path) {
+                tracing::error!(%error, "fill_source_failed_publish_cleanup");
+            }
+        }
+    }
+}
+
+fn export_with(
+    host: &Arc<Mutex<Host>>,
+    control: &dyn Control,
+    job: &str,
+    deadline: Instant,
+    before_commit: impl FnOnce(),
+) -> Result<()> {
     let (request, journal) = {
         let host = host.lock().expect("host lock");
         let Some(request) = host.snapshot.per_job.export_tips.get(job).cloned() else {
@@ -286,7 +326,7 @@ pub fn export(
                 .context("incomplete source")?,
             )?;
         }
-        incoming.publish(&journal, &generation)?;
+        before_commit();
         let mut host = host.lock().expect("host lock");
         ensure!(Instant::now() < deadline, "fill export timed out");
         ensure!(
@@ -300,9 +340,13 @@ pub fn export(
             .as_ref()
             .is_some_and(|old| old.request.observed_ms > request.observed_ms)
         {
-            fs::remove_dir_all(directory(&journal, &generation))?;
             return Ok(());
         }
+        // The reservation and deadline must still hold when the generation is
+        // renamed. Until the journal commits, every failure removes its files.
+        incoming.publish(&journal, &generation)?;
+        let mut unpublished = UncommittedGeneration(Some(directory(&journal, &generation)));
+        ensure!(Instant::now() < deadline, "fill export timed out");
         next.per_job.fill_sources.insert(
             slot_key,
             Slot {
@@ -314,6 +358,7 @@ pub fn export(
             },
         );
         host.save(next)?;
+        unpublished.0 = None;
         tracing::info!(
             jti = job,
             tip = request.integration_tip,
