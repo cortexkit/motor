@@ -564,7 +564,9 @@ async fn refuse_run_probe(root: &Path, id: uuid::Uuid) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let lease = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV","vcpus":2,"mem_mib":2048,"platform":"linux-x64","net":false,"max_s":60,"exp":now+120});
+    // A Run that would be admitted on a Job VM (its weight matches the lease's
+    // vCPUs), so the refusal below can only come from the Fill boot kind.
+    let lease = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV","vcpus":2,"mem_mib":4096,"platform":"linux-x64","net":false,"max_s":60,"exp":now+120});
     motor_protocol::write_frame_async(&mut socket, &serde_json::from_value(lease).unwrap())
         .await
         .unwrap();
@@ -576,7 +578,7 @@ async fn refuse_run_probe(root: &Path, id: uuid::Uuid) {
     .await
     .unwrap();
     assert!(matches!(next(&mut socket).await, Frame::Hello { .. }));
-    let run = json!({"type":"run","job_id":id,"workspace_key":"/home/motor-contract","repository_root":"/home/motor-contract","cwd":"/home/motor-contract","command":"true","env":{},"weight_hint":1,"timeout":60,"queue_wait_limit_s":10,"snapshot_commit":"a".repeat(40),"integration_tip":"a".repeat(40),"tree_hash":"b".repeat(40),"siblings":[],"bundles":[]});
+    let run = json!({"type":"run","job_id":id,"workspace_key":"/home/motor-contract","repository_root":"/home/motor-contract","cwd":"/home/motor-contract","command":"true","env":{},"weight_hint":2,"timeout":60,"queue_wait_limit_s":10,"snapshot_commit":"a".repeat(40),"integration_tip":"a".repeat(40),"tree_hash":"b".repeat(40),"siblings":[],"bundles":[]});
     motor_protocol::write_frame_async(&mut socket, &serde_json::from_value(run).unwrap())
         .await
         .unwrap();
