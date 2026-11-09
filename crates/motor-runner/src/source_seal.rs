@@ -84,6 +84,7 @@ pub(crate) struct Snapshot<'a> {
     config: &'a Config,
     trees: &'a crate::workspace::Trees,
     request: &'a Run,
+    preserve_seed_times: bool,
 }
 
 impl<'a> Sources<'a> {
@@ -96,7 +97,18 @@ impl<'a> Sources<'a> {
             config,
             trees,
             request,
+            preserve_seed_times: false,
         })
+    }
+
+    /// Build-base seeding calls this at launch only after this setup seeded and
+    /// time-set the checkout, never for build folders retained from earlier jobs.
+    #[allow(dead_code)]
+    pub(crate) fn preserve_seed_times(mut self) -> Self {
+        if let Self::Snapshot(snapshot) = &mut self {
+            snapshot.preserve_seed_times = true;
+        }
+        self
     }
 
     pub(crate) fn seal(
@@ -127,7 +139,7 @@ impl<'a> Sources<'a> {
                 step(
                     &root,
                     "rematerialize sources linked by preparation",
-                    refresh::planned_sources(&plan, &tree, &mirror),
+                    refresh::planned_sources(&plan, &tree, &mirror, snapshot.preserve_seed_times),
                 )?;
                 plan.unit = id;
                 let job_id = snapshot.request.job_id;
