@@ -450,6 +450,7 @@ mod rollback_tests {
                 queue: vec![],
                 attached_job: None,
                 quarantined: false,
+                have: Vec::new(),
             },
         );
         journal.store(&snapshot).unwrap();
@@ -488,6 +489,7 @@ mod rollback_tests {
                 queue: vec![],
                 attached_job: None,
                 quarantined: false,
+                have: Vec::new(),
             },
         );
         journal.store(&snapshot).unwrap();
@@ -535,6 +537,22 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
         },
     );
     let legacy = snapshot.clone();
+    snapshot.per_job.disks.insert(
+        "ws-rollback".into(),
+        crate::state::jobs::WorkspaceDisk {
+            sub: claims.sub.clone(),
+            workspace_key_hash: "hash".into(),
+            queue: vec![],
+            attached_job: None,
+            quarantined: false,
+            have: vec![motor_protocol::MirrorRef {
+                repository: Some("/repo".into()),
+                dependency: None,
+                reference: "refs/snapshots/held".into(),
+                commit: "held".into(),
+            }],
+        },
+    );
     snapshot.per_job.executions.insert(
         job.into(),
         crate::state::jobs::Execution {
@@ -555,6 +573,7 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
             boot_started_at_ms: Some(1800000000000),
             runner_hello: false,
             ended: false,
+            have_invalidated: true,
         },
     );
     journal.store(&snapshot).unwrap();

@@ -8,6 +8,8 @@ mod claim_log;
 mod closure;
 mod drain;
 mod enroll;
+#[cfg(target_os = "linux")]
+mod have_record;
 mod helper;
 mod job_admission;
 mod replacement;

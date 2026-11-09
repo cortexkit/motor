@@ -831,6 +831,20 @@ impl Host {
             return Ok(());
         }
         vm.event_seq = event.event_seq;
+        if event.event == TenantEventKind::MirrorRefs
+            && next.per_job.executions.contains_key(tenant)
+        {
+            if event.jti.is_some_and(|jti| jti.to_string() != tenant) {
+                return refuse(Refusal::Auth);
+            }
+            if let Some(report) = &event.mirror_refs {
+                jobs::have::report(&mut next, tenant, report);
+            } else {
+                jobs::have::invalidate(&mut next, tenant);
+            }
+            // Persist both the report and replay cursor before acknowledging it.
+            return self.save(next);
+        }
         if event.event == TenantEventKind::Idle {
             if event.jti.is_some() {
                 return refuse(Refusal::Auth);

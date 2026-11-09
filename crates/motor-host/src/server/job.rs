@@ -439,6 +439,14 @@ impl Runtime {
         let mut host = self.host.lock().expect("host lock");
         match frame["type"].as_str() {
             Some("started") => host.job_started(job, unix_ms())?,
+            Some("refusal")
+                if matches!(
+                    frame["reason"].as_str(),
+                    Some("transfer_interrupted" | "bundle_rejected")
+                ) =>
+            {
+                host.job_transfer_refused(job)?;
+            }
             Some("terminal") => {
                 host.receive_terminal(job, frame.clone(), unix_ms())?;
                 // Relay the recorded winner, including removal of unauthenticated
@@ -703,7 +711,9 @@ async fn boot(
     let stream = tokio::task::spawn_blocking(move || control.job_relay(&job, 52)).await??;
     stream.set_nonblocking(true)?;
     let mut stream = tokio::net::UnixStream::from_std(stream)?;
-    write_frame(&mut stream, &verified_lease(&execution.claims, true)).await?;
+    let mut lease = verified_lease(&execution.claims, true);
+    lease["mirror_reports"] = json!(true);
+    write_frame(&mut stream, &lease).await?;
     stream.write_all(&hello.bytes).await?;
     let actual = loop {
         let actual = read_frame(&mut stream).await?;
@@ -801,7 +811,9 @@ async fn live<S: AsyncRead + AsyncWrite + Unpin>(
     let stream = tokio::task::spawn_blocking(move || control.job_relay(&job, 52)).await??;
     stream.set_nonblocking(true)?;
     let mut guest = tokio::net::UnixStream::from_std(stream)?;
-    write_frame(&mut guest, &verified_lease(claims, true)).await?;
+    let mut lease = verified_lease(claims, true);
+    lease["mirror_reports"] = json!(true);
+    write_frame(&mut guest, &lease).await?;
     guest.write_all(&first.bytes).await?;
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut gr, mut gw) = guest.split();
@@ -917,10 +929,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 if frame.value["type"] == "withdraw" { withdraw_replies += 1; }
                 match frame.value["type"].as_str() {
                     Some("have") if !accepted => {
-                        let mut repositories = frame.value["repositories"].clone();
-                        if let Some(repositories) = repositories.as_array_mut() { for repository in repositories { repository["commits"] = json!([]); } }
-                        let dependencies: Vec<_> = frame.value["git_dependencies"].as_array().into_iter().flatten().map(|url| json!({"url":url,"commits":[]})).collect();
-                        write_frame(client, &json!({"type":"have_reply","repositories":repositories,"git_dependencies":dependencies})).await?;
+                        let motor_protocol::Frame::Have { repositories, git_dependencies } = serde_json::from_value(frame.value)? else { unreachable!() };
+                        let reply = runtime.host.lock().expect("host lock").job_have(&claims.jti, repositories, git_dependencies);
+                        write_frame(client, &serde_json::to_value(reply)?).await?;
                         have_replies += 1;
                     },
                     Some("run") if !accepted => {

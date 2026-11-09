@@ -142,6 +142,9 @@ impl Host {
             .get_or_insert_with(Default::default)
             .unclean_stop
             .get_or_insert(unclean);
+        if unclean {
+            super::jobs::have::invalidate(&mut next, job);
+        }
         self.save(next)
     }
     pub fn job_memory_sample(&mut self, sample: motor_protocol::MemorySample) -> Result<(), Error> {
@@ -180,6 +183,7 @@ impl Host {
             settle_stop(&mut next, job, cause, now_ms);
             defer_usage(&mut next, job);
         }
+        super::jobs::have::invalidate(&mut next, job);
         self.save(next)?;
         tracing::warn!(jti = job, cause = cause.as_str(), "job_host_stop");
         Ok(())
@@ -217,6 +221,14 @@ impl Host {
         }
         defer_usage(&mut next, &report.job_id);
         finalize_usage(&mut next, &report.job_id);
+        let clean = next.per_job.executions[&report.job_id]
+            .evidence
+            .as_ref()
+            .is_some_and(|e| e.unclean_stop == Some(false))
+            && report.oom_kill == 0;
+        if !clean {
+            super::jobs::have::invalidate(&mut next, &report.job_id);
+        }
         self.save(next)?;
         if report.oom_kill > 0 {
             tracing::warn!(
@@ -276,6 +288,7 @@ impl Host {
             defer_usage(&mut next, job);
             finalize_usage(&mut next, job);
         }
+        super::jobs::have::invalidate(&mut next, job);
         self.save(next)?;
         if new_gap {
             tracing::warn!(jti = job, first_gone_ms = first, "job_exit_evidence_gap");
@@ -291,6 +304,7 @@ impl Host {
         live: bool,
     ) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
+        super::jobs::have::transfer_terminal(&mut next, job, &frame);
         let evidence = next
             .per_job
             .executions
