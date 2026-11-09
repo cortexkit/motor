@@ -436,9 +436,18 @@ class InstallerTests(unittest.TestCase):
     def test_unpinned_or_ca_trusting_effective_sshd_is_refused(self):
         cases = {"authorizedkeysfile .ssh/authorized_keys": "does not pin the runner key file",
                  f"trustedusercakeys /etc/ca.pub\nauthorizedkeysfile {self.ssh}/authorized_keys": "trusts a user CA"}
+        # The sshd on macOS 27.2 prints keywords in mixed case, older ones in
+        # lower case; both must be read.
+        cases[f"TrustedUserCAKeys /etc/ca.pub\nAuthorizedKeysFile {self.ssh}/authorized_keys"] = "trusts a user CA"
+        cases["AuthorizedKeysFile .ssh/authorized_keys"] = "does not pin the runner key file"
         for effective, expected in cases.items():
             with self.subTest(effective=effective), patch.object(install, "run", side_effect=lambda *args: effective if args[:2] == ("/usr/sbin/sshd", "-T") else self.command(*args)):
                 self.assertIn(expected, " ".join(self.check()))
+
+    def test_mixed_case_pinned_effective_sshd_passes(self):
+        effective = f"TrustedUserCAKeys none\nAuthorizedKeysFile {self.ssh}/authorized_keys"
+        with patch.object(install, "run", side_effect=lambda *args: effective if args[:2] == ("/usr/sbin/sshd", "-T") else self.command(*args)):
+            self.assertFalse([error for error in self.check() if "sshd" in error])
 
     def test_changed_pinned_runner_key_is_refused(self):
         (self.ssh / "authorized_keys").write_text("ssh-ed25519 BBBB\n")

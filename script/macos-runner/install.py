@@ -539,7 +539,10 @@ def ssh_errors(text, effective, keys):
     errors = []
     if ssh_block(keys) not in text:
         errors.append("managed sshd Match User motor block is missing or changed")
-    values = dict(line.split(None, 1) for line in effective.splitlines() if " " in line)
+    # sshd -T prints keywords in lower case on older OpenSSH and in mixed case on
+    # macOS 27.2; keywords are case-insensitive either way.
+    values = {key.lower(): value for key, value in
+              (line.split(None, 1) for line in effective.splitlines() if " " in line)}
     if values.get("authorizedkeysfile") != str(keys):
         errors.append("sshd does not pin the runner key file for motor")
     if values.get("trustedusercakeys", "none") != "none":
