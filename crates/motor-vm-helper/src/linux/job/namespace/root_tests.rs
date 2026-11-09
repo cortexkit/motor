@@ -175,6 +175,18 @@ pub(in crate::linux::job) fn job_link(id: &str) {
         },
     )
     .unwrap();
+    assert!(
+        links().unwrap().iter().any(|link| owned(
+            link,
+            id,
+            &Tap {
+                tap_index: 17,
+                uid: 500000
+            }
+        )
+        .unwrap()),
+        "host veth must carry the job ownership alias after moving namespaces"
+    );
 }
 
 #[test]
@@ -353,4 +365,62 @@ fn isolated_startup_removes_orphan_namespaces_and_veths_idempotently() {
         .any(|link| link["ifname"] == "mtap17"));
     remove(live).unwrap();
     remove(live).unwrap();
+}
+
+#[test]
+fn isolated_startup_reclaims_aliasless_veths_after_interrupted_creation() {
+    let _fixture = Fixture::new();
+    let id = "aliasless-job";
+    create(id).unwrap();
+    // Model a crash after the two peers are created but before the explicit
+    // alias assignment and move to the host namespace can run.
+    ns_ip(
+        id,
+        &[
+            "link", "add", "mtap17", "type", "veth", "peer", "name", UPLINK,
+        ],
+    )
+    .unwrap();
+    let output = inside(id, "/usr/sbin/ip")
+        .unwrap()
+        .args(["-j", "-d", "link", "show", "mtap17"])
+        .output()
+        .unwrap();
+    let internal: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(internal[0]["ifalias"].is_null());
+    assert!(!links()
+        .unwrap()
+        .iter()
+        .any(|link| link["ifname"] == "mtap17"));
+    reconcile(&BTreeSet::new()).unwrap();
+    reconcile(&BTreeSet::new()).unwrap();
+    assert!(!path(id).unwrap().exists());
+    // Also reclaim the old host-first creation layout: the namespace mount
+    // identifies the untagged peer, so deleting it must remove the host veth.
+    create(id).unwrap();
+    ip(&[
+        "link",
+        "add",
+        "mtap17",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        UPLINK,
+        "netns",
+        &name(id).unwrap(),
+    ])
+    .unwrap();
+    let host = links()
+        .unwrap()
+        .into_iter()
+        .find(|link| link["ifname"] == "mtap17")
+        .unwrap();
+    assert!(host["ifalias"].is_null());
+    reconcile(&BTreeSet::new()).unwrap();
+    assert!(!path(id).unwrap().exists());
+    assert!(!links()
+        .unwrap()
+        .iter()
+        .any(|link| link["ifname"] == "mtap17"));
 }

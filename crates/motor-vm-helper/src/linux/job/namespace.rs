@@ -121,23 +121,22 @@ pub(super) fn connect(id: &str, tap: &Tap) -> Result<()> {
         return Err(Error("invalid job network index".into()));
     }
     let dev = tap.tap();
-    // The peer is born in the job namespace and the ownership alias is part of
-    // the same link-creation operation. Every partially-created veth is discoverable after
-    // a crash; deleting its namespace also removes the host peer.
-    ip(&[
-        "link",
-        "add",
-        &dev,
-        "alias",
-        &name(id)?,
-        "type",
-        "veth",
-        "peer",
-        "name",
-        UPLINK,
-        "netns",
-        &name(id)?,
-    ])?;
+    // iproute2 can ignore add-time aliases. Keep both peers inside the job
+    // namespace until the alias is set, then move the tagged peer to the host.
+    // A crash before the move leaves no unidentifiable host interface; deleting
+    // the namespace reclaims both peers even if the alias was never installed.
+    ns_ip(
+        id,
+        &["link", "add", &dev, "type", "veth", "peer", "name", UPLINK],
+    )?;
+    ns_ip(id, &["link", "set", &dev, "alias", &name(id)?])?;
+    let host_namespace = File::open("/proc/thread-self/ns/net")?;
+    let host_path = format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        host_namespace.as_raw_fd()
+    );
+    ns_ip(id, &["link", "set", &dev, "netns", &host_path])?;
     std::fs::write(format!("/proc/sys/net/ipv6/conf/{dev}/disable_ipv6"), "1")?;
     ns_ip(
         id,
