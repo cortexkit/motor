@@ -1,5 +1,5 @@
 use super::*;
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use ed25519_dalek::SigningKey;
 use motor_host::helper::Control;
 use motor_host::jobs::{Assignment, Resources};
@@ -11,6 +11,8 @@ use motor_protocol::{Frame, MirrorRef, TenantEvent};
 use motor_runner::{Config, Runner};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,17 +53,62 @@ fn hello() -> Value {
     json!({"type":"hello","protocol_version":1,"started":true,"default_branch_tip":true})
 }
 
+const WORKSPACE_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
 struct Disk {
     root: PathBuf,
     handle: tokio::runtime::Handle,
     prepare_hold: Mutex<Option<PrepareHold>>,
     released: tokio::sync::Notify,
+    workspaces: Mutex<BTreeMap<String, (String, u64)>>,
 }
 struct PrepareHold {
     entered: tokio::sync::oneshot::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
 impl Control for Disk {
+    fn ensure_workspace(&self, account: &str, disk_id: &str, size_bytes: u64) -> Result<()> {
+        motor_vm_helper::job::validate_account(account)?;
+        motor_vm_helper::job::validate_id(disk_id)?;
+        ensure!(
+            size_bytes > 0 && size_bytes <= WORKSPACE_DISK_BYTES && size_bytes.is_multiple_of(512),
+            "workspace cap exceeded"
+        );
+        let mut workspaces = self.workspaces.lock().unwrap();
+        let directory = self.root.join("workspace-disks");
+        let path = directory.join(disk_id);
+        if let Some((owner, cap)) = workspaces.get(disk_id) {
+            ensure!(
+                owner == account && *cap == size_bytes,
+                "workspace identity or size mismatch"
+            );
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            ensure!(
+                metadata.is_file() && metadata.len() == size_bytes,
+                "workspace disk changed"
+            );
+            return Ok(());
+        }
+        // The native runner uses a directory instead of mounting a disk. Keep
+        // a real capped sparse file alongside it to exercise boot provisioning.
+        std::fs::create_dir_all(&directory)?;
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_len(size_bytes)?;
+        file.sync_all()?;
+        std::fs::File::open(directory)?.sync_all()?;
+        workspaces.insert(disk_id.into(), (account.into(), size_bytes));
+        Ok(())
+    }
     fn start_job(&self, _: &motor_vm_helper::job::Start) -> Result<Value> {
         Ok(json!({"running":true,"tap_index":1}))
     }
@@ -130,7 +177,23 @@ impl Control for Disk {
         unreachable!()
     }
     fn available_bytes(&self) -> Result<u64> {
-        Ok(u64::MAX)
+        let path = std::ffi::CString::new(self.root.as_os_str().as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    }
+    fn capacity(&self) -> Result<motor_host::capacity::Capacity> {
+        Ok(motor_host::capacity::Capacity {
+            windows_vm_bytes: 0,
+            host_reserve_bytes: 0,
+            jobs_min_bytes: 1,
+            storage_margin_bytes: 1024 * 1024,
+            growth_allowance_bytes: 0,
+            tenant_memory_reserve_bytes: 0,
+        })
     }
 }
 impl Resources for Disk {
@@ -194,10 +257,15 @@ impl Fixture {
             handle: tokio::runtime::Handle::current(),
             prepare_hold: Mutex::new(None),
             released: tokio::sync::Notify::new(),
+            workspaces: Mutex::new(BTreeMap::new()),
         });
         let (journal, snapshot) = SqliteJournal::open(&root.path().join("host")).unwrap();
         let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
         host.settings = host_settings()[1].clone();
+        if let motor_host::config::HostSettings::PerJob(settings) = &mut host.settings {
+            settings.workspace_disk_cap_bytes = WORKSPACE_DISK_BYTES;
+        }
+        host.enforce_storage();
         host.record_host_resources(HostResources {
             at_ms: unix_ms(),
             available_mem_mib: 100_000,
@@ -463,6 +531,60 @@ impl Fixture {
         self.stop(&c);
         (c, have, bytes, terminal, started)
     }
+}
+
+#[tokio::test]
+async fn storage_control_provisions_sparse_capped_disks_and_keeps_admission_enforced() {
+    use std::os::unix::fs::MetadataExt;
+    let mut f = Fixture::new();
+    let account = f.claims().sub;
+    f.disk
+        .ensure_workspace(&account, "ws-fixture", WORKSPACE_DISK_BYTES)
+        .unwrap();
+    let path = f.root.path().join("workspace-disks/ws-fixture");
+    let before = std::fs::metadata(&path).unwrap();
+    assert_eq!(before.len(), WORKSPACE_DISK_BYTES);
+    assert_eq!(before.blocks(), 0);
+    f.disk
+        .ensure_workspace(&account, "ws-fixture", WORKSPACE_DISK_BYTES)
+        .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), before.ino());
+    assert!(f
+        .disk
+        .ensure_workspace(&account, "ws-fixture", WORKSPACE_DISK_BYTES / 2)
+        .is_err());
+    assert!(f
+        .disk
+        .ensure_workspace(
+            &format!("{account}-other"),
+            "ws-fixture",
+            WORKSPACE_DISK_BYTES
+        )
+        .is_err());
+    assert!(f
+        .disk
+        .ensure_workspace(&account, "too-large", WORKSPACE_DISK_BYTES + 512)
+        .is_err());
+    assert!(f
+        .disk
+        .ensure_workspace(&account, "../escape", WORKSPACE_DISK_BYTES)
+        .is_err());
+    assert!(!f.root.path().join("workspace-disks/too-large").exists());
+    assert_eq!(std::fs::metadata(path).unwrap().len(), WORKSPACE_DISK_BYTES);
+    assert_ne!(f.disk.available_bytes().unwrap(), u64::MAX);
+    let c = f.claims();
+    let mut host = f.runtime.host.lock().unwrap();
+    assert!(host.storage_enforced());
+    if let motor_host::config::HostSettings::PerJob(settings) = &mut host.settings {
+        settings.workspace_disk_cap_bytes = u64::MAX;
+    }
+    assert!(matches!(
+        host.claim(c, unix_ms()),
+        Err(motor_host::state::Error::Refused(
+            motor_host::state::Refusal::HostFull
+        ))
+    ));
+    assert!(host.snapshot.per_job.is_empty());
 }
 
 #[tokio::test]
