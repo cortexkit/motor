@@ -11,6 +11,8 @@ pub(in crate::linux::job) struct State {
     record_path: Option<PathBuf>,
     fail_remove: bool,
     fail_install: bool,
+    namespaces: BTreeSet<String>,
+    fail_namespace_remove: bool,
 }
 
 #[derive(Clone, Default)]
@@ -28,7 +30,27 @@ impl Access for Fake {
         }
         Ok(())
     }
-    fn ensure(&mut self, tap: &Tap) -> Result<()> {
+    fn create_namespace(&mut self, id: &str) -> Result<PathBuf> {
+        self.0.lock().unwrap().namespaces.insert(id.into());
+        namespace::path(id)
+    }
+    fn reconcile_namespaces(&mut self, retained: &BTreeSet<String>) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .namespaces
+            .retain(|id| retained.contains(id));
+        Ok(())
+    }
+    fn remove_namespace(&mut self, id: &str) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.fail_namespace_remove {
+            return Err(Error("namespace removal interrupted".into()));
+        }
+        state.namespaces.remove(id);
+        Ok(())
+    }
+    fn ensure(&mut self, _id: &str, tap: &Tap) -> Result<()> {
         self.0
             .lock()
             .unwrap()
@@ -41,7 +63,7 @@ impl Access for Fake {
         state.events.push(format!("read:{}", tap.tap_index));
         Ok(state.bytes.get(&tap.tap_index).copied())
     }
-    fn remove(&mut self, tap: &Tap) -> Result<()> {
+    fn remove(&mut self, _id: &str, tap: &Tap) -> Result<()> {
         let mut state = self.0.lock().unwrap();
         if let Some(path) = &state.record_path {
             let record: Record = serde_json::from_slice(&std::fs::read(path)?).unwrap();
@@ -97,10 +119,13 @@ fn network_policy_failure_prevents_tap_activation() {
     let (base, mut jobs, fake) = fixture();
     let tap = jobs.records[&start().job_id].tap().unwrap();
     fake.0.lock().unwrap().fail_install = true;
-    assert!(jobs.prepare_network(Vec::new(), tap).is_err());
+    assert!(jobs
+        .prepare_network(&start().job_id, Vec::new(), tap)
+        .is_err());
     assert_eq!(fake.0.lock().unwrap().events, ["install"]);
     fake.0.lock().unwrap().fail_install = false;
-    jobs.prepare_network(Vec::new(), tap).unwrap();
+    jobs.prepare_network(&start().job_id, Vec::new(), tap)
+        .unwrap();
     assert_eq!(
         fake.0.lock().unwrap().events,
         ["install", "install", "ensure:17"]
@@ -287,6 +312,48 @@ fn live_vmm_network_is_never_sampled_or_removed() {
     jobs.collect_exits().unwrap();
     assert!(fake.0.lock().unwrap().events.is_empty());
     assert!(vmm.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn namespace_removal_failure_keeps_index_fenced_and_replays_saved_evidence() {
+    let (base, mut jobs, mut fake) = fixture();
+    let id = start().job_id;
+    fake.create_namespace(&id).unwrap();
+    fake.0.lock().unwrap().fail_namespace_remove = true;
+    jobs.collect_exits().unwrap();
+    let saved = persisted(&jobs);
+    assert_eq!(saved.tap_index, Some(17));
+    assert_eq!(saved.egress_bytes, Some(1234));
+    assert!(jobs.group(&id).exists());
+    assert!(fake.0.lock().unwrap().namespaces.contains(&id));
+    assert!(jobs.collection_failures[&id].contains(&CollectionFailure::Network));
+    fake.0.lock().unwrap().fail_namespace_remove = false;
+    jobs.collect_exits().unwrap();
+    assert_eq!(persisted(&jobs).tap_index, None);
+    assert_eq!(persisted(&jobs).egress_bytes, Some(1234));
+    assert!(!fake.0.lock().unwrap().namespaces.contains(&id));
+    assert_eq!(
+        fake.0.lock().unwrap().events,
+        ["read:17", "remove:17", "remove:17"]
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn recovery_namespace_is_removed_without_a_tap_or_invented_egress() {
+    let (base, mut jobs, mut fake) = fixture();
+    let id = start().job_id;
+    let mut saved = persisted(&jobs);
+    saved.start.kind = job::VmKind::Recovery;
+    saved.tap_index = None;
+    jobs.save(&saved).unwrap();
+    jobs.records.insert(id.clone(), saved);
+    fake.create_namespace(&id).unwrap();
+    jobs.collect_exits().unwrap();
+    assert!(!fake.0.lock().unwrap().namespaces.contains(&id));
+    assert!(fake.0.lock().unwrap().events.is_empty());
+    assert_eq!(persisted(&jobs).egress_bytes, None);
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 #[test]

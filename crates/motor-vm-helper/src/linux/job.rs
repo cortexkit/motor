@@ -31,6 +31,7 @@ const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1";
 
 mod conntrack;
+mod namespace;
 mod network;
 mod workspace;
 use super::tenant_network::Tap;
@@ -182,7 +183,14 @@ impl LinuxJobs {
         let mut taps = tenants;
         taps.extend(self.records.values().filter_map(Record::tap));
         super::tenant_network::validate_taps(&taps)?;
-        self.maintain()
+        self.maintain()?;
+        let retained = self
+            .records
+            .values()
+            .filter(|r| !r.is_tombstone())
+            .map(|r| r.start.job_id.clone())
+            .collect();
+        self.network.reconcile_namespaces(&retained)
     }
 
     fn adopt_record(&mut self, record: Record) -> Result<()> {
@@ -392,12 +400,15 @@ impl LinuxJobs {
     fn remove_network(&mut self, id: &str) -> Result<()> {
         let mut record = self.records.get(id).unwrap().clone();
         if let Some(tap) = record.tap() {
-            self.network.remove(&tap)?;
+            self.network.remove(id, &tap)?;
+            self.network.remove_namespace(id)?;
             // A crash before this write retries idempotent removal, never the
             // measurement. Until it succeeds the allocation cannot be reused.
             record.tap_index = None;
             self.save(&record)?;
             self.records.insert(id.into(), record);
+        } else {
+            self.network.remove_namespace(id)?;
         }
         Ok(())
     }
@@ -673,8 +684,9 @@ impl LinuxJobs {
         let root = self.root(id);
         let group = self.group(id);
         let launch = (|| -> Result<()> {
+            let netns = self.network.create_namespace(id)?;
             if let Some(tap_index) = tap_index {
-                self.prepare_network(tenants, Tap { tap_index, uid })?;
+                self.prepare_network(id, tenants, Tap { tap_index, uid })?;
             }
             cgroup::create_job(&group, start.vcpus)?;
             super::create_boundary(&boundary)?;
@@ -701,27 +713,11 @@ impl LinuxJobs {
             let procs = OpenOptions::new()
                 .write(true)
                 .open(group.join("cgroup.procs"))?;
-            let mut command = Command::new(binaries.join("jailer"));
+            let mut command = jailer_command(binaries, &boundary, &netns, id, uid);
             // v1.17.0 keeps inherited membership with its default cgroup-version
             // 1 and no --cgroup arguments (jailer/src/env.rs:213-270, 658-661).
             // Do not add --cgroup-version 2: its no-argument branch can move the
             // jailer out of this job group, invalidating the empty-group proof.
-            command
-                .args(["--id", &format!("job-{id}"), "--exec-file"])
-                .arg(binaries.join("firecracker"))
-                .args([
-                    "--uid",
-                    &uid.to_string(),
-                    "--gid",
-                    &uid.to_string(),
-                    "--chroot-base-dir",
-                ])
-                .arg(&boundary)
-                .args(["--", "--api-sock", "/api.sock"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .env_clear();
             unsafe {
                 command.pre_exec(move || super::raw_place(procs.as_raw_fd()));
             }
@@ -750,10 +746,10 @@ impl LinuxJobs {
         self.status(id)
     }
 
-    fn prepare_network(&mut self, mut tenants: Vec<Tap>, tap: Tap) -> Result<()> {
+    fn prepare_network(&mut self, id: &str, mut tenants: Vec<Tap>, tap: Tap) -> Result<()> {
         tenants.extend(self.records.values().filter_map(Record::tap));
         self.network.install(&tenants)?;
-        self.network.ensure(&tap)
+        self.network.ensure(id, &tap)
     }
 
     fn stage_start_cache(
@@ -797,6 +793,29 @@ impl LinuxJobs {
         self.records.insert(id.into(), record);
         Ok(())
     }
+}
+
+fn jailer_command(binaries: &Path, boundary: &Path, netns: &Path, id: &str, uid: u32) -> Command {
+    let mut command = Command::new(binaries.join("jailer"));
+    command
+        .args(["--id", &format!("job-{id}"), "--exec-file"])
+        .arg(binaries.join("firecracker"))
+        .args([
+            "--uid",
+            &uid.to_string(),
+            "--gid",
+            &uid.to_string(),
+            "--chroot-base-dir",
+        ])
+        .arg(boundary)
+        .arg("--netns")
+        .arg(netns)
+        .args(["--", "--api-sock", "/api.sock"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .env_clear();
+    command
 }
 
 fn trusted_directory(path: &Path) -> Result<()> {
