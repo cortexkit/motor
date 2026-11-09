@@ -374,8 +374,37 @@ impl Runtime {
         // Release is durable and idempotent, including across host restarts.
         for job in ended {
             self.job_resources.release(&job)?;
+            let expire = {
+                let host = self.host.lock().expect("host lock");
+                host.snapshot
+                    .leases
+                    .get(&job)
+                    .and_then(|lease| lease.ended_at_ms)
+                    .is_some_and(|end| {
+                        now_ms.saturating_sub(end) >= crate::billing::RECORD_RETENTION_MS
+                    })
+                    && host.snapshot.per_job.executions[&job].replay_completion
+                        == Some(crate::state::jobs::storage::ReplayCompletion::Terminal)
+            };
+            if expire {
+                self.job_stream(&job)?.expire_chunks(now_ms)?;
+            }
         }
         self.host.lock().expect("host lock").billing_tick(now_ms)?;
+        let streams: Vec<_> = self
+            .job_streams
+            .lock()
+            .expect("job streams")
+            .values()
+            .cloned()
+            .collect();
+        for stream in streams {
+            stream.expire_chunks(now_ms)?;
+        }
+        self.host
+            .lock()
+            .expect("host lock")
+            .retention_tick(now_ms)?;
         if let Err(error) = self.tick_recoveries(now_ms) {
             failure.get_or_insert(error);
         }

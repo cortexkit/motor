@@ -63,6 +63,10 @@ pub struct Execution {
     pub final_replay_reservation_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_completion: Option<storage::ReplayCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayed_return_paths: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_accepted_at_ms: Option<u64>,
     pub claims: Claims,
     pub disk_id: String,
     pub memory_debit_mib: u64,
@@ -203,6 +207,9 @@ impl Host {
         }
         let ledger = &self.snapshot.per_job;
         if let Some(execution) = ledger.executions.get(&claims.jti) {
+            if !self.snapshot.leases.contains_key(&claims.jti) {
+                return Err(Refusal::Auth.into());
+            }
             if self.connections.iter().any(|connection| {
                 connection.job == claims.jti && connection.purpose == claims.purpose
             }) {
@@ -269,6 +276,8 @@ impl Host {
                 replay_reservation_bytes: Some(storage::REPLAY_RESERVATION_BYTES),
                 final_replay_reservation_bytes: None,
                 replay_completion: None,
+                relayed_return_paths: None,
+                usage_accepted_at_ms: None,
                 claims: claims.clone(),
                 disk_id: disk_id.clone(),
                 memory_debit_mib: debit,

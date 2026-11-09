@@ -591,6 +591,8 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     snapshot.per_job.executions.insert(
         job.into(),
         crate::state::jobs::Execution {
+            relayed_return_paths: None,
+            usage_accepted_at_ms: None,
             image_generation: Some("gen-rollback".into()),
             replay_reservation_bytes: Some(crate::state::jobs::storage::REPLAY_RESERVATION_BYTES),
             final_replay_reservation_bytes: Some(crate::state::jobs::storage::REPLAY_RECORD_BYTES),

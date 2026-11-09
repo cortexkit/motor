@@ -22,6 +22,21 @@ pub(crate) struct Stream {
     crash: AtomicBool,
 }
 impl Stream {
+    pub(super) fn expire_chunks(&self, now_ms: u64) -> Result<()> {
+        let end = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .leases
+            .get(&self.job)
+            .and_then(|lease| lease.ended_at_ms);
+        if end.is_some_and(|end| now_ms.saturating_sub(end) >= crate::billing::RECORD_RETENTION_MS)
+        {
+            self.with_store(Store::expire_chunks)?;
+        }
+        Ok(())
+    }
     pub(super) fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<T> {
         let mut store = self.store.lock().expect("replay store");
         let already_quarantined = store.is_err();
@@ -83,7 +98,7 @@ impl Runtime {
         } else {
             Store::open(&directory, job)
         })
-        .and_then(|store| {
+        .and_then(|mut store| {
             let host = self.host.lock().expect("host lock");
             ensure!(
                 store.ended()
@@ -91,6 +106,15 @@ impl Runtime {
                     || host.host_settled_frames(job, 0).is_some(),
                 "finished job is missing its replay terminal"
             );
+            let execution = &host.snapshot.per_job.executions[job];
+            if execution.replay_reservation_bytes
+                == Some(
+                    crate::state::jobs::storage::REPLAY_RESERVATION_BYTES
+                        - crate::state::jobs::storage::RETURN_BYTES,
+                )
+            {
+                store.set_return_limit(0)?;
+            }
             drop(host);
             // A file commit can outlive its following state transaction. Restore
             // observations and the watermark before exposing any committed bytes.
@@ -252,7 +276,14 @@ async fn collect(
                     .checked_sub(frame.bytes.len() as u64)
                     .context("corrupt queued spool")?;
                 if frame.value["type"] == "run" {
-                    runtime.host.lock().expect("host lock").delivered(*id)?;
+                    let motor_protocol::Frame::Run(run) =
+                        serde_json::from_value(frame.value.clone())?
+                    else {
+                        unreachable!()
+                    };
+                    let mut host = runtime.host.lock().expect("host lock");
+                    host.job_relayed_run(&claims.jti, !run.return_paths.is_empty())?;
+                    host.delivered(*id)?;
                 }
                 upload.observe(&frame.value)?;
                 write.lock().await.write_all(&frame.bytes).await?;
@@ -296,7 +327,16 @@ async fn collect(
                     withdraw_replies -= 1;
                     continue;
                 }
-                Some("accepted" | "hello") => continue,
+                Some("accepted") => {
+                    let limit = runtime
+                        .host
+                        .lock()
+                        .expect("host lock")
+                        .job_run_accepted(&claims.jti)?;
+                    store.with_store(|s| s.set_return_limit(limit))?;
+                    continue;
+                }
+                Some("hello") => continue,
                 _ => {}
             }
             let terminal = frame.value["type"] == "terminal";
@@ -403,12 +443,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     mut attached: bool,
 ) -> Result<()> {
     let stream = runtime.job_stream(&claims.jti)?;
+    stream.expire_chunks(unix_ms())?;
     let _owner = (!hello).then(|| UploadOwner(stream.clone()));
     let _ = publish_settlement(runtime, &claims.jti, &stream);
     let mut position = if attached {
         0
     } else {
-        stream.with_store(|s| Ok(s.len())).unwrap_or(0)
+        stream.with_store(|s| Ok(s.next_id())).unwrap_or(0)
     };
     let mut minimum = 0;
     if hello {
@@ -425,8 +466,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut read, mut write) = tokio::io::split(client);
     loop {
         let s = stream.clone();
-        let frame =
-            tokio::task::spawn_blocking(move || s.with_store(|s| s.frame(position))).await?;
+        let frame = tokio::task::spawn_blocking(move || {
+            s.with_store(|s| s.cursor_frame(position, minimum))
+        })
+        .await?;
         let frame = match frame {
             Ok(frame) => frame,
             Err(_) if !attached => None,
@@ -439,9 +482,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 return Ok(());
             }
         };
-        if let Some(bytes) = frame {
+        if let Some((next, bytes)) = frame {
             let value = crate::replay::decode(&bytes)?;
-            position += 1;
+            position = next;
             if attached
                 && !is_reply(&value)
                 && value["seq"].as_u64().is_none_or(|seq| seq >= minimum)
@@ -451,6 +494,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     .await
                     .map_err(anyhow::Error::from)
                     .map_err(client_io)?;
+                if let Some(seq) = value["seq"].as_u64() {
+                    minimum = seq.saturating_add(1);
+                }
                 if value["type"] == "terminal" {
                     // Billing acknowledgements are host metadata, not runner
                     // output. Reuse their durable record after the stored
@@ -484,7 +530,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 match request.value["type"].as_str() {
                     Some("attach") => {
                         minimum = request.value["from_seq"].as_u64().context("attach cursor")?;
-                        position = stream.with_store(|s| Ok(s.cursor_for_seq(minimum))).unwrap_or(0);
+                        position = 0;
                         attached = true;
                     }
                     Some("cancel" | "withdraw" | "job_status") => {

@@ -51,6 +51,39 @@ pub struct Base {
 }
 
 impl Host {
+    pub(crate) fn job_relayed_run(&mut self, job: &str, has_returns: bool) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        let execution = next
+            .per_job
+            .executions
+            .get_mut(job)
+            .ok_or(Error::Refused(crate::state::Refusal::Auth))?;
+        if execution.relayed_return_paths.is_none() {
+            execution.relayed_return_paths = Some(has_returns);
+            self.save(next)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn job_run_accepted(&mut self, job: &str) -> Result<u64, Error> {
+        let mut next = self.snapshot.clone();
+        let execution = next
+            .per_job
+            .executions
+            .get_mut(job)
+            .ok_or(Error::Refused(crate::state::Refusal::Auth))?;
+        let returns = if execution.relayed_return_paths == Some(false) {
+            0
+        } else {
+            RETURN_BYTES
+        };
+        if !execution.ended {
+            execution.replay_reservation_bytes =
+                Some(REPLAY_RESERVATION_BYTES - RETURN_BYTES + returns);
+        }
+        self.save(next)?;
+        Ok(returns)
+    }
     pub fn set_job_storage(&mut self, control: Arc<dyn crate::helper::Control>) {
         self.job_storage = Some(control);
     }

@@ -17,6 +17,7 @@ pub const REJECTED_OUTBOX_LIMIT: usize = 32;
 /// replayed. The hour after that covers late reattaches and lets an operator
 /// look at a job that just ended.
 pub const RECORD_RETENTION_MS: u64 = 60 * 60 * 1000;
+pub const REPLAY_RETENTION_MS: u64 = (24 * 60 * 60 + 300) * 1000;
 /// At most this many jobs are deleted per retention pass, so one pass after a
 /// long outage never holds the host-state mutex (and with it admission) for a
 /// large rewrite. Later passes delete the rest.
@@ -735,6 +736,16 @@ impl Host {
         status: u16,
         reply: &Value,
     ) -> Result<bool, Error> {
+        self.finish_request_at(request, status, reply, crate::server::unix_ms())
+    }
+
+    pub fn finish_request_at(
+        &mut self,
+        request: &Request,
+        status: u16,
+        reply: &Value,
+        now_ms: u64,
+    ) -> Result<bool, Error> {
         let revocations = if (200..300).contains(&status) && request.path.ends_with("/heartbeat") {
             if reply.get("revoked").is_some() {
                 match motor_lease::heartbeat_revocations(
@@ -800,6 +811,15 @@ impl Host {
             }
         }
         let mut next = self.snapshot.clone();
+        if (200..300).contains(&status) {
+            if let Some(execution) = request
+                .job
+                .as_ref()
+                .and_then(|job| next.per_job.executions.get_mut(job))
+            {
+                execution.usage_accepted_at_ms.get_or_insert(now_ms);
+            }
+        }
         if let Some(revocations) = revocations {
             for fence in next.revocations.values_mut() {
                 fence.listed = false;
@@ -897,6 +917,10 @@ impl Host {
     /// report is still inside its `OUTBOX_MAX_AGE_MS` retry window. It is also
     /// kept while its job token has not expired, because the lease record is
     /// what refuses a replay of that token.
+    /// Per-job VM records also wait until a successful broker reply to their
+    /// usage report is saved as `usage_accepted_at_ms`. They remain alongside
+    /// replay files for 24 hours plus the attach-token lifetime after the later
+    /// of that acceptance and the job's end.
     ///
     /// The deletion is one ordinary snapshot save, so it is exactly as
     /// crash-safe as every other state change: the journal publishes the
@@ -935,6 +959,14 @@ impl Host {
             .into_iter()
             .flatten()
             .max()
+            .and_then(|end| {
+                if let Some(execution) = snapshot.per_job.executions.get(job) {
+                    let anchor = end.max(execution.usage_accepted_at_ms?);
+                    (now_ms > anchor.saturating_add(REPLAY_RETENTION_MS)).then_some(end)
+                } else {
+                    Some(end)
+                }
+            })
         };
         let mut seen = std::collections::BTreeSet::new();
         let mut expired = std::collections::BTreeSet::new();
@@ -1025,6 +1057,13 @@ impl Host {
             || next.expired_outbox.len() != snapshot.expired_outbox.len()
             || next.rejected_outbox.len() != snapshot.rejected_outbox.len();
         if changed {
+            if let Some(directory) = self.journal_directory() {
+                for job in &expired {
+                    if snapshot.per_job.executions.contains_key(job) {
+                        crate::replay::remove(&directory, job).map_err(std::io::Error::other)?;
+                    }
+                }
+            }
             self.save(next)?;
             tracing::info!(jobs = expired.len(), "billing_records_pruned");
         }

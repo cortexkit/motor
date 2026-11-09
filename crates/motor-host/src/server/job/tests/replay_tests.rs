@@ -40,6 +40,17 @@ async fn launched(
     tokio::task::JoinHandle<Result<()>>,
     tokio::net::UnixStream,
 ) {
+    launched_with_returns(runtime, fake, true).await
+}
+async fn launched_with_returns(
+    runtime: &Arc<Runtime>,
+    fake: &Fake,
+    returns: bool,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<()>>,
+    tokio::net::UnixStream,
+) {
     let mut guest = peer(fake);
     let c = claims(JOB);
     let id = claim(runtime, &c);
@@ -49,10 +60,18 @@ async fn launched(
     next_type(&mut client, "hello").await;
     let mut request = run(JOB);
     request["bundles"] = json!([]);
+    if returns {
+        request["return_paths"] = json!(["/out"]);
+        request["return_chunked"] = json!(true);
+    }
     write_frame(&mut client, &request).await.unwrap();
     next_type(&mut client, "accepted").await;
     handshake(&mut guest).await;
     assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "run");
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].replay_reservation_bytes,
+        Some(crate::state::jobs::storage::REPLAY_RESERVATION_BYTES)
+    );
     write_frame(&mut guest, &json!({"type":"accepted","job_id":JOB}))
         .await
         .unwrap();
@@ -101,13 +120,17 @@ fn reopen(runtime: &Arc<Runtime>, fake: Arc<Fake>, storage: Arc<Storage>) -> Arc
     Runtime::with_job_resources("host".into(), host, fake, storage)
 }
 async fn replayed(runtime: &Arc<Runtime>) -> Vec<Vec<u8>> {
+    replayed_at(runtime, unix_ms()).await
+}
+async fn replayed_at(runtime: &Arc<Runtime>, now_ms: u64) -> Vec<Vec<u8>> {
     let mut c = claims(JOB);
     c.purpose = Purpose::Attach;
+    c.exp = now_ms / 1000 + 300;
     let id = runtime
         .host
         .lock()
         .unwrap()
-        .claim(c.clone(), unix_ms())
+        .claim(c.clone(), now_ms)
         .unwrap()
         .0;
     let (mut client, task) = start(runtime.clone(), c, id).await;
@@ -241,13 +264,15 @@ async fn detached_caller_retains_raw_output_returns_terminal_and_one_usage_acros
     let (runtime, fake, storage) = fixture();
     let (mut client, task, mut guest) = launched(&runtime, &fake).await;
     let frames = records();
-    for frame in &frames[..4] {
+    for frame in &frames[..5] {
         guest.write_all(frame).await.unwrap();
+    }
+    for frame in &frames[..5] {
         assert_eq!(next_record(&mut client).await.bytes, *frame);
     }
     drop(client);
     task.await.unwrap().unwrap();
-    for frame in &frames[4..] {
+    for frame in &frames[5..] {
         guest.write_all(frame).await.unwrap();
     }
     ack(&runtime, &mut guest).await;
@@ -474,6 +499,8 @@ async fn authoritative_terminals_are_byte_identical_live_and_on_replay_after_res
         let frames = records();
         for frame in &frames[..5] {
             guest.write_all(frame).await.unwrap();
+        }
+        for frame in &frames[..5] {
             assert_eq!(next_record(&mut client).await.bytes, *frame);
         }
         if host_stop {
@@ -610,4 +637,324 @@ async fn undelivered_upload_eof_keeps_the_no_start_terminal_and_hosted_receipt_l
         host.snapshot.zero_usage[JOB].ended_at_ms
     );
     assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn relayed_run_alone_sets_return_reservation_and_runner_hints_cannot_change_it() {
+    use crate::state::jobs::storage::{REPLAY_RESERVATION_BYTES, RETURN_BYTES};
+    for returns in [false, true] {
+        let (runtime, fake, _storage) = fixture();
+        let (mut client, task, mut guest) = launched_with_returns(&runtime, &fake, returns).await;
+        write_frame(
+            &mut guest,
+            &json!({"type":"output","seq":0,"stream":"stdout","bytes":"eA=="}),
+        )
+        .await
+        .unwrap();
+        next_type(&mut client, "output").await;
+        let expected = REPLAY_RESERVATION_BYTES - if returns { 0 } else { RETURN_BYTES };
+        assert_eq!(
+            runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].replay_reservation_bytes,
+            Some(expected)
+        );
+        assert_eq!(
+            runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].relayed_return_paths,
+            Some(returns)
+        );
+        for frame in [
+            json!({"type":"hello","return_paths":!returns,"return_reservation_bytes":if returns {0} else {RETURN_BYTES}}),
+            json!({"type":"heartbeat","return_reservation_bytes":if returns {0} else {RETURN_BYTES}}),
+            json!({"type":"accepted","return_paths":!returns}),
+        ] {
+            write_frame(&mut guest, &frame).await.unwrap();
+        }
+        write_frame(
+            &mut guest,
+            &json!({"type":"output","seq":1,"stream":"stdout","bytes":"eA=="}),
+        )
+        .await
+        .unwrap();
+        next_type(&mut client, "output").await;
+        assert_eq!(
+            runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].replay_reservation_bytes,
+            Some(expected)
+        );
+        guest.write_all(records().last().unwrap()).await.unwrap();
+        next_type(&mut client, "terminal").await;
+        assert_eq!(
+            read_frame(&mut guest).await.unwrap()["type"],
+            "terminal_stored"
+        );
+        drop(client);
+        task.await.unwrap().unwrap();
+        power_off(&runtime, &fake);
+    }
+}
+
+#[tokio::test]
+async fn fake_clock_chunk_expiry_and_delayed_usage_acceptance_survive_restart_without_rebilling_attach(
+) {
+    use crate::billing::{RECORD_RETENTION_MS, REPLAY_RETENTION_MS};
+    use motor_protocol::{ReturnManifestEntry, ReturnManifestOutcome, ReturnPathsFailureCause};
+    let (runtime, fake, storage) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    let mut manifest = json!({"type":"return_manifest","seq":3,"job_id":JOB,"cap_bytes":134217728,"total_bytes":3});
+    manifest["files"] = serde_json::to_value(vec![ReturnManifestEntry::returned(
+        "/out",
+        3,
+        "0".repeat(64),
+    )
+    .with_chunks(1)])
+    .unwrap();
+    for value in [
+        json!({"type":"started","seq":0,"job_id":JOB}),
+        json!({"type":"output","seq":1,"stream":"stdout","bytes":"eA=="}),
+        json!({"type":"return_chunk","seq":2,"job_id":JOB,"path_index":0,"offset":0,"data":"YWJj"}),
+        manifest,
+    ] {
+        write_frame(&mut guest, &value).await.unwrap();
+    }
+    guest.write_all(records().last().unwrap()).await.unwrap();
+    while next_record(&mut client).await.value["type"] != "terminal" {}
+    assert_eq!(
+        read_frame(&mut guest).await.unwrap()["type"],
+        "terminal_stored"
+    );
+    drop(client);
+    task.await.unwrap().unwrap();
+    power_off(&runtime, &fake);
+    let end = runtime.host.lock().unwrap().snapshot.leases[JOB]
+        .ended_at_ms
+        .unwrap();
+    let queued = runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .outbox
+        .iter()
+        .find(|r| r.job.as_deref() == Some(JOB))
+        .unwrap()
+        .clone();
+    let body = queued.body.clone();
+    runtime
+        .job_stream(JOB)
+        .unwrap()
+        .expire_chunks(end + RECORD_RETENTION_MS - 1)
+        .unwrap();
+    let before = replayed_at(&runtime, end + RECORD_RETENTION_MS - 1).await;
+    assert!(before
+        .iter()
+        .any(|f| crate::replay::decode(f).unwrap()["type"] == "return_chunk"));
+    runtime
+        .job_stream(JOB)
+        .unwrap()
+        .expire_chunks(end + RECORD_RETENTION_MS)
+        .unwrap();
+    let after = replayed_at(&runtime, end + RECORD_RETENTION_MS).await;
+    assert!(!after
+        .iter()
+        .any(|f| crate::replay::decode(f).unwrap()["type"] == "return_chunk"));
+    let manifest: motor_protocol::ReturnManifest = after
+        .iter()
+        .map(|f| crate::replay::decode(f).unwrap())
+        .find(|f| f["type"] == "return_manifest")
+        .map(|f| serde_json::from_value(f).unwrap())
+        .unwrap();
+    assert!(matches!(
+        manifest.files[0].outcome,
+        ReturnManifestOutcome::Failed {
+            cause: ReturnPathsFailureCause::Expired,
+            size: Some(3)
+        }
+    ));
+    assert_eq!(manifest.total_bytes, 0);
+    let paths = vec!["/out".to_owned()];
+    motor_protocol::ReturnAssembler::new(&paths, 134217728)
+        .finish_expired_replay(&manifest, 1)
+        .unwrap();
+    let accepted = end + 2 * 24 * 60 * 60 * 1000;
+    assert_eq!(
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .prune_retention(accepted)
+            .unwrap(),
+        0
+    );
+    assert!(!replayed_at(&runtime, accepted).await.is_empty());
+    assert_eq!(
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .snapshot
+            .outbox
+            .iter()
+            .filter(|r| r.job.as_deref() == Some(JOB))
+            .map(|r| &r.body)
+            .collect::<Vec<_>>(),
+        vec![&body]
+    );
+    let reply = json!({"job_id":JOB,"settled_vcpu_ms":100,"released_vcpu_ms":0});
+    assert!(runtime
+        .host
+        .lock()
+        .unwrap()
+        .finish_request_at(&queued, 200, &reply, accepted)
+        .unwrap());
+    assert!(runtime
+        .host
+        .lock()
+        .unwrap()
+        .finish_request_at(&queued, 200, &reply, accepted + 1000)
+        .unwrap());
+    assert_eq!(queued.body, body);
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].usage_accepted_at_ms,
+        Some(accepted)
+    );
+    let restarted = reopen(&runtime, fake, storage.clone());
+    let boundary = accepted + REPLAY_RETENTION_MS;
+    assert_eq!(
+        restarted
+            .host
+            .lock()
+            .unwrap()
+            .prune_retention(boundary)
+            .unwrap(),
+        0
+    );
+    let frames = replayed_at(&restarted, boundary).await;
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| crate::replay::decode(f).unwrap()["type"] == "terminal")
+            .count(),
+        1
+    );
+    assert!(restarted
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .outbox
+        .iter()
+        .all(|r| r.job.as_deref() != Some(JOB)));
+    assert_eq!(
+        restarted
+            .host
+            .lock()
+            .unwrap()
+            .prune_retention(boundary + 1)
+            .unwrap(),
+        1
+    );
+    let mut attach = claims(JOB);
+    attach.purpose = Purpose::Attach;
+    attach.exp = (boundary + 1) / 1000 + 300;
+    assert!(restarted
+        .host
+        .lock()
+        .unwrap()
+        .claim(attach, boundary + 1)
+        .is_err());
+    assert_eq!(
+        crate::replay::Store::open(storage.root.path(), JOB)
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn old_execution_snapshot_has_conservative_replay_defaults() {
+    let (runtime, _, _) = fixture();
+    claim(&runtime, &claims(JOB));
+    let mut snapshot = serde_json::to_value(&runtime.host.lock().unwrap().snapshot).unwrap();
+    let execution = snapshot["per_job"]["executions"][JOB]
+        .as_object_mut()
+        .unwrap();
+    execution.remove("relayed_return_paths");
+    execution.remove("usage_accepted_at_ms");
+    let snapshot: crate::state::Snapshot = serde_json::from_value(snapshot).unwrap();
+    assert_eq!(snapshot.per_job.executions[JOB].relayed_return_paths, None);
+    assert_eq!(snapshot.per_job.executions[JOB].usage_accepted_at_ms, None);
+    assert_eq!(
+        snapshot.per_job.executions[JOB].replay_reservation_bytes,
+        Some(crate::state::jobs::storage::REPLAY_RESERVATION_BYTES)
+    );
+}
+
+#[tokio::test]
+async fn slow_live_caller_and_restarted_attach_receive_truncation_then_all_retained_frames() {
+    let (runtime, fake, storage) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    write_frame(&mut guest, &json!({"type":"started","seq":0,"job_id":JOB}))
+        .await
+        .unwrap();
+    for seq in 1..=110 {
+        write_frame(
+            &mut guest,
+            &json!({"type":"output","seq":seq,"stream":"stdout","bytes":"e".repeat(700_000)}),
+        )
+        .await
+        .unwrap();
+    }
+    guest.write_all(records().last().unwrap()).await.unwrap();
+    assert_eq!(
+        read_frame(&mut guest).await.unwrap()["type"],
+        "terminal_stored"
+    );
+    let mut seen = Vec::new();
+    let mut terminal_count = 0;
+    loop {
+        let value = next_record(&mut client).await.value;
+        if value["type"] == "output" {
+            seen.push(value);
+        } else if value["type"] == "terminal" {
+            terminal_count += 1;
+            break;
+        }
+    }
+    assert_eq!(terminal_count, 1);
+    let beginning = seen
+        .iter()
+        .position(|v| v["truncated_before_seq"].is_u64())
+        .expect("slow caller must cross an evicted segment");
+    let earliest = seen[beginning]["seq"].as_u64().unwrap();
+    assert_eq!(seen[beginning]["truncated_before_seq"], earliest);
+    assert_eq!(
+        seen[beginning..]
+            .iter()
+            .map(|f| f["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        (earliest..=110).collect::<Vec<_>>()
+    );
+    drop(client);
+    task.await.unwrap().unwrap();
+    power_off(&runtime, &fake);
+    let restarted = reopen(&runtime, fake, storage);
+    let replay = replayed(&restarted).await;
+    let output: Vec<_> = replay
+        .iter()
+        .map(|f| crate::replay::decode(f).unwrap())
+        .filter(|f| f["type"] == "output")
+        .collect();
+    assert_eq!(output[0]["truncated_before_seq"], earliest);
+    assert_eq!(
+        output
+            .iter()
+            .map(|f| f["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        (earliest..=110).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|f| crate::replay::decode(f).unwrap()["type"] == "terminal")
+            .count(),
+        1
+    );
 }

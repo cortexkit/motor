@@ -447,8 +447,14 @@ fn record_deletion_releases_an_uncommitted_final_replay_hold() {
     );
     h.snapshot.billing.get_mut(JOB).unwrap().enqueued = true;
     h.snapshot.outbox.clear();
+    h.snapshot
+        .per_job
+        .executions
+        .get_mut(JOB)
+        .unwrap()
+        .usage_accepted_at_ms = Some(AT + 10);
     assert_eq!(
-        h.prune_retention(AT + motor_host::billing::RECORD_RETENTION_MS + 1000)
+        h.prune_retention(AT + motor_host::billing::REPLAY_RETENTION_MS + 1000)
             .unwrap(),
         1
     );
