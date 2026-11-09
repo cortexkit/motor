@@ -65,6 +65,7 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
 pub struct SqliteJournal {
     store: SqliteStore,
+    directory: PathBuf,
     /// What the database holds: the last snapshot whose transaction committed.
     stored: Snapshot,
 }
@@ -164,6 +165,7 @@ impl SqliteJournal {
         Ok((
             Self {
                 store,
+                directory: directory.to_path_buf(),
                 stored: snapshot.clone(),
             },
             snapshot,
@@ -191,6 +193,9 @@ impl SqliteJournal {
 }
 
 impl Journal for SqliteJournal {
+    fn directory(&self) -> Option<PathBuf> {
+        Some(self.directory.clone())
+    }
     fn store(&mut self, next: &Snapshot) -> io::Result<()> {
         let old = &self.stored;
         // Only the retention pass deletes a job's lease, billing or no-start

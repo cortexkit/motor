@@ -73,6 +73,7 @@ struct Fake {
     balloon_supported: AtomicBool,
     resident: Mutex<BTreeMap<String, u64>>,
     balloons: Mutex<Vec<(String, u64)>>,
+    scripted: Mutex<std::collections::VecDeque<UnixStream>>,
 }
 impl Fake {
     fn wait(&self, stage: &str) {
@@ -170,6 +171,9 @@ impl Control for Fake {
                 .ok_or_else(|| anyhow::anyhow!("no lifecycle fixture"));
         }
         ensure!(port == 52, "no lifecycle fixture");
+        if let Some(stream) = self.scripted.lock().unwrap().pop_front() {
+            return Ok(stream);
+        }
         let (a, mut b) = UnixStream::pair()?;
         self.peers.lock().unwrap().push(b.try_clone()?);
         let reply = self.hello.lock().unwrap().clone().unwrap_or_else(hello);
@@ -289,7 +293,9 @@ impl Resources for Storage {
     }
 }
 fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
-    let mut host = Host::new(BTreeMap::new(), Snapshot::default(), Box::new(Journal));
+    let storage = Storage::new();
+    let (journal, snapshot) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+    let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
     host.settings = crate::config::HostSettings::PerJob(crate::config::PerJobSettings {
         host_reserve_mib: 50,
         boot_reserve_mib: 20,
@@ -309,7 +315,6 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
         permit_budget: 4,
     });
     let fake = Arc::new(Fake::default());
-    let storage = Storage::new();
     (
         Runtime::with_job_resources("host".into(), host, fake.clone(), storage.clone()),
         fake,
@@ -1241,6 +1246,7 @@ async fn disconnect_or_refusal_before_run_stops_an_already_ready_vm_and_releases
 }
 
 mod balloon_tests;
+mod replay_tests;
 mod settlement_tests;
 
 #[test]

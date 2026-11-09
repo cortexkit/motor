@@ -140,18 +140,31 @@ impl Runtime {
                     .leases
                     .get(job)
                     .is_some_and(|lease| lease.state == LeaseState::Ended);
+                let stored_terminal = cancelled
+                    && self.job_stream(job).is_ok_and(|stream| {
+                        stream
+                            .with_store(|store| Ok(store.ended()))
+                            .unwrap_or(false)
+                    });
                 if !running {
                     self.host
                         .lock()
                         .expect("host lock")
                         .job_vmm_gone(job, unix_ms())?;
-                } else if cancelled
+                } else if (cancelled && !stored_terminal)
                     || (!execution.runner_hello
                         && self.boot_remaining(&execution, unix_ms()).is_zero())
                 {
                     self.stop_job(job, true, running)?;
                 } else {
                     self.start_job_events(job.clone());
+                    if execution.runner_hello
+                        && self.host.lock().expect("host lock").snapshot.leases[job].delivered
+                    {
+                        if let Err(error) = self.resume_job_stream(&execution) {
+                            tracing::error!(jti = job, %error, "job_replay_resume_failed");
+                        }
+                    }
                 }
             }
         }
@@ -766,12 +779,14 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         return live(&runtime, claims, client).await;
     }
     if claims.purpose == Purpose::Attach {
-        let first = read_frame(client).await?;
-        let terminal = AtomicBool::new(false);
-        return serve_stored(&runtime, &claims.jti, &first, client, &terminal).await;
+        return live(&runtime, claims, client).await;
     }
     let result = session(&runtime, claims, id, client).await;
     if let Err(error) = result {
+        if runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].delivered {
+            tracing::debug!(jti = claims.jti, %error, "job_caller_detached");
+            return Ok(());
+        }
         tracing::warn!(jti = claims.jti, %error, "job_boot_or_delivery_failed");
         if matches!(
             error.to_string().as_str(),
@@ -804,33 +819,7 @@ async fn live<S: AsyncRead + AsyncWrite + Unpin>(
     claims: &Claims,
     client: &mut S,
 ) -> Result<()> {
-    let first = raw(client).await?;
-    ensure!(first.value["type"] == "hello", "expected reconnect hello");
-    let control = runtime.control.clone();
-    let job = claims.jti.clone();
-    let stream = tokio::task::spawn_blocking(move || control.job_relay(&job, 52)).await??;
-    stream.set_nonblocking(true)?;
-    let mut guest = tokio::net::UnixStream::from_std(stream)?;
-    let mut lease = verified_lease(claims, true);
-    lease["mirror_reports"] = json!(true);
-    write_frame(&mut guest, &lease).await?;
-    guest.write_all(&first.bytes).await?;
-    let (mut cr, mut cw) = tokio::io::split(client);
-    let (mut gr, mut gw) = guest.split();
-    tokio::select! {
-        result = tokio::io::copy(&mut cr,&mut gw) => { result?; },
-        result = async {
-            loop {
-                let frame = raw(&mut gr).await?;
-                if let Some(terminal) = runtime.observe_job_frame(&claims.jti, &frame.value)? {
-                    write_frame(&mut cw, &terminal).await?;
-                    return Ok::<(),anyhow::Error>(());
-                }
-                cw.write_all(&frame.bytes).await?;
-            }
-        } => { result?; },
-    }
-    Ok(())
+    stream::serve(runtime, claims, client, true, Reader::default(), false).await
 }
 
 async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -981,70 +970,14 @@ async fn replay<S: AsyncRead + AsyncWrite + Unpin + Send>(
     claims: &Claims,
     id: u64,
     client: &mut S,
-    mut guest: tokio::net::UnixStream,
-    mut prelude: Replay,
+    guest: tokio::net::UnixStream,
+    prelude: Replay,
 ) -> Result<()> {
-    prelude.spool.file.flush().await?;
-    prelude
-        .spool
-        .file
-        .seek(std::io::SeekFrom::Start(prelude.hello_len))
-        .await?;
-    let (mut input, mut output) = guest.split();
-    // Read runner output while replaying so a full socket cannot deadlock a
-    // large queued upload against the guest's acknowledgments.
-    let (mut cr, mut cw) = tokio::io::split(client);
-    let replay = async {
-        let mut remaining = prelude.spool.bytes.saturating_sub(prelude.hello_len);
-        while remaining > 0 {
-            let frame = raw(&mut prelude.spool.file).await?;
-            remaining = remaining
-                .checked_sub(frame.bytes.len() as u64)
-                .ok_or_else(|| anyhow::anyhow!("corrupt queued spool"))?;
-            if frame.value["type"] == "run" {
-                // The guest has no job before Run. Record delivery before the
-                // first byte that could authorize execution.
-                runtime.host.lock().expect("host lock").delivered(id)?;
-            }
-            output.write_all(&frame.bytes).await?;
-        }
-        remove_spool(&prelude.spool.path)?;
-        output.write_all(&prelude.reader.buffered).await?;
-        tokio::io::copy(&mut cr, &mut output).await?;
-        Ok::<(), anyhow::Error>(())
+    let reader = Reader {
+        buffered: prelude.reader.buffered.clone(),
     };
-    let receive = async {
-        let mut suppress_accepted = true;
-        loop {
-            let frame = raw(&mut input).await?;
-            match frame.value["type"].as_str() {
-                Some("have_reply") if prelude.have_replies > 0 => {
-                    prelude.have_replies -= 1;
-                    continue;
-                }
-                Some("withdraw_reply") if prelude.withdraw_replies > 0 => {
-                    prelude.withdraw_replies -= 1;
-                    continue;
-                }
-                Some("accepted") if suppress_accepted => {
-                    suppress_accepted = false;
-                    continue;
-                }
-                _ => {}
-            }
-            // Do not acknowledge power-off without durable output storage.
-            if let Some(terminal) = runtime.observe_job_frame(&claims.jti, &frame.value)? {
-                write_frame(&mut cw, &terminal).await?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            cw.write_all(&frame.bytes).await?;
-            if frame.value["type"] == "terminal" {
-                return Ok::<(), anyhow::Error>(());
-            }
-        }
-    };
-    tokio::select! { result = replay => result?, result = receive => result? }
-    Ok(())
+    runtime.launch_job_stream(claims.clone(), guest.into_std()?, Some((id, prelude)))?;
+    stream::serve(runtime, claims, client, false, reader, true).await
 }
 
 fn promised_hello(assignment: &Assignment, client: &Value) -> Value {
@@ -1126,5 +1059,6 @@ async fn cancel<S: AsyncWrite + Unpin>(
 }
 
 pub(super) mod balloon;
+pub(super) mod stream;
 #[cfg(test)]
 mod tests;
