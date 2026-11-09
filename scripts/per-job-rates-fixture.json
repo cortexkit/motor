@@ -1,0 +1,67 @@
+{
+  "config": {
+    "window": {"start_ms": 1000, "end_ms": 11000},
+    "tenant_host": "host-tenant",
+    "per_job_host": "host-per-job",
+    "canary_jtis": ["t-canary", "p-canary"],
+    "tolerances": {"lost": 0.05, "host_stop": 0.05, "hosted_host_full": 0}
+  },
+  "max_gap_ms": 2000,
+  "journals": {
+    "tenant": [
+      {"__REALTIME_TIMESTAMP": "1000000", "__CURSOR": "s=1111;i=1", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=t-lost mode=tenant result=admitted"},
+      {"__REALTIME_TIMESTAMP": "2000000", "__CURSOR": "s=1111;i=2", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=t-ok mode=tenant result=admitted"},
+      {"__REALTIME_TIMESTAMP": "3000000", "__CURSOR": "s=1111;i=3", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=t-retry mode=tenant result=refused reason=host_full cause=permits"},
+      {"__REALTIME_TIMESTAMP": "4000000", "__CURSOR": "s=1111;i=4", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=t-retry mode=tenant result=admitted"},
+      {"__REALTIME_TIMESTAMP": "5000000", "__CURSOR": "s=1111;i=5", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=t-hostoom mode=tenant result=admitted"},
+      {"__REALTIME_TIMESTAMP": "6000000", "__CURSOR": "s=1111;i=6", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=t-ok2 mode=tenant result=admitted"},
+      {"__REALTIME_TIMESTAMP": "7000000", "__CURSOR": "s=1111;i=7", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=t-canary mode=tenant result=refused reason=host_full cause=memory"},
+      {"__REALTIME_TIMESTAMP": "9000000", "__CURSOR": "s=1111;i=8", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::server: tick"},
+      {"__REALTIME_TIMESTAMP": "11000000", "__CURSOR": "s=1111;i=9", "_BOOT_ID": "tenant-boot", "_HOSTNAME": "host-tenant", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::server: tick"}
+    ],
+    "per_job": [
+      {"__REALTIME_TIMESTAMP": "0", "__CURSOR": "s=2222;i=1", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-before-window mode=per_job result=admitted"},
+      {"__REALTIME_TIMESTAMP": "1000000", "__CURSOR": "s=2222;i=2", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-lost mode=per_job result=admitted"},
+      {"__REALTIME_TIMESTAMP": "2000000", "__CURSOR": "s=2222;i=3", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-stop-before-started mode=per_job result=waiting"},
+      {"__REALTIME_TIMESTAMP": "3000000", "__CURSOR": "s=2222;i=4", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-full-before-run mode=\"per_job\" result=\"refused\" reason=\"host_full\" cause=\"storage\""},
+      {"__REALTIME_TIMESTAMP": "4000000", "__CURSOR": "s=2222;i=5", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-full-before-run mode=per_job result=refused reason=host_full cause=memory"},
+      {"__REALTIME_TIMESTAMP": "5000000", "__CURSOR": "s=2222;i=6", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-quarantine mode=per_job result=refused reason=host_full cause=quarantined_workspace"},
+      {"__REALTIME_TIMESTAMP": "6000000", "__CURSOR": "s=2222;i=7", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-ok1 mode=per_job result=admitted"},
+      {"__REALTIME_TIMESTAMP": "7000000", "__CURSOR": "s=2222;i=8", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-ok2 mode=per_job result=admitted"},
+      {"__REALTIME_TIMESTAMP": "8000000", "__CURSOR": "s=2222;i=9", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-joblimit mode=per_job result=admitted"},
+      {"__REALTIME_TIMESTAMP": "9000000", "__CURSOR": "s=2222;i=a", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-hostoom mode=per_job result=admitted"},
+      {"__REALTIME_TIMESTAMP": "9500000", "__CURSOR": "s=2222;i=b", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-canary mode=per_job result=refused reason=host_full cause=permits"},
+      {"__REALTIME_TIMESTAMP": "10000000", "__CURSOR": "s=2222;i=c", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] WARN motor_host::state::settlement: job_host_stop jti=p-stop-before-started cause=host_pressure"},
+      {"__REALTIME_TIMESTAMP": "10500000", "__CURSOR": "s=2222;i=d", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] WARN motor_host::state::settlement: job_host_stop jti=p-hostoom cause=host_oom oom_kill=1"},
+      {"__REALTIME_TIMESTAMP": "11000000", "__CURSOR": "s=2222;i=e", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-after-window mode=per_job result=admitted"}
+    ]
+  },
+  "accepted_usage": {
+    "tenant": [
+      {"job_id": "t-lost", "vcpus": 2, "started_at_ms": 1100, "ended_at_ms": 2000, "mem_peak_mib": null, "egress_bytes": null, "outcome": "lost"},
+      {"job_id": "t-ok", "vcpus": 2, "started_at_ms": 2100, "ended_at_ms": 3000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "exit"},
+      {"job_id": "t-retry", "vcpus": 2, "started_at_ms": 4100, "ended_at_ms": 5000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "exit"},
+      {"job_id": "t-hostoom", "vcpus": 2, "started_at_ms": 5100, "ended_at_ms": 6000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "signal", "oom_kill": "host_oom"},
+      {"job_id": "t-ok2", "vcpus": 2, "started_at_ms": 6100, "ended_at_ms": 7000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "exit"},
+      {"job_id": "t-canary", "vcpus": 2, "started_at_ms": 7100, "ended_at_ms": 8000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "lost", "oom_kill": "host_pressure"}
+    ],
+    "per_job": [
+      {"job_id": "p-lost", "vcpus": 2, "started_at_ms": 1100, "ended_at_ms": 2000, "mem_peak_mib": null, "egress_bytes": null, "outcome": "lost"},
+      {"job_id": "p-stop-before-started", "vcpus": 2, "started_at_ms": 2100, "ended_at_ms": 10000, "mem_peak_mib": null, "egress_bytes": null, "outcome": "lost"},
+      {"job_id": "p-ok1", "vcpus": 2, "started_at_ms": 6100, "ended_at_ms": 7000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "exit"},
+      {"job_id": "p-ok2", "vcpus": 2, "started_at_ms": 7100, "ended_at_ms": 12000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "exit"},
+      {"job_id": "p-joblimit", "vcpus": 2, "started_at_ms": 8100, "ended_at_ms": 9000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "signal", "oom_kill": "job_limit"},
+      {"job_id": "p-hostoom", "vcpus": 2, "started_at_ms": 9100, "ended_at_ms": 10500, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "signal", "oom_kill": "host_oom"},
+      {"job_id": "p-canary", "vcpus": 2, "started_at_ms": 9600, "ended_at_ms": 10000, "mem_peak_mib": 100, "egress_bytes": 0, "outcome": "lost", "oom_kill": "host_pressure"},
+      {"job_id": "p-unclaimed", "vcpus": 2, "started_at_ms": 1000, "ended_at_ms": 2000, "mem_peak_mib": null, "egress_bytes": null, "outcome": "lost"},
+      {"job_id": "p-before-window", "vcpus": 2, "started_at_ms": 0, "ended_at_ms": 1000, "mem_peak_mib": null, "egress_bytes": null, "outcome": "lost"},
+      {"job_id": "p-after-window", "vcpus": 2, "started_at_ms": 11000, "ended_at_ms": 12000, "mem_peak_mib": null, "egress_bytes": null, "outcome": "lost"}
+    ]
+  },
+  "gapped_per_job_journal": [
+    {"__REALTIME_TIMESTAMP": "1000000", "__CURSOR": "s=2222;i=1", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::claim_log: run_claim jti=p-lost mode=per_job result=admitted"},
+    {"__REALTIME_TIMESTAMP": "7000000", "__CURSOR": "s=2222;i=2", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::server: tick"},
+    {"__REALTIME_TIMESTAMP": "9000000", "__CURSOR": "s=2222;i=3", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::server: tick"},
+    {"__REALTIME_TIMESTAMP": "11000000", "__CURSOR": "s=2222;i=4", "_BOOT_ID": "job-boot", "_HOSTNAME": "host-per-job", "_SYSTEMD_UNIT": "motor-host.service", "MESSAGE": "[motor-host] INFO motor_host::server: tick"}
+  ]
+}

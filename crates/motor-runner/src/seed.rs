@@ -912,8 +912,14 @@ mod tests {
                 "old generation"
             );
             assert_eq!(
-                fs::read_dir(&fixture.store).unwrap().count(),
-                1,
+                fs::read_dir(&fixture.store)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["current", "usage.json"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
                 "retired base deleted at lease end"
             );
         }
