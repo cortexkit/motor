@@ -4,9 +4,10 @@ Motor runs build and test commands for coding agents on remote machines,
 against a snapshot of the caller's checkout. The checkout stays available at
 the caller's absolute path; opted-in Linux repositories also use a fixed path
 inside each job, as described below.
-Linux jobs run in a tenant VM on a hosted server; Windows and macOS jobs each
-run in a fresh virtual machine. Output streams back as it is produced, a job
-survives dropped connections, and a command is never run twice: a job either
+Linux hosts default to tenant VMs and also have an opt-in per-job VM
+implementation; Windows and macOS jobs each run in a fresh virtual machine.
+Output streams back as it is produced, a job survives dropped connections, and
+a command is never run twice: a job either
 ran, provably did not start, or is reported as unknown.
 
 Motor is the `exec-remote/v1` provider for the
@@ -25,9 +26,9 @@ map and says where new code goes.
 | Protocol | `crates/motor-protocol` | Both ends | Framed client-runner protocol and codec; re-exports the caller types from `cortexkit-exec-remote-types`. [docs/wire-protocol.md](docs/wire-protocol.md) |
 | Broker | Not in this repository | Cloud service | Issues signed leases, places each Linux job on a registered host (or an overflow sandbox), bills usage. Motor keeps a byte-pinned copy of its contract and vectors in `crates/motor-lease/contracts/cloud/`. |
 | Lease library | `crates/motor-lease` | Used by `ck-motor`, `motor-host` and `motor-runner` | Lease tokens and signatures, without I/O; `motor-fake-broker` is a test broker. |
-| `motor-host` | `crates/motor-host` | Hosted server, unprivileged | TLS admission for leases, relay to the tenant VM's runner, heartbeats, usage and metrics to the broker, drain, a SQLite store. [docs/hosted-host.md](docs/hosted-host.md) |
-| `motor-vm-helper` | `crates/motor-vm-helper` | Hosted server, root | Owns the Firecracker tenant VMs: start, stop, suspend, restore, disks, CPU limits, network. Its per-job VM slot pool is not used by any runner backend. [docs/linux-microvm.md](docs/linux-microvm.md) |
-| `motor-runner` | `crates/motor-runner` | Linux: a tenant VM or an overflow sandbox. Windows and macOS: the runner host | Admission, queueing, Git mirrors, workspaces, execution, retained output. One instance serves one platform. |
+| `motor-host` | `crates/motor-host` | Hosted server, unprivileged | TLS admission for leases, VM scheduling and relay, heartbeats, usage and metrics to the broker, drain, SQLite state and per-job replay. [docs/hosted-host.md](docs/hosted-host.md) |
+| `motor-vm-helper` | `crates/motor-vm-helper` | Hosted server, root | Owns Firecracker tenant and job VMs, disks, cgroups, network and per-account cache credentials. [docs/linux-microvm.md](docs/linux-microvm.md) |
+| `motor-runner` | `crates/motor-runner` | Linux: a tenant VM, job VM or overflow sandbox. Windows and macOS: the runner host | Admission, queueing, Git mirrors, workspaces, execution, retained output. A job VM uses the tenant runner restricted to one job and workspace. |
 | Linux sandbox | `crates/motor-runner/src/isolation*`, `systemd.rs`, `network*.rs` | Wherever a Linux runner runs | Runs each Linux job as `motor-job` in a transient systemd service. [docs/job-isolation.md](docs/job-isolation.md) |
 | Windows backend | `crates/motor-runner/src/windows/` | Windows runner host | One VM per job from a sealed baseline: QEMU on a Linux host, or Hyper-V on a Windows host. [docs/windows-jobs.md](docs/windows-jobs.md) |
 | Windows guest agent | `crates/motor-winagent` | Inside the Windows VM | Receives the tree, runs the command as the guest's job account, reports its exit code. |
@@ -35,7 +36,7 @@ map and says where new code goes.
 | Compile cache | `crates/motor-runner/src/compile_cache.rs`, `writer/` | Runner instance | Shared read-only sccache for Linux jobs, filled by trusted builds of the default branch. [docs/compile-cache.md](docs/compile-cache.md) |
 | Scheduler | `crates/motor-runner/src/cpu.rs`, `engine.rs`, `disk.rs` | Runner instance | vCPU claims, CPU pinning, queue order, disk admission and cleanup. [docs/scheduling.md](docs/scheduling.md) |
 | Build-slot supervisor | `crates/prefrontal-build-slot` | Inside Linux jobs | Compiler wrapper that limits concurrent compiler processes across the jobs on one machine. |
-| Unused microVM parts | `crates/motor-vm-loader`, `crates/motor-vm-guest` | None | Snapshot-memory loader and one-command guest supervisor for per-job Firecracker VMs. No runner backend uses them. |
+| Snapshot-memory loader | `crates/motor-vm-loader` | None | Unprivileged userfaultfd snapshot-memory loader. No runner backend uses it. |
 
 ## How a job flows
 
@@ -52,7 +53,7 @@ map and says where new code goes.
 3. **Connect.** For Linux, `ck-motor` asks the broker for a lease. The broker
    places the job on a registered host, preferring one where the checkout is
    already warm, and `ck-motor` connects over TLS to that host's `motor-host`,
-   which relays the connection to the runner in the tenant VM. A lease refusal
+   which authenticates the lease and relays to a VM's runner. A lease refusal
    is a typed refusal; it never falls back to another path. If the broker
    places the job on an overflow sandbox instead, `ck-motor` reaches that
    sandbox's runner over the provider's SSH proxy. Windows and macOS jobs go
@@ -93,13 +94,71 @@ capacity is free.
   directories, the compile cache and opt-in local build bases. Workspaces live
   at the callers' paths under the runner's workspace roots, on the same
   reflink-capable filesystem.
-  In a tenant VM that filesystem is the VM's persistent job disk.
+  In a tenant VM that filesystem is the VM's persistent job disk. In per-job
+  mode, the workspace disk retains mirrors, the workspace catalog, snapshot ref
+  pins and retirement metadata; per-execution history is cleared before the
+  runner starts.
 - **Host.** `motor-host` keeps leases, relay positions, billing records and
-  revocation tombstones in a SQLite store; finished jobs are pruned after
-  their usage is acknowledged. `motor-vm-helper` keeps each tenant's VM disk,
-  image and records under its root-owned storage.
+  revocation tombstones in a SQLite store. In per-job mode, synced replay files
+  under the journal directory retain output and results after the VM stops;
+  retention also waits for usage acceptance. `motor-vm-helper` keeps VM disks,
+  immutable image generations and credential sets under root-owned storage.
 - **Caller.** `ck-motor` keeps an append-only journal of job records with
   periodic checkpoints. [docs/module.md](docs/module.md)
+
+## Per-job Linux VM mode
+
+`motor-host` accepts `tenant` (the default) or `per_job` in its JSON `mode`
+setting, but the executable currently refuses per-job startup. The implemented
+per-job scheduler cold-boots one Firecracker VM per job, with no memory snapshot
+or warm VM hold. The image/provisioning path does not yet produce the job
+`rootfs.ext4`/`toolchain.ext4` or the guest's `/run/motor/runner-args`, so this mode
+is not ready for an end-to-end operator switch.
+
+Each VM uses a shared read-only root, a full physical toolchain copy private to
+its account on read-only virtio-pmem with DAX, and a writable workspace disk on
+virtio-blk. Virtio-pmem exposes a file-backed persistent-memory device; direct
+access (DAX) maps its toolchain pages without a second guest page-cache copy.
+The disk is keyed by account and workspace hash and attached to only
+one VM at a time. Preparation and the command run inside that VM, using the
+tenant runner and the systemd sandbox in [job-isolation.md](docs/job-isolation.md).
+There is no separate bundle drive, root job account or container privilege.
+
+Admission reserves permits, boot memory, disk growth, image generation and replay
+space before `lease_ok`. Same-workspace jobs queue behind the attached disk;
+unclean disks are quarantined until a recovery VM succeeds or the disk is
+deleted. The host never mounts or parses guest-written disks. Host memory
+pressure is handled with measured guest-RAM residency and balloons, not guest
+capacity reports.
+
+Every field of the `per_job` settings object is required, with no compiled-in
+defaults:
+
+| Setting | Meaning |
+| --- | --- |
+| `vcpu_ceiling` | Maximum job vCPUs, at most the online CPU count. |
+| `permit_budget` | Host vCPU permits with overcommit, at least the ceiling and at most four times online CPUs. |
+| `host_reserve_mib` | Host available-memory floor in MiB. |
+| `boot_reserve_mib` | MiB added to each stated-memory debit until runner hello. |
+| `per_vm_overhead_mib` | MiB added to stated memory before resident guest RAM counts as overage. |
+| `reclaim_timeout_ms` | Wait after balloon inflation before rechecking pressure. |
+| `hysteresis_mib` | MiB above the reserve needed before balloon deflation. |
+| `workspace_disk_cap_bytes` | Workspace disk cap and growth reservation bound in bytes. |
+| `boot_deadline_ms` | Boot-to-runner-hello deadline. |
+| `recovery_timeout_ms` | Recovery-start deadline, with disk deletion on timeout. |
+| `exit_evidence_bound_ms` | Wait after the Firecracker virtual machine monitor (VMM) disappears; without exit evidence the job settles as lost. |
+| `teardown_timeout_ms` | Failed guest-channel teardown bound. |
+
+Time fields use milliseconds. [hosted-host.md](docs/hosted-host.md#per-job-mode-settings)
+describes admission and configuration tests. The helper owns cache credentials
+and installs only the account's read set for a job, the write key only for
+fills/base builds, and nothing for recovery. Key bytes
+never pass through `motor-host` or the workspace disk.
+
+Rollback keeps the host drained, selects tenant mode and restarts from retained
+tenant disks through recovery. Before placement resumes, the helper installs
+its current credential set into every tenant VM; a failed install keeps the
+host drained. See the [rollback details](docs/hosted-host.md#per-job-mode-rollback).
 
 ## Opt-in Linux fixed paths and build bases
 
@@ -167,8 +226,8 @@ Architecture:
   order, queue wait, disk admission, retention.
 - [docs/compile-cache.md](docs/compile-cache.md): the shared compile cache and
   its fills.
-- [docs/linux-microvm.md](docs/linux-microvm.md): `motor-vm-helper`, the loader
-  and the guest.
+- [docs/linux-microvm.md](docs/linux-microvm.md): tenant and job VMs, the helper
+  and the standalone loader.
 
 Contracts:
 

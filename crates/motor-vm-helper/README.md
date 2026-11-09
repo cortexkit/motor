@@ -1,9 +1,9 @@
 # motor-vm-helper
 
-`motor-vm-helper` is a Linux root service that owns a pool of Firecracker VM
-slots and hands the unprivileged runner only file descriptors. No runner
-backend uses it in this build: installing it does not change how any runner
-instance runs jobs.
+`motor-vm-helper` is a Linux root service that owns Firecracker tenant and job
+VMs and hands the unprivileged host agent relay descriptors. Tenant mode is the
+host default; job VMs cold-boot with per-start vCPUs and RAM, not snapshot slots.
+Each VM runs in a Firecracker virtual machine monitor (VMM) process.
 
 [docs/linux-microvm.md](../../docs/linux-microvm.md#motor-vm-helper) describes
 its host prerequisites, installation, protocol, restart behavior and tests.
@@ -18,11 +18,83 @@ sequence is in the host prerequisites linked above. Root-owned data below an
 unprivileged-owned parent is not sufficient: all VM reads use the protected
 mounted path.
 
+## Job VM cgroups and restarts
+
+The job VM implementation is independent of tenant snapshot starts and has
+these rules:
+
+1. **Independent lifetime.** Job VMMs run under `/sys/fs/cgroup/motorvm.slice`,
+   outside `motor-vm-helper.service`. The jailer enters its VM leaf before exec;
+   each leaf is newly created, has `cpu.max` for the request, and sets neither
+   `memory.max` nor `memory.high`. The slice has a checked aggregate MemoryMax
+   protecting host services; a per-VM memory limit must not reclaim toolchain
+   persistent-memory (pmem) pages another VM of the account uses. Host admission
+   and balloons manage residency.
+   Tests: `job_leaf_is_new_and_does_not_set_memory_limits`
+   (`src/linux/cgroup.rs`) and `job_child_is_placed_before_exec`
+   (`src/linux/job/tests.rs`).
+2. **Prefer the VMM as host out-of-memory (OOM) victim.** The helper verifies the
+   process is `firecracker`, writes `oom_score_adj=1000`, reads it back and requires it to
+   exceed both the helper's score and every process of the authenticated host
+   uid. Any failed check refuses the start. This is preference, not
+   proof that the kernel cannot kill a control-plane process. Tenant VMMs keep
+   their separate `-500` policy. Test:
+   `job_vmm_oom_score_is_read_back_above_host_and_helper`
+   (`src/linux/job/tests.rs`).
+3. **Restart and exit evidence.** Host disconnect or helper restart leaves job
+   VMMs running in the independent slice; adoption checks the recorded process
+   and cgroup identity. On exit the helper captures the leaf's final
+   `memory.events` `oom_kill`, persists the report before deleting cgroup
+   evidence, and replays it until the host durably acknowledges it. Missing
+   evidence is not a zero count: when the host's exit-evidence deadline expires
+   without a report, it settles that job as `lost` with no invented OOM cause.
+   Tests:
+   `helper_restart_re_adopts_a_live_vmm_without_killing_it`,
+   `adoption_refuses_a_cgroup_with_the_wrong_uid`, `final_oom_evidence_is_not_invented`,
+   and root/systemd `isolated_job_vmm_survives_helper_service_restart`
+   (`src/linux/job/tests.rs`). The service test uses a fixture VMM, not a real
+   job guest.
+
+## Credential store
+
+1. **Root owns the set.** Root's `motor-vm-helper set-remote-cache --account
+   ACCOUNT --config /absolute/config.json --read-key /absolute/read-key
+   [--write-key /absolute/write-key]` validates and atomically replaces a complete
+   account set under `/var/lib/motor-vm/remote-cache`. Directories are root-owned
+   0700 and files 0600; unsafe source paths, symlinks and key modes are refused.
+   `motor-host` cannot open the store or receive key bytes. Replacing a set needs
+   no drain; the next VM start reads it. Tests:
+   `validation_matches_operator_subject_prefix_schema_and_generation_checks`,
+   `invalid_credential_errors_never_include_secret_input` and root-only
+   `isolated_source_and_store_never_follow_links_or_accept_unsafe_keys`
+   (`src/linux/cache/tests.rs`). Full command/source requirements are in
+   [hosted-host.md](../../docs/hosted-host.md#root-remote-cache-credential-command).
+2. **Deliver only what this boot needs.** Jobs get config and read key;
+   trusted fill/base-build VMs also get write key; recovery and unprovisioned
+   accounts get no credential drive. Each read-only drive is nonce-bound to
+   its boot, mode 0600, owned by that VM's exclusive jail uid inside a root-only
+   boundary. The guest validates it before installing config 0444 and keys 0400
+   for the runner in tmpfs. Keys never reach host-agent memory, workspace disks,
+   bases, published images, replay or logs. The helper removes the temporary
+   drive before releasing the jail/uid, including cleanup after restart. Tests:
+   `credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms`,
+   `isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse`
+   (`src/linux/job/tests.rs`),
+   `isolated_account_drives_rotate_at_next_start_and_never_reuse_nonces` and
+   `isolated_store_and_drive_refuse_host_and_other_jail_uids`
+   (`src/linux/cache/tests.rs`).
+3. **Rollback uses current keys.** Tenant-mode rollback installs the helper's
+   current set through `install_tenant_cache`, not the keys saved on the tenant
+   disk. Placement remains drained if any install fails. Tests: root-only
+   `isolated_rotate_then_rollback_delivers_current_read_and_write_sets`
+   (`src/linux/cache/tests.rs`) and host
+   `failed_rollback_install_and_restart_keep_placement_fenced`
+   (`../motor-host/tests/it/rollback.rs`).
+
 # Persistent tenant operations
 
-The existing connection-owned job slots are unchanged. Tenant operations are
-independent of job leases and survive client disconnects. Authorized peers can
-send `ensure`, `attach_disk`, `suspend`, `restore`, `stop_tenant`, `set_cpu_max`,
+Tenant operations are independent of job leases and survive client disconnects.
+Authorized peers can send `ensure`, `attach_disk`, `suspend`, `restore`, `stop_tenant`, `set_cpu_max`,
 `set_egress`, `open_relay`, `adopt`, `tenant_metrics` and `recovery_complete`.
 Each takes only `tenant`; `set_cpu_max`
 also requires integer `vcpus` (1 through the registry ceiling), and `open_relay`
@@ -39,9 +111,9 @@ Only root provisioning writes `/etc/motor-vm-helper/tenants/<tenant>.json`.
 Tenant names are validated before opening any registry path, and registry
 symlinks/writable ancestors are refused. See `script/tenant-provision/README.md`
 for the registry, image, cgroup and disk prerequisites. Tenant VMMs specifically
-use `/usr/local/lib/firecracker/1.17.0/{jailer,firecracker}`; existing job binaries
-remain configured as before. They use ordinary file-backed RAM, no job UFFD
-loader, and never clone a tenant disk. A disk lock prevents duplicate attachment.
+use `/usr/local/lib/firecracker/1.17.0/{jailer,firecracker}`. They use ordinary
+file-backed RAM, no userfaultfd loader, and never clone a tenant disk. A disk lock
+prevents duplicate attachment.
 
 Fresh starts load a paused base snapshot for the pinned image, vCPU ceiling and
 guest RAM size, update the drive and tap,
@@ -81,7 +153,8 @@ helper takes SIGTERM and SIGINT on one thread and, once any request in
 progress finishes, runs `stop_tenant` for every running tenant, refuses all
 later requests and exits. A tenant whose preparation fails is recorded as
 unclean before its VMM is killed. Each tenant's outcome and stop time go to
-the journal. systemd then SIGKILLs what is left (job VMs). `TimeoutStopSec`
+the journal. systemd then SIGKILLs what is left in the service cgroup; job VMs
+live in a separate slice and survive. `TimeoutStopSec`
 covers one in-flight stop or suspend (600 s), then one tenant's preparation
 (400 s) and helper cleanup (20 s), for 1020 s total. Add 420 s for each further
 running tenant; the unit file shows the arithmetic.

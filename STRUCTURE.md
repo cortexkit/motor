@@ -15,9 +15,8 @@ crates/
   motor-lease/           lease tokens and signatures; contracts/cloud/ is the byte-pinned broker contract
   motor-runner/          the runner daemon: admission, queue, workspaces, sandbox, VM backends
   motor-host/            hosted server agent: TLS admission, relay to the tenant VM, broker reporting
-  motor-vm-helper/       root service owning Firecracker tenant VMs (and an unused per-job slot pool)
+  motor-vm-helper/       root service owning Firecracker tenant and job VMs
   motor-vm-loader/       userfaultfd snapshot loader for per-job VMs (unused)
-  motor-vm-guest/        one-command guest supervisor for per-job VMs (unused)
   motor-macvm/           macOS VM driver for the macOS backend (Virtualization.framework)
   motor-macagent/        guest agent inside each macOS job VM
   motor-winagent/        guest agent inside each Windows job VM; outside the workspace, own Cargo.lock

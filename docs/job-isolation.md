@@ -552,33 +552,38 @@ Tests: `post_credential_drop_rearms_parent_death_signal`,
 
 4.4.2. How a job can tell it is inside a motor job sandbox. On every Linux
 host backend that runs jobs (the operator test instance, a Boat sandbox and a
-hosted tenant VM) these hold, and callers may rely on them:
+hosted tenant VM or job VM) these hold, and callers may rely on them:
 
-- The job's process runs in the cgroup of its own transient system service,
-  `/proc/self/cgroup` reads `0::/motor.slice/motor-jobs.slice/motor-job-<uuid>.service`, with a
-  UUID in lowercase hyphenated form. It is the id of the runner that started the
-  unit and need not equal the job id the caller sees: a hosted job runs under
-  the tenant runner's own id. The name comes from one function, `host_unit_name`
-  in `crates/motor-runner/src/backend.rs`.
-- That cgroup is not delegated to the job: its directory and control files are
-  owned by root, so the job cannot change its own limits. The one exception is
-  `memory.pressure`, which systemd gives to the job account (mode 0644) so a
-  process can watch its own memory pressure; it changes no limit. Some hosts'
-  systemd leaves it owned by root instead (Boat sandboxes have been seen to), which
-  is also valid: either way the cgroup mount is read-only, so the job cannot write
-  it. Both parent slices, `motor.slice` and `motor-jobs.slice`, are owned by root.
-- PID 1 in the job's PID namespace (4.1) is the bash wrapper, running as the job
-  account.
-- The job account is `motor-job` (2.1). The tenant image recipe pins it to the
-  build server's uid and gid (999 and 986). Boat lets the system choose a free
-  system uid and a dedicated primary group when building each image, and records
-  the actual identity in the image inventory. Callers should check the sandbox
-  properties above, not a particular account number.
+1. The job's process runs in the cgroup of its own transient system service,
+   `/proc/self/cgroup` reads `0::/motor.slice/motor-jobs.slice/motor-job-<uuid>.service`, with a
+   UUID in lowercase hyphenated form. It is the id of the runner that started the
+   unit and need not equal the job id the caller sees: a hosted job runs under
+   the guest runner's own id. The name comes from one function, `host_unit_name`
+   in `crates/motor-runner/src/backend.rs`.
+2. That cgroup is not delegated to the job: its directory and control files are
+   owned by root, so the job cannot change its own limits. The one exception is
+   `memory.pressure`, which systemd gives to the job account (mode 0644) so a
+   process can watch its own memory pressure; it changes no limit. Some hosts'
+   systemd leaves it owned by root instead (Boat sandboxes have been seen to), which
+   is also valid: either way the cgroup mount is read-only, so the job cannot write
+   it. Both parent slices, `motor.slice` and `motor-jobs.slice`, are owned by root.
+3. PID 1 in the job's PID namespace (4.1) is the bash wrapper, running as the job
+   account.
+4. The job account is `motor-job` (2.1). The tenant image recipe pins it to the
+   build server's uid and gid (999 and 986). Boat lets the system choose a free
+   system uid and a dedicated primary group when building each image, and records
+   the actual identity in the image inventory. Callers should check the sandbox
+   properties above, not a particular account number.
 
 A caller that checks these should check the full shape (slice, prefix, UUID
-and suffix), not a prefix, and refuse when any of them differs. The live Boat
-probe checks PID 1 and `/proc/1/cgroup` (4.1); the cgroup path shape and
-ownership are not covered by a test.
+and suffix), not a prefix, and refuse when any of them differs. The root-only
+operator test `isolated_job_vm_preserves_full_sandbox_contract`
+(`crates/motor-host/tests/it/job_contract.rs`) checks every rule in 4.4.2 inside
+a real job VM: the full cgroup path, root-owned slices and control files, the
+read-only cgroup mount with the `memory.pressure` exception, PID 1's bash wrapper
+and the `motor-job` account. It requires a dedicated root/KVM host and is not
+portable qualification. The live Boat probe also checks PID 1 and
+`/proc/1/cgroup` (4.1).
 
 4.4.3. All job and cache-writer services, snapshot dependency helpers, Windows
 preparation and QEMU services share `motor-jobs.slice`. Its `MemoryHigh=75%`

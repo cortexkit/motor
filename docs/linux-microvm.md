@@ -1,33 +1,33 @@
 # Linux microVM components
 
-Three crates implement the parts of a Firecracker-based Linux job backend:
+Linux hosted VMs use the root helper and the unprivileged tenant runner:
 
 | Crate | Binary | Role |
 | --- | --- | --- |
-| `motor-vm-helper` | `motor-vm-helper` | Root service that owns a pool of VM slots, starts and stops Firecracker through the official jailer, and hands the runner only file descriptors. |
+| `motor-vm-helper` | `motor-vm-helper` | Root service that starts tenant and job VMs through the official Firecracker jailer, owns disks, cgroups, virtual network interfaces (TAPs) and cache credentials, and returns relay descriptors. |
 | `motor-vm-loader` | `motor-vm-loader` | Static, unprivileged loader that serves a VM snapshot's memory through `userfaultfd`. |
-| `motor-vm-guest` | `motor-vm-guest` | Supervisor that runs as root inside the guest image and executes one command per VM. |
+| `motor-runner` | `motor-runner` | Runs preparation and systemd-sandboxed commands inside tenant VMs; job VMs restrict the same runner to one job and workspace. |
 
-**No runner backend uses them in this build.** `motor-runner` does not depend on
-these crates, and `serve --backend vm` fails at startup with "VM backend is not
-available in this build" (`crates/motor-runner/src/backend.rs`, `select`).
-Installing the helper does not change how any runner instance runs jobs. Linux
-jobs run in the systemd sandbox described in [job-isolation.md](job-isolation.md);
-Windows jobs run in the separate QEMU backend described in
-[windows-jobs.md](windows-jobs.md).
+`motor-host` defaults to `mode: "tenant"`. Its opt-in `mode: "per_job"` schedules
+one cold-booted VM per job without memory snapshots or warm VM holds. The image
+recipe does not yet produce the job `rootfs.ext4`/`toolchain.ext4`, and no
+production path writes the guest's `/run/motor/runner-args`, so per-job mode is
+not ready for an end-to-end operator switch.
 
-This document records the interfaces between the three parts and how to test
-them.
+The standalone loader is not used by a runner backend. `serve --backend vm`
+remains unavailable; hosted per-job scheduling is a `motor-host` mode, not that
+runner backend. Windows jobs use the backend in [windows-jobs.md](windows-jobs.md).
 
 ## motor-vm-helper
 
-The helper is a Linux-only root service. The runner stays unprivileged and
-never sends the helper a path, executable, environment or argv.
+The helper is a Linux-only root service. `motor-host` stays unprivileged and
+sends bounded identities and operations, not arbitrary paths, executables,
+environment or argv.
 
 ### Host prerequisites
 
 The paths below are fixed by this build. `/var/lib/motor-vm` is the helper's
-storage root and has no override; executable and snapshot paths come from the
+storage root and has no override; executable paths come from the
 JSON configuration. It is a bind mount of the root-owned `/srv/build/vm`
 directory on the XFS build disk (or a dedicated XFS filesystem mounted at
 `/srv/build/vm` on a tenant-only host). All ancestors of the mounted view are root-owned;
@@ -39,22 +39,17 @@ private after the bind is mounted; a shared bind would otherwise propagate
 chroot mounts back into the source alias. The helper requires that companion,
 and `script/tenant-image/qualify.py` refuses a shared view before starting a VM.
 
-- Linux with cgroup v2, `openat2`, pidfds, `cgroup.kill` and `/dev/userfaultfd`,
+- Linux with cgroup v2, `openat2`, pidfds and `cgroup.kill`,
   and XFS with reflink support backing `/srv/build/vm`.
 - systemd 254 or newer (for `DelegateSubgroup=`). The unit is a root system
   service with the cpu, cpuset, memory and io controllers delegated. The helper
   process sits in the unit's `helper` leaf, not the delegation root.
 - The official Firecracker 1.17.0 jailer and Firecracker executable. The
   executable's basename must stay `firecracker`.
-- A static `motor-vm-loader` (below).
-- All binaries, the config, snapshot files and their ancestors root-owned, not
-  group- or other-writable, and not symlinks. Shared vmstate and rootfs inputs
-  readable by the slot uid (normally mode `0444`).
-- A slot uid range (`uid_base`, default 200000) with no passwd or NSS entries,
-  not overlapping the job-account range; set `job_account_range` to the job
-  backend's real reservation.
-- A reserved hugepage pool. `hugepages_per_slot` is the number of 2 MiB pages
-  for one guest.
+- All binaries, config and image files and their ancestors root-owned, not
+  group- or other-writable, and not symlinks.
+- A VM uid range (`uid_base`) with no passwd or Name Service Switch (NSS)
+  entries, not overlapping the configured `job_account_range`.
 
 ### Install
 
@@ -160,68 +155,119 @@ The socket is `/run/motor-vm-helper.sock`, `root:<socket_gid>`, mode `0660`.
 Only uids listed in the config are admitted, checked with `SO_PEERCRED`.
 
 Verify with `systemctl status motor-vm-helper`. To remove it, drain and stop
-every client instance, then `systemctl disable --now motor-vm-helper` and stop
-the hugepage reservation. Persistent images may stay. Never remove a live
-slot's jail or cgroup by hand. Keep `uid_base` unchanged while the service is
+every client instance, then `systemctl disable --now motor-vm-helper`.
+Persistent images may stay. Never remove a live
+VM's jail or cgroup by hand. Keep `uid_base` unchanged while the service is
 stopped: processes that escaped from an old uid range cannot be identified
 under a new one.
 
-### Protocol
+### Job VM interface and lifecycle
 
-Newline-delimited JSON, at most 4096 bytes per request. Unknown operations and
-fields are refused.
+The helper accepts bounded, newline-delimited JSON operations from authorized
+peers. A job start names `job_id`, `account`, `workspace_disk_id` and
+`image_generation_id`, with `vcpus`, `memory_mib`, optional `burst_mib` and a
+`kind` of `job` (default), `fill`, `base_build` or `recovery`. It accepts neither
+caller paths nor key material. Relays return descriptors; the host never gets
+the Firecracker API socket. Tenant operations are described in the
+[helper README](../crates/motor-vm-helper/README.md#persistent-tenant-operations).
 
-```json
-{"op":"acquire","instance":"e2e","job_id":"00000000-0000-4000-8000-000000000001"}
-{"op":"start","slot":0,"instance":"e2e","job_id":"00000000-0000-4000-8000-000000000001","kind":"job"}
-{"op":"stop","slot":0,"instance":"e2e","job_id":"00000000-0000-4000-8000-000000000001","export":true}
-{"op":"release","slot":0,"instance":"e2e","job_id":"00000000-0000-4000-8000-000000000001"}
-{"op":"list","instance":"e2e"}
-```
+Job VMs have the following contracts. The named portable tests exercise the
+implementation with fixtures; root-only tests need a dedicated operator host.
 
-- `acquire` returns `{"result":"acquired","slot":0}`, or `slot: null` when none
-  is free. The lease belongs to the connection and is identified by slot,
-  instance and job UUID.
-- `stop` does not release the lease; `release` requires a stopped VM. A lease
-  whose connection drops becomes dirty and is freed only after cleanup succeeds.
-- If the loader or jailer dies, the helper revokes the lease, kills every slot
-  process and cleans the slot without export. The agent stream then ends; the
-  runner must treat that as an abnormal end, not a guest exit status.
-- `start` returns `{"result":"started","fd_count":N}` with the descriptors
-  attached to the first reply byte (`SCM_RIGHTS`). Descriptor 0 is the agent's
-  vsock stream; descriptor 1, when present, is the proxy listener. The runner
-  never receives the Firecracker API socket.
+1. **Cold boot, not snapshot restore.** Each job VM gets its requested vCPUs and
+   sized RAM, a read-only root, a read-only account toolchain on virtio-pmem,
+   and one writable workspace on virtio-blk. Virtio-pmem presents a file-backed
+   persistent-memory device; direct access (DAX) maps those toolchain pages
+   without a second guest page-cache copy. There is no bundle drive: bundles
+   use the host-to-runner channel. Image generations are immutable and pinned
+   at admission; later publication does not replace files in use. Toolchain
+   copies use full physical blocks, not reflinks shared across accounts. Tests:
+   `cold_boot_uses_request_size_and_exactly_the_three_job_images`
+   (`crates/motor-vm-helper/src/linux/job/tests.rs`),
+   root-only `isolated_publication_verifies_pins_and_seals_acl_ready_physical_account_images`
+   (`crates/motor-vm-helper/src/linux/images/tests.rs`),
+   `generations_pin_at_claim_across_publication_gc_attachment_and_restart`
+   (`crates/motor-host/tests/it/job_admission/storage/images.rs`).
+2. **One disk attachment.** Workspace identity is `(account, workspace hash)`.
+   Same-workspace jobs may be admitted and queued, but no disk is attached to
+   two VMs. The host never mounts, parses or runs Git on guest-written disks.
+   Tests: `disk_identity_uses_account_and_hash_ignoring_cold_and_foreign_hints`
+   (`crates/motor-host/tests/it/job_admission.rs`) and
+   `attached_disk_is_refused_by_identity_and_inode_until_released`
+   (`crates/motor-vm-helper/src/linux/job/tests.rs`).
+3. **Same job sandbox.** The tenant runner in a job VM performs checkout,
+   sibling/dependency preparation, read-only source sealing and returned files.
+   Before runner start, per-execution records, events, output and returned-file
+   history are cleared; mirrors, workspace catalog, snapshot pins and retirement
+   metadata remain warm. The toolchain must mount with DAX before the workspace
+   is mounted. Root and containers inside commands are not provided. Sandbox
+   test: `isolated_job_vm_preserves_full_sandbox_contract`
+   (`crates/motor-host/tests/it/job_contract.rs`), which checks all of
+   [job-isolation.md 4.4.2](job-isolation.md#4-processes) in a real job VM. Naming
+   this operator test does not establish that it has passed. Cleanup tests:
+   `job_vm_cleanup_pins_only_execution_history_and_preserves_warm_state` and
+   `job_vm_cleanup_never_follows_history_symlinks`
+   (`crates/motor-runner/src/tenant_agent/paths.rs`); DAX test:
+   `daxless_boot_refuses_before_workspace_mount_or_account_input`
+   (`crates/motor-runner/src/tenant_agent/per_job.rs`).
+4. **Memory and accounting.** Guest RAM is
+   `ceil((mem_mib + burst) / 0.75)` MiB; stated memory stays `mem_mib`, while the
+   job's MemoryMax includes burst. Admission debits stated memory plus boot
+   reserve until runner hello, never burst. Pressure control uses host-measured
+   guest-RAM residency excluding pmem; guest samples are audit-only. Tests:
+   `guest_ram_rounds_limit_up_after_contract_burst_not_admission_debit` and
+   `queued_and_booting_debits_end_once_on_hello_not_on_boot`
+   (`crates/motor-host/tests/it/job_admission.rs`). Host virtual machine monitor
+   (VMM) cgroups and out-of-memory (OOM) evidence are specified in the
+   [helper README](../crates/motor-vm-helper/README.md#job-vm-cgroups-and-restarts).
+5. **Durable replay before power-off.** The host persists runner frames and
+   serves callers from its replay store even when detached. The guest can power
+   off only after the terminal is acknowledged as stored. Host restart adopts
+   the VM and resumes from the stored sequence, dropping duplicates. Tests:
+   `detached_caller_retains_raw_output_returns_terminal_and_one_usage_across_poweroff_and_restart`
+   and `host_down_while_command_finishes_resumes_last_sequence_and_drops_duplicate_output`
+   (`crates/motor-host/src/server/job/tests/replay_tests.rs`). Bounds and retention
+   are in the [host README](../crates/motor-host/README.md#per-job-replay-store).
 
-### Job files
+### Per-job host settings and rollback
 
-Job directories are `/var/lib/motor-vm/<instance>/jobs/<UUID>/`, owned by the
-client's uid. Instance names match `[a-z0-9-]{1,32}`.
+The host JSON's required `per_job` settings have no compiled-in defaults:
 
-- Inputs are the fixed files `tree.in`, `target.in` and `cargo.in`. The helper
-  checks their ownership and sizes against the snapshot record's `image_sizes`
-  and reflinks them into the jail as `/tree`, `/target` and `/cargo`. A scan
-  reads only `tree.out`.
-- Outputs are created exclusively, never overwritten: a job exports `tree.out`
-  and `target.out`, a warm build `target.out`, a fetch `cargo.out`, a scan
-  nothing. Export only after the guest reports a clean status, and remove
-  consumed outputs before another VM exports the same names.
-- All job-directory access runs as the client's uid (`setfsuid`/`setfsgid`)
-  through `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS` and
-  `RESOLVE_NO_XDEV`.
-- Size refusals log `vm_image_size`; capacity refusals log `vm_capacity`.
+| Setting | Purpose |
+| --- | --- |
+| `vcpu_ceiling` | Maximum job vCPUs, bounded by online CPUs. |
+| `permit_budget` | Overcommitted host vCPU permits, from the ceiling through four times online CPUs. |
+| `host_reserve_mib` | Available-memory reserve in MiB. |
+| `boot_reserve_mib` | MiB added to each pre-hello admission debit. |
+| `per_vm_overhead_mib` | MiB above stated memory before resident RAM counts as overage. |
+| `reclaim_timeout_ms` | Balloon-reclaim wait before rechecking pressure. |
+| `hysteresis_mib` | MiB above the reserve required before balloon deflation. |
+| `workspace_disk_cap_bytes` | Sparse disk cap and growth reservation bound. |
+| `boot_deadline_ms` | Boot-to-runner-hello deadline. |
+| `recovery_timeout_ms` | Recovery-start deadline, followed by disk deletion on timeout. |
+| `exit_evidence_bound_ms` | Bound from observing a gone VMM to missing-evidence settlement. |
+| `teardown_timeout_ms` | Failed guest-channel teardown bound. |
 
-The slot cleanup boundary is `/var/lib/motor-vm/jail/slot-<n>`, root-owned mode
-`0700`. The Firecracker root follows the jailer's layout:
-`/var/lib/motor-vm/jail/slot-<n>/firecracker/slot-<n>/root`. Cgroups are
-`<unit>/slots/slot-<n>`.
+Time settings are milliseconds. Parsing and the startup refusal are covered by
+`per_job_mode_refuses_each_unset_setting_without_defaults` and
+`complete_per_job_config_is_typed_but_startup_refuses_unavailable_runtime`
+(`crates/motor-host/src/main.rs`). The executable still refuses per-job startup.
 
-### Restart
+The helper owns the account credential store. Root's `motor-vm-helper
+set-remote-cache` installs a complete set atomically; only future starts see a
+replacement. Jobs get read credentials, fills/base builds also get the write key,
+and recovery gets none. See the [root command and source-file requirements](hosted-host.md#root-remote-cache-credential-command).
 
-On start, before publishing its socket, the helper kills every slot-uid process
-(including escaped ones), unmounts everything under each jail, removes jails and
-cgroups, and marks all slots free. If any of that fails, startup stops rather
-than publishing an unsafe slot. A cleanup failure at runtime leaves the slot
-dirty, and maintenance retries it. Stop the unit to kill its whole cgroup.
+The implemented rollback keeps placement drained, selects tenant mode and
+restarts from retained tenant disks through recovery, discarding per-job workspace
+disks only after their VMs stop. The helper must install its current credential
+set into each tenant VM before placement can resume. Failure leaves the host
+drained; saved tenant-disk keys never override a rotation. Tests:
+`rotate_then_rollback_installs_all_current_sets_before_undrain` and
+`failed_rollback_install_and_restart_keep_placement_fenced`
+(`crates/motor-host/tests/it/rollback.rs`). See
+[hosted-host.md](hosted-host.md#per-job-mode-rollback); it does not prescribe
+enabling per-job mode while its startup gate is closed.
 
 ## motor-vm-loader
 
@@ -231,7 +277,7 @@ Build it as a static binary, because it runs in an empty root:
 cargo build -p motor-vm-loader --release --target x86_64-unknown-linux-musl --locked
 ```
 
-The helper runs `motor-vm-loader --memory-fd N --listen-fd N`. Both are
+The standalone loader accepts `motor-vm-loader --memory-fd N --listen-fd N`. Both are
 inherited descriptors, not paths: a read-only snapshot-memory file and a bound
 Unix listener. The loader accepts one Firecracker connection, receives exactly
 one `userfaultfd` and a bounded JSON region list, then closes the listener.
@@ -241,66 +287,9 @@ one `userfaultfd` and a bounded JSON region list, then closes the listener.
   page size is 2 MiB, and no arithmetic may overflow.
 - Only missing-page events are accepted. Each fault is served with one 2 MiB
   `UFFDIO_COPY`; a partial copy is fatal, and `EEXIST` is a harmless race.
-- The loader needs no pathname access, file writes or new sockets. The helper
-  starts it with no supplementary groups, in an empty root, inside the slot
-  cgroup, as the slot uid, with `no_new_privs` and a syscall allowlist.
-
-## motor-vm-guest
-
-`motor-vm-guest [--port 52]` runs as root inside the guest image. It accepts one
-vsock connection per restored VM; the host sends one `Start` and receives
-`Frame`s. The types in `crates/motor-vm-guest/src/lib.rs` are the wire schema:
-a big-endian u32 length followed by strict JSON, at most 1 MiB. Output frames
-carry raw bytes, separately for stdout and stderr. A VM runs exactly one
-session and must then be stopped.
-
-### Image requirements
-
-- Fixed virtio drives: `/dev/vda` read-only root, `/dev/vdb` tree, `/dev/vdc`
-  target, `/dev/vdd` Cargo home; data drives unmounted when the snapshot is
-  taken.
-- `/proc`, `/sys`, `/dev` and a writable `/run` mounted by the image's init.
-- A job user with uid and gid 1000, no `sudo` or setuid-root binaries, and only
-  loopback networking.
-- The real pinned Cargo at `/opt/motor/bin/cargo` (not a rustup proxy), Git at
-  `/usr/bin/git`, and an immutable `/etc/motor-vm/cargo-config.toml`.
-- The image's own `HOME`, `PATH`, `RUSTUP_HOME` and similar keys; request
-  overrides of them are discarded.
-
-### Command execution
-
-Each `trees` entry maps a direct child of the tree image to an absolute path
-strictly below `/job`; the client translates workspace, sibling, cwd and
-manifest paths into that root. Traversal, symlink components and overlapping
-destinations are refused. Data mounts are `nosuid,nodev`. The target and Cargo
-mounts are `/run/motor-vm/target` and `/run/motor-vm/cargo`.
-
-Before running the command the agent sets the clock, credits 256 bits of host
-entropy and reseeds the kernel RNG, mounts the drives, and starts the network
-relay if `proxy_port` is set. The command drops groups, gid and uid, starts its
-own session and sets `no_new_privs`. Afterwards the agent kills every remaining
-uid-1000 process with pidfds, drains output, reaps, syncs and unmounts. Only
-then does it send `Status { clean: true }`. Any failure closes the stream
-without a clean status, and the host must not export that VM's images.
-
-With `proxy_port`, the relay listens on `127.0.0.1:3128` and opens a new vsock
-connection to the host for each TCP connection. HTTP policy belongs to the host
-proxy. Without it the job has no relay and is forced offline.
-
-### Dependency fetch
-
-A fetch ignores the request's environment and runs only the image's
-`cargo fetch --locked` from `/run/motor-vm/fetch` with the requested manifest;
-it never runs workspace code. `git_directories` maps each locked Git source and
-revision to a directory prepared from the client's Git bundles, and Git
-`insteadOf` rules route those sources to local repositories. The host rejects
-unavailable sources before launch; the guest rejects missing or extra mappings.
-
-Before reporting a clean status, the agent walks `CARGO_HOME` and rejects
-symlinks, special files and unknown paths. It checks every registry archive
-against the lockfile's SHA-256, requires an archive for each extracted source,
-and checks each Git checkout's revision. The only extra metadata accepted is
-Cargo's standard `CACHEDIR.TAG` in `registry/` and `git/`.
+- The loader needs no pathname access, file writes or new sockets. Its sandbox
+  test uses no supplementary groups, an empty root, an unprivileged uid,
+  `no_new_privs` and a syscall allowlist. The helper has no loader launch path.
 
 ## Tests
 
@@ -308,15 +297,9 @@ The portable suites run on macOS or Linux without KVM:
 
 ```sh
 cargo nextest run -p motor-vm-helper --lib --bins --locked
-cargo nextest run -p motor-vm-guest --locked
+cargo nextest run -p motor-host --lib --bins --locked
 cargo nextest run -p motor-vm-loader --locked
 ```
-
-On Linux, `cargo test -p motor-vm-helper` also runs the hugepage admission tests
-(`linux::tests::hugepage_shortage_refuses_before_vm_preparation`,
-`linux::tests::sufficient_hugepages_proceed_with_vm_preparation`,
-`linux::tests::unreadable_hugepage_pool_refuses_before_vm_preparation`). They
-inject the free-page count and need no root or hugepages.
 
 The feature-gated lanes fail, rather than skip, when a prerequisite is missing.
 They run as root, create mounts, cgroups and systemd units, and use fixed uids,
@@ -331,8 +314,8 @@ it reconciles real host policy rather than using the portable fixture's example.
 | --- | --- | --- |
 | `sudo ... cargo test -p motor-vm-helper --features linux-root-tests --lib` | Root and `CAP_SYS_ADMIN`, scratch on a native Linux filesystem | Filesystem, credential, mount-resolution and descriptor handling |
 | `sudo ... cargo nextest run -p motor-vm-helper --features linux-service-tests --lib` with `MOTOR_VM_TEST_JAILER` and `MOTOR_VM_TEST_FIRECRACKER` | Root, systemd 254+ as PID 1 with delegation, cgroup v2, unused uid/gid 200000, the official jailer, and the static fixture built from `fixtures/firecracker.c` | Cgroup placement, restart cleanup, and the real jailer layout |
-| `cargo nextest run -p motor-vm-guest --features linux-root-tests --locked` | Root, `CAP_SYS_ADMIN`, util-linux `unshare`, mount/PID/network namespaces | Privilege drop, mounts, outside-path hiding, reaping escaped processes |
-| `cargo nextest run -p motor-vm-guest --features trusted-cargo-tests --locked` | Network access and a real Cargo (not a rustup proxy) on `PATH` | Real registry and local-Git fetches |
+| `cargo nextest run -p motor-vm-helper --features linux-service-tests --lib -E 'test(=linux::job::tests::isolated_job_vmm_survives_helper_service_restart)'` | Root, systemd, cgroup v2, pinned jailer and static fixture, exclusive fixture uid | Job VMM slice, OOM score, restart adoption and exit evidence; not a real guest boot |
+| `cargo nextest run -p motor-host --lib -E 'test(=tests::job_contract::isolated_job_vm_preserves_full_sandbox_contract)' --run-ignored only --no-tests fail` | Dedicated root/KVM host and the test's explicit real-job-VM fixture | Full in-job sandbox contract in 4.4.2 |
 | `cargo test -p motor-vm-loader --features linux-uffd-tests --locked` | `userfaultfd` permission | Real `UFFDIO_COPY` of 2 MiB pages |
 | `MOTOR_VM_LOADER_BIN=<static loader> cargo nextest run -p motor-vm-loader --features linux-root-tests --locked` | Root and the helper's seccomp support | The loader reaching its fault loop under the real sandbox |
 
@@ -347,7 +330,6 @@ those tests without privileges. Benchmarks: `cargo bench -p motor-vm-loader --be
 measures the layout and copy logic; add `-- --uffd` on Linux to measure real
 `UFFDIO_COPY` calls.
 
-Snapshot restore, the guest clock and entropy calls, the ext4 mount lifecycle,
-vsock transport and loader seccomp compatibility need real VMs on a KVM host
-with prepared images and reserved hugepages. No test in this repository covers
-them.
+Portable fixtures do not prove real guest boot, DAX, virtual-socket (vsock)
+transport, network isolation or in-VM systemd behavior. Those require the root/KVM operator lanes
+with prepared images; no skip counts as a pass.

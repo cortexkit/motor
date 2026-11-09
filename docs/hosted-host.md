@@ -2,11 +2,17 @@
 
 This turns a dedicated Linux server into a hosted-runners host: the
 root `motor-vm-helper`, the unprivileged `motor-host` TLS agent, their
-configs and keys, one tenant VM for our fleet's account, and one public TLS
+configs and keys, a tenant VM for an account, and one public TLS
 port. Linux jobs run in hosted server VMs; the build server also runs the
 Windows runner. A fresh hosted host needs no SSH runner. Broker-side enrollment
 belongs to the broker operator; this procedure prints the facts the broker
 operator registers.
+
+The provisioning procedure below is for tenant mode, which is the default.
+`motor-host` also implements opt-in `mode: "per_job"` scheduling. The image recipe
+does not yet produce the job `rootfs.ext4`/`toolchain.ext4`, and no production path
+writes the guest's `/run/motor/runner-args`, so it is not ready for an end-to-end
+operator switch.
 
 The host id and the tenant's broker subject (`acct:<ULID>`) are installer
 arguments. They are not in this public repository; after installing they live
@@ -260,11 +266,123 @@ resize journal) ends the lease before Run as a retryable `hosted_host_full`;
 motor-host logs `tenant_start_refused` with the case, advertises nothing for
 the tenant and retries its start at most once a minute.
 
-The helper's job-slot settings are inert: `motor-host` sends only tenant
-operations, but the helper config requires one slot. It uses slot uid 290000
-and a one-uid job range starting at 300000, the values the tenant-image
-qualification harness (`script/tenant-image/qualify.py`) ran the helper with
-on this server.
+Tenant mode uses the registered tenant ceilings. Per-job mode uses explicit
+host-level admission and VM settings rather than a snapshot slot pool; see
+[Per-job mode settings](#per-job-mode-settings).
+
+## Per-job mode settings
+
+The closed host JSON object accepts `mode: "tenant"` (default) or `"per_job"`.
+The executable currently refuses per-job startup with `per_job mode is not yet
+available`; the following settings describe the implemented scheduler, not an
+enablement procedure. Every field of `per_job` is required, with no missing,
+null or defaulted values.
+
+Here VMM means the Firecracker virtual machine monitor process, and OOM means
+out of memory.
+
+| Setting | Unit | Meaning |
+| --- | --- | --- |
+| `vcpu_ceiling` | vCPUs | Maximum job size; 1 through the helper's online CPU count. |
+| `permit_budget` | vCPU permits | Host admission budget with CPU overcommit; at least `vcpu_ceiling`, at most four times online CPUs. |
+| `host_reserve_mib` | MiB | Host available-memory floor for admission and pressure reclamation. |
+| `boot_reserve_mib` | MiB | Added to each job's stated memory debit until its runner answers hello, including queued jobs. |
+| `per_vm_overhead_mib` | MiB | Added to stated memory when computing a VM's positive resident-RAM overage. |
+| `reclaim_timeout_ms` | milliseconds | Wait after balloon inflation before rechecking pressure and possibly stopping that VM. |
+| `hysteresis_mib` | MiB | Available memory above the host reserve needed to deflate balloons. |
+| `workspace_disk_cap_bytes` | bytes | Sparse workspace-disk size cap; admission reserves remaining possible physical growth. |
+| `boot_deadline_ms` | milliseconds | Bound from boot start to runner hello, excluding disk recovery. |
+| `recovery_timeout_ms` | milliseconds | Bound from recovery VM start; expiry stops recovery and deletes its workspace disk. |
+| `exit_evidence_bound_ms` | milliseconds | Maximum wait from discovering a gone VMM for durable exit/OOM evidence. |
+| `teardown_timeout_ms` | milliseconds | Bound on failed guest-channel teardown before the VM is stopped. |
+
+`per_job_mode_refuses_each_unset_setting_without_defaults`,
+`complete_per_job_config_is_typed_but_startup_refuses_unavailable_runtime`
+(`crates/motor-host/src/main.rs`) and the configuration tests in
+`crates/motor-host/src/config.rs` cover parsing and CPU validation. These are
+not real-VM qualification. No server-specific values belong in this document.
+
+Per-job admission reserves each claim before evaluating the next against the
+same sample: permits, stated memory plus boot reserve (never burst), disk growth,
+generation and replay. After runner hello, memory counts through host-measured
+available memory. A job's guest RAM is `ceil((mem_mib + burst) / 0.75)` MiB;
+its systemd job limit is stated memory plus burst. Same-workspace jobs queue
+until the disk is detached; quarantined disks refuse claims as `host_full`.
+Warm heartbeat entries describe workspace disks, busy while attached or
+quarantined; `tenant_disk` is omitted. Recovery and fills consume capacity too.
+
+### Root remote-cache credential command
+
+Install or replace the helper's complete set for an account as root:
+
+```sh
+sudo /usr/local/libexec/motor-vm-helper set-remote-cache --account <account> \
+  --config /absolute/root-only-dir/config.json \
+  --read-key /absolute/root-only-dir/read-key \
+  --write-key /absolute/root-only-dir/write-key
+```
+
+Omit `--write-key` for a read-only set. The account is the identity used in job
+starts, not a tenant name. Arguments are file paths, never literal secrets.
+Sources must be root-owned regular files, at most 64 KiB each, with absolute,
+symlink-free paths and no group/other-writable ancestors; keys must have no
+group or other permissions. Validation matches `set-remote-cache` in the tenant
+provisioner: config schema, account subject, tenant prefix and key generations.
+
+The helper atomically replaces `/var/lib/motor-vm/remote-cache`'s account set
+(root-owned directories 0700, files 0600) and syncs it before success. Replacement
+needs no drain or restart and applies at the next VM start; running VMs keep
+their original set. Jobs receive config and the read key, trusted fill/base-build
+VMs also receive the write key, and recovery receives neither keys nor a virtual
+network interface (TAP).
+The helper delivers a read-only, nonce-bound credential drive; the guest consumes
+it into tmpfs. `motor-host` never reads or relays key bytes, and no key is stored
+on a workspace disk, base, published image, replay store or log. See the
+[helper credential rules](../crates/motor-vm-helper/README.md#credential-store)
+for the named tests and the [rollback credential gate](#per-job-mode-rollback).
+
+### Claim log and rate comparison
+
+Both modes log one `run_claim` record per authenticated Run admission attempt,
+not per Attach or guest Run frame. It carries `jti` (the token's unique job
+identifier), `mode` and `result`
+(`admitted`, `waiting` or `refused`); refusals add wire `reason` and `cause`.
+`quarantined_workspace` is a separate cause. `job_host_stop` records carry the
+`jti` and cause even for a stop before `started`. Tokens and credentials are not
+logged. Keep raw `journalctl -u motor-host -o json` JSONL, including records
+bracketing the comparison window and later stops for that window's jobs.
+
+`scripts/export-per-job-rates.py` combines those journals with JSON arrays of
+**broker-accepted usage bodies**, never the host's pending outbox. Its config
+has `window: {start_ms, end_ms}`, distinct `tenant_host` and `per_job_host`
+labels, `canary_jtis`, and `tolerances: {lost, host_stop, hosted_host_full}` as
+absolute rate fractions. Choose each tolerance before comparing.
+
+```sh
+python3 scripts/export-per-job-rates.py --config comparison.json \
+  --max-gap-ms <maximum-log-silence-ms> \
+  --tenant-journal tenant.jsonl --per-job-journal per-job.jsonl \
+  --tenant-usage tenant-accepted.json --per-job-usage per-job-accepted.json \
+  > evidence.json
+python3 scripts/per-job-rates.py evidence.json
+```
+
+`--max-gap-ms` is required, with no default. Coverage means bounded log silence,
+not proof that no record was lost: a longer gap, boot change or journal cursor
+sequence-ID change splits coverage. Coverage is never extrapolated beyond
+recorded timestamps; sparse logs may need a periodic coverage marker. The
+comparison fails without reporting rates if either log does not cover the window.
+
+The denominator is distinct authenticated Run `jti`s claimed in
+`[start_ms, end_ms)`, including refusals before Run, excluding recorded canaries.
+Usage and stop evidence for that cohort may arrive after the window. The three
+compared numerators are lost usage, host OOM/pressure usage or host stop records,
+and identifiers refused `host_full` at least once for a non-quarantine cause
+(reported as `hosted_host_full`). Quarantine refusals are reported separately.
+The comparator exits 0 within tolerance, 1 above tolerance, and 2 for invalid or
+incomplete evidence. `scripts/test_per_job_rates.py` covers the fixture and
+coverage refusal; these rates are evidence for operator review, not an automatic
+authorization to switch modes.
 
 ## Firewall
 
@@ -550,6 +668,31 @@ journal, configs and tenant disk; never delete a tenant disk or the journal as
 part of a rollback.
 
 To return to service, run `--check`, then `--start`.
+
+### Per-job mode rollback
+
+Rollback from per-job mode keeps placement drained throughout: select tenant
+mode, restart using the retained tenant disks and complete their recovery, and
+install the helper's **current** remote-cache credential sets into the tenant
+VMs before placement resumes. Per-job workspace disks are discarded by the
+rollback path, not mounted on the host. Keep the tenant disks, keys and journal.
+The tenant disk's saved cache keys are not authoritative: a key rotation made
+while using job VMs must not resurrect a superseded read or write key. If any
+credential install fails, leave the host drained and fix the install before
+resuming placement.
+
+The implemented tenant rollback path discards saved tenant snapshots, wakes and
+recovers each tenant, then calls the helper's `install_tenant_cache` with only
+tenant and account identities. That operation installs the helper's current
+read/write set through the guest control channel. The pending rollback marker
+and drain survive failures and restarts; completing all installs clears only
+the pending marker, never the operator's drain. Tests:
+`rotate_then_rollback_installs_all_current_sets_before_undrain`,
+`failed_rollback_install_and_restart_keep_placement_fenced`
+(`crates/motor-host/tests/it/rollback.rs`), and the root-only
+`isolated_rotate_then_rollback_delivers_current_read_and_write_sets`
+(`crates/motor-vm-helper/src/linux/cache/tests.rs`). No mode switch is prescribed
+here while the per-job startup gate remains closed.
 
 ### Recovery timeouts
 

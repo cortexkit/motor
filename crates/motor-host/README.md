@@ -1,14 +1,16 @@
 # motor-host
 
-Unprivileged TLS admission for tenant VMs. The helper owns VM paths, disks,
-cgroups and taps; this process sends only registered tenant names and bounded
-helper operations. Run `motor-host <config.json>` as the user authorized by the
+Unprivileged TLS admission for tenant VMs and opt-in per-job VM scheduling. The
+helper owns VM paths, disks, cgroups, TAPs and cache credentials; this process
+sends bounded identities and helper operations, never key bytes.
+Run `motor-host <config.json>` as the user authorized by the
 helper. It requires a PEM certificate and PEM private key, not a public-CA
 certificate: clients compare the certificate's SubjectPublicKeyInfo (SPKI),
 which identifies its public key, with the SHA-256 pin supplied in the broker's
 lease response.
 
-Configuration is a closed JSON object with these required fields:
+Configuration is a closed JSON object. Tenant mode is the default; the shared
+and tenant configuration fields are:
 
 - `host_id`, `listen` (a socket address), `certificate`, `private_key`;
 - `host_signing_key`, a host-private file containing a raw 32-byte Ed25519 seed
@@ -54,6 +56,78 @@ identity. Fresh starts receive `attach_tenant`; restored guests receive only
 `post_restore`, with fresh host time and entropy. Adoption of an already initialized
 generation skips initialization and rebuilds its CPU quota from the journal.
 
+## Per-job mode
+
+The host config defaults to `mode: "tenant"`. `mode: "per_job"` requires the
+complete `per_job` object documented in
+[hosted-host.md](../../docs/hosted-host.md#per-job-mode-settings). The executable
+currently refuses per-job startup. The image recipe does not yet produce the
+job `rootfs.ext4`/`toolchain.ext4`, and no production path writes the guest's
+`/run/motor/runner-args`; the library/runtime implementation below is not an
+end-to-end deployment procedure.
+
+The scheduler durably binds each execution to an account/workspace disk and
+image generation before boot. Permit, memory and disk reservations precede
+`lease_ok`; same-workspace jobs queue behind the attached disk. Attach never
+creates a disk or execution. `run_claim` logs each authenticated Run claim in
+both modes, while `job_host_stop` records pressure/OOM causes even before
+`started`. The [claim log and rate tool](../../docs/hosted-host.md#claim-log-and-rate-comparison)
+describe collection and comparison.
+
+Rollback keeps placement drained while retained tenant disks recover and the
+helper installs its current account credentials into each tenant VM. Installation
+failure keeps the pending rollback and drain durable. See
+[hosted-host.md](../../docs/hosted-host.md#per-job-mode-rollback).
+
+### Per-job replay store
+
+These rules apply to the per-job implementation, not the tenant runner's own
+history store:
+
+1. **Persist before publication.** `motor-host` holds the single runner
+   connection and stores `started`, output, returned-file records/chunks,
+   manifest and terminal under `<journal_dir>/replay/<job UUID>/`, outside
+   SQLite. Fixed-size output segments, separate chunk files and `index.json`
+   are synced before the watermark advances or callers see frames. Host restart
+   resumes the runner stream from that watermark and drops duplicates. Tests:
+   `detached_caller_retains_raw_output_returns_terminal_and_one_usage_across_poweroff_and_restart`
+   and `host_down_while_command_finishes_resumes_last_sequence_and_drops_duplicate_output`
+   (`src/server/job/tests/replay_tests.rs`).
+2. **Bounded replay.** Output is bounded by `REPLAY_BYTES` (64 MiB), with old
+   segments retired and truncation persisted. A cursor behind retained output,
+   live or attached after restart, gets the earliest retained output with
+   `truncated_before_seq`, then every retained frame and one terminal. Admission
+   reserves that output bound, one segment, metadata/terminal allowance and
+   128 MiB of returned-file data. Only the host-observed Run can reduce the
+   return reservation to zero, after acceptance with empty `return_paths`.
+   Excess return data is refused, excess paths fail in the manifest, and the
+   terminal is retained. Tests:
+   `far_over_replay_bytes_maximum_returns_restart_and_expiry_stay_reserved` and
+   `excessive_return_frames_fail_only_excess_paths_and_keep_terminal`
+   (`src/replay/tests/bounds_tests.rs`),
+   `slow_live_caller_and_restarted_attach_receive_truncation_then_all_retained_frames`
+   and `relayed_run_alone_sets_return_reservation_and_runner_hints_cannot_change_it`
+   (`src/server/job/tests/replay_tests.rs`).
+3. **No VM needed for ended attaches.** The guest powers off only after the
+   terminal is stored and acknowledged. Live `cancel`, `withdraw` and
+   `job_status` use the single runner connection; after the terminal they are
+   answered from the store. Attach creates no execution and sends no second
+   usage report. Tests:
+   `live_controls_use_the_single_runner_connection_and_ended_controls_use_the_store`
+   (`src/server/job/tests/replay_tests.rs`) and
+   `attach_never_creates_disk_or_execution_live_ended_or_after_restart`
+   (`tests/it/job_admission.rs`).
+4. **Retain through attach eligibility.** Output, `started`, manifest, terminal,
+   lease and billing records remain for 24 hours plus the 300-second attach-token
+   lifetime after the later of job end and the saved broker usage acceptance.
+   Missing usage acceptance does not start deletion. Existing open-lease,
+   unqueued-usage, retry and unexpired-token holds still apply. Returned-file
+   chunks expire one hour after job end; subsequent replay retains the manifest
+   with those entries `expired`. The end-of-job reservation becomes retained
+   replay bytes until deletion. Test:
+   `fake_clock_chunk_expiry_and_delayed_usage_acceptance_survive_restart_without_rebilling_attach`
+   (`src/server/job/tests/replay_tests.rs`).
+
 ## Admission and durability
 
 The version-1 lease handshake (`lease_hello`, requester challenge, and result)
@@ -65,9 +139,11 @@ keys means no admission. Tenant binding and requester-key binding precede
 the challenge; signature verification precedes every wake and disk operation.
 
 Job tokens follow the mirrored CLOUD contract and use the full `linux-x64`
-platform name, lowercase UUIDv7 job IDs and nullable placement VM field. A null
-or unknown VM has no provisioned tenant binding and is refused with `auth`;
-the host does not invent a placement for it.
+platform name, lowercase UUIDv7 job IDs and nullable placement VM field. In
+tenant mode, a null or unknown VM has no provisioned tenant binding and is refused
+with `auth`; the host does not invent a tenant placement for it. In per-job mode,
+workspace disks are bound to the token's account and workspace hash; a placement
+hint never grants access to another workspace's disk.
 
 The host's durable state lives in SQLite at `<journal_dir>/store.db`, opened
 through the fleet's `cortexkit-store` layer (single-writer lease, versioned
@@ -147,9 +223,10 @@ Only one signed request is in flight. `usage_conflict`, `job_settled` and
 days an entry is archived under `journal_dir/outbox-expired` and the queue moves
 on. A 401 emits a key-retirement alert for an operator to check clock reversal.
 
-A finished job's records are kept for one hour (`RECORD_RETENTION_MS`) after
-the job finished, then deleted; the broker keeps each settled job's billing
-record for 13 months, so the host holds no billing history. Deleted are the
+In tenant mode, a finished job's records are kept for one hour
+(`RECORD_RETENTION_MS`) after the job finished, then deleted; the broker keeps
+each settled job's billing record for 13 months, so the host holds no billing
+history. Deleted are the
 lease with its account
 identifier, billing state, no-start report, pending cancel, and every queued,
 set-aside (including its `outbox-expired` file) or rejected usage request for

@@ -24,7 +24,7 @@ are separate projects.
 | [`motor-vm-helper`](crates/motor-vm-helper/README.md) | Root service owning the Firecracker tenant VMs on a hosted server. |
 | `motor-macvm`, `motor-macagent` | The macOS job VM driver and the guest agent inside each macOS job VM. |
 | `motor-winagent` | The guest agent inside each Windows job VM. A standalone crate outside the workspace. |
-| [`motor-vm-loader`](crates/motor-vm-loader/README.md), [`motor-vm-guest`](crates/motor-vm-guest/README.md) | Snapshot-memory loader and one-command guest supervisor for per-job Firecracker VMs. Not used by any runner backend. |
+| [`motor-vm-loader`](crates/motor-vm-loader/README.md) | Snapshot-memory loader. Not used by any runner backend. |
 | `prefrontal-build-slot` | Compiler-slot supervisor that limits concurrent compiles across jobs; vendored, see [VENDORED.md](crates/prefrontal-build-slot/VENDORED.md). |
 
 ## Build and test
