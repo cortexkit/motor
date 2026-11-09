@@ -21,13 +21,20 @@ pub fn validate_name(name: &str) -> Result<()> {
     }
     Ok(())
 }
+pub fn validate_account_binding(account: &str) -> Result<()> {
+    if !account.starts_with("acct:") && !account.starts_with("org:") {
+        return Err(Error("invalid tenant account subject".into()));
+    }
+    crate::job::validate_account(account)
+}
+
 pub fn validate_port(port: u32) -> Result<()> {
     if !matches!(port, 52..=54) {
         return Err(Error("tenant relay port must be 52, 53 or 54".into()));
     }
     Ok(())
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Operation {
     Ensure,
     PrepareStart,
@@ -42,12 +49,17 @@ pub enum Operation {
     Adopt,
     Metrics,
     RecoveryComplete,
+    InstallCache { account: Option<String> },
+    DiscardSnapshot,
     Remove,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
+    /// Root provisioning binds cache credentials to this VM, not its caller.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account: String,
     pub disk: PathBuf,
     pub generation: PathBuf,
     pub suspend: PathBuf,
@@ -102,6 +114,9 @@ impl Registry {
     }
     pub fn validate(&self, tenant: &str) -> Result<()> {
         validate_name(tenant)?;
+        if !self.account.is_empty() {
+            validate_account_binding(&self.account)?;
+        }
         validate_name(&self.image_version)?;
         let home = PathBuf::from(TENANTS).join(tenant);
         if self.disk != home.join("disk.img")
@@ -174,6 +189,9 @@ pub struct SnapshotKey {
 /// Platform methods keep the destructive boundary small. In particular, load
 /// leaves the guest paused; consume must durably unlink before resume is called.
 pub trait Backend {
+    fn install_cache(&mut self, _tenant: &str, _registry: &Registry) -> Result<()> {
+        Err(Error("tenant_cache_install_unavailable".into()))
+    }
     fn check_network(&mut self, _tenant: &str) -> std::result::Result<(), StartRefusal> {
         Ok(())
     }
@@ -382,6 +400,27 @@ impl<B: Backend> Controller<B> {
             }
         }
         match op {
+            Operation::DiscardSnapshot => {
+                self.stop_cleanly(tenant, &r)?;
+                self.0.consume(&r)?;
+                return Ok(Response::new(Reply::Ok));
+            }
+            Operation::InstallCache { account } => {
+                if r.account.is_empty() {
+                    return Err(Error("tenant_cache_account_missing".into()));
+                }
+                if account
+                    .as_ref()
+                    .is_some_and(|account| account != &r.account)
+                {
+                    return Err(Error("tenant_cache_account_mismatch".into()));
+                }
+                if !self.0.running(tenant) || self.0.unclean(&r)? {
+                    return Err(Error("tenant_cache_not_ready".into()));
+                }
+                self.0.install_cache(tenant, &r)?;
+                return Ok(Response::new(Reply::Ok));
+            }
             Operation::Ensure | Operation::Restore | Operation::PrepareStart => {
                 if self.0.running(tenant) {
                     // A failed activation stop may have left a live VM. Never

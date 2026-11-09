@@ -185,6 +185,14 @@ pub enum Request {
     RecoveryComplete {
         tenant: String,
     },
+    InstallTenantCache {
+        tenant: String,
+        #[serde(default)]
+        account: Option<String>,
+    },
+    DiscardTenantSnapshot {
+        tenant: String,
+    },
     /// Quarantines a stopped tenant's data and removes its records and
     /// network setup; see `removal`. Names the tenant only.
     #[serde(alias = "remove-tenant")]
@@ -636,6 +644,12 @@ impl<M: Machine> Helper<M> {
             Request::TenantMetrics { tenant } => self.tenant(&tenant, tenant::Operation::Metrics),
             Request::RecoveryComplete { tenant } => {
                 self.tenant(&tenant, tenant::Operation::RecoveryComplete)
+            }
+            Request::InstallTenantCache { tenant, account } => {
+                self.tenant(&tenant, tenant::Operation::InstallCache { account })
+            }
+            Request::DiscardTenantSnapshot { tenant } => {
+                self.tenant(&tenant, tenant::Operation::DiscardSnapshot)
             }
             Request::RemoveTenant { tenant } => self.tenant(&tenant, tenant::Operation::Remove),
         }

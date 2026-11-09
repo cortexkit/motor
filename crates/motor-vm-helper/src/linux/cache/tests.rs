@@ -96,6 +96,94 @@ mod root {
     }
 
     #[test]
+    fn isolated_rotate_then_rollback_delivers_current_read_and_write_sets() {
+        use std::os::unix::net::UnixStream;
+        let base = scratch();
+        let path = base.join("store");
+        for (tenant, account, write) in [
+            ("a", "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", true),
+            ("b", "org:01ARZ3NDEKTSV4RRFFQ69G5FAV", false),
+        ] {
+            let old = set(account, "superseded");
+            store::install(&path, account, &old).unwrap();
+            let mut rotated = set(account, "rotated");
+            if !write {
+                rotated.write_key = None;
+            }
+            store::install(&path, account, &rotated).unwrap();
+            let mut registry = crate::tenant::tests::registry(tenant);
+            registry.account = account.into();
+            let (helper, mut guest) = UnixStream::pair().unwrap();
+            let installed = std::thread::spawn(move || {
+                let mut header = [0; 4];
+                guest.read_exact(&mut header).unwrap();
+                let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+                guest.read_exact(&mut bytes).unwrap();
+                assert!(!String::from_utf8_lossy(&bytes).contains("superseded"));
+                let current: RemoteCacheRequest = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(current.op, "set_remote_cache");
+                assert_eq!(&*current.config, &*rotated.config);
+                assert_eq!(&*current.read_key, &*rotated.read_key);
+                assert_eq!(current.write_key.as_deref(), rotated.write_key.as_deref());
+                // A whole-set replacement withdraws the old writer credential
+                // when this account's current set is read-only.
+                let mut kept_tenant = old;
+                assert!(kept_tenant.write_key.is_some());
+                kept_tenant = current;
+                assert_eq!(kept_tenant.write_key.is_some(), write);
+                let reply = br#"{"ok":true}"#;
+                guest
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .unwrap();
+                guest.write_all(reply).unwrap();
+            });
+            install_tenant(&path, &registry, || Ok(helper)).unwrap();
+            installed.join().unwrap();
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn isolated_tenant_cache_install_redacts_untrusted_guest_errors_and_missing_sets() {
+        use std::os::unix::net::UnixStream;
+        let base = scratch();
+        let path = base.join("store");
+        let mut registry = crate::tenant::tests::registry("a");
+        registry.account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+        assert_eq!(
+            install_tenant(&path, &registry, || panic!("missing set must not connect"))
+                .unwrap_err()
+                .0,
+            "tenant_cache_set_missing"
+        );
+        store::install(&path, &registry.account, &set(&registry.account, "rotated")).unwrap();
+        for malformed in [false, true] {
+            let (helper, mut guest) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut header = [0; 4];
+                guest.read_exact(&mut header).unwrap();
+                let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+                guest.read_exact(&mut bytes).unwrap();
+                let reply = if malformed {
+                    b"READ-SECRET-rotated".to_vec()
+                } else {
+                    br#"{"ok":false,"error":"WRITE-SECRET-rotated"}"#.to_vec()
+                };
+                guest
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .unwrap();
+                guest.write_all(&reply).unwrap();
+            });
+            let error = install_tenant(&path, &registry, || Ok(helper)).unwrap_err();
+            assert_eq!(error.0, "tenant_cache_install_failed");
+            let visible = serde_json::to_string(&crate::Reply::Error { message: error.0 }).unwrap();
+            assert!(!visible.contains("SECRET"));
+            worker.join().unwrap();
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn isolated_account_drives_rotate_at_next_start_and_never_reuse_nonces() {
         let base = scratch();
         let path = base.join("store");

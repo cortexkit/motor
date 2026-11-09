@@ -305,6 +305,12 @@ impl Host {
         Ok(())
     }
     pub fn set_draining(&mut self, draining: bool) -> Result<(), Error> {
+        if !draining
+            && matches!(self.settings, crate::config::HostSettings::Tenant)
+            && self.snapshot.per_job.tenant_rollback_pending
+        {
+            return Err(Error::Refused(Refusal::HostFull));
+        }
         let mut next = self.snapshot.clone();
         next.draining = draining;
         self.save(next)
@@ -561,6 +567,9 @@ impl Host {
         let tenant = self.binding(claims)?.clone();
         if now_ms / 1000 >= claims.exp {
             return Err(Refusal::Expired.into());
+        }
+        if self.snapshot.per_job.tenant_rollback_pending && claims.purpose == Purpose::Run {
+            return Err(Refusal::HostFull.into());
         }
         if self.is_suspending(&tenant.tenant) {
             // The current first-party TLS connector budgets 60 seconds for admission and

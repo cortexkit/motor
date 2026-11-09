@@ -4,6 +4,7 @@ use serde_json::json;
 pub(crate) fn registry(name: &str) -> Registry {
     let root = PathBuf::from(TENANTS).join(name);
     Registry {
+        account: String::new(),
         capture_console: false,
         disk: root.join("disk.img"),
         generation: root.join("generation"),
@@ -52,6 +53,118 @@ fn memory_headroom_scales_with_ram_and_refuses_undersized_records() {
 }
 
 #[test]
+fn legacy_registry_omits_account_and_bound_registry_requires_strict_subject() {
+    let value = serde_json::to_value(registry("a")).unwrap();
+    assert!(value.get("account").is_none());
+    let legacy: Registry = serde_json::from_value(value).unwrap();
+    assert!(legacy.account.is_empty());
+    legacy.validate("a").unwrap();
+    let mut bound = legacy;
+    for account in [
+        "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "org:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ] {
+        bound.account = account.into();
+        bound.validate("a").unwrap();
+    }
+    for account in [
+        "account-1",
+        "acct:81ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "acct:01arz3ndektsv4rrffq69g5fav",
+        "user:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ] {
+        bound.account = account.into();
+        assert!(bound.validate("a").is_err(), "{account}");
+    }
+}
+
+#[test]
+fn tenant_cache_install_refuses_missing_or_mismatched_root_binding() {
+    let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let mut c = Controller(Fake {
+        running: true,
+        ..Fake::default()
+    });
+    let error = c
+        .handle(
+            "a",
+            Operation::InstallCache {
+                account: Some(account.into()),
+            },
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.0, "tenant_cache_account_missing");
+    c.0.cache_account = account;
+    let error = c
+        .handle(
+            "a",
+            Operation::InstallCache {
+                account: Some("org:01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+            },
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.0, "tenant_cache_account_mismatch");
+    assert!(!c.0.calls.iter().any(|call| call == "install-cache"));
+    let reply = c
+        .handle(
+            "a",
+            Operation::InstallCache {
+                account: Some(account.into()),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(reply.reply).unwrap(),
+        json!({"result":"ok"})
+    );
+    assert_eq!(
+        c.0.calls
+            .iter()
+            .filter(|call| *call == "install-cache")
+            .count(),
+        1
+    );
+    for op in ["install_tenant_cache", "discard_tenant_snapshot"] {
+        let value = json!({"op":op,"tenant":"a"});
+        assert!(serde_json::from_value::<crate::Request>(value.clone()).is_ok());
+        let mut extra = value;
+        extra["path"] = json!("/not-allowed");
+        assert!(serde_json::from_value::<crate::Request>(extra).is_err());
+    }
+}
+
+#[test]
+fn rollback_discards_memory_snapshot_and_only_recovers_unclean_disks() {
+    for unclean in [false, true] {
+        let mut c = Controller(Fake {
+            saved: Some(key(4)),
+            unclean,
+            ..Fake::default()
+        });
+        c.handle("a", Operation::DiscardSnapshot).unwrap();
+        assert!(c.0.saved.is_none());
+        let reply = c.handle("a", Operation::PrepareStart).unwrap();
+        assert!(
+            matches!(reply.reply, Reply::Tenant { restored: false, recovery_required, .. } if recovery_required == unclean)
+        );
+        assert!(!c.0.calls.iter().any(|call| call == "load-saved-tap"));
+        assert!(c.0.calls.iter().any(|call| call == "load-base-size-tap"));
+        if unclean {
+            c.handle("a", Operation::RecoveryComplete).unwrap();
+            assert!(c.0.calls.iter().any(|call| call == "guest-recovery-status"));
+        } else {
+            assert!(!c
+                .0
+                .calls
+                .iter()
+                .any(|call| call == "guest-recovery-status" || call == "unclean-fsync"));
+        }
+    }
+}
+
+#[test]
 fn page_cache_defaults_preserves_explicit_values_and_checks_overflow() {
     let mut value = serde_json::to_value(registry("a")).unwrap();
     value.as_object_mut().unwrap().remove("page_cache_mib");
@@ -94,6 +207,7 @@ fn tenant_paths_use_trusted_bind_view_and_refuse_old_source_spelling() {
     assert!(r.validate("a").is_err());
 }
 pub(crate) struct Fake {
+    cache_account: &'static str,
     calls: Vec<String>,
     running: bool,
     generation: u64,
@@ -119,6 +233,7 @@ pub(crate) struct Fake {
 impl Default for Fake {
     fn default() -> Self {
         Self {
+            cache_account: "",
             calls: vec![],
             running: false,
             generation: 4,
@@ -655,7 +770,12 @@ impl Backend for Fake {
         if self.registry_absent {
             return Err(Error("registry absent".into()));
         }
-        Ok(registry("a"))
+        let mut r = registry("a");
+        r.account = self.cache_account.into();
+        Ok(r)
+    }
+    fn install_cache(&mut self, _: &str, _: &Registry) -> Result<()> {
+        self.call("install-cache")
     }
     fn vm_present(&mut self, _: &str) -> Result<bool> {
         Ok(self.present)

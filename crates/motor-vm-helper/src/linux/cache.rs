@@ -23,6 +23,43 @@ pub(super) const IMAGE: &str = "remote-cache.img";
 const FILE_LIMIT: u64 = 65536;
 const NAMES: [&str; 3] = ["config.json", "read-key", "write-key"];
 
+pub(super) fn install_tenant(
+    store: &Path,
+    registry: &crate::tenant::Registry,
+    connect: impl FnOnce() -> Result<std::os::unix::net::UnixStream>,
+) -> Result<()> {
+    crate::tenant::validate_account_binding(&registry.account)?;
+    let set = store::load(store, &registry.account)?
+        .ok_or_else(|| Error("tenant_cache_set_missing".into()))?;
+    // The guest is untrusted: neither a rejected reply nor a parse error may
+    // quote credentials back into the host's reply or the helper's log.
+    let exchange = || -> Result<()> {
+        let mut stream = connect()?;
+        let timeout =
+            motor_protocol::TENANT_ATTACH_READ_DEADLINE + std::time::Duration::from_secs(120);
+        let deadline = std::time::Instant::now() + timeout;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        let bytes = Zeroizing::new(serde_json::to_vec(&set).map_err(|_| invalid())?);
+        stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        stream.write_all(&bytes)?;
+        let mut header = [0; 4];
+        super::tenant::read_deadline(&mut stream, &mut header, deadline)?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len == 0 || len > REMOTE_CACHE_DRIVE_MAX_BYTES {
+            return Err(invalid());
+        }
+        let mut bytes = Zeroizing::new(vec![0; len]);
+        super::tenant::read_deadline(&mut stream, &mut bytes, deadline)?;
+        let reply = SecretJson::new(serde_json::from_slice(&bytes).map_err(|_| invalid())?);
+        if reply.value()["ok"] != true {
+            return Err(invalid());
+        }
+        Ok(())
+    };
+    exchange().map_err(|_| Error("tenant_cache_install_failed".into()))
+}
+
 fn invalid() -> Error {
     Error("invalid remote-cache credentials".into())
 }

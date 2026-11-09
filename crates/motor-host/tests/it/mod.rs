@@ -16,6 +16,7 @@ mod replacement;
 mod resize;
 #[cfg(target_os = "linux")]
 mod resize_operator;
+mod rollback;
 mod store;
 mod transport;
 

@@ -592,6 +592,31 @@ class ProvisionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.checked(bad)
 
+    def test_tenant_account_binding_requires_root_and_matching_strict_subject(self):
+        self.switch_records()
+        path = p.REGISTRY / "a.json"
+        before = path.read_bytes()
+        subject = config()["sub"]
+        with mock.patch.object(p.os, "geteuid", return_value=1000):
+            with self.assertRaisesRegex(ValueError, "requires root"):
+                p.set_tenant_account("a", subject)
+        self.assertEqual(path.read_bytes(), before)
+        for bad in ["account-1", "acct:81ARZ3NDEKTSV4RRFFQ69G5FAV", "acct:01arz3ndektsv4rrffq69g5fav", "org:01ARZ3NDEKTSV4RRFFQ69G5FAV"]:
+            with mock.patch.object(p.os, "geteuid", return_value=0), mock.patch.object(p, "trusted"):
+                with self.assertRaises(ValueError):
+                    p.set_tenant_account("a", bad)
+            self.assertEqual(path.read_bytes(), before)
+        with mock.patch.object(p.os, "geteuid", return_value=0), mock.patch.object(p, "trusted") as trusted:
+            p.set_tenant_account("a", subject)
+            trusted.assert_any_call(path)
+            trusted.assert_any_call(p.PROVISION / "a.json")
+        record = json.loads(path.read_text())
+        self.assertEqual(record.pop("account"), subject)
+        self.assertEqual(record, json.loads(before))
+        with mock.patch.object(p.os, "geteuid", return_value=0), mock.patch.object(p, "trusted"):
+            p.set_tenant_account("a", subject)
+        self.assertEqual(json.loads(path.read_text())["account"], subject)
+
     def test_runner_args_small_disk_uses_bytes_and_quarter_cache(self):
         args = p.runner_args(config())
         self.assertIn("--return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648", args)
@@ -706,6 +731,7 @@ class ProvisionTests(unittest.TestCase):
         record = json.loads((p.REGISTRY / "a.json").read_text())
         self.assertEqual(record["disk"], str(self.root / "tenants/a/disk.img"))
         self.assertEqual(record["image_version"], "v1")
+        self.assertEqual(record["account"], c["sub"])
         self.assertEqual(json.loads(p.BINDINGS.read_text()), {"vm-a": {"tenant": "a", "sub": c["sub"]}})
         self.assertEqual(records["runner-args"], p.runner_args(c))
         self.assertEqual((self.root / "tenants/a/generation").read_text(), "0\n")

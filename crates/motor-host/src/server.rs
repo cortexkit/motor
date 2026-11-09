@@ -360,11 +360,37 @@ impl Runtime {
         if self.per_job() {
             return self.recover_jobs();
         }
+        {
+            let mut host = self.host.lock().expect("host lock");
+            if host.snapshot.per_job.tenant_rollback_pending
+                || host
+                    .snapshot
+                    .per_job
+                    .disks
+                    .values()
+                    .any(|disk| !disk.deleted)
+            {
+                let mut next = host.snapshot.clone();
+                next.per_job.tenant_rollback_pending = true;
+                next.draining = true;
+                host.save(next)?;
+            }
+        }
         if self.sandbox_identity.is_none() {
             self.host
                 .lock()
                 .expect("host lock")
                 .start_billing(unix_ms())?;
+        }
+        if self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .tenant_rollback_pending
+        {
+            return self.rollback_tenants();
         }
         let tenants: Vec<_> = self
             .host
@@ -1552,6 +1578,7 @@ impl Runtime {
 }
 
 mod job;
+mod rollback;
 pub(crate) use job::host_available_mib;
 
 fn verified_lease(claims: &Claims, burst_enabled: bool) -> Value {

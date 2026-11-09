@@ -16,6 +16,10 @@ pub mod storage;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
+    /// The helper's store may rotate while the kept tenant disk is unused.
+    /// Tenant startup must install the current sets before clearing this fence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tenant_rollback_pending: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fills: BTreeMap<String, fills::Reservation>,
     /// A DAX-less boot requires operator intervention, not an automatic retry.
@@ -32,7 +36,8 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn is_empty(&self) -> bool {
-        !self.dax_failed
+        !self.tenant_rollback_pending
+            && !self.dax_failed
             && self.fills.is_empty()
             && self.disks.is_empty()
             && self.executions.is_empty()

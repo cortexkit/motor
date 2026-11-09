@@ -9,6 +9,40 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 #[test]
+fn rollback_helper_requests_carry_only_tenant_and_account_not_credentials() {
+    let directory = scratch();
+    let path = directory.path().join("helper.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let worker = std::thread::spawn(move || {
+        for expected in [
+            json!({"op":"discard_tenant_snapshot","tenant":"tenant"}),
+            json!({"op":"install_tenant_cache","tenant":"tenant","account":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"}),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), expected);
+            stream.write_all(b"{\"result\":\"ok\"}\n").unwrap();
+        }
+    });
+    let helper = Helper {
+        socket: path,
+        storage: directory.path().to_owned(),
+        capacity: directory.path().join("capacity.json"),
+        guest_init: BTreeMap::new(),
+        vcpu_ceiling: BTreeMap::new(),
+        pressure_cgroups: BTreeMap::new(),
+    };
+    helper.discard_tenant_snapshot("tenant").unwrap();
+    helper
+        .install_tenant_cache("tenant", "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
 fn remote_cache_credentials_cross_only_the_helper_relay_and_fail_without_logging_bytes() {
     let directory = scratch();
     let path = directory.path().join("helper.sock");

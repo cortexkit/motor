@@ -237,6 +237,8 @@ def registry_disagreements(record: dict, registry: dict, provision) -> list[str]
     a field (such as max_weight) present in only one of them."""
     current = provision.checked(record)
     expected = {name: value for name, value in current.items() if name not in provision.PROVISION_ONLY}
+    if "account" in registry:
+        expected["account"] = current["sub"]
     home = provision.ROOT / "tenants" / current["tenant"]
     expected.update({name: str(home / leaf) for name, leaf in provision.REGISTRY_PATHS.items()})
     missing = object()

@@ -107,6 +107,12 @@ impl Runtime {
     }
 
     pub(super) fn recover_jobs(self: &Arc<Self>) -> Result<()> {
+        {
+            let mut host = self.host.lock().expect("host lock");
+            let mut next = host.snapshot.clone();
+            next.per_job.tenant_rollback_pending = true;
+            host.save(next)?;
+        }
         self.collect_job_exits(unix_ms())?;
         let executions: Vec<_> = self
             .host

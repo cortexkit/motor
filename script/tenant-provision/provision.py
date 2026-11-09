@@ -313,6 +313,12 @@ def component(value):
     return value
 
 
+def account_subject(value):
+    if not isinstance(value, str) or not re.fullmatch(r"(?:acct|org):[0-7][0-9A-HJKMNP-TV-Z]{25}", value):
+        raise ValueError("invalid tenant subject")
+    return value
+
+
 def checked(config, *, allow_old_headroom=False):
     allowed = {"tenant", "sub", "vm", "image_version", "vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "cpuset", "tap_index",
                "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "page_cache_mib", "snapshot_memory_high_mib", "io_weight", "resolvers",
@@ -334,8 +340,7 @@ def checked(config, *, allow_old_headroom=False):
             raise ValueError("fixed_path_repositories must contain distinct roots, or * alone")
     for name in ("tenant", "vm", "image_version"):
         component(c[name])
-    if not re.fullmatch(r"(?:acct|org):[0-9A-HJKMNP-TV-Z]{26}", c["sub"]):
-        raise ValueError("invalid tenant subject")
+    account_subject(c["sub"])
     for name, default in (("idle_suspend_s", 600), ("host_floor_bytes", 128 * 1024**3),
                           ("snapshot_memory_high_mib", 16384), ("io_weight", 100), ("page_cache_mib", DEFAULT_PAGE_CACHE_MIB)):
         c.setdefault(name, default)
@@ -935,6 +940,8 @@ def repair_from_registry(tenant, validate_image=None, check_trusted=None, output
             raise ValueError("helper registry has no image_version")
         adopted = component(record["image_version"])
         expected = {name: value for name, value in current.items() if name not in PROVISION_ONLY}
+        if "account" in record:
+            expected["account"] = current["sub"]
         home = ROOT / "tenants" / tenant
         expected.update({name: str(home / leaf) for name, leaf in REGISTRY_PATHS.items()})
         for name in sorted((set(record) | set(expected)) - {"image_version"}):
@@ -1664,6 +1671,7 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None, re
         atomic(home / REMOTE_CACHE_MANIFEST, remote_cache_manifest(remote_cache))
     atomic(home / "generation", "0\n")
     record = {k: v for k, v in c.items() if k not in PROVISION_ONLY}
+    record["account"] = c["sub"]
     record.update(disk=str(disk), generation=str(home / "generation"), suspend=str(home / "suspend"))
     # Only an unallocated, stopped index reaches publication. Reset legacy
     # deferred counters before a replacement registry can expose old usage.
@@ -2186,6 +2194,27 @@ def resize_abort(tenant, check_service=None, hook=None, output=print):
         output(f"{tenant}: resize aborted; the old records, helper config, disk and snapshots are in place")
 
 
+def set_tenant_account(tenant, account):
+    if os.geteuid() != 0:
+        raise ValueError("tenant account binding requires root")
+    tenant = component(tenant)
+    account_subject(account)
+    for path in (ROOT, REGISTRY, PROVISION, PROVISION / f"{tenant}.json", REGISTRY / f"{tenant}.json"):
+        trusted(path)
+    # Use the provisioning lock so a simultaneous resize or create cannot
+    # replace the registry with a record that loses the account binding.
+    fd = os.open(ROOT / "provision.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        config = checked(json.loads((PROVISION / f"{tenant}.json").read_text()), allow_old_headroom=True)
+        if config["tenant"] != tenant or config["sub"] != account:
+            raise ValueError("tenant account does not match provisioning record")
+        path = REGISTRY / f"{tenant}.json"
+        record = json.loads(path.read_text())
+        record["account"] = account
+        publish(path, json.dumps(record, indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
@@ -2194,6 +2223,9 @@ def main():
                         "holding the runner's remote compile cache config.json and read-key, and optionally the "
                         "tenant's write-key; they are installed on the new tenant disk only")
     commands = parser.add_subparsers(dest="command")
+    binding = commands.add_parser("set-tenant-account", help="bind an existing tenant to its root-provisioned account")
+    binding.add_argument("tenant")
+    binding.add_argument("--account", required=True)
     cache = commands.add_parser("set-remote-cache", help="deliver compile-cache files to an existing idle tenant")
     cache.add_argument("tenant")
     cache.add_argument("--remote-cache-dir", type=Path, required=True, dest="cache_directory")
@@ -2234,6 +2266,11 @@ def main():
             parser.error("apply-jobs-slice does not take --config")
         trusted(ROOT)
         apply_jobs_slice()
+        return
+    if args.command == "set-tenant-account":
+        if args.config is not None:
+            parser.error("set-tenant-account takes a tenant, not --config")
+        set_tenant_account(args.tenant, args.account)
         return
     if args.command == "set-remote-cache":
         if args.config is not None:

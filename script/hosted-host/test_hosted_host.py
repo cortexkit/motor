@@ -386,6 +386,17 @@ class InstalledStateTests(CapacityConfigTests):
         self.assertEqual(self.problems(), [])
         self.assertEqual(json.loads(self.record_path.read_text()), {**json.loads(hosted.TENANT_FILE.read_text()), "sub": SUB})
 
+    def test_optional_registry_account_must_match_provisioning_subject(self):
+        record = self.resized()
+        entry = self.registry_entry(record)
+        self.assertEqual(hosted.registry_disagreements(record, entry, provision), [])
+        entry["account"] = record["sub"]
+        self.assertEqual(hosted.registry_disagreements(record, entry, provision), [])
+        for account in ["", "acct:81ARZ3NDEKTSV4RRFFQ69G5FAV", "org:01ARZ3NDEKTSV4RRFFQ69G5FAV"]:
+            with self.subTest(account=account):
+                entry["account"] = account
+                self.assertEqual(hosted.registry_disagreements(record, entry, provision), ["account"])
+
     def test_no_windows_installed_state_reuses_one_capacity_read(self):
         self.capacity["windows_vm_bytes"] = 0
         self.slice["MemoryMax"] = str(provision.jobs_slice_limits(self.capacity)[0])

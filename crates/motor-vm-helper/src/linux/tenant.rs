@@ -264,7 +264,7 @@ fn prepare_stop_with(mut exchange: impl FnMut(&Value) -> Result<()>) -> Result<(
     }
 }
 
-fn read_deadline(
+pub(super) fn read_deadline(
     stream: &mut UnixStream,
     mut bytes: &mut [u8],
     deadline: std::time::Instant,
@@ -368,6 +368,11 @@ impl Backend for LinuxTenants {
         std::fs::remove_file(&path)?;
         File::open(path.parent().unwrap())?.sync_all()?;
         Ok(())
+    }
+    fn install_cache(&mut self, tenant: &str, registry: &Registry) -> Result<()> {
+        super::cache::install_tenant(Path::new(super::cache::STORE), registry, || {
+            self.relay(tenant, 54).map(UnixStream::from)
+        })
     }
     fn was_running(&mut self, registry: &Registry) -> Result<bool> {
         running_marker_present(&running_marker(registry))

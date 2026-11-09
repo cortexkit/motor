@@ -384,7 +384,7 @@ fn unreadable_caller_image_cannot_use_root_dac_override() {
     let image = job.join("tree.in");
     std::fs::write(&image, "abcd").unwrap();
     fs::chown(&File::open(&image).unwrap(), uid).unwrap();
-    std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o000)).unwrap();
     let fd = File::open(&base).unwrap();
     let pinned = fs::JobDir::open(&fd, &identity(), Peer { uid, gid: uid }).unwrap();
     assert!(pinned.source("tree.in", 4).is_err());

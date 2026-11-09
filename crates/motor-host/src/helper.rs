@@ -11,6 +11,12 @@ use zeroize::Zeroizing;
 pub const FRAME_LIMIT: usize = 1_048_576;
 
 pub trait Control: Send + Sync {
+    fn discard_tenant_snapshot(&self, _tenant: &str) -> Result<()> {
+        anyhow::bail!("tenant snapshot discard unavailable")
+    }
+    fn install_tenant_cache(&self, _tenant: &str, _account: &str) -> Result<()> {
+        anyhow::bail!("tenant cache install unavailable")
+    }
     fn prepare_fill(&self, _fill: &motor_vm_helper::job::Fill) -> Result<()> {
         anyhow::bail!("fill provisioning unavailable")
     }
@@ -256,9 +262,14 @@ const ORDINARY_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 const SNAPSHOT_HELPER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn helper_reply_deadline(request: &Value) -> Duration {
-    if request["op"] == "publish_job_images" || request["op"] == "prepare_job_images" {
+    if request["op"] == "install_tenant_cache" {
+        motor_protocol::TENANT_ATTACH_READ_DEADLINE + Duration::from_secs(150)
+    } else if request["op"] == "publish_job_images" || request["op"] == "prepare_job_images" {
         Duration::from_secs(3600)
-    } else if request["op"] == "suspend" || request["op"] == "stop_tenant" {
+    } else if matches!(
+        request["op"].as_str(),
+        Some("suspend" | "stop_tenant" | "discard_tenant_snapshot")
+    ) {
         SNAPSHOT_HELPER_REPLY_TIMEOUT
     } else {
         ORDINARY_HELPER_TIMEOUT
@@ -311,6 +322,17 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn discard_tenant_snapshot(&self, tenant: &str) -> Result<()> {
+        let (reply, _) = self.request(json!({"op":"discard_tenant_snapshot", "tenant":tenant}))?;
+        ensure!(reply["result"] == "ok", "tenant snapshot discard failed");
+        Ok(())
+    }
+    fn install_tenant_cache(&self, tenant: &str, account: &str) -> Result<()> {
+        let (reply, _) =
+            self.request(json!({"op":"install_tenant_cache", "tenant":tenant, "account":account}))?;
+        ensure!(reply["result"] == "ok", "tenant cache install failed");
+        Ok(())
+    }
     fn prepare_fill(&self, fill: &motor_vm_helper::job::Fill) -> Result<()> {
         self.request(json!({"op":"prepare_fill", "fill":fill}))?;
         Ok(())

@@ -339,6 +339,20 @@ fn write_job_ledger(
         PRIMARY KEY (kind, key)
     ) WITHOUT ROWID;",
     )?;
+    if old.tenant_rollback_pending != new.tenant_rollback_pending {
+        if new.tenant_rollback_pending {
+            tx.execute(
+                "INSERT INTO job_vm_entries (kind, key, value) VALUES ('tenant_rollback_pending', '', 'true')
+                 ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM job_vm_entries WHERE kind = 'tenant_rollback_pending' AND key = ''",
+                [],
+            )?;
+        }
+    }
     diff_job_entries(tx, "disk", &old.disks, &new.disks)?;
     diff_job_entries(tx, "base", &old.bases, &new.bases)?;
     diff_job_entries(tx, "image", &old.images, &new.images)?;
@@ -383,6 +397,9 @@ fn load_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
             let (kind, key, value): (String, String, String) =
                 (row.get(0)?, row.get(1)?, row.get(2)?);
             match kind.as_str() {
+                "tenant_rollback_pending" if key.is_empty() => {
+                    snapshot.per_job.tenant_rollback_pending = from_json(&value)?;
+                }
                 "disk" => drop(snapshot.per_job.disks.insert(key, from_json(&value)?)),
                 "base" => drop(snapshot.per_job.bases.insert(key, from_json(&value)?)),
                 "image" => drop(snapshot.per_job.images.insert(key, from_json(&value)?)),
@@ -484,6 +501,25 @@ mod rollback_tests {
         // It still rejects unknown legacy kinds, but never visits the new table.
         assert_eq!(load(&conn).unwrap(), legacy);
         assert_eq!(load_snapshot(&conn).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn tenant_rollback_pending_round_trips_without_changing_legacy_rows() {
+        let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+        let legacy = snapshot.clone();
+        snapshot.per_job.tenant_rollback_pending = true;
+        journal.store(&snapshot).unwrap();
+        drop(journal);
+        let conn = Connection::open(dir.path().join("store.db")).unwrap();
+        assert_eq!(load(&conn).unwrap(), legacy);
+        drop(conn);
+        let (mut journal, mut reopened) = SqliteJournal::open(dir.path()).unwrap();
+        assert_eq!(reopened, snapshot);
+        reopened.per_job.tenant_rollback_pending = false;
+        journal.store(&reopened).unwrap();
+        drop(journal);
+        assert_eq!(SqliteJournal::open(dir.path()).unwrap().1, legacy);
     }
 
     #[test]
