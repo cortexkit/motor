@@ -137,7 +137,7 @@ impl Host {
         self.reserve_storage(next, disk_id, now_ms)
     }
 
-    pub(super) fn reserve_storage(
+    pub(crate) fn reserve_storage(
         &mut self,
         next: &mut Snapshot,
         protected: &str,
@@ -157,6 +157,18 @@ impl Host {
         loop {
             let mut reserved =
                 super::images::reserved_bytes(&next.per_job).ok_or(RefusalCause::Storage)?;
+            reserved = reserved
+                .checked_add(
+                    (next.per_job.export_tips.len() as u64)
+                        .checked_mul(motor_protocol::FILL_SOURCE_MAX_BYTES)
+                        .ok_or(RefusalCause::Storage)?,
+                )
+                .ok_or(RefusalCause::Storage)?;
+            for source in next.per_job.fill_sources.values() {
+                reserved = reserved
+                    .checked_add(motor_protocol::FILL_SOURCE_MAX_BYTES.saturating_sub(source.bytes))
+                    .ok_or(RefusalCause::Storage)?;
+            }
             for fill in next.per_job.fills.values() {
                 let exclusive = control
                     .workspace_usage(&fill.fill.account, &fill.fill.disk_id())
@@ -239,6 +251,43 @@ impl Host {
         control: &dyn crate::helper::Control,
         attempted: &mut std::collections::BTreeSet<String>,
     ) -> Result<bool, ClaimError> {
+        let source = self
+            .snapshot
+            .per_job
+            .fill_sources
+            .iter()
+            .filter(|(key, slot)| {
+                !attempted.contains(*key)
+                    && !next.per_job.fills.values().any(|fill| {
+                        fill.fill.account == slot.request.account
+                            && fill.fill.repository_key
+                                == crate::jobs::fill_source::repository_key(
+                                    &slot.request.repository_root,
+                                )
+                    })
+                    && !next.per_job.export_tips.values().any(|request| {
+                        request.account == slot.request.account
+                            && request.repository_root == slot.request.repository_root
+                    })
+            })
+            .min_by_key(|(key, slot)| (slot.request.observed_ms, *key))
+            .map(|(key, slot)| (key.clone(), slot.clone()));
+        if let Some((key, slot)) = source {
+            attempted.insert(key.clone());
+            let mut intent = self.snapshot.clone();
+            intent.per_job.fill_sources.remove(&key);
+            self.save(intent).map_err(ClaimError::from)?;
+            next.per_job.fill_sources.remove(&key);
+            if let Some(root) = self.journal_directory() {
+                if let Err(error) = std::fs::remove_dir_all(crate::jobs::fill_source::directory(
+                    &root,
+                    &slot.generation,
+                )) {
+                    tracing::warn!(%error, "fill_source_eviction_failed");
+                }
+            }
+            return Ok(true);
+        }
         let idle = self
             .snapshot
             .per_job

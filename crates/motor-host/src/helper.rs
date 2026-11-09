@@ -913,6 +913,29 @@ fn available_bytes(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod helper_deadline_tests {
     #[test]
+    fn guest_json_rejects_unbounded_lengths_before_reading_a_body() {
+        struct HeaderOnly(std::io::Cursor<[u8; 4]>);
+        impl std::io::Read for HeaderOnly {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    self.0.position() < 4,
+                    "invalid length reached the body read/allocation path"
+                );
+                self.0.read(bytes)
+            }
+        }
+        assert_eq!(FRAME_LIMIT, 1 << 20);
+        for length in [0, FRAME_LIMIT as u32 + 1, u32::MAX] {
+            let error =
+                read_json(&mut HeaderOnly(std::io::Cursor::new(length.to_be_bytes()))).unwrap_err();
+            assert_eq!(error.to_string(), "invalid frame length");
+        }
+        let mut maximum = (FRAME_LIMIT as u32).to_be_bytes().to_vec();
+        maximum.extend_from_slice(b"{}");
+        maximum.resize(4 + FRAME_LIMIT, b' ');
+        assert_eq!(read_json(&mut maximum.as_slice()).unwrap(), json!({}));
+    }
+    #[test]
     fn older_helper_unknown_operation_is_distinct_from_a_transient_failure() {
         let old = anyhow::anyhow!("helper refused: unknown variant `job_memory`")
             .context("helper RPC context");

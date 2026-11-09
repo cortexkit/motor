@@ -958,3 +958,146 @@ async fn slow_live_caller_and_restarted_attach_receive_truncation_then_all_retai
         1
     );
 }
+#[tokio::test]
+async fn failed_export_starts_after_caller_terminal_and_does_not_extend_billing_or_change_replay() {
+    let (runtime, fake, _) = fixture();
+    let (export_host, mut export_guest) = UnixStream::pair().unwrap();
+    *fake.fill_export.lock().unwrap() = Some(export_host);
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    // The fixture's legacy Hello does not attest a default-branch tip. Install
+    // the same host-owned request that an attested Run records for this test.
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .export_tips
+        .insert(
+            JOB.into(),
+            crate::jobs::fill_source::Request {
+                account: claims(JOB).sub,
+                repository_root: "/home/source".into(),
+                integration_tip: "a".repeat(40),
+                mem_mib: 100,
+                observed_ms: unix_ms(),
+            },
+        );
+    let frames = records();
+    for frame in &frames {
+        guest.write_all(frame).await.unwrap();
+    }
+    for frame in &frames {
+        assert_eq!(next_record(&mut client).await.bytes, *frame);
+    }
+    task.await.unwrap().unwrap();
+    let end = runtime.host.lock().unwrap().snapshot.leases[JOB]
+        .ended_at_ms
+        .unwrap();
+    let usage_before = runtime.host.lock().unwrap().snapshot.billing[JOB].clone();
+    let at_export = runtime.clone();
+    let request = tokio::task::spawn_blocking(move || {
+        let request = crate::helper::read_json(&mut export_guest).unwrap();
+        assert_eq!(request["op"], "export_tip");
+        {
+            let mut host = at_export.host.lock().unwrap();
+            assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(end));
+            assert_eq!(host.snapshot.billing[JOB].terminal_received_ms, Some(end));
+            assert_eq!(host.snapshot.billing[JOB].ended_observed_ms, Some(end));
+            host.billing_tick(end + 300_000).unwrap();
+            assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(end));
+        }
+        crate::helper::write_json(
+            &mut export_guest,
+            &json!({"ok":false,"error":"export failure"}),
+        )
+        .unwrap();
+        request
+    })
+    .await
+    .unwrap();
+    assert_eq!(request["job_id"], JOB);
+    ack(&runtime, &mut guest).await;
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .billing_tick(end + 300_000)
+        .unwrap();
+    power_off(&runtime, &fake);
+    {
+        let host = runtime.host.lock().unwrap();
+        assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(end));
+        assert_eq!(host.snapshot.billing[JOB].terminal, usage_before.terminal);
+        assert_eq!(
+            host.snapshot.billing[JOB].ended_observed_ms,
+            usage_before.ended_observed_ms
+        );
+        assert!(host.snapshot.per_job.fill_sources.is_empty());
+        let billing = &host.snapshot.billing[JOB];
+        let usage = billing.usage.as_ref().unwrap();
+        assert_eq!(usage.ended_at_ms, end);
+        assert_eq!(
+            billing.hosted_terminal.as_ref().unwrap()["billed_vcpu_ms"],
+            u64::from(claims(JOB).vcpus) * (end - usage.started_at_ms)
+        );
+    }
+    assert_eq!(replayed(&runtime).await, frames);
+}
+#[tokio::test]
+async fn timed_out_export_stops_the_vm_without_changing_the_terminal_or_billed_end() {
+    let (runtime, fake, _) = fixture();
+    let (export_host, _stuck_guest) = UnixStream::pair().unwrap();
+    *fake.fill_export.lock().unwrap() = Some(export_host);
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    runtime
+        .job_stream(JOB)
+        .unwrap()
+        .set_export_timeout(Duration::from_millis(50));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .export_tips
+        .insert(
+            JOB.into(),
+            crate::jobs::fill_source::Request {
+                account: claims(JOB).sub,
+                repository_root: "/home/source".into(),
+                integration_tip: "a".repeat(40),
+                mem_mib: 100,
+                observed_ms: unix_ms(),
+            },
+        );
+    let frames = records();
+    for frame in &frames {
+        guest.write_all(frame).await.unwrap();
+    }
+    for frame in &frames {
+        assert_eq!(next_record(&mut client).await.bytes, *frame);
+    }
+    task.await.unwrap().unwrap();
+    let end = runtime.host.lock().unwrap().snapshot.leases[JOB]
+        .ended_at_ms
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("export deadline must stop the VM");
+    {
+        let host = runtime.host.lock().unwrap();
+        assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(end));
+        assert!(host.snapshot.per_job.export_tips.is_empty());
+        assert!(host.snapshot.per_job.fill_sources.is_empty());
+        assert_eq!(
+            host.snapshot.billing[JOB].terminal.as_ref().unwrap()["outcome"],
+            json!({"type":"exit","code":0})
+        );
+    }
+    assert_eq!(replayed(&runtime).await, frames);
+}

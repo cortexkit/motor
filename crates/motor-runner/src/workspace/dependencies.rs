@@ -290,6 +290,7 @@ impl Trees {
                     "dependency bundle must have exactly its declared ref",
                 ));
             }
+            git(&validation, &["check-ref-format", &reference])?;
             git(&validation, &["bundle", "verify", spool])?;
             super::transfer::fetch(
                 &validation,

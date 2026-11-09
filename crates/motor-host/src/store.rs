@@ -150,6 +150,7 @@ impl SqliteJournal {
                 .with_conn_fenced(|tx| {
                     tx.execute("DELETE FROM host_entries", [])?;
                     tx.execute("DELETE FROM host_values", [])?;
+                    tx.execute_batch("DROP TABLE IF EXISTS fill_source_entries;")?;
                     write_diff(tx, &Snapshot::default(), &snapshot)?;
                     put_value(tx, IMPORTED, &true)
                 })
@@ -162,6 +163,7 @@ impl SqliteJournal {
             fs::rename(&legacy, directory.join("journal.json.imported"))?;
             File::open(directory)?.sync_all()?;
         }
+        crate::jobs::fill_source::remove_unreferenced(directory, &snapshot.per_job.fill_sources)?;
         Ok((
             Self {
                 store,
@@ -179,7 +181,7 @@ impl SqliteJournal {
     /// motor-host is stopped: the store's lease refuses a second writer.
     pub fn export(directory: &Path) -> io::Result<PathBuf> {
         let (journal, snapshot) = Self::open(directory)?;
-        let (mut file, _) = FileJournal::open(directory)?;
+        let mut file = FileJournal::for_export(directory)?;
         file.store(&snapshot)?;
         journal
             .store
@@ -360,6 +362,42 @@ fn write_job_ledger(
     diff_job_entries(tx, "image", &old.images, &new.images)?;
     diff_job_entries(tx, "fill", &old.fills, &new.fills)?;
     diff_job_entries(tx, "execution", &old.executions, &new.executions)
+        .and_then(|()| write_fill_sources(tx, old, new))
+}
+
+fn write_fill_sources(
+    tx: &Transaction<'_>,
+    old: &crate::state::jobs::Ledger,
+    new: &crate::state::jobs::Ledger,
+) -> rusqlite::Result<()> {
+    if old.fill_sources == new.fill_sources && old.export_tips == new.export_tips {
+        return Ok(());
+    }
+    // Older hosts query only their known tables. Keep optional source metadata
+    // separate so a rollback can still load and update its job/lease records.
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS fill_source_entries (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;")?;
+    diff_source_entries(tx, "slot", &old.fill_sources, &new.fill_sources)?;
+    diff_source_entries(tx, "export", &old.export_tips, &new.export_tips)
+}
+
+fn diff_source_entries<V: Serialize + PartialEq>(
+    tx: &Transaction<'_>,
+    kind: &str,
+    old: &BTreeMap<String, V>,
+    new: &BTreeMap<String, V>,
+) -> rusqlite::Result<()> {
+    for (key, value) in new {
+        if old.get(key) != Some(value) {
+            tx.execute("INSERT INTO fill_source_entries(kind,key,value) VALUES (?1,?2,?3) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value", params![kind,key,to_json(value)?])?;
+        }
+    }
+    for key in old.keys().filter(|key| !new.contains_key(*key)) {
+        tx.execute(
+            "DELETE FROM fill_source_entries WHERE kind=?1 AND key=?2",
+            params![kind, key],
+        )?;
+    }
+    Ok(())
 }
 
 fn diff_job_entries<V: Serialize + PartialEq>(
@@ -387,6 +425,30 @@ fn diff_job_entries<V: Serialize + PartialEq>(
 }
 
 fn load_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
+    let mut snapshot = load_job_snapshot(conn)?;
+    let exists: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='fill_source_entries')", [], |row| row.get(0))?;
+    if exists {
+        let mut entries = conn.prepare("SELECT kind,key,value FROM fill_source_entries")?;
+        let mut rows = entries.query([])?;
+        while let Some(row) = rows.next()? {
+            let (kind, key, value): (String, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            match kind.as_str() {
+                "slot" => drop(
+                    snapshot
+                        .per_job
+                        .fill_sources
+                        .insert(key, from_json(&value)?),
+                ),
+                "export" => drop(snapshot.per_job.export_tips.insert(key, from_json(&value)?)),
+                _ => return Err(unknown("fill source entry kind", &kind)),
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
+fn load_job_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
     let mut snapshot = load(conn)?;
     let exists: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_vm_entries')",
@@ -714,4 +776,96 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
         assert_eq!(load(&conn).unwrap(), legacy);
         assert_eq!(load_snapshot(&conn).unwrap(), current);
     }
+}
+#[cfg(test)]
+fn source_slot_fixture() -> crate::jobs::fill_source::Slot {
+    crate::jobs::fill_source::Slot {
+        request: crate::jobs::fill_source::Request {
+            account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            repository_root: "/home/source".into(),
+            integration_tip: "a".repeat(40),
+            mem_mib: 100,
+            observed_ms: 1,
+        },
+        generation: "referenced".into(),
+        source: motor_protocol::FillSource {
+            repository_root: "/home/source".into(),
+            integration_tip: "a".repeat(40),
+            bundles: vec![],
+            git_dependencies: vec![],
+        },
+        bytes: 1,
+        last_fill_started_ms: None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fill_source_table_is_lazy_and_the_legacy_job_loader_can_update_old_state() {
+    let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+    let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+    let exists = || {
+        Connection::open(dir.path().join("store.db")).unwrap().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='fill_source_entries')", [], |row| row.get::<_, bool>(0)).unwrap()
+    };
+    assert!(!exists());
+    journal.store(&snapshot).unwrap();
+    assert!(!exists());
+    let slot = source_slot_fixture();
+    snapshot
+        .per_job
+        .export_tips
+        .insert("job".into(), slot.request.clone());
+    snapshot.per_job.fill_sources.insert("slot".into(), slot);
+    journal.store(&snapshot).unwrap();
+    assert!(exists());
+    drop(journal);
+    let mut conn = Connection::open(dir.path().join("store.db")).unwrap();
+    // This is the unchanged loader used before fill sources existed: it reads
+    // host and job tables, never enumerating unrelated additive tables.
+    let legacy = load_job_snapshot(&conn).unwrap();
+    assert!(legacy.per_job.fill_sources.is_empty());
+    assert!(legacy.per_job.export_tips.is_empty());
+    let mut updated = legacy.clone();
+    updated.draining = true;
+    let tx = conn.transaction().unwrap();
+    write_diff(&tx, &legacy, &updated).unwrap();
+    tx.commit().unwrap();
+    assert!(load_job_snapshot(&conn).unwrap().draining);
+    let restored = load_snapshot(&conn).unwrap();
+    assert_eq!(restored.per_job.fill_sources, snapshot.per_job.fill_sources);
+    assert_eq!(restored.per_job.export_tips, snapshot.per_job.export_tips);
+}
+
+#[cfg(test)]
+#[test]
+fn open_removes_unreferenced_source_generations_before_admission_and_export_keeps_referenced_files()
+{
+    let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+    let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+    snapshot
+        .per_job
+        .fill_sources
+        .insert("slot".into(), source_slot_fixture());
+    journal.store(&snapshot).unwrap();
+    for name in [
+        "referenced",
+        "renamed-before-commit",
+        "incoming-interrupted",
+    ] {
+        let path = crate::jobs::fill_source::directory(dir.path(), name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("0"), b"x").unwrap();
+    }
+    drop(journal);
+    let (journal, restored) = SqliteJournal::open(dir.path()).unwrap();
+    assert_eq!(restored.per_job.fill_sources, snapshot.per_job.fill_sources);
+    let referenced = crate::jobs::fill_source::directory(dir.path(), "referenced");
+    assert!(referenced.join("0").exists());
+    assert!(!crate::jobs::fill_source::directory(dir.path(), "renamed-before-commit").exists());
+    assert!(!crate::jobs::fill_source::directory(dir.path(), "incoming-interrupted").exists());
+    drop(journal);
+    SqliteJournal::export(dir.path()).unwrap();
+    let (_, exported) = FileJournal::open(dir.path()).unwrap();
+    assert_eq!(exported.per_job.fill_sources, snapshot.per_job.fill_sources);
+    assert!(referenced.join("0").exists());
 }

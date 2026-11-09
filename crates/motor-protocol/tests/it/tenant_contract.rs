@@ -389,3 +389,19 @@ fn host_attach_deadline_outlasts_guest_runner_readiness_wait() {
         "host attach deadline {TENANT_ATTACH_READ_DEADLINE:?} must exceed the guest readiness wait {TENANT_RUNNER_READINESS_WAIT:?} by at least 10 s"
     );
 }
+#[test]
+fn fill_source_operations_round_trip_generated_vectors_without_caller_frame_changes() {
+    for name in ["export-tip", "fill"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../test-vectors/exec-remote-v1/guest-agent/{name}.json"
+        ));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let request: TenantAgentRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+    }
+    assert!(serde_json::from_value::<TenantAgentRequest>(
+        serde_json::json!({"op":"unknown_fill_operation"})
+    )
+    .is_err());
+}

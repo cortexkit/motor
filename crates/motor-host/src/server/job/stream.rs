@@ -18,10 +18,24 @@ pub(crate) struct Stream {
     input: Mutex<Option<mpsc::Sender<Input>>>,
     running: AtomicBool,
     upload_detached: AtomicBool,
+    terminal_delivered: AtomicBool,
     #[cfg(test)]
     crash: AtomicBool,
+    #[cfg(test)]
+    export_limit: Mutex<Option<Duration>>,
 }
 impl Stream {
+    fn export_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(limit) = *self.export_limit.lock().unwrap() {
+            return limit;
+        }
+        Duration::from_secs(motor_protocol::FILL_SOURCE_EXPORT_TIMEOUT_S)
+    }
+    #[cfg(test)]
+    pub(super) fn set_export_timeout(&self, limit: Duration) {
+        *self.export_limit.lock().unwrap() = Some(limit);
+    }
     pub(super) fn expire_chunks(&self, now_ms: u64) -> Result<()> {
         let end = self
             .host
@@ -148,8 +162,11 @@ impl Runtime {
             input: Mutex::new(None),
             running: AtomicBool::new(false),
             upload_detached: AtomicBool::new(false),
+            terminal_delivered: AtomicBool::new(false),
             #[cfg(test)]
             crash: AtomicBool::new(false),
+            #[cfg(test)]
+            export_limit: Mutex::new(None),
         });
         streams.insert(job.to_owned(), stream.clone());
         Ok(stream)
@@ -258,6 +275,7 @@ async fn collect(
         std::collections::VecDeque<oneshot::Sender<Vec<u8>>>,
     >::new());
     let upload = async {
+        let default_branch_tip = prelude.as_ref().is_some_and(|(_, p)| p.default_branch_tip);
         let mut upload = Upload::default();
         if let Some((id, p)) = &mut prelude {
             p.spool.file.flush().await?;
@@ -279,6 +297,13 @@ async fn collect(
                     };
                     let mut host = runtime.host.lock().expect("host lock");
                     host.job_relayed_run(&claims.jti, !run.return_paths.is_empty())?;
+                    if let Err(error) = if default_branch_tip {
+                        host.note_fill_source(&claims.jti, &run, unix_ms())
+                    } else {
+                        Ok(())
+                    } {
+                        tracing::warn!(jti=claims.jti, %error, "fill_export_setup_failed");
+                    }
                     host.delivered(*id)?;
                 }
                 upload.observe(&frame.value)?;
@@ -300,6 +325,13 @@ async fn collect(
                 biased;
                 Some(input) = commands.recv() => {
                     let frame = crate::replay::decode(&input.bytes)?;
+                    if default_branch_tip && frame["type"] == "run" {
+                        if let Ok(motor_protocol::Frame::Run(run)) = serde_json::from_value(frame.clone()) {
+                            if let Err(error) = runtime.host.lock().expect("host lock").note_fill_source(&claims.jti, &run, unix_ms()) {
+                                tracing::warn!(jti=claims.jti, %error, "fill_export_setup_failed");
+                            }
+                        }
+                    }
                     upload.observe(&frame)?;
                     if let Some(reply) = input.reply {
                         let kind = format!("{}_reply", frame["type"].as_str().context("control type")?);
@@ -379,11 +411,77 @@ async fn collect(
                 }
             }
             if terminal {
-                write_frame(
-                    &mut *write.lock().await,
-                    &json!({"type":"terminal_stored","jti":claims.jti}),
-                )
-                .await?;
+                let host = runtime.host.clone();
+                let control = runtime.control.clone();
+                let job = claims.jti.clone();
+                let limit = store.export_timeout();
+                let deadline = std::time::Instant::now() + limit;
+                let due = host
+                    .lock()
+                    .expect("host lock")
+                    .snapshot
+                    .per_job
+                    .export_tips
+                    .contains_key(&job);
+                // The terminal is already durable and billing has ended. Do not
+                // make a connected caller wait for maintenance before seeing it.
+                let export = async {
+                    while due
+                        && !resume
+                        && !store.terminal_delivered.load(Ordering::Acquire)
+                        && !store.upload_detached.load(Ordering::Acquire)
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if !due {
+                        return Ok(());
+                    }
+                    tokio::task::spawn_blocking(move || {
+                        crate::jobs::fill_source::export(&host, &*control, &job, deadline)
+                    })
+                    .await?
+                };
+                let timed_out = match tokio::time::timeout(limit, export).await {
+                    Ok(Ok(())) => false,
+                    Ok(Err(error)) => {
+                        tracing::warn!(jti=claims.jti, %error, "fill_export_failed");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!(jti = claims.jti, "fill_export_timed_out");
+                        true
+                    }
+                };
+                {
+                    let mut host = runtime.host.lock().expect("host lock");
+                    let mut next = host.snapshot.clone();
+                    next.per_job.export_tips.remove(&claims.jti);
+                    if let Err(error) = host.save(next) {
+                        tracing::warn!(%error, "fill_export_release_failed");
+                    }
+                }
+                let acknowledged = if timed_out {
+                    false
+                } else {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                        write_frame(
+                            &mut *write.lock().await,
+                            &json!({"type":"terminal_stored","jti":claims.jti}),
+                        )
+                        .await
+                    })
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+                };
+                if !acknowledged {
+                    // The guest may be stuck exporting or no longer reading its
+                    // job channel. Its already committed terminal still wins;
+                    // a hard stop quarantines only the unfinished disk cleanup.
+                    let runtime = runtime.clone();
+                    let job = claims.jti.clone();
+                    tokio::task::spawn_blocking(move || runtime.stop_job(&job, false, true))
+                        .await??;
+                }
                 return Ok::<(), anyhow::Error>(());
             }
         }
@@ -494,6 +592,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     minimum = seq.saturating_add(1);
                 }
                 if value["type"] == "terminal" {
+                    stream.terminal_delivered.store(true, Ordering::Release);
                     // Billing acknowledgements are host metadata, not runner
                     // output. Reuse their durable record after the stored
                     // terminal on live streams and reattached streams alike.

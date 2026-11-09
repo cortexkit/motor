@@ -959,7 +959,8 @@ impl LinuxJobs {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&boundary)?;
             let nonce = self.stage_start_cache(&start, &boundary_fd, uid)?;
-            let requests = boot_requests(&start, tap_index, nonce.as_deref(), meta.len())?;
+            let requests =
+                recorded_boot_requests(&start, tap_index, nonce.as_deref(), meta.len(), &registry)?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             fs::chown(&File::open(&root)?, uid)?;
@@ -1233,6 +1234,43 @@ fn checked_boot_command_line(line: String) -> Result<String> {
         ));
     }
     Ok(line)
+}
+
+fn authorize_fill_boot(requests: &mut [(&str, Value)], role: job::WorkspaceRole) -> Result<()> {
+    // Only the root-owned disk registry grants fill authority. In particular,
+    // Start.kind alone must never give a job disk access to the fill operation.
+    if role == job::WorkspaceRole::Fill {
+        let (_, boot) = requests
+            .iter_mut()
+            .find(|(path, _)| *path == "/boot-source")
+            .ok_or_else(|| Error("missing boot source".into()))?;
+        let args = boot["boot_args"]
+            .as_str()
+            .ok_or_else(|| Error("missing boot arguments".into()))?;
+        boot["boot_args"] = checked_boot_command_line(format!("{args} motor.fill=1"))?.into();
+    }
+    Ok(())
+}
+
+/// Boot settings derived from the disk registry opened by the root helper.
+/// Unlike `Start.kind`, that record is not an input from the host agent.
+#[doc(hidden)]
+pub fn recorded_boot_requests(
+    start: &Start,
+    tap_index: Option<u8>,
+    nonce: Option<&str>,
+    workspace_bytes: u64,
+    registry: &job::Workspace,
+) -> Result<Vec<(&'static str, Value)>> {
+    if registry.account != start.account
+        || registry.workspace_disk_id != start.workspace_disk_id
+        || !registry.role.permits(start.kind)
+    {
+        return Err(Error("workspace registry does not permit boot".into()));
+    }
+    let mut requests = boot_requests(start, tap_index, nonce, workspace_bytes)?;
+    authorize_fill_boot(&mut requests, registry.role)?;
+    Ok(requests)
 }
 
 fn boot_command_line(start: &Start, nonce: Option<&str>, workspace_bytes: u64) -> Result<String> {

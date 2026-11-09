@@ -119,6 +119,11 @@ def upload(start, accepted, end):
 
 
 def main():
+    emit("guest-agent", "export-tip", {"op": "export_tip", "job_id": JOB,
+                                       "max_bytes": 1073741824})
+    emit("guest-agent", "fill", {"op": "fill", "source": {
+        "repository_root": REPO, "integration_tip": TIP,
+        "bundles": [BUNDLES[0]]}})
     home_bundles = [
         {**manifest, "repository": repository}
         for manifest, repository in zip(BUNDLES, [HOME_REPO, HOME_SIBLING])

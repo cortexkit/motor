@@ -273,6 +273,9 @@ impl Runtime {
         }
         self.probe_storage();
         let mut failure = self.collect_job_exits(now_ms).err();
+        if let Err(error) = self.host.lock().expect("host lock").clean_fill_sources() {
+            failure.get_or_insert(error);
+        }
         let due: Vec<_> = {
             let host = self.host.lock().expect("host lock");
             let crate::config::HostSettings::PerJob(settings) = &host.settings else {
@@ -1017,6 +1020,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 client,
                 ready.take().unwrap(),
                 Replay {
+                    default_branch_tip: hello.value["default_branch_tip"] == true,
                     spool,
                     reader,
                     have_replies,
@@ -1107,6 +1111,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
 }
 
 struct Replay {
+    default_branch_tip: bool,
     spool: Spool,
     reader: Reader,
     have_replies: usize,

@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::PathBuf;
 
+pub mod fill_source;
 pub mod fills;
 pub mod images;
 

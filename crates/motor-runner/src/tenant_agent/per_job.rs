@@ -129,7 +129,11 @@ pub(super) fn args() -> io::Result<RunnerArgs> {
         .map_err(|error| failure("job_vm_args_invalid", error))?;
     let mut args =
         RunnerArgs::read(Path::new(ARGS)).map_err(|error| failure("job_vm_args_invalid", error))?;
-    args.words.push("--per-job".into());
+    if !crate::fill_source::fill_boot(&fs::read_to_string("/proc/cmdline")?) {
+        args.words.push("--per-job".into());
+    }
+    // A future root-owned repository allowlist must render the same fixed-path
+    // policy for Job and Fill boots. Guest-exported metadata cannot enable it.
     Ok(args)
 }
 

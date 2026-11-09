@@ -36,7 +36,7 @@ fn trusted_ancestors(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn bind(directory: &Path, name: &str, owner: u32) -> io::Result<UnixListener> {
+pub(crate) fn bind(directory: &Path, name: &str, owner: u32) -> io::Result<UnixListener> {
     private_directory(directory, owner)?;
     let path = directory.join(name);
     match std::fs::symlink_metadata(&path) {
@@ -120,7 +120,7 @@ async fn serve_listeners(
     tokio::select! { result = lifecycle => result, result = connections => result }
 }
 
-async fn admin_session(runner: Runner, mut socket: UnixStream) -> io::Result<()> {
+pub(crate) async fn admin_session(runner: Runner, mut socket: UnixStream) -> io::Result<()> {
     let len = socket.read_u32().await? as usize;
     if len == 0 || len > MAX_FRAME_BYTES {
         return Err(io::Error::other("invalid admin frame length"));
@@ -128,6 +128,20 @@ async fn admin_session(runner: Runner, mut socket: UnixStream) -> io::Result<()>
     let mut bytes = vec![0; len];
     socket.read_exact(&mut bytes).await?;
     let request: TenantAgentRequest = serde_json::from_slice(&bytes)?;
+    #[cfg(target_os = "linux")]
+    if matches!(
+        request,
+        TenantAgentRequest::Fill { .. } | TenantAgentRequest::ExportTip { .. }
+    ) {
+        if let Err(error) = crate::fill_source::control(runner, request, &mut socket).await {
+            crate::tenant_agent::write_json(
+                &mut socket,
+                &json!({"ok":false,"error":error.to_string()}),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     let reply = dispatch(runner, request).await?;
     let bytes = serde_json::to_vec(&reply)?;
     socket.write_u32(bytes.len() as u32).await?;

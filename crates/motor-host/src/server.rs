@@ -298,6 +298,7 @@ impl Runtime {
             .values()
             .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
             .collect();
+        let host = Arc::new(Mutex::new(host));
         Arc::new(Self {
             job_resources: Arc::new(crate::jobs::Unavailable),
             image_generations: None,
@@ -305,13 +306,15 @@ impl Runtime {
             job_exits: Mutex::new(()),
             job_launches: Mutex::new(BTreeMap::new()),
             job_recoveries: Mutex::new(BTreeMap::new()),
-            job_fills: Mutex::new(crate::jobs::fills::Scheduler::default()),
+            job_fills: Mutex::new(crate::jobs::fills::Scheduler::new(Arc::new(
+                crate::jobs::fills::BundleFillGuest { host: host.clone() },
+            ))),
             job_balloon: Mutex::new(Default::default()),
             job_streams: Mutex::new(BTreeMap::new()),
             broker_endpoint,
             jwks_url,
             host_id,
-            host: Arc::new(Mutex::new(host)),
+            host,
             keys: RwLock::new(KeySet::default()),
             control,
             event_workers: Mutex::new(BTreeSet::new()),

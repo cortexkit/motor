@@ -62,6 +62,7 @@ fn run(job: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    fill_export: Mutex<Option<UnixStream>>,
     capacity_available: AtomicBool,
     fail_ensure: AtomicBool,
     ensured_caps: Mutex<Vec<u64>>,
@@ -224,6 +225,14 @@ impl Control for Fake {
         Ok(())
     }
     fn job_relay(&self, _: &str, port: u32) -> Result<UnixStream> {
+        if port == 54 {
+            return self
+                .fill_export
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("export unavailable"));
+        }
         if port == 53 {
             return self
                 .lifecycle

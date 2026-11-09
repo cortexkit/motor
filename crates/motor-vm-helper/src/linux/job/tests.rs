@@ -991,3 +991,30 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     run(&["stop", "motorvmtest.slice"]);
     std::fs::remove_dir_all(base).unwrap();
 }
+#[test]
+fn fill_boot_authority_comes_from_the_root_disk_role_not_the_requested_start_kind() {
+    let mut start = start();
+    start.kind = job::VmKind::Fill;
+    let mut requested = boot_requests(&start, Some(7), None, 4u64 << 30).unwrap();
+    let boot = |requests: &[(&str, Value)]| {
+        requests
+            .iter()
+            .find(|(path, _)| *path == "/boot-source")
+            .unwrap()
+            .1["boot_args"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(!boot(&requested)
+        .split_whitespace()
+        .any(|word| word == "motor.fill=1"));
+    authorize_fill_boot(&mut requested, job::WorkspaceRole::Job).unwrap();
+    assert!(!boot(&requested)
+        .split_whitespace()
+        .any(|word| word == "motor.fill=1"));
+    authorize_fill_boot(&mut requested, job::WorkspaceRole::Fill).unwrap();
+    assert!(boot(&requested)
+        .split_whitespace()
+        .any(|word| word == "motor.fill=1"));
+}

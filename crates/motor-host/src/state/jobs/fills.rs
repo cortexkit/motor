@@ -96,6 +96,13 @@ impl Host {
             generation.accounts.entry(account.into()).or_insert(false);
         }
         next.per_job.fills.insert(id.clone(), reservation.clone());
+        for slot in next.per_job.fill_sources.values_mut().filter(|slot| {
+            slot.request.account == account
+                && crate::jobs::fill_source::repository_key(&slot.request.repository_root)
+                    == repository_key
+        }) {
+            slot.last_fill_started_ms = Some(now_ms);
+        }
         if let Err(error) = self.reserve_storage(&mut next, "", now_ms) {
             if error.error.refusal() == Refusal::HostFull {
                 return Ok(None);
