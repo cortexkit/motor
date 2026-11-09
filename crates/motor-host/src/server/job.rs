@@ -529,6 +529,40 @@ struct Raw {
     bytes: Vec<u8>,
     value: Value,
 }
+
+#[derive(Debug)]
+enum SessionRefusal {
+    CapabilitiesChanged,
+    TransferInterrupted,
+    SpoolExceeded,
+}
+impl SessionRefusal {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::CapabilitiesChanged => "request_rejected",
+            Self::TransferInterrupted | Self::SpoolExceeded => "transfer_interrupted",
+        }
+    }
+}
+impl std::fmt::Display for SessionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CapabilitiesChanged => "assigned image capabilities changed",
+            Self::TransferInterrupted => "queued upload interrupted",
+            Self::SpoolExceeded => "queued upload exceeds reserved spool",
+        })
+    }
+}
+impl std::error::Error for SessionRefusal {}
+
+fn client_io(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<std::io::Error>().is_some() {
+        error.context(SessionRefusal::TransferInterrupted)
+    } else {
+        error
+    }
+}
+
 #[derive(Default)]
 struct Reader {
     buffered: Vec<u8>,
@@ -766,7 +800,7 @@ async fn boot(
     };
     ensure!(
         crate::jobs::hello_covers(&actual, &promised_hello(assignment, &hello.value)),
-        "assigned image capabilities changed"
+        SessionRefusal::CapabilitiesChanged
     );
     runtime
         .host
@@ -786,7 +820,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     id: u64,
     client: &mut S,
 ) -> Result<()> {
-    write_frame(client, &json!({"type":"lease_ok"})).await?;
+    let acknowledged = write_frame(client, &json!({"type":"lease_ok"})).await;
     let execution = runtime
         .host
         .lock()
@@ -796,6 +830,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         .executions[&claims.jti]
         .clone();
     if execution.boot_started && !execution.ended {
+        acknowledged?;
         let delivered =
             runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].delivered;
         let cancelled = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].state
@@ -809,32 +844,31 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         return live(&runtime, claims, client).await;
     }
     if claims.purpose == Purpose::Attach {
+        acknowledged?;
         return live(&runtime, claims, client).await;
     }
-    let result = session(&runtime, claims, id, client).await;
+    let result = match acknowledged {
+        Ok(()) => session(&runtime, claims, id, client).await,
+        Err(error) => Err(client_io(error)),
+    };
     if let Err(error) = result {
         if runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].delivered {
             tracing::debug!(jti = claims.jti, %error, "job_caller_detached");
             return Ok(());
         }
         tracing::warn!(jti = claims.jti, %error, "job_boot_or_delivery_failed");
-        if matches!(
-            error.to_string().as_str(),
-            "assigned image capabilities changed"
-                | "queued upload exceeds reserved spool"
-                | "queued upload interrupted"
-        ) {
-            let reason = if error.to_string() == "assigned image capabilities changed" {
-                "request_rejected"
-            } else {
-                "transfer_interrupted"
-            };
-            let frame = refusal(&claims.jti, reason, &error.to_string());
-            runtime.host.lock().expect("host lock").job_refused(
-                &claims.jti,
-                frame.clone(),
-                unix_ms(),
-            )?;
+        if let Some(refused) = error.downcast_ref::<SessionRefusal>() {
+            let reason = refused.reason();
+            let frame = refusal(&claims.jti, reason, &format!("{error:#}"));
+            {
+                let mut host = runtime.host.lock().expect("host lock");
+                // The independent spool replay may deliver Run while the caller
+                // disconnects. Refusal and delivery must race under the same lock.
+                if host.snapshot.leases[&claims.jti].delivered {
+                    return Ok(());
+                }
+                host.job_refused(&claims.jti, frame.clone(), unix_ms())?;
+            }
             let r = runtime.clone();
             let job = claims.jti.clone();
             tokio::task::spawn_blocking(move || r.stop_job(&job, true, false)).await??;
@@ -881,10 +915,14 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let expires = tokio::time::Instant::now()
         + Duration::from_millis(claims.exp.saturating_mul(1000).saturating_sub(unix_ms()));
     let mut reader = Reader::default();
-    let hello = tokio::time::timeout_at(expires, reader.next(client)).await??;
+    let hello = tokio::time::timeout_at(expires, reader.next(client))
+        .await?
+        .map_err(client_io)?;
     ensure!(hello.value["type"] == "hello", "expected hello");
     spool.append(&hello).await?;
-    write_frame(client, &promised_hello(&assignment, &hello.value)).await?;
+    write_frame(client, &promised_hello(&assignment, &hello.value))
+        .await
+        .map_err(client_io)?;
     let mut have_replies = 0usize;
     let mut withdraw_replies = 0usize;
     let mut accepted = false;
@@ -946,17 +984,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             },
             _ = tokio::time::sleep_until(expires), if !accepted => anyhow::bail!("queued lease expired"),
             frame = reader.next(client) => {
-                let frame = match frame {
-                    Err(error) if accepted && error.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) => {
-                        // Run is still in the host spool, so EOF here proves
-                        // that the runner could not have started the command.
-                        anyhow::bail!("queued upload interrupted");
-                    },
-                    result => result?,
-                };
+                let frame = frame.map_err(client_io)?;
                 if spool.append(&frame).await.is_err() {
-                    anyhow::bail!("queued upload exceeds reserved spool");
+                    anyhow::bail!(SessionRefusal::SpoolExceeded);
                 }
                 if cancel(runtime, claims, client, &frame.value, queue_clock.observe(false), queue_limit_ms).await? { return Ok(()); }
                 if frame.value["type"] == "withdraw" { withdraw_replies += 1; }
@@ -964,7 +994,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     Some("have") if !accepted => {
                         let motor_protocol::Frame::Have { repositories, git_dependencies } = serde_json::from_value(frame.value)? else { unreachable!() };
                         let reply = runtime.host.lock().expect("host lock").job_have(&claims.jti, repositories, git_dependencies);
-                        write_frame(client, &serde_json::to_value(reply)?).await?;
+                        write_frame(client, &serde_json::to_value(reply)?).await.map_err(client_io)?;
                         have_replies += 1;
                     },
                     Some("run") if !accepted => {
@@ -982,7 +1012,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         };
                         let mut reply = motor_protocol::Accepted::new(run.job_id, position as u32).with_platform(motor_protocol::Platform::Linux);
                         if let Some(network) = run.network { reply = reply.with_network(network); }
-                        write_frame(client, &serde_json::to_value(motor_protocol::Frame::Accepted(reply))?).await?;
+                        write_frame(client, &serde_json::to_value(motor_protocol::Frame::Accepted(reply))?).await.map_err(client_io)?;
                         accepted = true;
                     },
                     Some("bundle_chunk") if accepted => {},
@@ -995,7 +1025,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 // Same-workspace ownership and VM setup are not capacity wait.
                 // This host refuses capacity at claim rather than queueing it.
                 let wait = accepted.then(|| queue_clock.observe(false));
-                write_frame(client, &json!({"type":"heartbeat","queue_wait_ms":wait})).await?;
+                write_frame(client, &json!({"type":"heartbeat","queue_wait_ms":wait})).await.map_err(client_io)?;
             },
         }
     }
@@ -1049,7 +1079,8 @@ async fn cancel<S: AsyncWrite + Unpin>(
             client,
             &json!({"type":"withdraw_reply","outcome":"started"}),
         )
-        .await?;
+        .await
+        .map_err(client_io)?;
         return Ok(false);
     }
     let mut terminal = refusal(

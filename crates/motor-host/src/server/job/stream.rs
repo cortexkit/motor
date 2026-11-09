@@ -446,7 +446,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 && !is_reply(&value)
                 && value["seq"].as_u64().is_none_or(|seq| seq >= minimum)
             {
-                write.write_all(&bytes).await?;
+                write
+                    .write_all(&bytes)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .map_err(client_io)?;
                 if value["type"] == "terminal" {
                     // Billing acknowledgements are host metadata, not runner
                     // output. Reuse their durable record after the stored
@@ -471,8 +475,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             request = reader.next(&mut read) => {
                 let request = match request {
                     Ok(request) => request,
-                    Err(error) if error.to_string() == "client closed before delivery" => return Ok(()),
-                    Err(error) => return Err(error),
+                    Err(error) if hello && error.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) => return Ok(()),
+                    Err(error) => return Err(client_io(error)),
                 };
                 if request.value["type"] == "heartbeat" { continue; }
                 ensure!(request.value["job_id"] == claims.jti, "foreign job request");
