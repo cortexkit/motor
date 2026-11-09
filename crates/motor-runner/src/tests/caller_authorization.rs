@@ -212,6 +212,7 @@ fn queue_base_skips_a_mapped_fill_that_nests_a_workspace_and_retries() {
     let blocker = format!("{fill}/sub");
     workspace::record_workspace_entry(&mut inner.catalog, &blocker, &blocker, "tip", &[], 0);
     let plan = || BasePlan {
+        base: None,
         tip: "tip".into(),
         command: "true".into(),
         explicit_command: true,
@@ -290,6 +291,7 @@ async fn reserved_bind_and_runner_name_refusals_precede_mutation_for_each_operat
         assert!(runner.drop_workspace(path).await.is_err());
         let mut inner = runner.core.inner.lock().unwrap();
         let plan = BasePlan {
+            base: None,
             tip: "tip".into(),
             command: "true".into(),
             explicit_command: true,
@@ -444,6 +446,7 @@ fn collision_table_accepts_admission_and_fill_beside_runner_tools() {
         let mut inner = runner.core.inner.lock().unwrap();
         let before = inner.jobs.len();
         let plan = BasePlan {
+            base: None,
             tip: "tip".into(),
             command: "true".into(),
             explicit_command: true,

@@ -634,6 +634,10 @@ pub(crate) struct PublishFailure {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Repository {
+    /// Last base-fill start in runner-clock milliseconds. The base scheduler
+    /// reads this to bound refills across restarts, even after base eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_base_fill_started_ms: Option<u64>,
     pub failure_detail: Option<String>,
     pub filled_descriptor: Option<String>,
     pub filled_descriptors: BTreeMap<String, u64>,
