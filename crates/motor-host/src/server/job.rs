@@ -303,6 +303,16 @@ impl Runtime {
                     }
                 }
             };
+            if !gone
+                && execution
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|e| e.stop.is_some())
+            {
+                if let Err(error) = self.stop_job(job, false, true) {
+                    failure.get_or_insert(error);
+                }
+            }
             if gone {
                 self.host
                     .lock()
@@ -560,18 +570,33 @@ async fn failed<S: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let job = claims.jti.clone();
     let r = runtime.clone();
-    tokio::task::spawn_blocking(move || r.stop_job(&job, true, true)).await??;
+    let stopped = tokio::task::spawn_blocking(move || r.stop_job(&job, true, true)).await?;
+    if let Err(error) = stopped {
+        let recorded = runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions[&claims.jti]
+            .evidence
+            .as_ref()
+            .is_some_and(|e| e.winner.is_some());
+        if !recorded {
+            return Err(error);
+        }
+        tracing::warn!(jti = claims.jti, %error, "job_stop_retry_pending");
+    }
     // A channel failure after delivery is not proof the command did not run.
     // Wait for the helper receipt (or the first-gone evidence deadline).
     loop {
         let pending = {
             let host = runtime.host.lock().expect("host lock");
             host.snapshot.leases[&claims.jti].delivered
-                && host
-                    .snapshot
-                    .billing
-                    .get(&claims.jti)
-                    .is_none_or(|b| b.usage.is_none())
+                && host.snapshot.per_job.executions[&claims.jti]
+                    .evidence
+                    .as_ref()
+                    .is_none_or(|e| e.winner.is_none())
         };
         if !pending {
             break;

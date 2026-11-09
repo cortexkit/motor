@@ -816,3 +816,36 @@ fn late_receipt_after_bound_cannot_add_egress_or_change_the_guest_winner() {
         &[exit(JOB, 3)]
     );
 }
+
+#[tokio::test]
+async fn host_stop_client_result_does_not_wait_for_usage_or_exit_delivery() {
+    let (runtime, fake, storage) = fixture();
+    running(&runtime, JOB, true, true);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .job_host_stop(JOB, StopCause::HostPressure, 400)
+        .unwrap();
+    fake.fail_poll.store(true, Ordering::Release);
+    let (mut client, mut server) = tokio::io::duplex(8192);
+    failed(&runtime, &claims(JOB), &mut server).await.unwrap();
+    let frame = read_frame(&mut client).await.unwrap();
+    assert_eq!(frame["type"], "terminal");
+    assert_eq!(frame["outcome"]["type"], "signal");
+    assert!(runtime.host.lock().unwrap().snapshot.billing[JOB]
+        .usage
+        .is_none());
+    assert!(storage.held.lock().unwrap().contains(JOB));
+    fake.fail_poll.store(false, Ordering::Release);
+    runtime.tick_jobs(500).unwrap();
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.billing[JOB]
+            .usage
+            .as_ref()
+            .unwrap()
+            .egress_bytes,
+        None
+    );
+    assert!(!storage.held.lock().unwrap().contains(JOB));
+}
