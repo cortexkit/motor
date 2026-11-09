@@ -2,10 +2,12 @@
 """Portable checks for the job-image split; no mounts, image builds or VM boots."""
 
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
 import runpy
+import socket
 import stat
 import subprocess
 import tempfile
@@ -86,8 +88,12 @@ class JobImageTests(unittest.TestCase):
             self.split()
 
     def test_split_removes_access_and_default_acls_without_following_links(self):
-        with mock.patch.object(os, "listxattr", return_value=["system.posix_acl_access", "system.posix_acl_default"]), \
-             mock.patch.object(os, "removexattr") as remove:
+        removed = set()
+        def attributes(path, **_kwargs):
+            return [name for name in ("system.posix_acl_access", "system.posix_acl_default")
+                    if (path, name) not in removed]
+        with mock.patch.object(os, "listxattr", side_effect=attributes), \
+             mock.patch.object(os, "removexattr", side_effect=lambda path, name, **_kwargs: removed.add((path, name))) as remove:
             self.split()
         self.assertTrue(remove.call_count)
         self.assertEqual({call.args[1] for call in remove.call_args_list},
@@ -95,6 +101,46 @@ class JobImageTests(unittest.TestCase):
         for call in remove.call_args_list:
             self.assertFalse(call.kwargs["follow_symlinks"])
             self.assertFalse(call.args[0].is_symlink())
+
+    def test_verifier_refuses_setuid_setgid_and_sticky_bits_on_files_and_directories(self):
+        self.split()
+        for path in (self.tools / "usr/local/bin/node", self.tools / "usr/local/bin"):
+            for bit in (stat.S_ISUID, stat.S_ISGID, stat.S_ISVTX):
+                with self.subTest(path=path, bit=bit):
+                    path.chmod(0o755 | bit)
+                    with self.assertRaisesRegex(ValueError, "special toolchain permission"):
+                        job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+                    path.chmod(0o755)
+
+    def test_verifier_refuses_fifo_and_socket_fixtures(self):
+        self.split()
+        fifo = self.tools / "fifo"
+        os.mkfifo(fifo, 0o644)
+        with self.assertRaisesRegex(ValueError, "unsupported toolchain file type"):
+            job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+        fifo.unlink()
+        sock = self.tools / "socket"
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(sock))
+            sock.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "unsupported toolchain file type"):
+                job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+
+    def test_verifier_refuses_access_and_default_acl_fixtures(self):
+        self.split()
+        leaf = self.tools / "usr/local/bin/node"
+        directory = leaf.parent
+        def access(path, name, **_kwargs):
+            if path == leaf and name == "system.posix_acl_access":
+                return b"fixture access ACL"
+            raise OSError(errno.ENODATA, "no ACL")
+        with mock.patch.object(os, "getxattr", side_effect=access), \
+             self.assertRaisesRegex(ValueError, "plainly world-readable"):
+            job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
+        with mock.patch.object(os, "listxattr", side_effect=lambda path, **_kwargs:
+                               ["system.posix_acl_default"] if path == directory else []), \
+             self.assertRaisesRegex(ValueError, "default toolchain ACL"):
+            job_images.verify_toolchain(self.tools, owner=os.geteuid(), group=os.getegid())
 
     def test_job_manifest_matches_helper_schema_and_hashes_real_files(self):
         (self.stage / "kernel").mkdir()
@@ -153,9 +199,9 @@ class JobImageTests(unittest.TestCase):
     def test_bootstrap_mounts_readonly_before_init_and_each_mount_failure_stops_boot(self):
         script = str(job_images.HERE / "guest/motor-job-toolchain-init")
         expected = [
-            ["/usr/bin/mount", "-t", "ext4", "-o", "ro,dax=always", "/dev/pmem0", "/toolchain"],
+            ["/usr/bin/mount", "-t", "ext4", "-o", "ro,nosuid,nodev,dax=always", "/dev/pmem0", "/toolchain"],
             ["/usr/bin/mount", "--bind", "/toolchain/usr/local", "/usr/local"],
-            ["/usr/bin/mount", "-o", "remount,bind,ro", "/usr/local"],
+            ["/usr/bin/mount", "-o", "remount,bind,ro,nosuid,nodev", "/usr/local"],
         ]
         with mock.patch.object(Path, "mkdir"), mock.patch.object(subprocess, "run") as run, mock.patch.object(os, "execv") as execute:
             runpy.run_path(script)

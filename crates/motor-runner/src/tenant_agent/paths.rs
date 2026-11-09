@@ -97,6 +97,17 @@ impl Directory {
     }
 
     pub(super) fn bind(&self, target: &Self, readonly: bool) -> io::Result<Self> {
+        self.bind_with_remount(
+            target,
+            readonly.then_some(libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY),
+        )
+    }
+
+    pub(super) fn bind_toolchain(&self, target: &Self) -> io::Result<Self> {
+        self.bind_with_remount(target, Some(TOOLCHAIN_BIND_FLAGS))
+    }
+
+    fn bind_with_remount(&self, target: &Self, remount: Option<libc::c_ulong>) -> io::Result<Self> {
         // Mount in this process while both directory fds are open. A child
         // mount command would lose the CLOEXEC fds before resolving these paths.
         let source_fd = CString::new(self.fd_path().as_os_str().as_bytes())?;
@@ -116,14 +127,14 @@ impl Directory {
         // Reopen the trusted target to get a descriptor on the new mount,
         // rather than remounting the directory hidden underneath it.
         let mounted = Self::absolute(target.path(), target.owner)?;
-        if readonly {
+        if let Some(flags) = remount {
             let mounted_fd = CString::new(mounted.fd_path().as_os_str().as_bytes())?;
             if unsafe {
                 libc::mount(
                     std::ptr::null(),
                     mounted_fd.as_ptr(),
                     std::ptr::null(),
-                    libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                    flags,
                     std::ptr::null(),
                 )
             } < 0
@@ -154,6 +165,9 @@ impl Directory {
         self.file.sync_all()
     }
 }
+
+const TOOLCHAIN_BIND_FLAGS: libc::c_ulong =
+    libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
 
 fn unsafe_path(path: &Path, reason: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("unsafe tenant path {}: {reason}", path.display()))
@@ -250,6 +264,16 @@ mod tests {
 
     fn uid() -> u32 {
         unsafe { libc::geteuid() }
+    }
+
+    #[test]
+    fn toolchain_bind_is_readonly_nosuid_nodev_but_executable() {
+        assert_ne!(TOOLCHAIN_BIND_FLAGS & libc::MS_BIND, 0);
+        assert_ne!(TOOLCHAIN_BIND_FLAGS & libc::MS_REMOUNT, 0);
+        assert_ne!(TOOLCHAIN_BIND_FLAGS & libc::MS_RDONLY, 0);
+        assert_ne!(TOOLCHAIN_BIND_FLAGS & libc::MS_NOSUID, 0);
+        assert_ne!(TOOLCHAIN_BIND_FLAGS & libc::MS_NODEV, 0);
+        assert_eq!(TOOLCHAIN_BIND_FLAGS & libc::MS_NOEXEC, 0);
     }
 
     /// A tenant root shaped like a fresh tenant disk: mode 0755 and no default

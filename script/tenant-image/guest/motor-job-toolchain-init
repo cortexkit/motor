@@ -5,8 +5,8 @@ from pathlib import Path
 import subprocess
 
 Path("/toolchain").mkdir(mode=0o755, exist_ok=True)
-subprocess.run(["/usr/bin/mount", "-t", "ext4", "-o", "ro,dax=always",
+subprocess.run(["/usr/bin/mount", "-t", "ext4", "-o", "ro,nosuid,nodev,dax=always",
                 "/dev/pmem0", "/toolchain"], check=True)
 subprocess.run(["/usr/bin/mount", "--bind", "/toolchain/usr/local", "/usr/local"], check=True)
-subprocess.run(["/usr/bin/mount", "-o", "remount,bind,ro", "/usr/local"], check=True)
+subprocess.run(["/usr/bin/mount", "-o", "remount,bind,ro,nosuid,nodev", "/usr/local"], check=True)
 os.execv("/sbin/init", ["/sbin/init"])

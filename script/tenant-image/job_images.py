@@ -26,6 +26,19 @@ def installer():
     return module
 
 
+def verify_toolchain(tools, owner=0, group=0):
+    shared = installer()
+    shared.verify_tool_trees((tools,), owner=owner, group=group)
+    for path in shared.tool_tree_entries(tools):
+        mode = path.lstat().st_mode
+        if stat.S_IFMT(mode) not in (stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK):
+            raise ValueError(f"unsupported toolchain file type: {path}")
+        if mode & 0o7000:
+            raise ValueError(f"special toolchain permission bits: {path}")
+        if not stat.S_ISLNK(mode) and "system.posix_acl_default" in os.listxattr(path, follow_symlinks=False):
+            raise ValueError(f"default toolchain ACL: {path}")
+
+
 def split_tree(root, tools, own=os.lchown, owner=0, group=0):
     # Move, rather than copy, preserves every symlink and executable bit. The
     # tenant ext4 has already been packed, so none of its bytes change here.
@@ -49,7 +62,7 @@ def split_tree(root, tools, own=os.lchown, owner=0, group=0):
             for attribute in ("system.posix_acl_access", "system.posix_acl_default"):
                 if attribute in os.listxattr(path, follow_symlinks=False):
                     os.removexattr(path, attribute, follow_symlinks=False)
-    shared.verify_tool_trees((tools,), owner=owner, group=group)
+    verify_toolchain(tools, owner=owner, group=group)
     init = root / "sbin/motor-init"
     text = init.read_text()
     original = 'exec /sbin/init "$@"'

@@ -368,6 +368,47 @@ fn runner_boot_refuses_invalid_shape_disk_and_oversized_command_line() {
     invalid.vcpus = 0;
     assert!(boot_requests(&invalid, Some(17), None, 4 << 30).is_err());
     assert!(boot_requests(&start(), Some(17), Some(&"a".repeat(2048)), 4 << 30).is_err());
+    assert!(checked_boot_command_line("a".repeat(JOB_BOOT_CMDLINE_MAX_BYTES)).is_err());
+    assert!(checked_boot_command_line("a".repeat(JOB_BOOT_CMDLINE_MAX_BYTES - 1)).is_ok());
+}
+
+#[test]
+fn cache_nonce_requires_exact_lowercase_hex_before_any_boot_request() {
+    for nonce in [
+        String::new(),
+        "0".repeat(31),
+        "0".repeat(33),
+        "A".repeat(32),
+        "g".repeat(32),
+        format!("+{}", "0".repeat(31)),
+        "é".repeat(16),
+        format!("{} injected=1", "0".repeat(21)),
+    ] {
+        for kind in [job::VmKind::Job, job::VmKind::Recovery] {
+            let mut shape = start();
+            shape.kind = kind;
+            assert!(boot_requests(&shape, Some(17), Some(&nonce), 4 << 30)
+                .unwrap_err()
+                .0
+                .contains("invalid job cache nonce"));
+        }
+    }
+}
+
+#[test]
+fn early_boot_budget_uses_the_same_checked_line_with_credentials_reserved() {
+    let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
+    for vcpus in [1, 32] {
+        for bytes in [4 << 30, u64::MAX - 511] {
+            let mut shape = start();
+            shape.vcpus = vcpus;
+            let early = early_boot_command_line(&shape, bytes).unwrap();
+            let actual = boot_requests(&shape, Some(17), Some(&nonce), bytes).unwrap();
+            assert_eq!(actual[1].1["boot_args"], early);
+            assert!(boot_command_line(&shape, None, bytes).unwrap().len() < early.len());
+            assert!(early.len() < JOB_BOOT_CMDLINE_MAX_BYTES);
+        }
+    }
 }
 
 #[test]
