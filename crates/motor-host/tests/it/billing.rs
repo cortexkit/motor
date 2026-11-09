@@ -1302,6 +1302,7 @@ async fn pending_restart_withdrawal_requires_authoritative_proof_and_late_starte
         control.relays.lock().unwrap().push(relay);
         let runtime = motor_host::server::Runtime::new("host".into(), h, control.clone());
         let worker_runtime = runtime.clone();
+        let (tick_done, after_tick) = std::sync::mpsc::channel();
         let guest = std::thread::spawn(move || {
             let verified = read_json(&mut guest).unwrap();
             assert_eq!(verified["type"], "verified_lease");
@@ -1313,6 +1314,11 @@ async fn pending_restart_withdrawal_requires_authoritative_proof_and_late_starte
                 read_json(&mut guest).unwrap(),
                 json!({"type":"withdraw", "job_id":JOB2})
             );
+            // The tick that launches withdrawal also checks for due VM stops. Reply
+            // only after it returns, so settlement cannot trigger a stop in that tick.
+            after_tick
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             if started_race {
                 worker_runtime
                     .host
@@ -1328,6 +1334,14 @@ async fn pending_restart_withdrawal_requires_authoritative_proof_and_late_starte
             write_json(&mut guest, &json!({"type":"withdraw_reply", "outcome":if started_race {"started"} else {"withdrawn"}})).unwrap();
         });
         runtime.tick(MS + 360_000).unwrap();
+        {
+            let host = runtime.host.lock().unwrap();
+            assert_eq!(host.snapshot.leases[JOB2].state, LeaseState::Admitted);
+            assert!(host.host_settled_frames(JOB2, 0).is_none());
+            assert!(host.stops_due().is_empty());
+        }
+        assert_eq!(control.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        tick_done.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), updates.changed())
             .await
             .unwrap()
