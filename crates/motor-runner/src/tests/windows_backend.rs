@@ -168,6 +168,7 @@ struct Agent {
     starts: AtomicU64,
     stops: AtomicU64,
     phase: AtomicU64,
+    phase_changed: tokio::sync::Notify,
     host_phase: AtomicU64,
     unit_exit_checked: AtomicBool,
     clock: AtomicU64,
@@ -177,6 +178,12 @@ struct Agent {
     sealed: Mutex<Vec<String>>,
     units: Mutex<Vec<Vec<String>>>,
     exit_reply: Mutex<Option<ExitReply>>,
+}
+impl Agent {
+    fn reached(&self, phase: u64) {
+        self.phase.store(phase, Ordering::SeqCst);
+        self.phase_changed.notify_one();
+    }
 }
 struct FakeChild {
     exit_code: i32,
@@ -223,7 +230,7 @@ impl UnitChild for FakeChild {
     }
 }
 fn stall(agent: &Agent, stop: &AtomicBool, phase: u64) {
-    agent.phase.store(phase, Ordering::SeqCst);
+    agent.reached(phase);
     while !stop.load(Ordering::SeqCst) {
         std::thread::park_timeout(Duration::from_millis(2));
     }
@@ -497,7 +504,7 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     return Ok(());
                 }
                 session.send(&mut port, &AgentFrame::TreeReceived {})?;
-                a.phase.store(3, Ordering::SeqCst);
+                a.reached(3);
                 let mut gate = session.receive(&mut port)?.unwrap();
                 let returns = if let AgentFrame::RequestReturns { request } = gate {
                     *a.returns.lock().unwrap() = Some(request.clone());
@@ -546,13 +553,17 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     return Ok(());
                 }
                 if fault == Fault::FloodOutput {
-                    for sequence in 0..96 {
+                    // Keep all 96 distinguishable byte runs, but pack two into
+                    // each frame: every frame incurs a chunk and durable index
+                    // update. 48 frames per stream still overfill the 32-slot
+                    // output queues while storage is paused.
+                    for sequence in (0..96).step_by(2) {
                         for stream in [Stream::Stdout, Stream::Stderr] {
                             session.send(
                                 &mut port,
                                 &AgentFrame::Output {
                                     stream,
-                                    bytes: vec![sequence; 256],
+                                    bytes: [vec![sequence; 256], vec![sequence + 1; 256]].concat(),
                                 },
                             )?;
                         }
@@ -726,11 +737,41 @@ fn checkout_notice(commit: &str) -> String {
 async fn phase(agent: &Agent, wanted: u64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while agent.phase.load(Ordering::SeqCst) != wanted {
-            tokio::task::yield_now().await;
+            // Preparation and the fake agent run on OS threads. Wait for their
+            // progress instead of competing with them for CPU via yield_now.
+            // notify_one retains a permit if progress races this single waiter.
+            agent.phase_changed.notified().await;
         }
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn windows_backend_phase_wait_does_not_busy_poll() {
+    struct WakeCount(AtomicU64);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let wakes = Arc::new(WakeCount(AtomicU64::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut context = std::task::Context::from_waker(&waker);
+    let agent = Agent::default();
+    let wait = phase(&agent, 1);
+    tokio::pin!(wait);
+    assert!(std::future::Future::poll(wait.as_mut(), &mut context).is_pending());
+    // Tokio defers yield_now's wake until the scheduler gets another turn.
+    tokio::task::yield_now().await;
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        0,
+        "phase wait scheduled itself without agent progress"
+    );
+    agent.reached(1);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    wait.await;
 }
 fn job_artifacts(c: &Config, id: Uuid) -> [PathBuf; 3] {
     let vm = c.windows.as_ref().unwrap();
@@ -1323,7 +1364,7 @@ async fn windows_backend_slow_output_storage_preserves_exit_and_ordered_streams(
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !runner.config().windows_runtime.output_blocked(r.job_id) {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
@@ -1565,7 +1606,7 @@ async fn windows_backend_missing_exit_is_unknown_but_post_exit_failures_preserve
             if fault == Fault::UnitExit {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while a.host_phase.load(Ordering::SeqCst) != 8 {
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 })
                 .await
@@ -1578,7 +1619,7 @@ async fn windows_backend_missing_exit_is_unknown_but_post_exit_failures_preserve
         if fault == Fault::CollectOversized {
             tokio::time::timeout(Duration::from_secs(90), async {
                 while runner.job_status(r.job_id).unwrap().terminal.is_none() {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
             .await
@@ -3452,7 +3493,7 @@ async fn windows_backend_withdrawal_during_boot_destroys_prepared_vm() {
             .starting
             .contains(&r.job_id)
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
