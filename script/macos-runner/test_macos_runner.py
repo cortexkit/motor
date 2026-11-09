@@ -813,9 +813,17 @@ class AutoLoginTests(unittest.TestCase):
             if rest == ("set-keychain-settings", self.keychain):
                 return ""
             self.assertEqual(rest[:3], ("default-keychain", "-d", "user"))
+            # As on macOS 27.2, reading or clearing a default that is unset, or
+            # names a removed keychain file, fails with "A default keychain
+            # could not be found."
+            missing = not self.default_keychain or not Path(self.default_keychain).exists()
             if len(rest) == 3:
+                if missing:
+                    raise subprocess.CalledProcessError(1, args)
                 return '"' + self.default_keychain + '"'
             self.assertEqual(rest[3], "-s")
+            if len(rest) == 4 and missing:
+                raise subprocess.CalledProcessError(1, args)
             self.default_keychain = str(rest[4]) if len(rest) == 5 else ""
         elif args[:2] == ("/usr/sbin/sshd", "-t"):
             pass
@@ -978,7 +986,9 @@ class AutoLoginTests(unittest.TestCase):
         self.assertIsNone(self.user)
         self.assertFalse(self.kc.exists())
         self.assertFalse(self.keychain.exists())
-        self.assertEqual(self.default_keychain, "")
+        # motor is left with no usable default keychain, as before the install.
+        with self.assertRaises(subprocess.CalledProcessError):
+            install.run(*install.as_motor("/usr/bin/security", "default-keychain", "-d", "user"))
 
     def test_missing_saved_password_does_not_rotate_existing_keychain(self):
         install.configure_login(self.account)

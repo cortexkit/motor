@@ -369,7 +369,15 @@ def restore_login():
     if backup.get("default_keychain"):
         run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s", backup["default_keychain"]))
     else:
-        run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s"))
+        # macOS refuses to clear a default that is unset or names a removed
+        # file ("A default keychain could not be found"), as when the install's
+        # keychain was the default and was just removed: nothing to clear then.
+        try:
+            run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user"))
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s"))
     # Revoke the installed credential without setting a guessable password or disabling the account.
     secret_run("/usr/bin/dscl", ".", "-passwd", "/Users/motor", secrets.token_urlsafe(32))
     if login_managed():
