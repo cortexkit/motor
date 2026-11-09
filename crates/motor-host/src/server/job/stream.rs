@@ -106,13 +106,9 @@ impl Runtime {
                     || host.host_settled_frames(job, 0).is_some(),
                 "finished job is missing its replay terminal"
             );
-            let execution = &host.snapshot.per_job.executions[job];
-            if execution.replay_reservation_bytes
-                == Some(
-                    crate::state::jobs::storage::REPLAY_RESERVATION_BYTES
-                        - crate::state::jobs::storage::RETURN_BYTES,
-                )
-            {
+            // A Run the host relayed without return paths can never produce
+            // returned chunks, so a reopened store accepts none.
+            if host.snapshot.per_job.executions[job].relayed_return_paths == Some(false) {
                 store.set_return_limit(0)?;
             }
             drop(host);
