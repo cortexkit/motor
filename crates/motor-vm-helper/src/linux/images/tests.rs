@@ -86,38 +86,7 @@ fn image_requests_are_identity_only_and_reject_paths_and_unknown_fields() {
 #[cfg(feature = "linux-root-tests")]
 mod root {
     use super::*;
-
-    struct ReflinkStore(PathBuf);
-    impl ReflinkStore {
-        fn new(scratch: &Path) -> Self {
-            let image = scratch.join("image-store.xfs");
-            File::create(&image)
-                .unwrap()
-                .set_len(512 * 1024 * 1024)
-                .unwrap();
-            assert!(Command::new("/usr/sbin/mkfs.xfs")
-                .args(["-q", "-f", "-m", "reflink=1"])
-                .arg(&image)
-                .status()
-                .unwrap()
-                .success());
-            let mount = scratch.join("image-store");
-            std::fs::create_dir(&mount).unwrap();
-            assert!(Command::new("/usr/bin/mount")
-                .args(["-o", "loop,nodev,nosuid,noexec"])
-                .arg(&image)
-                .arg(&mount)
-                .status()
-                .unwrap()
-                .success());
-            Self(mount)
-        }
-    }
-    impl Drop for ReflinkStore {
-        fn drop(&mut self) {
-            fs::unmount(&self.0).expect("unmount disposable XFS image store");
-        }
-    }
+    use crate::linux::root_test_support::ReflinkStore;
 
     fn root_scratch(name: &str) -> ScratchDir {
         assert_eq!(

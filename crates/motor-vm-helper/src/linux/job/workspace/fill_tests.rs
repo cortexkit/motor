@@ -1,4 +1,5 @@
 use super::*;
+use crate::linux::root_test_support::ReflinkStore;
 
 fn fixture() -> (PathBuf, LinuxJobs, job::Fill) {
     assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -132,6 +133,9 @@ fn isolated_fill_promotion_requires_publication_clean_exit_evidence_and_detachme
 #[test]
 fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_base() {
     let (base, mut jobs, fill) = fixture();
+    // Root scratch may be ext4; exercise real reflinks on a disposable XFS store.
+    let store = ReflinkStore::new(&base);
+    jobs.workspaces = store.0.join("workspaces");
     prepare_fill(&jobs.workspaces, &fill).unwrap();
     let source = jobs.workspaces.join(fill.disk_id()).join("workspace.img");
     std::fs::write(&source, vec![42; 4096]).unwrap();
@@ -185,6 +189,8 @@ fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_ba
         )
         .unwrap();
     assert!(matches!(denied.reply, Reply::StartRefused { .. }));
+    drop((clone, original));
+    drop(store);
     std::fs::remove_dir_all(base).unwrap();
 }
 
