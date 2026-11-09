@@ -433,6 +433,9 @@ impl Host {
     }
 
     pub(crate) fn warm_workspaces(&self, now_ms: u64) -> Vec<motor_lease::WarmVm> {
+        if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
+            return self.job_warm_workspaces();
+        }
         let mut entries = Vec::new();
         for (tenant, advert) in &self.advert {
             if !self.is_ready(tenant) || self.placement_stopping(tenant) {

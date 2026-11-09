@@ -95,6 +95,7 @@ fn full() -> Snapshot {
     s.per_job.executions.insert(
         JOB.into(),
         motor_host::state::jobs::Execution {
+            boot_started_at_ms: None,
             claims: claims(JOB),
             disk_id: "ws-test".into(),
             memory_debit_mib: 16_640,

@@ -9,6 +9,7 @@ pub mod config;
 pub mod enroll;
 pub mod helper;
 pub mod ingress;
+pub mod jobs;
 pub mod journal;
 mod lost_diagnostics;
 pub mod metrics;

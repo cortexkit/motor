@@ -37,6 +37,8 @@ pub struct Execution {
     pub memory_debit_mib: u64,
     pub guest_ram_mib: u64,
     pub boot_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_started_at_ms: Option<u64>,
     pub runner_hello: bool,
     pub ended: bool,
 }
@@ -69,6 +71,48 @@ pub fn guest_ram_mib(claims: &Claims) -> Option<u64> {
 }
 
 impl Host {
+    pub(super) fn job_warm_workspaces(&self) -> Vec<motor_lease::WarmVm> {
+        let mut entries: Vec<_> = self
+            .snapshot
+            .per_job
+            .disks
+            .iter()
+            .map(|(id, disk)| {
+                let busy =
+                    disk.quarantined || disk.attached_job.is_some() || !disk.queue.is_empty();
+                let used = self
+                    .snapshot
+                    .per_job
+                    .executions
+                    .values()
+                    .filter(|e| &e.disk_id == id)
+                    .map(|e| e.claims.iat)
+                    .max()
+                    .unwrap_or(0);
+                (
+                    busy,
+                    used,
+                    motor_lease::WarmVm {
+                        tenant: disk.sub.clone(),
+                        workspace_key_hash: disk.workspace_key_hash.clone(),
+                        vm: id.clone(),
+                        busy,
+                    },
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.vm.cmp(&b.2.vm))
+        });
+        entries
+            .into_iter()
+            .take(64)
+            .map(|(_, _, entry)| entry)
+            .collect()
+    }
+
     pub fn record_host_resources(&mut self, resources: HostResources) {
         self.host_resources = Some(resources);
     }
@@ -184,6 +228,7 @@ impl Host {
                 memory_debit_mib: debit,
                 guest_ram_mib: guest_ram_mib(claims).ok_or(RefusalCause::Memory)?,
                 boot_started: false,
+                boot_started_at_ms: None,
                 runner_hello: false,
                 ended: false,
             };
@@ -203,6 +248,20 @@ impl Host {
             next.per_job
                 .executions
                 .insert(claims.jti.clone(), execution);
+            next.leases.insert(
+                claims.jti.clone(),
+                super::Lease {
+                    claims: claims.clone(),
+                    tenant: claims.jti.clone(),
+                    state: super::LeaseState::Reserved,
+                    delivered: false,
+                    replacing: false,
+                    started_at_ms: None,
+                    ended_at_ms: None,
+                    highest_seq: 0,
+                    refusal: None,
+                },
+            );
             // Identity, queue position and memory debit become visible together,
             // before lease_ok and before any launch authorization is returned.
             self.save(next)?;
@@ -223,6 +282,14 @@ impl Host {
     /// Consumes the sole launch authorization. After restart, a job with
     /// boot_started set must not launch again, even if runner_hello was lost.
     pub fn begin_job_boot(&mut self, job: &str) -> Result<Option<Execution>, Error> {
+        self.begin_job_boot_at(job, self.observed_at_ms)
+    }
+
+    pub fn begin_job_boot_at(
+        &mut self,
+        job: &str,
+        now_ms: u64,
+    ) -> Result<Option<Execution>, Error> {
         let execution = self
             .snapshot
             .per_job
@@ -243,6 +310,7 @@ impl Host {
         let mut next = self.snapshot.clone();
         let execution = next.per_job.executions.get_mut(job).unwrap();
         execution.boot_started = true;
+        execution.boot_started_at_ms = Some(now_ms);
         let launch = execution.clone();
         next.per_job
             .disks
@@ -291,6 +359,71 @@ impl Host {
             disk.quarantined |= unclean;
         }
         self.save(next)
+    }
+
+    /// A stopped VM cannot prove a delivered command never ran. Keep delivery
+    /// evidence and use the lost rule even when no Started frame was observed.
+    pub fn job_boot_failed(&mut self, job: &str, now_ms: u64) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        let lease = next
+            .leases
+            .get_mut(job)
+            .ok_or(Error::Refused(Refusal::Auth))?;
+        if lease.state != super::LeaseState::Ended {
+            if lease.delivered {
+                let billing = next.billing.entry(job.to_owned()).or_default();
+                crate::billing::settle_lost(lease, billing, now_ms, now_ms);
+                billing.restart_pending = Some(false);
+                // Delivery without Started is still billed at the full cap.
+                let mut usage = motor_lease::Usage {
+                    job_id: job.to_owned(),
+                    vcpus: lease.claims.vcpus,
+                    started_at_ms: now_ms.saturating_sub(lease.claims.max_s.saturating_mul(1000)),
+                    ended_at_ms: now_ms,
+                    outcome: motor_lease::UsageOutcome::Lost,
+                    mem_peak_mib: None,
+                    mem_working_peak_mib: None,
+                    mem_over_mib_ms: None,
+                    egress_bytes: None,
+                    oom_kill: None,
+                };
+                // Keep the full cap even when now_ms is below the cap duration.
+                usage.ended_at_ms = usage
+                    .started_at_ms
+                    .saturating_add(lease.claims.max_s.saturating_mul(1000));
+                billing.usage = Some(usage);
+                billing.hosted_terminal = Some(
+                    serde_json::json!({"type":"hosted_terminal", "job_id":job,
+                    "placement":format!("first_party/{}", lease.claims.placement.host),
+                    "billed_vcpu_ms":u64::from(lease.claims.vcpus).saturating_mul(lease.claims.max_s).saturating_mul(1000),
+                    "max_runtime_s":lease.claims.max_s}),
+                );
+            } else {
+                super::end_zero(&mut next, job, now_ms, Some(Refusal::InternalFailure))?;
+            }
+            crate::billing::finalize_ready(&mut next, now_ms);
+        }
+        self.save(next)
+    }
+
+    pub fn job_refused(
+        &mut self,
+        job: &str,
+        frame: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        if next
+            .leases
+            .get(job)
+            .is_some_and(|lease| lease.state != super::LeaseState::Ended && !lease.delivered)
+        {
+            super::end_zero(&mut next, job, now_ms, Some(Refusal::InternalFailure))?;
+            next.billing.entry(job.to_owned()).or_default().terminal = Some(frame);
+            crate::billing::finalize_ready(&mut next, now_ms);
+            self.save(next)?;
+        }
+        Ok(())
     }
 }
 
