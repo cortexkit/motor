@@ -6,6 +6,7 @@ use motor_host::state::{Admission, Error, Refusal};
 fn resources(h: &mut Host) {
     h.record_host_resources(HostResources {
         at_ms: NOW * 1000,
+        job_vm_headroom_mib: u64::MAX,
         available_mem_mib: 100_000,
         vcpu_ceiling: 2,
         permit_budget: 2,

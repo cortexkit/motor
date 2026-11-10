@@ -118,7 +118,8 @@ fn amended_contract_stale_missing_capacity_storage_and_negative_memory_bytes() {
         bytes(&mut h, AT + motor_host::state::MEMORY_FRESH_MS + 1),
         body(0, 0, 0, "", "")
     );
-    assert_eq!(bytes(&mut h, AT - 1), body(0, 0, 0, "", ""));
+    assert_eq!(bytes(&mut h, AT - 500), body(4, 950, 0, "", ""));
+    assert_eq!(bytes(&mut h, AT - 1_001), body(0, 0, 0, "", ""));
     let mut h = configure(host(), 1000);
     h.enforce_storage();
     h.observe_storage(Err("no capacity setting".into()), Ok(u64::MAX));

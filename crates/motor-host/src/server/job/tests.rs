@@ -66,6 +66,7 @@ struct Fake {
     readiness: Mutex<Option<motor_vm_helper::images::Readiness>>,
     fill_export: Mutex<Option<UnixStream>>,
     capacity_available: AtomicBool,
+    slice_headroom_mib: Mutex<Option<u64>>,
     fail_ensure: AtomicBool,
     ensured_caps: Mutex<Vec<u64>>,
     calls: Mutex<Vec<String>>,
@@ -148,6 +149,15 @@ impl Control for Fake {
     }
     fn host_available_mib(&self) -> anyhow::Result<u64> {
         Ok(1000)
+    }
+    fn job_vm_headroom_mib(&self) -> anyhow::Result<u64> {
+        self.slice_headroom_mib.lock().unwrap().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "job-VM memory.current unreadable",
+            )
+            .into()
+        })
     }
     fn online_cpus(&self) -> anyhow::Result<u32> {
         Ok(2)
@@ -489,11 +499,13 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
     });
     host.record_host_resources(HostResources {
         at_ms: unix_ms(),
+        job_vm_headroom_mib: u64::MAX,
         available_mem_mib: 1000,
         vcpu_ceiling: 2,
         permit_budget: 4,
     });
     let fake = Arc::new(Fake::default());
+    *fake.slice_headroom_mib.lock().unwrap() = Some(10_000);
     let runtime = Runtime::with_job_resources("host".into(), host, fake.clone(), storage.clone());
     runtime
         .configure_job_resolvers(vec!["1.1.1.1".into()])
@@ -959,6 +971,7 @@ async fn authenticated_per_job_transport_uses_no_tenant_binding_and_forwards_bur
         .unwrap()
         .record_host_resources(HostResources {
             at_ms: unix_ms(),
+            job_vm_headroom_mib: u64::MAX,
             available_mem_mib: 100_000,
             vcpu_ceiling: 2,
             permit_budget: 4,

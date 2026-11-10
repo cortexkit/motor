@@ -899,6 +899,37 @@ pub(crate) fn host_available_mib(meminfo: &str) -> Result<u64> {
     Ok(kib / 1024)
 }
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn job_vm_headroom_mib(slice: &std::path::Path) -> Result<u64> {
+    let limit: u64 = std::fs::read_to_string(slice.join("memory.max"))?
+        .trim()
+        .parse()
+        .context("job-VM memory.max must be finite bytes")?;
+    let stat = std::fs::read_to_string(slice.join("memory.stat"))?;
+    let mut file = None;
+    for line in stat.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some("file") {
+            ensure!(file.is_none(), "duplicate job-VM file memory");
+            file = Some(
+                fields
+                    .next()
+                    .context("job-VM file memory missing")?
+                    .parse::<u64>()?,
+            );
+            ensure!(fields.next().is_none(), "invalid job-VM file memory");
+        }
+    }
+    let file = file.context("job-VM file memory missing")?;
+    let current: u64 = std::fs::read_to_string(slice.join("memory.current"))?
+        .trim()
+        .parse()
+        .context("invalid job-VM memory.current")?;
+    // Like MemAvailable, treat file pages as reclaimable, but not anonymous,
+    // kernel or other charged memory. Saturation bounds cross-file sample drift.
+    Ok(limit.saturating_sub(current.saturating_sub(file)) / (1024 * 1024))
+}
+
 async fn boot(
     runtime: &Arc<Runtime>,
     execution: &Execution,

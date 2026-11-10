@@ -31,6 +31,7 @@ fn sample(h: &mut Host, available_mem_mib: u64) {
     h.record_host_resources(HostResources {
         at_ms: AT,
         available_mem_mib,
+        job_vm_headroom_mib: u64::MAX,
         vcpu_ceiling: 2,
         permit_budget: 4,
     });
@@ -73,6 +74,7 @@ fn disk_limit_host() -> Host {
     let mut h = memory_host(100_000);
     h.record_host_resources(HostResources {
         at_ms: AT,
+        job_vm_headroom_mib: u64::MAX,
         available_mem_mib: 100_000,
         vcpu_ceiling: 64,
         permit_budget: 256,
@@ -358,10 +360,17 @@ fn permits_include_overcommit_and_queued_jobs_and_are_released_only_on_stop() {
 }
 
 #[test]
-fn missing_stale_or_future_memory_samples_refuse_without_reservations() {
+fn slightly_ahead_memory_sample_keeps_admission_capacity() {
+    let mut h = memory_host(1_000);
+    assert_eq!(h.job_free_mem_mib(AT - 500), 950);
+    assert_eq!(h.claim(job(JOB), AT - 500).unwrap().1, Admission::Ready);
+}
+
+#[test]
+fn missing_stale_or_far_future_memory_samples_refuse_without_reservations() {
     let mut h = memory_host(1_000);
     full(h.claim(job(JOB), AT + motor_host::state::MEMORY_FRESH_MS + 1));
-    full(h.claim(job(JOB), AT - 1));
+    full(h.claim(job(JOB), AT - 1_001));
     assert!(h.snapshot.per_job.is_empty());
     let mut h = configure(
         Host::new(

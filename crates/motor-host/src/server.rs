@@ -715,12 +715,14 @@ impl Runtime {
                 capacity.as_ref().map_err(|e| anyhow::anyhow!(e.clone()))?;
                 settings.validate_cpus(self.control.online_cpus()?)?;
                 let available_mem_mib = self.control.host_available_mib()?;
+                let job_vm_headroom_mib = self.control.job_vm_headroom_mib()?;
                 Ok(crate::state::jobs::HostResources {
-                    // Use the caller's observation clock. A timestamp taken
-                    // later in this probe would look like a future sample to
-                    // the same tick/heartbeat and falsely withdraw capacity.
+                    // Use the caller's observation clock so the probe's I/O
+                    // time does not consume the allowance for concurrent
+                    // callers whose clocks were captured slightly earlier.
                     at_ms: now_ms,
                     available_mem_mib,
+                    job_vm_headroom_mib,
                     vcpu_ceiling: settings.vcpu_ceiling,
                     permit_budget: settings.permit_budget,
                 })
@@ -1810,6 +1812,8 @@ impl Runtime {
 mod job;
 mod rollback;
 pub(crate) use job::host_available_mib;
+#[cfg(target_os = "linux")]
+pub(crate) use job::job_vm_headroom_mib;
 
 fn verified_lease(claims: &Claims, burst_enabled: bool) -> Value {
     let mut lease = json!({"type":"verified_lease", "jti":claims.jti, "purpose":claims.purpose, "sub":claims.sub, "vcpus":claims.vcpus, "mem_mib":claims.mem_mib, "platform":claims.platform, "net":claims.net, "max_s":claims.max_s, "exp":claims.exp});
