@@ -9,6 +9,43 @@ pub mod fill_source;
 pub mod fills;
 pub mod images;
 
+/// The guest agent's `attach_tenant` request for a job or fill VM: the image's
+/// guest init plus this VM's network slot and identity. Both kinds go through
+/// here because the guest refuses an attach that lacks any identity field.
+pub(crate) fn guest_attach_request(
+    guest_init: &Value,
+    resolvers: &std::sync::RwLock<Vec<String>>,
+    vm_id: &str,
+    tap: u64,
+) -> Result<Value> {
+    use anyhow::ensure;
+    use serde_json::json;
+    let mut request = guest_init.clone();
+    let resolvers = resolvers.read().expect("job resolvers").clone();
+    ensure!(!resolvers.is_empty(), "job VM resolvers are not configured");
+    request["resolvers"] = json!(resolvers);
+    request["hostname"] = json!("motor");
+    let identity = motor_lease::sha256_hex(format!("motor-job-machine-id-v1\n{vm_id}").as_bytes());
+    ensure!(
+        identity[..32].bytes().any(|b| b != b'0'),
+        "invalid derived job machine identity"
+    );
+    request["machine_id"] = json!(&identity[..32]);
+    request["op"] = json!("attach_tenant");
+    request["generation"] = json!(1);
+    request["unix_ms"] = json!(crate::server::unix_ms());
+    request["seed"] = json!(motor_lease::base64url(&rand::random::<[u8; 32]>()));
+    request["address"] = json!(format!("10.200.{tap}.2/30"));
+    request["gateway"] = json!(format!("10.200.{tap}.1"));
+    // Recovery never belongs to a job or fill boot; only a recovery VM's own
+    // request may carry it.
+    ensure!(
+        request.get("recovery_required").is_none() && request.get("recovery_budget_ms").is_none(),
+        "job or fill boot cannot recover disks"
+    );
+    Ok(request)
+}
+
 pub const SPOOL_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]

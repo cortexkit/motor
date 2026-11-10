@@ -1819,6 +1819,84 @@ async fn quiet_running_job_channel_gets_host_heartbeats() {
     runtime.stop_job(JOB, true, false).unwrap();
 }
 
+/// ck-motor uploads missing history after its Run is accepted. A large upload
+/// outlasts the VM boot, so its later chunks reach the live connection and must
+/// be relayed, although a bundle chunk names no job.
+#[tokio::test]
+async fn bundle_chunks_after_the_run_reach_the_guest() {
+    let (runtime, fake, _) = fixture();
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    queued(&mut client, JOB).await;
+    // Output arrives through the live connection loop, so the chunk below is
+    // read there, not by the reader that spools frames during the boot.
+    next_type(&mut client, "output").await;
+    write_frame(
+        &mut client,
+        &json!({"type":"bundle_chunk","index":0,"offset":0,"data":"YWJj"}),
+    )
+    .await
+    .unwrap();
+    let relayed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let found = fake.inputs.lock().unwrap().iter().any(|bytes| {
+                serde_json::from_slice::<Value>(&bytes[4..]).unwrap()["type"] == "bundle_chunk"
+            });
+            if found {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(relayed.is_ok(), "the bundle chunk never reached the guest");
+    drop(client);
+    assert!(task.await.unwrap().is_ok(), "the upload was refused");
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+/// The guest agent refuses an attach that lacks the identity fields
+/// (resolvers, hostname, machine id); a fill VM needs them as a job VM does.
+#[test]
+fn fill_guest_attach_carries_the_job_vm_identity_fields() {
+    use crate::jobs::fills::FillGuest;
+    let (runtime, fake, _) = fixture();
+    let guest = crate::jobs::fills::BundleFillGuest {
+        host: runtime.host.clone(),
+        resolvers: runtime.job_resolvers.clone(),
+    };
+    let fill = crate::state::jobs::fills::Reservation {
+        fill: motor_vm_helper::job::Fill {
+            account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            repository_key: "0".repeat(64),
+            fill_id: JOB2.into(),
+            size_bytes: 1 << 30,
+        },
+        vcpus: 4,
+        memory_debit_mib: 8192,
+        guest_ram_mib: 8192,
+        runner_hello: false,
+        image_generation: None,
+        publication: None,
+    };
+    let assignment = Assignment {
+        image_generation_id: "generation".into(),
+        hello: json!({}),
+        spool: std::path::PathBuf::new(),
+        guest_init: json!({}),
+    };
+    guest
+        .initialize(&fill, &assignment, &*fake, &json!({"tap_index": 3}))
+        .unwrap();
+    let request = fake.guest_identity.lock().unwrap()[0].clone();
+    assert_eq!(request["op"], "attach_tenant");
+    assert_eq!(request["resolvers"], json!(["1.1.1.1"]));
+    assert_eq!(request["hostname"], "motor");
+    assert_eq!(request["machine_id"].as_str().unwrap().len(), 32);
+    assert_eq!(request["address"], "10.200.3.2/30");
+}
+
 #[test]
 fn mirror_report_is_recorded_before_lifecycle_ack() {
     let (runtime, fake, _) = fixture();

@@ -180,7 +180,7 @@ fn log_refusal(stage: &'static str, reason: Refusal, check: &str, jti: Option<&s
 }
 
 pub struct Runtime {
-    job_resolvers: RwLock<Vec<String>>,
+    job_resolvers: Arc<RwLock<Vec<String>>>,
     image_generations: Option<Arc<crate::jobs::images::Images>>,
     job_resources: Arc<dyn crate::jobs::Resources>,
     job_stops: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
@@ -452,8 +452,9 @@ impl Runtime {
             .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
             .collect();
         let host = Arc::new(Mutex::new(host));
+        let job_resolvers = Arc::new(RwLock::new(Vec::new()));
         Arc::new(Self {
-            job_resolvers: RwLock::new(Vec::new()),
+            job_resolvers: job_resolvers.clone(),
             job_resources: Arc::new(crate::jobs::Unavailable),
             image_generations: None,
             job_stops: Mutex::new(BTreeMap::new()),
@@ -462,7 +463,10 @@ impl Runtime {
             job_launches: Mutex::new(BTreeMap::new()),
             job_recoveries: Mutex::new(BTreeMap::new()),
             job_fills: Mutex::new(crate::jobs::fills::Scheduler::new(Arc::new(
-                crate::jobs::fills::BundleFillGuest { host: host.clone() },
+                crate::jobs::fills::BundleFillGuest {
+                    host: host.clone(),
+                    resolvers: job_resolvers,
+                },
             ))),
             job_balloon: Mutex::new(Default::default()),
             job_streams: Mutex::new(BTreeMap::new()),

@@ -693,7 +693,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     Err(error) => return Err(client_io(error)),
                 };
                 if request.value["type"] == "heartbeat" { continue; }
-                ensure!(request.value["job_id"] == claims.jti, "foreign job request");
+                // Bundle chunks carry no job id: they continue this connection's
+                // own upload, which outlasts the VM boot for a large history.
+                if request.value["type"] != "bundle_chunk" {
+                    ensure!(request.value["job_id"] == claims.jti, "foreign job request");
+                }
                 match request.value["type"].as_str() {
                     Some("attach") => {
                         minimum = request.value["from_seq"].as_u64().context("attach cursor")?;

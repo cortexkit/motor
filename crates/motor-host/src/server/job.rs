@@ -964,30 +964,12 @@ async fn boot(
         .as_u64()
         .filter(|n| (1..=254).contains(n))
         .ok_or_else(|| anyhow::anyhow!("missing job network allocation"))?;
-    let mut request = assignment.guest_init.clone();
-    let resolvers = runtime.job_resolvers.read().expect("job resolvers").clone();
-    ensure!(!resolvers.is_empty(), "job VM resolvers are not configured");
-    request["resolvers"] = json!(resolvers);
-    request["hostname"] = json!("motor");
-    let identity = motor_lease::sha256_hex(
-        format!("motor-job-machine-id-v1\n{}", execution.claims.jti).as_bytes(),
-    );
-    ensure!(
-        identity[..32].bytes().any(|b| b != b'0'),
-        "invalid derived job machine identity"
-    );
-    request["machine_id"] = json!(&identity[..32]);
-    request["op"] = json!("attach_tenant");
-    request["generation"] = json!(1);
-    request["unix_ms"] = json!(unix_ms());
-    request["seed"] = json!(motor_lease::base64url(&rand::random::<[u8; 32]>()));
-    request["address"] = json!(format!("10.200.{tap}.2/30"));
-    request["gateway"] = json!(format!("10.200.{tap}.1"));
-    // Recovery never belongs to the job boot budget or a job's guest attach.
-    ensure!(
-        request.get("recovery_required").is_none() && request.get("recovery_budget_ms").is_none(),
-        "job boot cannot recover disks"
-    );
+    let request = crate::jobs::guest_attach_request(
+        &assignment.guest_init,
+        &runtime.job_resolvers,
+        &execution.claims.jti,
+        tap,
+    )?;
     let control = runtime.control.clone();
     let job = execution.claims.jti.clone();
     let wait = runtime.boot_remaining(execution, unix_ms());

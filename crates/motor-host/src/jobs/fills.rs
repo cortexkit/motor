@@ -229,6 +229,9 @@ impl Scheduler {
 
 pub struct BundleFillGuest {
     pub host: Arc<Mutex<Host>>,
+    /// The runtime's configured job VM resolvers, shared so a fill VM gets
+    /// the same guest identity fields as a job VM.
+    pub resolvers: Arc<std::sync::RwLock<Vec<String>>>,
 }
 impl FillGuest for BundleFillGuest {
     fn candidates(&self) -> Result<Vec<Candidate>> {
@@ -260,23 +263,16 @@ impl FillGuest for BundleFillGuest {
         start_reply: &serde_json::Value,
     ) -> Result<()> {
         use anyhow::{ensure, Context};
-        use serde_json::json;
         let tap = start_reply["tap_index"]
             .as_u64()
             .filter(|n| (1..=254).contains(n))
             .context("missing fill network allocation")?;
-        let mut request = assignment.guest_init.clone();
-        request["op"] = json!("attach_tenant");
-        request["generation"] = json!(1);
-        request["unix_ms"] = json!(crate::server::unix_ms());
-        request["seed"] = json!(motor_lease::base64url(&rand::random::<[u8; 32]>()));
-        request["address"] = json!(format!("10.200.{tap}.2/30"));
-        request["gateway"] = json!(format!("10.200.{tap}.1"));
-        ensure!(
-            request.get("recovery_required").is_none()
-                && request.get("recovery_budget_ms").is_none(),
-            "fill cannot recover a job disk"
-        );
+        let request = super::guest_attach_request(
+            &assignment.guest_init,
+            &self.resolvers,
+            &fill.fill.fill_id,
+            tap,
+        )?;
         // A fill VM has no boot deadline of its own; 60 s covers a cold guest
         // boot (about a second) many times over.
         let reply = control.job_admin_after_start(
