@@ -59,6 +59,7 @@ pub enum Behavior {
     RefuseAttach(&'static str),
     BrokerRefuseAttach,
     RefuseHello(&'static str),
+    RefuseRun(&'static str, Option<&'static str>, Option<u64>),
     DropTerminal,
     WrongHost,
     DropRunAck,
@@ -552,6 +553,28 @@ impl Harness {
                                 }
                                 Frame::Run(run) => {
                                     runs.fetch_add(1, Ordering::SeqCst);
+                                    if let Behavior::RefuseRun(reason, detail, retry_after_ms) =
+                                        behavior
+                                    {
+                                        let refusal = motor_protocol::Refusal {
+                                            job_id: Some(id),
+                                            transfer_id: None,
+                                            reason: serde_json::from_value(serde_json::json!(
+                                                reason
+                                            ))
+                                            .unwrap(),
+                                            disk_full: None,
+                                            detail: detail.map(str::to_owned),
+                                            retry_after_ms,
+                                        };
+                                        motor_protocol::write_frame_async(
+                                            &mut tls,
+                                            &Frame::Refusal(refusal),
+                                        )
+                                        .await
+                                        .unwrap();
+                                        return;
+                                    }
                                     if matches!(behavior, Behavior::SettleThenDrop) {
                                         settle_then_drop(&mut tls, &broker, &claims, run.network)
                                             .await;

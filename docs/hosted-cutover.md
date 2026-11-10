@@ -64,8 +64,16 @@ an SSH connection or executes a local command.
 | Path outside supported roots | `RequestRejected` | `hosted_path_outside_roots` |
 | Hosted workspace prepare/drop | `RequestRejected` | `hosted_prepare_unsupported` |
 | Return path limits/capability missing | `RequestRejected` | `return_paths_exceeded`, `return_paths_unsupported`, `return_chunked_unsupported` |
-| Runner lease mismatch | `RequestRejected` | `lease_mismatch` |
+| Runner lease/claims mismatch (`RequestRejected` with no detail) | `RequestRejected` | `lease_mismatch` |
+| Runner workspace setup or dependency prefetch failure | `WorkspaceSetupFailed` | `workspace_setup_failed` |
+| Runner at capacity | `RunnerFull` | `runner_full` |
+| Runner draining | `RunnerDraining` | `runner_draining` |
+| Other runner pre-start refusal | Runner's existing typed reason | The reason's wire string (for example `request_rejected` for `RequestRejected` with detail, or the unchanged string for `Unknown`) |
 | Generic pre-start request rejection | Existing validation reason | `hosted_request_rejected` |
+
+Runner refusals retain their detail text separately from the hosted code. Only
+`RunnerDraining` retains a runner-supplied `retry_after_ms`; a refusal is not
+permission to fall back to a different route.
 
 `transient` returns the vault's optional `retry_after_ms` on the terminal. The
 caller may retry a refused request after that delay; ck-motor does not retry

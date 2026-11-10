@@ -25,6 +25,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) fn runner_refusal_code(reason: &RefusalReason, detail: Option<&str>) -> String {
+    // Tenant admission rejects a Run whose resource claims disagree with its
+    // lease as RequestRejected without detail. Other refusals describe their
+    // own failure; a workspace or capacity error is not a claims mismatch.
+    if *reason == RefusalReason::RequestRejected && detail.is_none() {
+        "lease_mismatch".into()
+    } else {
+        String::from(reason.clone())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BillingStatus {

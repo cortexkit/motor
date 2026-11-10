@@ -105,6 +105,62 @@ fn journal_replays_atomic_upserts_and_deletions_without_shutdown() {
 }
 
 #[test]
+fn journal_replays_legacy_hosted_refusal_without_reclassifying_it() {
+    let root = ScratchDir::new("motor-journal-legacy-refusal");
+    let crash = ScratchDir::new("motor-journal-legacy-refusal-crash");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::now_v7();
+    let mut refusal = TerminalRecord::new(
+        id,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceSetupFailed,
+        },
+        0,
+        0,
+        0,
+    )
+    .with_ran(Ran::None)
+    .with_refusal_detail("lease_mismatch: cargo prefetch failed: registry unavailable");
+    refusal.retry_after_ms = None;
+    // Older writers labelled every hosted runner refusal as a lease mismatch.
+    // Recovery must retain the recorded result, not reinterpret its detail.
+    storage
+        .update(|state| {
+            let mut hosted = crate::HostedJobState::new(&crate::Config::default());
+            hosted.hosted_code = Some("lease_mismatch".into());
+            hosted.hosted_no_fallback = true;
+            hosted.terminal = Some(refusal.clone());
+            state.jobs.insert(
+                id,
+                Job {
+                    hosted: Some(hosted),
+                    local_terminal: Some(refusal.clone()),
+                    ..Job::default()
+                },
+            );
+        })
+        .unwrap();
+    copy_store(&root, &crash);
+    assert!(fs::read(log(&crash))
+        .unwrap()
+        .windows(b"lease_mismatch: ".len())
+        .any(|bytes| bytes == b"lease_mismatch: "));
+    assert!(
+        !fs::read_to_string(crash.join("state.json"))
+            .unwrap()
+            .contains(&id.to_string()),
+        "exercise journal recovery, not a shutdown checkpoint"
+    );
+    let recovered = Storage::open(&crash).unwrap();
+    let job = recovered.job(id).unwrap();
+    assert_eq!(job.local_terminal, Some(refusal.clone()));
+    let hosted = job.hosted.unwrap();
+    assert_eq!(hosted.terminal, Some(refusal));
+    assert_eq!(hosted.hosted_code.as_deref(), Some("lease_mismatch"));
+    assert!(hosted.hosted_no_fallback);
+}
+
+#[test]
 fn torn_final_frames_are_truncated_before_later_appends() {
     let root = ScratchDir::new("motor-journal-torn");
     let storage = Storage::open(&root).unwrap();

@@ -1072,10 +1072,13 @@ impl Storage {
                         hosted.max_runtime_s.unwrap_or(0),
                     ));
                 }
-            }
-            if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
-                hosted.hosted_no_fallback = true;
-                hosted.hosted_code = Some("lease_mismatch".into());
+                if let Outcome::RefusedBeforeStart { reason } = &terminal.outcome {
+                    hosted.hosted_no_fallback = true;
+                    hosted.hosted_code = Some(crate::hosted::runner_refusal_code(
+                        reason,
+                        terminal.refusal_detail.as_deref(),
+                    ));
+                }
             }
             job.terminal_observed_at_ms.get_or_insert_with(now_ms);
             if job.hosted_cancel_complete() {

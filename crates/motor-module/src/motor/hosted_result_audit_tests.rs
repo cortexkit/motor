@@ -340,7 +340,7 @@ async fn audit_14b_probe_terminals_clear_retry_and_pending_cancel() {
 }
 
 #[tokio::test]
-async fn audit_14b_probe_refusal_is_normalized_as_lease_mismatch() {
+async fn audit_14b_probe_refusal_preserves_runner_reason_and_detail() {
     let h = Harness::new(Behavior::StatusTerminalRefused).await;
     let root = cortexkit_test_support::ScratchDir::new("audit-probe-refusal");
     let (motor, id) = detached(&h, &root).await;
@@ -349,16 +349,22 @@ async fn audit_14b_probe_refusal_is_normalized_as_lease_mismatch() {
         .probe_hosted_result(id, crate::hosted::now_s() * 1000, &owner)
         .await
         .unwrap();
-    assert!(reply
-        .terminal
-        .unwrap()
-        .refusal_detail
-        .unwrap()
-        .starts_with("lease_mismatch: "));
+    // A runner's request rejection is not evidence of a lease claims mismatch.
+    // Callers need its typed code and original detail to diagnose the failure.
+    let terminal = reply.terminal.unwrap();
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::RequestRejected,
+        }
+    );
+    assert_eq!(terminal.refusal_detail.as_deref(), Some("foreign lease"));
+    assert_eq!(terminal.retry_after_ms, None);
     assert_eq!(
         motor.hosted_state(id).unwrap().hosted_code.as_deref(),
-        Some("lease_mismatch")
+        Some("request_rejected")
     );
+    assert!(motor.hosted_state(id).unwrap().hosted_no_fallback);
     motor.hosted_results.lock().unwrap().remove(&id);
     motor.close().await;
 }

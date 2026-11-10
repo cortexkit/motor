@@ -721,6 +721,24 @@ impl Motor {
         retry_after_ms: Option<u64>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
     ) -> io::Result<()> {
+        let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
+            .with_ran(Ran::None);
+        terminal.retry_after_ms = retry_after_ms;
+        terminal.refusal_detail = detail;
+        if let Some(hash) = hash {
+            terminal = terminal.with_tree_hash(hash);
+        }
+        self.refused_terminal(terminal, None, tx).await
+    }
+    async fn refused_terminal(
+        &self,
+        mut terminal: TerminalRecord,
+        runner_code: Option<String>,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> io::Result<()> {
+        let id = terminal.job_id;
+        let reason = &terminal.outcome;
+        let detail = terminal.refusal_detail.take();
         if self.hosted_state(id).is_some() {
             tracing::warn!(job_id = %id, step = "refused_before_start", ?reason,
                 cause = detail.as_deref().unwrap_or("no refusal detail"), "hosted job stopped");
@@ -732,12 +750,7 @@ impl Motor {
                     cause = detail.as_deref().unwrap_or("no refusal detail"), "spill outcome");
             }
         }
-        let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
-            .with_ran(Ran::None);
-        terminal.retry_after_ms = retry_after_ms;
-        if let Some(hash) = hash {
-            terminal = terminal.with_tree_hash(hash);
-        }
+        let runner_refusal = runner_code.is_some();
         let detail = if self.hosted_state(id).is_some() {
             if let Some(state) = self.hosted_state(id).filter(|s| s.booked_or_attempted()) {
                 let boat = state
@@ -784,17 +797,19 @@ impl Motor {
             }
             // Validation details may append field diagnostics after a semicolon;
             // keep the stored refusal code separate from that explanation.
-            let code = detail
-                .as_deref()
-                .filter(|d| {
-                    d.starts_with("hosted_")
-                        || d.starts_with("return_paths_")
-                        || d.starts_with("return_chunked_")
-                        || d.starts_with("lease_mismatch")
-                })
-                .and_then(|d| d.split([':', ';']).next())
-                .unwrap_or("hosted_request_rejected")
-                .to_string();
+            let code = runner_code.unwrap_or_else(|| {
+                detail
+                    .as_deref()
+                    .filter(|d| {
+                        d.starts_with("hosted_")
+                            || d.starts_with("return_paths_")
+                            || d.starts_with("return_chunked_")
+                            || d.starts_with("lease_mismatch")
+                    })
+                    .and_then(|d| d.split([':', ';']).next())
+                    .unwrap_or("hosted_request_rejected")
+                    .to_string()
+            });
             self.storage.hosted_update(id, |state| {
                 state.hosted_no_fallback = true;
                 state.hosted_code = Some(code.clone());
@@ -807,10 +822,16 @@ impl Motor {
             ) && self
                 .hosted_state(id)
                 .is_some_and(|state| !state.booked_or_attempted());
-            Some(match detail {
-                Some(d) if d.starts_with(&code) || local_path_refusal => d,
-                other => format!("{code}: {}", other.as_deref().unwrap_or("request refused")),
-            })
+            if runner_refusal {
+                // The typed runner reason supplies the diagnostic code; its
+                // explanation is not a lease-validation error or a code source.
+                detail
+            } else {
+                Some(match detail {
+                    Some(d) if d.starts_with(&code) || local_path_refusal => d,
+                    other => format!("{code}: {}", other.as_deref().unwrap_or("request refused")),
+                })
+            }
         } else {
             self.with_spill_attempt(id, detail)
         };
@@ -1797,18 +1818,22 @@ impl Motor {
                     return Ok(true);
                 }
                 if hosted {
-                    let retry_after_ms = refusal
+                    let code =
+                        crate::hosted::runner_refusal_code(&reason, refusal.detail.as_deref());
+                    let mut terminal =
+                        TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
+                            .with_ran(Ran::None)
+                            .with_tree_hash(snapshots.main.tree_hash.clone());
+                    terminal.refusal_detail = if refusal.reason == RefusalReason::RunnerDraining {
+                        refusal.detail.clone()
+                    } else {
+                        detail
+                    };
+                    terminal.retry_after_ms = refusal
                         .retry_after_ms
-                        .filter(|_| reason == RefusalReason::RunnerDraining);
+                        .filter(|_| refusal.reason == RefusalReason::RunnerDraining);
                     return self
-                        .refused_with_retry(
-                            id,
-                            reason,
-                            Some(snapshots.main.tree_hash.clone()),
-                            Some(format!("lease_mismatch: {}", detail.unwrap_or_default())),
-                            retry_after_ms,
-                            tx,
-                        )
+                        .refused_terminal(terminal, Some(code), tx)
                         .await
                         .map(|_| false);
                 }
@@ -2372,21 +2397,15 @@ impl Motor {
         mut terminal: TerminalRecord,
     ) -> io::Result<TerminalRecord> {
         terminal.job_id = id;
-        if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
+        if !matches!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerDraining
+            }
+        ) {
             terminal.retry_after_ms = None;
         }
         terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
-        if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
-            && !terminal
-                .refusal_detail
-                .as_deref()
-                .is_some_and(|detail| detail.starts_with("lease_mismatch: "))
-        {
-            terminal.refusal_detail = Some(bounded_detail(format!(
-                "lease_mismatch: {}",
-                terminal.refusal_detail.take().unwrap_or_default()
-            )));
-        }
         self.storage.hosted_terminal(id, terminal)?;
         let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
         if let Some(owner) = owner {
@@ -3796,6 +3815,8 @@ mod boat_capacity_tests;
 mod fleet_capacity_tests;
 #[cfg(test)]
 mod fleet_routing_tests;
+#[cfg(test)]
+mod hosted_refusal_tests;
 #[cfg(test)]
 mod repository_routing_tests;
 #[cfg(test)]
