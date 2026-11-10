@@ -136,13 +136,23 @@ async fn unclean_stops_loss_unknown_identity_and_unknown_targets_clear_before_ne
                 .unwrap()
                 .job_stop_intent(&c.jti, true)
                 .unwrap(),
-            "gone" => f
-                .runtime
-                .host
-                .lock()
-                .unwrap()
-                .job_vmm_gone(&c.jti, unix_ms())
-                .unwrap(),
+            // A VMM gone without an exit receipt clears the disk's have-record
+            // only once the evidence bound passes; before that the receipt is
+            // still expected and decides whether the record is kept.
+            "gone" => {
+                let first = unix_ms();
+                let gone = |at| {
+                    f.runtime
+                        .host
+                        .lock()
+                        .unwrap()
+                        .job_vmm_gone(&c.jti, at)
+                        .unwrap()
+                };
+                gone(first);
+                assert!(!f.held(&c.jti).is_empty(), "gone within the bound");
+                gone(first + 10_000);
+            }
             "oom" => {
                 f.runtime
                     .host

@@ -291,8 +291,14 @@ impl Host {
             defer_usage(&mut next, job);
             finalize_usage(&mut next, job);
         }
-        super::jobs::have::invalidate(&mut next, job);
-        super::jobs::recovery::quarantine(&mut next, job);
+        // Within the bound a missing receipt is only collection lag (exit
+        // reports are polled, VMM liveness is checked every tick); the receipt
+        // then decides whether the disk needs recovery. Without one by the
+        // bound, the disk's state is unknown.
+        if expired {
+            super::jobs::have::invalidate(&mut next, job);
+            super::jobs::recovery::quarantine(&mut next, job);
+        }
         self.save(next)?;
         if new_gap {
             tracing::warn!(jti = job, first_gone_ms = first, "job_exit_evidence_gap");

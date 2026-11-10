@@ -176,9 +176,12 @@ fn guest_ended_vm_after_terminal_stored_releases_its_disk_clean() {
         .unwrap()
         .job_stop_intent(JOB, false)
         .unwrap();
+    // Live order: a tick sees the VMM gone before the helper's exit report is
+    // collected, and the report arrives on a later poll.
     fake.gone.lock().unwrap().insert(JOB.into());
-    fake.exits.lock().unwrap().push(exit(JOB, 0));
     runtime.tick_jobs(500).unwrap();
+    fake.exits.lock().unwrap().push(exit(JOB, 0));
+    runtime.tick_jobs(1600).unwrap();
     let calls = fake.calls.lock().unwrap().clone();
     assert_eq!(
         calls
