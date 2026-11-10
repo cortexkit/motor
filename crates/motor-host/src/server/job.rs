@@ -13,6 +13,18 @@ pub(super) struct Launch {
     cancelled: AtomicBool,
 }
 
+fn tick_step<T, E: Into<anyhow::Error>>(
+    failure: &mut Option<anyhow::Error>,
+    step: &str,
+    result: std::result::Result<T, E>,
+) {
+    if let Err(error) = result {
+        let error = error.into();
+        tracing::warn!(step, %error, "job_tick_step_failed");
+        failure.get_or_insert(error);
+    }
+}
+
 impl Runtime {
     fn launch_phase(&self, job: &str, starts_vm: bool) -> Result<Arc<Launch>> {
         let operations = self
@@ -272,10 +284,13 @@ impl Runtime {
             return Ok(());
         }
         self.probe_storage();
-        let mut failure = self.collect_job_exits(now_ms).err();
-        if let Err(error) = self.host.lock().expect("host lock").clean_fill_sources() {
-            failure.get_or_insert(error);
-        }
+        let mut failure = None;
+        tick_step(&mut failure, "exits", self.collect_job_exits(now_ms));
+        tick_step(
+            &mut failure,
+            "fill_sources",
+            self.host.lock().expect("host lock").clean_fill_sources(),
+        );
         let due: Vec<_> = {
             let host = self.host.lock().expect("host lock");
             let crate::config::HostSettings::PerJob(settings) = &host.settings else {
@@ -298,9 +313,11 @@ impl Runtime {
                 .collect()
         };
         for job in due {
-            if let Err(error) = self.stop_job(&job, true, true) {
-                failure.get_or_insert(error);
-            }
+            tick_step(
+                &mut failure,
+                "stop_expired",
+                self.stop_job(&job, true, true),
+            );
         }
         let active: Vec<_> = self
             .host
@@ -328,7 +345,7 @@ impl Runtime {
                 match self.control.adopt_job(job) {
                     Ok(running) => !running,
                     Err(error) => {
-                        failure.get_or_insert(error);
+                        tick_step(&mut failure, "adopt", Err::<(), _>(error));
                         false
                     }
                 }
@@ -339,15 +356,18 @@ impl Runtime {
                     .as_ref()
                     .is_some_and(|e| e.stop.is_some())
             {
-                if let Err(error) = self.stop_job(job, false, true) {
-                    failure.get_or_insert(error);
-                }
+                tick_step(&mut failure, "stop", self.stop_job(job, false, true));
             }
             if gone {
-                self.host
+                let result = self
+                    .host
                     .lock()
                     .expect("host lock")
-                    .job_vmm_gone(job, now_ms)?;
+                    .job_vmm_gone(job, now_ms);
+                if result.is_err() {
+                    tick_step(&mut failure, "vmm_gone", result);
+                    continue;
+                }
                 let expired = {
                     let host = self.host.lock().expect("host lock");
                     let crate::config::HostSettings::PerJob(s) = &host.settings else {
@@ -362,10 +382,12 @@ impl Runtime {
                         })
                 };
                 if expired {
-                    self.host
+                    let result = self
+                        .host
                         .lock()
                         .expect("host lock")
-                        .job_stopped_at(job, true, now_ms)?;
+                        .job_stopped_at(job, true, now_ms);
+                    tick_step(&mut failure, "stopped", result);
                 }
             }
         }
@@ -383,7 +405,7 @@ impl Runtime {
         // Retry a manager failure after the VM's stopped record was committed.
         // Release is durable and idempotent, including across host restarts.
         for job in ended {
-            self.job_resources.release(&job)?;
+            tick_step(&mut failure, "release", self.job_resources.release(&job));
             let expire = {
                 let host = self.host.lock().expect("host lock");
                 host.snapshot
@@ -397,10 +419,19 @@ impl Runtime {
                         == Some(crate::state::jobs::storage::ReplayCompletion::Terminal)
             };
             if expire {
-                self.job_stream(&job)?.expire_chunks(now_ms)?;
+                tick_step(
+                    &mut failure,
+                    "expire_job_replay",
+                    self.job_stream(&job)
+                        .and_then(|stream| stream.expire_chunks(now_ms)),
+                );
             }
         }
-        self.host.lock().expect("host lock").billing_tick(now_ms)?;
+        tick_step(
+            &mut failure,
+            "billing",
+            self.host.lock().expect("host lock").billing_tick(now_ms),
+        );
         let streams: Vec<_> = self
             .job_streams
             .lock()
@@ -409,23 +440,18 @@ impl Runtime {
             .cloned()
             .collect();
         for stream in streams {
-            stream.expire_chunks(now_ms)?;
+            tick_step(&mut failure, "expire_replay", stream.expire_chunks(now_ms));
         }
-        self.host
-            .lock()
-            .expect("host lock")
-            .retention_tick(now_ms)?;
-        if let Err(error) = self.tick_recoveries(now_ms) {
-            failure.get_or_insert(error);
-        }
-        if let Err(error) = self.job_fills.lock().expect("fill scheduler").tick(
+        let result = self.host.lock().expect("host lock").retention_tick(now_ms);
+        tick_step(&mut failure, "retention", result);
+        tick_step(&mut failure, "recoveries", self.tick_recoveries(now_ms));
+        let result = self.job_fills.lock().expect("fill scheduler").tick(
             self.host.clone(),
             self.control.clone(),
             self.job_resources.clone(),
             now_ms,
-        ) {
-            failure.get_or_insert(error);
-        }
+        );
+        tick_step(&mut failure, "fills", result);
         self.tick_balloon(now_ms);
         if let Some(error) = failure {
             return Err(error);
@@ -435,16 +461,27 @@ impl Runtime {
 
     fn collect_job_exits(&self, now_ms: u64) -> Result<()> {
         let _operation = self.job_exits.lock().expect("job exit collection");
-        for report in self.control.job_exits()? {
-            let accepted = self
-                .host
-                .lock()
-                .expect("host lock")
-                .job_exit_received(&report, now_ms)?;
-            if !accepted {
-                continue;
+        let mut failure = None;
+        let reports = match self.control.job_exits() {
+            Ok(reports) => reports,
+            Err(error) => {
+                tick_step(&mut failure, "poll_exits", Err::<(), _>(error));
+                Vec::new()
             }
-            self.finish_job_exit(&report)?;
+        };
+        for report in reports {
+            let result = (|| -> Result<()> {
+                let accepted = self
+                    .host
+                    .lock()
+                    .expect("host lock")
+                    .job_exit_received(&report, now_ms)?;
+                if accepted {
+                    self.finish_job_exit(&report)?;
+                }
+                Ok(())
+            })();
+            tick_step(&mut failure, "exit_receipt", result);
         }
         // A crash after helper acknowledgement can remove the report from its
         // next poll. The host's durable receipt remains enough to finish release.
@@ -460,9 +497,9 @@ impl Runtime {
             .filter_map(|e| e.evidence.as_ref()?.exit.as_ref().map(|r| r.report()))
             .collect();
         for report in receipts {
-            self.finish_job_exit(&report)?;
+            tick_step(&mut failure, "finish_exit", self.finish_job_exit(&report));
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     fn finish_job_exit(&self, report: &motor_vm_helper::job::ExitReport) -> Result<()> {

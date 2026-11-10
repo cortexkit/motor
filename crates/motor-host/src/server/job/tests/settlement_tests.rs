@@ -43,6 +43,31 @@ fn body(runtime: &Arc<Runtime>, job: &str) -> Vec<u8> {
 }
 
 #[test]
+fn failed_resource_cleanup_does_not_starve_billing_in_the_same_tick() {
+    let (runtime, _, storage) = fixture();
+    running(&runtime, JOB, true, true);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.receive_terminal(JOB, terminal(JOB), 400).unwrap();
+        assert!(host.job_exit_received(&exit(JOB, 0), 400).unwrap());
+        host.job_exit_acknowledged(&exit(JOB, 0)).unwrap();
+        host.job_stopped_at(JOB, false, 500).unwrap();
+    }
+    // A directory in place of the spool makes its unlink fail repeatedly.
+    // Settlement must still reach the broker outbox on every such tick.
+    std::fs::create_dir(storage.spool(JOB)).unwrap();
+    assert!(runtime.tick_jobs(100_000).is_err());
+    assert!(runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .outbox
+        .iter()
+        .any(|r| r.job.as_deref() == Some(JOB)));
+}
+
+#[test]
 fn every_terminal_pressure_exit_order_keeps_one_immutable_body() {
     for order in [
         [0, 1, 2],
