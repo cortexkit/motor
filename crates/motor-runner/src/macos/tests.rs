@@ -215,6 +215,106 @@ fn caller_paths_are_strict_and_never_touched() {
 }
 
 #[test]
+fn sibling_alias_collisions_are_refused_before_preparation() {
+    let mut f = Fixture::new();
+    let mut request = f.request();
+    request.workspace_key = "/Users/motor/worktrees/project".into();
+    request.cwd = request.workspace_key.clone();
+    // Invalid tools must never be reached when the destination plan is refused.
+    f.staging.tools.cargo.path = f.scratch.join("missing-cargo");
+    for (paths, left, right) in [
+        (
+            vec!["/Users/motor/project"],
+            "/Users/motor/worktrees/project",
+            "/Users/motor/worktrees/project",
+        ),
+        (
+            vec!["/Users/motor/shared", "/Users/motor/worktrees/shared"],
+            "/Users/motor/worktrees/shared",
+            "/Users/motor/worktrees/shared",
+        ),
+        (
+            vec!["/Users/motor/shared", "/Users/other/shared"],
+            "/Users/motor/worktrees/shared",
+            "/Users/motor/worktrees/shared",
+        ),
+        (
+            vec![
+                "/Users/motor/shared",
+                "/Users/motor/worktrees/shared/nested",
+            ],
+            "/Users/motor/worktrees/shared",
+            "/Users/motor/worktrees/shared/nested",
+        ),
+        (
+            vec!["/Users/motor/shared", "/Users/other/SHARED"],
+            "/Users/motor/worktrees/shared",
+            "/Users/motor/worktrees/SHARED",
+        ),
+    ] {
+        request.siblings = paths
+            .into_iter()
+            .map(|path| motor_protocol::SiblingSnapshot {
+                canonical_path: path.into(),
+                commit: request.snapshot_commit.clone(),
+                tree_hash: request.tree_hash.clone(),
+                base_commit: None,
+            })
+            .collect();
+        let error = f
+            .staging
+            .prepare(&request, Cancellation::default())
+            .err()
+            .expect("colliding aliases must be refused")
+            .to_string();
+        assert!(error.contains("overlapping share destinations"), "{error}");
+        assert!(error.contains(&format!("{left} and {right}")), "{error}");
+        assert!(!f.staging.state.join("jobs").exists());
+        assert!(!f.staging.state.join("prep").exists());
+    }
+}
+
+#[test]
+fn sibling_aliases_count_toward_the_boot_map_limit_before_preparation() {
+    let mut f = Fixture::new();
+    let mut request = f.request();
+    request.workspace_key = "/Users/motor/worktrees/project".into();
+    request.cwd = request.workspace_key.clone();
+    let sibling = motor_protocol::SiblingSnapshot {
+        canonical_path: String::new(),
+        commit: request.snapshot_commit.clone(),
+        tree_hash: request.tree_hash.clone(),
+        base_commit: None,
+    };
+    f.staging.tools.cargo.path = f.scratch.join("missing-cargo");
+    for (aliased, adjacent) in [(31, 0), (30, 2), (0, 62)] {
+        request.siblings = (0..aliased)
+            .map(|i| format!("/Users/motor/sibling-{i}"))
+            .chain((0..adjacent).map(|i| format!("/Users/motor/worktrees/adjacent-{i}")))
+            .map(|canonical_path| motor_protocol::SiblingSnapshot {
+                canonical_path,
+                ..sibling.clone()
+            })
+            .collect();
+        validate_paths(&request).unwrap();
+        request.siblings.push(motor_protocol::SiblingSnapshot {
+            canonical_path: "/Users/motor/worktrees/one-too-many".into(),
+            ..sibling.clone()
+        });
+        let error = f
+            .staging
+            .prepare(&request, Cancellation::default())
+            .err()
+            .expect("oversized share maps must be refused")
+            .to_string();
+        assert!(error.contains("62 sibling share destinations"), "{error}");
+        assert!(error.contains("including aliases"), "{error}");
+        assert!(!f.staging.state.join("jobs").exists());
+        assert!(!f.staging.state.join("prep").exists());
+    }
+}
+
+#[test]
 fn workspace_changes_compare_macos_staging_with_the_callers_snapshot() {
     let f = Fixture::new();
     write(&f.source.join("source"), "committed\n");

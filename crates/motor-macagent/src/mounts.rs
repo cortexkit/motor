@@ -40,7 +40,8 @@ pub fn validate(entries: &[Mount]) -> io::Result<()> {
             1
         } else if entry
             .tag
-            .strip_prefix("sibling-")
+            .strip_prefix("sibling-alias-")
+            .or_else(|| entry.tag.strip_prefix("sibling-"))
             .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         {
             2
@@ -328,6 +329,42 @@ mod tests {
         }
     }
     #[test]
+    fn sibling_alias_tags_keep_sibling_validation() {
+        let mut entries = map();
+        entries.push(Mount {
+            tag: "sibling-alias-0".into(),
+            destination: "/Users/test/worktrees/sibling".into(),
+            read_only: true,
+        });
+        validate(&entries).unwrap();
+        let mut fake = Fake::default();
+        mount_all(&entries, &mut fake).unwrap();
+        assert_eq!(fake.prepared, 4);
+        assert_eq!(fake.entries, entries);
+        for (destination, read_only) in [
+            ("/Users/test/worktrees/sibling", false),
+            ("/tmp/sibling", true),
+            ("/Users/test/../sibling", true),
+            ("/Users/test/repo/nested", true),
+            ("/Users/test/SIBLING", true),
+        ] {
+            let mut invalid = entries.clone();
+            invalid[3].destination = destination.into();
+            invalid[3].read_only = read_only;
+            let mut fake = Fake::default();
+            assert!(mount_all(&invalid, &mut fake).is_err());
+            assert_eq!(fake.prepared, 0);
+        }
+        let mut duplicate = entries.clone();
+        duplicate.push(Mount {
+            tag: "sibling-alias-0".into(),
+            destination: "/Users/test/another".into(),
+            read_only: true,
+        });
+        assert!(validate(&duplicate).is_err());
+    }
+
+    #[test]
     fn map_refuses_wrong_roles_access_modes_counts_and_cargo_destination() {
         let valid = map();
         validate(&valid).unwrap();
@@ -342,6 +379,11 @@ mod tests {
             "sibling-",
             "sibling-!",
             "sibling-111111111111111111111111111111111111111",
+            "sibling-alias-",
+            "sibling-alias-!",
+            "sibling-alias--1",
+            "sibling-alias-0-extra",
+            "sibling-alias-111111111111111111111111111111111111111",
         ] {
             let mut entries = valid.clone();
             entries[1].tag = tag.into();

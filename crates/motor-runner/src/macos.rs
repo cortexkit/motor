@@ -42,7 +42,7 @@ pub const PREP_TIMEOUT: Duration = Duration::from_secs(600);
 pub fn validate_paths(request: &Run) -> io::Result<()> {
     if request.siblings.len() > 62 {
         return Err(invalid(
-            "macos_path_invalid: at most 62 sibling shares are supported",
+            "macos_path_invalid: at most 62 sibling share destinations, including aliases (64 total entries)",
         ));
     }
     for path in [
@@ -60,19 +60,52 @@ pub fn validate_paths(request: &Run) -> io::Result<()> {
     {
         return Err(invalid("macos_path_invalid: cwd outside workspace"));
     }
-    let roots: Vec<_> = std::iter::once(&request.workspace_key)
-        .chain(request.siblings.iter().map(|s| &s.canonical_path))
-        .collect();
+    let mut roots = vec![request.workspace_key.clone()];
+    for (i, sibling) in request.siblings.iter().enumerate() {
+        roots.extend(
+            sibling_destinations(&request.workspace_key, &sibling.canonical_path, i)?
+                .into_iter()
+                .map(|(_, destination)| destination),
+        );
+    }
+    // Workspace and cargo-home reserve two of the boot map's 64 entries.
+    if roots.len() > 63 {
+        return Err(invalid(
+            "macos_path_invalid: at most 62 sibling share destinations, including aliases (64 total entries)",
+        ));
+    }
     for (i, root) in roots.iter().enumerate() {
-        if roots.iter().skip(i + 1).any(|other| {
-            let root = root.to_ascii_lowercase();
-            let other = other.to_ascii_lowercase();
-            Path::new(&root).starts_with(&other) || Path::new(&other).starts_with(&root)
-        }) {
-            return Err(invalid("macos_path_invalid: overlapping snapshots"));
+        for other in roots.iter().skip(i + 1) {
+            let left = root.to_ascii_lowercase();
+            let right = other.to_ascii_lowercase();
+            if Path::new(&left).starts_with(&right) || Path::new(&right).starts_with(&left) {
+                return Err(invalid(format!(
+                    "macos_path_invalid: overlapping share destinations: {root} and {other}"
+                )));
+            }
         }
     }
     Ok(())
+}
+
+fn sibling_destinations(
+    workspace: &str,
+    canonical: &str,
+    index: usize,
+) -> io::Result<Vec<(String, String)>> {
+    mapped(workspace)?;
+    mapped(canonical)?;
+    let alias = Path::new(workspace)
+        .parent()
+        .unwrap()
+        .join(Path::new(canonical).file_name().unwrap());
+    let mut destinations = vec![(format!("sibling-{index}"), canonical.to_owned())];
+    if alias != Path::new(canonical) {
+        let alias = alias.to_str().unwrap();
+        mapped(alias)?;
+        destinations.push((format!("sibling-alias-{index}"), alias.to_owned()));
+    }
+    Ok(destinations)
 }
 
 fn mapped(path: &str) -> io::Result<&Path> {
