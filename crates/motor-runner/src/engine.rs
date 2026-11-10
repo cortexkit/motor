@@ -10409,9 +10409,20 @@ impl Runner {
         if job.base && evidence.runtime_timed_out() && job.kill.is_none() {
             // The unit enforces its deadline even while the daemon is stopped.
             // Retain that result before any publication can trust an exit file.
-            job.kill = Some((Killed::Deadline, self.now()));
-            self.save(&job)?;
-            self.core.inner.lock().unwrap().jobs.insert(id, job.clone());
+            // Clone under the output-write lock so this save cannot roll back
+            // stream progress committed after finalization was claimed.
+            let log = self.job_log(id);
+            let _write = log.lock_write();
+            let mut updated = self.core.inner.lock().unwrap().jobs[&id].clone();
+            updated.kill.get_or_insert((Killed::Deadline, self.now()));
+            self.save(&updated)?;
+            self.core
+                .inner
+                .lock()
+                .unwrap()
+                .jobs
+                .insert(id, updated.clone());
+            job = updated;
             self.log_writer(&job, "runtime_expired");
         }
         let oom_stopped = evidence.oom_killed()

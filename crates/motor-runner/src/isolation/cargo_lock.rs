@@ -18,6 +18,7 @@ pub(super) fn diagnose(
     let Err(error) = result else { return Ok(()) };
     let detail = error.to_string();
     if error.kind() != io::ErrorKind::TimedOut
+        && !crate::sibling_snapshots::helper::UnsettledHelper::is(&error)
         && !(detail.contains("Blocking waiting for file lock") && detail.contains("package cache"))
     {
         return Err(error);
@@ -311,5 +312,20 @@ mod tests {
             "fetch miss"
         );
         assert!(diagnose(&mut command, |_| Ok(())).is_ok());
+        let error = diagnose(&mut command, |_| {
+            Err(io::Error::other(
+                crate::sibling_snapshots::helper::UnsettledHelper {
+                    unit: "motor-snaphelper-unsettled.service".into(),
+                    detail: "still live".into(),
+                },
+            ))
+        })
+        .unwrap_err();
+        assert!(crate::sibling_snapshots::helper::UnsettledHelper::is(
+            &error
+        ));
+        assert!(error
+            .to_string()
+            .contains("package cache lock holder unknown"));
     }
 }

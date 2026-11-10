@@ -57,7 +57,7 @@ impl ExecutionEvidence {
         self.result.as_deref() == Some("timeout")
     }
     #[cfg(any(target_os = "linux", test))]
-    fn unit(&mut self, text: &str, cgroups: &Path) {
+    pub(super) fn unit(&mut self, text: &str, cgroups: &Path) {
         let property = |name: &str| text.lines().find_map(|line| line.strip_prefix(name));
         self.main_code = property("ExecMainCode=").and_then(|v| v.parse().ok());
         self.main_status = property("ExecMainStatus=").and_then(|v| v.parse().ok());

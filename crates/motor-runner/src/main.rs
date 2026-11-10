@@ -923,14 +923,12 @@ mod tests {
             config.writer_runtime_limit,
             std::time::Duration::from_secs(7200)
         );
-        super::configure_options(
+        let error = super::configure_options(
             &mut config,
             ["--writer-runtime-limit-secs".into(), "0".into()].into_iter(),
         )
-        .unwrap();
-        assert!(config
-            .check_options()
-            .unwrap_err()
+        .unwrap_err();
+        assert!(error
             .to_string()
             .contains("--writer-runtime-limit-secs must be positive"));
     }
