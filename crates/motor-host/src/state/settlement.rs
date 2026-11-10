@@ -429,17 +429,24 @@ fn settle_stop(next: &mut Snapshot, job: &str, cause: StopCause, now_ms: u64) {
     let peak = sample.and_then(|s| s.mem_working_peak_mib);
     let over = sample.and_then(|s| s.mem_over_mib_ms).unwrap_or(None);
     let burst = next.leases[job].claims.mem_burst_mib.is_some();
+    let limit = super::jobs::memory_limit_mib(&next.leases[job].claims);
     let b = next.billing.entry(job.into()).or_default();
     b.terminal = Some(
         json!({"type":"terminal","job_id":job,"outcome":{"type":"signal","signal":9},"wall_ms":now_ms.saturating_sub(start),"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null,"oom_kill":{"cause":cause.as_str()},"mem_peak_mib":null,"mem_working_peak_mib":peak,"mem_over_mib_ms":burst.then_some(over)}),
     );
+    let fields = b.terminal.as_mut().unwrap().as_object_mut().unwrap();
     if !burst {
-        b.terminal
-            .as_mut()
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .remove("mem_over_mib_ms");
+        fields.remove("mem_over_mib_ms");
+    }
+    // The mem_* fields above are the runner-to-host names that billing reads.
+    // Callers decode the shared terminal record, whose memory fields have
+    // their own names; set them too, as the runner does on its own terminals,
+    // so a caller killed for host memory still sees its limit and peak.
+    if let Some(limit) = limit {
+        fields.insert("memory_stated_mib".into(), limit.into());
+    }
+    if let Some(peak) = peak {
+        fields.insert("memory_peak_working_mib".into(), peak.into());
     }
     b.terminal_live = true;
     b.terminal_received_ms = Some(now_ms);

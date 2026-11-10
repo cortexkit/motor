@@ -99,9 +99,15 @@ fn working_set_heavy_vm_stops_after_timeout_with_durable_host_pressure() {
         .unwrap();
     assert_eq!(e.stop.as_ref().unwrap().cause, StopCause::HostPressure);
     assert!(matches!(e.winner, Some(Winner::HostStop)));
+    let terminal = host.snapshot.billing[JOB].terminal.clone().unwrap();
+    assert_eq!(terminal["oom_kill"]["cause"], "host_pressure");
+    // What a caller decodes: the shared record keeps the kill cause and the
+    // memory the job ran with, not only the billing-side field names.
+    let record: motor_protocol::TerminalRecord = serde_json::from_value(terminal).unwrap();
+    assert_eq!(record.oom_kill().map(|k| k.cause()), Some("host_pressure"));
     assert_eq!(
-        host.snapshot.billing[JOB].terminal.as_ref().unwrap()["oom_kill"]["cause"],
-        "host_pressure"
+        record.memory_stated_mib(),
+        crate::state::jobs::memory_limit_mib(&host.snapshot.leases[JOB].claims)
     );
     assert!(
         host.snapshot.per_job.disks[&host.snapshot.per_job.executions[JOB].disk_id].quarantined
