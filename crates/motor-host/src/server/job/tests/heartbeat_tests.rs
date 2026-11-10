@@ -108,6 +108,118 @@ async fn failed_host_probe_discards_a_previously_fresh_sample() {
     assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0));
 }
 
+fn slice_files(storage: &Storage, max: &str, current: &str, stat: &str) -> std::path::PathBuf {
+    let slice = storage.root.path().join("slice");
+    std::fs::create_dir_all(&slice).unwrap();
+    for (name, content) in [
+        ("memory.max", max),
+        ("memory.current", current),
+        ("memory.stat", stat),
+    ] {
+        std::fs::write(slice.join(name), content).unwrap();
+    }
+    slice
+}
+
+#[test]
+fn slice_file_pages_are_reclaimable_but_anon_and_kernel_are_not() {
+    let (runtime, fake, storage) = fixture();
+    let slice = slice_files(
+        &storage,
+        "1048576000\n",
+        "1038090240\n",
+        "anon 786432000\nfile 209715200\nkernel 41943040\nfile_mapped 104857600\n",
+    );
+    // 1000 MiB limit - (990 MiB charged - 200 MiB file) = 210 MiB.
+    let headroom = job_vm_headroom_mib(&slice).unwrap();
+    assert_eq!(headroom, 210);
+    *fake.slice_headroom_mib.lock().unwrap() = Some(headroom);
+    fake.capacity_available.store(true, Ordering::SeqCst);
+    runtime.host.lock().unwrap().enforce_storage();
+    runtime.probe_storage_at(1000);
+    let host = runtime.host.lock().unwrap();
+    assert_eq!(host.job_free_mem_mib(1000), 160);
+}
+
+#[test]
+fn invalid_or_missing_slice_files_never_yield_headroom() {
+    let (_, _, storage) = fixture();
+    for (max, current, stat) in [
+        ("max", "0", "file 0"),
+        ("bad", "0", "file 0"),
+        ("1000", "bad", "file 0"),
+        ("1000", "0", "anon 0"),
+        ("1000", "0", "file bad"),
+        ("1000", "0", "file 0\nfile 0"),
+        ("1000", "0", "file 0 extra"),
+    ] {
+        let slice = slice_files(&storage, max, current, stat);
+        assert!(
+            job_vm_headroom_mib(&slice).is_err(),
+            "{max}, {current}, {stat}"
+        );
+    }
+    for name in ["memory.max", "memory.current", "memory.stat"] {
+        let slice = slice_files(&storage, "1000", "0", "file 0");
+        std::fs::remove_file(slice.join(name)).unwrap();
+        assert!(job_vm_headroom_mib(&slice).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn slice_headroom_saturates_drift_and_floors_bytes_to_mib() {
+    let (_, _, storage) = fixture();
+    for (current, file, expected) in [(0, 100, 1), (2097153, 0, 0), (1, 0, 0)] {
+        let slice = slice_files(
+            &storage,
+            "1048576",
+            &current.to_string(),
+            &format!("file {file}"),
+        );
+        assert_eq!(job_vm_headroom_mib(&slice).unwrap(), expected);
+    }
+}
+
+#[test]
+fn unreadable_slice_file_withdraws_a_previously_fresh_capacity_sample() {
+    let (runtime, fake, _) = fixture();
+    fake.capacity_available.store(true, Ordering::SeqCst);
+    runtime.host.lock().unwrap().enforce_storage();
+    runtime.probe_storage_at(1000);
+    assert_eq!(runtime.host.lock().unwrap().job_free_mem_mib(1000), 950);
+
+    // Model a read error through Control, including PermissionDenied even when
+    // the test runner is privileged enough to bypass a fixture's mode bits.
+    *fake.slice_headroom_mib.lock().unwrap() = None;
+    runtime.probe_storage_at(1001);
+    let host = runtime.host.lock().unwrap();
+    assert!(host.fresh_host_resources(1001).is_none());
+    let heartbeat = host.heartbeat(1001, host.job_free_mem_mib(1001), true);
+    assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0));
+}
+
+#[test]
+fn host_sample_freshness_bounds_both_past_age_and_future_skew() {
+    let (runtime, _, _) = fixture();
+    let mut host = runtime.host.lock().unwrap();
+    let mut sample = host.fresh_host_resources(unix_ms()).unwrap();
+    sample.at_ms = 50_000;
+    host.record_host_resources(sample);
+    for now in [
+        49_500,
+        49_000,
+        50_000,
+        50_000 + crate::state::MEMORY_FRESH_MS,
+    ] {
+        assert!(host.fresh_host_resources(now).is_some(), "{now}");
+    }
+    for now in [48_999, 50_001 + crate::state::MEMORY_FRESH_MS] {
+        assert!(host.fresh_host_resources(now).is_none(), "{now}");
+    }
+    host.host_resources_unavailable("test missing sample");
+    assert!(host.fresh_host_resources(50_000).is_none());
+}
+
 async fn dax_refusal(runtime: &Arc<Runtime>, fake: &Fake, job: &str) {
     *fake.init_reply.lock().unwrap() = Some(json!({"ok":false,"error":"job_vm_dax_required"}));
     let mut c = claims(job);
@@ -148,6 +260,7 @@ async fn dax_refusal_latches_health_across_restart_until_operator_clear_and_rela
     host.settings = settings;
     host.record_host_resources(HostResources {
         at_ms: unix_ms(),
+        job_vm_headroom_mib: u64::MAX,
         available_mem_mib: 1000,
         vcpu_ceiling: 2,
         permit_budget: 4,

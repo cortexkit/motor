@@ -289,6 +289,7 @@ fn fills_wait_for_queued_claims_and_capacity_refusals_then_require_fresh_memory(
         .is_none());
     h.record_host_resources(HostResources {
         at_ms: later,
+        job_vm_headroom_mib: u64::MAX,
         available_mem_mib: 170,
         vcpu_ceiling: 2,
         permit_budget: 4,

@@ -42,6 +42,9 @@ struct PerJobHost {
     adopts: std::sync::atomic::AtomicUsize,
 }
 impl Control for PerJobHost {
+    fn job_vm_headroom_mib(&self) -> Result<u64> {
+        Ok(10_000)
+    }
     fn host_available_mib(&self) -> Result<u64> {
         NoVm.host_available_mib()
     }

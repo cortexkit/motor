@@ -123,6 +123,9 @@ pub trait Control: Send + Sync {
     fn suspend(&self, tenant: &str) -> Result<()>;
     fn available_bytes(&self) -> Result<u64>;
     fn host_available_mib(&self) -> Result<u64>;
+    fn job_vm_headroom_mib(&self) -> Result<u64> {
+        anyhow::bail!("job-VM cgroup memory unavailable")
+    }
     fn online_cpus(&self) -> Result<u32>;
     /// Reads the host capacity file. Without one, the storage refusal stays
     /// latched and free memory is advertised as 0.
@@ -713,6 +716,14 @@ impl Control for Helper {
     }
     fn host_available_mib(&self) -> Result<u64> {
         crate::server::host_available_mib(&std::fs::read_to_string("/proc/meminfo")?)
+    }
+    fn job_vm_headroom_mib(&self) -> Result<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::server::job_vm_headroom_mib(Path::new(motor_vm_helper::linux::cgroup::JOB_SLICE))
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("job-VM cgroup memory requires Linux")
     }
     fn online_cpus(&self) -> Result<u32> {
         // CPU affinity can be narrower than the host's configured online CPUs.

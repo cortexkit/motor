@@ -25,6 +25,7 @@ fn restart(runtime: Arc<Runtime>, fake: Arc<Fake>, storage: Arc<Storage>) -> Arc
     host.settings = settings;
     host.record_host_resources(HostResources {
         at_ms: unix_ms(),
+        job_vm_headroom_mib: u64::MAX,
         available_mem_mib: 1000,
         vcpu_ceiling: 2,
         permit_budget: 4,
@@ -54,6 +55,7 @@ async fn unclean_mark_refuses_claim_and_keeps_warm_busy_across_restart_and_capac
     let mut host = runtime.host.lock().unwrap();
     host.record_host_resources(HostResources {
         at_ms: unix_ms(),
+        job_vm_headroom_mib: u64::MAX,
         available_mem_mib: 50,
         vcpu_ceiling: 2,
         permit_budget: 4,

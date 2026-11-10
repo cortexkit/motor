@@ -28,6 +28,7 @@ fn tick(runtime: &Arc<Runtime>, now: u64, available: u64) {
         .unwrap()
         .record_host_resources(HostResources {
             at_ms: now,
+            job_vm_headroom_mib: u64::MAX,
             available_mem_mib: available,
             vcpu_ceiling: 2,
             permit_budget: 4,
@@ -39,6 +40,42 @@ fn balloons(fake: &Fake) -> Vec<(String, u64)> {
 }
 fn stopped(runtime: &Arc<Runtime>, job: &str) -> bool {
     runtime.host.lock().unwrap().snapshot.per_job.executions[job].ended
+}
+
+#[test]
+fn job_slice_pressure_overrides_high_host_available_memory() {
+    let (runtime, fake, _) = fixture();
+    running(&runtime, &fake, JOB, 100, 140);
+    fake.capacity_available.store(true, Ordering::SeqCst);
+    *fake.slice_headroom_mib.lock().unwrap() = Some(49);
+    runtime.host.lock().unwrap().enforce_storage();
+    runtime.probe_storage_at(1000);
+    {
+        let host = runtime.host.lock().unwrap();
+        let sample = host.fresh_host_resources(1000).unwrap();
+        assert_eq!(sample.available_mem_mib, 1000);
+        assert_eq!(host.job_free_mem_mib(1000), 0);
+        assert_eq!(
+            host.heartbeat(1000, host.job_free_mem_mib(1000), true)
+                .free_mem_mib,
+            0
+        );
+    }
+    runtime.tick_balloon(1000);
+    assert_eq!(balloons(&fake), vec![(JOB.into(), 30)]);
+
+    // Slice recovery obeys the same reserve and hysteresis as host pressure.
+    for (now, headroom) in [(1001, 50), (1002, 60)] {
+        *fake.slice_headroom_mib.lock().unwrap() = Some(headroom);
+        runtime.probe_storage_at(now);
+        runtime.tick_balloon(now);
+        assert_eq!(balloons(&fake), vec![(JOB.into(), 30)]);
+    }
+    *fake.slice_headroom_mib.lock().unwrap() = Some(61);
+    runtime.probe_storage_at(1003);
+    runtime.tick_balloon(1003);
+    assert_eq!(balloons(&fake), vec![(JOB.into(), 30), (JOB.into(), 0)]);
+    assert_eq!(runtime.host.lock().unwrap().job_free_mem_mib(1003), 11);
 }
 
 #[test]
@@ -162,6 +199,7 @@ fn per_job_lifecycle_tick_runs_the_controller() {
         .unwrap()
         .record_host_resources(HostResources {
             at_ms: 1000,
+            job_vm_headroom_mib: u64::MAX,
             available_mem_mib: 49,
             vcpu_ceiling: 2,
             permit_budget: 4,
@@ -183,6 +221,7 @@ fn false_runner_and_balloon_statistics_do_not_affect_targets_order_or_capacity()
             .unwrap()
             .record_host_resources(HostResources {
                 at_ms: 900,
+                job_vm_headroom_mib: u64::MAX,
                 available_mem_mib: 1000,
                 vcpu_ceiling: 2,
                 permit_budget: 4,

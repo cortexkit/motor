@@ -401,6 +401,7 @@ fn reboot_gap_bound_starts_at_first_gone_observation_and_survives_restart() {
         .unwrap()
         .record_host_resources(HostResources {
             at_ms: unix_ms(),
+            job_vm_headroom_mib: u64::MAX,
             available_mem_mib: 1000,
             vcpu_ceiling: 2,
             permit_budget: 4,
@@ -531,6 +532,7 @@ fn crash_child() {
         .unwrap()
         .record_host_resources(HostResources {
             at_ms: unix_ms(),
+            job_vm_headroom_mib: u64::MAX,
             available_mem_mib: 1000,
             vcpu_ceiling: 2,
             permit_budget: 4,
@@ -673,6 +675,7 @@ fn host_originated_usage_resend_is_accepted_without_409() {
         let mut host = runtime.host.lock().unwrap();
         host.record_host_resources(HostResources {
             at_ms: now,
+            job_vm_headroom_mib: u64::MAX,
             available_mem_mib: 100_000,
             vcpu_ceiling: 2,
             permit_budget: 4,

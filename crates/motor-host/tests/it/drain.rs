@@ -297,6 +297,7 @@ fn bounded_drain_refuses_just_past_deadline_accepts_inside_and_allows_attach() {
             if matches!(settings, motor_host::config::HostSettings::PerJob(_)) {
                 h.record_host_resources(motor_host::state::jobs::HostResources {
                     at_ms: MS,
+                    job_vm_headroom_mib: u64::MAX,
                     available_mem_mib: 100_000,
                     vcpu_ceiling: 2,
                     permit_budget: 4,

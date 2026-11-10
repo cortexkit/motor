@@ -116,8 +116,27 @@ pub struct Execution {
 pub struct HostResources {
     pub at_ms: u64,
     pub available_mem_mib: u64,
+    pub job_vm_headroom_mib: u64,
     pub vcpu_ceiling: u32,
     pub permit_budget: u32,
+}
+
+const HOST_SAMPLE_AHEAD_MS: u64 = 1_000;
+
+impl HostResources {
+    pub(crate) fn free_mem_mib(&self, host_reserve_mib: u64) -> u64 {
+        // A VM can grow by GiB between probes and before reclaim takes effect.
+        // Keep the same reserve at both limits, rather than waiting until the
+        // slice is nearly full. Take the minimum first: this is one reserve,
+        // not two debits against the same available memory.
+        self.available_mem_mib
+            .min(self.job_vm_headroom_mib)
+            .saturating_sub(host_reserve_mib)
+    }
+
+    pub(crate) fn memory_pressure(&self, host_reserve_mib: u64) -> bool {
+        self.available_mem_mib.min(self.job_vm_headroom_mib) < host_reserve_mib
+    }
 }
 
 /// The token's optional field enables burst; its numeric value cannot enlarge
@@ -214,9 +233,7 @@ impl Host {
             .values()
             .filter(|job| !job.ended && !job.runner_hello)
             .fold(
-                sample
-                    .available_mem_mib
-                    .saturating_sub(settings.host_reserve_mib),
+                sample.free_mem_mib(settings.host_reserve_mib),
                 |free, job| free.saturating_sub(job.memory_debit_mib),
             );
         let free = self
@@ -236,7 +253,10 @@ impl Host {
 
     pub(crate) fn fresh_host_resources(&self, now_ms: u64) -> Option<HostResources> {
         let fresh = self.host_resources.filter(|sample| {
-            now_ms >= sample.at_ms && now_ms - sample.at_ms <= super::MEMORY_FRESH_MS
+            // Concurrent callers may have captured their clocks before the
+            // thread that published this sample. Allow only a bounded skew.
+            sample.at_ms.saturating_sub(now_ms) <= HOST_SAMPLE_AHEAD_MS
+                && now_ms.saturating_sub(sample.at_ms) <= super::MEMORY_FRESH_MS
         });
         if fresh.is_none() && !self.host_resources_failed.replace(true) {
             tracing::warn!("host_resources_missing_or_stale");

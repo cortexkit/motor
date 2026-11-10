@@ -67,6 +67,9 @@ struct PrepareHold {
     release: std::sync::mpsc::Receiver<()>,
 }
 impl Control for Disk {
+    fn job_vm_headroom_mib(&self) -> anyhow::Result<u64> {
+        Ok(100_000)
+    }
     fn host_available_mib(&self) -> anyhow::Result<u64> {
         Ok(100_000)
     }
@@ -290,6 +293,7 @@ impl Fixture {
         host.enforce_storage();
         host.record_host_resources(HostResources {
             at_ms: unix_ms(),
+            job_vm_headroom_mib: u64::MAX,
             available_mem_mib: 100_000,
             vcpu_ceiling: 4,
             permit_budget: 4,

@@ -70,18 +70,13 @@ impl Runtime {
             return Ok(());
         }
         controller.after_stop_sample_ms = None;
-        let available = sample.available_mem_mib;
         controller
             .targets
             .retain(|job, _| executions.iter().any(|e| &e.claims.jti == job));
-        if available >= settings.host_reserve_mib {
+        if !sample.memory_pressure(settings.host_reserve_mib) {
             // Ending an episode does not deflate until the hysteresis is crossed.
             controller.pending = None;
-            if available
-                > settings
-                    .host_reserve_mib
-                    .saturating_add(settings.hysteresis_mib)
-            {
+            if sample.free_mem_mib(settings.host_reserve_mib) > settings.hysteresis_mib {
                 for execution in executions {
                     let job = &execution.claims.jti;
                     // Also reset balloons inherited across a motor-host restart.
@@ -140,7 +135,7 @@ impl Runtime {
             ));
         }
         // No positive overage is never a reason to stop an innocent VM. While
-        // available < reserve, admission's job_free_mem_mib already returns 0.
+        // either memory floor is breached, admission already returns 0.
         Ok(())
     }
 }

@@ -298,11 +298,11 @@ out of memory.
 | --- | --- | --- |
 | `vcpu_ceiling` | vCPUs | Maximum job size; 1 through the helper's online CPU count. |
 | `permit_budget` | vCPU permits | Host admission budget with CPU overcommit; at least `vcpu_ceiling`, at most four times online CPUs. |
-| `host_reserve_mib` | MiB | Host available-memory floor for admission and pressure reclamation. |
+| `host_reserve_mib` | MiB | Available-memory floor at both the host and job-VM slice limits for admission and pressure reclamation. |
 | `boot_reserve_mib` | MiB | Added to each job's stated memory debit until its runner answers hello, including queued jobs. |
 | `per_vm_overhead_mib` | MiB | Added to stated memory when computing a VM's positive resident-RAM overage. |
 | `reclaim_timeout_ms` | milliseconds | Wait after balloon inflation before rechecking pressure and possibly stopping that VM. |
-| `hysteresis_mib` | MiB | Available memory above the host reserve needed to deflate balloons. |
+| `hysteresis_mib` | MiB | Available memory above the reserve at both limits needed to deflate balloons. |
 | `workspace_disk_cap_bytes` | bytes | Sparse workspace-disk size cap; admission reserves remaining possible physical growth. |
 | `boot_deadline_ms` | milliseconds | Bound from boot start to runner hello, excluding disk recovery. |
 | `recovery_timeout_ms` | milliseconds | Bound from recovery VM start; expiry stops recovery and deletes its workspace disk. |
@@ -324,7 +324,19 @@ not real-VM qualification. No server-specific values belong in this document.
 Per-job admission reserves each claim before evaluating the next against the
 same sample: permits, stated memory plus boot reserve (never burst), disk growth,
 generation and replay. After runner hello, memory counts through host-measured
-available memory. A job's guest RAM is `ceil((mem_mib + burst) / 0.75)` MiB;
+available memory. The host measures `/proc/meminfo`'s `MemAvailable` and the
+job-VM cgroup's room from
+`/sys/fs/cgroup/motorvm.slice/{memory.max,memory.current,memory.stat}`. Slice room
+is `memory.max - (memory.current - file)`, floored at zero, with file pages
+counted as reclaimable but anonymous, kernel and other charged memory not counted
+as free. The slice uses `host_reserve_mib` as its margin too: VM residency can
+grow by GiB between probes and before reclaim takes effect. The reserve is
+subtracted once from the smaller of host `MemAvailable` and slice room, not
+twice from the same memory. That headroom governs admission and balloon
+reclamation, so slice pressure triggers reclaim even when the host has free
+memory. Missing, unreadable or invalid slice files withdraw capacity. Samples
+may be at most 30 seconds old or one second ahead of a caller's clock; missing
+samples remain stale. A job's guest RAM is `ceil((mem_mib + burst) / 0.75)` MiB;
 its systemd job limit is stated memory plus burst. Same-workspace jobs queue
 until the disk is detached; quarantined disks refuse claims as `host_full`.
 Admission reserves at most 64 distinct job workspace disk attachments, the same
