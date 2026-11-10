@@ -32,10 +32,9 @@ fn render(name: &str, sandbox: &Sandbox, f: &Fixture, durable: bool) -> String {
 }
 
 /// SHA-256 of the rendered argv of every case below.
-// Jobs and repository-building writer fills need a 65536 open-file soft limit.
-// Every case adds LimitNOFILE=65536:524288, preserving systemd's hard ceiling;
-// the remaining argv is unchanged.
-const PINNED_SHA256: &str = "419cbab8b13f1cb32378ff65947f208f0026909abb5474b80b505e0b77e5fc97";
+// The writer case caps its service and all descendants at 90 minutes. Foreground
+// jobs retain their existing resource properties and request-based deadlines.
+const PINNED_SHA256: &str = "56c29d008b148fa2fc9ed69bec4ac1872bccd59c3edfbf5d4ac3e321db9be0c0";
 
 #[test]
 fn job_unit_commands_match_the_pinned_argv() {

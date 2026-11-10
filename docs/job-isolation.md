@@ -126,6 +126,19 @@ limit. Remove the variable from the nested command's environment (in Rust,
 `Command::env_remove("CARGO_BUILD_BUILD_DIR")`), so its build folder follows
 its own `--target-dir`. Not covered by a test.
 
+Trusted Cargo source preparation uses a different lock domain from sandbox
+builds: the shared Cargo home's package-cache locks. When an attempt times out
+or fails after reporting a package-cache lock wait, the runner adds a bounded,
+best-effort holder snapshot to its log and setup failure detail. It matches each
+lock file's device and inode against `/proc/locks`, excludes blocked contenders,
+and records holder PID, truncated command, cgroup and process start identity.
+URLs in those commands are redacted before truncation. Process age is not lock
+hold duration. The runner rechecks process start identity and lock ownership to
+avoid attributing an exited PID's lock to a replacement process; unavailable or
+vanished evidence reports `holder unknown` and is never itself an admission
+failure. A helper whose cleanup cannot be confirmed stopped is a fatal setup
+error naming its unit, not permission to launch an offline retry beside it.
+
 3.1. A job cannot read the runner's state, mirrors, other workspaces or other
 jobs' sandboxes. Tests: `isolated_job_cannot_access_runner_or_other_jobs` and
 `isolated_jobs_receive_private_shm_that_disappears_after_they_end` (operator-only).

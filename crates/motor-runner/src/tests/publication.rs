@@ -20,6 +20,155 @@ mod ccache_qualification;
 const HOUR: u64 = 60 * 60 * 1000;
 const DAY: u64 = 24 * HOUR;
 
+#[tokio::test]
+async fn writer_runtime_expiry_fails_fill_without_publication() {
+    let f = Fixture::new();
+    let ready = f.scratch.join("writer-ready");
+    declare(
+        &f,
+        &format!(
+            "trap 'exit 0' TERM; touch '{}'; {}",
+            ready.display(),
+            controlled_command(&f)
+        ),
+    );
+    let runner = controlled_runner_with(&f, |config| {
+        config.writer_runtime_limit = Duration::from_secs(2);
+    });
+    submit_reader(&f, &runner).await;
+    let fill = running_fill(&runner, 0).await;
+    until(|| ready.is_file()).await;
+    assert_eq!(fill.request.as_ref().unwrap().timeout, None);
+    // Valid writes and an exit-zero TERM handler must not publish a fill whose
+    // runner deadline expired. Missing write evidence would fail it anyway.
+    let harness = Harness::new();
+    let tool = if f.main.join("Cargo.toml").is_file() {
+        Tool::Sccache
+    } else {
+        Tool::Ccache
+    };
+    let binding = attach(
+        &runner,
+        &fill,
+        &harness,
+        tool,
+        Some(if tool == Tool::Sccache {
+            SCCACHE_OK
+        } else {
+            CCACHE_OK
+        }),
+    );
+    let path = if tool == Tool::Sccache {
+        format!("/{BUCKET}/fixture")
+    } else {
+        "/fixture".into()
+    };
+    assert_eq!(harness.put(&binding, &path, b"entry").await.status, 200);
+    f.clock.fetch_add(2001, Ordering::SeqCst);
+    runner.enforce_kills(std::time::Instant::now()).unwrap();
+    let killed = runner.core.inner.lock().unwrap().jobs[&fill.id].clone();
+    let deadline_recorded = matches!(killed.kill, Some((Killed::Deadline, _)));
+    if !deadline_recorded {
+        // A disabled deadline must still release the fixture's running shell
+        // before the regression assertion reports the missing enforcement.
+        fs::write(release_path(&f), "").unwrap();
+    }
+    drive(&runner, || {
+        let inner = runner.core.inner.lock().unwrap();
+        inner.jobs[&fill.id].terminal.is_some() && inner.writer.is_none()
+    })
+    .await;
+    assert!(
+        deadline_recorded,
+        "writer runtime deadline was not enforced"
+    );
+    let inner = runner.core.inner.lock().unwrap();
+    assert_eq!(
+        inner.jobs[&fill.id].terminal.as_ref().unwrap().killed,
+        Some(Killed::Deadline)
+    );
+    drop(inner);
+    let record = repository(&f, &runner);
+    assert!(record.publications.is_empty());
+    assert_eq!(record.failed_descriptor, fill.writer_descriptor);
+    assert_eq!(record.result, Some(RebuildResult::Failed));
+}
+
+#[tokio::test]
+async fn writer_lifecycle_logs_include_repository_unit_start_age_and_outcome() {
+    let f = Fixture::new();
+    declare(&f, &controlled_command(&f));
+    let runner = controlled_runner(&f);
+    submit_reader(&f, &runner).await;
+    let fill = running_fill(&runner, 0).await;
+    let mut sample = fill.clone();
+    let unit_id = Uuid::now_v7();
+    sample.process.as_mut().unwrap().unit = Some(unit_id);
+    f.clock.fetch_add(340_000, Ordering::SeqCst);
+    let log = capture_runner_logs(|| {
+        runner.log_writer(&sample, "started");
+        sample.kill = Some((Killed::Deadline, runner.now()));
+        runner.log_writer(&sample, "kill_requested");
+        sample.terminal_ended(Outcome::Exit { code: 0 }, runner.now());
+        runner.log_writer(&sample, "finished");
+    });
+    for value in [
+        "writer lifecycle",
+        "compile_cache_fill",
+        &f.root,
+        &unit_id.to_string(),
+        "started_ms",
+        "age_ms=340000",
+        "kill_requested",
+        "finished",
+        "Deadline",
+    ] {
+        assert!(log.contains(value), "missing {value}: {log}");
+    }
+    settle(&f, &runner, &fill).await;
+}
+
+#[tokio::test]
+async fn systemd_writer_timeout_overrides_a_successful_exit_and_valid_writes() {
+    let f = Fixture::new();
+    declare(&f, &controlled_command(&f));
+    let runner = controlled_runner(&f);
+    submit_reader(&f, &runner).await;
+    let fill = running_fill(&runner, 0).await;
+    let mut evidence = crate::engine::terminal_evidence::ExecutionEvidence::default();
+    evidence.unit(
+        "Result=timeout\nExecMainCode=1\nExecMainStatus=0\n",
+        Path::new("/sys/fs/cgroup"),
+    );
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&fill.id)
+        .unwrap()
+        .execution_evidence = Some(evidence);
+    settle(&f, &runner, &fill).await;
+    let job = runner.core.inner.lock().unwrap().jobs[&fill.id].clone();
+    assert_eq!(
+        job.terminal.as_ref().unwrap().outcome,
+        Outcome::Exit { code: 0 }
+    );
+    assert_eq!(
+        job.terminal.as_ref().unwrap().killed,
+        Some(Killed::Deadline)
+    );
+    let record = repository(&f, &runner);
+    assert_eq!(record.result, Some(RebuildResult::Failed));
+    assert!(record.publications.is_empty());
+    assert!(record
+        .failure_detail
+        .as_deref()
+        .unwrap()
+        .contains("writer runtime limit exceeded"));
+}
+
 fn store(name: &str) -> StoreIdentity {
     StoreIdentity {
         endpoint: "https://s3.example.invalid".into(),

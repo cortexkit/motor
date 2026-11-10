@@ -81,6 +81,31 @@ fn run_prefetch(config: &Config, scratch: &ScratchDir, limit: Duration) -> io::R
     )
 }
 
+#[test]
+fn snapshot_helper_settlement_failure_is_typed_and_names_the_unit() {
+    let scratch = ScratchDir::new("snapshot-unsettled");
+    let mut config = ending(&scratch, SUCCEEDED);
+    let calls = Arc::new(Mutex::new(0));
+    config.systemd_command = Some(Arc::new(move |_| {
+        let mut calls = calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            Ok(output(0, SUCCEEDED))
+        } else {
+            Err(io::Error::other("cannot inspect cleanup"))
+        }
+    }));
+    let error = run_prefetch(&config, &scratch, Duration::from_secs(1)).unwrap_err();
+    let unsettled = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<UnsettledHelper>()
+        .unwrap();
+    assert!(unsettled.unit.starts_with("motor-snaphelper-"));
+    assert!(unsettled.unit.ends_with(".service"));
+    assert!(unsettled.detail.contains("cannot inspect cleanup"));
+}
+
 // Installs the resolver with the Linux-only tenant agent.
 #[cfg(target_os = "linux")]
 #[test]

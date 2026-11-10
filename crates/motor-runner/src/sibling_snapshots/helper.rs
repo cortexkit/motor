@@ -479,6 +479,32 @@ pub(crate) fn run_with_test_resolver(
     run_via(config, helper, limit, command, view, move || resolver)
 }
 
+/// Cleanup failure is not a fetch failure: retrying could overlap a live helper.
+#[derive(Debug)]
+pub(crate) struct UnsettledHelper {
+    pub(crate) unit: String,
+    pub(crate) detail: String,
+}
+
+impl std::fmt::Display for UnsettledHelper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "helper unit {} could not be confirmed stopped: {}",
+            self.unit, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnsettledHelper {}
+
+#[cfg(target_os = "linux")]
+impl UnsettledHelper {
+    pub(crate) fn is(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|error| error.is::<Self>())
+    }
+}
+
 fn run_via(
     config: &Config,
     helper: Helper,
@@ -507,10 +533,10 @@ fn run_via(
     let output = files.output();
     files.remove();
     let settled = settled.map_err(|error| {
-        io::Error::other(format!(
-            "{} helper unit {unit} could not be confirmed stopped: {error}",
-            helper.label()
-        ))
+        io::Error::other(UnsettledHelper {
+            unit: unit.clone(),
+            detail: format!("{}: {error}{output}", helper.label()),
+        })
     })?;
     let observed = observed.map_err(|error| {
         io::Error::new(
