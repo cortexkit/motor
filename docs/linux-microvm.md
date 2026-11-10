@@ -18,6 +18,15 @@ The standalone loader is not used by a runner backend. `serve --backend vm`
 remains unavailable; hosted per-job scheduling is a `motor-host` mode, not that
 runner backend. Windows jobs use the backend in [windows-jobs.md](windows-jobs.md).
 
+A job VM returns unused memory to the host through the virtio balloon's
+free-page reporting, in 128 KiB blocks so that scattered free pages can be
+reported. In per-job mode the guest also keeps its file cache at or below 1 GiB:
+every two seconds the runner asks the kernel to reclaim file cache above that
+bound from the guest's root cgroup, which covers both preparation and the job.
+This reclaim never moves anonymous memory to swap, and it is best-effort: a
+failed request is logged once and the job continues. Tenant VMs and Boat
+sandboxes do not trim their cache this way.
+
 ## motor-vm-helper
 
 The helper is a Linux-only root service. `motor-host` stays unprivileged and

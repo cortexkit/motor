@@ -27,9 +27,9 @@ const JOB_OOM_SCORE: i32 = 1000;
 const JOB_BOOT_CMDLINE_MAX_BYTES: usize = 1536;
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
-// Keep the tenant image's boot contract until published image manifests carry
-// the command line, adding only the flag that selects the one-job guest mode.
-const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1";
+// Without huge pages, the guest defaults to reporting only whole 4 MiB blocks.
+// Report 128 KiB blocks so fragmented pages freed from file cache reach the host.
+const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1 page_reporting.page_reporting_order=5";
 
 mod conntrack;
 mod memory;
