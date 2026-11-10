@@ -6,6 +6,46 @@ mod network_tests;
 mod security_tests;
 
 #[test]
+fn absent_job_stop_and_adopt_are_idempotent_without_exit_evidence() {
+    let base = scratch();
+    let mut jobs = machine(&base);
+    let id = start().job_id;
+    jobs.stop(&id).unwrap();
+    let reply = serde_json::to_value(jobs.status(&id).unwrap().reply).unwrap();
+    assert_eq!(reply["known"], false);
+    assert_eq!(reply["running"], false);
+    assert!(reply.get("exit_report").is_none());
+    // Readers that ignore additive fields can still confirm that no VM
+    // holds the workspace; no exit receipt is synthesized.
+    assert_eq!(reply["result"], "job");
+    assert!(jobs.records.is_empty());
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn absent_job_requires_empty_cgroup_and_no_unreconciled_jail() {
+    let base = scratch();
+    let mut jobs = machine(&base);
+    let id = start().job_id;
+    let group = jobs.group(&id);
+    std::fs::create_dir_all(&group).unwrap();
+    std::fs::write(group.join("cgroup.procs"), "123\n").unwrap();
+    assert!(jobs.stop(&id).is_err());
+    assert!(jobs.status(&id).is_err());
+    std::fs::write(group.join("cgroup.procs"), "").unwrap();
+    std::fs::create_dir_all(jobs.boundary(&id)).unwrap();
+    assert!(jobs.stop(&id).is_err());
+    assert!(jobs.status(&id).is_err());
+    std::fs::remove_dir_all(jobs.boundary(&id)).unwrap();
+    jobs.stop(&id).unwrap();
+    assert_eq!(
+        serde_json::to_value(jobs.status(&id).unwrap().reply).unwrap()["known"],
+        false
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn balloon_refuses_target_above_recorded_ram_before_opening_any_process_or_socket() {
     let base = scratch();
     let mut jobs = machine(&base);
@@ -544,7 +584,7 @@ fn helper_restart_re_adopts_a_live_vmm_without_killing_it() {
         .adopt_record(serde_json::from_slice(&durable).unwrap())
         .unwrap();
     assert!(matches!(restarted.status(&start().job_id).unwrap().reply,
-        Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == vmm.child.id()));
+        Reply::Job { known: true, running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == vmm.child.id()));
     assert!(vmm.child.try_wait().unwrap().is_none());
     assert_eq!(unsafe { libc::kill(child_pid as i32, 0) }, 0);
     unsafe {
@@ -798,7 +838,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 .parse()
                 .unwrap();
             assert!(matches!(jobs.status(&start().job_id).unwrap().reply,
-                Reply::Job { running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == expected));
+                Reply::Job { known: true, running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == expected));
             assert_eq!(read_oom_score(expected).unwrap(), JOB_OOM_SCORE);
         }
         return;

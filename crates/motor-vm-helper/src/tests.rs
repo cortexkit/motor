@@ -103,6 +103,7 @@ impl Machine for Fake {
             _ => {}
         }
         Ok(Response::new(Reply::Job {
+            known: true,
             running: self.job_running,
             vmm_pid: None,
             exit_report: None,

@@ -9,6 +9,47 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 #[test]
+fn job_stop_and_adopt_readers_accept_additive_absent_status() {
+    let directory = scratch();
+    let path = directory.path().join("absent-helper.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let worker = std::thread::spawn(move || {
+        for op in ["stop_job", "adopt_job"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["op"], op);
+            let reply = motor_vm_helper::Reply::Job {
+                known: false,
+                running: false,
+                vmm_pid: None,
+                tap_index: None,
+                exit_report: None,
+            };
+            serde_json::to_writer(&mut stream, &reply).unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+    });
+    let helper = Helper {
+        socket: path,
+        storage: directory.path().to_owned(),
+        capacity: directory.path().join("capacity.json"),
+        guest_init: BTreeMap::new(),
+        vcpu_ceiling: BTreeMap::new(),
+        pressure_cgroups: BTreeMap::new(),
+    };
+    helper
+        .stop_job("00000000-0000-7000-8000-000000000001")
+        .unwrap();
+    assert!(!helper
+        .adopt_job("00000000-0000-7000-8000-000000000001")
+        .unwrap());
+    worker.join().unwrap();
+}
+
+#[test]
 fn rollback_helper_requests_carry_only_tenant_and_account_not_credentials() {
     let directory = scratch();
     let path = directory.path().join("helper.sock");

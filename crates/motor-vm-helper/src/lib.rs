@@ -277,6 +277,7 @@ pub enum Reply {
         resident_bytes: u64,
     },
     Job {
+        known: bool,
         running: bool,
         vmm_pid: Option<u32>,
         /// The helper's own allocation, used by the host for the guest address

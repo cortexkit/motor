@@ -763,17 +763,44 @@ impl LinuxJobs {
     }
 
     fn status(&self, id: &str) -> Result<Response> {
-        let record = self
-            .records
-            .get(id)
-            .ok_or_else(|| Error("unknown job VM".into()))?;
+        let Some(record) = self.records.get(id) else {
+            self.prove_absent(id)?;
+            return Ok(Response::new(Reply::Job {
+                known: false,
+                running: false,
+                vmm_pid: None,
+                tap_index: None,
+                exit_report: None,
+            }));
+        };
         let pid = self.pid(record)?;
         Ok(Response::new(Reply::Job {
+            known: true,
             running: pid.is_some(),
             vmm_pid: pid,
             tap_index: record.tap_index,
             exit_report: record.pending_exit(),
         }))
+    }
+
+    fn prove_absent(&self, id: &str) -> Result<()> {
+        job::validate_job_id(id)?;
+        match std::fs::read_to_string(self.group(id).join("cgroup.procs")) {
+            Ok(procs) if !procs.trim().is_empty() => {
+                return Err(Error("unrecorded job cgroup still holds processes".into()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Every jailer inherits this job's cgroup. Without its durable record,
+        // do not guess process ownership or clean a surviving jail: require
+        // both an empty cgroup and no jail before reporting an absent VM.
+        match std::fs::symlink_metadata(self.boundary(id)) {
+            Ok(_) => Err(Error("unrecorded job jail requires reconciliation".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn disk_available(&self, start: &Start, device: u64, inode: u64) -> Result<()> {
@@ -1028,11 +1055,9 @@ impl LinuxJobs {
     }
 
     fn stop(&mut self, id: &str) -> Result<()> {
-        let record = self
-            .records
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Error("unknown job VM".into()))?;
+        let Some(record) = self.records.get(id).cloned() else {
+            return self.prove_absent(id);
+        };
         if record.released {
             return Ok(());
         }
