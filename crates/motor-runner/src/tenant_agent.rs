@@ -1198,6 +1198,8 @@ fn runner_command(
         "--property=OOMScoreAdjust=-900",
         "--property=OOMPolicy=continue",
         "--property=LimitCORE=0",
+        "--property=StandardOutput=journal",
+        "--property=StandardError=journal",
         "--setenv=CARGO_HOME=/tenant/cargo-home",
         "--property=PrivateMounts=yes",
         "--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf",
@@ -1498,6 +1500,8 @@ mod tests {
         assert!(words.contains(&"--property=OOMScoreAdjust=-900"));
         assert!(words.contains(&"--property=OOMPolicy=continue"));
         assert!(words.contains(&"--property=LimitCORE=0"));
+        assert!(words.contains(&"--property=StandardOutput=journal"));
+        assert!(words.contains(&"--property=StandardError=journal"));
         assert!(words.contains(
             &"--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"
         ));

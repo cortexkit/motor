@@ -332,8 +332,55 @@ class QualificationTests(unittest.TestCase):
         self.assertNotIn("[Install]", unit)
         self.assertNotIn("systemd.wants=motor-qualification.service", original)
         self.assertLess(len(args.encode()), 4096)
-        runner = next(value.split(":", 1)[1] for value in args.split() if value.startswith("systemd.set_credential_binary=systemd.unit-dropin.motor-tenant-runner.service:"))
-        self.assertIn("StandardError=journal+console", base64.b64decode(runner).decode())
+        self.assertNotIn("systemd.unit-dropin.motor-tenant-runner.service", args)
+
+    def test_runner_journal_rejects_empty_omitted_and_unavailable_diagnostics_with_source_evidence(self):
+        source = dict(machine_id="b" * 32, journald_state="active", directories=[
+            dict(path="/var/log/journal", exists=True, machine_ids=["a" * 32])])
+        for entries, extra in [([], {}), ([dict(message="[message omitted]")], {}),
+                               ([], dict(unavailable=True, error=dict(exit_status=7, stderr_tail="denied")))]:
+            reply = dict(ok=True, journal=dict(entries=entries, unrecognized_messages_redacted=True,
+                                               source=source, **(extra or dict(command=dict(exit_status=0, stderr_tail="")))))
+            with self.subTest(reply=reply), self.assertRaisesRegex(RuntimeError, "runner journal diagnostics") as caught:
+                q.assert_runner_journal(reply)
+            evidence = str(caught.exception)
+            self.assertIn('"entries_count": ' + str(len(entries)), evidence)
+            self.assertIn('"machine_id": "' + "b" * 32, evidence)
+            self.assertIn('"machine_ids": ["' + "a" * 32, evidence)
+            if extra:
+                self.assertIn('"exit_status": 7', evidence)
+                self.assertIn('"stderr_tail": "denied"', evidence)
+            else:
+                self.assertIn('"exit_status": 0', evidence)
+                self.assertIn('"stderr_tail": ""', evidence)
+        reply = dict(ok=True, journal=dict(entries=[dict(message="materialize finished")],
+                                          unrecognized_messages_redacted=True))
+        self.assertEqual(q.assert_runner_journal(reply)["recognised_count"], 1)
+        with self.assertRaisesRegex(RuntimeError, "runner hello received"):
+            q.assert_runner_journal(reply, require_hello=True)
+
+    def test_runner_journal_uses_real_admin_diagnostics_for_tail_and_window(self):
+        harness = q.Harness.__new__(q.Harness)
+        harness.name, harness.uid, harness.gid = "qualify-host", 1234, 1234
+        harness.work = Path("/qualification")
+        harness.record = mock.Mock()
+        reply = dict(ok=True, journal=dict(entries=[dict(message="runner hello received elapsed_ms=1")],
+                                          unrecognized_messages_redacted=True,
+                                          command=dict(exit_status=0, stderr_tail="")))
+        with mock.patch.object(q.socket, "socket") as factory, mock.patch.object(q.os, "seteuid"), \
+                mock.patch.object(q.os, "setegid"):
+            conn = factory.return_value.__enter__.return_value
+            conn.recv.return_value = json.dumps(reply).encode() + b"\n"
+            evidence = harness.runner_journal()
+        self.assertEqual(len(evidence), 2)
+        self.assertEqual(evidence[0]["command"], dict(exit_status=0, stderr_tail=""))
+        self.assertEqual(conn.connect.call_args_list, [mock.call("/qualification/host-private/admin.sock")] * 2)
+        self.assertEqual([json.loads(call.args[0]) for call in conn.sendall.call_args_list], [
+            dict(tenant="qualify-host", op="diagnostics"),
+            dict(tenant="qualify-host", op="diagnostics", since_unix_s=0)])
+        source = __import__("inspect").getsource(q.Harness.execute)
+        self.assertIn('self.step("runner journal", self.runner_journal)', source)
+        self.assertIn("runner journal", q.STEPS)
 
     def test_guest_runner_diagnostics_include_unit_journal_and_actual_socket_peer(self):
         diagnostics = q.module("guest_runner_diagnostics", q.HERE / "guest/hosted_qualify.py")

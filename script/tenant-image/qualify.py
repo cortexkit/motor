@@ -59,7 +59,7 @@ JAVASCRIPT_MANAGERS = ("bun", "npm", "pnpm")
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
-          "tool trees", "root paths", "toolchain parity", "javascript setup", "trusted cargo fetch", "vsock isolation", "first job", "job sandbox", "warm target reuse", "suspend", "restore", "post-restore job",
+          "tool trees", "root paths", "toolchain parity", "javascript setup", "trusted cargo fetch", "vsock isolation", "first job", "runner journal", "job sandbox", "warm target reuse", "suspend", "restore", "post-restore job",
           "cold discard", "warm discard", "guest units", "teardown")
 
 
@@ -172,11 +172,9 @@ def qualification_args(original):
     # Direct tty output preserves exact evidence lines; journald's console
     # forwarding can prepend an identifier and PID to the checker's stdout.
     console = base64.b64encode(b"[Service]\nStandardOutput=tty\nStandardError=tty\nTTYPath=/dev/ttyS0\n").decode()
-    runner_console = base64.b64encode(b"[Service]\nStandardOutput=journal+console\nStandardError=journal+console\n").decode()
     return (original + " systemd.wants=motor-image-check.service systemd.wants=motor-qualification.service"
             + " systemd.set_credential_binary=systemd.extra-unit.motor-qualification.service:" + unit
-            + " systemd.set_credential_binary=systemd.unit-dropin.motor-image-check.service:" + console
-            + " systemd.set_credential_binary=systemd.unit-dropin.motor-tenant-runner.service:" + runner_console)
+            + " systemd.set_credential_binary=systemd.unit-dropin.motor-image-check.service:" + console)
 
 
 def exact_line(text, expected):
@@ -322,6 +320,24 @@ def assert_sandbox_job(frames):
                                  **{key: bytes(value).decode() for key, value in streams.items()}))
 
 
+def assert_runner_journal(reply, require_hello=False):
+    journal = reply.get("journal", {})
+    entries = journal.get("entries", [])
+    messages = [entry.get("message", "") for entry in entries]
+    recognised = [message for message in messages if message and message != "[message omitted]"]
+    evidence = dict(entries_count=len(entries), recognised_count=len(recognised),
+                    command=journal.get("command", journal.get("error")), source=journal.get("source"),
+                    ok=reply.get("ok"), unavailable=journal.get("unavailable"),
+                    error=reply.get("error"), sample=messages[:3])
+    if (reply.get("ok") is not True or journal.get("unavailable")
+            or journal.get("unrecognized_messages_redacted") is not True or not recognised
+            or (require_hello and not any(message.startswith("runner hello received") for message in recognised))):
+        raise RuntimeError("runner journal diagnostics missing recognised "
+                           + ("runner hello received" if require_hello else "entries")
+                           + ": " + json.dumps(evidence, sort_keys=True))
+    return evidence
+
+
 class Harness:
     def __init__(self, args):
         self.args = args
@@ -434,6 +450,31 @@ class Harness:
         if reply["result"] != "tenant":
             raise RuntimeError(f"helper refused {op}: {reply}")
         return reply
+
+    def runner_journal(self):
+        # Exercise the host-to-agent operation, not a root console journalctl.
+        # The runner must use its production unit without a logging drop-in.
+        evidence = []
+        for window in ({}, {"since_unix_s": 0}):
+            with socket.socket(socket.AF_UNIX) as conn:
+                conn.settimeout(15)
+                try:
+                    os.setegid(self.gid)
+                    os.seteuid(self.uid)
+                    conn.connect(str(self.work / "host-private/admin.sock"))
+                finally:
+                    os.seteuid(0)
+                    os.setegid(0)
+                conn.sendall(json.dumps(dict(tenant=self.name, op="diagnostics", **window)).encode() + b"\n")
+                data = b""
+                while not data.endswith(b"\n"):
+                    data += conn.recv(65536) or (_ for _ in ()).throw(EOFError())
+                    if len(data) > 4 * 1024**2:
+                        raise RuntimeError("runner diagnostics reply exceeded four MiB")
+            reply = json.loads(data)
+            self.record("runner_diagnostics", window=window, reply=reply)
+            evidence.append(assert_runner_journal(reply, require_hello=bool(window)))
+        return evidence
 
     def json_file(self, path, body, mode=0o600):
         path.write_text(json.dumps(body, indent=2) + "\n")
@@ -917,6 +958,7 @@ class Harness:
                 return assert_job(frames, 23 if number == 1 else 0,
                                   f"QUALIFY_STDOUT_{number}\n".encode(), f"QUALIFY_STDERR_{number}\n".encode())
             first = self.step("first job", lambda: [v.decode() for v in result(self.first_frames, 1)])
+            self.step("runner journal", self.runner_journal)
             # Inventory and kernel config cannot establish what an isolated job
             # actually sees. Submit through the same lease and TLS path as work.
             self.step("job sandbox", lambda: assert_sandbox_job(self.job(4, "python3 job-sandbox-probe.py")))

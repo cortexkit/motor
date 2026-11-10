@@ -38,6 +38,10 @@ impl JournalQuery {
             "--unit=motor-tenant-runner.service".to_owned(),
             "--output=json".to_owned(),
             "--no-pager".to_owned(),
+            // Attaching a tenant replaces /etc/machine-id after the base VM boots.
+            // Journald still writes under its cached boot ID; the default local
+            // journal query would skip that persistent journal directory.
+            "--merge".to_owned(),
         ];
         match self.since_unix_s {
             // journalctl reads "@<seconds>" as a Unix time.
@@ -457,7 +461,62 @@ fn journal_message(message: &str) -> String {
 async fn journal(query: JournalQuery) -> io::Result<Value> {
     let mut command = tokio::process::Command::new("journalctl");
     command.args(query.args());
-    journal_command(command, query).await
+    let mut result = journal_command(command, query).await?;
+    let service = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new("systemctl")
+            .args(["is-active", "systemd-journald.service"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let state = service
+        .ok()
+        .and_then(Result::ok)
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|state| {
+            matches!(
+                state.as_str(),
+                "active"
+                    | "inactive"
+                    | "failed"
+                    | "activating"
+                    | "deactivating"
+                    | "reloading"
+                    | "unknown"
+            )
+        });
+    result["source"] = journal_source(Path::new("/"), state.as_deref());
+    Ok(result)
+}
+
+fn journal_source(root: &Path, service_state: Option<&str>) -> Value {
+    let machine_id = fs::read_to_string(root.join("etc/machine-id"))
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| valid_machine_id(id));
+    let directories: Vec<_> = ["run/log/journal", "var/log/journal"]
+        .into_iter()
+        .map(|relative| {
+            let path = root.join(relative);
+            let ids = fs::read_dir(&path).map(|entries| {
+                let mut ids: Vec<_> = entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|id| valid_machine_id(id))
+                    .take(64)
+                    .collect();
+                ids.sort();
+                ids
+            });
+            json!({"path":format!("/{relative}"), "exists":path.is_dir(), "machine_ids":ids.ok()})
+        })
+        .collect();
+    json!({"machine_id":machine_id, "directories":directories, "journald_state":service_state})
+}
+
+fn valid_machine_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 async fn journal_command(
@@ -515,7 +574,9 @@ async fn journal_command(
             "stderr_tail":String::from_utf8_lossy(&tail)
         }}));
     }
-    Ok(journal_entries(&bytes, limit, &query))
+    let mut result = journal_entries(&bytes, limit, &query);
+    result["command"] = json!({"exit_status":status.code(), "stderr_tail":""});
+    Ok(result)
 }
 
 /// Turns journalctl's JSON lines into redacted entries. A job filter matches
@@ -552,6 +613,38 @@ fn journal_entries(bytes: &[u8], limit: u64, query: &JournalQuery) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_query_reads_the_boot_machine_id_after_tenant_attachment() {
+        for query in [
+            JournalQuery::default(),
+            JournalQuery {
+                since_unix_s: Some(1),
+                ..Default::default()
+            },
+        ] {
+            let args = query.args();
+            assert!(args.iter().any(|arg| arg == "--merge"), "{args:?}");
+            assert_eq!(args[0], "--unit=motor-tenant-runner.service");
+        }
+    }
+
+    #[test]
+    fn journal_source_reports_split_machine_ids_without_arbitrary_filenames() {
+        let root = cortexkit_test_support::ScratchDir::new("journal-machine-ids");
+        let boot_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tenant_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/machine-id"), format!("{tenant_id}\n")).unwrap();
+        fs::create_dir_all(root.join(format!("var/log/journal/{boot_id}"))).unwrap();
+        fs::create_dir_all(root.join("var/log/journal/TOP_SECRET")).unwrap();
+        let source = journal_source(&root, Some("active"));
+        assert_eq!(source["machine_id"], tenant_id);
+        assert_eq!(source["journald_state"], "active");
+        assert_eq!(source["directories"][0]["exists"], false);
+        assert_eq!(source["directories"][1]["machine_ids"], json!([boot_id]));
+        assert!(!source.to_string().contains("TOP_SECRET"));
+    }
 
     #[tokio::test]
     async fn attach_exit_returns_bounded_redacted_journal_without_a_live_pid() {
@@ -716,6 +809,7 @@ mod tests {
             format!("tenant_job_stream_ended jti={job} reason=error")
         );
         assert_eq!(reply["entries"][1]["message"], "[message omitted]");
+        assert_eq!(reply["command"], json!({"exit_status":0,"stderr_tail":""}));
         assert!(!reply.to_string().contains("TOP_SECRET"));
     }
 
@@ -789,10 +883,10 @@ mod tests {
             jti: Some(job),
         };
         assert_eq!(
-            window.args()[3..],
+            window.args()[4..],
             ["--since=@1800000000", "--until=@1800000600"]
         );
-        assert_eq!(JournalQuery::default().args()[3], "--lines=64");
+        assert_eq!(JournalQuery::default().args()[4], "--lines=64");
         let line = |message: String| {
             json!({"__REALTIME_TIMESTAMP":"1800000001000000","MESSAGE":message}).to_string()
         };

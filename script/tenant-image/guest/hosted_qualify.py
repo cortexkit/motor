@@ -189,8 +189,8 @@ def runner_diagnostics():
             state[name] = dict(code=result.returncode, stdout=result.stdout, stderr=result.stderr)
         except Exception as error:
             state[name] = dict(error=f"{type(error).__name__}: {error}")
-    # The guest keeps no journal, so a runner that never binds its socket leaves
-    # no log. Record what its threads and children are blocked in instead.
+    # A runner can block before it emits a log or binds its socket. Include its
+    # threads and children so a silent startup still leaves useful evidence.
     state["processes"] = process_snapshot(state)
     path = Path("/tenant/state/main/runner.sock")
     try:
