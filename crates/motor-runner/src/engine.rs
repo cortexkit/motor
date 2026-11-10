@@ -7927,7 +7927,12 @@ impl Runner {
         let repository = job
             .request
             .as_ref()
-            .map(|r| r.repository_root.as_str())
+            .map(|r| {
+                crate::caller_path::request(r)
+                    .caller_repository_root
+                    .text()
+                    .as_str()
+            })
             .unwrap_or("unknown");
         let unit = job
             .process

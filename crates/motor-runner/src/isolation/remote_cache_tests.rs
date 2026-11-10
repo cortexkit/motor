@@ -136,11 +136,11 @@ fn rendered_argv(
 
 /// SHA-256 of the rendered argv of every remote case below.
 ///
-/// Updated when job and fill units began starting with a 65536 open-file soft
-/// limit: each of the 16 rendered cases gains one `LimitNOFILE=65536:524288`
-/// line and nothing else changes.
+/// Last updated when fill units gained a runtime cap: each of the 4 rendered
+/// fill cases gains one `RuntimeMaxSec=5400000ms` line (the default writer
+/// limit) and nothing else changes.
 const REMOTE_PINNED_SHA256: &str =
-    "62d7197c910aa05539242b063306d20148c9fd875359056b1a702fbe56a7b62c";
+    "82d96319a6602b0a29a7c61cb442400995aeabcc1a3d9a28d2ea4dc1062e97ba";
 
 /// Every unit kind, rendered with and without forwarders: only forwarder starts
 /// and active-tool statistics change. Forwarders start right after the gate; with no
