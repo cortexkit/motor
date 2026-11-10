@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import stat
 import subprocess
@@ -18,6 +19,7 @@ import time
 import hosted_host
 
 HOST_CONFIG = Path("/etc/motor-host/host.json")
+REMOTE_CACHE_STORE = Path("/var/lib/motor-vm/remote-cache")
 COUNTS = ("active_leases", "active_job_vms", "active_fills", "active_recoveries")
 
 
@@ -247,19 +249,44 @@ def helper_exchange(path, request, timeout):
 def helper_request(path, request, timeout, *, wait=False):
     # The helper authenticates the connecting uid, even for a root operator.
     # Use the installed host account instead of granting root a new socket role.
-    result = subprocess.run([
-        "runuser", "-u", "motor-host", "--", sys.executable, str(Path(__file__).resolve()),
-        "--wait-helper" if wait else "--helper-request", str(path), json.dumps(request), str(timeout),
-    ], check=True, capture_output=True, text=True)
+    try:
+        result = subprocess.run([
+            "runuser", "-u", "motor-host", "--", sys.executable, str(Path(__file__).resolve()),
+            "--wait-helper" if wait else "--helper-request", str(path), json.dumps(request), str(timeout),
+        ], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        if not wait:
+            raise
+        # The socket probe uses the host uid, but only the root switch process
+        # can reliably read the helper's system journal on a locked-down host.
+        journal = subprocess.run([
+            "journalctl", "-u", "motor-vm-helper.service", "-n", "20", "--no-pager",
+        ], check=False, capture_output=True, text=True, timeout=30)
+        print(journal.stdout or journal.stderr, file=sys.stderr, end="")
+        raise ValueError(f"helper readiness failed: {error.stderr.strip()}") from error
     return json.loads(result.stdout)
+
+
+def helper_startup_state():
+    result = subprocess.run([
+        "systemctl", "show", "--property=ActiveState,SubState,NRestarts", "motor-vm-helper.service",
+    ], check=True, capture_output=True, text=True, timeout=30)
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
 
 
 def wait_helper_exchange(path, request, timeout):
     deadline = time.monotonic() + timeout
+    initial_restarts = None
     while True:
+        state = helper_startup_state()
+        restarts = int(state["NRestarts"])
+        if initial_restarts is None:
+            initial_restarts = restarts
+        if state["ActiveState"] == "failed" or state["SubState"] == "auto-restart" or restarts > initial_restarts:
+            raise ValueError(f"helper failed or is restarting: {state}; host remains drained")
         try:
-            return helper_exchange(path, request, max(0.001, deadline - time.monotonic()))
-        except (FileNotFoundError, ConnectionRefusedError, PermissionError) as error:
+            return helper_exchange(path, request, min(1, max(0.001, deadline - time.monotonic())))
+        except (FileNotFoundError, ConnectionRefusedError, PermissionError, ConnectionResetError, BrokenPipeError, TimeoutError) as error:
             if time.monotonic() >= deadline:
                 raise ValueError("helper socket did not become ready; host remains drained") from error
             time.sleep(min(1, max(0, deadline - time.monotonic())))
@@ -297,6 +324,31 @@ def clean_stop_tenants(path, registries, timeout):
             raise ValueError(f"tenant {tenant} stop was not clean; helper remains running; inspect {home}")
 
 
+def check_credential_set(account):
+    if not isinstance(account, str) or account in ("", ".", "..") or Path(account).name != account:
+        raise ValueError(f"invalid rollback credential account: {account!r}")
+    directory = REMOTE_CACHE_STORE / account
+    paths = [(REMOTE_CACHE_STORE, True), (directory, True),
+             (directory / "config.json", False), (directory / "read-key", False)]
+    write_key = directory / "write-key"
+    if write_key.exists() or write_key.is_symlink():
+        paths.append((write_key, False))
+    for path, is_directory in paths:
+        try:
+            metadata = path.lstat()
+            valid = (stat.S_ISDIR(metadata.st_mode) if is_directory else stat.S_ISREG(metadata.st_mode))
+            valid = valid and metadata.st_uid == 0 and not metadata.st_mode & 0o077
+        except FileNotFoundError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                f"rollback credential set for account {account!r} is missing or insecure at {path}; install it with: "
+                f"sudo /usr/local/libexec/motor-vm-helper set-remote-cache --account {shlex.quote(account)} "
+                "--config /absolute/root-only-dir/config.json --read-key /absolute/root-only-dir/read-key "
+                "[--write-key /absolute/root-only-dir/write-key] (docs/hosted-host.md, root credential command)"
+            )
+
+
 def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
            host_path=HOST_CONFIG, helper_path=hosted_host.HELPER_CONFIG,
            install_binaries=None, expected_commit=None):
@@ -312,8 +364,13 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
     registries = {}
     for binding in bindings.values():
         registry = read_json(Path(host["registry_dir"]) / f"{binding['tenant']}.json")
-        if registry.get("account") != binding["sub"] or not Path(registry["disk"]).is_file():
-            raise ValueError("tenant disk and account binding must be retained for rollback")
+        if registry.get("account") != binding["sub"]:
+            raise ValueError(f"tenant {binding['tenant']} rollback registry account {registry.get('account')!r} "
+                             f"does not match binding sub {binding['sub']!r}; restore the matching registry and binding")
+        if not Path(registry["disk"]).is_file():
+            raise ValueError(f"tenant {binding['tenant']} rollback disk missing: {registry['disk']}; restore the retained tenant disk")
+        if mode == "tenant":
+            check_credential_set(binding["sub"])
         registries[binding["tenant"]] = registry
     staged_host = dict(host, mode=mode)
     staged_helper = dict(helper)
@@ -334,10 +391,16 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
     if expected_commit and install_binaries is None:
         raise ValueError("--expected-commit requires --install-binaries")
     binaries = BinaryInstall(install_binaries, expected_commit) if install_binaries is not None else None
-    with tempfile.TemporaryDirectory(prefix="motor-switch-mode-") as directory:
+    # The helper rejects writable ancestors, including the system temp folder.
+    # Stage beside its root-controlled installed config, not under TMPDIR.
+    with tempfile.TemporaryDirectory(prefix=".motor-switch-mode-", dir=Path(helper_path).parent) as directory:
         staged = Path(directory) / "host.json"
         staged.write_text(json.dumps(staged_host))
         validator = Path(install_binaries) / "motor-host" if install_binaries is not None else hosted_host.HOST_BINARY
+        run(validator, "check-config", staged)
+        staged = Path(directory) / "helper.json"
+        staged.write_text(json.dumps(staged_helper))
+        validator = Path(install_binaries) / "motor-vm-helper" if install_binaries is not None else hosted_host.HELPER_BINARY
         run(validator, "check-config", staged)
     admin = Path(host["admin_socket"])
     status = hosted_host.admin_exchange({"op": "host_status"}, admin)

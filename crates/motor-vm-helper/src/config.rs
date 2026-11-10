@@ -122,6 +122,14 @@ impl Config {
                     "invalid or overlapping job VMM uid range or memory ceiling".into(),
                 ));
             }
+            if jobs
+                .workspace_disk_max_bytes
+                .is_some_and(|maximum| maximum == 0 || maximum % 512 != 0)
+            {
+                return Err(Error(
+                    "workspace_disk_max_bytes must be positive and sector aligned".into(),
+                ));
+            }
         }
         if count == 0
             || self.allowed_uids.is_empty()
@@ -225,4 +233,55 @@ pub(crate) fn cpu_list(s: &str) -> bool {
                 _ => false,
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job_config() -> Config {
+        let mut config: Config =
+            serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();
+        config.job_vms = Some(JobVms {
+            uid_base: 500000,
+            uid_count: 128,
+            memory_max_bytes: 4096,
+            workspace_disk_max_bytes: Some(512),
+        });
+        config
+    }
+
+    #[test]
+    fn job_workspace_maximum_must_be_positive_and_sector_aligned_when_enabled() {
+        let mut config = job_config();
+        for maximum in [None, Some(512), Some(1024)] {
+            config.job_vms.as_mut().unwrap().workspace_disk_max_bytes = maximum;
+            config.validate_resources().unwrap();
+        }
+        for maximum in [0, 1, 511, 513, u64::MAX] {
+            config.job_vms.as_mut().unwrap().workspace_disk_max_bytes = Some(maximum);
+            assert!(config
+                .validate_resources()
+                .unwrap_err()
+                .0
+                .contains("workspace_disk_max_bytes"));
+        }
+    }
+
+    #[test]
+    fn job_uid_pool_excludes_both_edges_of_reserved_tenant_range() {
+        let mut config = job_config();
+        for (base, count) in [(399999, 1), (400256, 1)] {
+            let jobs = config.job_vms.as_mut().unwrap();
+            jobs.uid_base = base;
+            jobs.uid_count = count;
+            config.validate_resources().unwrap();
+        }
+        for (base, count) in [(399999, 2), (400000, 1), (400255, 1)] {
+            let jobs = config.job_vms.as_mut().unwrap();
+            jobs.uid_base = base;
+            jobs.uid_count = count;
+            assert!(config.validate_resources().is_err());
+        }
+    }
 }

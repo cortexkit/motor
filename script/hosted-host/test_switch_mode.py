@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -61,8 +62,14 @@ class SwitchModeTests(unittest.TestCase):
         self.real_wait_started = switch.wait_started
         self.patch(switch, "wait_started", side_effect=self.host_ready)
         self.patch(switch, "service_state", side_effect=lambda unit: "active" if self.services[unit] else "inactive")
+        self.real_helper_state = switch.helper_startup_state
+        self.helper_state = self.patch(switch, "helper_startup_state", return_value={
+            "ActiveState": "active", "SubState": "running", "NRestarts": "0",
+        })
         self.real_replace_json = switch.replace_json
         self.patch(switch, "replace_json", side_effect=self.replace_config)
+        self.real_credential_check = switch.check_credential_set
+        self.credential_check = self.patch(switch, "check_credential_set")
 
     def fault(self, point):
         if self.failure_point == point and not self.failed:
@@ -117,7 +124,7 @@ class SwitchModeTests(unittest.TestCase):
         output = self.perform("per_job")
         self.assertEqual(switch.read_json(self.host_path)["mode"], "per_job")
         self.assertEqual(switch.read_json(self.helper_path)["job_vms"], switch.read_json(self.job_vms))
-        self.assertEqual([event[:3] for event in self.events[1:]], [
+        self.assertEqual([event[:3] for event in self.events[2:]], [
             ("fresh-drain",), ("publish", self.host["helper_socket"], "gen-1"),
             ("systemctl", "stop", "motor-host.service"),
             ("clean-stop-tenants",),
@@ -133,6 +140,31 @@ class SwitchModeTests(unittest.TestCase):
         self.assertIn("placement_hint.host='test-host'", output)
         self.assertIn("only after success", output)
         self.assertTrue(all(call.args[0] == {"op": "host_status"} for call in self.admin.call_args_list))
+
+    def test_target_helper_checks_staged_config_before_any_service_stops(self):
+        for install in (False, True):
+            with self.subTest(install=install):
+                self.events.clear()
+                directory = self.artifacts() if install else self.installed
+                validator = directory / "motor-vm-helper"
+                original_command = self.command
+
+                def check(*args):
+                    if Path(args[0]) == validator and args[1] == "check-config":
+                        self.assertEqual(Path(args[2]).parent.parent, self.helper_path.parent)
+                        self.assertEqual(switch.read_json(args[2]), {
+                            "allowed_uids": [1000], "job_vms": switch.read_json(self.job_vms),
+                        })
+                        raise ValueError("helper refused staged config: overlapping job VMM uid range")
+                    original_command(*args)
+
+                self.command_run.side_effect = check
+                with self.assertRaisesRegex(ValueError, "helper refused staged config"):
+                    self.perform("per_job", **({"install_binaries": directory, "expected_commit": "a" * 40} if install else {}))
+                self.assertFalse(any(event[0] == "systemctl" for event in self.events))
+                self.drain.assert_not_called()
+                self.publish.assert_not_called()
+                self.assert_restored()
 
     def test_tenant_switch_only_selects_tenant_and_uses_existing_runtime_rollback(self):
         self.host.update(mode="per_job", per_job={"workspace_disk_cap_bytes": 1024})
@@ -192,6 +224,74 @@ class SwitchModeTests(unittest.TestCase):
                     self.perform("per_job")
                 self.command_run.assert_not_called()
                 self.drain.assert_not_called()
+
+    def test_tenant_rollback_checks_every_bound_account_credential_set_before_stopping(self):
+        self.host["mode"] = "per_job"
+        self.host_path.write_text(json.dumps(self.host))
+        self.bindings.write_text(json.dumps({
+            "vm": {"tenant": "tenant", "sub": "account"},
+            "vm2": {"tenant": "tenant2", "sub": "other-account"},
+        }))
+        (self.root / "tenant2.json").write_text(json.dumps({"account": "other-account", "disk": str(self.disk)}))
+        self.credential_check.side_effect = [None, ValueError("missing credential set for other-account; set-remote-cache")]
+        with self.assertRaisesRegex(ValueError, "other-account; set-remote-cache"):
+            self.perform("tenant")
+        self.assertEqual(self.credential_check.call_args_list, [mock.call("account"), mock.call("other-account")])
+        self.command_run.assert_not_called()
+        self.drain.assert_not_called()
+
+    def test_tenant_rollback_names_missing_disk_or_mismatched_registry_before_stopping(self):
+        self.host["mode"] = "per_job"
+        self.host_path.write_text(json.dumps(self.host))
+        for registry, error in [({"account": "other-account", "disk": str(self.disk)}, "registry account.*other-account.*binding sub.*account"),
+                                ({"account": "account", "disk": str(self.root / "missing.ext4")}, "rollback disk missing:.*missing.ext4")]:
+            with self.subTest(registry=registry):
+                (self.root / "tenant.json").write_text(json.dumps(registry))
+                with self.assertRaisesRegex(ValueError, error):
+                    self.perform("tenant")
+                self.command_run.assert_not_called()
+                self.drain.assert_not_called()
+
+    def test_credential_set_checks_required_layout_and_permissions_without_reading_keys(self):
+        store = self.root / "remote-cache"
+        account = store / "account"
+        metadata = {
+            store: SimpleNamespace(st_uid=0, st_mode=0o40700),
+            account: SimpleNamespace(st_uid=0, st_mode=0o40700),
+            account / "config.json": SimpleNamespace(st_uid=0, st_mode=0o100600),
+            account / "read-key": SimpleNamespace(st_uid=0, st_mode=0o100600),
+        }
+
+        def lstat(path):
+            if path not in metadata:
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return metadata[path]
+
+        with mock.patch.object(switch, "REMOTE_CACHE_STORE", store), mock.patch.object(Path, "lstat", autospec=True, side_effect=lstat):
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("must not read keys")):
+                self.real_credential_check("account")
+                for path in list(metadata):
+                    original = metadata.pop(path)
+                    with self.subTest(missing=path), self.assertRaisesRegex(ValueError, "account.*missing or insecure.*set-remote-cache --account account"):
+                        self.real_credential_check("account")
+                    metadata[path] = original
+                for mode, uid in [(0o120777, 0), (0o100644, 0), (0o100600, 1000)]:
+                    metadata[account / "read-key"] = SimpleNamespace(st_uid=uid, st_mode=mode)
+                    with self.subTest(mode=mode, uid=uid), self.assertRaisesRegex(ValueError, "read-key.*set-remote-cache"):
+                        self.real_credential_check("account")
+                metadata[account / "read-key"] = SimpleNamespace(st_uid=0, st_mode=0o100600)
+                account.mkdir(parents=True)
+                (account / "write-key").write_text("not read by preflight")
+                metadata[account / "write-key"] = SimpleNamespace(st_uid=0, st_mode=0o100600)
+                self.real_credential_check("account")
+                metadata[account / "write-key"] = SimpleNamespace(st_uid=0, st_mode=0o120777)
+                with self.assertRaisesRegex(ValueError, "write-key.*set-remote-cache"):
+                    self.real_credential_check("account")
+
+    def test_credential_account_cannot_escape_the_store(self):
+        for account in ("..", "../account", "/account", "."):
+            with self.subTest(account=account), self.assertRaisesRegex(ValueError, "invalid rollback credential account"):
+                self.real_credential_check(account)
 
     def test_generation_publication_failure_keeps_existing_config_and_services(self):
         self.publish.side_effect = ValueError("unverified image")
@@ -263,6 +363,43 @@ class SwitchModeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "did not confirm.*stopped"):
                 with mock.patch.object(switch, "wait_helper_available", self.real_available):
                     self.real_wait_helper("helper.sock", "tenant", 1)
+
+    def test_helper_start_wait_refuses_failed_or_auto_restarting_service_immediately(self):
+        for state in ({"ActiveState": "failed", "SubState": "failed", "NRestarts": "0"},
+                      {"ActiveState": "activating", "SubState": "auto-restart", "NRestarts": "1"}):
+            with self.subTest(state=state):
+                self.helper_state.return_value = state
+                with mock.patch.object(switch, "helper_exchange") as exchange, mock.patch.object(switch.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(ValueError, "helper failed or is restarting"):
+                        switch.wait_helper_exchange("helper.sock", {}, 300)
+                    exchange.assert_not_called()
+                    sleep.assert_not_called()
+
+    def test_helper_start_wait_detects_restarts_between_polls_and_bounds_socket_timeout(self):
+        self.helper_state.side_effect = [
+            {"ActiveState": "active", "SubState": "running", "NRestarts": "2"},
+            {"ActiveState": "active", "SubState": "running", "NRestarts": "3"},
+        ]
+        with mock.patch.object(switch, "helper_exchange", side_effect=TimeoutError()) as exchange, mock.patch.object(switch.time, "sleep"):
+            with self.assertRaisesRegex(ValueError, "helper failed or is restarting"):
+                switch.wait_helper_exchange("helper.sock", {}, 300)
+            self.assertEqual(exchange.call_count, 1)
+            self.assertLessEqual(exchange.call_args.args[2], 1)
+
+    def test_helper_startup_state_reads_systemd_properties(self):
+        with mock.patch.object(switch.subprocess, "run", return_value=mock.Mock(stdout="ActiveState=activating\nSubState=auto-restart\nNRestarts=5\n")) as run:
+            self.assertEqual(self.real_helper_state(), {"ActiveState": "activating", "SubState": "auto-restart", "NRestarts": "5"})
+            self.assertIn("--property=ActiveState,SubState,NRestarts", run.call_args.args[0])
+
+    def test_failed_helper_probe_prints_last_twenty_journal_lines_as_root(self):
+        failure = switch.subprocess.CalledProcessError(1, "runuser", stderr="helper failed or is restarting")
+        journal = "\n".join(f"helper log {i}" for i in range(20)) + "\n"
+        with mock.patch.object(switch.subprocess, "run", side_effect=[failure, mock.Mock(stdout=journal)]) as run:
+            with contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaisesRegex(ValueError, "helper failed or is restarting"):
+                    switch.helper_request("helper.sock", {}, 300, wait=True)
+            self.assertEqual(output.getvalue(), journal)
+            self.assertEqual(run.call_args.args[0], ["journalctl", "-u", "motor-vm-helper.service", "-n", "20", "--no-pager"])
 
     def artifacts(self, stamp="a" * 40):
         directory = self.root / "release"
