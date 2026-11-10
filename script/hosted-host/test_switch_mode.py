@@ -125,12 +125,14 @@ class SwitchModeTests(unittest.TestCase):
         self.assertEqual(switch.read_json(self.host_path)["mode"], "per_job")
         self.assertEqual(switch.read_json(self.helper_path)["job_vms"], switch.read_json(self.job_vms))
         self.assertEqual([event[:3] for event in self.events[2:]], [
-            ("fresh-drain",), ("publish", self.host["helper_socket"], "gen-1"),
+            ("fresh-drain",),
             ("systemctl", "stop", "motor-host.service"),
             ("clean-stop-tenants",),
             ("systemctl", "stop", "motor-vm-helper.service"),
             ("systemctl", "start", "motor-vm-helper.service"),
             ("helper-ready",),
+            # The replacement helper publishes, not the one it replaced.
+            ("publish", self.host["helper_socket"], "gen-1"),
             ("runuser", "-u", "motor-host"),
             (str(switch.hosted_host.HOST_BINARY), "check-config", str(self.host_path)),
             ("systemctl", "start", "motor-host.service"),
@@ -293,13 +295,16 @@ class SwitchModeTests(unittest.TestCase):
             with self.subTest(account=account), self.assertRaisesRegex(ValueError, "invalid rollback credential account"):
                 self.real_credential_check(account)
 
-    def test_generation_publication_failure_keeps_existing_config_and_services(self):
+    def test_generation_publication_failure_restores_config_and_services(self):
         self.publish.side_effect = ValueError("unverified image")
         before = self.host_path.read_bytes()
         with self.assertRaisesRegex(ValueError, "unverified image"):
             self.perform("per_job")
         self.assertEqual(self.host_path.read_bytes(), before)
-        self.assertFalse(any(event[0] == "systemctl" for event in self.events))
+        starts = [event for event in self.events if event[:2] == ("systemctl", "start")]
+        self.assertEqual(starts[-2:], [("systemctl", "start", "motor-vm-helper.service"),
+                                       ("systemctl", "start", "motor-host.service")])
+        self.assertFalse(any("select-job-images" in event for event in self.events))
 
     def test_refuses_an_undrained_host(self):
         self.status["draining"] = False

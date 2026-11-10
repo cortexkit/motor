@@ -417,9 +417,7 @@ default) for work to finish. In per-job mode, `host-status` additionally reports
 the remaining work, exits nonzero and leaves placement drained. Missing counts
 are not treated as zero.
 
-Before stopping services it publishes the generation through the helper's
-existing `publish_job_images` operation, which verifies the staged artifacts and
-creates a read-only, hash-pinned publication. Then it stops `motor-host`, explicitly sends the
+It stops `motor-host`, explicitly sends the
 helper's clean `stop_tenant` operation for each retained tenant, checks that both
 the stop reply and the helper's subsequent `adopt` inspection both report
 `running: false`. It also refuses if the tenant home's `running.json` (a VM that
@@ -427,6 +425,13 @@ has not completed a clean stop) or `unclean-stop.json` (a recorded failed guest
 flush) remains. **Only after that proof does it stop the helper service.**
 Never kill the helper or its cgroup while a tenant VM runs. A timeout or dirty
 stop aborts the switch and resumes the original services, still drained.
+
+After the replacement helper is ready, the switch to `per_job` publishes the
+generation through that helper's `publish_job_images` operation, which verifies
+the staged artifacts and creates a read-only, hash-pinned publication. The
+helper that will run the job VMs publishes, because the helper it replaced may
+apply different image checks. A refused publication restores the original
+configs, binaries and services, still drained.
 
 Every failure from the first service-stop attempt triggers restoration and
 exits nonzero. Before config replacement, the original configs remain in place

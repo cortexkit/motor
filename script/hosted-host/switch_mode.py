@@ -408,8 +408,6 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
         raise ValueError("drain the host before switching mode")
     hosted_host.drain_host(timeout, admin)
     wait_empty(admin, old_mode, timeout)
-    if mode == "per_job":
-        publish_to_helper(host["helper_socket"], generation)
     replaced = host_start_attempted = False
     try:
         if binaries:
@@ -426,6 +424,10 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
         run("systemctl", "start", "motor-vm-helper.service")
         wait_helper(host["helper_socket"], next(iter(registries)), timeout)
         if mode == "per_job":
+            # Publish with the helper that will run the job VMs. The helper
+            # running before the switch may be an older build with different
+            # image checks, so its verdict would not hold for the new one.
+            publish_to_helper(host["helper_socket"], generation)
             run("runuser", "-u", "motor-host", "--", hosted_host.HOST_BINARY,
                 "select-job-images", host_path, generation)
         run(hosted_host.HOST_BINARY, "check-config", host_path)
