@@ -2372,8 +2372,15 @@ impl Motor {
                 }
             })?;
         }
-        self.storage
-            .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
+        self.storage.hosted_update(id, |s| {
+            // Settlement can await while a runner terminal is being received.
+            // Preserve that evidence instead of restoring an older summary.
+            if s.has_real_terminal() {
+                terminal = s.terminal.clone().unwrap();
+            } else {
+                s.terminal = Some(terminal.clone());
+            }
+        })?;
         if self.hosted_state(id).is_some_and(|state| {
             state.finish_done
                 && state

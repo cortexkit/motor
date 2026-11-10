@@ -983,6 +983,191 @@ async fn late_cancel_ack_cannot_replace_an_already_observed_exit_finish() {
     motor.close().await;
 }
 
+#[tokio::test]
+async fn cancel_timeout_finish_cannot_overwrite_a_concurrent_runner_terminal() {
+    assert_cancel_timeout_finish_preserves_observed_terminal(false).await;
+}
+
+#[tokio::test]
+async fn cancel_timeout_finish_cannot_overwrite_an_observed_unknown_terminal() {
+    assert_cancel_timeout_finish_preserves_observed_terminal(true).await;
+}
+
+#[tokio::test]
+async fn late_runner_terminal_cannot_replace_a_different_observed_unknown() {
+    let (_root, motor, id) = fixture();
+    let unknown = TerminalRecord::new(id, Outcome::OutcomeUnknown, 125, 0, 0)
+        .with_ran(Ran::Remote)
+        .with_refusal_detail("runner could not recover the execution outcome");
+    motor.persist_hosted_terminal(id, unknown.clone()).unwrap();
+    motor
+        .persist_hosted_terminal(id, real_terminal(id))
+        .unwrap();
+    assert_eq!(motor.hosted_state(id).unwrap().terminal, Some(unknown));
+    assert!(motor.hosted_state(id).unwrap().observed_unknown_terminal);
+    motor
+        .storage
+        .hosted_update(id, |state| state.billing = crate::BillingStatus::Available)
+        .unwrap();
+    motor.close().await;
+}
+
+async fn assert_cancel_timeout_finish_preserves_observed_terminal(unknown: bool) {
+    let (_root, motor, id) = fixture();
+    motor
+        .storage
+        .cancel_acknowledged_with_owner(id, true)
+        .unwrap();
+    motor.storage.cancel_terminal_wait_expired(id).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.finish_done = true;
+            state.billing = crate::BillingStatus::Available;
+            state.billed_vcpu_ms = Some(250);
+        })
+        .unwrap();
+    let mut terminal = real_terminal(id);
+    terminal.outcome = Outcome::Exit { code: 143 };
+    terminal.killed = Some(motor_protocol::Killed::Cancel);
+    terminal.wall_ms = 389_320;
+    if unknown {
+        terminal.outcome = Outcome::OutcomeUnknown;
+        terminal.refusal_detail = Some("runner could not recover the execution outcome".into());
+        terminal.killed = None;
+    }
+    let (tx, mut records) = mpsc::channel(32);
+    {
+        let finish_lock = motor.storage.lock_finish(id).await;
+        let finish = motor.finish_hosted(id, false, &tx);
+        tokio::pin!(finish);
+        // Hold settlement after the timeout captured its unknown summary, so a
+        // runner terminal can be persisted before that older finish resumes.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(finish.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        motor.persist_hosted_terminal(id, terminal.clone()).unwrap();
+        assert_eq!(
+            motor.hosted_state(id).unwrap().terminal,
+            Some(terminal.clone())
+        );
+        drop(finish_lock);
+        finish.await.unwrap();
+    }
+    assert_eq!(
+        motor.hosted_state(id).unwrap().terminal,
+        Some(terminal.clone())
+    );
+    assert_eq!(
+        records.recv().await.unwrap().unwrap(),
+        StreamRecord::Terminal(terminal)
+    );
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.finish_done);
+    assert_eq!(state.billed_vcpu_ms, Some(250));
+    assert_eq!(state.observed_unknown_terminal, unknown);
+    motor.close().await;
+}
+
+async fn assert_status_and_attach_terminal(motor: &Motor, id: Uuid, terminal: &TerminalRecord) {
+    assert_eq!(
+        motor.job_status(id).await.unwrap().terminal.as_ref(),
+        Some(terminal)
+    );
+    for from_seq in [0, 7, u64::MAX] {
+        let mut stream = motor.attach(AttachRequest::new(id, from_seq)).unwrap();
+        assert_eq!(
+            stream.records.recv().await.unwrap().unwrap(),
+            StreamRecord::Terminal(terminal.clone())
+        );
+        assert!(stream.records.recv().await.is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_cancel_terminal_survives_timeout_status_attach_and_journal_reopen() {
+    let (root, motor, id) = fixture();
+    let channel = Channel::open(&SilentStatus, id).await.unwrap();
+    channel.send(Frame::JobStatus { job_id: id }).await.unwrap();
+    motor
+        .storage
+        .cancel_acknowledged_with_owner(id, true)
+        .unwrap();
+    let (tx, mut records) = mpsc::channel(32);
+    {
+        let follow = motor.follow(id, 0, Some(channel), &tx, watch::channel(false).1);
+        tokio::pin!(follow);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(follow.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(follow.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            records.try_recv().is_err(),
+            "the wait must not end before 30 seconds"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        follow.await.unwrap();
+    }
+    let StreamRecord::Terminal(placeholder) = records.recv().await.unwrap().unwrap() else {
+        panic!("cancel timeout must emit a terminal");
+    };
+    assert_eq!(placeholder.outcome, Outcome::OutcomeUnknown);
+    assert_eq!(
+        placeholder.refusal_detail.as_deref(),
+        Some(crate::hosted::CANCEL_ACKNOWLEDGED)
+    );
+    motor
+        .storage
+        .hosted_update(id, |state| state.billing = crate::BillingStatus::Available)
+        .unwrap();
+    assert_status_and_attach_terminal(&motor, id, &placeholder).await;
+
+    let mut terminal = real_terminal(id);
+    terminal.outcome = Outcome::Exit { code: 143 };
+    terminal.killed = Some(motor_protocol::Killed::Cancel);
+    terminal.wall_ms = 389_320;
+    // The first stream has ended. A later runner/status observation uses this
+    // same persistence entry point, without emitting another terminal there.
+    motor
+        .persist_hosted_terminal_with_sequence(id, terminal.clone(), Some(0))
+        .unwrap();
+    assert!(records.try_recv().is_err());
+    assert_status_and_attach_terminal(&motor, id, &terminal).await;
+
+    let crash = cortexkit_test_support::ScratchDir::new("late-cancel-terminal-crash");
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == "state.json" || name.to_string_lossy().starts_with("journal-") {
+            std::fs::copy(entry.path(), crash.join(name)).unwrap();
+        }
+    }
+    assert!(
+        !std::fs::read_to_string(crash.join("state.json"))
+            .unwrap()
+            .contains(&id.to_string()),
+        "recovery must replay the journal rather than a shutdown checkpoint"
+    );
+    let recovered = Motor::with_connector(
+        motor.config.clone(),
+        &crash,
+        Arc::new(NoSsh(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    assert_status_and_attach_terminal(&recovered, id, &terminal).await;
+    recovered.close().await;
+    motor.close().await;
+}
+
 impl crate::Connector for SilentStatus {
     fn connect(
         &self,
