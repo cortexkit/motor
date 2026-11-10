@@ -8,27 +8,48 @@ fn main() {
     let result = (|| {
         let mut args = std::env::args_os().skip(1);
         let command = args.next();
-        motor_vm_helper::linux::cache::disable_core_dumps()?;
         if command.as_deref() == Some(std::ffi::OsStr::new("set-remote-cache")) {
+            motor_vm_helper::linux::cache::disable_core_dumps()?;
             return motor_vm_helper::linux::cache::install_command(args.collect());
         }
-        if command.as_deref() != Some(std::ffi::OsStr::new("--config")) {
-            return Err(motor_vm_helper::Error(
-                "usage: motor-vm-helper --config /etc/motor-vm-helper.json".into(),
-            ));
+        let (check_only, path) = config_command(command, args)?;
+        let config = server::load_config(&path)?;
+        if check_only {
+            config.validate()?;
+            motor_vm_helper::linux::startup_check::check(&config)?;
+            println!("helper config settings valid");
+            return Ok(());
         }
-        let path = args
-            .next()
-            .ok_or_else(|| motor_vm_helper::Error("missing config path".into()))?;
-        if args.next().is_some() {
-            return Err(motor_vm_helper::Error("unexpected arguments".into()));
-        }
-        server::serve(server::load_config(std::path::Path::new(&path))?)
+        motor_vm_helper::linux::cache::disable_core_dumps()?;
+        server::serve(config)
     })();
     if let Err(e) = result {
         eprintln!("motor-vm-helper: {e}");
         std::process::exit(1);
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn config_command(
+    command: Option<std::ffi::OsString>,
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> motor_vm_helper::Result<(bool, std::path::PathBuf)> {
+    let check_only = command.as_deref() == Some(std::ffi::OsStr::new("check-config"));
+    if !check_only && command.as_deref() != Some(std::ffi::OsStr::new("--config")) {
+        return Err(motor_vm_helper::Error(
+            "usage: motor-vm-helper [--config | check-config] /etc/motor-vm-helper.json; \
+             check-config is read-only; existing job records are parsed but not revalidated \
+             against new settings until service startup"
+                .into(),
+        ));
+    }
+    let path = args
+        .next()
+        .ok_or_else(|| motor_vm_helper::Error("missing config path".into()))?;
+    if args.next().is_some() {
+        return Err(motor_vm_helper::Error("unexpected arguments".into()));
+    }
+    Ok((check_only, path.into()))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -54,6 +75,31 @@ fn version_output(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<
 
 #[cfg(test)]
 mod version_tests {
+    #[test]
+    fn config_command_distinguishes_read_only_preflight_and_rejects_missing_or_extra_paths() {
+        for (command, check_only) in [("check-config", true), ("--config", false)] {
+            let parse = |paths: &[&str]| {
+                super::config_command(
+                    Some(command.into()),
+                    paths.iter().map(std::ffi::OsString::from),
+                )
+            };
+            let (check, path) = parse(&["/etc/helper.json"]).unwrap();
+            assert_eq!(check, check_only);
+            assert_eq!(path, std::path::Path::new("/etc/helper.json"));
+            assert_eq!(parse(&[]).unwrap_err().0, "missing config path");
+            assert_eq!(
+                parse(&["one", "two"]).unwrap_err().0,
+                "unexpected arguments"
+            );
+        }
+        let error = super::config_command(None, std::iter::empty())
+            .unwrap_err()
+            .0;
+        assert!(error.contains("check-config is read-only"));
+        assert!(error.contains("not revalidated"));
+    }
+
     #[test]
     fn version_is_an_exact_early_flag_and_reports_the_compile_time_stamp() {
         let args = |values: &[&str]| {

@@ -34,7 +34,7 @@ const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vd
 mod conntrack;
 mod memory;
 mod namespace;
-mod network;
+pub(super) mod network;
 mod workspace;
 
 pub(super) fn image_copy_exclusive_bytes(file: &File) -> Result<u64> {

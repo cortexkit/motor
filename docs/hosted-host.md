@@ -343,8 +343,12 @@ Before switching:
    without `per_job_readiness` is refused, never treated as ready. Retain the
    tenant disks, registry entries, account bindings in `tenants.json`, keys and
    host journal for rollback. Each registry's `account` must match its binding's
-   `sub` (the broker account subject). Install the helper's current remote-cache credential set for that account
-   using the [root credential command](#root-remote-cache-credential-command).
+   `sub` (the broker account subject). Switching back to tenant mode requires a
+   complete helper remote-cache credential set for every bound account, even if
+   per-job mode ran without those credentials. Install it using the
+   [root credential command](#root-remote-cache-credential-command). The switch
+   checks the retained disk, account binding and root-owned credential-set layout
+   before stopping any service; it never reads key bytes.
 2. Build the tenant image using the [image build procedure](../script/tenant-image/README.md),
    adding `--job-generation GENERATION` to `build.py build IMAGE_VERSION --runner ...`.
    Use the normal tenant image-switch procedure to install that image first, so
@@ -356,11 +360,14 @@ Before switching:
 3. Prepare two operator-owned JSON files: the complete `per_job` settings object
    above, and the helper's `job_vms` object. The latter requires `uid_base`,
    `uid_count`, `memory_max_bytes` and `workspace_disk_max_bytes`; use an unused
-   UID range and the host's actual memory budget. Its workspace maximum must
-   cover `workspace_disk_cap_bytes`. No resource values are supplied by the
-   switching script. Helper startup validates its resource ranges and isolation
-   prerequisites; a refusal restores the original mode and running services,
-   still drained.
+   UID range and the host's actual memory budget. UIDs 400000 through 400255
+   (`[400000, 400256)`) are reserved for tenant VMMs and must not overlap the job
+   range. `uid_count` plus the number of registered tenants must be at most 254,
+   the shared TAP allocation limit. Its positive, sector-aligned workspace
+   maximum must cover `workspace_disk_cap_bytes`. No resource values are supplied
+   by the switching script. These UID, TAP, memory and disk settings are checked
+   before anything stops, using the target helper binary's read-only
+   `check-config` command.
 4. [Drain the host](#drain-the-host-for-an-update), wait for `draining: true`, then
    run from the installed checkout:
 
@@ -387,7 +394,16 @@ Before switching:
    the new files with atomic renames. Keep those rollback copies until the
    canary succeeds. Without the option, installed binaries are unchanged.
 
-The script validates staged host settings with `motor-host check-config`, obtains
+The script validates staged settings with `motor-host check-config` and
+`motor-vm-helper check-config`, using the binaries in `--install-binaries` when
+given, otherwise the installed pair. The helper preflight reuses startup's
+read-only checks, including trusted inputs, registered tenants and job-record
+parsing. It does not revalidate existing job records against new settings;
+service startup still checks their compatibility while adopting them. Live
+cgroup setup and VM reconciliation remain startup operations, not preflight
+guarantees. If the helper fails or begins restarting while the script waits for
+readiness, the switch fails immediately and prints its last 20 journal lines.
+The script then obtains
 a fresh broker drain acknowledgement, and waits up to `--timeout` seconds (300 by
 default) for work to finish. In per-job mode, `host-status` additionally reports
 `active_job_vms` (including pending teardown), `active_fills` and

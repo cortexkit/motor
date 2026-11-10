@@ -5,6 +5,7 @@ pub mod images;
 pub mod job;
 pub mod process;
 pub mod server;
+pub mod startup_check;
 pub mod tenant;
 mod tenant_network;
 
@@ -34,29 +35,12 @@ impl LinuxMachine {
         if unsafe { libc::geteuid() } != 0 {
             return Err(Error("motor-vm-helper must run as root".into()));
         }
+        let base = startup_check::check(&config)?;
         // Filesystem-credential guards intentionally use only the peer gid.
         // Do not let the root service's supplementary groups grant the runner
         // access it would not have on its own. Do this before starting threads.
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
             return Err(std::io::Error::last_os_error().into());
-        }
-        config.validate_resources()?;
-        process::refuse_passwd_entries(config.uid_base, config.slots.len())?;
-        for path in [&config.jailer, &config.firecracker] {
-            fs::trusted_file(path)?;
-        }
-        if config.firecracker.file_name().and_then(|n| n.to_str()) != Some("firecracker") {
-            return Err(Error(
-                "configured Firecracker executable must be named firecracker".into(),
-            ));
-        }
-        let base = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(BUILD_ROOT)?;
-        fs::trusted(Path::new(BUILD_ROOT), &base.metadata()?)?;
-        for ancestor in Path::new(BUILD_ROOT).ancestors() {
-            fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
         }
         let jail = Path::new(BUILD_ROOT).join("jail");
         if !jail.try_exists()? {

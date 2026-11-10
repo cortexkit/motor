@@ -94,12 +94,27 @@ pub(super) fn read_records(root: &Path) -> Result<Vec<Record>> {
     Ok(records)
 }
 
-pub(super) fn check_capacity(job_count: u32, tenants: usize) -> Result<()> {
+pub(in crate::linux) fn check_capacity(job_count: u32, tenants: usize) -> Result<()> {
     if u64::from(job_count) + tenants as u64 > 254 {
         return Err(Error(format!(
             "job_vms.uid_count {job_count} + registered tenants {tenants} exceeds TAP range 254"
         )));
     }
+    Ok(())
+}
+
+pub(in crate::linux) fn check_startup(
+    config: &crate::config::Config,
+    registries: &Path,
+    records: &Path,
+) -> Result<()> {
+    let tenants = tenant_taps(registries)?;
+    if let Some(settings) = &config.job_vms {
+        check_capacity(settings.uid_count, tenants.len())?;
+    }
+    // Parsing is read-only. Adopting records also inspects live cgroups and
+    // reconciles resources, so that remains part of the real service startup.
+    read_records(records)?;
     Ok(())
 }
 
