@@ -1177,7 +1177,7 @@ async fn completed_detached_owner(h: &Harness, root: &std::path::Path) -> (Motor
     .expect("detached completed owner must retire")
     .unwrap();
     assert!(motor.storage.job(id).unwrap().hosted_complete());
-    assert_eq!(motor.hosted_state(id).unwrap().final_seq, Some(63));
+    assert_eq!(motor.hosted_state(id).unwrap().replay_end_seq, Some(64));
     (motor, id)
 }
 
@@ -1313,7 +1313,7 @@ async fn hosted_finished_late_attach_replays_after_journal_recovery() {
         let motor =
             Motor::with_connector(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0))))
                 .unwrap();
-        assert_eq!(motor.hosted_state(id).unwrap().final_seq, Some(63));
+        assert_eq!(motor.hosted_state(id).unwrap().replay_end_seq, Some(64));
         h.attach_history_expired.store(expired, Ordering::SeqCst);
         if expired {
             assert_expired_replay(&motor, id).await;
@@ -1326,14 +1326,17 @@ async fn hosted_finished_late_attach_replays_after_journal_recovery() {
 }
 
 #[tokio::test]
-async fn hosted_finished_old_store_without_final_seq_still_requests_replay() {
+async fn hosted_finished_old_store_without_replay_end_seq_still_requests_replay() {
     for expired in [false, true] {
         let h = Harness::new(Behavior::OwnerReplay).await;
         let root = cortexkit_test_support::ScratchDir::new("hosted-finished-old-source");
         let recovered = cortexkit_test_support::ScratchDir::new("hosted-finished-old-store");
         let (motor, id) = completed_detached_owner(&h, &root).await;
         let mut job = serde_json::to_value(motor.storage.job(id).unwrap()).unwrap();
-        job["hosted"].as_object_mut().unwrap().remove("final_seq");
+        job["hosted"]
+            .as_object_mut()
+            .unwrap()
+            .remove("replay_end_seq");
         std::fs::write(
             recovered.join("state.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -1347,10 +1350,10 @@ async fn hosted_finished_old_store_without_final_seq_still_requests_replay() {
             Motor::with_connector(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0))))
                 .unwrap();
         let state = motor.hosted_state(id).unwrap();
-        assert_eq!(state.final_seq, None);
+        assert_eq!(state.replay_end_seq, None);
         assert!(serde_json::to_value(state)
             .unwrap()
-            .get("final_seq")
+            .get("replay_end_seq")
             .is_none());
         h.attach_history_expired.store(expired, Ordering::SeqCst);
         if expired {

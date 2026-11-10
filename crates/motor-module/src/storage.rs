@@ -1057,7 +1057,7 @@ impl Storage {
         &self,
         id: Uuid,
         terminal: TerminalRecord,
-        final_seq: Option<u64>,
+        replay_end_seq: Option<u64>,
     ) -> io::Result<()> {
         self.update(|state| {
             let Some(job) = state.jobs.get_mut(&id) else {
@@ -1069,8 +1069,8 @@ impl Storage {
             let Some(hosted) = job.hosted.as_mut() else {
                 return;
             };
-            if let Some(last) = final_seq {
-                hosted.final_seq = Some(last);
+            if let Some(end) = replay_end_seq {
+                hosted.replay_end_seq = Some(end);
             }
             if !hosted.has_real_terminal() {
                 hosted.terminal = Some(terminal.clone());
