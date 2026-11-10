@@ -98,7 +98,7 @@ impl Resources for Images {
     ) -> anyhow::Result<Assignment> {
         Ok(Assignment {
             image_generation_id: "image".into(),
-            hello: json!({}),
+            hello: json!({"type":"hello","protocol_version":1}),
             guest_init: json!({}),
             spool: "unused".into(),
         })

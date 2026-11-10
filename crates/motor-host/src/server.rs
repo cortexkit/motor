@@ -180,6 +180,7 @@ fn log_refusal(stage: &'static str, reason: Refusal, check: &str, jti: Option<&s
 }
 
 pub struct Runtime {
+    job_resolvers: RwLock<Vec<String>>,
     image_generations: Option<Arc<crate::jobs::images::Images>>,
     job_resources: Arc<dyn crate::jobs::Resources>,
     job_stops: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
@@ -209,6 +210,17 @@ pub struct Runtime {
     pub(crate) sandbox_identity: Option<crate::sandbox::IdentityFile>,
 }
 impl Runtime {
+    pub fn configure_job_resolvers(&self, resolvers: Vec<String>) -> Result<()> {
+        ensure!(
+            !resolvers.is_empty()
+                && resolvers
+                    .iter()
+                    .all(|s| s.parse::<std::net::Ipv4Addr>().is_ok()),
+            "job VM resolvers must be nonempty IPv4 addresses"
+        );
+        *self.job_resolvers.write().expect("job resolvers") = resolvers;
+        Ok(())
+    }
     /// Construct a runtime with durable image-generation support.
     pub fn with_image_generations(
         host_id: String,
@@ -274,6 +286,17 @@ impl Runtime {
     pub fn validate_job_startup(&self) -> Result<()> {
         if !self.per_job() {
             return Ok(());
+        }
+        {
+            let host = self.host.lock().expect("host lock");
+            for (id, image) in &host.snapshot.per_job.images {
+                if image.current {
+                    image
+                        .manifest
+                        .validate()
+                        .with_context(|| format!("invalid active job image {id}"))?;
+                }
+            }
         }
         let published = self.ready_job_images()?;
         ensure!(
@@ -406,6 +429,7 @@ impl Runtime {
             .collect();
         let host = Arc::new(Mutex::new(host));
         Arc::new(Self {
+            job_resolvers: RwLock::new(Vec::new()),
             job_resources: Arc::new(crate::jobs::Unavailable),
             image_generations: None,
             job_stops: Mutex::new(BTreeMap::new()),

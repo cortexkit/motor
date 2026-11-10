@@ -105,7 +105,7 @@ mod root {
             kernel: artifact("kernel"),
             rootfs: artifact("rootfs.ext4"),
             toolchain: artifact("toolchain.ext4"),
-            hello: serde_json::json!({"type":"hello"}),
+            hello: serde_json::json!({"type":"hello","protocol_version":1}),
             guest_init: serde_json::json!({}),
         };
         std::fs::write(
@@ -194,7 +194,7 @@ mod root {
             kernel: hash("kernel"),
             rootfs: hash("rootfs.ext4"),
             toolchain: hash("toolchain.ext4"),
-            hello: serde_json::json!({"type":"hello"}),
+            hello: serde_json::json!({"type":"hello","protocol_version":1}),
             guest_init: serde_json::json!({}),
         };
         std::fs::write(

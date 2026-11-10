@@ -88,6 +88,7 @@ struct Fake {
     scripted: Mutex<std::collections::VecDeque<UnixStream>>,
     recovery_reply: Mutex<Option<Value>>,
     init_reply: Mutex<Option<Value>>,
+    guest_identity: Mutex<Vec<Value>>,
     recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
 }
 impl Fake {
@@ -219,6 +220,9 @@ impl Control for Fake {
         Ok(json!({"result":"job","running":true,"tap_index":1}))
     }
     fn job_admin(&self, _: &str, request: &Value) -> Result<Value> {
+        if request["op"] == "attach_tenant" {
+            self.guest_identity.lock().unwrap().push(request.clone());
+        }
         if request["op"] == "recover_workspace" {
             self.wait("recovery");
             return Ok(self
@@ -366,6 +370,7 @@ struct Storage {
     held: Mutex<BTreeSet<String>>,
     releases: Mutex<BTreeMap<String, usize>>,
     fail_prepare: AtomicBool,
+    pinned_hello: Mutex<Option<Value>>,
     released: tokio::sync::Notify,
     recovery_available: AtomicBool,
     /// When set, acquire refuses if the host lock is already held, as the
@@ -381,6 +386,7 @@ impl Storage {
             held: Mutex::new(BTreeSet::new()),
             releases: Mutex::new(BTreeMap::new()),
             fail_prepare: AtomicBool::new(false),
+            pinned_hello: Mutex::new(None),
             released: tokio::sync::Notify::new(),
             recovery_available: AtomicBool::new(false),
             host: std::sync::OnceLock::new(),
@@ -419,7 +425,12 @@ impl Resources for Storage {
         self.held.lock().unwrap().insert(e.claims.jti.clone());
         Ok(Assignment {
             image_generation_id: "gen-1".into(),
-            hello: hello(),
+            hello: self
+                .pinned_hello
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(hello),
             spool: self.spool(&e.claims.jti),
             guest_init: json!({"resolvers":["1.1.1.1"],"hostname":"job","machine_id":"0123456789abcdef0123456789abcdef"}),
         })
@@ -461,11 +472,11 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
         permit_budget: 4,
     });
     let fake = Arc::new(Fake::default());
-    (
-        Runtime::with_job_resources("host".into(), host, fake.clone(), storage.clone()),
-        fake,
-        storage,
-    )
+    let runtime = Runtime::with_job_resources("host".into(), host, fake.clone(), storage.clone());
+    runtime
+        .configure_job_resolvers(vec!["1.1.1.1".into()])
+        .unwrap();
+    (runtime, fake, storage)
 }
 fn claim(runtime: &Arc<Runtime>, c: &Claims) -> u64 {
     let mut host = runtime.host.lock().unwrap();
@@ -1360,6 +1371,94 @@ async fn free_disk_boots_on_hello_and_ready_vm_waits_for_validated_run() {
     drop(client);
     task.await.unwrap().unwrap();
     runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn hosted_client_wire_exchange_accepts_pinned_runner_hello_and_runs_after_boot() {
+    use motor_protocol::{write_frame_async, Frame, PROTOCOL_VERSION};
+    let (runtime, fake, storage) = fixture();
+    runtime
+        .configure_job_resolvers(vec!["9.9.9.9".into()])
+        .unwrap();
+    let mut config =
+        motor_runner::Config::new(storage.root.path().join("unused-runner-state"), "main");
+    config.tenant_vm = true;
+    config.isolate_jobs = true;
+    config.return_chunked_max_bytes = Some(134217728);
+    let pinned =
+        serde_json::to_value(motor_runner::runner_hello(&config, true, true, true)).unwrap();
+    *storage.pinned_hello.lock().unwrap() = Some(pinned.clone());
+    *fake.hello.lock().unwrap() = Some(pinned);
+    *fake.hang.lock().unwrap() = "boot";
+    struct ReleaseGate(Arc<Fake>);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            *self.0.gate.0.lock().unwrap() = true;
+            self.0.gate.1.notify_all();
+        }
+    }
+    let _release = ReleaseGate(fake.clone());
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    // This is Channel::from_hosted's frame and codec, including its false
+    // `default_branch_tip: false` offer. Decode the reply as Frame too: an untyped object can
+    // look like capabilities to the host but makes the production client close.
+    write_frame_async(
+        &mut client,
+        &Frame::Hello {
+            return_paths: false,
+            return_chunked_max_bytes: None,
+            return_chunked: false,
+            sibling_paths: false,
+            protocol_version: PROTOCOL_VERSION,
+            started: true,
+            default_branch_tip: false,
+            gate_jobs: true,
+            platforms: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    loop {
+        match serde_json::from_value::<Frame>(read_frame(&mut client).await.unwrap()).unwrap() {
+            Frame::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                return_paths: true,
+                ..
+            } => break,
+            Frame::Heartbeat { .. } => continue,
+            other => panic!("invalid hosted runner hello: {other:?}"),
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(1), fake.entered.notified())
+        .await
+        .unwrap();
+    write_frame_async(
+        &mut client,
+        &serde_json::from_value::<Frame>(run(JOB)).unwrap(),
+    )
+    .await
+    .unwrap();
+    next_type(&mut client, "accepted").await;
+    assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    next_type(&mut client, "output").await;
+    assert!(runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    let request = fake.guest_identity.lock().unwrap()[0].clone();
+    assert_eq!(request["resolvers"], json!(["9.9.9.9"]));
+    assert_eq!(request["hostname"], "motor");
+    let machine_id = request["machine_id"].as_str().unwrap();
+    assert_eq!(machine_id.len(), 32);
+    assert!(machine_id
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    assert!(machine_id.bytes().any(|b| b != b'0'));
+    assert_ne!(machine_id, "0123456789abcdef0123456789abcdef");
+    drop(client);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

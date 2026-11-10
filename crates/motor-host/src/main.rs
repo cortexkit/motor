@@ -225,6 +225,7 @@ async fn main() -> Result<()> {
         broker_endpoint,
         jwks_url,
     );
+    runtime.configure_job_resolvers(config.resolvers.iter().map(ToString::to_string).collect())?;
     runtime
         .fetch_keys
         .store(true, std::sync::atomic::Ordering::Relaxed);

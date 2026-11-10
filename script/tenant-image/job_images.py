@@ -167,13 +167,23 @@ def artifact(path):
     return dict(bytes=length, sha256=hasher.hexdigest())
 
 
+def runner_hello(runner):
+    result = subprocess.run([str(runner), "print-hello", "--backend", "host", "--tenant-vm",
+                             "--return-chunked-max-bytes", "134217728"],
+                            check=True, capture_output=True, text=True)
+    hello = json.loads(result.stdout)
+    if not isinstance(hello, dict) or hello.get("type") != "hello" or hello.get("protocol_version") != 1:
+        raise ValueError("image runner did not emit a valid pinned Hello")
+    return hello
+
+
 def publish(stage, target):
     paths = {"kernel": stage / "kernel/vmlinux", "rootfs": stage / "job/rootfs.ext4",
              "toolchain": stage / "job/toolchain.ext4"}
     manifest = {key: artifact(path) for key, path in paths.items()}
-    # These fields describe image configuration, not a per-VM policy. The
-    # helper supplies runner arguments at each start; neither object adds any.
-    manifest.update(hello={}, guest_init={})
+    # Query the exact binary placed in the image, without opening runner state.
+    # Guest identity and resolver policy remain runtime-owned, not image data.
+    manifest.update(hello=runner_hello(stage / "motor-runner"), guest_init={})
     for key, source in paths.items():
         name = "kernel" if key == "kernel" else f"{key}.ext4"
         # The kernel is also a tenant output, so leave its source in place.

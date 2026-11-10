@@ -132,7 +132,8 @@ class ImageTests(unittest.TestCase):
         self.versions = self.root / "versions.txt"
         self.versions.write_bytes((HERE / "versions.txt").read_bytes())
         self.runner = self.root / "runner"
-        self.runner.write_bytes(b"guest runner input")
+        self.runner.write_text('#!/bin/sh\ntest "$1" = print-hello || exit 42\nprintf \'%s\\n\' \'{"type":"hello","protocol_version":1}\'\n')
+        self.runner.chmod(0o755)
         self.calls = []
 
     def builder(self, stage, pins, runner, jobs):
@@ -305,7 +306,7 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(manifest["version"], "test-1")
         self.assertEqual(manifest["kernel_sha256"], hashlib.sha256(b"kernel").hexdigest())
         self.assertEqual(manifest["rootfs_sha256"], hashlib.sha256(b"root filesystem").hexdigest())
-        self.assertEqual(manifest["runner_sha256"], hashlib.sha256(b"guest runner input").hexdigest())
+        self.assertEqual(manifest["runner_sha256"], "069f73902805b426f72c61c743c034fef0262f96a32a363c8b514b6f342c8403")
         self.assertIn("root=/dev/vda ro init=/sbin/motor-init", manifest["boot_args"])
         self.assertFalse((target / ".work").exists())
         self.assertEqual((target / "rootfs").stat().st_mode & 0o222, 0)

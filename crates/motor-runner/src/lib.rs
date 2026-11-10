@@ -114,7 +114,7 @@ pub use caller_path::CallerRoot;
 pub use engine::{Config, Runner, BOAT_DISK_RESERVE_BYTES, DEFAULT_FREE_SPACE_FLOOR_BYTES};
 #[cfg(target_os = "linux")]
 pub use privilege::run_helpers_directly_as_root;
-pub use server::serve;
+pub use server::{runner_hello, serve};
 pub use storage::{JobState, REPLAY_BYTES, RETENTION_MS};
 #[cfg(target_os = "linux")]
 #[doc(hidden)]

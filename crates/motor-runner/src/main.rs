@@ -102,6 +102,14 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         return forget_caller_root_args(args.collect());
     }
     let (job, drain_timeout_s, exit_after) = configure_options(&mut config, args)?;
+    if operation == "print-hello" {
+        serde_json::to_writer(
+            std::io::stdout(),
+            &motor_runner::runner_hello(&config, true, true, true),
+        )?;
+        println!();
+        return Ok(());
+    }
     match operation.as_str() {
         "metrics-key" => {
             println!("{}", motor_runner::metrics::public_key(&config)?);
@@ -895,6 +903,22 @@ mod metrics_cli_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn print_hello_answers_without_opening_runner_state() {
+        let root = cortexkit_test_support::scratch_root()
+            .join(format!("print-hello-{}", std::process::id()));
+        assert!(!root.exists());
+        super::run(vec![
+            "print-hello".into(),
+            "--state-root".into(),
+            root.display().to_string(),
+            "--tenant-vm".into(),
+        ])
+        .await
+        .unwrap();
+        assert!(!root.exists());
+    }
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn helper_operations_reject_malformed_sudo_forms_before_runner_options() {

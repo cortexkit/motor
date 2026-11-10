@@ -53,6 +53,15 @@ impl Manifest {
         if !self.hello.is_object() || !self.guest_init.is_object() {
             return Err(Error("image runner configuration must be an object".into()));
         }
+        if !matches!(
+            serde_json::from_value::<motor_protocol::Frame>(self.hello.clone()),
+            Ok(motor_protocol::Frame::Hello {
+                protocol_version: motor_protocol::PROTOCOL_VERSION,
+                ..
+            })
+        ) {
+            return Err(Error("image manifest requires the runner's pinned Hello with type=hello and the supported protocol_version; rebuild the job image".into()));
+        }
         Ok(())
     }
 
@@ -95,6 +104,36 @@ impl Operation {
                 validate_generation(generation)?;
                 job::validate_account(account)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_requires_a_typed_compatible_runner_hello() {
+        let artifact = Artifact {
+            bytes: 4096,
+            sha256: "a".repeat(64),
+        };
+        let mut manifest = Manifest {
+            kernel: artifact.clone(),
+            rootfs: artifact.clone(),
+            toolchain: artifact,
+            hello: serde_json::json!({"type":"hello","protocol_version": motor_protocol::PROTOCOL_VERSION}),
+            guest_init: serde_json::json!({}),
+        };
+        manifest.validate().unwrap();
+        for hello in [
+            serde_json::json!({}),
+            serde_json::json!({"type":"hello"}),
+            serde_json::json!({"type":"hello","protocol_version":0}),
+            serde_json::json!({"type":"heartbeat"}),
+        ] {
+            manifest.hello = hello;
+            assert!(manifest.validate().unwrap_err().0.contains("pinned Hello"));
         }
     }
 }

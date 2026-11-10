@@ -228,13 +228,17 @@ class JobImageTests(unittest.TestCase):
         (self.stage / "job/toolchain.ext4").write_bytes(b"toolchain")
         target = self.stage / "staging/generation"
         target.mkdir(parents=True)
+        pinned_hello = {"type": "hello", "protocol_version": 1, "return_paths": True}
+        runner = self.stage / "motor-runner"
+        runner.write_text("#!/bin/sh\ntest \"$1\" = print-hello || exit 42\nprintf '%s\\n' '" + json.dumps(pinned_hello) + "'\n")
+        runner.chmod(0o755)
         manifest = job_images.publish(self.stage, target)
         self.assertFalse((target / "manifest.json").exists())
         job_images.complete(target, manifest)
         self.assertEqual(set(p.name for p in target.iterdir()),
                          {"kernel", "rootfs.ext4", "toolchain.ext4", "manifest.json"})
         self.assertEqual(set(manifest), {"kernel", "rootfs", "toolchain", "hello", "guest_init"})
-        self.assertEqual(manifest["hello"], {})
+        self.assertEqual(manifest["hello"], pinned_hello)
         self.assertEqual(manifest["guest_init"], {})
         for key, name in (("kernel", "kernel"), ("rootfs", "rootfs.ext4"), ("toolchain", "toolchain.ext4")):
             data = (target / name).read_bytes()
@@ -242,6 +246,11 @@ class JobImageTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE((target / name).stat().st_mode), 0o444)
         self.assertEqual(json.loads((target / "manifest.json").read_text()), manifest)
         self.assertEqual((self.stage / "kernel/vmlinux").read_bytes(), b"pinned tenant kernel")
+
+    def test_image_runner_hello_cannot_be_an_empty_placeholder(self):
+        with mock.patch.object(job_images.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="{}")):
+            with self.assertRaisesRegex(ValueError, "valid pinned Hello"):
+                job_images.runner_hello(self.stage / "motor-runner")
 
     def test_empty_artifact_is_never_published(self):
         path = self.stage / "empty"

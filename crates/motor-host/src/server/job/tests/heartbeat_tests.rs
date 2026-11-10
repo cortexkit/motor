@@ -137,6 +137,9 @@ async fn dax_refusal_latches_health_across_restart_until_operator_clear_and_rela
         permit_budget: 4,
     });
     let runtime = Runtime::with_job_resources("host".into(), host, fake.clone(), storage);
+    runtime
+        .configure_job_resolvers(vec!["1.1.1.1".into()])
+        .unwrap();
     {
         let mut host = runtime.host.lock().unwrap();
         let heartbeat = host.heartbeat(unix_ms(), 950, true);

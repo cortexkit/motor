@@ -24,6 +24,32 @@ fn unix_s() -> u64 {
         .as_secs()
 }
 
+/// The runner's Hello, also recorded by image builders before publishing an
+/// image. Keep capability negotiation here so manifests cannot drift from the
+/// response the same runner sends after boot.
+pub fn runner_hello(
+    config: &crate::Config,
+    started: bool,
+    default_branch_tip: bool,
+    gate_jobs: bool,
+) -> Frame {
+    Frame::Hello {
+        return_paths: config.supports_returns(),
+        return_chunked_max_bytes: config.return_chunked_max_bytes,
+        return_chunked: config.supports_returns(),
+        sibling_paths: config.sibling_snapshot_mode(),
+        protocol_version: PROTOCOL_VERSION,
+        started,
+        default_branch_tip,
+        gate_jobs,
+        platforms: match config.served_platform() {
+            Platform::Windows => vec!["windows".into()],
+            Platform::Macos => vec!["macos".into()],
+            _ => Vec::new(),
+        },
+    }
+}
+
 struct TenantState {
     admitted: bool,
     closed: bool,
@@ -627,21 +653,12 @@ async fn session(
     );
     send(
         tx,
-        Frame::Hello {
-            return_paths: runner.config().supports_returns(),
-            return_chunked_max_bytes: runner.config().return_chunked_max_bytes,
-            return_chunked: runner.config().supports_returns(),
-            sibling_paths: runner.config().sibling_snapshot_mode(),
-            protocol_version: PROTOCOL_VERSION,
-            started: supports_started,
-            default_branch_tip: supports_default_branch_tip,
-            gate_jobs: supports_gate_jobs,
-            platforms: match runner.config().served_platform() {
-                Platform::Windows => vec!["windows".into()],
-                Platform::Macos => vec!["macos".into()],
-                _ => Vec::new(),
-            },
-        },
+        runner_hello(
+            runner.config(),
+            supports_started,
+            supports_default_branch_tip,
+            supports_gate_jobs,
+        ),
     )
     .await?;
     if protocol_version != PROTOCOL_VERSION {

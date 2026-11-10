@@ -21,6 +21,9 @@ fn managed() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
         "http://broker".into(),
         "http://keys".into(),
     );
+    runtime
+        .configure_job_resolvers(vec!["1.1.1.1".into()])
+        .unwrap();
     runtime.probe_storage();
     (runtime, fake, storage)
 }
@@ -121,6 +124,29 @@ fn unpublished_active_generation_refuses_startup() {
         runtime.validate_job_startup().unwrap_err().to_string(),
         "active job image generation gen-1 is no longer published and verified by the helper"
     );
+}
+
+#[test]
+fn empty_active_image_hello_refuses_before_expensive_helper_readiness() {
+    let (runtime, fake, _) = managed();
+    runtime
+        .select_initial_job_images("gen-1", unix_ms())
+        .unwrap();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .images
+        .get_mut("gen-1")
+        .unwrap()
+        .manifest
+        .hello = json!({});
+    fake.calls.lock().unwrap().clear();
+    let error = runtime.validate_job_startup().unwrap_err();
+    assert!(format!("{error:#}").contains("pinned Hello"));
+    assert!(fake.calls.lock().unwrap().is_empty());
 }
 
 #[test]
