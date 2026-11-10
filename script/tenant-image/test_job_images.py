@@ -19,6 +19,16 @@ import job_images
 
 
 class JobImageTests(unittest.TestCase):
+    def test_pinned_hello_arguments_match_the_helpers_job_runner_arguments(self):
+        # The image pins the Hello its runner prints with these arguments; the
+        # booted runner gets the helper's. A drift would refuse every job.
+        helper = Path(__file__).resolve().parents[2] / "crates/motor-vm-helper/src/linux/job.rs"
+        source = " ".join(helper.read_text().split())
+        backend = " ".join(job_images.JOB_RUNNER_HELLO_ARGS[:3])
+        returns = " ".join(job_images.JOB_RUNNER_HELLO_ARGS[3:])
+        self.assertIn(f'"{backend} --job-network', source)
+        self.assertIn(returns, source)
+
     def test_missing_installer_loader_refuses_build(self):
         with mock.patch.object(job_images.importlib.util, "spec_from_file_location", return_value=None):
             with self.assertRaisesRegex(ImportError, "shared tenant installer"):
@@ -230,7 +240,10 @@ class JobImageTests(unittest.TestCase):
         target.mkdir(parents=True)
         pinned_hello = {"type": "hello", "protocol_version": 1, "return_paths": True}
         runner = self.stage / "motor-runner"
-        runner.write_text("#!/bin/sh\ntest \"$1\" = print-hello || exit 42\nprintf '%s\\n' '" + json.dumps(pinned_hello) + "'\n")
+        # Like the real runner, refuse a return maximum given without a budget.
+        runner.write_text("#!/bin/sh\ntest \"$1\" = print-hello || exit 42\n"
+                          "case \"$*\" in *'--return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648'*) ;; *) exit 43 ;; esac\n"
+                          "printf '%s\\n' '" + json.dumps(pinned_hello) + "'\n")
         runner.chmod(0o755)
         manifest = job_images.publish(self.stage, target)
         self.assertFalse((target / "manifest.json").exists())

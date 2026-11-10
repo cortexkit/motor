@@ -167,9 +167,18 @@ def artifact(path):
     return dict(bytes=length, sha256=hasher.hexdigest())
 
 
+# The Hello-relevant subset of the arguments motor-vm-helper gives every job VM
+# runner (boot_command_line in crates/motor-vm-helper/src/linux/job.rs). The
+# runner refuses a return maximum without a return budget, and the pinned Hello
+# must match what the booted runner sends: motor-host refuses a job whose
+# runner Hello does not cover it.
+JOB_RUNNER_HELLO_ARGS = ("--backend", "host", "--tenant-vm",
+                         "--return-chunked-max-bytes", "134217728",
+                         "--return-budget-bytes", "2147483648")
+
+
 def runner_hello(runner):
-    result = subprocess.run([str(runner), "print-hello", "--backend", "host", "--tenant-vm",
-                             "--return-chunked-max-bytes", "134217728"],
+    result = subprocess.run([str(runner), "print-hello", *JOB_RUNNER_HELLO_ARGS],
                             check=True, capture_output=True, text=True)
     hello = json.loads(result.stdout)
     if not isinstance(hello, dict) or hello.get("type") != "hello" or hello.get("protocol_version") != 1:
