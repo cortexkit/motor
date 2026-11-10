@@ -1930,18 +1930,26 @@ where
         nonces
             .verify(&challenge, &claims, &requester_jwk, &sig, unix_ms() / 1000)
             .map_err(|_| (Error::Refused(Refusal::Auth), "challenge_signature"))?;
-        let mut host = runtime.host.lock().expect("host lock");
-        host.consume_nonce(challenge.nonce, challenge.ts, unix_ms() / 1000)
-            .map_err(|error| (error, "challenge_nonce"))?;
-        let (id, _) = host
-            .claim(claims.clone(), unix_ms())
-            .map_err(|error| (error, "admission"))?;
-        if matches!(host.settings, crate::config::HostSettings::PerJob(_))
-            && claims.purpose == Purpose::Run
-        {
-            let execution = host.snapshot.per_job.executions[&claims.jti].clone();
+        let (id, execution) = {
+            let mut host = runtime.host.lock().expect("host lock");
+            host.consume_nonce(challenge.nonce, challenge.ts, unix_ms() / 1000)
+                .map_err(|error| (error, "challenge_nonce"))?;
+            let (id, _) = host
+                .claim(claims.clone(), unix_ms())
+                .map_err(|error| (error, "admission"))?;
+            let execution = (matches!(host.settings, crate::config::HostSettings::PerJob(_))
+                && claims.purpose == Purpose::Run)
+                .then(|| host.snapshot.per_job.executions[&claims.jti].clone());
+            (id, execution)
+        };
+        // The image manager takes the host lock itself to read the job's
+        // generation, and std's Mutex is not reentrant: acquiring with the guard
+        // above still held hangs the first per-job admission and, with it, every
+        // later heartbeat and admin request.
+        if let Some(execution) = execution {
             if let Err(error) = runtime.job_resources.acquire(&execution) {
                 tracing::error!(jti = claims.jti, %error, "job_resources_refused");
+                let mut host = runtime.host.lock().expect("host lock");
                 host.job_boot_failed(&claims.jti, unix_ms())
                     .map_err(|error| (error, "admission"))?;
                 host.job_stopped_at(&claims.jti, false, unix_ms())
@@ -1950,6 +1958,7 @@ where
                 return Err((Error::Refused(Refusal::HostFull), "job_resources"));
             }
         }
+        let host = runtime.host.lock().expect("host lock");
         Ok((
             id,
             host.watch_connection(id)

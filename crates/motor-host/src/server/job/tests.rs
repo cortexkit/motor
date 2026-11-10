@@ -368,6 +368,9 @@ struct Storage {
     fail_prepare: AtomicBool,
     released: tokio::sync::Notify,
     recovery_available: AtomicBool,
+    /// When set, acquire refuses if the host lock is already held, as the
+    /// production image manager would hang taking it.
+    host: std::sync::OnceLock<Arc<Mutex<Host>>>,
 }
 impl Storage {
     fn new() -> Arc<Self> {
@@ -380,6 +383,7 @@ impl Storage {
             fail_prepare: AtomicBool::new(false),
             released: tokio::sync::Notify::new(),
             recovery_available: AtomicBool::new(false),
+            host: std::sync::OnceLock::new(),
         })
     }
     fn spool(&self, job: &str) -> std::path::PathBuf {
@@ -406,6 +410,12 @@ impl Resources for Storage {
         })
     }
     fn acquire(&self, e: &Execution) -> Result<Assignment> {
+        if let Some(host) = self.host.get() {
+            ensure!(
+                host.try_lock().is_ok(),
+                "job resources acquired while the host lock is held"
+            );
+        }
         self.held.lock().unwrap().insert(e.claims.jti.clone());
         Ok(Assignment {
             image_generation_id: "gen-1".into(),
@@ -889,6 +899,7 @@ async fn authenticated_per_job_transport_uses_no_tenant_binding_and_forwards_bur
     use ed25519_dalek::{Signer, SigningKey};
     use motor_lease::{Jwks, JwksKey, RequesterJwk};
     let (runtime, fake, storage) = fixture();
+    assert!(storage.host.set(runtime.host.clone()).is_ok());
     let broker = SigningKey::from_bytes(&[7; 32]);
     let requester = SigningKey::from_bytes(&[8; 32]);
     runtime
