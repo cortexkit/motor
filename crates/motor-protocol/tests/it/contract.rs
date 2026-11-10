@@ -61,6 +61,7 @@ const FRAME_CASES: &[&str] = &[
     "withdraw_reply-started",
     "attach",
     "terminal",
+    "terminal-last-seq",
     "prepare",
     "prepare-workspace-kind-head",
     "prepare-workspace-kind-task",
@@ -261,7 +262,7 @@ fn golden_vectors_are_complete_and_canonical() {
             count += 1;
         }
     }
-    assert_eq!(count, 139);
+    assert_eq!(count, 140);
 }
 
 #[test]

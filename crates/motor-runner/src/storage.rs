@@ -453,6 +453,14 @@ impl Job {
             bundle_bytes,
         )
         .with_ran(if remote { Ran::Remote } else { Ran::None });
+        // The durable log cursor includes Started, output and returned files,
+        // even when their replay bytes have expired. A zero cursor cannot
+        // establish a last sequence for a legacy or unstarted job.
+        if remote {
+            if let Some(last_seq) = self.next_seq.checked_sub(1) {
+                terminal = terminal.with_last_seq(last_seq);
+            }
+        }
         if report_source {
             terminal = terminal.with_source_read_only(self.source_read_only);
             if let Some(memory) = self.memory_stated_mib {
@@ -951,6 +959,33 @@ mod tests {
     }
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn terminal_last_seq_uses_durable_cursor_and_survives_record_roundtrip() {
+        for (started_ms, next_seq, expected) in [
+            (None, 0, None),
+            (None, 19, None),
+            (Some(125), 0, None),
+            (Some(125), 1, Some(0)),
+            (Some(125), 19, Some(18)),
+        ] {
+            let mut job = Job::new(Uuid::now_v7(), None, 100, 0, 1);
+            job.started_ms = started_ms;
+            job.next_seq = next_seq;
+            job.terminal(Outcome::OutcomeUnknown, 200);
+            assert_eq!(job.terminal.as_ref().unwrap().last_seq(), expected);
+            let bytes = serde_json::to_vec(&job).unwrap();
+            let restored: Job = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored.terminal.as_ref().unwrap().last_seq(), expected);
+            assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+            if expected.is_none() {
+                assert!(serde_json::to_value(&job.terminal)
+                    .unwrap()
+                    .get("last_seq")
+                    .is_none());
+            }
+        }
+    }
 
     #[test]
     fn prepared_javascript_directories_survive_job_record_roundtrip() {

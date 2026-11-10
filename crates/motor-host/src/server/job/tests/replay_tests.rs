@@ -10,7 +10,7 @@ fn records() -> Vec<Vec<u8>> {
         bytes(br#"{ "type":"return_result", "seq":2, "files":[], "extension":"raw" }"#),
         bytes(br#"{ "type":"return_chunk", "seq":3, "bytes":"YWJj", "extension":"raw" }"#),
         bytes(br#"{ "type":"return_manifest", "seq":4, "files":[] }"#),
-        bytes(format!(r#"{{ "type":"terminal","job_id":"{JOB}","outcome":{{"type":"exit","code":0}},"wall_ms":100,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null }}"#).as_bytes()),
+        bytes(format!(r#"{{ "type":"terminal","job_id":"{JOB}","outcome":{{"type":"exit","code":0}},"wall_ms":100,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null,"last_seq":4 }}"#).as_bytes()),
     ]
 }
 async fn next_record(client: &mut tokio::io::DuplexStream) -> Raw {
@@ -78,6 +78,9 @@ async fn launched_with_returns(
     (client, task, guest)
 }
 async fn ack(runtime: &Arc<Runtime>, guest: &mut tokio::net::UnixStream) {
+    ack_at(runtime, guest, 4).await;
+}
+async fn ack_at(runtime: &Arc<Runtime>, guest: &mut tokio::net::UnixStream, highest_seq: u64) {
     assert_eq!(
         read_frame(guest).await.unwrap(),
         json!({"type":"terminal_stored","jti":JOB})
@@ -90,7 +93,7 @@ async fn ack(runtime: &Arc<Runtime>, guest: &mut tokio::net::UnixStream) {
     );
     assert_eq!(
         runtime.host.lock().unwrap().snapshot.leases[JOB].highest_seq,
-        4
+        highest_seq
     );
 }
 fn power_off(runtime: &Arc<Runtime>, fake: &Fake) {
@@ -514,13 +517,21 @@ async fn authoritative_terminals_are_byte_identical_live_and_on_replay_after_res
                     unix_ms(),
                 )
                 .unwrap();
+            let tail =
+                bytes(br#"{ "type":"output", "seq":5, "stream":"stdout", "bytes":"dGFpbA==" }"#);
+            guest.write_all(&tail).await.unwrap();
+            assert_eq!(next_record(&mut client).await.bytes, tail);
         }
         let mut forged = crate::replay::decode(frames.last().unwrap()).unwrap();
         forged["oom_kill"] = json!({"cause":"host_pressure"});
+        if host_stop {
+            forged["last_seq"] = json!(123);
+        }
         let raw_terminal = bytes(&serde_json::to_vec(&forged).unwrap());
         guest.write_all(&raw_terminal).await.unwrap();
         let delivered = next_record(&mut client).await;
         assert_eq!(delivered.value["type"], "terminal");
+        assert_eq!(delivered.value["last_seq"], if host_stop { 5 } else { 4 });
         if host_stop {
             assert_eq!(delivered.value["oom_kill"]["cause"], "host_pressure");
             assert_eq!(delivered.value["outcome"]["type"], "signal");
@@ -528,7 +539,7 @@ async fn authoritative_terminals_are_byte_identical_live_and_on_replay_after_res
             assert!(delivered.value.get("oom_kill").is_none());
             assert_eq!(delivered.value["outcome"]["type"], "exit");
         }
-        ack(&runtime, &mut guest).await;
+        ack_at(&runtime, &mut guest, if host_stop { 5 } else { 4 }).await;
         let stored = runtime.job_stream(JOB).unwrap();
         assert_eq!(
             stored.with_store(|s| s.raw_frame(s.len() - 1)).unwrap(),

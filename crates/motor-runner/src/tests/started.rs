@@ -72,7 +72,8 @@ async fn linux_command_has_no_windows_checkout_notice() {
     assert_eq!(runner.config().served_platform(), Platform::Linux);
     let (request, bytes) = f.run("printf linux-output");
     f.submit(&runner, &request, &bytes);
-    terminal(&runner, request.job_id).await;
+    let terminal = terminal(&runner, request.job_id).await;
+    assert_eq!(terminal.last_seq(), Some(1));
     base_done(&runner).await;
     let replay = runner.replay(request.job_id, 0).unwrap();
     let output = replay
@@ -94,7 +95,9 @@ async fn started_replay_is_inclusive_durable_and_not_repeated() {
     let runner = Runner::open(config.clone()).unwrap();
     let (request, bytes) = f.run("printf replay-output");
     f.submit(&runner, &request, &bytes);
-    terminal(&runner, request.job_id).await;
+    let terminal = terminal(&runner, request.job_id).await;
+    assert_eq!(terminal.last_seq(), Some(1));
+    let terminal_bytes = serde_json::to_vec(&Frame::Terminal(terminal)).unwrap();
     base_done(&runner).await;
     let before = runner.replay(request.job_id, 0).unwrap();
     assert!(matches!(
@@ -115,6 +118,25 @@ async fn started_replay_is_inclusive_durable_and_not_repeated() {
     let runner = reopen(config);
     assert_eq!(runner.replay(request.job_id, 0).unwrap(), before);
     assert_eq!(runner.replay(request.job_id, 1).unwrap(), after);
+    assert_eq!(
+        serde_json::to_vec(runner.replay(request.job_id, 0).unwrap().last().unwrap()).unwrap(),
+        terminal_bytes
+    );
+}
+
+#[tokio::test]
+async fn silent_started_job_reports_started_last_seq() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let (request, bytes) = f.run(":");
+    f.submit(&runner, &request, &bytes);
+    let terminal = terminal(&runner, request.job_id).await;
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    assert_eq!(terminal.last_seq(), Some(0));
+    assert!(matches!(
+        runner.replay(request.job_id, 0).unwrap().as_slice(),
+        [Frame::Started { seq: 0, .. }, Frame::Terminal(_)]
+    ));
 }
 
 #[tokio::test]
@@ -170,6 +192,11 @@ async fn live_started_frame_is_sent_once_before_output() {
             Frame::Terminal(t) => {
                 assert_eq!(t.outcome, Outcome::Exit { code: 0 });
                 assert_eq!(t.queue_wait_ms, 25);
+                assert_eq!(t.last_seq(), Some(seq - 1));
+                assert_eq!(
+                    runner.replay(request.job_id, 0).unwrap().last(),
+                    Some(&Frame::Terminal(t))
+                );
                 break;
             }
             other => panic!("unexpected frame after Started: {other:?}"),
@@ -194,6 +221,8 @@ async fn refused_before_start_has_no_started_record() {
         }
     );
     assert_eq!(t.ran, Some(Ran::None));
+    assert_eq!(t.last_seq(), None);
+    assert!(serde_json::to_value(&t).unwrap().get("last_seq").is_none());
     assert_eq!(
         runner.replay(request.job_id, 0).unwrap(),
         vec![Frame::Terminal(t)]
@@ -238,7 +267,7 @@ fn legacy_replay_projects_cursors_and_real_truncation_but_not_terminal() {
     assert_eq!(
         legacy.last(),
         native.last(),
-        "Terminal has no sequence fields"
+        "Terminal retains the authoritative log watermark"
     );
     assert_eq!(runner.replay_legacy(id, 1).unwrap(), legacy[1..]);
     assert_eq!(runner.replay_legacy(id, 3).unwrap(), legacy[3..]);

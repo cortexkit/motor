@@ -419,6 +419,7 @@ async fn hosted_unknown_past_deadline_retires_once_across_restart_without_reatta
             s.broker_url = http.url.clone();
             s.placement.as_mut().unwrap().host = "boat:unknown".into();
             s.billing = BillingStatus::Pending;
+            s.replay_end_seq = Some(19);
         })
         .unwrap();
     let now = motor
@@ -433,6 +434,7 @@ async fn hosted_unknown_past_deadline_retires_once_across_restart_without_reatta
     let terminal = job.local_terminal.unwrap();
     assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
     assert_eq!(terminal.ran, Some(Ran::Unknown("maybe".into())));
+    assert_eq!(terminal.last_seq(), None);
     assert!(terminal
         .refusal_detail
         .as_deref()
@@ -1178,16 +1180,21 @@ async fn completed_detached_owner(h: &Harness, root: &std::path::Path) -> (Motor
     .unwrap();
     assert!(motor.storage.job(id).unwrap().hosted_complete());
     assert_eq!(motor.hosted_state(id).unwrap().replay_end_seq, Some(64));
+    assert_eq!(
+        motor.hosted_state(id).unwrap().terminal.unwrap().last_seq(),
+        Some(63)
+    );
     (motor, id)
 }
 
-async fn assert_completed_replay(motor: &Motor, id: Uuid) {
+async fn assert_completed_replay(motor: &Motor, id: Uuid, expected_last_seq: Option<u64>) {
     let mut caller = motor.attach(AttachRequest::new(id, 1)).unwrap();
     let has_owner = motor.hosted_results.lock().unwrap().contains_key(&id);
     let stopped = has_owner.then(|| motor.hosted_result_stopped_for_test(id));
     owner_outputs(motor, id, &mut caller, 1).await;
     assert!(matches!(result_record(&mut caller).await,
-        StreamRecord::Terminal(terminal) if terminal.outcome == Outcome::Exit { code: 41 }));
+        StreamRecord::Terminal(terminal) if terminal.outcome == Outcome::Exit { code: 41 }
+            && terminal.last_seq() == expected_last_seq));
     assert!(caller.records.recv().await.is_none());
     tokio::time::timeout(
         Duration::from_secs(15),
@@ -1201,7 +1208,8 @@ async fn assert_completed_replay(motor: &Motor, id: Uuid) {
 async fn assert_expired_replay(motor: &Motor, id: Uuid) {
     let mut caller = motor.attach(AttachRequest::new(id, 1)).unwrap();
     assert!(matches!(result_record(&mut caller).await,
-        StreamRecord::Terminal(terminal) if terminal.outcome == Outcome::HistoryExpired));
+        StreamRecord::Terminal(terminal) if terminal.outcome == Outcome::HistoryExpired
+            && terminal.last_seq().is_none()));
     assert!(caller.records.recv().await.is_none());
     assert_eq!(
         motor.hosted_state(id).unwrap().terminal.unwrap().outcome,
@@ -1214,7 +1222,7 @@ async fn hosted_finished_late_attach_replays_after_owner_retirement() {
     let h = Harness::new(Behavior::OwnerReplay).await;
     let root = cortexkit_test_support::ScratchDir::new("hosted-finished-late-attach");
     let (motor, id) = completed_detached_owner(&h, &root).await;
-    assert_completed_replay(&motor, id).await;
+    assert_completed_replay(&motor, id, Some(63)).await;
     assert_eq!(owner_replay_cursors(&h), vec![1, 1]);
     let mut boundary = motor.attach(AttachRequest::new(id, 63)).unwrap();
     owner_outputs(&motor, id, &mut boundary, 63).await;
@@ -1318,7 +1326,7 @@ async fn hosted_finished_late_attach_replays_after_journal_recovery() {
         if expired {
             assert_expired_replay(&motor, id).await;
         } else {
-            assert_completed_replay(&motor, id).await;
+            assert_completed_replay(&motor, id, Some(63)).await;
         }
         assert_eq!(owner_replay_cursors(&h), vec![1, 1]);
         motor.close().await;
@@ -1359,7 +1367,7 @@ async fn hosted_finished_old_store_without_replay_end_seq_still_requests_replay(
         if expired {
             assert_expired_replay(&motor, id).await;
         } else {
-            assert_completed_replay(&motor, id).await;
+            assert_completed_replay(&motor, id, None).await;
         }
         assert_eq!(owner_replay_cursors(&h), vec![1, 1]);
         motor.close().await;

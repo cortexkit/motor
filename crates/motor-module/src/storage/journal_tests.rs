@@ -47,6 +47,121 @@ fn terminal(id: Uuid) -> TerminalRecord {
 }
 
 #[test]
+fn hosted_terminal_last_seq_preserves_runner_or_uses_persisted_replay_end() {
+    for (end, runner_seq, outcome, ran, expected) in [
+        (
+            Some(19),
+            Some(27),
+            Outcome::Exit { code: 0 },
+            Ran::Remote,
+            Some(27),
+        ),
+        (
+            Some(19),
+            None,
+            Outcome::Exit { code: 0 },
+            Ran::Remote,
+            Some(18),
+        ),
+        (
+            Some(1),
+            None,
+            Outcome::Exit { code: 0 },
+            Ran::Remote,
+            Some(0),
+        ),
+        (Some(0), None, Outcome::Exit { code: 0 }, Ran::Remote, None),
+        (None, None, Outcome::Exit { code: 0 }, Ran::Remote, None),
+        (
+            Some(19),
+            None,
+            Outcome::OutcomeUnknown,
+            Ran::Remote,
+            Some(18),
+        ),
+        (Some(19), None, Outcome::HistoryExpired, Ran::Remote, None),
+        (
+            Some(19),
+            None,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerFull,
+            },
+            Ran::None,
+            None,
+        ),
+        (Some(19), None, Outcome::Exit { code: 0 }, Ran::None, None),
+    ] {
+        let root = ScratchDir::new("hosted-terminal-last-seq");
+        let storage = Storage::open(&root).unwrap();
+        let id = Uuid::now_v7();
+        lifecycle(&storage, id);
+        storage
+            .hosted_update(id, |state| {
+                state.terminal = None;
+                state.finish_done = false;
+                state.replay_end_seq = end;
+            })
+            .unwrap();
+        let mut terminal = TerminalRecord::new(id, outcome, 1, 0, 0).with_ran(ran);
+        if let Some(seq) = runner_seq {
+            terminal = terminal.with_last_seq(seq);
+        }
+        storage.hosted_terminal(id, terminal).unwrap();
+        assert_eq!(
+            storage
+                .job(id)
+                .unwrap()
+                .hosted
+                .unwrap()
+                .terminal
+                .unwrap()
+                .last_seq(),
+            expected
+        );
+        storage.shutdown().unwrap();
+        drop(storage);
+        let storage = Storage::open(&root).unwrap();
+        assert_eq!(
+            storage
+                .job(id)
+                .unwrap()
+                .hosted
+                .unwrap()
+                .terminal
+                .unwrap()
+                .last_seq(),
+            expected
+        );
+        storage.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn hosted_terminal_last_seq_uses_cursor_committed_with_terminal() {
+    let root = ScratchDir::new("hosted-terminal-cursor");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::now_v7();
+    lifecycle(&storage, id);
+    storage
+        .hosted_update(id, |state| {
+            state.terminal = None;
+            state.finish_done = false;
+        })
+        .unwrap();
+    storage
+        .hosted_terminal_with_sequence(
+            id,
+            TerminalRecord::new(id, Outcome::Exit { code: 0 }, 1, 0, 0).with_ran(Ran::Remote),
+            Some(6),
+        )
+        .unwrap();
+    let hosted = storage.job(id).unwrap().hosted.unwrap();
+    assert_eq!(hosted.replay_end_seq, Some(6));
+    assert_eq!(hosted.terminal.unwrap().last_seq(), Some(5));
+    storage.shutdown().unwrap();
+}
+
+#[test]
 fn journal_replays_atomic_upserts_and_deletions_without_shutdown() {
     let root = ScratchDir::new("motor-journal-maps");
     let crash = ScratchDir::new("motor-journal-maps-crash");
