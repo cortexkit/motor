@@ -3733,7 +3733,7 @@ impl Runner {
         let repository = paths::fill_source(source).caller;
         let plan = self.base_plan(repository.text(), &source.integration_tip, true);
         let mut inner = self.core.inner.lock().unwrap();
-        if !self.warm_builds_enabled(&source.integration_tip) {
+        if !self.fill_vm_writer_enabled(&source.integration_tip) {
             return Err(invalid("fill writer unavailable"));
         }
         self.queue_base_planned(&mut inner, repository.text(), repository.text(), plan)?;
@@ -5604,6 +5604,17 @@ impl Runner {
     }
     /// Whether warm builds may be queued for `tip` at all, from configuration
     /// alone; `queue_base_planned` also checks for a drain under the lock.
+    /// Whether a per-job fill VM may run the fill it was booted for. Such a VM
+    /// exists only for that fill (it refuses every Run), so the per-job refusal
+    /// in `warm_builds_enabled`, which keeps job VMs from queuing fills, does
+    /// not apply; the cache writer and its write key still must be present.
+    #[cfg(target_os = "linux")]
+    fn fill_vm_writer_enabled(&self, tip: &str) -> bool {
+        !tip.is_empty()
+            && self.core.config.per_job
+            && self.core.config.writer_enabled()
+            && self.core.quarantined.is_empty()
+    }
     fn warm_builds_enabled(&self, tip: &str) -> bool {
         if self.core.config.per_job {
             return false;

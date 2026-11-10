@@ -44,6 +44,35 @@ fn job_vm_accepts_one_execution_and_workspace_even_after_completion() {
     assert!(!runner.warm_builds_enabled("tip"));
 }
 
+/// A per-job fill VM exists only to run its fill, so the per-job refusal that
+/// keeps job VMs from queuing fills must not refuse it; the write key and a
+/// tip remain required.
+#[cfg(target_os = "linux")]
+#[test]
+fn per_job_fill_vm_may_fill_only_with_a_write_key_and_tip() {
+    let f = Fixture::new();
+    for (key, tip, expected) in [
+        (Some(true), "tip", true),
+        (Some(false), "tip", false),
+        (Some(true), "", false),
+    ] {
+        let mut config = f.config();
+        config.manual_tick = true;
+        config.tenant_vm = true;
+        config.per_job = true;
+        config.tenant_write_key = key;
+        let runner = Runner::open(config).unwrap();
+        assert_eq!(
+            runner.fill_vm_writer_enabled(tip),
+            expected,
+            "{key:?} {tip:?}"
+        );
+        // Job VMs still never queue fills of their own.
+        assert!(!runner.warm_builds_enabled(tip));
+        drop(runner);
+    }
+}
+
 #[test]
 fn job_vm_preparation_cannot_select_a_second_workspace() {
     let f = Fixture::new();
