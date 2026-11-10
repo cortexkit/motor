@@ -478,10 +478,15 @@ pub(crate) fn settle_failure(next: &mut Snapshot, job: &str, now_ms: u64) {
     let b = next.billing.entry(job.into()).or_default();
     crate::billing::settle_lost(lease, b, now_ms, now_ms);
     b.restart_pending = Some(false);
-    let start = lease
-        .started_at_ms
-        .unwrap_or(now_ms.saturating_sub(lease.claims.max_s.saturating_mul(1000)));
-    let end = start.saturating_add(lease.claims.max_s.saturating_mul(1000));
+    // A lost job is billed for the time it was observed running, up to when
+    // the host gave it up, exactly as tenant mode bills one: never for its
+    // whole requested runtime, which charged callers for our own failures
+    // (a 16-vCPU job lost after about 90 s was billed 86,400 vCPU-s). With no
+    // observed start nothing is billed.
+    let start = lease.started_at_ms.unwrap_or(now_ms);
+    let end = now_ms
+        .max(start)
+        .min(start.saturating_add(lease.claims.max_s.saturating_mul(1000)));
     b.usage = Some(Usage {
         job_id: job.into(),
         vcpus: lease.claims.vcpus,
@@ -495,6 +500,6 @@ pub(crate) fn settle_failure(next: &mut Snapshot, job: &str, now_ms: u64) {
         oom_kill: None,
     });
     b.hosted_terminal = Some(
-        json!({"type":"hosted_terminal","job_id":job,"placement":format!("first_party/{}",lease.claims.placement.host),"billed_vcpu_ms":u64::from(lease.claims.vcpus).saturating_mul(lease.claims.max_s).saturating_mul(1000),"max_runtime_s":lease.claims.max_s}),
+        json!({"type":"hosted_terminal","job_id":job,"placement":format!("first_party/{}",lease.claims.placement.host),"billed_vcpu_ms":u64::from(lease.claims.vcpus).saturating_mul(end.saturating_sub(start)),"max_runtime_s":lease.claims.max_s}),
     );
 }

@@ -652,6 +652,14 @@ impl Spool {
             bytes: 0,
         })
     }
+    /// Whether the largest frame still fits. While it doesn't, the queued
+    /// session stops reading the client, so TCP pauses the upload until the
+    /// job's VM is ready to take it. A first job in a new workspace uploads
+    /// the repository's whole history, often more than the spool, and must
+    /// wait for its VM rather than be refused.
+    fn has_room(&self) -> bool {
+        self.bytes.saturating_add(FRAME_LIMIT as u64 + 4) <= SPOOL_LIMIT
+    }
     async fn append(&mut self, frame: &Raw) -> Result<()> {
         let bytes = self.bytes.saturating_add(frame.bytes.len() as u64);
         ensure!(bytes <= SPOOL_LIMIT, "queued upload exceeds reserved spool");
@@ -1208,7 +1216,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 launch_session.0.pending.store(false, Ordering::SeqCst);
             },
             _ = tokio::time::sleep_until(expires), if !accepted => anyhow::bail!("queued lease expired"),
-            frame = reader.next(client) => {
+            frame = reader.next(client), if spool.has_room() => {
                 let frame = frame.map_err(client_io)?;
                 if spool.append(&frame).await.is_err() {
                     anyhow::bail!(SessionRefusal::SpoolExceeded);

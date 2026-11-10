@@ -1514,6 +1514,18 @@ impl Runtime {
     }
     pub fn host_admin(&self, request: &Value) -> Result<Value> {
         let op = request["op"].as_str().context("admin operation")?;
+        if op == "publish_job_images" {
+            // A per-job image rollout: new jobs boot the new generation while
+            // running ones keep theirs, so no drain or restart is needed. The
+            // image manager takes the host lock itself; do not hold it here.
+            let generation = request["generation"]
+                .as_str()
+                .filter(|_| request.as_object().is_some_and(|o| o.len() == 2))
+                .context("publish_job_images takes exactly a generation")?;
+            self.publish_job_images(generation, unix_ms())?;
+            tracing::info!(generation, "job_image_generation_published");
+            return Ok(json!({"ok":true,"published":generation}));
+        }
         ensure!(
             matches!(
                 op,

@@ -188,6 +188,32 @@ fn offline_selection_is_durable_fenced_and_cannot_replace_an_active_generation()
 }
 
 #[test]
+fn running_host_publishes_a_new_generation_through_the_admin_socket() {
+    let (runtime, fake, _storage) = managed();
+    runtime
+        .select_initial_job_images("gen-1", unix_ms())
+        .unwrap();
+    // Only exactly {op, generation} is accepted; nothing else rides along.
+    for bad in [
+        json!({"op":"publish_job_images"}),
+        json!({"op":"publish_job_images","generation":"gen-2","extra":1}),
+    ] {
+        assert!(runtime.host_admin(&bad).is_err(), "{bad}");
+    }
+    let reply = runtime
+        .host_admin(&json!({"op":"publish_job_images","generation":"gen-2"}))
+        .unwrap();
+    assert_eq!(reply, json!({"ok":true,"published":"gen-2"}));
+    assert!(fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call == "publish:gen-2"));
+    assert!(runtime.host.lock().unwrap().snapshot.per_job.images["gen-2"].current);
+}
+
+#[test]
 fn switching_back_into_per_job_replaces_an_idle_generation_but_never_a_held_one() {
     let (runtime, fake, storage) = managed();
     runtime

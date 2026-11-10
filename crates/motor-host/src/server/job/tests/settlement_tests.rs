@@ -187,11 +187,10 @@ fn receipt_is_the_only_oom_evidence_and_never_corrects_an_earlier_usage() {
             }
         );
         assert_eq!(usage.oom_kill, (count > 0).then_some(OomKill::HostOom));
-        if count > 0 {
-            assert_eq!(usage.ended_at_ms, 500);
-        } else {
-            assert_eq!(usage.ended_at_ms - usage.started_at_ms, 30_000);
-        }
+        // Lost or killed, a job is billed up to when the host settled it, never
+        // for its whole requested runtime.
+        assert_eq!(usage.ended_at_ms, 500);
+        assert!(usage.ended_at_ms - usage.started_at_ms < 30_000);
         assert_eq!(
             host.snapshot.per_job.executions[JOB]
                 .evidence
@@ -233,7 +232,13 @@ fn delivery_is_the_no_start_boundary_for_exit_and_pressure() {
         let usage = host.snapshot.billing[JOB].usage.as_ref().unwrap();
         if delivered {
             assert_eq!(usage.outcome, UsageOutcome::Lost);
-            assert_eq!(usage.ended_at_ms - usage.started_at_ms, 30_000);
+            // Billed for observed running time only, up to settlement at 400.
+            if started {
+                assert_eq!(usage.ended_at_ms, 400);
+                assert!(usage.started_at_ms < 400);
+            } else {
+                assert_eq!(usage.ended_at_ms, usage.started_at_ms);
+            }
             let frames = host.host_settled_frames(JOB, 0).unwrap();
             assert_eq!(frames[1]["outcome"]["type"], "outcome_unknown");
             assert_eq!(frames[1]["ran"], "remote");

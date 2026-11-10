@@ -859,7 +859,8 @@ fn timeout_after_delivery_keeps_delivery_and_lost_usage_and_releases_once() {
     );
     let usage = billing.usage.as_ref().unwrap();
     assert_eq!(usage.outcome, motor_lease::UsageOutcome::Lost);
-    assert_eq!(usage.ended_at_ms - usage.started_at_ms, 30_000);
+    // Never observed running: nothing is billed, as in tenant mode.
+    assert_eq!(usage.ended_at_ms, usage.started_at_ms);
     drop(host);
     assert_eq!(
         fake.calls.lock().unwrap().as_slice(),
@@ -923,6 +924,12 @@ async fn spool_is_bounded_and_drop_cleans_it() {
         .await
         .is_err());
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    // The queued session pauses the client before a largest frame could
+    // overflow, so a full-history upload waits instead of being refused.
+    spool.bytes = SPOOL_LIMIT - FRAME_LIMIT as u64 - 4;
+    assert!(spool.has_room());
+    spool.bytes += 1;
+    assert!(!spool.has_room());
     drop(spool);
     assert!(!path.exists());
 }
@@ -1237,8 +1244,10 @@ async fn fragmented_prelude_frame_survives_a_heartbeat_turn() {
     assert_eq!(frame.value, value);
 }
 
+/// A queued upload larger than the spool is paused, not refused: a first job
+/// in a new workspace sends the whole history while its VM can't boot yet.
 #[tokio::test]
-async fn queued_upload_over_cap_refuses_before_run_and_deletes_reserved_spool() {
+async fn queued_upload_over_cap_pauses_within_the_spool_and_disconnect_deletes_it() {
     let (runtime, fake, storage) = fixture();
     let c = claims(JOB);
     let id = claim(&runtime, &c);
@@ -1258,16 +1267,23 @@ async fn queued_upload_over_cap_refuses_before_run_and_deletes_reserved_spool() 
     let (mut client, task) = start(runtime.clone(), c, id).await;
     queued(&mut client, JOB).await;
     let chunk = json!({"type":"bundle_chunk","index":0,"offset":0,"data":"a".repeat(700_000)});
-    for _ in 0..100 {
-        if write_frame(&mut client, &chunk).await.is_err() {
-            break;
+    // 100 chunks (70 MB) exceed the 64 MiB spool. The host stops reading, so
+    // the writes stall rather than fail.
+    let written = tokio::time::timeout(Duration::from_secs(3), async {
+        for _ in 0..100 {
+            write_frame(&mut client, &chunk).await.unwrap();
         }
-    }
-    let terminal = next_type(&mut client, "terminal").await;
-    assert_eq!(terminal["ran"], "none");
-    assert_eq!(terminal["outcome"]["reason"], "transfer_interrupted");
-    let _: motor_protocol::Frame = serde_json::from_value(terminal).unwrap();
-    task.await.unwrap().unwrap();
+    })
+    .await;
+    assert!(written.is_err(), "an over-cap upload must pause");
+    let spooled = std::fs::metadata(storage.spool(JOB)).unwrap().len();
+    assert!(spooled > SPOOL_LIMIT - 2 * FRAME_LIMIT as u64, "{spooled}");
+    assert!(spooled <= SPOOL_LIMIT, "{spooled}");
+    // The paused session stays alive and keeps the caller informed.
+    next_type(&mut client, "heartbeat").await;
+    assert!(!task.is_finished());
+    drop(client);
+    let _ = task.await.unwrap();
     assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
     assert!(fake.calls.lock().unwrap().is_empty());
     assert!(!storage.spool(JOB).exists());
