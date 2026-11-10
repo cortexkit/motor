@@ -138,10 +138,10 @@ impl Host {
             .executions
             .get_mut(job)
             .ok_or(Error::Refused(Refusal::Auth))?;
-        e.evidence
-            .get_or_insert_with(Default::default)
-            .unclean_stop
-            .get_or_insert(unclean);
+        // A clean intent, recorded when the guest is told to end its own VM,
+        // never masks a later forced stop: unclean only ever wins.
+        let stop = &mut e.evidence.get_or_insert_with(Default::default).unclean_stop;
+        *stop = Some(stop.unwrap_or(false) || unclean);
         if unclean {
             super::jobs::have::invalidate(&mut next, job);
             super::jobs::recovery::quarantine(&mut next, job);

@@ -115,6 +115,10 @@ impl Runtime {
                     .expect("host lock")
                     .job_stop_intent(job, unclean)?;
                 self.control.stop_job(job)?;
+                self.helper_stopped_jobs
+                    .lock()
+                    .expect("helper stopped jobs")
+                    .insert(job.to_owned());
                 self.collect_job_exits(unix_ms())?;
                 // A successful stop call alone is not the durable exit receipt.
                 // Retain reservations until receipt/ack, or the evidence bound.
@@ -124,6 +128,14 @@ impl Runtime {
             host.job_stopped_at(job, unclean, unix_ms())?;
         }
         self.job_resources.release(job)
+    }
+
+    /// Forgets that this process stopped a job's VM, once the job has ended.
+    fn forget_helper_stop(&self, job: &str) {
+        self.helper_stopped_jobs
+            .lock()
+            .expect("helper stopped jobs")
+            .remove(job);
     }
 
     pub(super) fn recover_jobs(self: &Arc<Self>) -> Result<()> {
@@ -431,6 +443,7 @@ impl Runtime {
         // Retry a manager failure after the VM's stopped record was committed.
         // Release is durable and idempotent, including across host restarts.
         for job in ended {
+            self.forget_helper_stop(&job);
             tick_step(&mut failure, "release", self.job_resources.release(&job));
             let expire = {
                 let host = self.host.lock().expect("host lock");
@@ -577,6 +590,28 @@ impl Runtime {
                 .lock()
                 .expect("host lock")
                 .job_exit_acknowledged(report)?;
+        }
+        // A VM that ended by itself still holds its jail and workspace disk in
+        // the helper until a stop releases them; without it the disk stays
+        // "awaiting cleanup" and its next job or recovery is refused. A VM
+        // this host stopped already went through the helper's stop, and an
+        // ended job (a repeated report) was released the first time.
+        let ended = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions[&report.job_id]
+            .ended;
+        if !ended
+            && !self
+                .helper_stopped_jobs
+                .lock()
+                .expect("helper stopped jobs")
+                .contains(&report.job_id)
+        {
+            self.control.stop_job(&report.job_id)?;
         }
         {
             let mut host = self.host.lock().expect("host lock");

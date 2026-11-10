@@ -461,6 +461,18 @@ async fn collect(
                         tracing::warn!(%error, "fill_export_release_failed");
                     }
                 }
+                if !timed_out {
+                    // Once acknowledged, the guest drains its reports, unmounts
+                    // its disks and ends its own VM: a clean stop, so the disk
+                    // is reused without a recovery check. Record that before the
+                    // guest can exit. A forced stop later (no acknowledgement,
+                    // or a guest that never ends) upgrades it to unclean.
+                    runtime
+                        .host
+                        .lock()
+                        .expect("host lock")
+                        .job_stop_intent(&claims.jti, false)?;
+                }
                 let acknowledged = if timed_out {
                     false
                 } else {

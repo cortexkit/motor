@@ -163,6 +163,57 @@ fn concurrent_terminal_pressure_and_exit_commit_one_winner() {
     assert_eq!(body(&runtime, JOB), original);
 }
 
+/// The normal end of a job: the host acknowledges the stored terminal, the
+/// guest ends its own VM, and the helper reports the exit. The disk must come
+/// back clean (no recovery VM) and the helper must release it exactly once.
+#[test]
+fn guest_ended_vm_after_terminal_stored_releases_its_disk_clean() {
+    let (runtime, fake, _) = fixture();
+    running(&runtime, JOB, true, true);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .job_stop_intent(JOB, false)
+        .unwrap();
+    fake.gone.lock().unwrap().insert(JOB.into());
+    fake.exits.lock().unwrap().push(exit(JOB, 0));
+    runtime.tick_jobs(500).unwrap();
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| *c == &format!("stop:{JOB}"))
+            .count(),
+        1,
+        "{calls:?}"
+    );
+    let host = runtime.host.lock().unwrap();
+    let execution = &host.snapshot.per_job.executions[JOB];
+    assert!(execution.ended);
+    let disk = &host.snapshot.per_job.disks[&execution.disk_id];
+    assert!(
+        !disk.quarantined,
+        "a clean guest exit must not need recovery"
+    );
+    assert!(disk.recovery.is_none());
+}
+
+#[test]
+fn a_forced_stop_after_a_clean_intent_still_quarantines() {
+    let (runtime, _, _) = fixture();
+    running(&runtime, JOB, true, true);
+    let mut host = runtime.host.lock().unwrap();
+    host.job_stop_intent(JOB, false).unwrap();
+    host.job_stop_intent(JOB, true).unwrap();
+    let execution = &host.snapshot.per_job.executions[JOB];
+    assert_eq!(
+        execution.evidence.as_ref().unwrap().unclean_stop,
+        Some(true)
+    );
+    assert!(host.snapshot.per_job.disks[&execution.disk_id].quarantined);
+}
+
 #[test]
 fn receipt_is_the_only_oom_evidence_and_never_corrects_an_earlier_usage() {
     for count in [0, 4] {

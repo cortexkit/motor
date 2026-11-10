@@ -184,6 +184,10 @@ pub struct Runtime {
     image_generations: Option<Arc<crate::jobs::images::Images>>,
     job_resources: Arc<dyn crate::jobs::Resources>,
     job_stops: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// Job VMs this host process already stopped through the helper, so exit
+    /// collection releases only VMs that ended by themselves. Lost on restart,
+    /// which costs one more (idempotent) helper stop.
+    helper_stopped_jobs: Mutex<std::collections::BTreeSet<String>>,
     job_exits: Mutex<Option<u64>>,
     job_launches: Mutex<BTreeMap<String, Arc<job::Launch>>>,
     job_recoveries: Mutex<BTreeMap<String, job::recovery::Worker>>,
@@ -453,6 +457,7 @@ impl Runtime {
             job_resources: Arc::new(crate::jobs::Unavailable),
             image_generations: None,
             job_stops: Mutex::new(BTreeMap::new()),
+            helper_stopped_jobs: Mutex::new(Default::default()),
             job_exits: Mutex::new(None),
             job_launches: Mutex::new(BTreeMap::new()),
             job_recoveries: Mutex::new(BTreeMap::new()),
