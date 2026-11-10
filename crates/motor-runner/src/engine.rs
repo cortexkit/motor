@@ -10147,6 +10147,7 @@ impl Runner {
                         &self.core.backend.unit_name(&self.core.config, unit),
                         job.memory_stated_mib,
                         job.mem_over_mib_ms.clone(),
+                        crate::working_memory::file_cache_reclaim_enabled(&self.core.config),
                         move |peak, over| {
                             if let Some(log) = events.as_ref().and_then(|events| events.upgrade()) {
                                 log.sample(

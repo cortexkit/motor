@@ -158,6 +158,7 @@ impl WorkingPeak {
         unit: &str,
         stated_mib: Option<u64>,
         over: Option<OverIntegral>,
+        reclaim_file_cache: bool,
         publish: impl Fn(Option<u64>, Option<Option<u64>>) + Send + 'static,
     ) {
         if self.0.started.swap(true, Ordering::Relaxed) {
@@ -170,6 +171,7 @@ impl WorkingPeak {
             .join("memory.stat");
         let weak = Arc::downgrade(&self.0);
         let started = std::time::Instant::now();
+        let mut cache = reclaim_file_cache.then(FileCacheReclaimer::default);
         let _ = thread::Builder::new()
             .name("job-working-memory".into())
             .spawn(move || loop {
@@ -192,6 +194,16 @@ impl WorkingPeak {
                 publish(peak.get(), over.as_ref().map(OverIntegral::get));
                 if stopped {
                     return;
+                }
+                if let Some(cache) = &mut cache {
+                    if let Err(error) = cache.sample(Path::new("/sys/fs/cgroup")) {
+                        // One runner serves the boot's one job. Keep retries
+                        // best-effort without flooding the guest's log.
+                        static LOGGED: AtomicBool = AtomicBool::new(false);
+                        if !LOGGED.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(%error, "guest file-cache reclaim failed; job continues");
+                        }
+                    }
                 }
                 drop(peak);
                 thread::park_timeout(std::time::Duration::from_secs(1));
@@ -237,9 +249,188 @@ fn working_bytes(text: &str) -> Option<u64> {
         .checked_add(kernel)
 }
 
+#[cfg(any(target_os = "linux", test))]
+const FILE_CACHE_BOUND: u64 = 1 << 30;
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn file_cache_reclaim_enabled(config: &crate::Config) -> bool {
+    cfg!(target_os = "linux")
+        && config.per_job
+        && !config.boat_profile
+        && config.backend == crate::BackendKind::Host
+}
+
+#[derive(Default)]
+#[cfg(any(target_os = "linux", test))]
+struct FileCacheReclaimer {
+    ticks: u8,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl FileCacheReclaimer {
+    fn sample(&mut self, root: &Path) -> std::io::Result<()> {
+        self.ticks += 1;
+        if self.ticks < 2 {
+            return Ok(());
+        }
+        self.ticks = 0;
+        let Some(bytes) = std::fs::read_to_string(root.join("memory.stat"))
+            .ok()
+            .and_then(|text| file_cache_reclaim_bytes(&text))
+            .filter(|bytes| *bytes > 0)
+        else {
+            return Ok(());
+        };
+        // The pinned guest kernel supports swappiness=0. Never fall back to
+        // anonymous reclaim, even if a swap device appears in a guest.
+        std::fs::write(root.join("memory.reclaim"), format!("{bytes} swappiness=0"))
+    }
+}
+
+/// The file counter includes tmpfs/shmem, which must not be treated as disposable
+/// disk cache. Reject incomplete or malformed snapshots instead of guessing.
+#[cfg(any(target_os = "linux", test))]
+fn file_cache_reclaim_bytes(text: &str) -> Option<u64> {
+    let mut file = None;
+    let mut shmem = None;
+    let mut keys = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let key = fields.next()?;
+        let value = fields.next()?.parse::<u64>().ok()?;
+        if fields.next().is_some() || !keys.insert(key) {
+            return None;
+        }
+        match key {
+            "file" => file = Some(value),
+            "shmem" => shmem = Some(value),
+            _ => {}
+        }
+    }
+    Some(file?.checked_sub(shmem?)?.saturating_sub(FILE_CACHE_BOUND))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_cache_reclaim_is_only_for_per_job_linux_guests() {
+        let mut config = crate::Config::new(cortexkit_test_support::scratch_root(), "cache-mode");
+        config.tenant_vm = true;
+        assert!(!file_cache_reclaim_enabled(&config), "shared tenant VM");
+        config.per_job = true;
+        assert_eq!(
+            file_cache_reclaim_enabled(&config),
+            cfg!(target_os = "linux")
+        );
+        config.boat_profile = true;
+        assert!(!file_cache_reclaim_enabled(&config), "Boat sandbox");
+        config.boat_profile = false;
+        for backend in [
+            crate::BackendKind::Vm,
+            crate::BackendKind::WindowsVm,
+            crate::BackendKind::MacosVm,
+        ] {
+            config.backend = backend;
+            assert!(!file_cache_reclaim_enabled(&config), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn file_cache_reclaim_samples_root_every_two_ticks_and_never_requests_swap() {
+        let root = cortexkit_test_support::scratch_root().join(format!(
+            "file-cache-reclaim-{}",
+            motor_protocol::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cache = FileCacheReclaimer::default();
+        std::fs::write(
+            root.join("memory.stat"),
+            "file 3221225472\nshmem 1073741824\n",
+        )
+        .unwrap();
+        cache.sample(&root).unwrap();
+        assert!(!root.join("memory.reclaim").exists());
+        cache.sample(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory.reclaim")).unwrap(),
+            "1073741824 swappiness=0"
+        );
+        for text in ["file broken\nshmem 0\n", "file 1073741824\nshmem 0\n"] {
+            std::fs::write(root.join("memory.stat"), text).unwrap();
+            std::fs::write(root.join("memory.reclaim"), "untouched").unwrap();
+            cache.sample(&root).unwrap();
+            cache.sample(&root).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("memory.reclaim")).unwrap(),
+                "untouched"
+            );
+        }
+        std::fs::write(root.join("memory.stat"), "file 2147483648\nshmem 0\n").unwrap();
+        std::fs::remove_file(root.join("memory.reclaim")).unwrap();
+        std::fs::create_dir(root.join("memory.reclaim")).unwrap();
+        cache.sample(&root).unwrap();
+        assert!(cache.sample(&root).is_err());
+        std::fs::remove_dir(root.join("memory.reclaim")).unwrap();
+        cache.sample(&root).unwrap();
+        cache.sample(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory.reclaim")).unwrap(),
+            "1073741824 swappiness=0"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_cache_reclaim_obeys_bound_and_excludes_shmem() {
+        for cache in [0, FILE_CACHE_BOUND - 1, FILE_CACHE_BOUND] {
+            assert_eq!(
+                file_cache_reclaim_bytes(&format!("file {cache}\nshmem 0\n")),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            file_cache_reclaim_bytes(&format!("file {}\nshmem 0\n", FILE_CACHE_BOUND + 1)),
+            Some(1)
+        );
+        assert_eq!(
+            file_cache_reclaim_bytes(&format!(
+                "anon 9999999999\nfile {}\nshmem {}\nfile_dirty 4096\n",
+                3 * FILE_CACHE_BOUND,
+                FILE_CACHE_BOUND
+            )),
+            Some(FILE_CACHE_BOUND)
+        );
+        assert_eq!(
+            file_cache_reclaim_bytes(&format!(
+                "file {}\nshmem {}\n",
+                3 * FILE_CACHE_BOUND,
+                3 * FILE_CACHE_BOUND
+            )),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn file_cache_reclaim_rejects_malformed_or_incomplete_stats() {
+        for text in [
+            "",
+            "file 9999999999\n",
+            "shmem 0\n",
+            "file broken\nshmem 0\n",
+            "file -1\nshmem 0\n",
+            "file 18446744073709551616\nshmem 0\n",
+            "file 9999999999 extra\nshmem 0\n",
+            "file 9999999999\nshmem 0\nfile 9999999999\n",
+            "file 9999999999\nshmem 0\nshmem 0\n",
+            "file 9999999999\nshmem 0\nanon broken\n",
+            "file 1\nshmem 2\n",
+            "file 9999999999\n\nshmem 0\n",
+        ] {
+            assert_eq!(file_cache_reclaim_bytes(text), None, "{text:?}");
+        }
+    }
 
     #[test]
     fn overage_integrates_only_working_bytes_above_stated_without_interval_rounding() {

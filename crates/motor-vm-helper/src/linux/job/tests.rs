@@ -389,7 +389,7 @@ fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
         .collect();
     assert_eq!(
         requests[1].1["boot_args"],
-        format!("{tenant_args} motor.per_job=1 motor.runner_args={encoded}")
+        format!("{tenant_args} motor.per_job=1 page_reporting.page_reporting_order=5 motor.runner_args={encoded}")
     );
 }
 
@@ -1090,6 +1090,9 @@ fn fill_boot_authority_comes_from_the_root_disk_role_not_the_requested_start_kin
         .split_whitespace()
         .any(|word| word == "motor.fill=1"));
     authorize_fill_boot(&mut requested, job::WorkspaceRole::Fill).unwrap();
+    assert!(boot(&requested)
+        .split_whitespace()
+        .any(|word| word == "page_reporting.page_reporting_order=5"));
     assert!(boot(&requested)
         .split_whitespace()
         .any(|word| word == "motor.fill=1"));
