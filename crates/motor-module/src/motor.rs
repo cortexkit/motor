@@ -3107,9 +3107,12 @@ impl Motor {
                         {
                             return self.hosted_history_expired(id, tx).await.map(|_| false);
                         }
-                        return emit(tx, StreamRecord::Terminal(terminal))
-                            .await
-                            .map(|_| false);
+                        return emit(
+                            tx,
+                            StreamRecord::Terminal(state.received_terminal(terminal)),
+                        )
+                        .await
+                        .map(|_| false);
                     }
                     if terminal.ran == Some(Ran::None)
                         && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }

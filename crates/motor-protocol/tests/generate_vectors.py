@@ -198,6 +198,7 @@ def main():
         "withdraw_reply-started": {"type": "withdraw_reply", "outcome": "started"},
         "attach": {"type": "attach", "job_id": JOB, "from_seq": 7},
         "terminal": terminal({"type": "exit", "code": 0}),
+        "terminal-last-seq": terminal({"type": "exit", "code": 0}, last_seq=7),
         "prepare": PREPARE,
         "prepare-workspace-kind-head": {**PREPARE, "workspace_key": REPO,
                                         "workspace_kind": "head"},

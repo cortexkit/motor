@@ -18,6 +18,7 @@ async fn return_paths_result_is_sequenced_before_real_terminal_and_durable_on_at
         panic!("missing result: {frames:?}")
     };
     assert_eq!(result.seq, 2);
+    assert_eq!(t.last_seq(), Some(2));
     assert_eq!(result.return_paths_failed, None);
     let file = &result.returned_files.as_ref().unwrap()[0];
     assert_eq!(

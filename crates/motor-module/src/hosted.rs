@@ -148,6 +148,24 @@ fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 impl HostedJobState {
+    /// Only received runner terminals can use the replay cursor as evidence.
+    /// Locally synthesized summaries do not prove what the runner emitted.
+    pub(crate) fn received_terminal(&self, terminal: TerminalRecord) -> TerminalRecord {
+        if terminal.last_seq().is_none()
+            && terminal.ran != Some(motor_protocol::Ran::None)
+            && !matches!(
+                terminal.outcome,
+                motor_protocol::Outcome::RefusedBeforeStart { .. }
+                    | motor_protocol::Outcome::HistoryExpired
+            )
+        {
+            if let Some(last_seq) = self.replay_end_seq.and_then(|end| end.checked_sub(1)) {
+                return terminal.with_last_seq(last_seq);
+            }
+        }
+        terminal
+    }
+
     pub(crate) fn needs_output_replay(&self, cursor: u64) -> bool {
         cursor != u64::MAX
             && !(self.terminal.is_some() && !self.has_real_terminal())

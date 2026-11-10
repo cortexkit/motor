@@ -377,6 +377,7 @@ async fn collect(
                 s.with_store(|s| {
                     let delivery = if frame.value["type"] == "terminal" {
                         r.observe_job_frame(&job, &frame.value)?
+                            .map(|terminal| host_terminal_delivery(terminal, s.last_seq()))
                             .filter(|terminal| *terminal != frame.value)
                             .map(|terminal| -> Result<Vec<u8>> {
                                 let data = serde_json::to_vec(&terminal)?;
@@ -497,6 +498,42 @@ async fn collect(
     tokio::select! { result = upload => result, result = receive => result, _ = crashed => Ok(()) }
 }
 
+// Host-stop evidence can be committed before the collector drains its final
+// output. Freeze the delivered watermark only when committing the terminal to
+// replay, using the host's own cursor rather than the guest's terminal claims.
+fn host_terminal_delivery(mut terminal: Value, last_seq: Option<u64>) -> Value {
+    if matches!(
+        terminal["oom_kill"]["cause"].as_str(),
+        Some("host_pressure" | "host_oom")
+    ) {
+        let fields = terminal.as_object_mut().expect("terminal object");
+        if let Some(seq) = last_seq {
+            fields.insert("last_seq".into(), seq.into());
+        } else {
+            fields.remove("last_seq");
+        }
+    }
+    terminal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_terminal_watermark_distinguishes_unknown_from_sequence_zero() {
+        for cause in ["host_pressure", "host_oom"] {
+            let terminal = json!({"type":"terminal","oom_kill":{"cause":cause},"last_seq":123});
+            assert!(host_terminal_delivery(terminal.clone(), None)
+                .get("last_seq")
+                .is_none());
+            assert_eq!(host_terminal_delivery(terminal, Some(0))["last_seq"], 0);
+        }
+        let terminal = json!({"type":"terminal","last_seq":123});
+        assert_eq!(host_terminal_delivery(terminal.clone(), Some(5)), terminal);
+    }
+}
+
 pub(super) fn publish_settlement(runtime: &Runtime, job: &str, stream: &Stream) -> Result<()> {
     stream.with_store(|store| {
         if store.ended() {
@@ -512,6 +549,7 @@ pub(super) fn publish_settlement(runtime: &Runtime, job: &str, stream: &Stream) 
                 if frame["type"] == "hosted_terminal" {
                     continue;
                 }
+                let frame = host_terminal_delivery(frame, store.last_seq());
                 let data = serde_json::to_vec(&frame)?;
                 let bytes = [(data.len() as u32).to_be_bytes().as_slice(), &data].concat();
                 store.append(&bytes)?;

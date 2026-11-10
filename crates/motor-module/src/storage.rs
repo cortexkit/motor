@@ -1072,6 +1072,7 @@ impl Storage {
             if let Some(end) = replay_end_seq {
                 hosted.replay_end_seq = Some(end);
             }
+            let terminal = hosted.received_terminal(terminal.clone());
             if !hosted.has_real_terminal() {
                 hosted.terminal = Some(terminal.clone());
                 hosted.observed_unknown_terminal =

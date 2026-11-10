@@ -702,7 +702,9 @@ fn macos_returns_replay_restart_and_expire_after_staging_deletion() {
             assert_eq!(files, vec![Some(b"x".to_vec())]);
             assert_eq!(seqs, vec![1]);
             assert_eq!(manifest.seq, 2);
+            assert!(matches!(frames.last(), Some(Frame::Terminal(t)) if t.last_seq() == Some(2)));
         } else {
+            assert!(matches!(frames.last(), Some(Frame::Terminal(t)) if t.last_seq() == Some(1)));
             assert!(
                 matches!(&frames[1], Frame::ReturnResult(result) if result.seq == 1 && result.returned_files.as_ref().unwrap()[0].data == "eA==")
             );

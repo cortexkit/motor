@@ -1398,6 +1398,7 @@ async fn windows_backend_slow_output_storage_preserves_exit_and_ordered_streams(
         assert!(!page.is_empty());
     }
     let expected: Vec<u8> = (0..96).flat_map(|sequence| [sequence; 256]).collect();
+    assert_eq!(result.last_seq(), Some(cursor - 1));
     assert_eq!(streams[0], expected);
     assert_eq!(
         streams[1],
