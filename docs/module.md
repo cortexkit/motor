@@ -91,6 +91,13 @@ the current phase has lasted two seconds and are at least ten seconds apart.
 They keep carrying the job ID. Callers that do not opt in receive no progress,
 and attach does not replay progress records.
 
+For broker-leased jobs, `Accepted` may include display-only `placement` with a
+`provider` and optional `host`. Registered hosts use provider `first_party` and
+include the host name; overflow sandboxes use provider `overflow` and omit the
+host. Placement is never a routing or retry input and is preserved when
+`Accepted` is re-sent for a keyed submission. If the grant has no provider,
+`placement` is omitted.
+
 `exec.cancel {job_id}` can stop a job that is still waiting for placement. When
 no Run was sent to a runner, the job ends `cancelled` with `ran: none`. An
 in-flight lease request is allowed to reply so any booked lease can be released

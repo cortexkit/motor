@@ -564,13 +564,34 @@ async fn keyed_hosted_route_reattaches_without_second_run() {
         .await
         .unwrap();
     let id = stream.job_id;
-    records(stream).await;
+    let first = records(stream).await;
+    let expected = serde_json::json!({ "provider": "overflow" });
+    let first_accepted = first
+        .iter()
+        .find_map(|record| match record {
+            StreamRecord::Accepted(accepted) => Some(accepted),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(first_accepted).unwrap()["placement"],
+        expected
+    );
     assert!(motor.hosted_state(id).unwrap().run_sent);
     motor.close().await;
     let motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
-    attached(
-        &records(motor.submit_agent(request, None, PRINCIPAL).await.unwrap()).await,
-        id,
+    let replay = records(motor.submit_agent(request, None, PRINCIPAL).await.unwrap()).await;
+    attached(&replay, id);
+    let replay_accepted = replay
+        .iter()
+        .find_map(|record| match record {
+            StreamRecord::Accepted(accepted) => Some(accepted),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(replay_accepted).unwrap()["placement"],
+        expected
     );
     assert_eq!(boat.runs.load(Ordering::SeqCst), 1);
 }

@@ -1324,6 +1324,7 @@ impl Motor {
             };
         // Measures how long a spilled job spent on its hosted route.
         let spill_started = tokio::time::Instant::now();
+        let mut caller_placement = None;
         let (mut channel, held) = loop {
             let opened = if let Some(state) = self.hosted_state(id) {
                 let client = self
@@ -1338,6 +1339,7 @@ impl Motor {
                         return Err(io::Error::other("hosted booking stopped during shutdown"));
                     }
                     Ok((channel, lease)) => {
+                        caller_placement = lease.caller_placement();
                         request.timeout = Some(lease.max_s);
                         request.weight_hint = Some(request.weight_hint.unwrap_or(2));
                         Ok(channel)
@@ -1748,6 +1750,9 @@ impl Motor {
         match admission {
             Ok(Incoming::Frame(Frame::Accepted(mut accepted))) => {
                 accepted.attached = false;
+                if let Some(placement) = caller_placement {
+                    accepted = accepted.with_placement(placement);
+                }
                 let mut caller_accepted = accepted
                     .clone()
                     .with_env_not_forwarded(env_not_forwarded.clone());

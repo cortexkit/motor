@@ -269,6 +269,7 @@ pub(crate) mod harness;
 mod replacement;
 mod settled_reattach;
 use harness::*;
+use motor_lease::Placement;
 use motor_protocol::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
