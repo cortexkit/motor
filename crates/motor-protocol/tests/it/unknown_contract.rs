@@ -109,9 +109,9 @@ fn sha256sums_covers_every_corpus_file() {
         }
     }
     assert_eq!(listed, actual, "missing or unchecked corpus checksums");
-    // Each of 141 cases has .json, .jcs and .sha256 files. Eleven published
+    // Each of 142 cases has .json, .jcs and .sha256 files. Eleven published
     // cases have only .jcs/.sha256 pairs; README.md adds one file.
-    assert_eq!(listed.len(), 446);
+    assert_eq!(listed.len(), 449);
 }
 
 #[test]
