@@ -240,7 +240,7 @@ pub(super) fn inspect(uplink: &str) -> Result<State> {
 
 fn arguments(n: u8, delete: bool, uplink: &str) -> Vec<String> {
     let mut values: Vec<String> = if delete {
-        vec!["--force", "delete", "route", "allow"]
+        vec!["--force", "route", "delete", "allow"]
     } else {
         vec!["route", "allow"]
     }
@@ -448,8 +448,30 @@ mod tests {
         );
         assert_eq!(
             &arguments(1, true, "enp6s0")[..4],
-            ["--force", "delete", "route", "allow"]
+            ["--force", "route", "delete", "allow"]
         );
+    }
+
+    #[test]
+    fn generated_route_commands_parse_with_ufws_own_grammar() {
+        // Use the distribution's parser without constructing its firewall
+        // backend: dry-run still requires root on some UFW versions.
+        for delete in [false, true] {
+            let output = std::process::Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import sys, gettext; gettext.install('ufw'); from ufw.frontend import parse_command; p = parse_command(['ufw'] + sys.argv[2:]); r = p.data['rule']; assert p.action == 'allow' and p.data['type'] == 'route'; assert r.forward and r.remove == (sys.argv[1] == 'true'); assert (r.interface_in, r.interface_out) == ('mtap1', 'enp6s0'); assert r.get_comment() == 'motor-tenant-mtap1'",
+                    if delete { "true" } else { "false" },
+                ])
+                .args(arguments(1, delete, "enp6s0"))
+                .output()
+                .expect("system Python and the distribution ufw package are required");
+            assert!(
+                output.status.success(),
+                "UFW rejected generated route (delete={delete}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
