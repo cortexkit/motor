@@ -347,12 +347,14 @@ impl LinuxJobs {
         let mut failed = Vec::new();
         for (id, child) in &mut self.children {
             match child.try_wait() {
-                Ok(Some(status)) => ended.push((id.clone(), status.success())),
+                Ok(Some(status)) => ended.push((id.clone(), status.success(), status)),
                 Ok(None) => (),
                 Err(error) => failed.push((id.clone(), error)),
             }
         }
-        for (id, success) in ended {
+        for (id, success, status) in ended {
+            eprintln!("job {id} VMM exited: {status}");
+            log_console_tail(&id, &self.boundary(&id));
             let mut record = self.records[&id].clone();
             if record.start.kind == job::VmKind::Fill {
                 record.fill_exit_success = Some(success);
@@ -1006,7 +1008,18 @@ impl LinuxJobs {
             let procs = OpenOptions::new()
                 .write(true)
                 .open(group.join("cgroup.procs"))?;
+            // The guest's serial console (kernel and systemd messages) is the
+            // only record of why a VM halted or died. Keep it in the root-only
+            // boundary, outside the jail, until the VM ends; its tail then goes
+            // to the helper journal before the boundary is removed.
+            let console = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_APPEND)
+                .open(boundary.join(CONSOLE_LOG))?;
             let mut command = jailer_command(binaries, &boundary, &netns, id, uid);
+            command.stdout(console);
             // v1.17.0 keeps inherited membership with its default cgroup-version
             // 1 and no --cgroup arguments (jailer/src/env.rs:213-270, 658-661).
             // Do not add --cgroup-version 2: its no-argument branch can move the
@@ -1065,7 +1078,9 @@ impl LinuxJobs {
         if group.try_exists()? {
             std::fs::write(group.join("cgroup.kill"), "1")?;
             if let Some(mut child) = self.children.remove(id) {
-                child.wait()?;
+                let status = child.wait()?;
+                eprintln!("job {id} VMM stopped by the helper: {status}");
+                log_console_tail(id, &self.boundary(id));
             }
             tenant::wait_empty(&group)?;
         }
@@ -1083,6 +1098,49 @@ impl LinuxJobs {
         self.save(&record)?;
         self.records.insert(id.into(), record);
         Ok(())
+    }
+}
+
+const CONSOLE_LOG: &str = "console.log";
+/// The console's last bytes are what explain a halt or crash; a guest can write
+/// as much as it likes, so only this much is ever read back.
+const CONSOLE_TAIL_BYTES: u64 = 16 * 1024;
+
+/// Copies the tail of a job VM's serial console to the helper journal, one
+/// line per entry with control characters replaced, so guest-written bytes
+/// cannot forge journal fields or terminal sequences.
+fn log_console_tail(id: &str, boundary: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(boundary.join(CONSOLE_LOG))
+    else {
+        return;
+    };
+    let length = file.metadata().map_or(0, |meta| meta.len());
+    let start = length.saturating_sub(CONSOLE_TAIL_BYTES);
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err()
+        || file
+            .take(CONSOLE_TAIL_BYTES)
+            .read_to_end(&mut tail)
+            .is_err()
+    {
+        return;
+    }
+    for line in String::from_utf8_lossy(&tail)
+        .lines()
+        .skip(usize::from(start > 0))
+    {
+        let line: String = line
+            .chars()
+            .take(300)
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
+        if !line.trim().is_empty() {
+            eprintln!("job {id} console: {line}");
+        }
     }
 }
 
