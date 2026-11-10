@@ -581,8 +581,9 @@ impl Motor {
                 .storage
                 .job(id)
                 .filter(|job| job.hosted_complete())
-                // Health retirement already reports that the result never
-                // arrived. Its local unknown summary cannot hide a clean success.
+                // Health retirement and synthesized cancellation summaries
+                // already report that the result never arrived. These unknown
+                // outcomes cannot hide a clean success or require a new owner.
                 .filter(|job| {
                     job.health_retired()
                         || job
@@ -2412,7 +2413,7 @@ impl Motor {
         &self,
         id: Uuid,
         mut terminal: TerminalRecord,
-        final_seq: Option<u64>,
+        replay_end_seq: Option<u64>,
     ) -> io::Result<TerminalRecord> {
         terminal.job_id = id;
         if !matches!(
@@ -2425,7 +2426,7 @@ impl Motor {
         }
         terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
         self.storage
-            .hosted_terminal_with_sequence(id, terminal, final_seq)?;
+            .hosted_terminal_with_sequence(id, terminal, replay_end_seq)?;
         let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
         if let Some(owner) = owner {
             self.start_boat_terminal_drain(id, &owner);
@@ -2502,6 +2503,32 @@ impl Motor {
     async fn follow_attempt(
         &self,
         id: Uuid,
+        cursor: u64,
+        channel: Option<Channel>,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+        wake: watch::Receiver<bool>,
+        spill_after: Option<u64>,
+        placement_queue: Option<&mut PlacementQueue>,
+    ) -> io::Result<bool> {
+        // The transport loop owns enough async state that embedding it in every
+        // caller can exhaust a Tokio worker's stack when reconnecting. Keep its
+        // state on the heap, including when the initial Run enters this path.
+        Box::pin(self.follow_attempt_inner(
+            id,
+            cursor,
+            channel,
+            tx,
+            wake,
+            spill_after,
+            placement_queue,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn follow_attempt_inner(
+        &self,
+        id: Uuid,
         mut cursor: u64,
         mut channel: Option<Channel>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
@@ -2522,7 +2549,6 @@ impl Motor {
             .as_ref()
             .is_some_and(|owner| owner.take_probe_settlement());
         let mut delivery_cursor = if cursor == u64::MAX { 0 } else { cursor };
-        let mut observed_last_seq = None;
         // Frames to and from the build server carry its ID for the job; records
         // and storage keep the caller's.
         let build_server_id = self.build_server_id(id);
@@ -2943,18 +2969,6 @@ impl Motor {
             let Some(incoming) = incoming else {
                 continue;
             };
-            let seq = match &incoming {
-                Ok(Incoming::Frame(Frame::Started { seq, .. })) => Some(*seq),
-                Ok(Incoming::Frame(Frame::Output(output))) => Some(output.seq),
-                Ok(Incoming::Frame(Frame::ReturnResult(result))) => Some(result.seq),
-                Ok(Incoming::Frame(Frame::ReturnChunk(chunk))) => Some(chunk.seq),
-                Ok(Incoming::Frame(Frame::ReturnManifest(manifest))) => Some(manifest.seq),
-                Ok(Incoming::Unknown(seq)) => *seq,
-                _ => None,
-            };
-            if let Some(seq) = seq {
-                observed_last_seq = Some(observed_last_seq.map_or(seq, |last: u64| last.max(seq)));
-            }
             match incoming {
                 Ok(Incoming::Frame(Frame::Heartbeat { queue_wait_ms })) => {
                     queue_deadline = queue_wait_ms.and_then(|elapsed| {
@@ -3083,7 +3097,7 @@ impl Motor {
                     terminal.job_id = id;
                     if completed_replay {
                         let state = self.hosted_state(id).unwrap();
-                        if state.final_seq.is_some_and(|last| cursor <= last)
+                        if state.replay_end_seq.is_some_and(|end| cursor < end)
                             || terminal.outcome == Outcome::HistoryExpired
                             || (state.has_real_terminal()
                                 && state
@@ -3124,7 +3138,7 @@ impl Motor {
                         terminal = self.persist_hosted_terminal_with_sequence(
                             id,
                             terminal,
-                            observed_last_seq,
+                            (cursor != u64::MAX).then_some(cursor),
                         )?;
                         log_hosted_terminal(id, &terminal);
                     }

@@ -60,10 +60,10 @@ pub struct HostedJobState {
     pub billed_vcpu_ms: Option<u64>,
     pub billing: BillingStatus,
     pub terminal: Option<TerminalRecord>,
-    /// Last sequenced record preceding the hosted terminal. Older stores and
-    /// summary-only observations leave it unknown, not proof of empty output.
+    /// Exclusive end of the stream preceding the hosted terminal. Zero proves
+    /// an empty stream; older stores and summary-only observations are unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) final_seq: Option<u64>,
+    pub(crate) replay_end_seq: Option<u64>,
     /// Set when this process read an OutcomeUnknown terminal from the host or
     /// a status reply. The stored observation timestamp can't show that: older
     /// clients also stamp it on unknown summaries they made up themselves.
@@ -149,7 +149,9 @@ fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
 }
 impl HostedJobState {
     pub(crate) fn needs_output_replay(&self, cursor: u64) -> bool {
-        cursor != u64::MAX && self.final_seq.is_none_or(|last| cursor <= last)
+        cursor != u64::MAX
+            && !(self.terminal.is_some() && !self.has_real_terminal())
+            && self.replay_end_seq.is_none_or(|end| cursor < end)
     }
     pub(crate) fn elapsed_ms(&self) -> u64 {
         self.started_at_ms.map_or(0, |started| {
