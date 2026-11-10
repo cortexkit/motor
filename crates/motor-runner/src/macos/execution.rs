@@ -243,17 +243,21 @@ fn prepare(
 }
 
 fn sibling_shares(workspace: &str, staged: &Staged) -> io::Result<Vec<ShareLocation>> {
-    let mut shares = Vec::new();
-    for (i, (canonical, host)) in staged.siblings.iter().enumerate() {
-        for (tag, guest) in super::sibling_destinations(workspace, canonical, i)? {
-            shares.push(ShareLocation {
-                host: host.clone(),
-                tag,
-                guest: guest.into(),
-            });
-        }
-    }
-    Ok(shares)
+    Ok(super::sibling_destinations(
+        workspace,
+        staged
+            .siblings
+            .iter()
+            .map(|(canonical, _)| canonical.as_str()),
+    )?
+    .into_iter()
+    .enumerate()
+    .map(|(tag_index, (sibling_index, guest))| ShareLocation {
+        host: staged.siblings[sibling_index].1.clone(),
+        tag: format!("sibling-{tag_index}"),
+        guest: guest.into(),
+    })
+    .collect())
 }
 
 pub(super) fn capture_changes(

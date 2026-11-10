@@ -190,7 +190,7 @@ fn linked_worktree_sibling_alias_shares_the_read_only_snapshot() {
             },
             ShareLocation {
                 host,
-                tag: "sibling-alias-0".into(),
+                tag: "sibling-1".into(),
                 guest: "/Users/test/worktrees/subconscious".into(),
             },
         ]
@@ -216,6 +216,62 @@ fn linked_worktree_sibling_alias_shares_the_read_only_snapshot() {
         assert_eq!(share.location, location);
         assert!(share.read_only);
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn sibling_alias_map_uses_existing_guest_roles_in_canonical_then_alias_order() {
+    let scratch = ScratchDir::new("macos-sibling-agent-compatibility");
+    let mut staged = staged(&scratch, Uuid::now_v7());
+    staged.siblings = [
+        "/Users/test/subconscious",
+        "/Users/test/worktrees/adjacent",
+        "/Users/other/third",
+    ]
+    .into_iter()
+    .map(|canonical| {
+        (
+            canonical.to_owned(),
+            staged.tree.join(canonical.trim_start_matches('/')),
+        )
+    })
+    .collect();
+    let workspace = "/Users/test/worktrees/branch";
+    let siblings = sibling_shares(workspace, &staged).unwrap();
+    assert_eq!(
+        siblings
+            .iter()
+            .map(|share| (share.tag.as_str(), share.guest.to_str().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("sibling-0", "/Users/test/subconscious"),
+            ("sibling-1", "/Users/test/worktrees/adjacent"),
+            ("sibling-2", "/Users/other/third"),
+            ("sibling-3", "/Users/test/worktrees/subconscious"),
+            ("sibling-4", "/Users/test/worktrees/third"),
+        ]
+    );
+    assert_eq!(siblings[0].host, siblings[3].host);
+    assert_eq!(siblings[2].host, siblings[4].host);
+    let job = JobVmConfig::new(JobVmRequest {
+        clone: scratch.join("clone"),
+        nonce_disk: scratch.join("nonce"),
+        workspace: ShareLocation {
+            host: staged.workspace,
+            tag: "workspace".into(),
+            guest: workspace.into(),
+        },
+        siblings,
+        cargo_home: ShareLocation {
+            host: staged.cargo_home,
+            tag: "cargo-home".into(),
+            guest: motor_macvm::CARGO_HOME.into(),
+        },
+    })
+    .unwrap();
+    let mounts = job.mounts();
+    assert!(mounts[1..6].iter().all(|mount| mount.read_only));
+    motor_macagent::mounts::validate(&mounts).unwrap();
 }
 
 #[test]

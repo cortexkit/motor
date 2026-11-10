@@ -56,3 +56,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 flate2 = "1"
 cortexkit-test-support = "=0.1.10"
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+motor-macagent = { path = "../motor-macagent" }

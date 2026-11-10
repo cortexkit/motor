@@ -243,8 +243,8 @@ fn sibling_alias_collisions_are_refused_before_preparation() {
                 "/Users/motor/shared",
                 "/Users/motor/worktrees/shared/nested",
             ],
-            "/Users/motor/worktrees/shared",
             "/Users/motor/worktrees/shared/nested",
+            "/Users/motor/worktrees/shared",
         ),
         (
             vec!["/Users/motor/shared", "/Users/other/SHARED"],

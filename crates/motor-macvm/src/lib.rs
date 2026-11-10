@@ -616,7 +616,7 @@ mod tests {
         let canonical = input.siblings[0].clone();
         input.siblings.push(ShareLocation {
             host: canonical.host.clone(),
-            tag: "sibling-alias-0".into(),
+            tag: "sibling-1".into(),
             guest: "/Users/caller/worktrees/sibling".into(),
         });
         let plan = JobVmConfig::new(input.clone()).unwrap();
@@ -625,7 +625,7 @@ mod tests {
             plan.shares()[2].location.host
         );
         assert!(plan.shares()[1..3].iter().all(|share| share.read_only));
-        assert_eq!(plan.mounts()[2].tag, "sibling-alias-0");
+        assert_eq!(plan.mounts()[2].tag, "sibling-1");
         assert!(plan.mounts()[2].read_only);
         input.siblings[1].guest = canonical.guest.join("nested");
         assert!(JobVmConfig::new(input).is_err());
@@ -635,26 +635,25 @@ mod tests {
     fn sibling_aliases_count_toward_the_64_entry_limit() {
         let mut input = request();
         input.siblings = (0..31)
-            .flat_map(|i| {
-                let host = format!("/state/jobs/job/sibling-{i}");
-                [
-                    share(
-                        &host,
-                        &format!("sibling-{i}"),
-                        &format!("/Users/caller/sibling-{i}"),
-                    ),
-                    share(
-                        &host,
-                        &format!("sibling-alias-{i}"),
-                        &format!("/Users/caller/worktrees/sibling-{i}"),
-                    ),
-                ]
+            .map(|i| {
+                share(
+                    &format!("/state/jobs/job/sibling-{i}"),
+                    &format!("sibling-{i}"),
+                    &format!("/Users/caller/sibling-{i}"),
+                )
             })
+            .chain((0..31).map(|i| {
+                share(
+                    &format!("/state/jobs/job/sibling-{i}"),
+                    &format!("sibling-{}", 31 + i),
+                    &format!("/Users/caller/worktrees/sibling-{i}"),
+                )
+            }))
             .collect();
         assert_eq!(JobVmConfig::new(input.clone()).unwrap().mounts().len(), 64);
         input.siblings.push(share(
             "/state/jobs/job/extra",
-            "sibling-31",
+            "sibling-62",
             "/Users/caller/extra",
         ));
         assert!(

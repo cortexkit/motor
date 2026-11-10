@@ -61,13 +61,14 @@ pub fn validate_paths(request: &Run) -> io::Result<()> {
         return Err(invalid("macos_path_invalid: cwd outside workspace"));
     }
     let mut roots = vec![request.workspace_key.clone()];
-    for (i, sibling) in request.siblings.iter().enumerate() {
-        roots.extend(
-            sibling_destinations(&request.workspace_key, &sibling.canonical_path, i)?
-                .into_iter()
-                .map(|(_, destination)| destination),
-        );
-    }
+    roots.extend(
+        sibling_destinations(
+            &request.workspace_key,
+            request.siblings.iter().map(|s| s.canonical_path.as_str()),
+        )?
+        .into_iter()
+        .map(|(_, destination)| destination),
+    );
     // Workspace and cargo-home reserve two of the boot map's 64 entries.
     if roots.len() > 63 {
         return Err(invalid(
@@ -88,23 +89,29 @@ pub fn validate_paths(request: &Run) -> io::Result<()> {
     Ok(())
 }
 
-fn sibling_destinations(
+fn sibling_destinations<'a>(
     workspace: &str,
-    canonical: &str,
-    index: usize,
-) -> io::Result<Vec<(String, String)>> {
+    siblings: impl IntoIterator<Item = &'a str>,
+) -> io::Result<Vec<(usize, String)>> {
     mapped(workspace)?;
-    mapped(canonical)?;
-    let alias = Path::new(workspace)
-        .parent()
-        .unwrap()
-        .join(Path::new(canonical).file_name().unwrap());
-    let mut destinations = vec![(format!("sibling-{index}"), canonical.to_owned())];
-    if alias != Path::new(canonical) {
-        let alias = alias.to_str().unwrap();
-        mapped(alias)?;
-        destinations.push((format!("sibling-alias-{index}"), alias.to_owned()));
+    let mut destinations = Vec::new();
+    let mut aliases = Vec::new();
+    for (index, canonical) in siblings.into_iter().enumerate() {
+        mapped(canonical)?;
+        let alias = Path::new(workspace)
+            .parent()
+            .unwrap()
+            .join(Path::new(canonical).file_name().unwrap());
+        destinations.push((index, canonical.to_owned()));
+        if alias != Path::new(canonical) {
+            let alias = alias.to_str().unwrap();
+            mapped(alias)?;
+            aliases.push((index, alias.to_owned()));
+        }
     }
+    // Keep canonical tags stable and number aliases afterward using the same
+    // sibling-N role understood by the agent in the sealed guest image.
+    destinations.extend(aliases);
     Ok(destinations)
 }
 

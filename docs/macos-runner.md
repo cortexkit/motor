@@ -82,15 +82,19 @@ destinations must not overlap, the workspace and cargo-home must be read-write,
 and every sibling must be read-only. The nonce disk remains an unmounted raw,
 read-only device, never a guest share.
 
-1. The runner emits `workspace`, `cargo-home`, `sibling-N` and `sibling-alias-N`
-   tags (decimal N is the sibling's index). The alias destination is the
+1. The runner emits `workspace`, `cargo-home` and `sibling-N` tags (decimal N).
+   Canonical siblings keep indices 0 through k−1; aliases are numbered from k
+   onward in sibling order, where k is the number of declared siblings. Aliases
+   use the existing sibling role so the agent baked into the sealed guest image
+   remains unchanged; no image rebuild is required. The alias destination is the
    workspace caller path's parent joined with the canonical sibling's basename;
    it is omitted only when equal to the canonical path. Both sibling shares
    expose the same staged host directory read-only, so source timestamps are
    applied once to that directory, not separately for the alias.
    `linked_worktree_sibling_alias_shares_the_read_only_snapshot`,
    `adjacent_workspace_sibling_has_no_alias_share` and
-   `sibling_alias_tags_keep_sibling_validation` pin the layout and access rules.
+   `sibling_alias_map_uses_existing_guest_roles_in_canonical_then_alias_order`
+   pin the layout, access rules and compatibility with the unchanged agent.
 2. Canonical and alias destinations together may consume at most 62 sibling
    entries, leaving workspace and cargo-home within the 64-entry map bound.
    This permits 31 siblings when every sibling needs an alias, or up to 62 when
