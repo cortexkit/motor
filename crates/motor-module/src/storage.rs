@@ -1048,7 +1048,17 @@ impl Storage {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn hosted_terminal(&self, id: Uuid, terminal: TerminalRecord) -> io::Result<()> {
+        self.hosted_terminal_with_sequence(id, terminal, None)
+    }
+
+    pub(crate) fn hosted_terminal_with_sequence(
+        &self,
+        id: Uuid,
+        terminal: TerminalRecord,
+        final_seq: Option<u64>,
+    ) -> io::Result<()> {
         self.update(|state| {
             let Some(job) = state.jobs.get_mut(&id) else {
                 return;
@@ -1059,6 +1069,9 @@ impl Storage {
             let Some(hosted) = job.hosted.as_mut() else {
                 return;
             };
+            if let Some(last) = final_seq {
+                hosted.final_seq = Some(last);
+            }
             if !hosted.has_real_terminal() {
                 hosted.terminal = Some(terminal.clone());
                 hosted.observed_unknown_terminal =

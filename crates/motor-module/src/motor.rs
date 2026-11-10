@@ -581,13 +581,22 @@ impl Motor {
                 .storage
                 .job(id)
                 .filter(|job| job.hosted_complete())
-                .and_then(|job| job.hosted_route()?.terminal);
+                // Health retirement already reports that the result never
+                // arrived. Its local unknown summary cannot hide a clean success.
+                .filter(|job| {
+                    job.health_retired()
+                        || job
+                            .hosted_route()
+                            .is_some_and(|state| !state.needs_output_replay(request.from_seq))
+                })
+                .and_then(|job| job.hosted_route())
+                .and_then(|state| state.terminal);
             if let Some(terminal) = completed {
                 tokio::spawn(async move {
                     let _ = emit(&tx, StreamRecord::Terminal(terminal)).await;
                 });
             } else {
-                let owner = self.ensure_hosted_result(id, None);
+                let owner = self.ensure_hosted_result_at(id, request.from_seq);
                 let owner = self.subscribe_hosted_result(id, owner, request.from_seq, false, tx);
                 stream.wake = owner.wake.clone();
             }
@@ -2394,7 +2403,16 @@ impl Motor {
     fn persist_hosted_terminal(
         &self,
         id: Uuid,
+        terminal: TerminalRecord,
+    ) -> io::Result<TerminalRecord> {
+        self.persist_hosted_terminal_with_sequence(id, terminal, None)
+    }
+
+    fn persist_hosted_terminal_with_sequence(
+        &self,
+        id: Uuid,
         mut terminal: TerminalRecord,
+        final_seq: Option<u64>,
     ) -> io::Result<TerminalRecord> {
         terminal.job_id = id;
         if !matches!(
@@ -2406,7 +2424,8 @@ impl Motor {
             terminal.retry_after_ms = None;
         }
         terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
-        self.storage.hosted_terminal(id, terminal)?;
+        self.storage
+            .hosted_terminal_with_sequence(id, terminal, final_seq)?;
         let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
         if let Some(owner) = owner {
             self.start_boat_terminal_drain(id, &owner);
@@ -2503,28 +2522,57 @@ impl Motor {
             .as_ref()
             .is_some_and(|owner| owner.take_probe_settlement());
         let mut delivery_cursor = if cursor == u64::MAX { 0 } else { cursor };
+        let mut observed_last_seq = None;
         // Frames to and from the build server carry its ID for the job; records
         // and storage keep the caller's.
         let build_server_id = self.build_server_id(id);
+        // hosted_complete ends command and billing cleanup, but first-party
+        // hosts can still retain output for attach. A stored terminal summary
+        // alone cannot satisfy an earlier output cursor.
+        let completed_replay = self
+            .storage
+            .job(id)
+            .is_some_and(|job| job.hosted_complete())
+            && (self
+                .hosted_state(id)
+                .is_some_and(|state| state.needs_output_replay(cursor))
+                || owner.as_ref().is_some_and(|owner| owner.has_rewind()));
+        if completed_replay
+            && self.hosted_state(id).is_some_and(|state| {
+                state.finish_done
+                    && state
+                        .placement
+                        .as_ref()
+                        .is_some_and(|p| p.host.starts_with("boat:"))
+            })
+        {
+            if let Some(owner) = &owner {
+                owner.take_rewind();
+            }
+            return self.hosted_history_expired(id, tx).await.map(|_| false);
+        }
         if self
             .storage
             .job(id)
             .is_some_and(|job| job.hosted_complete())
             && owner.as_ref().is_none_or(|owner| !owner.has_rewind())
+            && !completed_replay
         {
             return self.finish_hosted(id, false, tx).await.map(|_| false);
         }
-        if self.hosted_state(id).is_some_and(|state| {
-            state
-                .placement
-                .as_ref()
-                .is_some_and(|p| p.host.starts_with("boat:"))
-                && (state.pending_finish.is_some()
-                    || (channel.is_none()
-                        && state
-                            .host_deadline_s()
-                            .is_some_and(|deadline| crate::hosted::now_s() >= deadline)))
-        }) {
+        if !completed_replay
+            && self.hosted_state(id).is_some_and(|state| {
+                state
+                    .placement
+                    .as_ref()
+                    .is_some_and(|p| p.host.starts_with("boat:"))
+                    && (state.pending_finish.is_some()
+                        || (channel.is_none()
+                            && state
+                                .host_deadline_s()
+                                .is_some_and(|deadline| crate::hosted::now_s() >= deadline)))
+            })
+        {
             return self.finish_hosted(id, false, tx).await.map(|_| false);
         }
         let wait = self
@@ -2678,6 +2726,7 @@ impl Motor {
                         .is_some_and(|state| state.terminal.is_some())
                         && owner.now_ms() >= self.hosted_result_deadline(id)?
                         && (!probe_settlement || reattaches > 1)
+                        && !completed_replay
                     {
                         return self.finish_hosted(id, true, tx).await.map(|_| false);
                     }
@@ -2706,6 +2755,9 @@ impl Motor {
                 }
                 let opened = tokio::select! {
                     result = self.open_job_channel_at(id, now) => result,
+                    _ = tokio::time::sleep(Duration::from_secs(60)), if completed_replay => {
+                        return self.hosted_history_expired(id, tx).await.map(|_| false);
+                    },
                     _ = async { match cancel_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
                         self.storage.cancel_terminal_wait_expired(id)?;
                         return self.finish_hosted(id, false, tx).await.map(|_| false);
@@ -2723,6 +2775,9 @@ impl Motor {
                         return Err(io::Error::other("caller detached"));
                     },
                 };
+                if completed_replay && opened.is_err() {
+                    return self.hosted_history_expired(id, tx).await.map(|_| false);
+                }
                 #[cfg(test)]
                 if let Some(owner) = &owner {
                     owner.trace_transport_for_test("channel open completed");
@@ -2825,7 +2880,7 @@ impl Motor {
                                 hosted_terminal_deadline.get_or_insert(
                                     tokio::time::Instant::now() + Duration::from_secs(30),
                                 );
-                            } else {
+                            } else if !completed_replay {
                                 hosted_terminal_deadline =
                                     Some(tokio::time::Instant::now() + Duration::from_secs(5));
                             }
@@ -2833,6 +2888,9 @@ impl Motor {
                     }
                 }
                 if channel.is_none() {
+                    if completed_replay {
+                        return self.hosted_history_expired(id, tx).await.map(|_| false);
+                    }
                     if hosted {
                         continue;
                     }
@@ -2848,12 +2906,20 @@ impl Motor {
                     self.log_hosted_failure(id, "follow", "caller detached");
                     return Err(io::Error::other("caller detached"));
                 },
+                // Bound an unavailable replay by inactivity, not by total output
+                // duration; the billing deadline must not cut a long replay short.
+                _ = tokio::time::sleep(Duration::from_secs(60)), if completed_replay => {
+                    return self.hosted_history_expired(id, tx).await.map(|_| false);
+                },
                 frame = c.next_job() => Some(frame),
                 _ = async { if let Some(deadline) = host_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if owner.is_none() => {
                     self.log_hosted_failure(id, "follow", "host deadline passed without a terminal");
                     return self.finish_hosted(id, false, tx).await.map(|_| false);
                 },
                 _ = async { if let Some(deadline) = hosted_terminal_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => {
+                    if completed_replay {
+                        return self.hosted_history_expired(id, tx).await.map(|_| false);
+                    }
                     if self.hosted_state(id).is_some_and(|state| state.awaiting_cancel_terminal()) {
                         self.storage.cancel_terminal_wait_expired(id)?;
                         return self.finish_hosted(id, false, tx).await.map(|_| false);
@@ -2877,6 +2943,18 @@ impl Motor {
             let Some(incoming) = incoming else {
                 continue;
             };
+            let seq = match &incoming {
+                Ok(Incoming::Frame(Frame::Started { seq, .. })) => Some(*seq),
+                Ok(Incoming::Frame(Frame::Output(output))) => Some(output.seq),
+                Ok(Incoming::Frame(Frame::ReturnResult(result))) => Some(result.seq),
+                Ok(Incoming::Frame(Frame::ReturnChunk(chunk))) => Some(chunk.seq),
+                Ok(Incoming::Frame(Frame::ReturnManifest(manifest))) => Some(manifest.seq),
+                Ok(Incoming::Unknown(seq)) => *seq,
+                _ => None,
+            };
+            if let Some(seq) = seq {
+                observed_last_seq = Some(observed_last_seq.map_or(seq, |last: u64| last.max(seq)));
+            }
             match incoming {
                 Ok(Incoming::Frame(Frame::Heartbeat { queue_wait_ms })) => {
                     queue_deadline = queue_wait_ms.and_then(|elapsed| {
@@ -3003,6 +3081,22 @@ impl Motor {
                         ));
                     }
                     terminal.job_id = id;
+                    if completed_replay {
+                        let state = self.hosted_state(id).unwrap();
+                        if state.final_seq.is_some_and(|last| cursor <= last)
+                            || terminal.outcome == Outcome::HistoryExpired
+                            || (state.has_real_terminal()
+                                && state
+                                    .terminal
+                                    .as_ref()
+                                    .is_some_and(|stored| stored.outcome != terminal.outcome))
+                        {
+                            return self.hosted_history_expired(id, tx).await.map(|_| false);
+                        }
+                        return emit(tx, StreamRecord::Terminal(terminal))
+                            .await
+                            .map(|_| false);
+                    }
                     if terminal.ran == Some(Ran::None)
                         && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }
                             if windows_retryable_refusal(reason, terminal.refusal_detail.as_deref()))
@@ -3027,7 +3121,11 @@ impl Motor {
                             self.with_spill_attempt(id, terminal.refusal_detail.take());
                     }
                     if hosted {
-                        terminal = self.persist_hosted_terminal(id, terminal)?;
+                        terminal = self.persist_hosted_terminal_with_sequence(
+                            id,
+                            terminal,
+                            observed_last_seq,
+                        )?;
                         log_hosted_terminal(id, &terminal);
                     }
                     let boat = hosted
@@ -3095,6 +3193,9 @@ impl Motor {
                 Ok(Incoming::Frame(Frame::HostedTerminal(terminal)))
                     if hosted && terminal.job_id == build_server_id =>
                 {
+                    if completed_replay {
+                        return self.hosted_history_expired(id, tx).await.map(|_| false);
+                    }
                     let state = self.hosted_state(id).unwrap();
                     if state.terminal.is_none()
                         || state.placement.as_ref().is_none_or(|p| {
@@ -3166,6 +3267,9 @@ impl Motor {
                     cancel_retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
                 }
                 other => {
+                    if completed_replay {
+                        return self.hosted_history_expired(id, tx).await.map(|_| false);
+                    }
                     if hosted {
                         // Name the close, so an outcome-unknown job says which
                         // connection ended and how.

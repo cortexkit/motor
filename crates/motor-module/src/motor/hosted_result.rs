@@ -216,6 +216,19 @@ impl Drop for Subscriber {
 }
 
 impl Motor {
+    pub(super) async fn hosted_history_expired(
+        &self,
+        id: Uuid,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> io::Result<()> {
+        // Replay failure describes missing history, not a new execution outcome.
+        // Keep the durable terminal so status still reports the real result.
+        super::emit(
+            tx,
+            StreamRecord::Terminal(TerminalRecord::new(id, Outcome::HistoryExpired, 0, 0, 0)),
+        )
+        .await
+    }
     #[cfg(test)]
     pub(super) fn hosted_result_snapshot_for_test(&self, id: Uuid) -> String {
         let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
@@ -347,7 +360,9 @@ impl Motor {
                     .storage
                     .job(id)
                     .filter(|job| job.hosted_complete())
-                    .and_then(|job| job.hosted_route()?.terminal)
+                    .and_then(|job| job.hosted_route())
+                    .filter(|state| !state.needs_output_replay(cursor))
+                    .and_then(|state| state.terminal)
                 {
                     tokio::spawn(async move {
                         let _ = tx.send(Ok(StreamRecord::Terminal(terminal))).await;
@@ -364,7 +379,7 @@ impl Motor {
                     });
                     return owner;
                 }
-                owner = self.ensure_hosted_result(id, None);
+                owner = self.ensure_hosted_result_at(id, cursor);
                 continue;
             }
             let subscriber = state.next_subscriber;
@@ -709,10 +724,19 @@ impl Motor {
     }
 
     pub(super) fn ensure_hosted_result(&self, id: Uuid, probe_at: Option<u64>) -> Arc<Owner> {
-        self.ensure_hosted_result_entry(id, probe_at).0
+        self.ensure_hosted_result_entry(id, probe_at, None).0
     }
 
-    fn ensure_hosted_result_entry(&self, id: Uuid, probe_at: Option<u64>) -> (Arc<Owner>, bool) {
+    pub(super) fn ensure_hosted_result_at(&self, id: Uuid, cursor: u64) -> Arc<Owner> {
+        self.ensure_hosted_result_entry(id, None, Some(cursor)).0
+    }
+
+    fn ensure_hosted_result_entry(
+        &self,
+        id: Uuid,
+        probe_at: Option<u64>,
+        cursor: Option<u64>,
+    ) -> (Arc<Owner>, bool) {
         let mut owners = self.hosted_results.lock().unwrap();
         if let Some(owner) = owners
             .get(&id)
@@ -720,16 +744,18 @@ impl Motor {
         {
             return (owner.clone(), false);
         }
-        let cursor = self.storage.job(id).map_or(u64::MAX, |job| {
-            if job.return_result.is_none()
-                && (job.return_requested.is_some()
-                    || job.return_cap_bytes.is_some()
-                    || job.return_cwd.is_some())
-            {
-                0
-            } else {
-                u64::MAX
-            }
+        let cursor = cursor.unwrap_or_else(|| {
+            self.storage.job(id).map_or(u64::MAX, |job| {
+                if job.return_result.is_none()
+                    && (job.return_requested.is_some()
+                        || job.return_cap_bytes.is_some()
+                        || job.return_cwd.is_some())
+                {
+                    0
+                } else {
+                    u64::MAX
+                }
+            })
         });
         let owner = Owner::new(cursor);
         self.start_boat_terminal_drain(id, &owner);
@@ -804,7 +830,7 @@ impl Motor {
     }
 
     pub(super) async fn hosted_result_status(&self, id: Uuid, now: u64) -> JobStatusReply {
-        let (owner, elected) = self.ensure_hosted_result_entry(id, Some(now));
+        let (owner, elected) = self.ensure_hosted_result_entry(id, Some(now), None);
         let already_owned = !elected;
         {
             let mut state = owner.state.lock().unwrap();
