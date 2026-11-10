@@ -142,6 +142,8 @@ fn prepare(
         staged.source_files.clone(),
         &super::source_seal::returns(&setup.request)?,
     )?;
+    // Aliases share the canonical host directory, so timestamp each staged tree
+    // only once; both guest mounts observe the same source mtimes.
     let mut source_trees = Vec::new();
     for (destination, repository, commit) in std::iter::once((
         &setup.request.workspace_key,
@@ -199,12 +201,7 @@ fn prepare(
             "workspace".into(),
             setup.request.workspace_key.clone(),
         ),
-        siblings: staged
-            .siblings
-            .iter()
-            .enumerate()
-            .map(|(i, (guest, host))| share(host, format!("sibling-{i}"), guest.clone()))
-            .collect(),
+        siblings: sibling_shares(&setup.request.workspace_key, &staged)?,
         cargo_home: share(
             &staged.cargo_home,
             "cargo-home".into(),
@@ -243,6 +240,24 @@ fn prepare(
     }
     #[allow(unreachable_code)]
     start_io(config, setup, entry, nonce, staged, staging, mtimes)
+}
+
+fn sibling_shares(workspace: &str, staged: &Staged) -> io::Result<Vec<ShareLocation>> {
+    Ok(super::sibling_destinations(
+        workspace,
+        staged
+            .siblings
+            .iter()
+            .map(|(canonical, _)| canonical.as_str()),
+    )?
+    .into_iter()
+    .enumerate()
+    .map(|(tag_index, (sibling_index, guest))| ShareLocation {
+        host: staged.siblings[sibling_index].1.clone(),
+        tag: format!("sibling-{tag_index}"),
+        guest: guest.into(),
+    })
+    .collect())
 }
 
 pub(super) fn capture_changes(

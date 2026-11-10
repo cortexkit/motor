@@ -171,6 +171,128 @@ fn staged(root: &Path, id: Uuid) -> Staged {
 }
 
 #[test]
+fn linked_worktree_sibling_alias_shares_the_read_only_snapshot() {
+    let scratch = ScratchDir::new("macos-sibling-alias");
+    let mut staged = staged(&scratch, Uuid::now_v7());
+    let host = staged.tree.join("Users/test/subconscious");
+    staged
+        .siblings
+        .push(("/Users/test/subconscious".into(), host.clone()));
+    let workspace = "/Users/test/worktrees/branch";
+    let siblings = sibling_shares(workspace, &staged).unwrap();
+    assert_eq!(
+        siblings,
+        vec![
+            ShareLocation {
+                host: host.clone(),
+                tag: "sibling-0".into(),
+                guest: "/Users/test/subconscious".into(),
+            },
+            ShareLocation {
+                host,
+                tag: "sibling-1".into(),
+                guest: "/Users/test/worktrees/subconscious".into(),
+            },
+        ]
+    );
+    let job = JobVmConfig::new(JobVmRequest {
+        clone: scratch.join("clone"),
+        nonce_disk: scratch.join("nonce"),
+        workspace: ShareLocation {
+            host: staged.workspace,
+            tag: "workspace".into(),
+            guest: workspace.into(),
+        },
+        siblings: siblings.clone(),
+        cargo_home: ShareLocation {
+            host: staged.cargo_home,
+            tag: "cargo-home".into(),
+            guest: motor_macvm::CARGO_HOME.into(),
+        },
+    })
+    .unwrap();
+    assert_eq!(job.shares().len(), 4);
+    for (share, location) in job.shares()[1..3].iter().zip(siblings) {
+        assert_eq!(share.location, location);
+        assert!(share.read_only);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn sibling_alias_map_uses_existing_guest_roles_in_canonical_then_alias_order() {
+    let scratch = ScratchDir::new("macos-sibling-agent-compatibility");
+    let mut staged = staged(&scratch, Uuid::now_v7());
+    staged.siblings = [
+        "/Users/test/subconscious",
+        "/Users/test/worktrees/adjacent",
+        "/Users/other/third",
+    ]
+    .into_iter()
+    .map(|canonical| {
+        (
+            canonical.to_owned(),
+            staged.tree.join(canonical.trim_start_matches('/')),
+        )
+    })
+    .collect();
+    let workspace = "/Users/test/worktrees/branch";
+    let siblings = sibling_shares(workspace, &staged).unwrap();
+    assert_eq!(
+        siblings
+            .iter()
+            .map(|share| (share.tag.as_str(), share.guest.to_str().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("sibling-0", "/Users/test/subconscious"),
+            ("sibling-1", "/Users/test/worktrees/adjacent"),
+            ("sibling-2", "/Users/other/third"),
+            ("sibling-3", "/Users/test/worktrees/subconscious"),
+            ("sibling-4", "/Users/test/worktrees/third"),
+        ]
+    );
+    assert_eq!(siblings[0].host, siblings[3].host);
+    assert_eq!(siblings[2].host, siblings[4].host);
+    let job = JobVmConfig::new(JobVmRequest {
+        clone: scratch.join("clone"),
+        nonce_disk: scratch.join("nonce"),
+        workspace: ShareLocation {
+            host: staged.workspace,
+            tag: "workspace".into(),
+            guest: workspace.into(),
+        },
+        siblings,
+        cargo_home: ShareLocation {
+            host: staged.cargo_home,
+            tag: "cargo-home".into(),
+            guest: motor_macvm::CARGO_HOME.into(),
+        },
+    })
+    .unwrap();
+    let mounts = job.mounts();
+    assert!(mounts[1..6].iter().all(|mount| mount.read_only));
+    motor_macagent::mounts::validate(&mounts).unwrap();
+}
+
+#[test]
+fn adjacent_workspace_sibling_has_no_alias_share() {
+    let scratch = ScratchDir::new("macos-sibling-adjacent");
+    let mut staged = staged(&scratch, Uuid::now_v7());
+    let host = staged.tree.join("Users/test/subconscious");
+    staged
+        .siblings
+        .push(("/Users/test/subconscious".into(), host.clone()));
+    assert_eq!(
+        sibling_shares("/Users/test/repo", &staged).unwrap(),
+        vec![ShareLocation {
+            host,
+            tag: "sibling-0".into(),
+            guest: "/Users/test/subconscious".into(),
+        }]
+    );
+}
+
+#[test]
 fn source_unseal_barrier_prevents_target_cache_publication() {
     let scratch = ScratchDir::new("macos-target-seal-barrier");
     let root = scratch.join("state");

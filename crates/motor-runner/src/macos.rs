@@ -42,7 +42,7 @@ pub const PREP_TIMEOUT: Duration = Duration::from_secs(600);
 pub fn validate_paths(request: &Run) -> io::Result<()> {
     if request.siblings.len() > 62 {
         return Err(invalid(
-            "macos_path_invalid: at most 62 sibling shares are supported",
+            "macos_path_invalid: at most 62 sibling share destinations, including aliases (64 total entries)",
         ));
     }
     for path in [
@@ -60,19 +60,59 @@ pub fn validate_paths(request: &Run) -> io::Result<()> {
     {
         return Err(invalid("macos_path_invalid: cwd outside workspace"));
     }
-    let roots: Vec<_> = std::iter::once(&request.workspace_key)
-        .chain(request.siblings.iter().map(|s| &s.canonical_path))
-        .collect();
+    let mut roots = vec![request.workspace_key.clone()];
+    roots.extend(
+        sibling_destinations(
+            &request.workspace_key,
+            request.siblings.iter().map(|s| s.canonical_path.as_str()),
+        )?
+        .into_iter()
+        .map(|(_, destination)| destination),
+    );
+    // Workspace and cargo-home reserve two of the boot map's 64 entries.
+    if roots.len() > 63 {
+        return Err(invalid(
+            "macos_path_invalid: at most 62 sibling share destinations, including aliases (64 total entries)",
+        ));
+    }
     for (i, root) in roots.iter().enumerate() {
-        if roots.iter().skip(i + 1).any(|other| {
-            let root = root.to_ascii_lowercase();
-            let other = other.to_ascii_lowercase();
-            Path::new(&root).starts_with(&other) || Path::new(&other).starts_with(&root)
-        }) {
-            return Err(invalid("macos_path_invalid: overlapping snapshots"));
+        for other in roots.iter().skip(i + 1) {
+            let left = root.to_ascii_lowercase();
+            let right = other.to_ascii_lowercase();
+            if Path::new(&left).starts_with(&right) || Path::new(&right).starts_with(&left) {
+                return Err(invalid(format!(
+                    "macos_path_invalid: overlapping share destinations: {root} and {other}"
+                )));
+            }
         }
     }
     Ok(())
+}
+
+fn sibling_destinations<'a>(
+    workspace: &str,
+    siblings: impl IntoIterator<Item = &'a str>,
+) -> io::Result<Vec<(usize, String)>> {
+    mapped(workspace)?;
+    let mut destinations = Vec::new();
+    let mut aliases = Vec::new();
+    for (index, canonical) in siblings.into_iter().enumerate() {
+        mapped(canonical)?;
+        let alias = Path::new(workspace)
+            .parent()
+            .unwrap()
+            .join(Path::new(canonical).file_name().unwrap());
+        destinations.push((index, canonical.to_owned()));
+        if alias != Path::new(canonical) {
+            let alias = alias.to_str().unwrap();
+            mapped(alias)?;
+            aliases.push((index, alias.to_owned()));
+        }
+    }
+    // Keep canonical tags stable and number aliases afterward using the same
+    // sibling-N role understood by the agent in the sealed guest image.
+    destinations.extend(aliases);
+    Ok(destinations)
 }
 
 fn mapped(path: &str) -> io::Result<&Path> {

@@ -78,6 +78,11 @@ fn absolute_normal(path: &Path) -> bool {
 
 impl JobVmConfig {
     pub fn new(request: JobVmRequest) -> io::Result<Self> {
+        if request.siblings.len() > 62 {
+            return Err(invalid(
+                "at most 62 sibling share destinations, including aliases (64 total entries)",
+            ));
+        }
         if !absolute_normal(&request.clone) || !absolute_normal(&request.nonce_disk) {
             return Err(invalid(
                 "clone and nonce disk must be normalized absolute paths",
@@ -604,6 +609,61 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn sibling_aliases_reuse_host_directories_read_only() {
+        let mut input = request();
+        input.siblings[0].tag = "sibling-0".into();
+        let canonical = input.siblings[0].clone();
+        input.siblings.push(ShareLocation {
+            host: canonical.host.clone(),
+            tag: "sibling-1".into(),
+            guest: "/Users/caller/worktrees/sibling".into(),
+        });
+        let plan = JobVmConfig::new(input.clone()).unwrap();
+        assert_eq!(
+            plan.shares()[1].location.host,
+            plan.shares()[2].location.host
+        );
+        assert!(plan.shares()[1..3].iter().all(|share| share.read_only));
+        assert_eq!(plan.mounts()[2].tag, "sibling-1");
+        assert!(plan.mounts()[2].read_only);
+        input.siblings[1].guest = canonical.guest.join("nested");
+        assert!(JobVmConfig::new(input).is_err());
+    }
+
+    #[test]
+    fn sibling_aliases_count_toward_the_64_entry_limit() {
+        let mut input = request();
+        input.siblings = (0..31)
+            .map(|i| {
+                share(
+                    &format!("/state/jobs/job/sibling-{i}"),
+                    &format!("sibling-{i}"),
+                    &format!("/Users/caller/sibling-{i}"),
+                )
+            })
+            .chain((0..31).map(|i| {
+                share(
+                    &format!("/state/jobs/job/sibling-{i}"),
+                    &format!("sibling-{}", 31 + i),
+                    &format!("/Users/caller/worktrees/sibling-{i}"),
+                )
+            }))
+            .collect();
+        assert_eq!(JobVmConfig::new(input.clone()).unwrap().mounts().len(), 64);
+        input.siblings.push(share(
+            "/state/jobs/job/extra",
+            "sibling-62",
+            "/Users/caller/extra",
+        ));
+        assert!(
+            JobVmConfig::new(input)
+                .unwrap_err()
+                .to_string()
+                .contains("64 total entries")
+        );
+    }
+
     #[test]
     fn rejects_ambiguous_or_secret_exposing_shares() {
         for variant in 0..7 {

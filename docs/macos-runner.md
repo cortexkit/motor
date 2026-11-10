@@ -68,7 +68,8 @@ host `Start`. The host may send `Cancel` after `TreeEnd` until terminal status.
 ### Shares and command execution
 
 The workspace is mounted read-write at its caller's absolute path. Each sibling
-is mounted read-only at its own caller path, preserving their relative layout.
+is mounted read-only at its canonical caller path and, for a linked worktree,
+beside the workspace so `../<sibling name>` resolves to the same snapshot.
 The per-job cargo-home share is mounted read-write at
 **`/opt/motor/job/cargo-home`**. No host state, prep tree or persistent cache is
 shared. The VM helper writes the exact tag/destination/access map retained by
@@ -80,8 +81,33 @@ destination is permitted outside that root. Destinations and tags must be unique
 destinations must not overlap, the workspace and cargo-home must be read-write,
 and every sibling must be read-only. The nonce disk remains an unmounted raw,
 read-only device, never a guest share.
-The runner emits tags `workspace`, `cargo-home` and `sibling-N` (decimal N),
-with at most 62 siblings so the complete map stays within its 64-entry bound.
+
+1. The runner emits `workspace`, `cargo-home` and `sibling-N` tags (decimal N).
+   Canonical siblings keep indices 0 through k−1; aliases are numbered from k
+   onward in sibling order, where k is the number of declared siblings. Aliases
+   use the existing sibling role so the agent baked into the sealed guest image
+   remains unchanged; no image rebuild is required. The alias destination is the
+   workspace caller path's parent joined with the canonical sibling's basename;
+   it is omitted only when equal to the canonical path. Both sibling shares
+   expose the same staged host directory read-only, so source timestamps are
+   applied once to that directory, not separately for the alias.
+   `linked_worktree_sibling_alias_shares_the_read_only_snapshot`,
+   `adjacent_workspace_sibling_has_no_alias_share` and
+   `sibling_alias_map_uses_existing_guest_roles_in_canonical_then_alias_order`
+   pin the layout, access rules and compatibility with the unchanged agent.
+2. Canonical and alias destinations together may consume at most 62 sibling
+   entries, leaving workspace and cargo-home within the 64-entry map bound.
+   This permits 31 siblings when every sibling needs an alias, or up to 62 when
+   none does; mixed layouts count each required alias. An oversized map is
+   refused before tools or staging begin, never by dropping an alias.
+   `sibling_aliases_count_toward_the_boot_map_limit_before_preparation` and
+   `sibling_aliases_count_toward_the_64_entry_limit` cover the boundary.
+3. A canonical or alias destination that equals, contains or lies beneath
+   another share destination is refused before preparation, with both paths
+   named in the error. Comparisons are case-insensitive, as for the guest's
+   mount map; an alias never mounts over another share.
+   `sibling_alias_collisions_are_refused_before_preparation` covers workspace,
+   canonical sibling and alias conflicts, including nested destinations.
 
 The agent runs `/sbin/mount_virtiofs` with `nosuid,nodev` for every entry and `ro`
 for siblings, then verifies the filesystem type, exact tag, destination and
