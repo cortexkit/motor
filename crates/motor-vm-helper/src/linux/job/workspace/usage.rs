@@ -29,12 +29,20 @@ struct Map {
 }
 
 pub(crate) fn exclusive_bytes(file: &File) -> Result<u64> {
+    // Map only the file's own bytes. XFS keeps speculative preallocation past
+    // EOF while a just-written file is still open, and FIEMAP reports it as
+    // unwritten or delayed-allocation extents; those blocks are not part of
+    // the file and would be refused or counted as if they held its data.
+    let size = file.metadata()?.len();
     let mut start = 0;
     let mut exclusive = 0u64;
     loop {
+        if start >= size {
+            return Ok(exclusive);
+        }
         let mut map = Map {
             start,
-            length: u64::MAX - start,
+            length: size - start,
             // Flush delayed allocation before interpreting physical extents.
             flags: 1,
             mapped: 0,
@@ -65,8 +73,9 @@ pub(crate) fn exclusive_bytes(file: &File) -> Result<u64> {
                 .checked_add(extent.length)
                 .ok_or_else(|| Error("FIEMAP overflow".into()))?;
             if extent.flags & SHARED == 0 {
+                // A block-aligned last extent may end past EOF; count file bytes only.
                 exclusive = exclusive
-                    .checked_add(extent.length)
+                    .checked_add(start.min(size).saturating_sub(extent.logical))
                     .ok_or_else(|| Error("FIEMAP overflow".into()))?;
             }
         }
@@ -106,6 +115,28 @@ mod tests {
         clone.sync_all().unwrap();
         assert_eq!(exclusive_bytes(&clone).unwrap(), 1024 * 1024);
         assert_eq!(exclusive_bytes(&source).unwrap(), 1024 * 1024);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn open_just_written_file_counts_only_its_own_bytes() {
+        // Publication checks a physical copy before closing it. On XFS the
+        // still-open file carries speculative preallocation past EOF.
+        let base = super::super::super::tests::scratch();
+        std::fs::create_dir_all(&base).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(base.join("copy"))
+            .unwrap();
+        let chunk = vec![7; 1024 * 1024];
+        for _ in 0..96 {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(&chunk[..4096 + 333]).unwrap();
+        file.sync_all().unwrap();
+        let len = file.metadata().unwrap().len();
+        assert_eq!(exclusive_bytes(&file).unwrap(), len);
         std::fs::remove_dir_all(base).unwrap();
     }
 }
