@@ -127,7 +127,25 @@ impl Runtime {
             let mut host = self.host.lock().expect("host lock");
             host.job_stopped_at(job, unclean, unix_ms())?;
         }
+        self.publish_job_settlement(job)?;
         self.job_resources.release(job)
+    }
+
+    fn publish_job_settlement(&self, job: &str) -> Result<()> {
+        if self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions[job]
+            .replay_completion
+            == Some(crate::state::jobs::storage::ReplayCompletion::Quarantined)
+        {
+            return Ok(());
+        }
+        let stream = self.job_stream(job)?;
+        stream::publish_settlement(self, job, &stream)
     }
 
     /// Forgets that this process stopped a job's VM, once the job has ended.
@@ -159,11 +177,9 @@ impl Runtime {
         for execution in executions {
             let job = &execution.claims.jti;
             if execution.ended {
-                if execution.final_replay_reservation_bytes.is_some() {
-                    if let Ok(stream) = self.job_stream(job) {
-                        if let Err(error) = stream::publish_settlement(self, job, &stream) {
-                            tracing::warn!(jti = job, %error, "job_final_replay_unavailable");
-                        }
+                if let Ok(stream) = self.job_stream(job) {
+                    if let Err(error) = stream::publish_settlement(self, job, &stream) {
+                        tracing::warn!(jti = job, %error, "job_final_replay_unavailable");
                     }
                 }
                 self.job_resources.release(job)?;
@@ -444,6 +460,22 @@ impl Runtime {
         // Release is durable and idempotent, including across host restarts.
         for job in ended {
             self.forget_helper_stop(&job);
+            if self
+                .host
+                .lock()
+                .expect("host lock")
+                .snapshot
+                .per_job
+                .executions[&job]
+                .replay_completion
+                .is_none()
+            {
+                tick_step(
+                    &mut failure,
+                    "settlement_replay",
+                    self.publish_job_settlement(&job),
+                );
+            }
             tick_step(&mut failure, "release", self.job_resources.release(&job));
             let expire = {
                 let host = self.host.lock().expect("host lock");
@@ -622,6 +654,7 @@ impl Runtime {
                 .unwrap_or(true);
             host.job_stopped_at(&report.job_id, unclean, unix_ms())?;
         }
+        self.publish_job_settlement(&report.job_id)?;
         self.job_resources.release(&report.job_id)
     }
 
@@ -866,7 +899,16 @@ async fn failed<S: AsyncWrite + Unpin>(
         .host
         .lock()
         .expect("host lock")
-        .host_settled_frames(&claims.jti, 0);
+        .host_settled_frames(&claims.jti, 0)
+        .filter(|frames| {
+            // Keep the live pre-delivery error reply as lease_refused; the
+            // replay terminal still records the durable refusal for reattach.
+            !frames.iter().any(|frame| {
+                frame["type"] == "terminal"
+                    && frame["ran"] == "none"
+                    && frame["outcome"]["reason"] == "internal_failure"
+            })
+        });
     if let Some(frames) = frames {
         for frame in frames {
             write_frame(client, &frame).await?;

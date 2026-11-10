@@ -440,7 +440,7 @@ fn reboot_gap_bound_starts_at_first_gone_observation_and_survives_restart() {
 
 #[test]
 fn helper_restart_re_adopts_running_jobs_and_keeps_their_outcomes_separate() {
-    let (runtime, _, _) = fixture();
+    let (runtime, _, storage) = fixture();
     running(&runtime, JOB, true, true);
     // A distinct workspace lets both VMs run concurrently.
     let mut second = claims(JOB2);
@@ -460,9 +460,10 @@ fn helper_restart_re_adopts_running_jobs_and_keeps_their_outcomes_separate() {
     // reconnect to the existing VMs without authorizing another launch.
     let fake = Arc::new(Fake::default());
     let snapshot = runtime.host.lock().unwrap().snapshot.clone();
-    let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(Journal));
+    let (journal, _) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+    let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
     host.settings = runtime.host.lock().unwrap().settings.clone();
-    let restarted = Runtime::with_job_resources("host".into(), host, fake.clone(), Storage::new());
+    let restarted = Runtime::with_job_resources("host".into(), host, fake.clone(), storage);
     restarted.recover_jobs().unwrap();
     assert_eq!(
         fake.calls

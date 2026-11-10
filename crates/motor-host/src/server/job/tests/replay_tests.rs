@@ -505,6 +505,141 @@ async fn failed_guest_channel_stops_after_teardown_timeout_and_replays_lost_sett
 }
 
 #[tokio::test]
+async fn delayed_exit_after_delivered_channel_failure_commits_terminal_for_live_and_attach() {
+    let (runtime, fake, _) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    // No Started frame is observed, but the delivered Run may still have run.
+    guest.write_all(&records()[1]).await.unwrap();
+    assert_eq!(next_record(&mut client).await.value["seq"], 1);
+    fake.fail_poll.store(true, Ordering::SeqCst);
+    drop(guest);
+    let stream = runtime.job_stream(JOB).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stream.running_for_test() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!stream.with_store(|s| Ok(s.ended())).unwrap());
+    fake.fail_poll.store(false, Ordering::SeqCst);
+    runtime.collect_job_exits(unix_ms()).unwrap();
+    assert!(stream.with_store(|s| Ok(s.ended())).unwrap());
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = read_frame(&mut client).await.unwrap();
+            if frame["type"] == "terminal" {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(terminal["outcome"]["type"], "outcome_unknown");
+    assert_eq!(terminal["ran"], "remote");
+    assert_eq!(terminal["last_seq"], 2);
+    task.await.unwrap().unwrap();
+    let attached = replayed(&runtime).await;
+    assert_eq!(
+        crate::replay::decode(attached.last().unwrap()).unwrap(),
+        terminal
+    );
+}
+
+#[tokio::test]
+async fn execution_exit_preserves_an_already_stored_runner_terminal() {
+    let (runtime, fake, _) = fixture();
+    let id = claim(&runtime, &claims(JOB));
+    runtime.host.lock().unwrap().delivered(id).unwrap();
+    let stored = runtime.job_stream(JOB).unwrap();
+    stored
+        .with_store(|s| {
+            for frame in records() {
+                s.append(&frame)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    {
+        let terminal = crate::replay::decode(records().last().unwrap()).unwrap();
+        runtime.observe_job_frame(JOB, &terminal).unwrap();
+    }
+    power_off(&runtime, &fake);
+    assert_eq!(
+        stored.with_store(|s| s.frame(s.len() - 1)).unwrap(),
+        Some(records().last().unwrap().clone())
+    );
+    assert_eq!(replayed(&runtime).await.last(), records().last());
+}
+
+#[tokio::test]
+async fn restart_recovers_a_missing_terminal_after_receipt_or_evidence_expiry() {
+    use crate::state::jobs::storage::ReplayCompletion;
+    for receipt in [false, true] {
+        let (runtime, fake, storage) = fixture();
+        let id = claim(&runtime, &claims(JOB));
+        {
+            let mut host = runtime.host.lock().unwrap();
+            host.delivered(id).unwrap();
+            if receipt {
+                host.job_exit_received(
+                    &motor_vm_helper::job::ExitReport {
+                        job_id: JOB.into(),
+                        oom_kill: 0,
+                        egress_bytes: None,
+                    },
+                    unix_ms(),
+                )
+                .unwrap();
+            }
+            host.job_stopped(JOB, true).unwrap();
+            // Older snapshots can have exit evidence without a replayable billing terminal.
+            let mut next = host.snapshot.clone();
+            next.billing.entry(JOB.into()).or_default().terminal = None;
+            host.save(next).unwrap();
+        }
+        let mut store = crate::replay::Store::open(storage.root.path(), JOB).unwrap();
+        store.append(&records()[1]).unwrap();
+        drop(store);
+        let restarted = reopen(&runtime, fake, storage);
+        restarted.recover().unwrap();
+        let stream = restarted.job_stream(JOB).unwrap();
+        assert!(stream.with_store(|s| Ok(s.ended())).unwrap());
+        assert_eq!(
+            restarted.host.lock().unwrap().snapshot.per_job.executions[JOB].replay_completion,
+            Some(ReplayCompletion::Terminal)
+        );
+        let attached = replayed(&restarted).await;
+        let terminal = crate::replay::decode(attached.last().unwrap()).unwrap();
+        assert_eq!(terminal["outcome"]["type"], "outcome_unknown");
+        assert_eq!(terminal["ran"], "remote");
+        assert_eq!(terminal["last_seq"], 1);
+    }
+}
+
+#[test]
+fn missing_terminal_without_durable_execution_end_is_not_repaired() {
+    for ended_without_evidence in [false, true] {
+        let (runtime, fake, storage) = fixture();
+        claim(&runtime, &claims(JOB));
+        if ended_without_evidence {
+            let mut host = runtime.host.lock().unwrap();
+            let mut next = host.snapshot.clone();
+            next.per_job.executions.get_mut(JOB).unwrap().ended = true;
+            host.save(next).unwrap();
+        }
+        let restarted = reopen(&runtime, fake, storage);
+        let stream = restarted.job_stream(JOB).unwrap();
+        let ended = stream.with_store(|s| Ok(s.ended()));
+        if ended_without_evidence {
+            assert!(ended.is_err());
+        } else {
+            assert!(!ended.unwrap());
+        }
+    }
+}
+
+#[tokio::test]
 async fn authoritative_terminals_are_byte_identical_live_and_on_replay_after_restart() {
     for host_stop in [false, true] {
         let (runtime, fake, storage) = fixture();

@@ -1298,7 +1298,8 @@ fn restart_cleans_never_booted_spools_and_releases_admission() {
     std::fs::write(storage.spool(JOB), b"abandoned").unwrap();
     let saved = runtime.host.lock().unwrap().snapshot.clone();
     let settings = runtime.host.lock().unwrap().settings.clone();
-    let mut host = Host::new(BTreeMap::new(), saved, Box::new(Journal));
+    let (journal, _) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+    let mut host = Host::new(BTreeMap::new(), saved, Box::new(journal));
     host.settings = settings;
     let restarted = Runtime::with_job_resources(
         "host".into(),
