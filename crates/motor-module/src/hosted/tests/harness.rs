@@ -183,6 +183,8 @@ pub struct Harness {
     /// records but never answers, holding its connection open as a broker
     /// that stopped responding would; 0 answers every request.
     pub unanswered_lease: Arc<AtomicUsize>,
+    /// Hold a parsed lease reply after the broker has decided whether to book it.
+    pub lease_reply_gate: Arc<tokio::sync::watch::Sender<bool>>,
     pub tasks: Vec<JoinHandle<()>>,
 }
 impl Drop for Harness {
@@ -802,6 +804,7 @@ impl Harness {
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let unanswered_lease = Arc::new(AtomicUsize::new(0));
+        let lease_reply_gate = Arc::new(tokio::sync::watch::Sender::new(true));
         let http_task = tokio::spawn({
             let timeline = timeline.clone();
             let broker = broker.clone();
@@ -815,6 +818,7 @@ impl Harness {
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
             let unanswered_lease = unanswered_lease.clone();
+            let lease_reply_gate = lease_reply_gate.clone();
             let run_gate = run_gate.clone();
             async move {
                 // Connections of unanswered requests, kept open until the
@@ -988,6 +992,11 @@ impl Harness {
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
                         continue;
                     }
+                    if path == "/v1/leases" {
+                        timeline.mark("lease reply ready");
+                        let mut gate = lease_reply_gate.subscribe();
+                        gate.wait_for(|open| *open).await.unwrap();
+                    }
                     let body = serde_json::to_vec(&reply.body).unwrap();
                     timeline.mark(format!("broker reply {path} status={}", reply.status));
                     let head = format!("HTTP/1.1 {} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n", reply.status, body.len());
@@ -1027,6 +1036,7 @@ impl Harness {
             attach_history_expired,
             drop_follow,
             unanswered_lease,
+            lease_reply_gate,
             tasks: vec![host_task, http_task],
         }
     }

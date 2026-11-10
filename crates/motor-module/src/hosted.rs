@@ -315,6 +315,7 @@ impl HostedJobState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
     Shutdown,
+    Cancelled,
     Auth,
     /// An attach token was issued, but the host explicitly refused it as auth.
     AttachAuth,
@@ -418,6 +419,7 @@ impl Error {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::Shutdown => "hosted_shutdown",
+            Self::Cancelled => "hosted_cancelled",
             Self::Auth | Self::AttachAuth => "hosted_auth",
             Self::Expired => "hosted_expired",
             Self::Spki => "hosted_spki_mismatch",
@@ -936,6 +938,7 @@ pub(crate) struct Client {
     wait_answers: std::sync::Mutex<WaitAnswers>,
     probe_replies: Option<std::sync::Mutex<fence_probe::Replies>>,
     booking_open: Option<Arc<std::sync::Mutex<bool>>>,
+    cancellation: Option<(Uuid, Arc<Storage>, tokio::sync::watch::Receiver<bool>)>,
     progress: crate::motor::progress::Reporter,
     #[cfg(test)]
     connector: Option<Arc<dyn crate::transport::Connector>>,
@@ -956,11 +959,55 @@ impl Client {
             wait_answers: std::sync::Mutex::new(WaitAnswers::default()),
             probe_replies: None,
             booking_open: None,
+            cancellation: None,
             progress: crate::motor::progress::Reporter::new(false, 2),
             #[cfg(test)]
             connector: None,
         }
     }
+    pub(crate) fn with_cancellation(
+        mut self,
+        id: Uuid,
+        storage: Arc<Storage>,
+        wake: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        self.cancellation = Some((id, storage, wake));
+        self
+    }
+
+    fn cancel_pending(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|(id, storage, _)| storage.job(*id).is_some_and(|job| job.pending_cancel))
+    }
+
+    async fn cancelled(&self) {
+        let Some((_, _, wake)) = &self.cancellation else {
+            return std::future::pending().await;
+        };
+        let mut wake = wake.clone();
+        loop {
+            wake.borrow_and_update();
+            if self.cancel_pending() {
+                return;
+            }
+            if wake.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
+    }
+
+    async fn while_placing<T>(
+        &self,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, Error> {
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => Err(Error::Cancelled),
+            result = future => Ok(result),
+        }
+    }
+
     /// The `error` code of the broker's last refusal seen by this client.
     pub(crate) fn broker_code(&self) -> Option<String> {
         self.broker_code.lock().unwrap().clone()
@@ -1376,6 +1423,9 @@ impl Client {
         let mut cut_off = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
         let mut boat_host_full = false;
         'lease_requests: loop {
+            if self.cancel_pending() {
+                return Err(Error::Cancelled);
+            }
             self.progress
                 .phase(motor_protocol::ProgressPhase::PlacementWait);
             let state = storage
@@ -1386,8 +1436,12 @@ impl Client {
                 return Err(Error::Connect);
             }
             if let Some(iat) = state.retry_iat {
-                if tokio::time::timeout_at(provisioning_deadline, wait_after_iat(iat))
-                    .await
+                if self
+                    .while_placing(tokio::time::timeout_at(
+                        provisioning_deadline,
+                        wait_after_iat(iat),
+                    ))
+                    .await?
                     .is_err()
                 {
                     return Err(self.wait_expired(cut_off));
@@ -1402,7 +1456,13 @@ impl Client {
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
             // means no HTTP request was sent to create a reservation for it.
-            let bearer = match tokio::time::timeout_at(provisioning_deadline, self.bearer()).await {
+            let bearer = match self
+                .while_placing(tokio::time::timeout_at(
+                    provisioning_deadline,
+                    self.bearer(),
+                ))
+                .await?
+            {
                 Ok(result) => result?,
                 Err(_) => return Err(self.wait_expired(cut_off)),
             };
@@ -1485,6 +1545,9 @@ impl Client {
                 storage
                     .hosted_update(id, |state| state.lease(&lease))
                     .map_err(|_| Error::Broker)?;
+                if self.cancel_pending() {
+                    return Err(Error::Cancelled);
+                }
                 tracing::info!(job_id = %id, attempt, provider = if boat { "boat" } else { "first_party" },
                 host = %lease.placement.host, vm = lease.placement.vm.as_deref().unwrap_or(""),
                 max_s = lease.max_s, "hosted lease granted");
@@ -1504,8 +1567,8 @@ impl Client {
                 "hosted connect started");
                 self.progress.phase(motor_protocol::ProgressPhase::Connect);
                 let connected = self
-                    .connect(runner_id, &lease, &key, motor_lease::Purpose::Run)
-                    .await;
+                    .while_placing(self.connect(runner_id, &lease, &key, motor_lease::Purpose::Run))
+                    .await?;
                 match &connected {
                     Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
                     Err(failure) => {
@@ -1546,12 +1609,14 @@ impl Client {
                     let retry_at =
                         tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
                     if retry_at >= provisioning_deadline {
-                        tokio::time::sleep_until(provisioning_deadline).await;
+                        self.while_placing(tokio::time::sleep_until(provisioning_deadline))
+                            .await?;
                         return Err(Error::BoatHostFull);
                     }
                     tracing::info!(job_id = %id, attempt, retry_after_ms = HOST_FULL_RETRY_MS,
                         "Boat host full; waiting for a fresh booking");
-                    tokio::time::sleep_until(retry_at).await;
+                    self.while_placing(tokio::time::sleep_until(retry_at))
+                        .await?;
                     body.job_id = Uuid::now_v7().to_string();
                     storage
                         .hosted_update(id, |s| {
@@ -1587,10 +1652,13 @@ impl Client {
                         // the reservation and requester key while the broker tries
                         // another host; any refusal leaves the old placement intact.
                         let replacement = async {
-                            let bearer =
-                                tokio::time::timeout_at(provisioning_deadline, self.bearer())
-                                    .await
-                                    .map_err(|_| Error::HostFull)??;
+                            let bearer = self
+                                .while_placing(tokio::time::timeout_at(
+                                    provisioning_deadline,
+                                    self.bearer(),
+                                ))
+                                .await?
+                                .map_err(|_| Error::HostFull)??;
                             self.post_ready_authorized::<_, Lease>(
                                 &format!("/v1/leases/{runner_id}/replace"),
                                 &serde_json::json!({}),
@@ -1683,7 +1751,8 @@ impl Client {
                         let retry_at =
                             tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
                         if retry_at >= provisioning_deadline {
-                            tokio::time::sleep_until(provisioning_deadline).await;
+                            self.while_placing(tokio::time::sleep_until(provisioning_deadline))
+                                .await?;
                             return Err(self.wait_expired(Error::NoCapacity(HOST_FULL_RETRY_MS)));
                         }
                         storage
@@ -1695,7 +1764,8 @@ impl Client {
                         tracing::info!(job_id = %id, attempt, code = e.code(),
                         retry_after_ms = HOST_FULL_RETRY_MS, "hosted host full; waiting to ask again");
                         cut_off = Error::NoCapacity(HOST_FULL_RETRY_MS);
-                        tokio::time::sleep_until(retry_at).await;
+                        self.while_placing(tokio::time::sleep_until(retry_at))
+                            .await?;
                         continue 'lease_requests;
                     }
                     Err(e) if e.replaceable() && attempt < 2 => continue 'lease_requests,
@@ -1727,20 +1797,36 @@ impl Client {
     ) -> Result<R, Error> {
         let mut pending = cut_off;
         loop {
-            let reply =
-                tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer)).await;
+            if self.cancel_pending() {
+                return Err(Error::Cancelled);
+            }
+            let request = self.post_authorized(path, body, bearer);
+            tokio::pin!(request);
+            // Disconnect is not rollback: the broker commits a reservation before
+            // replying (runners-contract.md, lease transaction and Boat booking).
+            // On cancel, await this reply and let the submission record and settle
+            // any grant before returning; never discard it to stop placement.
+            let reply = tokio::select! {
+                biased;
+                reply = &mut request => Some(reply),
+                _ = self.cancelled() => Some(request.await),
+                _ = tokio::time::sleep_until(deadline) => None,
+            };
             let reply = match reply {
-                Ok(Err(Error::HostFull | Error::Capacity)) if cut_off == Error::BoatHostFull => {
-                    Ok(Err(Error::NoCapacity(HOST_FULL_RETRY_MS)))
+                Some(Err(Error::HostFull | Error::Capacity)) if cut_off == Error::BoatHostFull => {
+                    Some(Err(Error::NoCapacity(HOST_FULL_RETRY_MS)))
                 }
                 reply => reply,
             };
-            if let Ok(Err(error)) = &reply {
+            if let Some(Err(error)) = &reply {
                 self.wait_answers.lock().unwrap().observe(*error);
             }
+            if self.cancel_pending() && !matches!(&reply, Some(Ok(_))) {
+                return Err(Error::Cancelled);
+            }
             match reply {
-                Err(_) => return Err(self.wait_expired(pending)),
-                Ok(Err(
+                None => return Err(self.wait_expired(pending)),
+                Some(Err(
                     error @ (Error::Provisioning(_)
                     | Error::NoCapacity(_)
                     | Error::ReplacePending(_)),
@@ -1763,16 +1849,21 @@ impl Client {
                     #[cfg(test)]
                     tracing::info!(path, "hosted broker retry wait");
                     if retry_at >= deadline {
-                        tokio::time::sleep_until(deadline).await;
+                        self.while_placing(tokio::time::sleep_until(deadline))
+                            .await?;
                         return Err(self.wait_expired(pending));
                     }
-                    tokio::time::sleep_until(retry_at).await;
-                    bearer = match tokio::time::timeout_at(deadline, self.bearer()).await {
+                    self.while_placing(tokio::time::sleep_until(retry_at))
+                        .await?;
+                    bearer = match self
+                        .while_placing(tokio::time::timeout_at(deadline, self.bearer()))
+                        .await?
+                    {
                         Ok(result) => result?,
                         Err(_) => return Err(self.wait_expired(pending)),
                     };
                 }
-                Ok(result) => return result,
+                Some(result) => return result,
             }
         }
     }

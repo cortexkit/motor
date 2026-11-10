@@ -17,6 +17,7 @@ pub(crate) struct Reporter {
     phase: watch::Sender<Option<Phase>>,
     enabled: bool,
     vcpus: u32,
+    job_id: Option<motor_protocol::Uuid>,
 }
 
 impl Reporter {
@@ -26,7 +27,20 @@ impl Reporter {
             phase,
             enabled,
             vcpus,
+            job_id: None,
         }
+    }
+
+    pub(crate) fn with_job_id(mut self, id: motor_protocol::Uuid) -> Self {
+        self.job_id = Some(id);
+        self
+    }
+
+    pub(crate) fn initial(&self) -> StreamRecord {
+        self.record(&Phase {
+            kind: ProgressPhase::PlacementWait,
+            started: Instant::now(),
+        })
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -67,6 +81,10 @@ impl Reporter {
         };
         let record = Progress::new(phase.kind.clone(), elapsed, detail)
             .unwrap_or_else(|_| Progress::new(phase.kind.clone(), elapsed, None).unwrap());
+        let record = match self.job_id {
+            Some(id) => record.with_job_id(id),
+            None => record,
+        };
         StreamRecord::Progress(record)
     }
 
