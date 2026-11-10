@@ -117,6 +117,7 @@ impl Runtime {
             Store::open(&directory, job)
         })
         .and_then(|mut store| {
+            publish_to_store(self, job, &mut store)?;
             let host = self.host.lock().expect("host lock");
             ensure!(
                 store.ended()
@@ -532,14 +533,16 @@ async fn collect(
     tokio::select! { result = upload => result, result = receive => result, _ = crashed => Ok(()) }
 }
 
-// Host-stop evidence can be committed before the collector drains its final
+// Host settlement can be committed before the collector drains its final
 // output. Freeze the delivered watermark only when committing the terminal to
 // replay, using the host's own cursor rather than the guest's terminal claims.
 fn host_terminal_delivery(mut terminal: Value, last_seq: Option<u64>) -> Value {
-    if matches!(
-        terminal["oom_kill"]["cause"].as_str(),
-        Some("host_pressure" | "host_oom")
-    ) {
+    if terminal["outcome"]["type"] == "outcome_unknown"
+        || matches!(
+            terminal["oom_kill"]["cause"].as_str(),
+            Some("host_pressure" | "host_oom")
+        )
+    {
         let fields = terminal.as_object_mut().expect("terminal object");
         if let Some(seq) = last_seq {
             fields.insert("last_seq".into(), seq.into());
@@ -569,35 +572,80 @@ mod tests {
 }
 
 pub(super) fn publish_settlement(runtime: &Runtime, job: &str, stream: &Stream) -> Result<()> {
-    stream.with_store(|store| {
-        if store.ended() {
-            return Ok(());
-        }
-        let frames = runtime
-            .host
-            .lock()
-            .expect("host lock")
-            .host_settled_frames(job, store.last_seq().unwrap_or(0).saturating_add(1));
-        if let Some(frames) = frames {
-            for frame in frames {
-                if frame["type"] == "hosted_terminal" {
-                    continue;
-                }
-                let frame = host_terminal_delivery(frame, store.last_seq());
-                let data = serde_json::to_vec(&frame)?;
-                let bytes = [(data.len() as u32).to_be_bytes().as_slice(), &data].concat();
-                store.append(&bytes)?;
-                if let Some(seq) = frame["seq"].as_u64() {
-                    runtime
-                        .host
-                        .lock()
-                        .expect("host lock")
-                        .watermark(job, seq)?;
-                }
+    stream.with_store(|store| publish_to_store(runtime, job, store))
+}
+
+fn publish_to_store(runtime: &Runtime, job: &str, store: &mut Store) -> Result<()> {
+    if store.ended() {
+        return Ok(());
+    }
+    let frames = {
+        let mut host = runtime.host.lock().expect("host lock");
+        if let Some(frames) =
+            host.host_settled_frames(job, store.last_seq().unwrap_or(0).saturating_add(1))
+        {
+            // These frames already encode proven queued-job withdrawals or
+            // outcomes selected by the host's settlement evidence.
+            frames
+        } else {
+            let execution = &host.snapshot.per_job.executions[job];
+            if !execution.ended
+                || !execution
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|e| e.exit.is_some() || e.evidence_expired)
+            {
+                return Ok(());
             }
+            // Queued-job withdrawal ends an undelivered lease with zero usage,
+            // so no Run can later be delivered. Missing Started proves nothing.
+            let lease = &host.snapshot.leases[job];
+            let never_started = !lease.delivered
+                && lease.started_at_ms.is_none()
+                && host.snapshot.zero_usage.contains_key(job);
+            let terminal = if never_started {
+                host.snapshot
+                    .billing
+                    .get(job)
+                    .and_then(|b| b.terminal.clone())
+                    .unwrap_or_else(|| {
+                        refusal(
+                            job,
+                            "internal_failure",
+                            "execution ended before Run delivery",
+                        )
+                    })
+            } else {
+                // An ended VM proves no more output can arrive, not that its
+                // delivered Run never started. Missing history stays unknown.
+                host_terminal_delivery(
+                    json!({"type":"terminal","job_id":job,"outcome":{"type":"outcome_unknown"},"wall_ms":0,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null}),
+                    store.last_seq(),
+                )
+            };
+            let mut next = host.snapshot.clone();
+            next.billing.entry(job.into()).or_default().terminal = Some(terminal.clone());
+            host.save(next)?;
+            vec![terminal]
         }
-        Ok(())
-    })
+    };
+    for frame in frames {
+        if frame["type"] == "hosted_terminal" {
+            continue;
+        }
+        let frame = host_terminal_delivery(frame, store.last_seq());
+        let data = serde_json::to_vec(&frame)?;
+        let bytes = [(data.len() as u32).to_be_bytes().as_slice(), &data].concat();
+        store.append(&bytes)?;
+        if let Some(seq) = frame["seq"].as_u64() {
+            runtime
+                .host
+                .lock()
+                .expect("host lock")
+                .watermark(job, seq)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
