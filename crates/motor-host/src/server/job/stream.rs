@@ -10,6 +10,13 @@ use tokio::sync::oneshot;
 /// the runner's 60-second wire inactivity limit.
 pub(super) const GUEST_HEARTBEAT: Duration = Duration::from_secs(5);
 
+/// Longest gap between host writes to an attached caller once the job has
+/// started, inside ck-motor's 60-second read inactivity limit. The runner's
+/// own heartbeats are not replay records, so a job that prints nothing for a
+/// minute would otherwise look dead to the caller, which then reconnects and
+/// replays from its cursor over and over.
+pub(super) const CLIENT_HEARTBEAT: Duration = Duration::from_secs(10);
+
 struct Input {
     bytes: Vec<u8>,
     reply: Option<oneshot::Sender<Vec<u8>>>,
@@ -678,6 +685,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
     }
     let (mut read, mut write) = tokio::io::split(client);
+    let mut last_write = tokio::time::Instant::now();
+    // Heartbeats carry no queue time, which tells ck-motor to stop timing a
+    // queue; send them only once the runner has started the command. Every
+    // sequenced record (started, output, returned files) comes after that.
+    let mut started = false;
     loop {
         let s = stream.clone();
         let frame = tokio::task::spawn_blocking(move || {
@@ -699,6 +711,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some((next, bytes)) = frame {
             let value = crate::replay::decode(&bytes)?;
             position = next;
+            started |= value["seq"].is_u64();
             if attached
                 && !is_reply(&value)
                 && value["seq"].as_u64().is_none_or(|seq| seq >= minimum)
@@ -708,6 +721,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     .await
                     .map_err(anyhow::Error::from)
                     .map_err(client_io)?;
+                last_write = tokio::time::Instant::now();
                 if let Some(seq) = value["seq"].as_u64() {
                     minimum = seq.saturating_add(1);
                 }
@@ -778,7 +792,14 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     _ => anyhow::bail!("operation_refused"),
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                if attached && started && last_write.elapsed() >= CLIENT_HEARTBEAT {
+                    write_frame(&mut write, &json!({"type":"heartbeat"}))
+                        .await
+                        .map_err(client_io)?;
+                    last_write = tokio::time::Instant::now();
+                }
+            }
         }
     }
 }

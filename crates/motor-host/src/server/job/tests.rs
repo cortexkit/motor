@@ -1833,6 +1833,30 @@ async fn quiet_running_job_channel_gets_host_heartbeats() {
     runtime.stop_job(JOB, true, false).unwrap();
 }
 
+/// ck-motor closes a host stream after 60 s without a byte. Runner heartbeats
+/// are not replay records, so once a job has started and gone quiet, the host
+/// itself must keep the attached caller's stream alive.
+#[tokio::test]
+async fn quiet_started_job_sends_the_caller_host_heartbeats() {
+    let (runtime, fake, _) = fixture();
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    queued(&mut client, JOB).await;
+    next_type(&mut client, "output").await;
+    let beat = tokio::time::timeout(
+        super::stream::CLIENT_HEARTBEAT + Duration::from_secs(3),
+        next_type(&mut client, "heartbeat"),
+    )
+    .await
+    .expect("no host heartbeat reached the quiet caller");
+    assert_eq!(beat, json!({"type":"heartbeat"}));
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+    drop(fake);
+}
+
 /// ck-motor uploads missing history after its Run is accepted. A large upload
 /// outlasts the VM boot, so its later chunks reach the live connection and must
 /// be relayed, although a bundle chunk names no job.
