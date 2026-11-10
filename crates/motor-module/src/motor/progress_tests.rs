@@ -63,7 +63,7 @@ async fn hosted_wait(opt_in: bool) -> Vec<StreamRecord> {
     .await;
     tokio::time::advance(Duration::from_millis(1999)).await;
     tokio::task::yield_now().await;
-    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap().len(), usize::from(opt_in));
     for (advance, elapsed) in [(1, 2000), (9999, 2000), (1, 12000), (10000, 22000)] {
         tokio::time::advance(Duration::from_millis(advance)).await;
         tokio::task::yield_now().await;
@@ -125,9 +125,17 @@ async fn hosted_no_capacity_progress_cadence_and_no_replay() {
             .iter()
             .map(|p| p.phase_elapsed_ms())
             .collect::<Vec<_>>(),
-        [2000, 12000, 22000]
+        [0, 2000, 12000, 22000]
     );
     for record in progress {
+        let id = records
+            .iter()
+            .find_map(|record| match record {
+                StreamRecord::Accepted(accepted) => Some(accepted.job_id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(record.job_id(), Some(id));
         assert_eq!(record.phase(), &ProgressPhase::PlacementWait);
         assert_eq!(
             record.detail(),
@@ -155,7 +163,48 @@ async fn opted_out_hosted_wait_has_no_progress() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn fast_hosted_run_has_no_progress() {
+async fn timed_progress_carries_the_assigned_job_id() {
+    let _clock = HeldClock::new();
+    let logs = crate::logging::Captured::default();
+    let _logs = crate::logging::scoped(logs.clone());
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.lease_replies.lock().unwrap().push_back((
+        503,
+        serde_json::json!({"error":"no_capacity"}),
+        "30",
+    ));
+    let (scratch, repo) = committed_repo();
+    let motor = Motor::with_connector(
+        Config {
+            hosted_repositories: vec![repo.to_str().unwrap().into()],
+            ..h.config()
+        },
+        &scratch.0.join("state"),
+        Arc::new(NoSsh(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    let mut stream = motor.run(request(&repo).with_progress(true)).unwrap();
+    let id = stream.job_id;
+    until("broker retry before the timed progress", || {
+        logs.text().contains("hosted broker retry wait")
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    loop {
+        if let StreamRecord::Progress(progress) = stream.records.recv().await.unwrap().unwrap() {
+            if progress.phase_elapsed_ms() >= 2000 {
+                assert_eq!(progress.job_id(), Some(id));
+                break;
+            }
+        }
+    }
+    stream.cancel().unwrap();
+    collect(stream, Arc::new(Mutex::new(Vec::new()))).await;
+    motor.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_hosted_run_reports_id_immediately() {
     let _clock = HeldClock::new();
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
@@ -176,11 +225,19 @@ async fn fast_hosted_run_has_no_progress() {
     ));
     until("fast hosted completion", || task.is_finished()).await;
     task.await.unwrap();
-    assert!(!seen
-        .lock()
-        .unwrap()
+    let seen = seen.lock().unwrap().clone();
+    let StreamRecord::Progress(progress) = &seen[0] else {
+        panic!("the first record must disclose the job ID: {seen:?}");
+    };
+    assert_eq!(progress.phase_elapsed_ms(), 0);
+    let id = seen
         .iter()
-        .any(|r| matches!(r, StreamRecord::Progress(_))));
+        .find_map(|record| match record {
+            StreamRecord::Accepted(accepted) => Some(accepted.job_id),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(progress.job_id(), Some(id));
     motor.close().await;
 }
 

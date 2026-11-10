@@ -952,10 +952,11 @@ async fn grant_after_cancel_before_connect_finishes_cancelled_once() {
     job.owner.await.unwrap().unwrap();
     assert_eq!(terminal(job.stream).await.outcome, Outcome::Cancelled);
     job.motor.shutdown_hosted().await;
+    // A cancel during placement sends no Run.
     assert_eq!(
         h.runner.runs.load(Ordering::SeqCst),
-        1,
-        "only the tombstoned submission, never a resubmission"
+        0,
+        "no submission or resubmission reaches the runner"
     );
     assert_settled(&h, &job.motor, id, "cancelled", 0);
 }

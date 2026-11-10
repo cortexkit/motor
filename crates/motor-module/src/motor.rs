@@ -86,6 +86,8 @@ pub struct Motor {
 }
 mod agent_run;
 mod health;
+#[cfg(test)]
+mod placement_cancel_tests;
 pub(crate) mod progress;
 #[cfg(test)]
 mod progress_tests;
@@ -483,6 +485,16 @@ impl Motor {
             (caller_tx, caller_wake, None)
         };
         let owner_tx = tx.clone();
+        if request.progress() {
+            // Publish the ID before starting work, independently of phase timers.
+            tx.try_send(Ok(progress::Reporter::new(
+                true,
+                request.weight_hint.unwrap_or(2),
+            )
+            .with_job_id(id)
+            .initial()))
+                .map_err(io::Error::other)?;
+        }
         let motor = self.clone();
         let producer = tokio::spawn(async move {
             let _submission = submission;
@@ -894,7 +906,8 @@ impl Motor {
         let progress = progress::Reporter::new(
             submission.0.progress(),
             submission.0.weight_hint.unwrap_or(2),
-        );
+        )
+        .with_job_id(id);
         let _health = self.observe_health_submission(
             id,
             submission.0.platform.clone().unwrap_or(Platform::Linux),
@@ -1313,7 +1326,10 @@ impl Motor {
         let spill_started = tokio::time::Instant::now();
         let (mut channel, held) = loop {
             let opened = if let Some(state) = self.hosted_state(id) {
-                let client = self.hosted_client(state).with_progress(progress.clone());
+                let client = self
+                    .hosted_client(state)
+                    .with_progress(progress.clone())
+                    .with_cancellation(id, self.storage.clone(), wake.clone());
                 match client
                     .run_for_caller(id, &request, &self.storage, caller)
                     .await
@@ -1327,12 +1343,10 @@ impl Motor {
                         Ok(channel)
                     }
                     Err(error) => {
-                        if matches!(error, crate::hosted::Error::Provisioning(_))
-                            && self.pending(id)
+                        if self.pending(id)
+                            && self.hosted_state(id).is_some_and(|state| !state.run_sent)
                         {
-                            // A booking can arrive after cancellation. Preserve an unknown
-                            // outcome and settle it rather than starting a replacement job.
-                            return self.finish_hosted(id, true, tx).await.map(|_| false);
+                            return self.cancel_hosted_before_run(id, tx).await.map(|_| false);
                         }
                         if spilled && matches!(error, crate::hosted::Error::Provisioning(_)) {
                             let waited_ms = u64::try_from(spill_started.elapsed().as_millis())

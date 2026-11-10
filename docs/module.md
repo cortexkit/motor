@@ -84,6 +84,21 @@ for submission to settle; explicit `exec.cancel` persists cancellation intent
 even while the runner is admitting the job. Linux workspace lifecycle calls do
 not prepare a runner before a dependent run; placement happens when the job runs.
 
+A caller that opts into progress with `progress: true` receives a progress record
+as soon as the job ID exists, before `Accepted`. That first record carries
+`job_id` and is exempt from the usual progress timing: later records wait until
+the current phase has lasted two seconds and are at least ten seconds apart.
+They keep carrying the job ID. Callers that do not opt in receive no progress,
+and attach does not replay progress records.
+
+`exec.cancel {job_id}` can stop a job that is still waiting for placement. When
+no Run was sent to a runner, the job ends `cancelled` with `ran: none`. An
+in-flight lease request is allowed to reply so any booked lease can be released
+or finished; dropping its connection would not roll back the booking. Once a
+Run may have reached a runner, cancellation follows the runner's terminal
+instead of claiming the job never ran. Detaching a stream still leaves the job
+running.
+
 AFT, the agent tool, currently uses one connection and one route per remote job
 (at most two or three calls in flight). Its live cancellation sends a Cancel
 frame on the run subscription and immediately follows with attach, or status

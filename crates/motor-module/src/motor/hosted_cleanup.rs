@@ -20,6 +20,37 @@ impl Default for Cleanup {
 }
 
 impl Motor {
+    pub(super) async fn cancel_hosted_before_run(
+        &self,
+        id: Uuid,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> io::Result<()> {
+        // Only the submission owner calls this, before it can send any Run frame.
+        let terminal = TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0).with_ran(Ran::None);
+        self.storage
+            .hosted_update(id, |state| state.terminal = Some(terminal.clone()))?;
+        self.storage.local_terminal(terminal.clone())?;
+        if let Some(state) = self.hosted_state(id).filter(|state| {
+            state
+                .placement
+                .as_ref()
+                .is_some_and(|placement| placement.host.starts_with("boat:"))
+        }) {
+            self.hosted_client(state)
+                .finish(id, Some(&terminal), &self.storage)
+                .await?;
+        }
+        if let Err(error) = self
+            .cleanup_hosted_once_with_deadline(id, false, None)
+            .await
+        {
+            self.log_hosted_failure(id, "cancel_placement_settlement", error);
+        }
+        // Failed releases and finishes retain their durable retry owner.
+        self.recover_hosted(id);
+        emit(tx, StreamRecord::Terminal(terminal)).await
+    }
+
     pub(super) fn retire_unstarted_hosted(&self, id: Uuid, now: u64) -> io::Result<bool> {
         // Keep ownership gates closed until the terminal is durable. In
         // particular, settlement recovery and a submission waiting for capacity

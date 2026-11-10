@@ -127,13 +127,9 @@ async fn cancel_without_a_granted_lease_settles_the_never_ran_booking_once() {
     let Some(reported) = reported else {
         panic!("the caller was told no outcome at all");
     };
-    assert!(
-        matches!(
-            reported.outcome,
-            Outcome::OutcomeUnknown | Outcome::Cancelled
-        ),
-        "{reported:?}"
-    );
+    assert_eq!(reported.outcome, Outcome::Cancelled);
+    assert_eq!(reported.ran, Some(Ran::None));
+    assert_eq!(boat.runs.load(Ordering::SeqCst), 0);
 
     // The lease request is answered last, after the caller is gone. Nothing
     // was booked, and nothing may stay booked.
