@@ -124,6 +124,11 @@ and jobs.
 Otherwise identical sources produce unrelated entries and every lookup misses.
 Test: `reader_and_writer_have_identical_hashed_cargo_inputs`.
 
+Fills therefore inherit the same nested-Cargo lock trap as jobs: a build script
+starting another Cargo with its own `--target-dir` must remove
+`CARGO_BUILD_BUILD_DIR` from that child command's environment. See
+[job isolation](job-isolation.md) for the build-folder lock and workaround.
+
 Linux fills and isolated Rust jobs also share
 `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
 `CARGO_PROFILE_TEST_DEBUG=line-tables-only`. Line-only debug info keeps file and
@@ -291,6 +296,15 @@ tests.
   Test: `failed_descriptor_is_suppressed_until_change_or_restart`.
 
 ### After a fill
+
+Linux writer units, including compile-cache fills and local base builds, have a
+90-minute runtime cap. The runner-local `--writer-runtime-limit-secs` setting
+changes that cap (default `5400`, must be positive). On expiry systemd stops the
+whole unit, escalating to SIGKILL after two seconds; the failed fill cannot
+publish a successful fill record or replace the current build base. The cap
+covers execution, including preflight and warm-up steps, not queue wait or
+trusted source preparation. The runner logs writer start, end and kill requests
+with repository, unit and age so operators can identify a stuck writer.
 
 The runner records the files the writer created (with `inotify`, without
 walking existing entries) and repairs their permissions so readers can open

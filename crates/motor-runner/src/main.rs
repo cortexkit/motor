@@ -542,6 +542,10 @@ fn configure_options(
                 config.snapshot_javascript_timeout =
                     std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
             }
+            "--writer-runtime-limit-secs" => {
+                config.writer_runtime_limit =
+                    std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
+            }
             "--sibling-freshness-entries" => {
                 config.sibling_freshness_entries = value.parse().map_err(io::Error::other)?
             }
@@ -903,6 +907,34 @@ mod metrics_cli_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writer_runtime_limit_defaults_to_ninety_minutes_and_rejects_zero() {
+        let mut config = motor_runner::Config::new("unused-writer-limit-state", "main");
+        assert_eq!(
+            config.writer_runtime_limit,
+            std::time::Duration::from_secs(5400)
+        );
+        super::configure_options(
+            &mut config,
+            ["--writer-runtime-limit-secs".into(), "7200".into()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.writer_runtime_limit,
+            std::time::Duration::from_secs(7200)
+        );
+        super::configure_options(
+            &mut config,
+            ["--writer-runtime-limit-secs".into(), "0".into()].into_iter(),
+        )
+        .unwrap();
+        assert!(config
+            .check_options()
+            .unwrap_err()
+            .to_string()
+            .contains("--writer-runtime-limit-secs must be positive"));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn print_hello_answers_without_opening_runner_state() {

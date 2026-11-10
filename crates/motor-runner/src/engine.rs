@@ -226,6 +226,9 @@ pub struct Config {
     /// Time limit of one sibling snapshot helper unit running a JavaScript
     /// install while a snapshot is created.
     pub snapshot_javascript_timeout: Duration,
+    /// Runtime cap for a cache fill or base build, independent of queue/setup
+    /// time. Linux also enforces it in the writer unit if the daemon stops.
+    pub writer_runtime_limit: Duration,
     /// Most entries one workspace's freshness record keeps per sibling; older
     /// closed entries are folded into one `unknown` entry beyond it (see
     /// `sibling_snapshots::freshness`). At least 2.
@@ -450,6 +453,8 @@ const WARM_BUILD_VCPUS: u32 = 4;
 /// registry or JavaScript package cache can take minutes to fill; a helper
 /// still running after this is stuck.
 const DEFAULT_SNAPSHOT_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// Cold repository builds include test artifacts and a clippy warm-up pass.
+pub(crate) const DEFAULT_WRITER_RUNTIME_LIMIT: Duration = Duration::from_secs(90 * 60);
 
 /// Default of `Config::sibling_snapshot_cap`. With the 24-hour idle expiry
 /// it bounds snapshot disk use at about 3 GiB in the worst case for the four
@@ -613,6 +618,7 @@ impl Config {
             drop_timeout: Duration::from_secs(60),
             snapshot_prefetch_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
             snapshot_javascript_timeout: DEFAULT_SNAPSHOT_HELPER_TIMEOUT,
+            writer_runtime_limit: DEFAULT_WRITER_RUNTIME_LIMIT,
             sibling_freshness_entries: crate::sibling_snapshots::freshness::DEFAULT_RECORD_ENTRIES,
             sibling_snapshot_cap: DEFAULT_SIBLING_SNAPSHOT_CAP,
             sibling_snapshot_idle: DEFAULT_SIBLING_SNAPSHOT_IDLE,
@@ -711,6 +717,11 @@ impl Config {
 
     /// Validate serve options without opening the state directory or taking locks.
     pub fn check_options(&self) -> io::Result<()> {
+        if self.writer_runtime_limit.is_zero() {
+            return Err(io::Error::other(
+                "--writer-runtime-limit-secs must be positive",
+            ));
+        }
         if self.per_job && (!self.tenant_vm || self.boat_profile) {
             return Err(io::Error::other("--per-job requires a tenant runner"));
         }
@@ -6480,6 +6491,7 @@ impl Runner {
                 );
             }
             tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel checked unit is alive");
+            self.log_writer(&job, "kill_requested");
             if let Err(error) = self.core.backend.cancel(&self.core.config, &job, false) {
                 tracing::warn!(job_id = %id, %error, "cancel stop failed; intent retained for scheduler retry");
                 return Err(error);
@@ -7908,6 +7920,33 @@ impl Runner {
         Ok(())
     }
 
+    fn log_writer(&self, job: &Job, event: &'static str) {
+        if !job.base {
+            return;
+        }
+        let repository = job
+            .request
+            .as_ref()
+            .map(|r| r.repository_root.as_str())
+            .unwrap_or("unknown");
+        let unit = job
+            .process
+            .and_then(|process| process.unit)
+            .map(|unit| self.core.backend.unit_name(&self.core.config, unit));
+        #[cfg(target_os = "linux")]
+        let kind = if job.base_launch.is_some() {
+            "base_build"
+        } else {
+            "compile_cache_fill"
+        };
+        #[cfg(not(target_os = "linux"))]
+        let kind = "compile_cache_fill";
+        tracing::info!(job_id = %job.id, repository, unit = unit.as_deref().unwrap_or("not_started"),
+            kind, event, started_ms = job.started_ms, age_ms = job.started_ms.map(|start| self.now().saturating_sub(start)),
+            outcome = ?job.terminal.as_ref().map(|terminal| &terminal.outcome), kill = ?job.kill,
+            "writer lifecycle");
+    }
+
     fn enforce_kills(&self, instant: std::time::Instant) -> io::Result<()> {
         let now = self.now();
         let ids: Vec<_> = self
@@ -7936,27 +7975,29 @@ impl Runner {
             else {
                 continue;
             };
-            if job.kill.is_none()
-                && job
-                    .request
+            let timeout_ms = if job.base {
+                Some(
+                    self.core
+                        .config
+                        .writer_runtime_limit
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                )
+            } else {
+                job.request
                     .as_ref()
                     .and_then(|request| request.timeout)
-                    .is_some_and(|seconds| {
-                        now.saturating_sub(job.started_ms.unwrap()) >= seconds.saturating_mul(1000)
-                    })
+                    .map(|seconds| seconds.saturating_mul(1000))
+            };
+            if job.kill.is_none()
+                && timeout_ms
+                    .is_some_and(|limit| now.saturating_sub(job.started_ms.unwrap()) >= limit)
             {
                 let mut updated = job.clone();
                 // Storage contention may defer this pass past the deadline.
                 // Keep the original expiry time so a late pass cannot restart
                 // the TERM-to-KILL grace period for an already-overdue command.
-                let deadline = job.started_ms.unwrap().saturating_add(
-                    job.request
-                        .as_ref()
-                        .unwrap()
-                        .timeout
-                        .unwrap()
-                        .saturating_mul(1000),
-                );
+                let deadline = job.started_ms.unwrap().saturating_add(timeout_ms.unwrap());
                 updated.kill = Some((Killed::Deadline, deadline));
                 drop(inner);
                 self.save(&updated)?;
@@ -8003,6 +8044,7 @@ impl Runner {
                     let hard = now.saturating_sub(killed_at) >= 2000;
                     if (hard && attempts < 3) || (!hard && attempts == 0) {
                         let lateness_ms = self.now().saturating_sub(killed_at);
+                        self.log_writer(&job, "kill_requested");
                         let stopped = self.core.backend.cancel(&self.core.config, &job, hard);
                         if stopped.is_ok()
                             && matches!(job.kill, Some((Killed::Deadline, _)))
@@ -9228,6 +9270,7 @@ impl Runner {
             return self.failed_launch(id, execution, error, false, "release_failed");
         }
         tracing::info!(job_id = %id, workspace = %paths::request(&r).caller_workspace_key.text(), base = s.base, permits = weight, since_ms = started_ms, "job started");
+        self.log_writer(&inner.jobs[&id], "started");
         drop(inner);
         if launch.durable_output {
             if let Some(output) = output {
@@ -10333,7 +10376,7 @@ impl Runner {
         // job during collection or persistence retries. It still occupies its
         // workspace until the terminal is committed.
         let finish_started = std::time::Instant::now();
-        let job = {
+        let mut job = {
             // Wait out a cancel or deadline stop that is querying or
             // signalling the unit without the state lock (see
             // `JobLog::signalling`) before claiming finalization.
@@ -10363,6 +10406,14 @@ impl Runner {
         let ended_ms = self.now();
         job.mem_working_peak_mib.stop();
         let evidence = self.execution_evidence(&job);
+        if job.base && evidence.runtime_timed_out() && job.kill.is_none() {
+            // The unit enforces its deadline even while the daemon is stopped.
+            // Retain that result before any publication can trust an exit file.
+            job.kill = Some((Killed::Deadline, self.now()));
+            self.save(&job)?;
+            self.core.inner.lock().unwrap().jobs.insert(id, job.clone());
+            self.log_writer(&job, "runtime_expired");
+        }
         let oom_stopped = evidence.oom_killed()
             || self
                 .core
@@ -10537,6 +10588,9 @@ impl Runner {
             cleanup
         });
         let mut fill_failure = Vec::new();
+        if job.base && matches!(job.kill, Some((Killed::Deadline, _))) {
+            fill_failure.push("writer runtime limit exceeded".into());
+        }
         if let Err(error) = &lock_check {
             fill_failure.push(format!("lockfile integrity: {error}"));
         }
@@ -10673,7 +10727,8 @@ impl Runner {
             if let Some(exit) = inner.exit_statuses.get(&id) {
                 status = Ok(*exit);
             }
-            let success = lock_check.is_ok()
+            let success = (!job.base || inner.jobs[&id].kill.is_none())
+                && lock_check.is_ok()
                 && writer_stats.is_ok()
                 && status.as_ref().is_ok_and(|s| s.success());
             let monitoring_error = status.as_ref().err().map(ToString::to_string);
@@ -10883,6 +10938,7 @@ impl Runner {
         let base = job.base;
         tracing::info!(job_id = %id, outcome = ?job.terminal.as_ref().unwrap().outcome, base,
             finish_ms = finish_started.elapsed().as_millis() as u64, "job finished");
+        self.log_writer(job, "finished");
         if base {
             if !status.as_ref().is_ok_and(|s| s.success()) {
                 fill_failure.push(format!(

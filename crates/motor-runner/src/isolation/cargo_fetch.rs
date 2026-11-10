@@ -89,11 +89,18 @@ fn prepare_with_limits_via(
     let Err(online_error) = online_result else {
         return Ok(());
     };
+    if crate::sibling_snapshots::helper::UnsettledHelper::is(&online_error) {
+        return Err(online_error);
+    }
     crate::setup_log::phase("fetch cargo dependencies offline fallback", || {
         run(command()?.arg("--offline").env("CARGO_NET_OFFLINE", "true"), offline)
-    }).map_err(|offline_error| io::Error::new(offline_error.kind(), format!(
+    }).map_err(|offline_error| {
+        if crate::sibling_snapshots::helper::UnsettledHelper::is(&offline_error) {
+            return offline_error;
+        }
+        io::Error::new(offline_error.kind(), format!(
         "tenant dependency preparation failed: online fetch: {online_error}; offline fallback could not supply locked sources: {offline_error}; provision the tenant Cargo registry index, crate cache and Git sources before running this locked workspace"
-    )))
+    ))})
 }
 
 /// Even offline Cargo can wait for a cache lock or a stuck toolchain probe.
@@ -183,6 +190,72 @@ fn drain(stderr: &mut impl Read, diagnostic: &mut Vec<u8>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsettled_online_helper_never_launches_offline_fallback() {
+        let mut calls = 0;
+        let error = prepare_with_limits_via(
+            || Ok(Command::new("cargo")),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            |_, _| {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::Error::other(
+                        crate::sibling_snapshots::helper::UnsettledHelper {
+                            unit: "motor-snaphelper-unsettled.service".into(),
+                            detail: "injected settlement failure".into(),
+                        },
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(crate::sibling_snapshots::helper::UnsettledHelper::is(
+            &error
+        ));
+        assert!(error
+            .to_string()
+            .contains("motor-snaphelper-unsettled.service"));
+        let contextual = super::super::with_fetch_context(error, "source route");
+        assert!(super::super::cargo_prefetch_admission(
+            uuid::Uuid::now_v7(),
+            true,
+            Err(contextual)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unsettled_offline_helper_retains_its_fatal_type() {
+        let mut calls = 0;
+        let error = prepare_with_limits_via(
+            || Ok(Command::new("cargo")),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            |_, _| {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::Error::other("fetch failed"))
+                } else {
+                    Err(io::Error::other(
+                        crate::sibling_snapshots::helper::UnsettledHelper {
+                            unit: "motor-snaphelper-offline.service".into(),
+                            detail: "still live".into(),
+                        },
+                    ))
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(crate::sibling_snapshots::helper::UnsettledHelper::is(
+            &error
+        ));
+    }
 
     #[test]
     fn tenant_online_qualification_requires_a_new_cache_and_a_downloaded_crate() {

@@ -20,6 +20,71 @@ mod ccache_qualification;
 const HOUR: u64 = 60 * 60 * 1000;
 const DAY: u64 = 24 * HOUR;
 
+#[tokio::test]
+async fn writer_runtime_expiry_fails_fill_without_publication() {
+    let f = Fixture::new();
+    declare(&f, &controlled_command(&f));
+    let runner = controlled_runner_with(&f, |config| {
+        config.writer_runtime_limit = Duration::from_secs(2);
+    });
+    submit_reader(&f, &runner).await;
+    let fill = running_fill(&runner, 0).await;
+    assert_eq!(fill.request.as_ref().unwrap().timeout, None);
+    f.clock.fetch_add(2001, Ordering::SeqCst);
+    runner.enforce_kills(std::time::Instant::now()).unwrap();
+    let killed = runner.core.inner.lock().unwrap().jobs[&fill.id].clone();
+    assert!(matches!(killed.kill, Some((Killed::Deadline, _))));
+    drive(&runner, || {
+        let inner = runner.core.inner.lock().unwrap();
+        inner.jobs[&fill.id].terminal.is_some() && inner.writer.is_none()
+    })
+    .await;
+    let inner = runner.core.inner.lock().unwrap();
+    assert_eq!(
+        inner.jobs[&fill.id].terminal.as_ref().unwrap().outcome,
+        Outcome::TimedOut
+    );
+    drop(inner);
+    let record = repository(&f, &runner);
+    assert!(record.publications.is_empty());
+    assert_eq!(record.failed_descriptor, fill.writer_descriptor);
+    assert_eq!(record.result, Some(RebuildResult::Failed));
+}
+
+#[tokio::test]
+async fn writer_lifecycle_logs_include_repository_unit_start_age_and_outcome() {
+    let f = Fixture::new();
+    declare(&f, &controlled_command(&f));
+    let runner = controlled_runner(&f);
+    submit_reader(&f, &runner).await;
+    let fill = running_fill(&runner, 0).await;
+    let mut sample = fill.clone();
+    let unit_id = Uuid::now_v7();
+    sample.process.as_mut().unwrap().unit = Some(unit_id);
+    f.clock.fetch_add(340_000, Ordering::SeqCst);
+    let log = capture_runner_logs(|| {
+        runner.log_writer(&sample, "started");
+        sample.kill = Some((Killed::Deadline, runner.now()));
+        runner.log_writer(&sample, "kill_requested");
+        sample.terminal_ended(Outcome::TimedOut, runner.now());
+        runner.log_writer(&sample, "finished");
+    });
+    for value in [
+        "writer lifecycle",
+        "compile_cache_fill",
+        &f.root,
+        &unit_id.to_string(),
+        "started_ms",
+        "age_ms=340000",
+        "kill_requested",
+        "finished",
+        "TimedOut",
+    ] {
+        assert!(log.contains(value), "missing {value}: {log}");
+    }
+    settle(&f, &runner, &fill).await;
+}
+
 fn store(name: &str) -> StoreIdentity {
     StoreIdentity {
         endpoint: "https://s3.example.invalid".into(),

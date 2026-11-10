@@ -38,6 +38,141 @@ fn stale_lockfile_refusal_says_to_update_it_locally() {
 }
 
 #[test]
+fn unsettled_nested_fetch_is_fatal_instead_of_optional() {
+    let f = Fixture::new();
+    cargo_package_fixture(&f.workspace.join("nested"), "nested", false);
+    commit_cargo_fixture(&f.workspace);
+    let error = prefetch_cargo_in(
+        &f.workspace,
+        "HEAD",
+        false,
+        Duration::from_secs(1),
+        |_| Ok(Command::new("cargo")),
+        |_, _| panic!("unsettled helper was treated as an optional fetch miss"),
+        |_, fetch| {
+            assert!(matches!(fetch, CargoFetch::Nested(_)));
+            Err(io::Error::other(
+                crate::sibling_snapshots::helper::UnsettledHelper {
+                    unit: "motor-snaphelper-nested.service".into(),
+                    detail: "still running".into(),
+                },
+            ))
+        },
+    )
+    .unwrap_err();
+    assert!(crate::sibling_snapshots::helper::UnsettledHelper::is(
+        &error
+    ));
+}
+
+#[test]
+fn writer_units_have_a_runtime_cap_without_limiting_foreground_jobs() {
+    let f = Fixture::new();
+    for writer in [false, true] {
+        for durable in [false, true] {
+            for tenant in [false, true] {
+                let mut sandbox = f
+                    .command_sandbox()
+                    .in_tenant_vm(tenant)
+                    .with_writer_runtime_limit(Duration::from_secs(17));
+                sandbox.writer = writer;
+                if writer {
+                    sandbox.user = WRITER_USER;
+                }
+                let command = sandbox
+                    .command("sleep 60", &f.workspace, &[], durable, &[0], 1)
+                    .unwrap();
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                assert_eq!(args.contains(&"--property=RuntimeMaxSec=17000ms"), writer);
+                assert!(args.contains(&"--property=KillMode=control-group"));
+                assert!(args.contains(&"--property=SendSIGKILL=yes"));
+                assert!(args.contains(&"--property=TimeoutStopSec=2s"));
+            }
+        }
+    }
+    let mut writer = f.command_sandbox();
+    writer.writer = true;
+    let default = writer
+        .command("true", &f.workspace, &[], true, &[0], 1)
+        .unwrap();
+    assert!(default
+        .get_args()
+        .any(|arg| arg == "--property=RuntimeMaxSec=5400000ms"));
+    assert!(writer
+        .with_writer_runtime_limit(Duration::ZERO)
+        .command("true", &f.workspace, &[], true, &[0], 1)
+        .is_err());
+}
+
+#[test]
+#[ignore = "requires trusted operator, sudo and systemd; starts no VM"]
+fn isolated_writer_runtime_cap_kills_term_resistant_setsid_lock_holder() {
+    let f = Fixture::new();
+    let mut sandbox = f
+        .command_sandbox()
+        .with_writer_runtime_limit(Duration::from_secs(2));
+    sandbox.writer = true;
+    let rendered = sandbox
+        .command("true", &f.workspace, &[], true, &[0], 1)
+        .unwrap();
+    let properties: Vec<_> = rendered
+        .get_args()
+        .filter(|arg| {
+            arg.to_str().is_some_and(|arg| {
+                [
+                    "RuntimeMaxSec=",
+                    "KillMode=",
+                    "SendSIGKILL=",
+                    "TimeoutStopSec=",
+                ]
+                .iter()
+                .any(|name| arg.starts_with(&format!("--property={name}")))
+            })
+        })
+        .collect();
+    let name = format!(
+        "motor-writer-runtime-test-{}.service",
+        Uuid::now_v7().simple()
+    );
+    let result = crate::privilege::command("/usr/bin/systemd-run")
+        .args(["--wait", "--service-type=exec", "--unit", &name])
+        .args(properties)
+        .args(["/bin/bash", "-c", r#"trap '' TERM
+setsid /bin/bash -c 'trap "" TERM; exec 9>"$1/.package-cache"; flock -x 9; echo $$ >"$1/holder-pid"; while :; do sleep 30; done' child "$1" &
+wait"#, "writer-timeout"])
+        .arg(&*f.scratch).status().unwrap();
+    let state = crate::privilege::command("/usr/bin/systemctl")
+        .args(["show", "--property=Result", &name])
+        .output()
+        .unwrap();
+    for operation in ["stop", "reset-failed"] {
+        let _ = crate::privilege::command("/usr/bin/systemctl")
+            .args([operation, &name])
+            .status();
+    }
+    assert!(!result.success());
+    assert!(String::from_utf8_lossy(&state.stdout).contains("Result=timeout"));
+    let pid = fs::read_to_string(f.scratch.join("holder-pid")).unwrap();
+    let stat = fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+    assert!(
+        stat.is_err()
+            || stat.is_ok_and(|stat| matches!(
+                stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+                Some("Z" | "X")
+            ))
+    );
+    use std::os::fd::AsRawFd;
+    let lock = File::open(f.scratch.join(".package-cache")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+}
+
+#[test]
 fn job_and_fill_units_raise_nofile_soft_limit_and_keep_the_hard_limit() {
     let f = Fixture::new();
     for (tenant, boat, private_pids, writer) in [
@@ -934,6 +1069,7 @@ impl Fixture {
             slice_budget: std::sync::Mutex::new(None),
             user: USER,
             writer: false,
+            writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
         }
     }
 }
@@ -1118,6 +1254,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         slice_budget: std::sync::Mutex::new(None),
         user: USER,
         writer: false,
+        writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
     };
     let source = r#"printf '%s\n' "$TMPDIR" "$HOME" "${X:-y}""#;
     let env =
@@ -1616,6 +1753,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 slice_budget: std::sync::Mutex::new(None),
                 user: USER,
                 writer: false,
+                writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
             };
             let started = Instant::now();
             let mut launch = if isolated {
@@ -1676,6 +1814,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 slice_budget: std::sync::Mutex::new(None),
                 user: USER,
                 writer: false,
+                writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
             };
             let mut launch = if isolated {
                 sandbox.launch(command, &workspace, &env)
@@ -2142,6 +2281,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         slice_budget: std::sync::Mutex::new(None),
         user: USER,
         writer: false,
+        writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
     };
     for writer in [false, true] {
         sandbox.writer = writer;

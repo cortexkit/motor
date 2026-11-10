@@ -1142,6 +1142,7 @@ impl Backend for HostBackend {
                         #[cfg(test)]
                         let sandbox = sandbox.with_memory_floor_gib(config.memory_floor_gib);
                         sandbox
+                            .with_writer_runtime_limit(config.writer_runtime_limit)
                             .retaining_failed_units()
                             .in_tenant_vm(config.tenant_vm)
                             .with_cargo_image(config.per_job.then(|| {

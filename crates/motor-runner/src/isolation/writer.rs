@@ -585,6 +585,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         slice_budget: std::sync::Mutex::new(None),
         user: WRITER_USER,
         writer: false,
+        writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
     };
     let command = sandbox
         .command(CacheServer::script(), &f.workspace, &[], false, &[], 0)

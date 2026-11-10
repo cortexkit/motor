@@ -20,6 +20,7 @@ use std::{
 use uuid::Uuid;
 
 mod cargo_fetch;
+mod cargo_lock;
 pub(crate) mod cargo_overlay;
 pub(crate) mod cargo_sources;
 mod host_inputs;
@@ -2378,6 +2379,7 @@ pub(crate) struct Sandbox {
     // Operator fixtures reuse the production mount layout with the writer identity.
     user: &'static str,
     writer: bool,
+    writer_runtime_limit: Duration,
     network: bool,
     tenant_vm: bool,
     private_pids: bool,
@@ -2579,10 +2581,17 @@ fn bounded_cargo_fetch(command: &mut Command, limit: Duration) -> io::Result<()>
     } else {
         String::new()
     };
-    Err(io::Error::other(format!(
-        "{timeout}{command:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    )))
+    Err(io::Error::new(
+        if matches!(output.status.code(), Some(124 | 137)) {
+            io::ErrorKind::TimedOut
+        } else {
+            io::ErrorKind::Other
+        },
+        format!(
+            "{timeout}{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    ))
 }
 
 /// One trusted Cargo fetch of the prefetch, with the bound it runs under.
@@ -2598,11 +2607,11 @@ enum CargoFetch {
 
 /// Runs one fetch as a plain child of the daemon, on the host's paths.
 fn run_cargo_fetch_on_host(command: &mut Command, fetch: CargoFetch) -> io::Result<()> {
-    match fetch {
+    cargo_lock::diagnose(command, |command| match fetch {
         CargoFetch::Root => checked(command),
         CargoFetch::TenantAttempt(limit) => cargo_fetch::bounded(command, limit),
         CargoFetch::Nested(limit) => bounded_cargo_fetch(command, limit),
-    }
+    })
 }
 
 /// Qualifies the online tenant prefetch in a real snapshot helper, not merely
@@ -2653,7 +2662,9 @@ impl SnapshotSiblings<'_> {
             CargoFetch::Root => configured,
             CargoFetch::TenantAttempt(limit) | CargoFetch::Nested(limit) => limit.min(configured),
         };
-        helper::run(self.config, Helper::CargoPrefetch, limit, command, view)
+        cargo_lock::diagnose(command, |command| {
+            helper::run(self.config, Helper::CargoPrefetch, limit, command, view)
+        })
     }
 }
 
@@ -2716,6 +2727,9 @@ fn prefetch_cargo_in(
         let fetched = command(&workspace.join(lockfile.parent().unwrap_or(Path::new(""))))
             .and_then(|mut command| run(&mut command, CargoFetch::Nested(nested_limit)));
         if let Err(error) = fetched {
+            if crate::sibling_snapshots::helper::UnsettledHelper::is(&error) {
+                return Err(error);
+            }
             skip(&lockfile, &error.to_string());
         }
     }
@@ -2756,7 +2770,7 @@ fn prepare_cargo_checkouts(
             crate::caller_path::JobTree::new(host, caller),
             &sibling.tree_hash,
         )
-        .map_err(|error| io::Error::other(format!("sibling {}: {error}", caller.display())))?;
+        .map_err(|error| with_fetch_context(error, &format!("sibling {}", caller.display())))?;
     }
     Ok(())
 }
@@ -2860,13 +2874,22 @@ pub(crate) fn prefetch_cargo_dependencies<'a>(
             })
         })
     })
-    .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))
+    .map_err(|error| {
+        if crate::sibling_snapshots::helper::UnsettledHelper::is(&error) {
+            error
+        } else {
+            io::Error::other(fetch_failure(stage, &error.to_string()))
+        }
+    })
 }
 
 /// The failure comes first: refusal details are cut to a fixed size, and a
 /// lockfile with several git dependencies yields a route list long enough to
 /// push Cargo's own error past the cut.
 fn with_fetch_context(error: io::Error, context: &str) -> io::Error {
+    if crate::sibling_snapshots::helper::UnsettledHelper::is(&error) {
+        return error;
+    }
     io::Error::new(error.kind(), format!("{error}; {context}"))
 }
 
@@ -2879,7 +2902,7 @@ pub(crate) fn cargo_prefetch_admission(
     result: io::Result<()>,
 ) -> io::Result<()> {
     match result {
-        Err(error) if network => {
+        Err(error) if network && !crate::sibling_snapshots::helper::UnsettledHelper::is(&error) => {
             tracing::warn!(job_id = %id, %error, "dependency prefetch skipped; this job fetches what it needs itself");
             Ok(())
         }
@@ -3688,6 +3711,7 @@ impl Sandbox {
             slice_budget: std::sync::Mutex::new(None),
             user: if writer { WRITER_USER } else { USER },
             writer,
+            writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
             network: false,
             tenant_vm: false,
             private_pids: true,
@@ -3722,6 +3746,11 @@ impl Sandbox {
         self.cache_generation
             .as_deref()
             .map(|generation| (generation, self.cache_forwarders.as_slice()))
+    }
+
+    pub(crate) fn with_writer_runtime_limit(mut self, limit: Duration) -> Self {
+        self.writer_runtime_limit = limit;
+        self
     }
 
     /// See [`Sandbox::retain_failed`].
@@ -3865,6 +3894,7 @@ impl Sandbox {
             slice_budget: std::sync::Mutex::new(None),
             user: USER,
             writer: false,
+            writer_runtime_limit: crate::engine::DEFAULT_WRITER_RUNTIME_LIMIT,
         };
         let command = sandbox.command("true", scratch, env, false, &[], 2)?;
         Ok(command.get_args().map(|arg| arg.to_owned()).collect())
@@ -3974,6 +4004,15 @@ impl Sandbox {
         // Repository builds need more than systemd's 1024 soft default; keep
         // its existing hard ceiling, including for cache fills that build code.
         cmd.arg("--property=LimitNOFILE=65536:524288");
+        if self.writer {
+            if self.writer_runtime_limit.is_zero() {
+                return Err(io::Error::other("writer runtime limit must be positive"));
+            }
+            cmd.arg(format!(
+                "--property=RuntimeMaxSec={}ms",
+                self.writer_runtime_limit.as_millis()
+            ));
+        }
         if self.tenant_vm {
             cmd.args(tenant_unit_properties());
         }

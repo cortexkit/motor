@@ -53,6 +53,9 @@ fn value<T: std::fmt::Display>(value: Option<T>) -> String {
 }
 
 impl ExecutionEvidence {
+    pub(super) fn runtime_timed_out(&self) -> bool {
+        self.result.as_deref() == Some("timeout")
+    }
     #[cfg(any(target_os = "linux", test))]
     fn unit(&mut self, text: &str, cgroups: &Path) {
         let property = |name: &str| text.lines().find_map(|line| line.strip_prefix(name));
@@ -208,6 +211,17 @@ impl Runner {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_expiry_is_distinct_from_exit_zero_and_other_unit_failures() {
+        let mut evidence = super::ExecutionEvidence::default();
+        for (result, expired) in [("success", false), ("oom-kill", false), ("timeout", true)] {
+            evidence.unit(
+                &format!("Result={result}\nExecMainCode=1\nExecMainStatus=0\n"),
+                std::path::Path::new("/sys/fs/cgroup"),
+            );
+            assert_eq!(evidence.runtime_timed_out(), expired);
+        }
+    }
     use super::*;
 
     #[test]
