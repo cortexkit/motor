@@ -158,9 +158,10 @@ impl Runtime {
                     ensure!(control.adopt_job(&start.job_id)?, "recovery VM gone");
                 }
                 flag.store(false, Ordering::Release);
-                let reply = control.job_admin(
+                let reply = control.job_admin_after_start(
                     &start.job_id,
                     &json!({"op":"recover_workspace", "budget_ms":remaining}),
+                    Duration::from_millis(remaining),
                 )?;
                 ensure!(reply["ok"] == true, "guest recovery refused");
                 let result = reply["recovery"]

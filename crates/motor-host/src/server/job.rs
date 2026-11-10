@@ -947,8 +947,10 @@ async fn boot(
     );
     let control = runtime.control.clone();
     let job = execution.claims.jti.clone();
+    let wait = runtime.boot_remaining(execution, unix_ms());
     let initialized =
-        tokio::task::spawn_blocking(move || control.job_admin(&job, &request)).await??;
+        tokio::task::spawn_blocking(move || control.job_admin_after_start(&job, &request, wait))
+            .await??;
     if initialized["ok"] != true && initialized["error"] == "job_vm_dax_required" {
         runtime
             .host

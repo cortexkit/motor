@@ -88,6 +88,13 @@ pub trait Control: Send + Sync {
             control_read_deadline(request),
         )
     }
+    /// The first control exchange with a VM that was just started. Its guest
+    /// agent listens on port 54 only once the guest kernel and init are up,
+    /// about a second after start; the real helper waits up to `wait` for it.
+    /// Fakes answer at once, so the default is a plain `job_admin`.
+    fn job_admin_after_start(&self, job: &str, request: &Value, _wait: Duration) -> Result<Value> {
+        self.job_admin(job, request)
+    }
     fn metrics(&self, _tenant: &str) -> Result<crate::billing::Metrics> {
         anyhow::bail!("tenant metrics unavailable")
     }
@@ -482,6 +489,10 @@ impl Control for Helper {
         );
         Ok(UnixStream::from(fds.remove(0)))
     }
+    fn job_admin_after_start(&self, job: &str, request: &Value, wait: Duration) -> Result<Value> {
+        let stream = open_after_start(|| self.job_relay(job, 54), wait)?;
+        exchange_control(stream, job, request, control_read_deadline(request))
+    }
     fn pressure_cgroup(&self, tenant: &str) -> Option<&Path> {
         self.pressure_cgroups.get(tenant).map(PathBuf::as_path)
     }
@@ -781,6 +792,29 @@ pub fn control_read_deadline(request: &Value) -> Duration {
     }
 }
 
+/// Opens a just-started VM's control relay, retrying until `wait` runs out.
+/// Until the guest agent listens, Firecracker closes the vsock connection
+/// without an acknowledgement and the helper refuses the relay. A relay open
+/// sends nothing to the guest, so a retry cannot repeat any guest action.
+fn open_after_start(
+    mut open: impl FnMut() -> Result<UnixStream>,
+    wait: Duration,
+) -> Result<UnixStream> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match open() {
+            Ok(stream) => return Ok(stream),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                return Err(error.context(format!(
+                    "guest agent did not open its control port within {} ms of VM start",
+                    wait.as_millis()
+                )))
+            }
+        }
+    }
+}
+
 pub(crate) fn exchange_control(
     mut stream: UnixStream,
     tenant: &str,
@@ -934,6 +968,33 @@ fn available_bytes(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod helper_deadline_tests {
+    #[test]
+    fn control_relay_after_start_waits_for_the_guest_agent_then_gives_up() {
+        use super::*;
+        let mut attempts = 0;
+        let stream = open_after_start(
+            || {
+                attempts += 1;
+                if attempts < 4 {
+                    bail!("read_CONNECT_ack: failed to fill whole buffer")
+                }
+                Ok(UnixStream::pair()?.0)
+            },
+            Duration::from_secs(5),
+        );
+        assert!(stream.is_ok());
+        assert_eq!(attempts, 4, "a booting guest must be retried, not refused");
+
+        let started = Instant::now();
+        let error =
+            open_after_start(|| bail!("read_CONNECT_ack"), Duration::from_millis(250)).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(
+            format!("{error:#}").contains("did not open its control port within 250 ms"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn guest_json_rejects_unbounded_lengths_before_reading_a_body() {
         struct HeaderOnly(std::io::Cursor<[u8; 4]>);

@@ -277,7 +277,13 @@ impl FillGuest for BundleFillGuest {
                 && request.get("recovery_budget_ms").is_none(),
             "fill cannot recover a job disk"
         );
-        let reply = control.job_admin(&fill.fill.fill_id, &request)?;
+        // A fill VM has no boot deadline of its own; 60 s covers a cold guest
+        // boot (about a second) many times over.
+        let reply = control.job_admin_after_start(
+            &fill.fill.fill_id,
+            &request,
+            std::time::Duration::from_secs(60),
+        )?;
         ensure!(
             reply["ok"] == true,
             "fill initialization refused: {}",

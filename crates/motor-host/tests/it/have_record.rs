@@ -152,7 +152,23 @@ impl Control for Disk {
                 std::fs::remove_file(path)?;
             }
         }
-        let runner = Runner::open(config).expect("open real runner fixture");
+        // Each relay stands in for a fresh job VM on the same workspace disk, so
+        // it reopens the runner state the previous relay's runner still holds
+        // until its serving task drops it. Runner::open's exclusive state lock
+        // refuses that overlap with WouldBlock; wait it out as a VM boot would.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let runner = loop {
+            match Runner::open(config.clone()) {
+                Ok(runner) => break runner,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < end =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                Err(error) => panic!("open real runner fixture: {error}"),
+            }
+        };
         let (host, guest) = UnixStream::pair()?;
         guest.set_nonblocking(true)?;
         let _entered = self.handle.enter();
