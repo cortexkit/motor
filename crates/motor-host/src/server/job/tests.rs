@@ -370,6 +370,9 @@ struct Storage {
     held: Mutex<BTreeSet<String>>,
     releases: Mutex<BTreeMap<String, usize>>,
     fail_prepare: AtomicBool,
+    pause_prepare: AtomicBool,
+    prepare_gate: (Mutex<bool>, Condvar),
+    prepare_entered: tokio::sync::Notify,
     pinned_hello: Mutex<Option<Value>>,
     released: tokio::sync::Notify,
     recovery_available: AtomicBool,
@@ -386,6 +389,9 @@ impl Storage {
             held: Mutex::new(BTreeSet::new()),
             releases: Mutex::new(BTreeMap::new()),
             fail_prepare: AtomicBool::new(false),
+            pause_prepare: AtomicBool::new(false),
+            prepare_gate: (Mutex::new(false), Condvar::new()),
+            prepare_entered: tokio::sync::Notify::new(),
             pinned_hello: Mutex::new(None),
             released: tokio::sync::Notify::new(),
             recovery_available: AtomicBool::new(false),
@@ -436,6 +442,13 @@ impl Resources for Storage {
         })
     }
     fn prepare(&self, _: &Execution) -> Result<()> {
+        if self.pause_prepare.load(Ordering::Acquire) {
+            self.prepare_entered.notify_one();
+            let mut ready = self.prepare_gate.0.lock().unwrap();
+            while !*ready {
+                ready = self.prepare_gate.1.wait(ready).unwrap();
+            }
+        }
         ensure!(!self.fail_prepare.load(Ordering::Acquire), "copy failed");
         Ok(())
     }
@@ -1459,6 +1472,182 @@ async fn hosted_client_wire_exchange_accepts_pinned_runner_hello_and_runs_after_
     assert_ne!(machine_id, "0123456789abcdef0123456789abcdef");
     drop(client);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn slow_first_account_copy_is_outside_boot_clock_and_not_adoptable() {
+    use motor_protocol::{write_frame_async, Frame, PROTOCOL_VERSION};
+    let (runtime, fake, storage) = fixture();
+    let mut manifest = fake.inspect_job_images("gen-1").unwrap();
+    manifest.toolchain.bytes = 34 * 1024 * 1024 * 1024;
+    runtime.host.lock().unwrap().snapshot.per_job.images.insert(
+        "gen-1".into(),
+        crate::state::jobs::images::Generation {
+            manifest,
+            current: true,
+            pending: false,
+            artifacts_ready: true,
+            deleting: false,
+            removed: false,
+            accounts: BTreeMap::new(),
+            recovery_holders: BTreeMap::new(),
+        },
+    );
+    storage.pause_prepare.store(true, Ordering::Release);
+    struct ReleaseCopy(Arc<Storage>);
+    impl Drop for ReleaseCopy {
+        fn drop(&mut self) {
+            *self.0.prepare_gate.0.lock().unwrap() = true;
+            self.0.prepare_gate.1.notify_all();
+        }
+    }
+    let _release = ReleaseCopy(storage.clone());
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame_async(
+        &mut client,
+        &Frame::Hello {
+            return_paths: false,
+            return_chunked_max_bytes: None,
+            return_chunked: false,
+            sibling_paths: false,
+            protocol_version: PROTOCOL_VERSION,
+            started: true,
+            default_branch_tip: false,
+            gate_jobs: true,
+            platforms: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let hello: Frame = serde_json::from_value(next_type(&mut client, "hello").await).unwrap();
+    assert!(matches!(
+        hello,
+        Frame::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            ..
+        }
+    ));
+    tokio::time::timeout(Duration::from_secs(1), storage.prepare_entered.notified())
+        .await
+        .unwrap();
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].boot_started);
+    runtime.tick_jobs(unix_ms()).unwrap();
+    assert!(!fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("adopt:")));
+    write_frame_async(
+        &mut client,
+        &serde_json::from_value::<Frame>(run(JOB)).unwrap(),
+    )
+    .await
+    .unwrap();
+    next_type(&mut client, "accepted").await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(65)).await;
+    tokio::time::resume();
+    *storage.prepare_gate.0.lock().unwrap() = true;
+    storage.prepare_gate.1.notify_all();
+    next_type(&mut client, "output").await;
+    assert!(runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    drop(client);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn account_preparation_timeout_refuses_before_start_and_releases_after_copy_cleanup() {
+    let (runtime, fake, storage) = fixture();
+    storage.pause_prepare.store(true, Ordering::Release);
+    struct ReleaseCopy(Arc<Storage>);
+    impl Drop for ReleaseCopy {
+        fn drop(&mut self) {
+            *self.0.prepare_gate.0.lock().unwrap() = true;
+            self.0.prepare_gate.1.notify_all();
+        }
+    }
+    let _release = ReleaseCopy(storage.clone());
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    tokio::time::timeout(Duration::from_secs(2), queued(&mut client, JOB))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), storage.prepare_entered.notified())
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        next_type(&mut client, "lease_refused"),
+    )
+    .await
+    .unwrap();
+    drop(client);
+    task.await.unwrap().unwrap();
+    assert!(fake.calls.lock().unwrap().is_empty());
+    assert!(storage.held.lock().unwrap().contains(JOB));
+    storage.fail_prepare.store(true, Ordering::Release);
+    *storage.prepare_gate.0.lock().unwrap() = true;
+    storage.prepare_gate.1.notify_all();
+    tokio::time::timeout(Duration::from_secs(2), storage.released.notified())
+        .await
+        .unwrap();
+    assert!(!storage.held.lock().unwrap().contains(JOB));
+    let host = runtime.host.lock().unwrap();
+    assert!(host.snapshot.per_job.executions[JOB].ended);
+    assert!(host.snapshot.leases[JOB].started_at_ms.is_none());
+    assert_eq!(storage.releases.lock().unwrap()[JOB], 1);
+}
+
+#[tokio::test]
+async fn tick_never_adopts_while_helper_start_or_guest_attach_is_in_flight() {
+    for stage in ["boot", "runner"] {
+        let (runtime, fake, _) = fixture();
+        if let crate::config::HostSettings::PerJob(settings) =
+            &mut runtime.host.lock().unwrap().settings
+        {
+            settings.boot_deadline_ms = 60_000;
+        }
+        *fake.hang.lock().unwrap() = stage;
+        struct ReleaseGate(Arc<Fake>);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                *self.0.gate.0.lock().unwrap() = true;
+                self.0.gate.1.notify_all();
+            }
+        }
+        let _release = ReleaseGate(fake.clone());
+        let c = claims(JOB);
+        let id = claim(&runtime, &c);
+        let (mut client, task) = start(runtime.clone(), c, id).await;
+        queued(&mut client, JOB).await;
+        tokio::time::timeout(Duration::from_secs(1), fake.entered.notified())
+            .await
+            .unwrap();
+        assert!(runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].boot_started);
+        runtime.tick_jobs(unix_ms()).unwrap();
+        assert!(
+            !fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("adopt:")),
+            "adoption during {stage}"
+        );
+        *fake.gate.0.lock().unwrap() = true;
+        fake.gate.1.notify_all();
+        next_type(&mut client, "output").await;
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]

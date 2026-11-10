@@ -4,6 +4,29 @@ use cortexkit_test_support::ScratchDir;
 use motor_runner::image_source_tree_already_readable as runner_readable;
 
 #[test]
+fn expired_account_copy_removes_partial_files_without_publishing_a_target() {
+    let scratch = ScratchDir::new("motor-image-copy-timeout");
+    let source = scratch.join("source");
+    std::fs::write(&source, vec![7_u8; 8192]).unwrap();
+    let partial_path = scratch.join(".account.partial");
+    {
+        let partial = Partial(partial_path.clone());
+        std::fs::create_dir(&partial.0).unwrap();
+        let mut source = File::open(&source).unwrap();
+        let error = physical_copy_until(
+            &mut source,
+            &partial.0.join("toolchain.ext4"),
+            Some(Instant::now()),
+        )
+        .unwrap_err();
+        assert!(error.0.contains("preparation deadline exceeded"));
+        assert!(digest_until(&mut source, Some(Instant::now())).is_err());
+    }
+    assert!(!partial_path.exists());
+    assert!(!scratch.join("account").exists());
+}
+
+#[test]
 fn account_copies_have_full_private_extents_even_when_source_is_reflinked() {
     let scratch = ScratchDir::new("motor-image-physical-copy");
     let source = scratch.join("source");

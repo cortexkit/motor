@@ -79,6 +79,17 @@ helper installs its current account credentials into each tenant VM. Installatio
 failure keeps the pending rollback and drain durable. See
 [hosted-host.md](../../docs/hosted-host.md#per-job-mode-rollback).
 
+### Account image preparation
+
+The first admission for an account prepares its reserved toolchain copy before
+the VM boot clock starts. Preparation is coalesced per image generation and
+account, and has a separate deadline: 60 seconds plus one second per 64 MiB of
+toolchain image, rounded up, capped at 3500 seconds. The host answers with the
+image's pinned runner Hello, accepts bounded queued uploads and sends heartbeats
+while preparation runs. Expiry refuses the job before start; helper cleanup
+removes partial copies before the host releases their reservations. Image
+publication still prepares all accounts already known to the host.
+
 ### Per-job replay store
 
 These rules apply to the per-job implementation, not the tenant runner's own

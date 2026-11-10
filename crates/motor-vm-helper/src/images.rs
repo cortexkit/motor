@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub const STAGING: &str = "/var/lib/motor-vm/job-image-staging";
 
+/// Bound first-account preparation separately from VM boot: one minute for
+/// setup plus a 64 MiB/s transfer allowance, below the one-hour RPC deadline.
+pub fn account_prepare_timeout(bytes: u64) -> std::time::Duration {
+    let seconds = 60_u64.saturating_add(bytes.div_ceil(64 * 1024 * 1024));
+    std::time::Duration::from_secs(seconds.min(3500))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Readiness {
     pub job_vms_configured: bool,
@@ -111,6 +118,16 @@ impl Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_copy_budget_scales_with_image_size_but_fits_rpc_deadline() {
+        assert_eq!(account_prepare_timeout(0).as_secs(), 60);
+        assert_eq!(
+            account_prepare_timeout(34 * 1024 * 1024 * 1024).as_secs(),
+            604
+        );
+        assert_eq!(account_prepare_timeout(u64::MAX).as_secs(), 3500);
+    }
 
     #[test]
     fn manifest_requires_a_typed_compatible_runner_hello() {

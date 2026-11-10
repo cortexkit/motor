@@ -30,7 +30,8 @@ pub trait Resources: Send + Sync {
     /// Repeating this after a restart returns the same assignment for the job id.
     /// This must not copy images or recover disks.
     fn acquire(&self, execution: &Execution) -> Result<Assignment>;
-    /// Full physical account-image copies belong here, inside the boot deadline.
+    /// Full physical account-image copies belong here, before the boot clock.
+    /// Admission reserves their space first; preparation has its own bound.
     /// This may not start a VM or perform disk recovery.
     fn prepare(&self, execution: &Execution) -> Result<()>;
     /// Idempotent durable release, called only after stop confirmation or when

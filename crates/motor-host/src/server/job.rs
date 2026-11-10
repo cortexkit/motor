@@ -11,6 +11,14 @@ pub(super) struct Launch {
     started: AtomicBool,
     in_flight: AtomicBool,
     cancelled: AtomicBool,
+    pending: AtomicBool,
+}
+
+struct LaunchSession(Arc<Launch>);
+impl Drop for LaunchSession {
+    fn drop(&mut self) {
+        self.0.pending.store(false, Ordering::SeqCst);
+    }
 }
 
 fn tick_step<T, E: Into<anyhow::Error>>(
@@ -334,6 +342,20 @@ impl Runtime {
             .collect();
         for execution in active {
             let job = &execution.claims.jti;
+            // A local launch can be between blocking preparation/start calls
+            // or still initializing the guest. Only a completed launch, or
+            // restart recovery with no local launch, can be adopted safely.
+            if self
+                .job_launches
+                .lock()
+                .expect("job launches")
+                .get(job)
+                .is_some_and(|launch| {
+                    launch.pending.load(Ordering::SeqCst) || launch.in_flight.load(Ordering::SeqCst)
+                })
+            {
+                continue;
+            }
             let gone = if execution
                 .evidence
                 .as_ref()
@@ -805,7 +827,6 @@ async fn boot(
     id: u64,
     hello: &Raw,
 ) -> Result<tokio::net::UnixStream> {
-    let resources = runtime.job_resources.clone();
     let e = execution.clone();
     let launch = runtime.launch_phase(&execution.claims.jti, false)?;
     let r = runtime.clone();
@@ -823,7 +844,7 @@ async fn boot(
                     .quarantine_workspace(&e.claims.jti)?;
                 return Err(error);
             }
-            resources.prepare(&e)
+            Ok(())
         })();
         launch.in_flight.store(false, Ordering::SeqCst);
         if launch.cancelled.load(Ordering::SeqCst) {
@@ -1050,6 +1071,44 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
     write_frame(client, &promised_hello(&assignment, &hello.value))
         .await
         .map_err(client_io)?;
+    let launch = Arc::new(Launch::default());
+    launch.pending.store(true, Ordering::SeqCst);
+    let preparation_limit = {
+        let host = runtime.host.lock().expect("host lock");
+        ensure!(
+            host.snapshot.leases[&claims.jti].state != LeaseState::Ended,
+            "job cancelled before preparation"
+        );
+        runtime
+            .job_launches
+            .lock()
+            .expect("job launches")
+            .insert(claims.jti.clone(), launch.clone());
+        motor_vm_helper::images::account_prepare_timeout(
+            host.snapshot
+                .per_job
+                .images
+                .get(&assignment.image_generation_id)
+                .map_or(0, |g| g.manifest.toolchain.bytes),
+        )
+    };
+    let launch_session = LaunchSession(launch);
+    let phase = runtime.launch_phase(&claims.jti, false)?;
+    let r = runtime.clone();
+    let e = execution.clone();
+    let preparation = tokio::task::spawn_blocking(move || {
+        let result = r.job_resources.prepare(&e);
+        phase.in_flight.store(false, Ordering::SeqCst);
+        if phase.cancelled.load(Ordering::SeqCst) {
+            r.stop_job(&e.claims.jti, true, false)?;
+        }
+        result
+    });
+    let mut preparing = Some(Box::pin(async move {
+        tokio::time::timeout(preparation_limit, preparation)
+            .await
+            .map_err(|_| anyhow::anyhow!("account image preparation deadline exceeded"))??
+    }));
     let mut have_replies = 0usize;
     let mut withdraw_replies = 0usize;
     let mut accepted = false;
@@ -1079,7 +1138,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             )
             .await;
         }
-        let launch = if starting.is_none() && ready.is_none() {
+        let launch = if preparing.is_none() && starting.is_none() && ready.is_none() {
             runtime
                 .host
                 .lock()
@@ -1089,11 +1148,6 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             None
         };
         if let Some(execution) = launch {
-            runtime
-                .job_launches
-                .lock()
-                .expect("job launches")
-                .insert(claims.jti.clone(), Arc::new(Launch::default()));
             let deadline =
                 tokio::time::Instant::now() + runtime.boot_remaining(&execution, unix_ms());
             let r = runtime.clone();
@@ -1106,9 +1160,14 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }));
         }
         tokio::select! {
+            result = async { preparing.as_mut().expect("preparation in progress").as_mut().await }, if preparing.is_some() => {
+                result?;
+                preparing = None;
+            },
             stream = async { starting.as_mut().expect("boot in progress").as_mut().await }, if starting.is_some() => {
                 ready = Some(stream?);
                 starting = None;
+                launch_session.0.pending.store(false, Ordering::SeqCst);
             },
             _ = tokio::time::sleep_until(expires), if !accepted => anyhow::bail!("queued lease expired"),
             frame = reader.next(client) => {

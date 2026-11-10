@@ -309,6 +309,8 @@ out of memory.
 | `exit_evidence_bound_ms` | milliseconds | Maximum wait from discovering a gone VMM for durable exit/OOM evidence. |
 | `teardown_timeout_ms` | milliseconds | Bound on failed guest-channel teardown before the VM is stopped. |
 
+First-account toolchain copies run before the boot clock under a [separate preparation deadline](../crates/motor-host/README.md#account-image-preparation).
+
 `per_job_mode_refuses_each_unset_setting_without_defaults`,
 `complete_per_job_config_selects_image_managed_runtime`
 (`crates/motor-host/src/main.rs`) and the configuration tests in

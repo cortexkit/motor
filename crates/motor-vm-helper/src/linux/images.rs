@@ -13,7 +13,8 @@ use std::{
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 fn directory(path: &Path) -> Result<()> {
@@ -89,11 +90,38 @@ fn pin(staging: &Path, root: &Path, id: &str) -> Result<Manifest> {
 }
 
 pub(super) fn digest(file: &mut File) -> Result<Artifact> {
+    digest_until(file, None)
+}
+
+fn prepare_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return Err(Error("account image preparation deadline exceeded".into()));
+    }
+    Ok(())
+}
+
+fn digest_until(file: &mut File, deadline: Option<Instant>) -> Result<Artifact> {
     use std::io::{Seek, SeekFrom};
+    prepare_deadline(deadline)?;
     file.seek(SeekFrom::Start(0))?;
-    let output = Command::new("/usr/bin/sha256sum")
+    let mut child = Command::new("/usr/bin/sha256sum")
         .stdin(file.try_clone()?)
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if let Err(error) = prepare_deadline(deadline) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output()?;
+    prepare_deadline(deadline)?;
     if !output.status.success() {
         return Err(Error("cannot hash image artifact".into()));
     }
@@ -110,8 +138,12 @@ pub(super) fn digest(file: &mut File) -> Result<Artifact> {
 }
 
 fn verify(path: &Path, expected: &Artifact) -> Result<File> {
+    verify_until(path, expected, None)
+}
+
+fn verify_until(path: &Path, expected: &Artifact, deadline: Option<Instant>) -> Result<File> {
     let mut file = fs::trusted_file(path)?;
-    if &digest(&mut file)? != expected {
+    if &digest_until(&mut file, deadline)? != expected {
         return Err(Error(format!(
             "pinned image hash mismatch: {}",
             path.display()
@@ -124,7 +156,12 @@ fn verify(path: &Path, expected: &Artifact) -> Result<File> {
 // Then verify full exclusive allocation: even zero-filled ranges must have
 // their own blocks, so account images cannot share mapped toolchain pages.
 fn physical_copy(source: &mut File, target: &Path) -> Result<()> {
+    physical_copy_until(source, target, None)
+}
+
+fn physical_copy_until(source: &mut File, target: &Path, deadline: Option<Instant>) -> Result<()> {
     use std::io::{Seek, SeekFrom};
+    prepare_deadline(deadline)?;
     source.seek(SeekFrom::Start(0))?;
     let mut out = OpenOptions::new()
         .write(true)
@@ -134,6 +171,7 @@ fn physical_copy(source: &mut File, target: &Path) -> Result<()> {
         .open(target)?;
     let mut buffer = vec![0; 1024 * 1024];
     loop {
+        prepare_deadline(deadline)?;
         let n = source.read(&mut buffer)?;
         if n == 0 {
             break;
@@ -142,6 +180,7 @@ fn physical_copy(source: &mut File, target: &Path) -> Result<()> {
     }
     out.sync_all()?;
     require_physical_copy(&out)?;
+    prepare_deadline(deadline)?;
     Ok(())
 }
 
@@ -376,27 +415,30 @@ fn publish(
 }
 
 fn prepare(root: &Path, id: &str, account: &str) -> Result<()> {
+    let started = Instant::now();
     let image = root.join(id);
     let pinned = manifest(&image)?;
+    let deadline = Some(started + crate::images::account_prepare_timeout(pinned.toolchain.bytes));
     let accounts = image.join("accounts");
     directory(&accounts)?;
     let target = accounts.join(account);
     if target.try_exists()? {
-        let copy = verify(&target.join("toolchain.ext4"), &pinned.toolchain)?;
+        let copy = verify_until(&target.join("toolchain.ext4"), &pinned.toolchain, deadline)?;
         require_physical_copy(&copy)?;
         return Ok(());
     }
-    let mut source = verify(&image.join("toolchain.ext4"), &pinned.toolchain)?;
     let partial = Partial(accounts.join(format!(".{account}.partial")));
     if partial.0.try_exists()? {
         std::fs::remove_dir_all(&partial.0)?;
     }
     directory(&partial.0)?;
+    let mut source = verify_until(&image.join("toolchain.ext4"), &pinned.toolchain, deadline)?;
     let path = partial.0.join("toolchain.ext4");
-    physical_copy(&mut source, &path)?;
-    verify(&path, &pinned.toolchain)?;
+    physical_copy_until(&mut source, &path, deadline)?;
+    verify_until(&path, &pinned.toolchain, deadline)?;
     seal(&path)?;
     File::open(&partial.0)?.sync_all()?;
+    prepare_deadline(deadline)?;
     std::fs::rename(&partial.0, target)?;
     File::open(accounts)?.sync_all()?;
     Ok(())

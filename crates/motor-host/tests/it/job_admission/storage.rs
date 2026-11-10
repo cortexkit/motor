@@ -166,6 +166,8 @@ fn durable_host(path: &std::path::Path, available: u64) -> Host {
 }
 
 struct Storage {
+    prepares: Mutex<Vec<(String, String)>>,
+    fail_prepare: std::sync::atomic::AtomicBool,
     free: AtomicU64,
     exclusive: Mutex<BTreeMap<String, u64>>,
     evicted: Mutex<Vec<String>>,
@@ -176,6 +178,8 @@ struct Storage {
 impl Storage {
     fn new(free: u64) -> Arc<Self> {
         Arc::new(Self {
+            prepares: Mutex::new(Vec::new()),
+            fail_prepare: false.into(),
             free: AtomicU64::new(free),
             exclusive: Mutex::new(BTreeMap::new()),
             evicted: Mutex::new(Vec::new()),
@@ -197,6 +201,17 @@ impl Storage {
     }
 }
 impl Control for Storage {
+    fn prepare_job_images(&self, generation: &str, account: &str) -> anyhow::Result<()> {
+        self.prepares
+            .lock()
+            .unwrap()
+            .push((generation.into(), account.into()));
+        anyhow::ensure!(
+            !self.fail_prepare.load(Ordering::SeqCst),
+            "injected image copy failure"
+        );
+        Ok(())
+    }
     fn host_available_mib(&self) -> anyhow::Result<u64> {
         Ok(100_000)
     }

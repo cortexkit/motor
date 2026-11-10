@@ -13,7 +13,7 @@ fn manifest() -> Manifest {
         kernel: artifact(4096),
         rootfs: artifact(1024 * 1024),
         toolchain: artifact(TOOLCHAIN),
-        hello: json!({"type":"hello", "version":1}),
+        hello: json!({"type":"hello", "protocol_version":1}),
         guest_init: json!({}),
     }
 }
@@ -118,6 +118,63 @@ fn missing_account_copy_is_reserved_once_in_the_claim_transaction() {
     storage.free.fetch_add(TOOLCHAIN, Ordering::SeqCst);
     h.claim(foreign, AT).unwrap();
     assert_eq!(h.snapshot.per_job.images["gen-1"].accounts.len(), 2);
+}
+
+#[test]
+fn concurrent_first_jobs_prepare_one_reserved_account_copy() {
+    let root = scratch();
+    let storage = Storage::new(FLOOR + 10 * CAP);
+    let mut h = durable_host(root.path(), 10_000);
+    enable(&mut h, &storage);
+    publish(&mut h, "gen-1");
+    h.claim(job(JOB), AT).unwrap();
+    h.claim(job(JOB2), AT).unwrap();
+    assert_eq!(h.snapshot.per_job.images["gen-1"].accounts.len(), 1);
+    let first = h.snapshot.per_job.executions[JOB].clone();
+    let second = h.snapshot.per_job.executions[JOB2].clone();
+    let host = Arc::new(Mutex::new(h));
+    let resources = Arc::new(Images::new(host.clone(), storage.clone()));
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    std::thread::scope(|scope| {
+        for execution in [first, second] {
+            let resources = resources.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                resources.prepare(&execution).unwrap();
+            });
+        }
+        barrier.wait();
+    });
+    assert_eq!(
+        storage.prepares.lock().unwrap().as_slice(),
+        &[("gen-1".into(), job(JOB).sub.clone())]
+    );
+    assert!(host.lock().unwrap().snapshot.per_job.images["gen-1"].accounts[&job(JOB).sub]);
+}
+
+#[test]
+fn failed_first_copy_releases_its_unready_account_reservation_after_job_refusal() {
+    let root = scratch();
+    let storage = Storage::new(FLOOR + 10 * CAP);
+    let mut h = durable_host(root.path(), 10_000);
+    enable(&mut h, &storage);
+    publish(&mut h, "gen-1");
+    h.claim(job(JOB), AT).unwrap();
+    let execution = h.snapshot.per_job.executions[JOB].clone();
+    let host = Arc::new(Mutex::new(h));
+    let resources = Images::new(host.clone(), storage.clone());
+    storage.fail_prepare.store(true, Ordering::SeqCst);
+    assert!(resources.prepare(&execution).is_err());
+    assert!(!host.lock().unwrap().snapshot.per_job.images["gen-1"].accounts[&job(JOB).sub]);
+    host.lock()
+        .unwrap()
+        .job_stopped_at(JOB, false, AT + 1)
+        .unwrap();
+    resources.release(JOB).unwrap();
+    assert!(host.lock().unwrap().snapshot.per_job.images["gen-1"]
+        .accounts
+        .is_empty());
 }
 
 #[test]
