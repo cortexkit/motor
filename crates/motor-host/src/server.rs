@@ -340,6 +340,20 @@ impl Runtime {
     /// Bootstrap only. Later rollouts use the running admin publication path;
     /// a stale offline command must not change an established active generation.
     pub fn select_initial_job_images(&self, generation: &str, now_ms: u64) -> Result<()> {
+        self.select_job_images(generation, false, now_ms)
+    }
+
+    /// Bootstrap after an earlier per-job period on this host. A host switched
+    /// back to tenant mode keeps the generation it last ran as current, but
+    /// nothing uses it while the host is in tenant mode, so switching into
+    /// per-job mode again may name a newer one. The old generation is replaced
+    /// only while no unfinished job or recovery holds it; the image manager
+    /// collects it afterwards like any superseded generation.
+    pub fn select_job_images_replacing_idle(&self, generation: &str, now_ms: u64) -> Result<()> {
+        self.select_job_images(generation, true, now_ms)
+    }
+
+    fn select_job_images(&self, generation: &str, replace_idle: bool, now_ms: u64) -> Result<()> {
         ensure!(self.per_job(), "select-job-images requires per_job mode");
         motor_vm_helper::images::validate_generation(generation)?;
         let published = self.ready_job_images()?;
@@ -356,8 +370,14 @@ impl Runtime {
                 .iter()
                 .find(|(_, image)| image.current)
             {
-                ensure!(active == generation, "an active job image generation already exists; use the running publish_job_images admin command for rollouts");
-                return Ok(());
+                if active == generation {
+                    return Ok(());
+                }
+                ensure!(replace_idle, "an active job image generation already exists; use the running publish_job_images admin command for rollouts");
+                ensure!(
+                    !host.job_image_generation_held(active),
+                    "active job image generation {active} is still held by an unfinished job or recovery"
+                );
             }
         }
         self.publish_job_images(generation, now_ms)

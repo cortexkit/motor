@@ -138,7 +138,9 @@ class SwitchModeTests(unittest.TestCase):
             ("systemctl", "start", "motor-host.service"),
         ])
         select = next(event for event in self.events if "select-job-images" in event)
-        self.assertEqual(select[-2:], (str(self.host_path), "gen-1"))
+        # A switch always comes from tenant mode, so a generation left current
+        # by an earlier per-job period may be replaced while nothing holds it.
+        self.assertEqual(select[-3:], (str(self.host_path), "gen-1", "--replace-idle"))
         self.assertIn("placement_hint.host='test-host'", output)
         self.assertIn("only after success", output)
         self.assertTrue(all(call.args[0] == {"op": "host_status"} for call in self.admin.call_args_list))

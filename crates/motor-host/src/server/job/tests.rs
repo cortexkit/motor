@@ -139,6 +139,13 @@ impl Control for Fake {
             .push(format!("prepare:{generation}"));
         Ok(())
     }
+    fn remove_job_images(&self, generation: &str) -> Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("remove:{generation}"));
+        Ok(())
+    }
     fn host_available_mib(&self) -> anyhow::Result<u64> {
         Ok(1000)
     }

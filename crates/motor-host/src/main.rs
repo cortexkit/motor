@@ -91,10 +91,16 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some("select-job-images") => {
-            let args: Vec<_> = std::env::args_os().skip(2).collect();
+            let mut args: Vec<_> = std::env::args_os().skip(2).collect();
+            // `--replace-idle` is only for switching a host from tenant mode back
+            // into per-job mode; see `Runtime::select_job_images_replacing_idle`.
+            let replace_idle = args.len() == 3 && args[2] == "--replace-idle";
+            if replace_idle {
+                args.pop();
+            }
             ensure!(
                 args.len() == 2,
-                "usage: motor-host select-job-images <config.json> <generation>"
+                "usage: motor-host select-job-images <config.json> <generation> [--replace-idle]"
             );
             let config: Config = serde_json::from_reader(File::open(&args[0])?)?;
             let helper = config.helper();
@@ -108,10 +114,12 @@ async fn main() -> Result<()> {
             let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
             host.settings = settings;
             let runtime = Runtime::with_image_generations(config.host_id, host, Arc::new(helper));
-            runtime.select_initial_job_images(
-                args[1].to_str().context("generation must be UTF-8")?,
-                unix_ms(),
-            )?;
+            let generation = args[1].to_str().context("generation must be UTF-8")?;
+            if replace_idle {
+                runtime.select_job_images_replacing_idle(generation, unix_ms())?;
+            } else {
+                runtime.select_initial_job_images(generation, unix_ms())?;
+            }
             println!("initial job image generation selected");
             return Ok(());
         }

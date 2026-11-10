@@ -187,6 +187,65 @@ fn offline_selection_is_durable_fenced_and_cannot_replace_an_active_generation()
     drop(journal);
 }
 
+#[test]
+fn switching_back_into_per_job_replaces_an_idle_generation_but_never_a_held_one() {
+    let (runtime, fake, storage) = managed();
+    runtime
+        .select_initial_job_images("gen-1", unix_ms())
+        .unwrap();
+    // A recovery holding the old generation pins it, so even a mode switch
+    // must not move the host off it.
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .images
+        .get_mut("gen-1")
+        .unwrap()
+        .recovery_holders
+        .insert("recovery".into(), "account".into());
+    let error = runtime
+        .select_job_images_replacing_idle("gen-2", unix_ms())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("still held"), "{error}");
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .images
+        .get_mut("gen-1")
+        .unwrap()
+        .recovery_holders
+        .clear();
+    // The plain bootstrap still refuses; only the explicit switch path replaces.
+    assert!(runtime
+        .select_initial_job_images("gen-2", unix_ms())
+        .unwrap_err()
+        .to_string()
+        .contains("already exists"));
+    runtime
+        .select_job_images_replacing_idle("gen-2", unix_ms())
+        .unwrap();
+    let calls = fake.calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|call| call == "publish:gen-2"));
+    // The superseded generation is collected like any other once it is idle.
+    assert!(calls.iter().any(|call| call == "remove:gen-1"));
+    drop(runtime);
+    let (journal, snapshot) = crate::store::SqliteJournal::open(storage.root.path()).unwrap();
+    assert!(snapshot.per_job.images["gen-2"].current);
+    assert!(snapshot
+        .per_job
+        .images
+        .get("gen-1")
+        .is_none_or(|generation| !generation.current));
+    drop(journal);
+}
+
 #[tokio::test]
 async fn image_managed_runtime_starts_and_serves_a_job_without_a_tenant_vm() {
     let (runtime, fake, _storage) = managed();

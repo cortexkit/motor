@@ -81,6 +81,11 @@ fn held(ledger: &Ledger, id: &str) -> bool {
 }
 
 impl Host {
+    /// Whether an unfinished job or a disk recovery still uses this generation.
+    pub fn job_image_generation_held(&self, id: &str) -> bool {
+        self.snapshot.per_job.images.contains_key(id) && held(&self.snapshot.per_job, id)
+    }
+
     /// Reserve the entire publication before the helper performs any image work.
     /// An interrupted publication remains pending and cannot be assigned.
     pub fn begin_image_publication(

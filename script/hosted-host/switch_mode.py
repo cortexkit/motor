@@ -428,8 +428,13 @@ def switch(mode, *, per_job=None, job_vms=None, generation=None, timeout=300,
             # running before the switch may be an older build with different
             # image checks, so its verdict would not hold for the new one.
             publish_to_helper(host["helper_socket"], generation)
+            # Only a tenant-mode host gets here (same-mode switches are refused
+            # above), so any generation still current in the store was left by an
+            # earlier per-job period and nothing uses it. --replace-idle lets the
+            # named generation replace it; motor-host refuses if a job or
+            # recovery still holds the old one.
             run("runuser", "-u", "motor-host", "--", hosted_host.HOST_BINARY,
-                "select-job-images", host_path, generation)
+                "select-job-images", host_path, generation, "--replace-idle")
         run(hosted_host.HOST_BINARY, "check-config", host_path)
         host_start_attempted = True
         run("systemctl", "start", "motor-host.service")
