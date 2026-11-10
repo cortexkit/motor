@@ -175,6 +175,8 @@ pub struct Harness {
     /// Reject this many valid Attach handshakes with an `auth` authentication
     /// refusal before claiming a slot, to model delayed observation of a close.
     pub attach_auth_refusals: Arc<AtomicUsize>,
+    /// Make subsequent protocol attaches report that retained history expired.
+    pub attach_history_expired: Arc<std::sync::atomic::AtomicBool>,
     /// Changing the generation closes QuietAttach's current relay once.
     pub drop_follow: Arc<tokio::sync::watch::Sender<usize>>,
     /// The 1-based number of the `/v1/leases` request the broker reads and
@@ -266,6 +268,7 @@ impl Harness {
         let run_gate = Arc::new(tokio::sync::watch::Sender::new(true));
         let attach_lifecycle = Arc::new(tokio::sync::watch::Sender::new((0, 0, 0)));
         let attach_auth_refusals = Arc::new(AtomicUsize::new(0));
+        let attach_history_expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_follow = Arc::new(tokio::sync::watch::Sender::new(0));
         let host_task = tokio::spawn({
             let timeline = timeline.clone();
@@ -275,6 +278,7 @@ impl Harness {
             let run_gate = run_gate.clone();
             let attach_lifecycle = attach_lifecycle.clone();
             let attach_auth_refusals = attach_auth_refusals.clone();
+            let attach_history_expired = attach_history_expired.clone();
             let drop_follow = drop_follow.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
@@ -297,6 +301,7 @@ impl Harness {
                     let run_gate = run_gate.clone();
                     let attach_lifecycle = attach_lifecycle.clone();
                     let attach_auth_refusals = attach_auth_refusals.clone();
+                    let attach_history_expired = attach_history_expired.clone();
                     let drop_follow = drop_follow.clone();
                     let broker = broker.clone();
                     tokio::spawn(async move {
@@ -656,6 +661,22 @@ impl Harness {
                                 Frame::Attach(attach) => {
                                     timeline
                                         .mark(format!("host Attach from_seq={}", attach.from_seq));
+                                    if attach_history_expired.load(Ordering::SeqCst) {
+                                        motor_protocol::write_frame_async(
+                                            &mut tls,
+                                            &Frame::Terminal(TerminalRecord::new(
+                                                id,
+                                                Outcome::HistoryExpired,
+                                                0,
+                                                0,
+                                                0,
+                                            )),
+                                        )
+                                        .await
+                                        .unwrap();
+                                        tls.flush().await.unwrap();
+                                        return;
+                                    }
                                     if matches!(behavior, Behavior::DropTerminal) {
                                         attach_lifecycle
                                             .send_modify(|(_, _, following)| *following += 1);
@@ -1003,6 +1024,7 @@ impl Harness {
             run_gate,
             attach_lifecycle,
             attach_auth_refusals,
+            attach_history_expired,
             drop_follow,
             unanswered_lease,
             tasks: vec![host_task, http_task],

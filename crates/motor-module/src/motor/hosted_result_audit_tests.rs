@@ -176,13 +176,21 @@ async fn audit_07_subscribing_to_stopped_owner_never_strands_caller() {
     owner.state.lock().unwrap().finished = true;
     owner.stopped.send_replace(true);
     let (tx, mut records) = mpsc::channel(32);
-    motor.subscribe_hosted_result(id, owner, 0, false, tx);
+    motor.subscribe_hosted_result(id, owner.clone(), u64::MAX, false, tx);
     let record = tokio::time::timeout(Duration::from_secs(1), records.recv())
         .await
         .expect("a stopped owner must not strand a new subscriber")
         .unwrap()
         .unwrap();
     assert!(matches!(record, StreamRecord::Terminal(t) if t.outcome == Outcome::Exit { code: 41 }));
+    let (tx, mut records) = mpsc::channel(32);
+    motor.subscribe_hosted_result(id, owner, 0, false, tx);
+    let record = tokio::time::timeout(Duration::from_secs(1), records.recv())
+        .await
+        .expect("a stopped owner must answer a replay even when the host is gone")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(record, StreamRecord::Terminal(t) if t.outcome == Outcome::HistoryExpired));
     motor.close().await;
 }
 

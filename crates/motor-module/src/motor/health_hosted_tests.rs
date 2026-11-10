@@ -933,7 +933,8 @@ async fn health_auth_past_deadline_cannot_retire_live_hosted_result_owner() {
         panic!("terminal missing")
     };
     assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
-    let mut later = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    // The caller already consumed seq 0; only the terminal summary is pending.
+    let mut later = motor.attach(AttachRequest::new(id, 1)).unwrap();
     assert_eq!(
         result_record(&mut later).await,
         StreamRecord::Terminal(terminal)
@@ -1158,5 +1159,206 @@ impl Motor {
         self.storage
             .hosted_update(id, |state| state.retry_iat = Some(0))
             .unwrap();
+    }
+}
+
+async fn completed_detached_owner(h: &Harness, root: &std::path::Path) -> (Motor, Uuid) {
+    let (motor, id) = detached_job(h, root).await;
+    // The result connection outlives its caller and receives the entire stream
+    // without any subscribers. Wait for retirement, not just terminal storage,
+    // so the following attach cannot accidentally use the old in-memory ring.
+    motor.ensure_hosted_result_at(id, 1);
+    let mut stopped = motor.hosted_result_stopped_for_test(id);
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stopped.wait_for(|stopped| *stopped),
+    )
+    .await
+    .expect("detached completed owner must retire")
+    .unwrap();
+    assert!(motor.storage.job(id).unwrap().hosted_complete());
+    assert_eq!(motor.hosted_state(id).unwrap().final_seq, Some(63));
+    (motor, id)
+}
+
+async fn assert_completed_replay(motor: &Motor, id: Uuid) {
+    let mut caller = motor.attach(AttachRequest::new(id, 1)).unwrap();
+    let has_owner = motor.hosted_results.lock().unwrap().contains_key(&id);
+    let stopped = has_owner.then(|| motor.hosted_result_stopped_for_test(id));
+    owner_outputs(motor, id, &mut caller, 1).await;
+    assert!(matches!(result_record(&mut caller).await,
+        StreamRecord::Terminal(terminal) if terminal.outcome == Outcome::Exit { code: 41 }));
+    assert!(caller.records.recv().await.is_none());
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stopped.unwrap().wait_for(|stopped| *stopped),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+async fn assert_expired_replay(motor: &Motor, id: Uuid) {
+    let mut caller = motor.attach(AttachRequest::new(id, 1)).unwrap();
+    assert!(matches!(result_record(&mut caller).await,
+        StreamRecord::Terminal(terminal) if terminal.outcome == Outcome::HistoryExpired));
+    assert!(caller.records.recv().await.is_none());
+    assert_eq!(
+        motor.hosted_state(id).unwrap().terminal.unwrap().outcome,
+        Outcome::Exit { code: 41 }
+    );
+}
+
+#[tokio::test]
+async fn hosted_finished_late_attach_replays_after_owner_retirement() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    let root = cortexkit_test_support::ScratchDir::new("hosted-finished-late-attach");
+    let (motor, id) = completed_detached_owner(&h, &root).await;
+    assert_completed_replay(&motor, id).await;
+    assert_eq!(owner_replay_cursors(&h), vec![1, 1]);
+    let mut boundary = motor.attach(AttachRequest::new(id, 63)).unwrap();
+    owner_outputs(&motor, id, &mut boundary, 63).await;
+    assert!(matches!(
+        result_record(&mut boundary).await,
+        StreamRecord::Terminal(_)
+    ));
+    drop(boundary);
+    let mut summary = motor.attach(AttachRequest::new(id, 64)).unwrap();
+    assert!(matches!(
+        result_record(&mut summary).await,
+        StreamRecord::Terminal(_)
+    ));
+    assert_eq!(owner_replay_cursors(&h), vec![1, 1, 63]);
+    drop(summary);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_finished_late_attach_reports_expired_host_history() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    let root = cortexkit_test_support::ScratchDir::new("hosted-finished-expired");
+    let (motor, id) = completed_detached_owner(&h, &root).await;
+    h.attach_history_expired.store(true, Ordering::SeqCst);
+    assert_expired_replay(&motor, id).await;
+    assert_eq!(owner_replay_cursors(&h), vec![1, 1]);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_finished_late_attach_does_not_use_billing_delivery_deadline() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    let root = cortexkit_test_support::ScratchDir::new("hosted-finished-slow-replay");
+    let (motor, id) = completed_detached_owner(&h, &root).await;
+    h.run_gate.send_replace(false);
+    let mut caller = motor.attach(AttachRequest::new(id, 1)).unwrap();
+    owner_outputs(&motor, id, &mut caller, 1).await;
+    // Billing normally gets five seconds after a terminal. A replay's output
+    // and terminal may take longer even though billing already completed.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(6), caller.records.recv())
+            .await
+            .is_err()
+    );
+    h.run_gate.send_replace(true);
+    assert!(matches!(result_record(&mut caller).await,
+        StreamRecord::Terminal(terminal) if terminal.outcome == Outcome::Exit { code: 41 }));
+    drop(caller);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_finished_late_attach_reports_retired_boat_history() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    let root = cortexkit_test_support::ScratchDir::new("hosted-finished-boat");
+    let (motor, id) = completed_detached_owner(&h, &root).await;
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.placement.as_mut().unwrap().host = "boat:retired".into();
+            state.finish_done = true;
+        })
+        .unwrap();
+    assert_expired_replay(&motor, id).await;
+    assert_eq!(owner_replay_cursors(&h), vec![1]);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_finished_late_attach_reports_refused_host_replay() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    let root = cortexkit_test_support::ScratchDir::new("hosted-finished-refused");
+    let (motor, id) = completed_detached_owner(&h, &root).await;
+    h.attach_auth_refusals.store(1, Ordering::SeqCst);
+    assert_expired_replay(&motor, id).await;
+    assert_eq!(h.attach_auth_refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(owner_replay_cursors(&h), vec![1]);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_finished_late_attach_replays_after_journal_recovery() {
+    for expired in [false, true] {
+        let h = Harness::new(Behavior::OwnerReplay).await;
+        let root = cortexkit_test_support::ScratchDir::new("hosted-finished-journal-source");
+        let recovered = cortexkit_test_support::ScratchDir::new("hosted-finished-journal-recovery");
+        let (motor, id) = completed_detached_owner(&h, &root).await;
+        // Copy the durable files before orderly shutdown checkpoints the journal.
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), recovered.join(entry.file_name())).unwrap();
+            }
+        }
+        motor.close().await;
+        let motor =
+            Motor::with_connector(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0))))
+                .unwrap();
+        assert_eq!(motor.hosted_state(id).unwrap().final_seq, Some(63));
+        h.attach_history_expired.store(expired, Ordering::SeqCst);
+        if expired {
+            assert_expired_replay(&motor, id).await;
+        } else {
+            assert_completed_replay(&motor, id).await;
+        }
+        assert_eq!(owner_replay_cursors(&h), vec![1, 1]);
+        motor.close().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_finished_old_store_without_final_seq_still_requests_replay() {
+    for expired in [false, true] {
+        let h = Harness::new(Behavior::OwnerReplay).await;
+        let root = cortexkit_test_support::ScratchDir::new("hosted-finished-old-source");
+        let recovered = cortexkit_test_support::ScratchDir::new("hosted-finished-old-store");
+        let (motor, id) = completed_detached_owner(&h, &root).await;
+        let mut job = serde_json::to_value(motor.storage.job(id).unwrap()).unwrap();
+        job["hosted"].as_object_mut().unwrap().remove("final_seq");
+        std::fs::write(
+            recovered.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "jobs": {id.to_string(): job}, "snapshots": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        motor.close().await;
+        let motor =
+            Motor::with_connector(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0))))
+                .unwrap();
+        let state = motor.hosted_state(id).unwrap();
+        assert_eq!(state.final_seq, None);
+        assert!(serde_json::to_value(state)
+            .unwrap()
+            .get("final_seq")
+            .is_none());
+        h.attach_history_expired.store(expired, Ordering::SeqCst);
+        if expired {
+            assert_expired_replay(&motor, id).await;
+        } else {
+            assert_completed_replay(&motor, id).await;
+        }
+        assert_eq!(owner_replay_cursors(&h), vec![1, 1]);
+        motor.close().await;
     }
 }
