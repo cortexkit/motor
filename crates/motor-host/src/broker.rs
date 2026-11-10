@@ -443,20 +443,19 @@ impl Heartbeats {
         }
     }
     pub fn step(&mut self, now_ms: u64) -> Result<()> {
-        let tenants: Vec<_> = self
-            .runtime
-            .host
-            .lock()
-            .expect("host lock")
-            .tenants
-            .values()
-            .map(|t| t.tenant.clone())
-            .collect();
+        let tenants: Vec<_> = {
+            let host = self.runtime.host.lock().expect("host lock");
+            if matches!(&host.settings, crate::config::HostSettings::PerJob(_)) {
+                Vec::new()
+            } else {
+                host.tenants.values().map(|t| t.tenant.clone()).collect()
+            }
+        };
         let mut healthy = self.last_state.as_ref().is_none_or(|h| h.healthy);
         let due = now_ms.saturating_sub(self.last_heartbeat) >= 15_000;
         // A failed probe latches the storage refusal; the heartbeat is still
         // sent, advertising no free vCPUs.
-        self.runtime.probe_storage();
+        self.runtime.probe_storage_at(now_ms);
         let changed = {
             let host = self.runtime.host.lock().expect("host lock");
             // Free memory is not lifecycle state, so any value compares equal.

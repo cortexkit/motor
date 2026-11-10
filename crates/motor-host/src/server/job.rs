@@ -291,9 +291,13 @@ impl Runtime {
         if !self.per_job() {
             return Ok(());
         }
-        self.probe_storage();
+        self.probe_storage_at(now_ms);
         let mut failure = None;
-        tick_step(&mut failure, "exits", self.collect_job_exits(now_ms));
+        tick_step(
+            &mut failure,
+            "exits",
+            self.collect_job_exits_at(now_ms, false),
+        );
         tick_step(
             &mut failure,
             "fill_sources",
@@ -482,10 +486,42 @@ impl Runtime {
     }
 
     fn collect_job_exits(&self, now_ms: u64) -> Result<()> {
-        let _operation = self.job_exits.lock().expect("job exit collection");
+        self.collect_job_exits_at(now_ms, true)
+    }
+
+    fn collect_job_exits_at(&self, now_ms: u64, force: bool) -> Result<()> {
+        let mut last_poll = self.job_exits.lock().expect("job exit collection");
         let mut failure = None;
-        let reports = match self.control.job_exits() {
-            Ok(reports) => reports,
+        // Idle ticks run more often than helper polling needs to. A stopping
+        // or gone VM still needs prompt exit evidence for settlement. Explicit
+        // stop/restart polls and acknowledgement of stored helper exit reports
+        // remain immediate.
+        let awaiting_exit = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .any(|e| {
+                !e.ended
+                    && e.evidence.as_ref().is_some_and(|e| {
+                        e.exit.is_none() && (e.gone_at_ms.is_some() || e.stop.is_some())
+                    })
+            });
+        let poll = force
+            || awaiting_exit
+            || last_poll.is_none_or(|last| now_ms < last || now_ms - last >= 1000);
+        let reports = match poll
+            .then(|| {
+                *last_poll = Some(now_ms);
+                self.control.job_exits()
+            })
+            .transpose()
+        {
+            Ok(None) => Vec::new(),
+            Ok(Some(reports)) => reports,
             Err(error) => {
                 tick_step(&mut failure, "poll_exits", Err::<(), _>(error));
                 Vec::new()

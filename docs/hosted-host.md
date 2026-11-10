@@ -311,6 +311,10 @@ out of memory.
 
 First-account toolchain copies run before the boot clock under a [separate preparation deadline](../crates/motor-host/README.md#account-image-preparation).
 
+Per-job startup verifies the published image hashes before binding the admin
+socket. The scan can take tens of seconds for large images; a missing admin
+socket during that interval does not by itself mean startup is hung.
+
 `per_job_mode_refuses_each_unset_setting_without_defaults`,
 `complete_per_job_config_selects_image_managed_runtime`
 (`crates/motor-host/src/main.rs`) and the configuration tests in

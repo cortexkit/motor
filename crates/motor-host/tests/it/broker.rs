@@ -37,6 +37,112 @@ impl Control for NoVm {
     }
 }
 
+#[derive(Default)]
+struct PerJobHost {
+    adopts: std::sync::atomic::AtomicUsize,
+}
+impl Control for PerJobHost {
+    fn host_available_mib(&self) -> Result<u64> {
+        NoVm.host_available_mib()
+    }
+    fn online_cpus(&self) -> Result<u32> {
+        NoVm.online_cpus()
+    }
+    fn capacity(&self) -> Result<motor_host::capacity::Capacity> {
+        Ok(motor_host::capacity::Capacity {
+            windows_vm_bytes: 0,
+            host_reserve_bytes: 0,
+            jobs_min_bytes: 1,
+            storage_margin_bytes: 0,
+            growth_allowance_bytes: 0,
+            tenant_memory_reserve_bytes: 0,
+        })
+    }
+    fn adopt(&self, _: &str) -> Result<bool> {
+        self.adopts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(false)
+    }
+    fn wake(&self, t: &str, memory: Option<u64>) -> Result<u64> {
+        NoVm.wake(t, memory)
+    }
+    fn quota(&self, t: &str, vcpus: u32) -> Result<()> {
+        NoVm.quota(t, vcpus)
+    }
+    fn relay(&self, t: &str, port: u32) -> Result<std::os::unix::net::UnixStream> {
+        NoVm.relay(t, port)
+    }
+    fn admin(&self, t: &str, request: &Value) -> Result<Value> {
+        NoVm.admin(t, request)
+    }
+    fn suspend(&self, t: &str) -> Result<()> {
+        NoVm.suspend(t)
+    }
+    fn available_bytes(&self) -> Result<u64> {
+        NoVm.available_bytes()
+    }
+}
+
+#[test]
+fn per_job_heartbeats_use_the_step_sample_time_without_five_second_capacity_flaps() {
+    let mut h = host();
+    h.settings = host_settings()[1].clone();
+    h.enforce_storage();
+    let control = Arc::new(PerJobHost::default());
+    let runtime = Runtime::new("host".into(), h, control.clone());
+    let now = motor_host::server::unix_ms().saturating_sub(100);
+    let mut heartbeats = motor_host::broker::Heartbeats::new(runtime.clone());
+    heartbeats.step(now).unwrap();
+    {
+        let host = runtime.host.lock().unwrap();
+        assert!(host.fresh_host_resources(now).is_some());
+        let body: Value =
+            serde_json::from_slice(&host.snapshot.outbox.last().unwrap().body).unwrap();
+        assert_eq!(body["free_vcpus"], 4);
+    }
+    heartbeats.step(now + 5_000).unwrap();
+    assert_eq!(
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .snapshot
+            .outbox
+            .last()
+            .unwrap()
+            .created_ms,
+        now
+    );
+    heartbeats.step(now + 15_000).unwrap();
+    assert_eq!(
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .snapshot
+            .outbox
+            .last()
+            .unwrap()
+            .created_ms,
+        now + 15_000
+    );
+    assert_eq!(control.adopts.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn per_job_metrics_omit_retained_stopped_shared_tenants() {
+    let mut h = host();
+    assert!(!h.tenants.is_empty());
+    h.settings = host_settings()[1].clone();
+    let runtime = Runtime::new("host".into(), h, Arc::new(PerJobHost::default()));
+    let sample = motor_host::metrics::Sampler::default()
+        .sample(&runtime, std::path::Path::new("/"), NOW * 1000)
+        .unwrap();
+    assert!(sample.tenants.is_empty());
+    assert!(sample.runners.is_empty());
+}
+
 fn metrics_request(ms: u64) -> motor_host::billing::Request {
     let vector: Value = serde_json::from_str(include_str!(
         "../../../motor-lease/contracts/cloud/host-metrics.json"

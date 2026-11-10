@@ -184,7 +184,7 @@ pub struct Runtime {
     image_generations: Option<Arc<crate::jobs::images::Images>>,
     job_resources: Arc<dyn crate::jobs::Resources>,
     job_stops: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
-    job_exits: Mutex<()>,
+    job_exits: Mutex<Option<u64>>,
     job_launches: Mutex<BTreeMap<String, Arc<job::Launch>>>,
     job_recoveries: Mutex<BTreeMap<String, job::recovery::Worker>>,
     job_fills: Mutex<crate::jobs::fills::Scheduler>,
@@ -433,7 +433,7 @@ impl Runtime {
             job_resources: Arc::new(crate::jobs::Unavailable),
             image_generations: None,
             job_stops: Mutex::new(BTreeMap::new()),
-            job_exits: Mutex::new(()),
+            job_exits: Mutex::new(None),
             job_launches: Mutex::new(BTreeMap::new()),
             job_recoveries: Mutex::new(BTreeMap::new()),
             job_fills: Mutex::new(crate::jobs::fills::Scheduler::new(Arc::new(
@@ -665,6 +665,10 @@ impl Runtime {
     /// admission and every heartbeat; a host that does not enforce the
     /// refusal skips the I/O.
     pub fn probe_storage(&self) {
+        self.probe_storage_at(unix_ms());
+    }
+
+    pub(crate) fn probe_storage_at(&self, now_ms: u64) {
         if !self.host.lock().expect("host lock").storage_enforced() {
             return;
         }
@@ -683,7 +687,10 @@ impl Runtime {
                 settings.validate_cpus(self.control.online_cpus()?)?;
                 let available_mem_mib = self.control.host_available_mib()?;
                 Ok(crate::state::jobs::HostResources {
-                    at_ms: unix_ms(),
+                    // Use the caller's observation clock. A timestamp taken
+                    // later in this probe would look like a future sample to
+                    // the same tick/heartbeat and falsely withdraw capacity.
+                    at_ms: now_ms,
                     available_mem_mib,
                     vcpu_ceiling: settings.vcpu_ceiling,
                     permit_budget: settings.permit_budget,

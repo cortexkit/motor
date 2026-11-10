@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn periodic_exit_polling_is_bounded_but_explicit_collection_remains_immediate() {
+    let (runtime, fake, _) = fixture();
+    let now = unix_ms();
+    for offset in (0..1000).step_by(100) {
+        runtime.tick_jobs(now + offset).unwrap();
+    }
+    assert_eq!(fake.exit_polls.load(Ordering::SeqCst), 1);
+    runtime.collect_job_exits(now + 950).unwrap();
+    assert_eq!(fake.exit_polls.load(Ordering::SeqCst), 2);
+    runtime.tick_jobs(now + 1000).unwrap();
+    assert_eq!(fake.exit_polls.load(Ordering::SeqCst), 2);
+    runtime.tick_jobs(now + 1950).unwrap();
+    assert_eq!(fake.exit_polls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
 fn trusted_memavailable_floors_kib_to_mib_and_refuses_missing_or_invalid_samples() {
     assert_eq!(
         host_available_mib("MemTotal: 99999 kB\nMemAvailable: 3071 kB\n").unwrap(),

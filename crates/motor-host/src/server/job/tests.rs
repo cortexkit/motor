@@ -80,6 +80,7 @@ struct Fake {
     gone: Mutex<BTreeSet<String>>,
     fail_ack: AtomicBool,
     fail_poll: AtomicBool,
+    exit_polls: std::sync::atomic::AtomicU64,
     disconnect_on_run: AtomicBool,
     acknowledgements: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
     balloon_supported: AtomicBool,
@@ -190,6 +191,7 @@ impl Control for Fake {
         Ok(())
     }
     fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {
+        self.exit_polls.fetch_add(1, Ordering::SeqCst);
         ensure!(
             !self.fail_poll.load(Ordering::Acquire),
             "injected exit poll failure"

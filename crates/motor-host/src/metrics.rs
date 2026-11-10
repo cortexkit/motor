@@ -95,6 +95,9 @@ impl Sampler {
     fn tenants(&mut self, runtime: &Arc<Runtime>, sample: &mut HostMetrics) {
         let bindings: Vec<_> = {
             let host = runtime.host.lock().expect("host lock");
+            if matches!(&host.settings, crate::config::HostSettings::PerJob(_)) {
+                return;
+            }
             host.tenants
                 .iter()
                 .take(8)
