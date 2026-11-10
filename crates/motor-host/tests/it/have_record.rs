@@ -279,6 +279,10 @@ impl Fixture {
             permit_budget: 4,
         });
         let runtime = Runtime::with_job_resources("host".into(), host, disk.clone(), disk.clone());
+        // Production configures these from host.json; a job VM boot refuses without them.
+        runtime
+            .configure_job_resolvers(vec!["1.1.1.1".into()])
+            .unwrap();
         let broker = SigningKey::from_bytes(&[7; 32]);
         let requester = SigningKey::from_bytes(&[8; 32]);
         runtime
