@@ -255,6 +255,7 @@ pub(crate) fn matches(lease: &VerifiedLease, run: &Run) -> bool {
 /// helper's `reboot=k` boot argument, a guest reboot resets through the
 /// keyboard controller, which Firecracker handles by exiting. systemd still
 /// stops services and unmounts every disk first, as for a power-off.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn job_vm_exit_command() -> std::process::Command {
     let mut command = std::process::Command::new("systemctl");
     command.arg("reboot");
