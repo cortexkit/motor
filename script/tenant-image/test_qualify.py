@@ -9,6 +9,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -362,20 +363,58 @@ class QualificationTests(unittest.TestCase):
     def test_runner_journal_uses_real_admin_diagnostics_for_tail_and_window(self):
         harness = q.Harness.__new__(q.Harness)
         harness.name, harness.uid, harness.gid = "qualify-host", 1234, 1234
-        harness.work = Path("/qualification")
         harness.record = mock.Mock()
         reply = dict(ok=True, journal=dict(entries=[dict(message="runner hello received elapsed_ms=1")],
                                           unrecognized_messages_redacted=True,
                                           command=dict(exit_status=0, stderr_tail="")))
-        with mock.patch.object(q.socket, "socket") as factory, mock.patch.object(q.os, "seteuid"), \
-                mock.patch.object(q.os, "setegid"):
-            conn = factory.return_value.__enter__.return_value
-            conn.recv.return_value = json.dumps(reply).encode() + b"\n"
-            evidence = harness.runner_journal()
+        requests, errors = [], []
+
+        def receive(conn, size):
+            data = bytearray()
+            while len(data) < size:
+                chunk = conn.recv(size - len(data))
+                if not chunk:
+                    raise EOFError("fake admin socket closed before frame completed")
+                data.extend(chunk)
+            return data
+
+        def serve(listener):
+            try:
+                for _ in range(2):
+                    conn, _ = listener.accept()
+                    with conn:
+                        conn.settimeout(5)
+                        size, = struct.unpack(">I", receive(conn, 4))
+                        if not 0 < size <= 16 * 1024**2:
+                            raise ValueError(f"invalid admin request frame size: {size}")
+                        requests.append(json.loads(receive(conn, size)))
+                        payload = json.dumps(reply).encode()
+                        header = struct.pack(">I", len(payload))
+                        # Split both header and body to exercise exact-length reads.
+                        for chunk in (header[:2], header[2:], payload[:7], payload[7:]):
+                            conn.sendall(chunk)
+            except Exception as error:
+                errors.append(error)
+
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(socket.AF_UNIX) as listener:
+            harness.work = Path(tmp)
+            admin = harness.work / "host-private/admin.sock"
+            admin.parent.mkdir()
+            listener.bind(str(admin))
+            listener.listen(2)
+            listener.settimeout(5)
+            server = threading.Thread(target=serve, args=(listener,), daemon=True)
+            server.start()
+            try:
+                with mock.patch.object(q.os, "seteuid"), mock.patch.object(q.os, "setegid"):
+                    evidence = harness.runner_journal()
+            finally:
+                server.join(timeout=6)
+            self.assertFalse(server.is_alive(), "fake admin server did not finish")
+        self.assertEqual(errors, [])
         self.assertEqual(len(evidence), 2)
         self.assertEqual(evidence[0]["command"], dict(exit_status=0, stderr_tail=""))
-        self.assertEqual(conn.connect.call_args_list, [mock.call("/qualification/host-private/admin.sock")] * 2)
-        self.assertEqual([json.loads(call.args[0]) for call in conn.sendall.call_args_list], [
+        self.assertEqual(requests, [
             dict(tenant="qualify-host", op="diagnostics"),
             dict(tenant="qualify-host", op="diagnostics", since_unix_s=0)])
         source = __import__("inspect").getsource(q.Harness.execute)

@@ -465,13 +465,8 @@ class Harness:
                 finally:
                     os.seteuid(0)
                     os.setegid(0)
-                conn.sendall(json.dumps(dict(tenant=self.name, op="diagnostics", **window)).encode() + b"\n")
-                data = b""
-                while not data.endswith(b"\n"):
-                    data += conn.recv(65536) or (_ for _ in ()).throw(EOFError())
-                    if len(data) > 4 * 1024**2:
-                        raise RuntimeError("runner diagnostics reply exceeded four MiB")
-            reply = json.loads(data)
+                send_frame(conn, dict(tenant=self.name, op="diagnostics", **window))
+                reply = frame(conn)
             self.record("runner_diagnostics", window=window, reply=reply)
             evidence.append(assert_runner_journal(reply, require_hello=bool(window)))
         return evidence
