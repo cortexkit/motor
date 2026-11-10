@@ -205,15 +205,11 @@ fn host_sample_freshness_bounds_both_past_age_and_future_skew() {
     let mut sample = host.fresh_host_resources(unix_ms()).unwrap();
     sample.at_ms = 50_000;
     host.record_host_resources(sample);
-    for now in [
-        49_500,
-        49_000,
-        50_000,
-        50_000 + crate::state::MEMORY_FRESH_MS,
-    ] {
+    let window = crate::state::MEMORY_FRESH_MS;
+    for now in [49_500, 49_000, 50_000 - window, 50_000, 50_000 + window] {
         assert!(host.fresh_host_resources(now).is_some(), "{now}");
     }
-    for now in [48_999, 50_001 + crate::state::MEMORY_FRESH_MS] {
+    for now in [50_000 - window - 1, 50_001 + window] {
         assert!(host.fresh_host_resources(now).is_none(), "{now}");
     }
     host.host_resources_unavailable("test missing sample");

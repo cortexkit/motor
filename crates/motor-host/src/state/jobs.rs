@@ -121,7 +121,10 @@ pub struct HostResources {
     pub permit_budget: u32,
 }
 
-const HOST_SAMPLE_AHEAD_MS: u64 = 1_000;
+// A caller may capture its clock, then wait on I/O or a lock while another
+// thread publishes a newer sample. Such a sample is newer than the caller's
+// view, not stale; allow the same window ahead as behind.
+const HOST_SAMPLE_AHEAD_MS: u64 = super::MEMORY_FRESH_MS;
 
 impl HostResources {
     pub(crate) fn free_mem_mib(&self, host_reserve_mib: u64) -> u64 {
@@ -259,7 +262,11 @@ impl Host {
                 && now_ms.saturating_sub(sample.at_ms) <= super::MEMORY_FRESH_MS
         });
         if fresh.is_none() && !self.host_resources_failed.replace(true) {
-            tracing::warn!("host_resources_missing_or_stale");
+            tracing::warn!(
+                now_ms,
+                sample_at_ms = self.host_resources.map(|s| s.at_ms),
+                "host_resources_missing_or_stale"
+            );
         }
         fresh
     }

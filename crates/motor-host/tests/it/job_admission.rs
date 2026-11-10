@@ -363,6 +363,9 @@ fn permits_include_overcommit_and_queued_jobs_and_are_released_only_on_stop() {
 fn slightly_ahead_memory_sample_keeps_admission_capacity() {
     let mut h = memory_host(1_000);
     assert_eq!(h.job_free_mem_mib(AT - 500), 950);
+    // A caller that captured its clock seconds before another thread published
+    // the sample still sees capacity.
+    assert_eq!(h.job_free_mem_mib(AT - 5_000), 950);
     assert_eq!(h.claim(job(JOB), AT - 500).unwrap().1, Admission::Ready);
 }
 
@@ -370,7 +373,7 @@ fn slightly_ahead_memory_sample_keeps_admission_capacity() {
 fn missing_stale_or_far_future_memory_samples_refuse_without_reservations() {
     let mut h = memory_host(1_000);
     full(h.claim(job(JOB), AT + motor_host::state::MEMORY_FRESH_MS + 1));
-    full(h.claim(job(JOB), AT - 1_001));
+    full(h.claim(job(JOB), AT - motor_host::state::MEMORY_FRESH_MS - 1));
     assert!(h.snapshot.per_job.is_empty());
     let mut h = configure(
         Host::new(
