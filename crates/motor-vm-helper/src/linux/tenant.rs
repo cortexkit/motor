@@ -1109,10 +1109,30 @@ fn api_with_timeout(
         }
     }
     if status.split_whitespace().nth(1) != Some("204") {
+        // Firecracker names the cause of a refusal in a small JSON fault body
+        // (an invalid ID, a missing file). Keep a bounded copy so the helper's
+        // error says why, not only which status came back.
+        let mut rest = Vec::new();
+        let remaining = end
+            .saturating_duration_since(std::time::Instant::now())
+            .min(Duration::from_secs(2));
+        if !remaining.is_zero() && reader.get_ref().set_read_timeout(Some(remaining)).is_ok() {
+            let _ = (&mut reader).take(4096).read_to_end(&mut rest);
+        }
+        let response = String::from_utf8_lossy(&rest);
+        let fault = response
+            .split_once("\r\n\r\n")
+            .map_or("", |(_, body)| body)
+            .trim();
+        let detail = if fault.is_empty() {
+            status.trim().to_string()
+        } else {
+            format!("{} {fault}", status.trim())
+        };
         return Err(failure(
             "response_status",
             true,
-            std::io::Error::other(status.trim()),
+            std::io::Error::other(detail),
         ));
     }
     eprintln!(

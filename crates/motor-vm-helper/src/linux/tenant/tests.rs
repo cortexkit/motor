@@ -339,6 +339,29 @@ fn snapshot_deadline_scales_with_memory_and_reserves_helper_cleanup_budget() {
 }
 
 #[test]
+fn firecracker_refusal_carries_its_fault_message() {
+    let scratch = cortexkit_test_support::ScratchDir::new("api-fault");
+    let listener = UnixListener::bind(scratch.join("api.sock")).unwrap();
+    let thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"fault_message\":\"API Resource IDs can only contain alphanumeric characters and underscores.\"}")
+            .unwrap();
+    });
+    let error = api(scratch.path(), "PUT", "/drives/x", &json!({})).unwrap_err();
+    thread.join().unwrap();
+    let text = error.to_string();
+    assert!(text.contains("HTTP/1.1 400"), "{text}");
+    assert!(
+        text.contains("API Resource IDs can only contain alphanumeric characters"),
+        "{text}"
+    );
+}
+
+#[test]
 fn firecracker_create_timeout_names_the_endpoint_and_uncertain_writer() {
     let scratch = cortexkit_test_support::ScratchDir::new("create-timeout");
     let listener = UnixListener::bind(scratch.join("api.sock")).unwrap();

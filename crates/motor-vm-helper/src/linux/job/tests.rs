@@ -64,17 +64,53 @@ fn balloon_refuses_target_above_recorded_ram_before_opening_any_process_or_socke
     std::fs::remove_dir_all(base).unwrap();
 }
 
+/// Firecracker answers 400 InvalidID to any resource ID (in the path or the
+/// body) with characters other than ASCII alphanumerics and underscores. A
+/// hyphenated credential drive ID once failed every credentialed job start.
+#[test]
+fn every_boot_request_uses_ids_firecracker_accepts() {
+    let valid =
+        |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let nonce = "0123456789abcdef0123456789abcdef";
+    for kind in [
+        job::VmKind::Job,
+        job::VmKind::Fill,
+        job::VmKind::BaseBuild,
+        job::VmKind::Recovery,
+    ] {
+        let mut start = start();
+        start.kind = kind;
+        for nonce in [Some(nonce), None] {
+            for (path, body) in boot_requests(&start, Some(17), nonce, 4 << 30).unwrap() {
+                for resource in ["/drives/", "/pmem/", "/network-interfaces/"] {
+                    if let Some(id) = path.strip_prefix(resource) {
+                        assert!(valid(id), "{kind:?}: invalid Firecracker ID in path {path}");
+                    }
+                }
+                for key in ["drive_id", "iface_id", "id"] {
+                    if let Some(id) = body[key].as_str() {
+                        assert!(
+                            valid(id),
+                            "{kind:?}: invalid Firecracker {key} {id} in {path}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
     let nonce = "0123456789abcdef0123456789abcdef";
     let requests = boot_requests(&start(), Some(17), Some(nonce), 4 << 30).unwrap();
     let drive = requests
         .iter()
-        .find(|request| request.0 == "/drives/remote-cache")
+        .find(|request| request.0 == "/drives/remote_cache")
         .unwrap();
     assert_eq!(
         drive.1,
-        json!({"drive_id":"remote-cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})
+        json!({"drive_id":"remote_cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})
     );
     let encoded: String = runner_args(&start(), 4 << 30, true)
         .unwrap()
@@ -89,7 +125,7 @@ fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
     let plain = boot_requests(&start(), Some(17), None, 4 << 30).unwrap();
     assert!(!plain
         .iter()
-        .any(|request| request.0 == "/drives/remote-cache"));
+        .any(|request| request.0 == "/drives/remote_cache"));
     assert!(!plain[1].1["boot_args"]
         .as_str()
         .unwrap()
@@ -101,7 +137,7 @@ fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
         recovery[1].1["boot_args"],
         format!("{JOB_BOOT_ARGS} motor.recovery=1")
     );
-    assert!(!recovery.iter().any(|r| r.0 == "/drives/remote-cache"));
+    assert!(!recovery.iter().any(|r| r.0 == "/drives/remote_cache"));
     assert!(!recovery
         .iter()
         .any(|request| request.0.starts_with("/network-interfaces/")));

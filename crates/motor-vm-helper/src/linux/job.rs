@@ -1380,7 +1380,10 @@ pub fn boot_requests(
         ));
     }
     if nonce.is_some() {
-        requests.push(("/drives/remote-cache", json!({"drive_id":"remote-cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})));
+        // Firecracker refuses resource IDs with anything but alphanumerics and
+        // underscores (400 InvalidID). The guest finds this drive by its nonce,
+        // so the ID only has to be valid.
+        requests.push(("/drives/remote_cache", json!({"drive_id":"remote_cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})));
     }
     requests.push(("/actions", json!({"action_type":"InstanceStart"})));
     Ok(requests)
