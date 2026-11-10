@@ -118,6 +118,14 @@ the checkout copies its own final binaries back into the target folder. The
 opt-in fixed path in 3.9 gives a repository's worktrees the same Cargo path
 without sharing a writable checkout or build folder.
 
+A build script that runs a nested Cargo in the same workspace inherits this
+variable. `--target-dir` does not move a build folder that
+`CARGO_BUILD_BUILD_DIR` sets, so the nested Cargo uses the outer build's
+folder and waits on the lock the outer Cargo holds, until the job's time
+limit. Remove the variable from the nested command's environment (in Rust,
+`Command::env_remove("CARGO_BUILD_BUILD_DIR")`), so its build folder follows
+its own `--target-dir`. Not covered by a test.
+
 3.1. A job cannot read the runner's state, mirrors, other workspaces or other
 jobs' sandboxes. Tests: `isolated_job_cannot_access_runner_or_other_jobs` and
 `isolated_jobs_receive_private_shm_that_disappears_after_they_end` (operator-only).
