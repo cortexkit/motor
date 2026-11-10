@@ -21,6 +21,16 @@ async fn next_record(client: &mut tokio::io::DuplexStream) -> Raw {
         }
     }
 }
+/// The next frame the host sends the guest, skipping the host's keep-alive
+/// heartbeats as the guest runner does.
+async fn guest_frame(guest: &mut tokio::net::UnixStream) -> Value {
+    loop {
+        let frame = read_frame(guest).await.unwrap();
+        if frame["type"] != "heartbeat" {
+            return frame;
+        }
+    }
+}
 fn peer(fake: &Fake) -> tokio::net::UnixStream {
     let (host, guest) = UnixStream::pair().unwrap();
     fake.scripted.lock().unwrap().push_back(host);
@@ -67,7 +77,7 @@ async fn launched_with_returns(
     write_frame(&mut client, &request).await.unwrap();
     next_type(&mut client, "accepted").await;
     handshake(&mut guest).await;
-    assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "run");
+    assert_eq!(guest_frame(&mut guest).await["type"], "run");
     assert_eq!(
         runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].replay_reservation_bytes,
         Some(crate::state::jobs::storage::REPLAY_RESERVATION_BYTES)
@@ -420,7 +430,7 @@ async fn live_controls_use_the_single_runner_connection_and_ended_controls_use_t
     ] {
         let request = json!({"type":kind,"job_id":JOB});
         write_frame(&mut client, &request).await.unwrap();
-        assert_eq!(read_frame(&mut guest).await.unwrap(), request);
+        assert_eq!(guest_frame(&mut guest).await, request);
         write_frame(&mut guest, &response).await.unwrap();
         assert_eq!(read_frame(&mut client).await.unwrap(), response);
     }
@@ -584,7 +594,7 @@ async fn concurrent_controls_receive_only_their_own_runner_reply() {
         write_frame(client, &json!({"type":"job_status","job_id":JOB}))
             .await
             .unwrap();
-        assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "job_status");
+        assert_eq!(guest_frame(&mut guest).await["type"], "job_status");
     }
     for ordinal in [1, 2] {
         write_frame(
@@ -692,10 +702,7 @@ async fn relayed_run_alone_sets_return_reservation_and_runner_hints_cannot_chang
         );
         guest.write_all(records().last().unwrap()).await.unwrap();
         next_type(&mut client, "terminal").await;
-        assert_eq!(
-            read_frame(&mut guest).await.unwrap()["type"],
-            "terminal_stored"
-        );
+        assert_eq!(guest_frame(&mut guest).await["type"], "terminal_stored");
         drop(client);
         task.await.unwrap().unwrap();
         power_off(&runtime, &fake);
@@ -727,10 +734,7 @@ async fn fake_clock_chunk_expiry_and_delayed_usage_acceptance_survive_restart_wi
     }
     guest.write_all(records().last().unwrap()).await.unwrap();
     while next_record(&mut client).await.value["type"] != "terminal" {}
-    assert_eq!(
-        read_frame(&mut guest).await.unwrap()["type"],
-        "terminal_stored"
-    );
+    assert_eq!(guest_frame(&mut guest).await["type"], "terminal_stored");
     drop(client);
     task.await.unwrap().unwrap();
     power_off(&runtime, &fake);
@@ -914,10 +918,7 @@ async fn slow_live_caller_and_restarted_attach_receive_truncation_then_all_retai
         .unwrap();
     }
     guest.write_all(records().last().unwrap()).await.unwrap();
-    assert_eq!(
-        read_frame(&mut guest).await.unwrap()["type"],
-        "terminal_stored"
-    );
+    assert_eq!(guest_frame(&mut guest).await["type"], "terminal_stored");
     let mut seen = Vec::new();
     let mut terminal_count = 0;
     loop {

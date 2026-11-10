@@ -1794,6 +1794,31 @@ async fn delivered_run_without_guest_acceptance_replays_unknown_after_disconnect
     runtime.host.lock().unwrap().close(id).unwrap();
 }
 
+/// The guest runner closes its channel after 60 s with no byte from the host.
+/// Once the upload is over, only host heartbeats keep a long job's channel
+/// open, whether or not a client is attached.
+#[tokio::test]
+async fn quiet_running_job_channel_gets_host_heartbeats() {
+    let (runtime, fake, _) = fixture();
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    queued(&mut client, JOB).await;
+    next_type(&mut client, "output").await;
+    let quiet = fake.inputs.lock().unwrap().len();
+    tokio::time::sleep(super::stream::GUEST_HEARTBEAT + Duration::from_secs(1)).await;
+    let beats = fake.inputs.lock().unwrap()[quiet..]
+        .iter()
+        .filter(|bytes| {
+            serde_json::from_slice::<Value>(&bytes[4..]).unwrap()["type"] == "heartbeat"
+        })
+        .count();
+    assert!(beats >= 1, "no host heartbeat reached the guest");
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
 #[test]
 fn mirror_report_is_recorded_before_lifecycle_ack() {
     let (runtime, fake, _) = fixture();

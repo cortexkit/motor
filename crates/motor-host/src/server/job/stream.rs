@@ -6,6 +6,10 @@ use crate::state::jobs::storage::ReplayCompletion;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+/// Longest gap between host writes to a job VM's runner channel, well inside
+/// the runner's 60-second wire inactivity limit.
+pub(super) const GUEST_HEARTBEAT: Duration = Duration::from_secs(5);
+
 struct Input {
     bytes: Vec<u8>,
     reply: Option<oneshot::Sender<Vec<u8>>>,
@@ -311,6 +315,14 @@ async fn collect(
             }
             remove_spool(&p.spool.path)?;
         }
+        // The guest runner closes its channel after 60 s without a byte from
+        // the host ("wire inactivity"). In tenant mode ck-motor's heartbeats
+        // pass through; here the host answers client heartbeats itself and the
+        // client may detach, so the host keeps the guest channel alive on its
+        // own. A failed heartbeat only stops heartbeats: a guest that closed
+        // its input must not fail the stream before its terminal is read.
+        let mut last_write = tokio::time::Instant::now();
+        let mut heartbeats = true;
         loop {
             if store.upload_detached.load(Ordering::Acquire)
                 && !upload.complete()
@@ -338,8 +350,18 @@ async fn collect(
                         pending.lock().expect("pending replies").entry(kind).or_default().push_back(reply);
                     }
                     write.lock().await.write_all(&input.bytes).await?;
+                    last_write = tokio::time::Instant::now();
                 }
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            if heartbeats && last_write.elapsed() >= GUEST_HEARTBEAT {
+                let beat =
+                    write_frame(&mut *write.lock().await, &json!({"type":"heartbeat"})).await;
+                if let Err(error) = beat {
+                    tracing::info!(jti = claims.jti, %error, "guest_heartbeat_stopped");
+                    heartbeats = false;
+                }
+                last_write = tokio::time::Instant::now();
             }
         }
     };
