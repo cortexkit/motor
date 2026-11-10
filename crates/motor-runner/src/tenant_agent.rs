@@ -171,10 +171,7 @@ async fn fill_session<S: AsyncRead + AsyncWrite + Unpin>(
         }
         write_json(socket, &reply).await?;
         if reply["ok"] == true {
-            let status = Command::new("systemctl").arg("poweroff").status()?;
-            if !status.success() {
-                return Err(io::Error::other("fill VM poweroff failed"));
-            }
+            crate::tenant::end_job_vm("fill")?;
         }
     } else {
         let reply = read_json(&mut runner)

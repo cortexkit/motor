@@ -248,6 +248,28 @@ pub(crate) fn matches(lease: &VerifiedLease, run: &Run) -> bool {
         && run.timeout.is_some_and(|s| s <= lease.max_s)
 }
 
+/// The command a job or fill VM runs to end itself once its work is settled.
+/// It must be a reboot, not a power-off: Firecracker has no power-off exit, so
+/// after `poweroff` the guest halts and the VMM keeps running, holding the
+/// workspace disk and its memory, and the host never sees the VM end. With the
+/// helper's `reboot=k` boot argument, a guest reboot resets through the
+/// keyboard controller, which Firecracker handles by exiting. systemd still
+/// stops services and unmounts every disk first, as for a power-off.
+pub(crate) fn job_vm_exit_command() -> std::process::Command {
+    let mut command = std::process::Command::new("systemctl");
+    command.arg("reboot");
+    command
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn end_job_vm(kind: &str) -> io::Result<()> {
+    let status = job_vm_exit_command().status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("{kind} VM exit failed")));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub async fn serve_tenant(runner: crate::Runner) -> io::Result<()> {
     if !runner.config().tenant_vm {
@@ -286,8 +308,7 @@ pub async fn serve_tenant(runner: crate::Runner) -> io::Result<()> {
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
                     if job_runner.job_poweroff_ready() {
-                        let status = std::process::Command::new("systemctl").arg("poweroff").status()?;
-                        if !status.success() { return Err(io::Error::other("job VM poweroff failed")); }
+                        end_job_vm("job")?;
                         return Ok::<(), io::Error>(());
                     }
                     if !job_runner.config().per_job && job_runner.drain_should_exit() { return Ok::<(), io::Error>(()); }

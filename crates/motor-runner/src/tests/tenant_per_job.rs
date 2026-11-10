@@ -83,6 +83,15 @@ fn tenant_mode_still_accepts_multiple_jobs_and_workspaces() {
     }
 }
 
+/// Firecracker exits on a guest reboot but not on a power-off, which only
+/// halts the guest and leaves the VM holding its disk (ovh-2, 10 Nov 2026).
+#[test]
+fn job_vms_end_by_reboot_because_firecracker_ignores_poweroff() {
+    let command = crate::tenant::job_vm_exit_command();
+    assert_eq!(command.get_program(), "systemctl");
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["reboot"]);
+}
+
 #[tokio::test]
 async fn poweroff_waits_for_terminal_stored_ack_on_the_host_job_stream() {
     let f = Fixture::new();
