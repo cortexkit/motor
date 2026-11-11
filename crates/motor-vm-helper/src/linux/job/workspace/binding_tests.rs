@@ -13,7 +13,7 @@ fn isolated_workspace_binding_is_created_from_verified_grant_and_never_backfille
         .unwrap(),
     );
     let id = job::test_id(97);
-    let account = "account-1";
+    let account = crate::cache_write::tests::ACCOUNT;
     crate::cache_write::tests::with_fresh_token(&id, account, |config, token| {
         jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
             crate::cache_write::Grants::new(config),
@@ -103,7 +103,7 @@ fn isolated_pre_intent_retry_stages_write_key_and_read_only_credential_drive() {
     let start = Start {
         kind: job::VmKind::Job,
         job_id: job::test_id(99),
-        account: "account-1".into(),
+        account: crate::cache_write::tests::ACCOUNT.into(),
         workspace_disk_id: "bound".into(),
         image_generation_id: "image".into(),
         vcpus: 1,

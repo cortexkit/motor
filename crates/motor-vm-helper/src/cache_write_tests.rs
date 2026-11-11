@@ -17,7 +17,7 @@ use std::{
 };
 
 const NOW: u64 = 1_700_000_000;
-const ACCOUNT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+pub(crate) const ACCOUNT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(NOW)

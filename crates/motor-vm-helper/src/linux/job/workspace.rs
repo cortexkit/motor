@@ -297,8 +297,9 @@ pub(super) fn seed_bound(
         let previous: job::Seed =
             serde_json::from_reader(fs::trusted_file(&root.join(id).join("seed.json"))?)
                 .map_err(|e| Error(e.to_string()))?;
-        // A grant selector is not seed provenance. Retrying with another token
-        // must neither change the original binding nor backfill a legacy disk.
+        // cache_write_job_id selects a verified grant when creating a new disk.
+        // Ignore that field on an existing disk: retries must not replace its
+        // stored workspace hash or add a hash to a legacy registry.
         if registry.role != job::WorkspaceRole::Job
             || disk.metadata()?.uid() != 0
             || previous.account != seed.account

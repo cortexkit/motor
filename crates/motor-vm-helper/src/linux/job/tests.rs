@@ -1290,6 +1290,7 @@ fn fill_boot_authority_comes_from_the_root_disk_role_not_the_requested_start_kin
 fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
     let base = scratch();
     let mut record = record();
+    record.start.account = crate::cache_write::tests::ACCOUNT.into();
     let id = record.start.job_id.clone();
     let account = record.start.account.clone();
     crate::cache_write::tests::with_fresh_token(&id, &account, |config, token| {
@@ -1405,7 +1406,8 @@ fn write_boot_flag_requires_job_role_and_staged_credentials_without_granting_fil
 fn start_retry_before_durable_intent_reuses_grant_for_write_boot_configuration() {
     let base = scratch();
     let mut jobs = machine(&base);
-    let start = start();
+    let mut start = start();
+    start.account = crate::cache_write::tests::ACCOUNT.into();
     crate::cache_write::tests::with_fresh_token(&start.job_id, &start.account, |config, token| {
         jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
             crate::cache_write::Grants::new(config),

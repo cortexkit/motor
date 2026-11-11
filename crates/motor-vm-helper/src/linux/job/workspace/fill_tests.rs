@@ -135,7 +135,8 @@ fn isolated_fill_promotion_requires_publication_clean_exit_evidence_and_detachme
 
 #[test]
 fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_base() {
-    let (base, mut jobs, fill) = fixture();
+    let (base, mut jobs, mut fill) = fixture();
+    fill.account = crate::cache_write::tests::ACCOUNT.into();
     // Root scratch may be ext4; exercise real reflinks on a disposable XFS store.
     let store = ReflinkStore::new(&base);
     jobs.workspaces = store.0.join("workspaces");
@@ -151,7 +152,7 @@ fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_ba
         base_id: fill.disk_id(),
         disk_id: "new-job".into(),
     };
-    for (account, repository_key) in [("foreign", "repo"), ("account", "foreign")] {
+    for (account, repository_key) in [("foreign", "repo"), (fill.account.as_str(), "foreign")] {
         let mut wrong = request.clone();
         wrong.account = account.into();
         wrong.repository_key = repository_key.into();
@@ -174,7 +175,7 @@ fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_ba
             .admit(token)
             .unwrap();
         let mut bound = request.clone();
-        bound.cache_write_job_id = Some(id);
+        bound.cache_write_job_id = Some(id.clone());
         jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)
             .unwrap();
         assert!(open_disk(&jobs.workspaces, &fill.account, "new-job")

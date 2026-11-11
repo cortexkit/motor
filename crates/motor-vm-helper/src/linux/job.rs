@@ -1370,7 +1370,8 @@ fn early_boot_command_line(
     if start.kind == job::VmKind::Fill {
         checked_boot_command_line(format!("{line} motor.fill=1"))
     } else if start.kind == job::VmKind::Job {
-        checked_boot_command_line(format!("{line} motor.cache_write=1"))
+        checked_boot_command_line(format!("{line} motor.cache_write=1"))?;
+        Ok(line)
     } else {
         Ok(line)
     }
