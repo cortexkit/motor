@@ -459,9 +459,17 @@ pub(crate) fn host_unit_name(id: Uuid) -> String {
 // floor, then scale at 3.5 GiB per vCPU to leave host headroom for larger jobs.
 const MEMORY_BYTES_PER_VCPU: u64 = 7 * (1 << 29);
 const MEMORY_FLOOR_GIB: u64 = 16;
+// Default-branch cache builds have measured peaks above 16 GiB, even at 4 vCPUs.
+#[cfg(target_os = "linux")]
+const WRITER_MEMORY_FLOOR_GIB: u64 = 24;
 
 fn memory_max_with_floor(vcpus: u32, floor_gib: u64) -> u64 {
     (u64::from(vcpus) * MEMORY_BYTES_PER_VCPU).max(floor_gib.saturating_mul(1 << 30))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn writer_memory_max(vcpus: u32) -> u64 {
+    memory_max_with_floor(vcpus, WRITER_MEMORY_FLOOR_GIB)
 }
 
 #[cfg(not(test))]

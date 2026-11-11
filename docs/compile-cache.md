@@ -267,6 +267,10 @@ tests.
 
 ### When fills run
 
+Background compile-cache fills have a 24 GiB memory floor, because some
+repositories' builds need more than 16 GiB; in per-job mode, a fill VM's stated
+memory is at least 24 GiB.
+
 - A fill's identity is its descriptor: a hash of the toolchain, the warm
   command, and every `Cargo.toml`, `Cargo.lock`, `rust-toolchain*` and
   `.cargo/config*` path and blob in the tip. A new tip with the same descriptor

@@ -150,7 +150,7 @@ fn cache_write_samples_are_log_only_and_never_change_heartbeat_metrics_or_billin
     let run = |samples| {
         let helper = Arc::new(Helper::default());
         let runtime =
-            motor_host::server::Runtime::new("host".into(), memory_host(10_000), helper.clone());
+            motor_host::server::Runtime::new("host".into(), memory_host(64 * 1024), helper.clone());
         let mut scheduler = Scheduler::new(Arc::new(Samples(samples)));
         scheduler
             .tick(runtime.host.clone(), helper.clone(), Arc::new(Images), AT)
@@ -240,14 +240,86 @@ impl FillGuest for Guest {
 }
 
 #[test]
+fn fill_source_stated_memory_has_a_floor_and_preserves_larger_job_claims() {
+    for (stated, expected) in [(4096, 24_576), (32_768, 32_768)] {
+        let mut h = memory_host(64 * 1024);
+        let mut trigger = job(JOB);
+        trigger.vcpus = 2;
+        trigger.mem_mib = stated;
+        h.claim(trigger, AT).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-vectors/exec-remote-v1/frames/run.json");
+        let motor_protocol::Frame::Run(mut run) =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        run.integration_tip = "a".repeat(40);
+        h.note_fill_source(JOB, &run, AT).unwrap();
+        assert_eq!(h.snapshot.per_job.export_tips[JOB].mem_mib, expected);
+    }
+}
+
+#[test]
+fn fill_memory_floor_sizes_guest_and_debit_independently_of_the_triggering_job() {
+    for (stated, expected_stated, expected_guest) in
+        [(4096, 24_576, 32_768), (32_768, 32_768, 43_691)]
+    {
+        let mut h = memory_host(64 * 1024);
+        h.record_host_resources(HostResources {
+            at_ms: AT,
+            job_vm_headroom_mib: u64::MAX,
+            available_mem_mib: 64 * 1024,
+            vcpu_ceiling: 4,
+            permit_budget: 4,
+        });
+        let mut trigger = job(JOB);
+        trigger.vcpus = 2;
+        trigger.mem_mib = stated;
+        let fill = h
+            .reserve_fill(&trigger.sub, "repo", trigger.mem_mib, AT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fill.vcpus, 4);
+        assert_eq!(fill.memory_debit_mib, expected_stated + 20);
+        assert_eq!(fill.guest_ram_mib, expected_guest);
+        let mut sized = trigger;
+        sized.mem_mib = expected_stated;
+        sized.mem_burst_mib = None;
+        assert_eq!(
+            Some(fill.guest_ram_mib),
+            motor_host::state::jobs::guest_ram_mib(&sized)
+        );
+        assert_eq!(h.job_free_mem_mib(AT), 65_486 - (expected_stated + 20));
+        h.fill_runner_hello(&fill.fill.fill_id).unwrap();
+        assert_eq!(h.job_free_mem_mib(AT), 65_486);
+    }
+}
+
+#[test]
+fn fill_memory_floor_refuses_when_free_memory_is_below_its_debit() {
+    // After the host reserve, this is one MiB below the 24 GiB floor's debit.
+    let mut h = memory_host(24_645);
+    assert_eq!(h.job_free_mem_mib(AT), 24_595);
+    assert!(h
+        .reserve_fill(&job(JOB).sub, "repo", 4096, AT)
+        .unwrap()
+        .is_none());
+    assert!(h.snapshot.per_job.fills.is_empty());
+    assert_eq!(h.job_free_mem_mib(AT), 24_595);
+}
+
+#[test]
 fn fills_debit_fixed_samples_advertise_capacity_and_are_not_preempted_or_billed() {
-    let mut h = memory_host(400);
+    // The 24 GiB fill floor plus boot/host reserves leaves 230 MiB free.
+    let mut h = memory_host(24_876);
     let fill = h
         .reserve_fill(&job(JOB).sub, "repo", 100, AT)
         .unwrap()
         .unwrap();
     assert_eq!(fill.vcpus, 2);
-    assert_eq!(fill.memory_debit_mib, 120);
+    assert_eq!(fill.memory_debit_mib, 24_596); // 24 GiB floor plus boot reserve.
+    assert_eq!(fill.guest_ram_mib, 32_768);
     assert_eq!(h.job_free_mem_mib(AT), 230);
     let memory = h.free_mem_mib(AT);
     let heartbeat = serde_json::to_value(h.heartbeat(AT, memory, true)).unwrap();
@@ -256,7 +328,8 @@ fn fills_debit_fixed_samples_advertise_capacity_and_are_not_preempted_or_billed(
     full(h.claim(job(JOB2), AT));
     assert_eq!(h.snapshot.per_job.fills.len(), 1);
     h.fill_runner_hello(&fill.fill.fill_id).unwrap();
-    assert_eq!(h.job_free_mem_mib(AT), 230);
+    // The 24 GiB floor's debit is released at hello; the job's debit remains.
+    assert_eq!(h.job_free_mem_mib(AT), 24_706);
     h.fill_publication(&fill.fill.fill_id, pins()).unwrap();
     h.fill_finished(&fill.fill.fill_id, true, AT).unwrap();
     assert!(!h.snapshot.leases.contains_key(&fill.fill.fill_id));
@@ -290,7 +363,8 @@ fn fills_wait_for_queued_claims_and_capacity_refusals_then_require_fresh_memory(
     h.record_host_resources(HostResources {
         at_ms: later,
         job_vm_headroom_mib: u64::MAX,
-        available_mem_mib: 170,
+        // The 24 GiB fill floor, boot reserve and host reserve fit exactly.
+        available_mem_mib: 24_646,
         vcpu_ceiling: 2,
         permit_budget: 4,
     });
@@ -312,7 +386,7 @@ fn fills_wait_for_queued_claims_and_capacity_refusals_then_require_fresh_memory(
 fn scheduler_uses_recent_repository_and_success_have_but_discards_failures_and_never_bills_traffic()
 {
     for success in [true, false] {
-        let host = Arc::new(Mutex::new(memory_host(10_000)));
+        let host = Arc::new(Mutex::new(memory_host(64 * 1024)));
         let helper = Arc::new(Helper::default());
         let mut scheduler = Scheduler::new(Arc::new(Guest {
             success,
@@ -336,6 +410,10 @@ fn scheduler_uses_recent_repository_and_success_have_but_discards_failures_and_n
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].kind, motor_vm_helper::job::VmKind::Fill);
         assert_eq!(starts[0].account, job(JOB).sub);
+        assert_eq!(starts[0].vcpus, 2);
+        // A fill's 24 GiB stated floor needs 32 GiB of guest RAM.
+        assert_eq!(starts[0].memory_mib, 32_768);
+        assert_eq!(starts[0].burst_mib, None);
         assert_eq!(*helper.finishes.lock().unwrap(), [success]);
         let h = host.lock().unwrap();
         assert!(h.snapshot.outbox.is_empty());
@@ -355,7 +433,7 @@ fn scheduler_uses_recent_repository_and_success_have_but_discards_failures_and_n
 
 #[test]
 fn new_disks_are_empty_and_seeded_disks_start_with_only_the_same_accounts_base_have() {
-    let mut h = memory_host(10_000);
+    let mut h = memory_host(64 * 1024);
     let fill = h
         .reserve_fill(&job(JOB).sub, "repo", 100, AT)
         .unwrap()
@@ -402,7 +480,7 @@ fn unavailable_guest_is_disabled_once_and_reserves_nothing() {
             unreachable!()
         }
     }
-    let host = Arc::new(Mutex::new(memory_host(10_000)));
+    let host = Arc::new(Mutex::new(memory_host(64 * 1024)));
     let helper = Arc::new(Helper::default());
     let guest = Arc::new(Unavailable(AtomicUsize::new(0)));
     let mut scheduler = Scheduler::new(guest.clone());
@@ -431,7 +509,7 @@ fn fill_reservations_and_publication_have_survive_restart_and_legacy_ledgers_loa
     let dir = scratch();
     let id;
     {
-        let mut h = durable_host(dir.path(), 10_000);
+        let mut h = durable_host(dir.path(), 64 * 1024);
         let fill = h
             .reserve_fill(&job(JOB).sub, "repo", 100, AT)
             .unwrap()
@@ -439,7 +517,8 @@ fn fill_reservations_and_publication_have_survive_restart_and_legacy_ledgers_loa
         id = fill.fill.fill_id;
         h.fill_publication(&id, pins()).unwrap();
     }
-    let h = durable_host(dir.path(), 10_000);
+    let h = durable_host(dir.path(), 64 * 1024);
     assert_eq!(h.snapshot.per_job.fills[&id].publication, Some(pins()));
-    assert_eq!(h.job_free_mem_mib(AT), 9830);
+    // Restart retains the 24 GiB fill floor's debit plus boot reserve.
+    assert_eq!(h.job_free_mem_mib(AT), 40_890);
 }

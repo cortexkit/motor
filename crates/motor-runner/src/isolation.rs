@@ -4081,10 +4081,12 @@ impl Sandbox {
         let memory_max = crate::backend::memory_max(resources.vcpus, self.memory_floor_gib);
         #[cfg(not(test))]
         let memory_max = crate::backend::memory_max(resources.vcpus);
-        // Only a tenant job receives a host-verified cap. Build-server, Boat
-        // and dependency-writer units keep their existing limits. The slice
-        // clamp below applies to it like any other limit.
-        let memory_max = if self.tenant_vm && !self.boat_profile && !self.writer {
+        // Writers need their own build-memory floor regardless of the job
+        // that triggered them. Only ordinary tenant jobs use a host-verified
+        // cap; all limits still pass through the slice clamp below.
+        let memory_max = if self.writer {
+            crate::backend::writer_memory_max(resources.vcpus)
+        } else if self.tenant_vm && !self.boat_profile {
             resources
                 .memory_mib
                 .map(|mib| mib.saturating_mul(1 << 20))

@@ -38,7 +38,8 @@ fn fill_source_slot() -> crate::jobs::fill_source::Slot {
 
 #[test]
 fn source_slot_growth_and_atomic_replacement_are_both_reserved_before_a_fill() {
-    let mut h = memory_host(10_000);
+    // Leave room for the 24 GiB fill floor so only storage controls admission.
+    let mut h = memory_host(64 * 1024);
     let storage = Storage::new(FLOOR + 3 * CAP - 2);
     enable(&mut h, &storage);
     let slot = fill_source_slot();
@@ -64,7 +65,8 @@ fn source_slot_growth_and_atomic_replacement_are_both_reserved_before_a_fill() {
 
 #[test]
 fn a_new_fill_reservation_cannot_evict_the_source_it_will_need() {
-    let mut h = memory_host(10_000);
+    // Leave room for the 24 GiB fill floor so only storage controls admission.
+    let mut h = memory_host(64 * 1024);
     let storage = Storage::new(FLOOR + 2 * CAP - 2);
     enable(&mut h, &storage);
     let slot = fill_source_slot();
@@ -131,7 +133,8 @@ fn pressure_evicts_an_idle_repository_source_and_its_payload_before_refusing_a_j
 
 #[test]
 fn fill_storage_uses_the_same_growth_promises_as_run_claims() {
-    let mut h = memory_host(10_000);
+    // Leave room for the 24 GiB fill floor so only storage controls admission.
+    let mut h = memory_host(64 * 1024);
     let storage = Storage::new(FLOOR + CAP - 1);
     enable(&mut h, &storage);
     assert!(h
