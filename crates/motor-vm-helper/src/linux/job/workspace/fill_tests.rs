@@ -10,6 +10,7 @@ fn fixture() -> (PathBuf, LinuxJobs, job::Fill) {
         uid_count: 2,
         memory_max_bytes: 1048576,
         workspace_disk_max_bytes: Some(4096),
+        fixed_path_repositories: Default::default(),
     });
     let fill = job::Fill {
         account: "account".into(),

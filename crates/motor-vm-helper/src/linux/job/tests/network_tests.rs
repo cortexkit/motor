@@ -84,6 +84,7 @@ fn fixture() -> (PathBuf, LinuxJobs, Fake) {
     let mut jobs = machine(&base);
     jobs.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
+        fixed_path_repositories: Default::default(),
         uid_base: unsafe { libc::geteuid() },
         uid_count: 64,
         memory_max_bytes: 1048576,
@@ -175,6 +176,7 @@ fn startup_capacity_counts_all_job_slots_and_registered_tenants() {
     let mut jobs = machine(&base);
     jobs.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
+        fixed_path_repositories: Default::default(),
         uid_base: 500000,
         uid_count: 255,
         memory_max_bytes: 1048576,
@@ -195,6 +197,7 @@ fn startup_removes_leftover_job_network_only_after_durable_final_counters() {
     let mut restarted = machine(&base);
     restarted.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
+        fixed_path_repositories: Default::default(),
         uid_base: saved.uid,
         uid_count: 64,
         memory_max_bytes: 1048576,

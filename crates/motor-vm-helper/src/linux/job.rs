@@ -893,7 +893,11 @@ impl LinuxJobs {
         }
         let disk = fs::trusted_file(&workspace.join("workspace.img"))?;
         let meta = disk.metadata()?;
-        early_boot_command_line(&start, meta.len())?;
+        early_boot_command_line(
+            &start,
+            meta.len(),
+            fixed_path_policy(&settings, &registry, start.kind),
+        )?;
         self.disk_available(&start, meta.dev(), meta.ino())?;
         // The helper is a singleton; its serialized requests and durable intent
         // records exclude concurrent use by both workspace id and device/inode.
@@ -988,8 +992,14 @@ impl LinuxJobs {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&boundary)?;
             let nonce = self.stage_start_cache(&start, &boundary_fd, uid)?;
-            let requests =
-                recorded_boot_requests(&start, tap_index, nonce.as_deref(), meta.len(), &registry)?;
+            let requests = recorded_boot_requests(
+                &start,
+                tap_index,
+                nonce.as_deref(),
+                meta.len(),
+                &registry,
+                &settings,
+            )?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             fs::chown(&File::open(&root)?, uid)?;
@@ -1274,7 +1284,12 @@ fn set_job_oom_score(pid: u32, host_score: i32, helper_score: i32) -> Result<()>
 
 // These arguments are deliberately not secret: job code can read /proc/cmdline.
 // Disk policy matches tenant provisioning; the parity test pins its constants.
-fn runner_args(start: &Start, disk_bytes: u64, remote_cache: bool) -> Result<String> {
+fn runner_args(
+    start: &Start,
+    disk_bytes: u64,
+    remote_cache: bool,
+    fixed_paths: Option<(&str, &[String])>,
+) -> Result<String> {
     start.validate()?;
     if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
         return Err(Error("invalid job workspace disk length".into()));
@@ -1287,7 +1302,7 @@ fn runner_args(start: &Start, disk_bytes: u64, remote_cache: bool) -> Result<Str
     } else {
         ""
     };
-    let text = format!(
+    let mut text = format!(
         "--backend host --tenant-vm --job-network veth --state-root /tenant/state \
          --max-weight {0} --rustc-slots {0} \
          --return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648 \
@@ -1297,15 +1312,47 @@ fn runner_args(start: &Start, disk_bytes: u64, remote_cache: bool) -> Result<Str
          --workspace-root /home --owned-workspace-root /home",
         start.vcpus
     );
+    if let Some((account, roots)) = fixed_paths.filter(|(_, roots)| !roots.is_empty()) {
+        text.push_str(&format!(" --account-subject {account}"));
+        for root in roots {
+            text.push_str(&format!(" --fixed-path-repository {root}"));
+        }
+    }
     crate::tenant::activation::validate_runner_args(&text)?;
     Ok(text)
 }
 
-fn early_boot_command_line(start: &Start, workspace_bytes: u64) -> Result<String> {
+fn early_boot_command_line(
+    start: &Start,
+    workspace_bytes: u64,
+    fixed_paths: Option<(&str, &[String])>,
+) -> Result<String> {
     // Credential staging happens later. Budget for its longest possible line
     // now so command-line refusal precedes any namespace, cgroup or VM work.
     let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
-    boot_command_line(start, Some(&nonce), workspace_bytes)
+    let line = boot_command_line(start, Some(&nonce), workspace_bytes, fixed_paths)?;
+    if start.kind == job::VmKind::Fill {
+        checked_boot_command_line(format!("{line} motor.fill=1"))
+    } else {
+        Ok(line)
+    }
+}
+
+fn fixed_path_policy<'a>(
+    settings: &'a JobVms,
+    registry: &'a Workspace,
+    kind: job::VmKind,
+) -> Option<(&'a str, &'a [String])> {
+    if !matches!(kind, job::VmKind::Job | job::VmKind::Fill) {
+        return None;
+    }
+    // Neither the start request nor guest-exported source metadata chooses roots.
+    // The account comes from the root-owned disk registry, not the host agent.
+    settings
+        .fixed_path_repositories
+        .get(&registry.account)
+        .filter(|roots| !roots.is_empty())
+        .map(|roots| (registry.account.as_str(), roots.as_slice()))
 }
 
 fn checked_boot_command_line(line: String) -> Result<String> {
@@ -1344,6 +1391,7 @@ pub fn recorded_boot_requests(
     nonce: Option<&str>,
     workspace_bytes: u64,
     registry: &job::Workspace,
+    settings: &JobVms,
 ) -> Result<Vec<(&'static str, Value)>> {
     if registry.account != start.account
         || registry.workspace_disk_id != start.workspace_disk_id
@@ -1351,12 +1399,24 @@ pub fn recorded_boot_requests(
     {
         return Err(Error("workspace registry does not permit boot".into()));
     }
-    let mut requests = boot_requests(start, tap_index, nonce, workspace_bytes)?;
+    settings.validate_fixed_path_repositories()?;
+    let mut requests = boot_requests_with_fixed_paths(
+        start,
+        tap_index,
+        nonce,
+        workspace_bytes,
+        fixed_path_policy(settings, registry, start.kind),
+    )?;
     authorize_fill_boot(&mut requests, registry.role)?;
     Ok(requests)
 }
 
-fn boot_command_line(start: &Start, nonce: Option<&str>, workspace_bytes: u64) -> Result<String> {
+fn boot_command_line(
+    start: &Start,
+    nonce: Option<&str>,
+    workspace_bytes: u64,
+    fixed_paths: Option<(&str, &[String])>,
+) -> Result<String> {
     if nonce.is_some_and(|nonce| {
         nonce.len() != REMOTE_CACHE_DRIVE_NONCE_BYTES * 2
             || !nonce
@@ -1373,7 +1433,7 @@ fn boot_command_line(start: &Start, nonce: Option<&str>, workspace_bytes: u64) -
     let args = if start.kind == job::VmKind::Recovery {
         format!("{JOB_BOOT_ARGS} motor.recovery=1")
     } else {
-        let text = runner_args(start, workspace_bytes, nonce.is_some())?;
+        let text = runner_args(start, workspace_bytes, nonce.is_some(), fixed_paths)?;
         let encoded: String = text
             .as_bytes()
             .iter()
@@ -1398,7 +1458,17 @@ pub fn boot_requests(
     nonce: Option<&str>,
     workspace_bytes: u64,
 ) -> Result<Vec<(&'static str, Value)>> {
-    let boot_args = boot_command_line(start, nonce, workspace_bytes)?;
+    boot_requests_with_fixed_paths(start, tap_index, nonce, workspace_bytes, None)
+}
+
+fn boot_requests_with_fixed_paths(
+    start: &Start,
+    tap_index: Option<u8>,
+    nonce: Option<&str>,
+    workspace_bytes: u64,
+    fixed_paths: Option<(&str, &[String])>,
+) -> Result<Vec<(&'static str, Value)>> {
+    let boot_args = boot_command_line(start, nonce, workspace_bytes, fixed_paths)?;
     let (tap_index, nonce) = if start.kind == job::VmKind::Recovery {
         (None, None)
     } else {

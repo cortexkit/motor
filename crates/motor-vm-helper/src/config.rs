@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 use serde::{de::IgnoredAny, Deserialize};
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::{collections::BTreeMap, net::Ipv4Addr, path::PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +31,9 @@ pub struct JobVms {
     /// creation is disabled, rather than accepting an unbounded host request.
     #[serde(default)]
     pub workspace_disk_max_bytes: Option<u64>,
+    /// Root-owned repository allowlists, keyed by the workspace's account.
+    #[serde(default)]
+    pub fixed_path_repositories: BTreeMap<String, Vec<String>>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +101,7 @@ impl Config {
             .checked_add(self.job_account_range.count)
             .ok_or_else(|| Error("job account uid range overflow".into()))?;
         if let Some(jobs) = &self.job_vms {
+            jobs.validate_fixed_path_repositories()?;
             let jobs_end = jobs
                 .uid_base
                 .checked_add(jobs.uid_count)
@@ -193,6 +197,27 @@ impl Config {
         }
     }
 }
+impl JobVms {
+    pub(crate) fn validate_fixed_path_repositories(&self) -> Result<()> {
+        for (account, roots) in &self.fixed_path_repositories {
+            crate::tenant::validate_account_binding(account)?;
+            let mut seen = std::collections::BTreeSet::new();
+            for root in roots {
+                if (root == "*" && roots.len() != 1)
+                    || (root != "*" && !std::path::Path::new(root).is_absolute())
+                    || root.chars().any(char::is_whitespace)
+                    || root.contains('\0')
+                    || !seen.insert(root)
+                {
+                    return Err(Error(
+                        "job_vms.fixed_path_repositories requires distinct absolute roots without whitespace, or '*' alone".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 pub(crate) fn valid_uplink(value: &str) -> bool {
     (1..=15).contains(&value.len())
         && value.as_bytes()[0].is_ascii_alphanumeric()
@@ -247,6 +272,7 @@ mod tests {
             uid_count: 128,
             memory_max_bytes: 4096,
             workspace_disk_max_bytes: Some(512),
+            fixed_path_repositories: Default::default(),
         });
         config
     }
@@ -282,6 +308,64 @@ mod tests {
             jobs.uid_base = base;
             jobs.uid_count = count;
             assert!(config.validate_resources().is_err());
+        }
+    }
+
+    #[test]
+    fn job_fixed_path_map_defaults_off_and_accepts_roots_or_wildcard_per_subject() {
+        let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let org = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let settings: JobVms = serde_json::from_value(serde_json::json!({
+            "uid_base": 500000, "uid_count": 128, "memory_max_bytes": 4096
+        }))
+        .unwrap();
+        assert!(settings.fixed_path_repositories.is_empty());
+        let mut config = job_config();
+        for map in [
+            serde_json::json!({}),
+            serde_json::json!({account: []}),
+            serde_json::json!({account: ["/home/repo", "/Users/repo"], org: ["*"]}),
+        ] {
+            config.job_vms.as_mut().unwrap().fixed_path_repositories =
+                serde_json::from_value(map).unwrap();
+            config.validate_resources().unwrap();
+        }
+    }
+
+    #[test]
+    fn job_fixed_path_map_refuses_malformed_subjects_roots_and_json_shapes() {
+        let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut config = job_config();
+        for map in [
+            serde_json::json!({"account-1": ["/repo"]}),
+            serde_json::json!({"acct:bad": ["/repo"]}),
+            serde_json::json!({"user:01ARZ3NDEKTSV4RRFFQ69G5FAV": ["/repo"]}),
+            serde_json::json!({account: [""]}),
+            serde_json::json!({account: ["relative"]}),
+            serde_json::json!({account: ["/repo", "/repo"]}),
+            serde_json::json!({account: ["*", "/repo"]}),
+            serde_json::json!({account: ["*", "*"]}),
+            serde_json::json!({account: ["/with space"]}),
+            serde_json::json!({account: ["/with\t tab"]}),
+            serde_json::json!({account: ["/with\nnewline"]}),
+            serde_json::json!({account: ["/with\u{2003}space"]}),
+            serde_json::json!({account: ["/with\0nul"]}),
+        ] {
+            config.job_vms.as_mut().unwrap().fixed_path_repositories =
+                serde_json::from_value(map.clone()).unwrap();
+            assert!(config.validate_resources().is_err(), "accepted {map}");
+        }
+        for map in [
+            serde_json::json!([]),
+            serde_json::json!(null),
+            serde_json::json!({account: "*"}),
+            serde_json::json!({account: [1]}),
+        ] {
+            let settings = serde_json::json!({
+                "uid_base": 500000, "uid_count": 128, "memory_max_bytes": 4096,
+                "fixed_path_repositories": map
+            });
+            assert!(serde_json::from_value::<JobVms>(settings).is_err());
         }
     }
 }

@@ -978,6 +978,7 @@ async fn boot(
     assignment: &Assignment,
     id: u64,
     hello: &Raw,
+    repository_root: Option<String>,
 ) -> Result<tokio::net::UnixStream> {
     let e = execution.clone();
     let launch = runtime.launch_phase(&execution.claims.jti, false)?;
@@ -989,6 +990,23 @@ async fn boot(
                 .as_ref()
                 .context("workspace cap missing")?
                 .cap_bytes;
+            if let Some(root) = repository_root {
+                let seeded = (|| -> Result<bool> {
+                    let plan = r.host.lock().expect("host lock").job_seed_plan(
+                        &e.claims.jti,
+                        &crate::jobs::fill_source::repository_key(&root),
+                    )?;
+                    let Some(plan) = plan else { return Ok(false); };
+                    r.control.seed_workspace(&plan.request)?;
+                    r.host.lock().expect("host lock").job_seeded(&e.claims.jti, &plan, unix_ms())?;
+                    Ok(true)
+                })();
+                match seeded {
+                    Ok(true) => {},
+                    Ok(false) => tracing::info!(jti = %e.claims.jti, "workspace_base_missing; using empty workspace"),
+                    Err(error) => tracing::warn!(jti = %e.claims.jti, %error, "workspace_base_seed_failed; ensuring workspace without seed"),
+                }
+            }
             if let Err(error) = r.control.ensure_workspace(&e.claims.sub, &e.disk_id, cap) {
                 r.host
                     .lock()
@@ -1255,6 +1273,12 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<tokio::net::UnixStream>> + Send>>;
     let mut starting: Option<Starting> = None;
     let mut ready = None;
+    let new_workspace = runtime
+        .host
+        .lock()
+        .expect("host lock")
+        .job_workspace_is_new(&claims.jti);
+    let mut repository_root = None;
     loop {
         if accepted && ready.is_some() && !buffered_frame_ready(&reader.buffered) {
             return replay(
@@ -1274,7 +1298,11 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             )
             .await;
         }
-        let launch = if preparing.is_none() && starting.is_none() && ready.is_none() {
+        let launch = if preparing.is_none()
+            && starting.is_none()
+            && ready.is_none()
+            && (!new_workspace || repository_root.is_some())
+        {
             runtime
                 .host
                 .lock()
@@ -1289,8 +1317,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             let r = runtime.clone();
             let a = assignment.clone();
             let h = hello.clone();
+            let root = if new_workspace {
+                repository_root.clone()
+            } else {
+                None
+            };
             starting = Some(Box::pin(async move {
-                tokio::time::timeout_at(deadline, boot(&r, &execution, &a, id, &h))
+                tokio::time::timeout_at(deadline, boot(&r, &execution, &a, id, &h, root))
                     .await
                     .map_err(|_| anyhow::anyhow!("job boot deadline exceeded"))?
             }));
@@ -1328,6 +1361,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                             && run.platform.as_ref().is_none_or(|p| p == &motor_protocol::Platform::Linux)
                             && run.timeout.is_some_and(|s| s <= claims.max_s), "queued Run does not match lease");
                         queue_clock = QueueClock::new();
+                        // Only this authenticated job's Run selects its repository cache;
+                        // the account remains the verified lease's subject.
+                        repository_root = Some(run.repository_root.clone());
                         queue_limit_ms = Some(run.queue_wait_limit_s.saturating_mul(1000));
                         let position = {
                             let host = runtime.host.lock().expect("host lock");

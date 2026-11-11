@@ -8,6 +8,7 @@ use std::sync::Condvar;
 
 mod heartbeat_tests;
 mod recovery_tests;
+mod seed_tests;
 mod startup_tests;
 #[path = "upload_tests.rs"]
 mod upload_tests;
@@ -69,6 +70,10 @@ struct Fake {
     slice_headroom_mib: Mutex<Option<u64>>,
     fail_ensure: AtomicBool,
     ensured_caps: Mutex<Vec<u64>>,
+    seeds: Mutex<Vec<motor_vm_helper::job::Seed>>,
+    fail_seed: AtomicBool,
+    workspace_contents: Mutex<BTreeMap<String, Option<String>>>,
+    seed_runtime: Mutex<Option<std::sync::Weak<Runtime>>>,
     calls: Mutex<Vec<String>>,
     inputs: Arc<Mutex<Vec<Vec<u8>>>>,
     gate: (Mutex<bool>, Condvar),
@@ -176,12 +181,43 @@ impl Control for Fake {
             tenant_memory_reserve_bytes: 0,
         })
     }
-    fn ensure_workspace(&self, _: &str, _: &str, cap: u64) -> Result<()> {
+    fn ensure_workspace(&self, _: &str, disk: &str, cap: u64) -> Result<()> {
         self.ensured_caps.lock().unwrap().push(cap);
         ensure!(
             !self.fail_ensure.load(Ordering::SeqCst),
             "workspace size mismatch"
         );
+        self.workspace_contents
+            .lock()
+            .unwrap()
+            .entry(disk.into())
+            .or_insert(None);
+        Ok(())
+    }
+    fn seed_workspace(&self, seed: &motor_vm_helper::job::Seed) -> Result<()> {
+        if let Some(runtime) = self
+            .seed_runtime
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            assert!(
+                runtime.host.try_lock().is_ok(),
+                "helper called under host lock"
+            );
+        }
+        self.seeds.lock().unwrap().push(seed.clone());
+        ensure!(
+            !self.fail_seed.load(Ordering::SeqCst),
+            "injected seed failure"
+        );
+        let mut disks = self.workspace_contents.lock().unwrap();
+        ensure!(
+            !disks.contains_key(&seed.disk_id),
+            "existing disk cannot be seeded"
+        );
+        disks.insert(seed.disk_id.clone(), Some(seed.base_id.clone()));
         Ok(())
     }
     fn job_memory(&self, job: &str) -> Result<u64> {
@@ -520,6 +556,19 @@ fn claim(runtime: &Arc<Runtime>, c: &Claims) -> u64 {
     runtime.job_resources.acquire(&execution).unwrap();
     id
 }
+
+fn existing_workspace(runtime: &Arc<Runtime>, job: &str) {
+    let mut host = runtime.host.lock().unwrap();
+    let mut previous = host.snapshot.per_job.executions[job].clone();
+    previous.claims.jti = "00000000-0000-7000-8000-000000000099".into();
+    previous.boot_started = true;
+    previous.runner_hello = true;
+    previous.ended = true;
+    host.snapshot
+        .per_job
+        .executions
+        .insert(previous.claims.jti.clone(), previous);
+}
 async fn start(
     runtime: Arc<Runtime>,
     c: Claims,
@@ -700,6 +749,7 @@ async fn capability_mismatch_never_delivers_run_and_guest_refusal_cannot_rewrite
         *fake.hello.lock().unwrap() = Some(json!({"type":"hello","protocol_version":1}));
         let c = claims(JOB);
         let id = claim(&runtime, &c);
+        existing_workspace(&runtime, JOB);
         let event: motor_protocol::TenantEvent = serde_json::from_value(
             json!({"type":"event","event_seq":1,"event":"refused","jti":JOB,"cause":"disconnect"}),
         )
@@ -1391,10 +1441,11 @@ async fn wait_for_runner_hello(runtime: &Arc<Runtime>, job: &str) {
 }
 
 #[tokio::test]
-async fn free_disk_boots_on_hello_and_ready_vm_waits_for_validated_run() {
+async fn existing_disk_boots_on_hello_and_ready_vm_waits_for_validated_run() {
     let (runtime, fake, storage) = fixture();
     let c = claims(JOB);
     let id = claim(&runtime, &c);
+    existing_workspace(&runtime, JOB);
     let (mut client, task) = start(runtime.clone(), c, id).await;
     next_type(&mut client, "lease_ok").await;
     assert!(fake.calls.lock().unwrap().is_empty());
@@ -1452,6 +1503,7 @@ async fn hosted_client_wire_exchange_accepts_pinned_runner_hello_and_runs_after_
     let _release = ReleaseGate(fake.clone());
     let c = claims(JOB);
     let id = claim(&runtime, &c);
+    existing_workspace(&runtime, JOB);
     let (mut client, task) = start(runtime.clone(), c, id).await;
     next_type(&mut client, "lease_ok").await;
     // This is Channel::from_hosted's frame and codec, including its false
@@ -1695,6 +1747,7 @@ async fn run_validated_before_vm_ready_remains_spooled_until_hello() {
     *fake.hang.lock().unwrap() = "runner";
     let c = claims(JOB);
     let id = claim(&runtime, &c);
+    existing_workspace(&runtime, JOB);
     let (mut client, task) = start(runtime.clone(), c, id).await;
     next_type(&mut client, "lease_ok").await;
     write_frame(&mut client, &hello()).await.unwrap();
@@ -1721,6 +1774,7 @@ async fn disconnect_or_refusal_before_run_stops_an_already_ready_vm_and_releases
         let (runtime, fake, storage) = fixture();
         let c = claims(JOB);
         let id = claim(&runtime, &c);
+        existing_workspace(&runtime, JOB);
         let (mut client, task) = start(runtime.clone(), c, id).await;
         next_type(&mut client, "lease_ok").await;
         write_frame(&mut client, &hello()).await.unwrap();

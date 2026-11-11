@@ -367,6 +367,7 @@ mod tests {
             uid_count: 1,
             memory_max_bytes: 1048576,
             workspace_disk_max_bytes: Some(4096),
+            fixed_path_repositories: Default::default(),
         });
         let mut host = request();
         host.workspace_disk_id = "disk-3".into();
@@ -392,6 +393,7 @@ mod tests {
             uid_count: 1,
             memory_max_bytes: 1048576,
             workspace_disk_max_bytes: Some(4096),
+            fixed_path_repositories: Default::default(),
         });
         let root = jobs.workspaces.clone();
         let mut record = super::super::tests::record();
@@ -445,6 +447,7 @@ mod tests {
             uid_count: 1,
             memory_max_bytes: 1048576,
             workspace_disk_max_bytes: Some(8192),
+            fixed_path_repositories: Default::default(),
         });
         let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let op = |size_bytes| Operation::EnsureWorkspace {

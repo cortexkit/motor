@@ -11,6 +11,7 @@ fn fixture(base: &Path) -> LinuxJobs {
     let mut jobs = machine(base);
     jobs.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
+        fixed_path_repositories: Default::default(),
         uid_base: unsafe { libc::geteuid() },
         uid_count: 1,
         memory_max_bytes: 1048576,

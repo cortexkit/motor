@@ -228,7 +228,7 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
     assert!(matches!(next(&mut socket).await, Frame::Hello { .. }));
     let workspace = "/home/motor-contract";
     let request = json!({"type":"run", "job_id":id, "workspace_key":workspace, "repository_root":workspace, "cwd":workspace,
-        "command":"python3 probe.py", "env":{}, "weight_hint":2, "timeout":60, "queue_wait_limit_s":10,
+        "command":"python3 -c 'import os; print(\"fixed cwd hex: \" + os.getcwd().encode().hex())' && python3 probe.py", "env":{}, "weight_hint":2, "timeout":60, "queue_wait_limit_s":10,
         "snapshot_commit":commit, "integration_tip":commit, "tree_hash":tree, "siblings":[],
         "bundles":[{"index":0, "repository":workspace, "length":bytes.len(), "sha256":format!("{:x}", Sha256::digest(&bytes))}]});
     write(&mut socket, &serde_json::from_value(request).unwrap())
@@ -261,6 +261,16 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
                 assert!(
                     output.contains("PASS job sandbox:"),
                     "missing full contract verdict: {output}"
+                );
+                let fixed = format!(
+                    "/w/acct-01ARZ3NDEKTSV4RRFFQ69G5FAV/{:x}/motor-contract",
+                    Sha256::digest(workspace.as_bytes())
+                );
+                // Encoding keeps diagnostic path rewriting from hiding the actual cwd.
+                let encoded: String = fixed.bytes().map(|byte| format!("{byte:02x}")).collect();
+                assert!(
+                    output.contains(&format!("fixed cwd hex: {encoded}")),
+                    "missing fixed checkout path: {output}"
                 );
                 println!("real job VM contract: {output}");
                 let refused = crate::helper::exchange_control(
@@ -485,12 +495,23 @@ fn isolated_vm(fill: bool) {
                 motor_vm_helper::job::WorkspaceRole::Job
             },
         };
+        let settings = motor_vm_helper::config::JobVms {
+            uid_base: uid,
+            uid_count: 1,
+            memory_max_bytes: 4 << 30,
+            workspace_disk_max_bytes: Some(4 << 30),
+            fixed_path_repositories: std::collections::BTreeMap::from([(
+                start.account.clone(),
+                vec!["/home/motor-contract".into()],
+            )]),
+        };
         for (path, mut body) in motor_vm_helper::linux::job::recorded_boot_requests(
             &start,
             Some(tap),
             None,
             File::open(&workspace).unwrap().metadata().unwrap().len(),
             &registry,
+            &settings,
         )
         .unwrap()
         {
