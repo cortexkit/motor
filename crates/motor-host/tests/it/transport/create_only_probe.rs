@@ -1,25 +1,34 @@
 use super::*;
 use motor_protocol::{CreateOnlyProbeDetail as Detail, CreateOnlyProbeReport};
 
-#[test]
-fn probe_requires_idle_host_and_bound_account_then_forwards_reports_without_recording_them() {
-    let (runtime, fake, _, _, _) = fixture();
-    let request = json!({"op":"remote_cache_create_only_probe","account":"tenant"});
-    let busy = runtime.admin("tenant", &request).unwrap();
-    assert_eq!(busy["error"], "remote_cache_host_not_idle");
-    assert_eq!(busy["exit_code"], 1);
-    assert!(fake.calls.lock().unwrap().is_empty());
-    runtime.host.lock().unwrap().set_draining(true).unwrap();
+fn serving_host_with_active_lease() -> (Arc<Runtime>, Arc<Fake>) {
+    let (runtime, fake, _, _, claims) = fixture();
+    let now = unix_ms();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.guest_ready("tenant", 1).unwrap();
+        let (id, _) = host.claim(claims, now).unwrap();
+        host.delivered(id).unwrap();
+        host.event(
+            "tenant",
+            &event(1, TenantEventKind::Admitted, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        assert!(!host.snapshot.draining);
+    }
     assert_eq!(
-        runtime
-            .admin(
-                "tenant",
-                &json!({"op":"remote_cache_create_only_probe","account":"other"})
-            )
-            .unwrap()["error"],
-        "remote_cache_invalid_request"
+        runtime.host_admin(&json!({"op":"host_status"})).unwrap()["active_leases"],
+        1
     );
-    assert!(fake.calls.lock().unwrap().is_empty());
+    fake.calls.lock().unwrap().clear();
+    (runtime, fake)
+}
+
+#[test]
+fn probe_runs_with_an_active_lease_and_bound_account_without_recording_reports() {
+    let (runtime, fake) = serving_host_with_active_lease();
+    let request = json!({"op":"remote_cache_create_only_probe","account":"tenant"});
     let failed = CreateOnlyProbeReport::refused(Detail::UnexpectedStatusOrBytes);
     *fake.admin_reply.lock().unwrap() = Some(serde_json::to_value(&failed).unwrap());
     let before = runtime.host.lock().unwrap().snapshot.clone();
@@ -43,6 +52,35 @@ fn probe_requires_idle_host_and_bound_account_then_forwards_reports_without_reco
     let passed = CreateOnlyProbeReport::new(cases);
     *fake.admin_reply.lock().unwrap() = Some(serde_json::to_value(&passed).unwrap());
     assert_eq!(runtime.admin("tenant", &request).unwrap()["exit_code"], 0);
+    fake.calls.lock().unwrap().clear();
+    assert_eq!(
+        runtime
+            .admin(
+                "tenant",
+                &json!({"op":"remote_cache_create_only_probe","account":"other"})
+            )
+            .unwrap()["error"],
+        "remote_cache_invalid_request"
+    );
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn active_leases_still_refuse_provisioning_and_activation_even_on_a_drained_host() {
+    let (runtime, fake) = serving_host_with_active_lease();
+    for draining in [false, true] {
+        runtime.host.lock().unwrap().set_draining(draining).unwrap();
+        for request in [
+            json!({"op":"set_remote_cache","config":"configuration","read_key":"read-key"}),
+            json!({"op":"activate_runner_args"}),
+        ] {
+            assert_eq!(
+                runtime.admin("tenant", &request).unwrap()["error"],
+                "remote_cache_host_not_idle"
+            );
+        }
+    }
+    assert!(fake.calls.lock().unwrap().is_empty());
 }
 
 #[test]

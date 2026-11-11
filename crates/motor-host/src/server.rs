@@ -1650,14 +1650,13 @@ impl Runtime {
                     ),
                 )?);
             }
-            {
+            // The store probe has its own object namespace and does not replace
+            // the gateway's store configuration or keys, so serving jobs need
+            // not stop. The tenant operations lock still excludes provisioning
+            // while the probe runs.
+            if request["op"] != "remote_cache_create_only_probe" {
                 let host = self.host.lock().expect("host lock");
                 if !host.snapshot.draining || active_leases(&host) != 0 {
-                    if request["op"] == "remote_cache_create_only_probe" {
-                        return Ok(
-                            json!({"ok":false,"exit_code":1,"cases":[],"error":"remote_cache_host_not_idle"}),
-                        );
-                    }
                     return Ok(json!({"ok":false,"error":"remote_cache_host_not_idle"}));
                 }
             }
