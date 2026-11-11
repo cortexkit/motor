@@ -11,7 +11,7 @@ fn running(runtime: &Arc<Runtime>, fake: &Fake, job: &str, at: u64, resident_mib
     c.workspace_key_hash = Some(motor_lease::base64url(&hash));
     let id = claim(runtime, &c);
     let mut host = runtime.host.lock().unwrap();
-    host.begin_job_boot_at(job, at).unwrap().unwrap();
+    boot_at(&mut host, job, at);
     host.job_runner_hello(job).unwrap();
     host.delivered(id).unwrap();
     host.job_started(job, at).unwrap();
@@ -273,7 +273,7 @@ fn no_burst_preserves_the_entire_stated_allocation_and_floor_before_pressure_sto
     {
         let mut host = runtime.host.lock().unwrap();
         assert_eq!(host.snapshot.per_job.executions[JOB].guest_ram_mib, 134);
-        host.begin_job_boot_at(JOB, 100).unwrap().unwrap();
+        boot_at(&mut host, JOB, 100);
         host.job_runner_hello(JOB).unwrap();
         host.delivered(id).unwrap();
         host.job_started(JOB, 100).unwrap();

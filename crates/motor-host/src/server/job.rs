@@ -13,6 +13,7 @@ pub(super) struct Launch {
     cancelled: AtomicBool,
     pending: AtomicBool,
     prestart_limit_ms: Mutex<Option<u64>>,
+    boot_ready_at_ms: Mutex<Option<u64>>,
 }
 
 struct LaunchSession(Arc<Launch>);
@@ -388,36 +389,42 @@ impl Runtime {
                     }
                     let lease = &host.snapshot.leases[&e.claims.jti];
                     let started = lease.started_at_ms;
-                    // A stalled upload or admission has no Started clock. Bound
-                    // it by the caller's queue budget; after restart only the
-                    // signed max_s remains available, so use that as the bound.
-                    let prestart_limit = self
+                    let launch = self
                         .job_launches
                         .lock()
                         .expect("job launches")
                         .get(&e.claims.jti)
+                        .cloned();
+                    // Disk ownership waits do not spend the caller's queue
+                    // budget. Start the pre-boot bound only once the disk is
+                    // ready; restart recovery settles unbooted jobs separately.
+                    let prestart_limit = launch
+                        .as_ref()
                         .and_then(|launch| {
                             *launch.prestart_limit_ms.lock().expect("prestart limit")
                         })
                         .unwrap_or_else(|| e.claims.max_s.saturating_mul(1000));
-                    let deadline = started
-                        .unwrap_or_else(|| {
-                            e.boot_started_at_ms
-                                .unwrap_or_else(|| e.claims.iat.saturating_mul(1000))
+                    let prestart_at = launch
+                        .as_ref()
+                        .and_then(|launch| {
+                            *launch.boot_ready_at_ms.lock().expect("boot ready time")
                         })
-                        .saturating_add(if started.is_some() {
+                        .or(e.boot_started_at_ms)
+                        .or_else(|| e.boot_started.then(|| e.claims.iat.saturating_mul(1000)));
+                    let deadline = started.or(prestart_at).map(|at| {
+                        at.saturating_add(if started.is_some() {
                             e.claims.max_s.saturating_mul(1000)
                         } else {
                             prestart_limit
                         })
-                        .saturating_add(crate::billing::BACKSTOP_CANCEL_GRACE_MS);
+                        .saturating_add(crate::billing::BACKSTOP_CANCEL_GRACE_MS)
+                    });
                     (e.boot_started
                         && !e.runner_hello
                         && e.boot_started_at_ms.is_none_or(|at| {
                             now_ms >= at.saturating_add(settings.boot_deadline_ms)
                         }))
-                        || (!e.boot_started && now_ms >= e.claims.exp.saturating_mul(1000))
-                        || (e.boot_started && now_ms >= deadline)
+                        || deadline.is_some_and(|deadline| now_ms >= deadline)
                 })
                 .map(|e| (e.claims.jti.clone(), e.runner_hello))
                 .collect()
@@ -1400,11 +1407,21 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             && ready.is_none()
             && (!new_workspace || repository_root.is_some())
         {
-            runtime
-                .host
-                .lock()
-                .expect("host lock")
-                .begin_job_boot_at(&claims.jti, unix_ms())?
+            let mut host = runtime.host.lock().expect("host lock");
+            ensure!(
+                host.snapshot.leases[&claims.jti].state != LeaseState::Ended,
+                "job cancelled before boot"
+            );
+            let now_ms = unix_ms();
+            if host.job_boot_disk_ready(&claims.jti) {
+                launch_session
+                    .0
+                    .boot_ready_at_ms
+                    .lock()
+                    .expect("boot ready time")
+                    .get_or_insert(now_ms);
+            }
+            host.begin_job_boot_at(&claims.jti, now_ms)?
         } else {
             None
         };
@@ -1479,8 +1496,8 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
             },
             _ = heartbeat.tick() => {
-                // Same-workspace ownership and VM setup are not capacity wait.
-                // This host refuses capacity at claim rather than queueing it.
+                // Admitted workspace queues, including a memory recheck before
+                // boot, keep the same paused caller queue clock as VM setup.
                 let wait = accepted.then(|| queue_clock.observe(false));
                 write_frame(client, &json!({"type":"heartbeat","queue_wait_ms":wait})).await.map_err(client_io)?;
             },

@@ -597,6 +597,15 @@ fn claim(runtime: &Arc<Runtime>, c: &Claims) -> u64 {
     id
 }
 
+fn boot_at(host: &mut Host, job: &str, at_ms: u64) {
+    // Keep the trusted sample on the synthetic boot clock, then restore its
+    // wall clock so later claims still see fresh resources.
+    let sample = host.fresh_host_resources(unix_ms()).unwrap();
+    host.record_host_resources(HostResources { at_ms, ..sample });
+    host.begin_job_boot_at(job, at_ms).unwrap().unwrap();
+    host.record_host_resources(sample);
+}
+
 fn existing_workspace(runtime: &Arc<Runtime>, job: &str) {
     let mut host = runtime.host.lock().unwrap();
     let mut previous = host.snapshot.per_job.executions[job].clone();
@@ -685,7 +694,38 @@ async fn no_boot_before_first_frame_and_busy_disk_has_queue_frames() {
     );
     assert!(next_type(&mut client, "heartbeat").await["queue_wait_ms"].is_number());
     assert!(fake.calls.lock().unwrap().is_empty());
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .record_host_resources(HostResources {
+            at_ms: unix_ms(),
+            available_mem_mib: 169,
+            job_vm_headroom_mib: u64::MAX,
+            vcpu_ceiling: 2,
+            permit_budget: 4,
+        });
     runtime.stop_job(JOB, false, false).unwrap();
+    assert_eq!(
+        next_type(&mut client, "heartbeat").await["queue_wait_ms"],
+        0
+    );
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB2].boot_started);
+    assert_eq!(
+        fake.calls.lock().unwrap().as_slice(),
+        [format!("stop:{JOB}")]
+    );
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .record_host_resources(HostResources {
+            at_ms: unix_ms(),
+            available_mem_mib: 1000,
+            job_vm_headroom_mib: u64::MAX,
+            vcpu_ceiling: 2,
+            permit_budget: 4,
+        });
     next_type(&mut client, "output").await;
     assert_eq!(
         fake.calls.lock().unwrap().as_slice(),
@@ -941,13 +981,7 @@ fn timeout_after_delivery_keeps_delivery_and_lost_usage_and_releases_once() {
     let (runtime, fake, storage) = fixture();
     let c = claims(JOB);
     let id = claim(&runtime, &c);
-    runtime
-        .host
-        .lock()
-        .unwrap()
-        .begin_job_boot_at(JOB, 100)
-        .unwrap()
-        .unwrap();
+    boot_at(&mut runtime.host.lock().unwrap(), JOB, 100);
     runtime.host.lock().unwrap().delivered(id).unwrap();
     runtime.tick_jobs(1101).unwrap();
     runtime.tick_jobs(1200).unwrap();
@@ -1434,6 +1468,18 @@ fn restart_cleans_never_booted_spools_and_releases_admission() {
     );
     restarted.recover().unwrap();
     assert!(restarted.host.lock().unwrap().snapshot.per_job.executions[JOB].ended);
+    let frames = restarted
+        .host
+        .lock()
+        .unwrap()
+        .host_settled_frames(JOB, 0)
+        .unwrap();
+    let terminal = frames
+        .iter()
+        .find(|frame| frame["type"] == "terminal")
+        .unwrap();
+    assert_eq!(terminal["ran"], "none");
+    assert_eq!(terminal["outcome"]["type"], "refused_before_start");
     assert!(!storage.spool(JOB).exists());
     assert_eq!(storage.releases.lock().unwrap()[JOB], 1);
 }

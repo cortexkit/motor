@@ -325,7 +325,10 @@ fn fills_debit_fixed_samples_advertise_capacity_and_are_not_preempted_or_billed(
     let heartbeat = serde_json::to_value(h.heartbeat(AT, memory, true)).unwrap();
     assert_eq!(heartbeat["free_vcpus"], 2);
     h.claim(job(JOB), AT).unwrap();
-    full(h.claim(job(JOB2), AT));
+    h.begin_job_boot(JOB).unwrap().unwrap();
+    let mut other = job(JOB2);
+    other.workspace_key_hash = Some(motor_lease::base64url(&[6; 32]));
+    full(h.claim(other, AT));
     assert_eq!(h.snapshot.per_job.fills.len(), 1);
     h.fill_runner_hello(&fill.fill.fill_id).unwrap();
     // The 24 GiB floor's debit is released at hello; the job's debit remains.

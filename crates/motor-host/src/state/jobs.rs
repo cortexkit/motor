@@ -234,7 +234,7 @@ impl Host {
             .per_job
             .executions
             .values()
-            .filter(|job| !job.ended && !job.runner_hello)
+            .filter(|job| job.boot_started && !job.ended && !job.runner_hello)
             .fold(
                 sample.free_mem_mib(settings.host_reserve_mib),
                 |free, job| free.saturating_sub(job.memory_debit_mib),
@@ -355,7 +355,11 @@ impl Host {
                 .mem_mib
                 .checked_add(settings.boot_reserve_mib)
                 .ok_or(RefusalCause::Memory)?;
-            if self.job_free_mem_mib(now_ms) < debit {
+            // A disk-queued job has no VM yet. Recheck memory when it can
+            // actually boot instead of refusing or reserving memory now.
+            if !existing.is_some_and(|(_, disk)| disk.holds_job_disk_slot())
+                && self.job_free_mem_mib(now_ms) < debit
+            {
                 return Err(RefusalCause::Memory.into());
             }
             // A host has one disk per account/workspace pair. Cold or foreign
@@ -427,8 +431,8 @@ impl Host {
                 },
             );
             self.reserve_job_storage(&mut next, &disk_id, now_ms)?;
-            // Identity, queue position, memory and storage debits become visible together,
-            // before lease_ok and before any launch authorization is returned.
+            // Identity, queue position, permits and storage debits become visible together,
+            // before admission returns and before any launch authorization is returned.
             self.save(next)?;
             if let Some(hinted_vm) = &claims.placement.vm {
                 if hinted_vm != &disk_id {
@@ -460,6 +464,17 @@ impl Host {
         self.begin_job_boot_at(job, self.observed_at_ms)
     }
 
+    pub(crate) fn job_boot_disk_ready(&self, job: &str) -> bool {
+        self.snapshot.per_job.executions.get(job).is_some_and(|e| {
+            let disk = &self.snapshot.per_job.disks[&e.disk_id];
+            !e.boot_started
+                && !e.ended
+                && !disk.quarantined
+                && disk.attached_job.is_none()
+                && disk.queue.first().map(String::as_str) == Some(job)
+        })
+    }
+
     pub fn begin_job_boot_at(
         &mut self,
         job: &str,
@@ -472,14 +487,12 @@ impl Host {
             .get(job)
             .ok_or(Refusal::Auth)
             .map_err(Error::Refused)?;
-        if execution.boot_started || execution.ended {
+        if !self.job_boot_disk_ready(job) {
             return Ok(None);
         }
-        let disk = &self.snapshot.per_job.disks[&execution.disk_id];
-        if disk.quarantined
-            || disk.attached_job.is_some()
-            || disk.queue.first().map(String::as_str) != Some(job)
-        {
+        // Persist the debit with the launch authorization, under the host lock.
+        // A job that cannot fit keeps its queue position without owning a VM.
+        if self.job_free_mem_mib(now_ms) < execution.memory_debit_mib {
             return Ok(None);
         }
         let mut next = self.snapshot.clone();

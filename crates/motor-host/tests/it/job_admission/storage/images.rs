@@ -52,7 +52,7 @@ fn generations_pin_at_claim_across_publication_gc_attachment_and_restart() {
     let mut h = durable_host(root.path(), 10_000);
     enable(&mut h, &storage);
     assert!(h.begin_image_gc("gen-1").is_err());
-    assert!(h.begin_job_boot(JOB).unwrap().is_some());
+    assert!(h.begin_job_boot_at(JOB, AT).unwrap().is_some());
     let host = Arc::new(Mutex::new(h));
     let resources = Images::new(host.clone(), storage.clone());
     // Publication and a GC attempt happened after claim but before the helper
