@@ -131,10 +131,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
+      # The runner image fetches packages through a cloud mirror list. When the
+      # Azure mirror's name stops resolving, every package fetch fails, so read
+      # Ubuntu's own archive and security servers on whichever cloud runs the job.
       - name: Install musl C compiler and Rust target
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q musl-tools
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          # Keep the image's own archive keyring for signature checks.
+          keyring=$(sed -n 's/^Signed-By: *//p' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null | head -n 1)
+          keyring=${keyring:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
+          sudo rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list
+          printf 'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: %s %s-updates\nComponents: main universe\nSigned-By: %s\n\nTypes: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: %s-security\nComponents: main universe\nSigned-By: %s\n' \
+            "$codename" "$codename" "$keyring" "$codename" "$keyring" | sudo tee /etc/apt/sources.list.d/ubuntu.sources >/dev/null
+          sudo apt-get update -q -o Acquire::Retries=3
+          sudo apt-get install -y -q -o Acquire::Retries=3 musl-tools
           rustup target add x86_64-unknown-linux-musl
       - name: Build static tenant runner
         run: |
