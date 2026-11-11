@@ -394,7 +394,11 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
                     let successful =
                         matches!(terminal.outcome, motor_protocol::Outcome::Exit { code: 0 });
                     if !successful {
-                        return Err(invalid("fill command failed"));
+                        return Err(invalid(format!(
+                            "fill command failed ({:?}): {}",
+                            terminal.outcome,
+                            output_tail(&runner, id)
+                        )));
                     }
                     // Wait for publication and ownership repair to finish before
                     // reporting success and allowing this VM to power off.
@@ -439,6 +443,33 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
         }
         _ => Err(invalid("operation_refused")),
     }
+}
+
+/// The last 2 KiB of a failed fill's output, on one line. A fill VM and its
+/// disk are gone moments after a failure, so the refusal the host logs is the
+/// only record of why the trusted build failed.
+fn output_tail(runner: &Runner, id: motor_protocol::Uuid) -> String {
+    const TAIL_BYTES: usize = 2048;
+    let Ok(frames) = runner.replay(id, 0) else {
+        return "output unavailable".into();
+    };
+    let mut bytes: Vec<u8> = frames
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Frame::Output(output) => Some(output.bytes.0),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    if bytes.len() > TAIL_BYTES {
+        bytes.drain(..bytes.len() - TAIL_BYTES);
+    }
+    String::from_utf8_lossy(&bytes)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 #[cfg(target_os = "linux")]
