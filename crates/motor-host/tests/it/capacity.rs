@@ -413,13 +413,12 @@ fn free_memory_follows_the_guest_sample_with_the_reserve_and_freshness_bound() {
     // Running, not yet sampled: 0 until the first probe, without a log.
     logs.capture(|| assert_eq!(h.free_mem_mib(now), 0));
     assert_eq!(logs.count("tenant_memory_unavailable"), 0);
-    // The broker needs max(16384, 3584 x vcpus) MiB; 16,384 MiB plus the
-    // 2 GiB reserve is exactly its 4-vCPU threshold.
+    // A reserved lease is also debited by its 16,384 MiB request.
     for (bytes, advertised) in [
-        ((16_384 + 2_048) * MIB, 16_384),
-        ((16_384 + 2_048 + 1) * MIB, 16_385),
-        ((16_384 + 2_048 - 1) * MIB, 16_383),
-        ((16_384 + 2_048 + 1) * MIB - 1, 16_384),
+        ((16_384 + 2_048) * MIB, 0),
+        ((16_384 + 2_048 + 1) * MIB, 1),
+        ((16_384 + 2_048 - 1) * MIB, 0),
+        ((16_384 + 2_048 + 1) * MIB - 1, 0),
         (2_048 * MIB, 0),
         (GIB, 0),
     ] {
@@ -427,7 +426,7 @@ fn free_memory_follows_the_guest_sample_with_the_reserve_and_freshness_bound() {
         assert_eq!(h.free_mem_mib(now), advertised, "{bytes}");
     }
     h.record_memory("tenant", now, Ok(Some(50 * GIB)));
-    assert_eq!(h.free_mem_mib(now + 30_000), 51_200 - 2_048);
+    assert_eq!(h.free_mem_mib(now + 30_000), 51_200 - 2_048 - 16_384);
     logs.capture(|| assert_eq!(h.free_mem_mib(now + 30_001), 0));
     assert!(logs.text().contains("stale_sample"), "{}", logs.text());
     for (reading, case) in [
@@ -451,8 +450,95 @@ fn free_memory_follows_the_guest_sample_with_the_reserve_and_freshness_bound() {
     // sample from the previous run is never reused.
     h.record_memory("tenant", now, Ok(Some(GIB)));
     h.guest_unready("tenant");
-    assert_eq!(h.free_mem_mib(now), 77_824);
+    assert_eq!(h.free_mem_mib(now), 77_824 - 16_384);
     h.guest_ready("tenant", 2).unwrap();
+    assert_eq!(h.free_mem_mib(now), 0);
+}
+
+#[test]
+fn ready_tenant_memory_debits_reserved_leases_but_not_admitted_or_started_leases() {
+    let mut h = host_with(vec![("vm", tenant_one())]);
+    let now = NOW * 1000;
+    observe(&mut h, u64::MAX);
+    h.guest_ready("tenant", 1).unwrap();
+    h.record_memory("tenant", now, Ok(Some(50 * GIB)));
+
+    let (connection, _) = h.claim(claims(JOB), now).unwrap();
+    let memory = h.free_mem_mib(now);
+    let heartbeat = h.heartbeat(now, memory, true);
+    assert_eq!(heartbeat.free_mem_mib, 32_768);
+    assert_eq!(heartbeat.running[0].state, motor_lease::JobState::Reserved);
+
+    h.delivered(connection).unwrap();
+    assert_eq!(h.free_mem_mib(now), 32_768);
+    for (seq, kind, state) in [
+        (
+            1,
+            TenantEventKind::Admitted,
+            motor_lease::JobState::Admitted,
+        ),
+        (2, TenantEventKind::Started, motor_lease::JobState::Started),
+    ] {
+        h.event("tenant", &event(seq, kind, Some(JOB), None), now)
+            .unwrap();
+        let memory = h.free_mem_mib(now);
+        let heartbeat = h.heartbeat(now, memory, true);
+        assert_eq!(heartbeat.free_mem_mib, 49_152);
+        assert_eq!(heartbeat.running[0].state, state);
+    }
+}
+
+#[test]
+fn reserved_memory_debits_only_its_own_tenant_before_taking_the_maximum() {
+    let mut second = tenant_one();
+    second.tenant = "tenant-2".into();
+    second.sub = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW".into();
+    let mut h = host_with(vec![("vm", tenant_one()), ("vm-2", second)]);
+    let now = NOW * 1000;
+    observe(&mut h, u64::MAX);
+    h.guest_ready("tenant", 1).unwrap();
+    h.guest_ready("tenant-2", 1).unwrap();
+    h.record_memory("tenant", now, Ok(Some(50 * GIB)));
+    h.record_memory("tenant-2", now, Ok(Some(40 * GIB)));
+    assert_eq!(h.free_mem_mib(now), 49_152);
+
+    h.claim(claims(JOB), now).unwrap();
+    // Tenant 1 now has 32,768 MiB free; tenant 2 is still at 38,912 MiB.
+    assert_eq!(h.free_mem_mib(now), 38_912);
+    h.record_memory("tenant-2", now, Ok(Some(30 * GIB)));
+    assert_eq!(h.free_mem_mib(now), 32_768);
+}
+
+#[test]
+fn not_ready_tenant_memory_debits_every_reserved_lease() {
+    let mut h = host_with(vec![("vm", tenant_one())]);
+    let now = NOW * 1000;
+    observe(&mut h, u64::MAX);
+    assert!(!h.is_ready("tenant"));
+    assert_eq!(h.free_mem_mib(now), 77_824);
+
+    h.claim(claims(JOB), now).unwrap();
+    assert_eq!(h.free_mem_mib(now), 61_440);
+    let (connection, _) = h.claim(claims(JOB2), now).unwrap();
+    assert_eq!(h.free_mem_mib(now), 45_056);
+    h.close(connection).unwrap();
+    assert_eq!(h.free_mem_mib(now), 61_440);
+}
+
+#[test]
+fn reserved_memory_debits_saturate_for_ready_and_not_ready_tenants() {
+    let mut tenant = tenant_one();
+    tenant.guest_ram_mib = 20_000;
+    let mut h = host_with(vec![("vm", tenant)]);
+    let now = NOW * 1000;
+    observe(&mut h, u64::MAX);
+    h.claim(claims(JOB), now).unwrap();
+    assert_eq!(h.free_mem_mib(now), 1_568);
+    h.claim(claims(JOB2), now).unwrap();
+    assert_eq!(h.free_mem_mib(now), 0);
+
+    h.guest_ready("tenant", 1).unwrap();
+    h.record_memory("tenant", now, Ok(Some(4 * GIB)));
     assert_eq!(h.free_mem_mib(now), 0);
 }
 

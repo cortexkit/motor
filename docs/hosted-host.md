@@ -233,6 +233,8 @@ at a first install to change the disk size.
 The guest advertises
 `memory_max` of its placeable size: 28,672 − 2,048 = 26,624 MiB places
 leases of up to 7 vCPUs ([hosted-cutover.md](hosted-cutover.md#enable-on-one-machine)).
+The host also subtracts each reserved lease's requested memory from its tenant's
+advertised free memory, so the figure accounts for every job the heartbeat lists.
 
 ### Growing the tenant
 

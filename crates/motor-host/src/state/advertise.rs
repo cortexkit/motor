@@ -591,8 +591,10 @@ impl Host {
     /// tenant that is not running advertises its guest RAM, so the broker can
     /// place the lease that wakes it; a running tenant advertises its guest's
     /// measured available memory. Both are floored to MiB and reduced by
-    /// `tenant_memory_reserve_bytes` rounded up to whole MiB, saturating at
-    /// 0. A running tenant without a usable sample, a pending/refused start or stop,
+    /// `tenant_memory_reserve_bytes` rounded up to whole MiB and this tenant's
+    /// reserved leases' requested memory, saturating at 0. Reserved leases are
+    /// debited because the broker ends its memory hold once a job is listed.
+    /// A running tenant without a usable sample, a pending/refused start or stop,
     /// and any tenant while no valid capacity file has been read advertise 0.
     /// Logs each running tenant's unusable-sample case once when it starts.
     pub fn free_mem_mib(&mut self, now_ms: u64) -> u64 {
@@ -627,8 +629,19 @@ impl Host {
         if self.start_fenced(&tenant.tenant) || self.placement_stopping(&tenant.tenant) {
             return 0;
         }
+        let reserved_mib = self
+            .snapshot
+            .leases
+            .values()
+            .filter(|lease| lease.tenant == tenant.tenant && lease.state == LeaseState::Reserved)
+            .fold(0_u64, |total, lease| {
+                total.saturating_add(lease.claims.mem_mib)
+            });
         if !self.is_ready(&tenant.tenant) {
-            return tenant.guest_ram_mib.saturating_sub(reserve_mib);
+            return tenant
+                .guest_ram_mib
+                .saturating_sub(reserve_mib)
+                .saturating_sub(reserved_mib);
         }
         let advert = self.advert.entry(tenant.tenant.clone()).or_default();
         let (value, case, detail) = match &advert.memory {
@@ -670,6 +683,6 @@ impl Host {
             }
             advert.memory_case = case;
         }
-        value
+        value.saturating_sub(reserved_mib)
     }
 }
