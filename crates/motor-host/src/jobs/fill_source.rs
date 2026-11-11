@@ -194,7 +194,10 @@ impl Host {
             account: execution.claims.sub.clone(),
             repository_root: run.repository_root.clone(),
             integration_tip: run.integration_tip.clone(),
-            mem_mib: execution.claims.mem_mib,
+            mem_mib: execution
+                .claims
+                .mem_mib
+                .max(crate::state::jobs::fills::MEMORY_FLOOR_MIB),
             observed_ms: now_ms,
         };
         let slot_key = key(&request.account, &request.repository_root);

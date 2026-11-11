@@ -136,11 +136,10 @@ fn rendered_argv(
 
 /// SHA-256 of the rendered argv of every remote case below.
 ///
-/// Last updated when fill units gained a runtime cap: each of the 4 rendered
-/// fill cases gains one `RuntimeMaxSec=5400000ms` line (the default writer
-/// limit) and nothing else changes.
+/// Each of the four rendered fill cases now uses the 24 GiB floor for
+/// `MemoryMax` and `/dev/shm`; every other argument is unchanged.
 const REMOTE_PINNED_SHA256: &str =
-    "82d96319a6602b0a29a7c61cb442400995aeabcc1a3d9a28d2ea4dc1062e97ba";
+    "658c9e7fbe39a465a639d41c7575117c6e1ddacd3cf82d810d89df4bd0f61056";
 
 /// Every unit kind, rendered with and without forwarders: only forwarder starts
 /// and active-tool statistics change. Forwarders start right after the gate; with no

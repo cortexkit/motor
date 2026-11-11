@@ -32,9 +32,9 @@ fn render(name: &str, sandbox: &Sandbox, f: &Fixture, durable: bool) -> String {
 }
 
 /// SHA-256 of the rendered argv of every case below.
-// The writer case caps its service and all descendants at 90 minutes. Foreground
+// The writer case uses the 24 GiB floor for MemoryMax and /dev/shm; foreground
 // jobs retain their existing resource properties and request-based deadlines.
-const PINNED_SHA256: &str = "56c29d008b148fa2fc9ed69bec4ac1872bccd59c3edfbf5d4ac3e321db9be0c0";
+const PINNED_SHA256: &str = "f23f56beed08957d2b25727a009852d5c48a8f02c65596ddba763a8c3c160c70";
 
 #[test]
 fn job_unit_commands_match_the_pinned_argv() {

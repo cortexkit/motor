@@ -3,6 +3,8 @@ use super::*;
 
 /// A quiet claim interval, not a promise to preempt an already running fill.
 pub const CAPACITY_QUIET_MS: u64 = 30_000;
+// Default-branch cache builds have measured peaks above 16 GiB with few vCPUs.
+pub const MEMORY_FLOOR_MIB: u64 = 24 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Reservation {
@@ -53,12 +55,16 @@ impl Host {
         let Some(sample) = self.fresh_host_resources(now_ms) else {
             return Ok(None);
         };
+        if mem_mib == 0 {
+            return Ok(None);
+        }
         let vcpus = 4.min(sample.vcpu_ceiling).min(sample.permit_budget);
+        // Apply the floor here too, for sources retained before the floor rose.
+        let mem_mib = mem_mib.max(MEMORY_FLOOR_MIB);
         let Some(debit) = mem_mib.checked_add(settings.boot_reserve_mib) else {
             return Ok(None);
         };
         if vcpus == 0
-            || mem_mib == 0
             || self.job_free_vcpus(now_ms) < u64::from(vcpus)
             || self.job_free_mem_mib(now_ms) < debit
         {

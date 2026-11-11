@@ -216,6 +216,61 @@ fn memory_max_scales_per_vcpu_with_a_sixteen_gib_floor() {
 }
 
 #[test]
+fn writer_memory_has_a_twenty_four_gib_floor_and_still_obeys_the_slice() {
+    let f = Fixture::new();
+    for tenant in [false, true] {
+        for (writer, vcpus, stated, ceiling, expected) in [
+            (true, 4, Some(4096), None, 24_u64 << 30),
+            (true, 8, Some(4096), None, 28 << 30),
+            (true, 4, Some(4096), Some(20_u64 << 30), 20 << 30),
+            (true, 8, Some(4096), Some(26 << 30), 26 << 30),
+            (false, 4, None, None, 16 << 30),
+            (
+                false,
+                4,
+                Some(4096),
+                None,
+                if tenant { 4 << 30 } else { 16 << 30 },
+            ),
+        ] {
+            let mut sandbox = f.command_sandbox().in_tenant_vm(tenant);
+            sandbox.writer = writer;
+            if let Some(ceiling) = ceiling {
+                sandbox = sandbox
+                    .with_slice_budget(crate::systemd::JobMemoryBudget::from_max(ceiling).unwrap());
+            }
+            let command = sandbox
+                .command_for_resources(
+                    "true",
+                    &f.workspace,
+                    &[],
+                    true,
+                    &[0],
+                    crate::backend::JobResources {
+                        vcpus,
+                        memory_mib: stated,
+                    },
+                )
+                .unwrap();
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert!(
+                args.contains(&format!("--property=MemoryMax={expected}").as_str()),
+                "tenant={tenant}, writer={writer}, vcpus={vcpus}: {args:?}"
+            );
+            assert!(args.contains(
+                &format!(
+                    "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={expected}"
+                )
+                .as_str()
+            ));
+        }
+    }
+}
+
+#[test]
 fn tenant_unit_uses_host_memory_and_keeps_other_target_limits() {
     let f = Fixture::new();
     for (tenant, boat, stated, expected) in [
