@@ -103,6 +103,12 @@ struct Fake {
     admin_requests: Mutex<Vec<(String, Value)>>,
     write_block_reply: Mutex<Option<Value>>,
     recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
+    /// A refusal the fake runner sends instead of `accepted` for a Run.
+    refuse_run: Mutex<Option<Value>>,
+    /// After refusing, stop reading the channel but keep it open until the
+    /// host stops the VM, as a runner that refused mid-upload does.
+    stall_after_refusal: AtomicBool,
+    stopped: Arc<AtomicBool>,
 }
 impl Fake {
     fn wait(&self, stage: &str) {
@@ -335,6 +341,7 @@ impl Control for Fake {
     }
     fn stop_job(&self, job: &str) -> Result<()> {
         self.calls.lock().unwrap().push(format!("stop:{job}"));
+        self.stopped.store(true, Ordering::SeqCst);
         *self.gate.0.lock().unwrap() = true;
         self.gate.1.notify_all();
         self.peers.lock().unwrap().clear();
@@ -374,6 +381,9 @@ impl Control for Fake {
         let reply = self.hello.lock().unwrap().clone().unwrap_or_else(hello);
         let inputs = self.inputs.clone();
         let disconnect_on_run = self.disconnect_on_run.load(Ordering::SeqCst);
+        let refuse_run = self.refuse_run.lock().unwrap().clone();
+        let stall_after_refusal = self.stall_after_refusal.load(Ordering::SeqCst);
+        let stopped = self.stopped.clone();
         std::thread::spawn(move || {
             let read = |stream: &mut UnixStream| -> Result<(Vec<u8>, Value)> {
                 use std::io::Read;
@@ -409,6 +419,16 @@ impl Control for Fake {
                             // A missing guest acknowledgment cannot undo Run delivery.
                             b.shutdown(std::net::Shutdown::Both).unwrap();
                             return;
+                        }
+                        if let Some(refusal) = &refuse_run {
+                            let _ = write_json(&mut b, refusal);
+                            if stall_after_refusal {
+                                while !stopped.load(Ordering::SeqCst) {
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                return;
+                            }
+                            continue;
                         }
                         let _ = write_json(
                             &mut b,
@@ -1922,6 +1942,136 @@ async fn delivered_run_without_guest_acceptance_replays_unknown_after_disconnect
     drop(client);
     task.await.unwrap().unwrap();
     runtime.host.lock().unwrap().close(id).unwrap();
+}
+
+/// A job VM boots after the host has already told the caller its Run was
+/// accepted and queued. When the VM's runner then refuses that Run at
+/// admission, the caller must get a stored no-start terminal carrying the
+/// runner's reason, live and again on reattach, so it can resubmit. The host
+/// then stops the VM and releases the job's reservations.
+async fn runner_refusal_after_host_acceptance(large_upload: bool) {
+    let (runtime, fake, storage) = fixture();
+    let detail = "runner_disk_full: free_bytes=1 floor_bytes=2";
+    *fake.refuse_run.lock().unwrap() = Some(json!({"type":"refusal","job_id":JOB,
+        "reason":"runner_disk_full","disk_full":{"free_bytes":1,"floor_bytes":2},"detail":detail}));
+    // A runner that refused mid-upload stops reading the rest of it but keeps
+    // its channel open, so the host's writes back up behind the socket buffers.
+    fake.stall_after_refusal
+        .store(large_upload, Ordering::SeqCst);
+    if large_upload {
+        hold_boot(&runtime, &fake, "runner");
+    }
+    let mut c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c.clone(), id).await;
+    // Far more than any socket buffer between the host and the guest.
+    let chunks: Vec<Value> = (0..16u64)
+        .map(|n| json!({"type":"bundle_chunk","index":0,"offset":n * 262_143,"data":"YWFh".repeat(87_381)}))
+        .collect();
+    let mut request = run(JOB);
+    if large_upload {
+        request["bundles"] = json!([{"index":0,"repository":request["repository_root"],
+            "length":16 * 262_143,"sha256":"0".repeat(64)}]);
+    }
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(&mut client, &request).await.unwrap();
+    next_type(&mut client, "accepted").await;
+    if large_upload {
+        let spooled = [hello(), request.clone()]
+            .iter()
+            .chain(&chunks)
+            .map(|f| serde_json::to_vec(f).unwrap().len() as u64 + 4)
+            .sum::<u64>();
+        for chunk in &chunks {
+            write_frame(&mut client, chunk).await.unwrap();
+        }
+        // Release the boot only once the whole upload waits in the spool, so
+        // the host replays it into a runner that has stopped reading.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while std::fs::metadata(storage.spool(JOB)).map_or(0, |m| m.len()) < spooled {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upload reaches the spool");
+        *fake.gate.0.lock().unwrap() = true;
+        fake.gate.1.notify_all();
+    }
+    let terminal = tokio::time::timeout(Duration::from_secs(10), next_type(&mut client, "terminal"))
+        .await
+        .expect("the runner's refusal reaches the caller as a terminal");
+    assert_eq!(
+        terminal["outcome"],
+        json!({"type":"refused_before_start","reason":"runner_disk_full"})
+    );
+    assert_eq!(terminal["ran"], "none");
+    assert_eq!(terminal["refusal_detail"], detail);
+    next_type(&mut client, "hosted_terminal").await;
+    task.await.unwrap().unwrap();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while storage.releases.lock().unwrap().get(JOB).is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refused job's reservations are released");
+    assert_eq!(storage.releases.lock().unwrap()[JOB], 1);
+    assert!(fake.calls.lock().unwrap().contains(&format!("stop:{JOB}")));
+    if large_upload {
+        assert!(
+            !fake.inputs.lock().unwrap().iter().any(|bytes| {
+                serde_json::from_slice::<Value>(&bytes[4..]).unwrap()["type"] == "bundle_chunk"
+            }),
+            "the runner stopped reading before the upload"
+        );
+    }
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let lease = &host.snapshot.leases[JOB];
+        assert!(lease.delivered);
+        assert!(lease.started_at_ms.is_none());
+        assert_eq!(lease.state, LeaseState::Ended);
+        assert_eq!(host.snapshot.billing[JOB].terminal.as_ref(), Some(&terminal));
+        assert!(host.snapshot.per_job.executions[JOB].ended);
+        host.close(id).unwrap();
+    }
+
+    c.purpose = Purpose::Attach;
+    let id = runtime
+        .host
+        .lock()
+        .unwrap()
+        .claim(c.clone(), unix_ms())
+        .unwrap()
+        .0;
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(
+        &mut client,
+        &json!({"type":"attach","job_id":JOB,"from_seq":0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next_type(&mut client, "terminal").await, terminal);
+    next_type(&mut client, "hosted_terminal").await;
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.host.lock().unwrap().close(id).unwrap();
+}
+
+#[tokio::test]
+async fn runner_refusal_after_host_acceptance_is_a_stored_no_start_terminal() {
+    runner_refusal_after_host_acceptance(false).await;
+}
+
+#[tokio::test]
+async fn runner_refusal_mid_upload_that_stops_reading_is_a_stored_no_start_terminal() {
+    runner_refusal_after_host_acceptance(true).await;
 }
 
 /// The guest runner closes its channel after 60 s with no byte from the host.
