@@ -9,6 +9,47 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 #[test]
+fn cache_write_admission_sends_only_raw_token_and_requires_helper_success() {
+    let directory = scratch();
+    let path = directory.path().join("cache-grant.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let worker = std::thread::spawn(move || {
+        for reply in [
+            json!({"result":"ok"}),
+            json!({"result":"error","message":"token refused"}),
+            json!({"result":"job"}),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap(),
+                json!({"op":"admit_cache_write","token":"original.signed.token"})
+            );
+            writeln!(stream, "{reply}").unwrap();
+        }
+    });
+    let helper = Helper {
+        socket: path,
+        storage: directory.path().to_owned(),
+        capacity: directory.path().join("capacity.json"),
+        guest_init: BTreeMap::new(),
+        vcpu_ceiling: BTreeMap::new(),
+        pressure_cgroups: BTreeMap::new(),
+    };
+    helper.admit_cache_write("original.signed.token").unwrap();
+    for _ in 0..2 {
+        let error = helper
+            .admit_cache_write("original.signed.token")
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("original.signed.token"));
+    }
+    worker.join().unwrap();
+}
+
+#[test]
 fn job_stop_and_adopt_readers_accept_additive_absent_status() {
     let directory = scratch();
     let path = directory.path().join("absent-helper.sock");

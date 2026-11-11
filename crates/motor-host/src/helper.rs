@@ -64,6 +64,9 @@ pub trait Control: Send + Sync {
     fn ack_job_exit(&self, _report: &motor_vm_helper::job::ExitReport) -> Result<()> {
         anyhow::bail!("job VM exit acknowledgement unavailable")
     }
+    fn admit_cache_write(&self, _token: &str) -> Result<()> {
+        anyhow::bail!("cache-write admission unavailable")
+    }
     fn start_job(&self, _start: &motor_vm_helper::job::Start) -> Result<Value> {
         anyhow::bail!("job VM start unavailable")
     }
@@ -457,6 +460,14 @@ impl Control for Helper {
         ensure!(
             reply["result"] == "ok",
             "job VM exit acknowledgement refused"
+        );
+        Ok(())
+    }
+    fn admit_cache_write(&self, token: &str) -> Result<()> {
+        let (reply, fds) = self.request(json!({"op":"admit_cache_write", "token":token}))?;
+        ensure!(
+            reply["result"] == "ok" && fds.is_empty(),
+            "cache-write admission refused"
         );
         Ok(())
     }

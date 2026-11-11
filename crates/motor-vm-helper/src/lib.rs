@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, os::fd::OwnedFd};
 use uuid::Uuid;
 
+pub mod cache_write;
 pub mod config;
 pub mod images;
 pub mod job;
@@ -41,6 +42,9 @@ pub enum Kind {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    AdmitCacheWrite {
+        token: String,
+    },
     PerJobReadiness {},
     PrepareFill {
         fill: job::Fill,
@@ -342,6 +346,9 @@ impl Response {
 /// Cleanup must include all slot-uid processes, mounts, chroots and cgroups.
 /// A failed cleanup is never evidence that the slot is free.
 pub trait Machine {
+    fn cache_write_authority(&self) -> Option<cache_write::Authority> {
+        None
+    }
     fn job_vms_configured(&self) -> bool {
         false
     }
@@ -426,6 +433,17 @@ impl<M: Machine> Helper<M> {
         }
     }
     #[cfg(target_os = "linux")]
+    pub(crate) fn admission_work(&self, connection: u64) -> Result<cache_write::Authority> {
+        if self.stopping || !self.connections.contains_key(&connection) {
+            return Err(Error(
+                "connection is not authorised for cache-write admission".into(),
+            ));
+        }
+        self.machine
+            .cache_write_authority()
+            .ok_or_else(|| Error("cache-write admission is not configured".into()))
+    }
+    #[cfg(target_os = "linux")]
     pub(crate) fn readiness_work(&self, connection: u64) -> Result<images::Operation> {
         let op = images::Operation::Readiness {
             job_vms_configured: self.machine.job_vms_configured(),
@@ -454,6 +472,11 @@ impl<M: Machine> Helper<M> {
             return Err(Error("helper is stopping".into()));
         }
         match request {
+            // The socket server uses admission_work to check authorization, then
+            // releases the global Helper lock before fetching signing keys.
+            Request::AdmitCacheWrite { .. } => {
+                Err(Error("cache-write admission requires detached work".into()))
+            }
             Request::PerJobReadiness {} => {
                 let job_vms_configured = self.machine.job_vms_configured();
                 let workspace_disk_max_bytes = self.machine.workspace_disk_max_bytes();

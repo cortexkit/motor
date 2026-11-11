@@ -110,6 +110,7 @@ enum CollectionFailure {
 }
 
 pub struct LinuxJobs {
+    pub(super) cache_write_grants: crate::cache_write::Authority,
     settings: Option<JobVms>,
     groups: PathBuf,
     records_path: PathBuf,
@@ -165,6 +166,9 @@ impl LinuxJobs {
     }
     pub fn new(config: &Config) -> Self {
         Self {
+            cache_write_grants: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::cache_write::Grants::new(config),
+            )),
             settings: config.job_vms.clone(),
             groups: cgroup::JOB_SLICE.into(),
             records_path: job::RECORDS.into(),

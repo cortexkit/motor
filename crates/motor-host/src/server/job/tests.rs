@@ -7,6 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Condvar;
 
 mod admin_tests;
+mod cache_write_tests;
 mod deadline_tests;
 mod heartbeat_tests;
 mod recovery_tests;
@@ -68,6 +69,8 @@ fn run(job: &str) -> Value {
 
 #[derive(Default)]
 struct Fake {
+    cache_write_tokens: Mutex<Vec<String>>,
+    fail_cache_write: AtomicBool,
     readiness: Mutex<Option<motor_vm_helper::images::Readiness>>,
     fill_export: Mutex<Option<UnixStream>>,
     capacity_available: AtomicBool,
@@ -121,6 +124,15 @@ impl Fake {
     }
 }
 impl Control for Fake {
+    fn admit_cache_write(&self, token: &str) -> Result<()> {
+        self.cache_write_tokens.lock().unwrap().push(token.into());
+        self.wait("cache-write");
+        ensure!(
+            !self.fail_cache_write.load(Ordering::SeqCst),
+            "grant refused"
+        );
+        Ok(())
+    }
     fn per_job_readiness(&self) -> Result<motor_vm_helper::images::Readiness> {
         self.calls.lock().unwrap().push("readiness".into());
         self.readiness

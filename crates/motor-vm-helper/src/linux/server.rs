@@ -1,5 +1,5 @@
 use super::{fs, LinuxMachine, SOCKET};
-use crate::{Error, Helper, Peer, Reply, Request, Response, Result};
+use crate::{Error, Helper, Machine, Peer, Reply, Request, Response, Result};
 use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -74,6 +74,13 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o660))?;
+    let authority = helper.lock().unwrap().machine.cache_write_authority();
+    if let Some(authority) = authority {
+        std::thread::spawn(move || loop {
+            std::thread::park_timeout(Duration::from_millis(100));
+            authority.lock().unwrap().maintain();
+        });
+    }
     let maintenance = helper.clone();
     std::thread::spawn(move || loop {
         std::thread::park_timeout(Duration::from_millis(100));
@@ -123,7 +130,7 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
     }
     Ok(())
 }
-fn connection_loop<M: crate::Machine>(
+pub(crate) fn connection_loop<M: crate::Machine>(
     helper: &Mutex<Helper<M>>,
     id: u64,
     mut stream: UnixStream,
@@ -158,6 +165,11 @@ fn connection_loop<M: crate::Machine>(
                 // Image copies must not hold the helper mutex: admission probes
                 // and stops must remain responsive during a publication.
                 let op = match request {
+                    Request::AdmitCacheWrite { token } => {
+                        let authority = helper.lock().unwrap().admission_work(id)?;
+                        authority.lock().unwrap().admit(&token)?;
+                        return Ok(Response::new(Reply::Ok));
+                    }
                     Request::PerJobReadiness {} => helper.lock().unwrap().readiness_work(id)?,
                     Request::RemoveJobImages { generation } => {
                         let response = helper.lock().unwrap().handle(

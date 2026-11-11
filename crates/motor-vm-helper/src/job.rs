@@ -60,29 +60,37 @@ impl Start {
 
     pub fn validate_fresh_at(&self, now: SystemTime) -> Result<()> {
         self.validate()?;
-        let id = uuid::Uuid::parse_str(&self.job_id).unwrap();
-        let millis = u64::from_be_bytes([
-            0,
-            0,
-            id.as_bytes()[0],
-            id.as_bytes()[1],
-            id.as_bytes()[2],
-            id.as_bytes()[3],
-            id.as_bytes()[4],
-            id.as_bytes()[5],
-        ]);
-        let created = UNIX_EPOCH + Duration::from_millis(millis);
-        if now
-            .duration_since(created)
-            .is_ok_and(|age| age > MAX_START_AGE)
-            || created
-                .duration_since(now)
-                .is_ok_and(|ahead| ahead > MAX_START_FUTURE)
-        {
-            return Err(Error("job UUIDv7 timestamp outside start window".into()));
-        }
-        Ok(())
+        validate_start_window(&self.job_id, now)
     }
+}
+
+pub(crate) fn validate_start_window(job_id: &str, now: SystemTime) -> Result<()> {
+    validate_job_id(job_id)?;
+    let id = uuid::Uuid::parse_str(job_id).unwrap();
+    if id.get_version_num() != 7 || id.get_variant() != uuid::Variant::RFC4122 {
+        return Err(Error("job start requires a UUIDv7".into()));
+    }
+    let millis = u64::from_be_bytes([
+        0,
+        0,
+        id.as_bytes()[0],
+        id.as_bytes()[1],
+        id.as_bytes()[2],
+        id.as_bytes()[3],
+        id.as_bytes()[4],
+        id.as_bytes()[5],
+    ]);
+    let created = UNIX_EPOCH + Duration::from_millis(millis);
+    if now
+        .duration_since(created)
+        .is_ok_and(|age| age > MAX_START_AGE)
+        || created
+            .duration_since(now)
+            .is_ok_and(|ahead| ahead > MAX_START_FUTURE)
+    {
+        return Err(Error("job UUIDv7 timestamp outside start window".into()));
+    }
+    Ok(())
 }
 
 pub fn validate_id(id: &str) -> Result<()> {
