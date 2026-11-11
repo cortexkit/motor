@@ -135,6 +135,20 @@ fn layout_follows_host_role() {
     );
     assert_eq!(tenant.role().keys(), &[KeyRole::Read]);
 
+    // Job and fill VMs read the set the guest agent copies from their boot
+    // drive, not tenant provisioning; a fill VM's runner is not `per_job`.
+    for (per_job, fill_vm) in [(true, false), (false, true)] {
+        config.per_job = per_job;
+        config.fill_vm = fill_vm;
+        assert_eq!(
+            Layout::for_config(&config).config_path(),
+            PathBuf::from("/run/motor/cache/config.json"),
+            "per_job={per_job} fill_vm={fill_vm}"
+        );
+    }
+    config.per_job = false;
+    config.fill_vm = false;
+
     config.tenant_vm = false;
     config.boat_profile = true;
     let boat = Layout::for_config(&config);

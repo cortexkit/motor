@@ -114,6 +114,10 @@ pub struct Config {
     pub tenant_vm: bool,
     /// A fresh job VM accepts one execution and one caller workspace for its lifetime.
     pub per_job: bool,
+    /// A per-job fill VM: a tenant runner (not `per_job`) booted only to run one
+    /// imported fill. Like a job VM, it reads its cache credentials from the
+    /// boot drive the guest agent installs, not from tenant provisioning.
+    pub fill_vm: bool,
     /// Exact caller repository roots selected for job checkouts at
     /// `/w/<account>/<repo-key>/<name>`; `*` selects all roots.
     pub fixed_path_repositories: Vec<String>,
@@ -548,6 +552,7 @@ impl Config {
             metrics: crate::metrics::Settings::default(),
             tenant_vm: false,
             per_job: false,
+            fill_vm: false,
             fixed_path_repositories: Vec::new(),
             account_subject: None,
             boat_profile: false,
@@ -724,6 +729,11 @@ impl Config {
         }
         if self.per_job && (!self.tenant_vm || self.boat_profile) {
             return Err(io::Error::other("--per-job requires a tenant runner"));
+        }
+        if self.fill_vm && (!self.tenant_vm || self.boat_profile || self.per_job) {
+            return Err(io::Error::other(
+                "--fill-vm requires a tenant runner without --per-job",
+            ));
         }
         check_fixed_path_options(
             &self.fixed_path_repositories,
@@ -5628,10 +5638,17 @@ impl Runner {
                 "remote cache is off in the runner arguments".into()
             } else if let Some(error) = &config.remote_cache_error {
                 format!("remote cache did not start: {error}")
-            } else if config.remote_cache_runtime.is_none() {
-                "remote cache runtime is not running".into()
+            } else if let Some(runtime) = &config.remote_cache_runtime {
+                match runtime.watch.admit() {
+                    Some(_) => "no cache write key in the installed credentials".into(),
+                    None => format!(
+                        "no usable cache credentials (enabled={:?}, status={:?})",
+                        runtime.watch.enabled_setting(),
+                        runtime.watch.status()
+                    ),
+                }
             } else {
-                "no cache write key in the installed credentials".into()
+                "remote cache runtime is not running".into()
             });
         }
         if !config.writer_enabled() {

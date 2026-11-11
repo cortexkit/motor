@@ -466,6 +466,10 @@ fn configure_options(
             config.per_job = true;
             continue;
         }
+        if arg == "--fill-vm" {
+            config.fill_vm = true;
+            continue;
+        }
         if arg == "--boat-profile" {
             config.boat_profile = true;
             config.disk_reserve_bytes = motor_runner::BOAT_DISK_RESERVE_BYTES;
@@ -600,6 +604,16 @@ mod fixed_path_options {
     use super::*;
 
     const SUBJECT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fill_vm_option_requires_tenant_mode_without_per_job() {
+        assert!(parse(&["--fill-vm"], true).is_err());
+        assert!(parse(&["--fill-vm", "--tenant-vm", "--per-job"], true).is_err());
+        assert!(parse(&["--fill-vm", "--tenant-vm", "--boat-profile"], true).is_err());
+        let config = parse(&["--fill-vm", "--tenant-vm"], true).unwrap();
+        assert!(config.fill_vm && !config.per_job);
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

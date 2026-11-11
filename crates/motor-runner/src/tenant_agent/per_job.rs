@@ -129,7 +129,11 @@ pub(super) fn args() -> io::Result<RunnerArgs> {
         .map_err(|error| failure("job_vm_args_invalid", error))?;
     let mut args =
         RunnerArgs::read(Path::new(ARGS)).map_err(|error| failure("job_vm_args_invalid", error))?;
-    if !crate::fill_source::fill_boot(&fs::read_to_string("/proc/cmdline")?) {
+    // A fill boot runs a tenant runner for its one fill, not a job VM's
+    // runner; `--fill-vm` still points it at the boot drive's credentials.
+    if crate::fill_source::fill_boot(&fs::read_to_string("/proc/cmdline")?) {
+        args.words.push("--fill-vm".into());
+    } else {
         args.words.push("--per-job".into());
     }
     // A future root-owned repository allowlist must render the same fixed-path
