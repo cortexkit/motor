@@ -340,6 +340,7 @@ impl Control for Fake {
         Ok(())
     }
     fn stop_job(&self, job: &str) -> Result<()> {
+        self.wait("stop");
         self.calls.lock().unwrap().push(format!("stop:{job}"));
         self.stopped.store(true, Ordering::SeqCst);
         *self.gate.0.lock().unwrap() = true;

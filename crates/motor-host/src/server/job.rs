@@ -1236,6 +1236,22 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
             runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].delivered;
         let cancelled = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].state
             == LeaseState::Ended;
+        if cancelled && claims.purpose == Purpose::Attach {
+            let terminal_stored = runtime
+                .host
+                .lock()
+                .expect("host lock")
+                .snapshot
+                .per_job
+                .executions[&claims.jti]
+                .replay_completion
+                == Some(crate::state::jobs::storage::ReplayCompletion::Terminal);
+            // A stored terminal ends the lease before VM teardown finishes.
+            // Attach still needs replay even while the execution remains live.
+            if terminal_stored {
+                return live(&runtime, claims, client).await;
+            }
+        }
         if cancelled || !execution.runner_hello || !delivered {
             write_frame(client, &json!({"type":"lease_refused","reason":"auth"})).await?;
             return Ok(());

@@ -69,7 +69,36 @@ async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_no
     terminal["ran"] = json!("none");
     terminal["wall_ms"] = json!(0);
     terminal["last_seq"] = Value::Null;
+    // Consume the boot gate's notification before reusing it for VM stop.
+    fake.entered.notified().await;
+    *fake.hang.lock().unwrap() = "stop";
+    *fake.gate.0.lock().unwrap() = false;
+    struct ReleaseStop(Arc<Fake>);
+    impl Drop for ReleaseStop {
+        fn drop(&mut self) {
+            *self.0.gate.0.lock().unwrap() = true;
+            self.0.gate.1.notify_all();
+        }
+    }
+    let release_stop = ReleaseStop(fake.clone());
     write_frame(&mut guest, &terminal).await.unwrap();
+    // The incomplete upload half-closed the guest's input, so the host cannot
+    // send its terminal_stored acknowledgement. Hold the resulting VM stop
+    // after replay commits, before teardown marks the execution ended, and
+    // attach in that exact interval.
+    tokio::time::timeout(Duration::from_secs(5), fake.entered.notified())
+        .await
+        .expect("terminal did not reach VM stop");
+    {
+        let host = runtime.host.lock().unwrap();
+        assert_eq!(host.snapshot.leases[JOB].state, LeaseState::Ended);
+        assert!(!host.snapshot.per_job.executions[JOB].ended);
+    }
+    assert!(runtime
+        .job_stream(JOB)
+        .unwrap()
+        .with_store(|s| Ok(s.ended()))
+        .unwrap());
     let (mut client, task, _) = observer(&runtime).await;
     assert_eq!(
         next_type(&mut client, "terminal").await["outcome"]["type"],
@@ -77,6 +106,7 @@ async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_no
     );
     drop(client);
     task.await.unwrap().unwrap();
+    drop(release_stop);
     runtime.stop_job(JOB, false, true).unwrap();
     assert_eq!(
         fake.calls
@@ -87,6 +117,55 @@ async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_no
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn reconnect_without_a_stored_terminal_refuses_unready_or_ended_leases() {
+    for (runner_hello, delivered, ended) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        for purpose in [Purpose::Attach, Purpose::Run] {
+            let (runtime, fake, _) = fixture();
+            let c = claims(JOB);
+            let id = claim(&runtime, &c);
+            {
+                let mut host = runtime.host.lock().unwrap();
+                host.begin_job_boot(JOB).unwrap().unwrap();
+                if runner_hello {
+                    host.job_runner_hello(JOB).unwrap();
+                }
+                if delivered {
+                    host.delivered(id).unwrap();
+                }
+                if ended {
+                    host.job_boot_failed(JOB, unix_ms()).unwrap();
+                    assert_eq!(host.snapshot.leases[JOB].state, LeaseState::Ended);
+                }
+                assert!(!host.snapshot.per_job.executions[JOB].ended);
+                assert_eq!(
+                    host.snapshot.per_job.executions[JOB].replay_completion,
+                    None
+                );
+                host.close(id).unwrap();
+            }
+            let mut c = claims(JOB);
+            c.purpose = purpose;
+            let id = claim(&runtime, &c);
+            let (mut client, task) = start(runtime.clone(), c, id).await;
+            next_type(&mut client, "lease_ok").await;
+            assert_eq!(
+                next_type(&mut client, "lease_refused").await,
+                json!({"type":"lease_refused","reason":"auth"}),
+                "purpose={purpose:?}, runner_hello={runner_hello}, delivered={delivered}, ended={ended}"
+            );
+            task.await.unwrap().unwrap();
+            runtime.host.lock().unwrap().close(id).unwrap();
+            assert!(fake.calls.lock().unwrap().is_empty());
+            runtime.stop_job(JOB, true, false).unwrap();
+        }
+    }
 }
 
 fn bytes(text: &[u8]) -> Vec<u8> {
