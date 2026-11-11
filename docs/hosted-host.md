@@ -397,6 +397,21 @@ Before switching:
    by the switching script. These UID, TAP, memory and disk settings are checked
    before anything stops, using the target helper binary's read-only
    `check-config` command.
+
+   The optional `job_vms.fixed_path_repositories` map enables fixed checkout paths
+   and local build bases per account. For example:
+
+   ```json
+   {"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV": ["/home/project"]}
+   ```
+
+   Keys must be `acct:` or `org:` account subjects. Each list contains distinct
+   absolute repository roots without whitespace, or `["*"]` alone. A missing
+   map, missing account or empty list leaves fixed paths off. The map is part of
+   the root-owned helper configuration, not the host's start request or guest
+   source metadata. Job and Fill VMs receive the same policy for their own
+   account; Recovery VMs receive none. Malformed maps are refused at helper
+   startup and by `check-config`.
 4. [Drain the host](#drain-the-host-for-an-update), wait for `draining: true`, then
    run from the installed checkout:
 
@@ -532,11 +547,15 @@ replacing its per-account, per-repository source slot. Each slot is capped at
 1 GiB and counts in storage admission; an oversized export is refused, never
 truncated. A fresh Fill disk receives bundles, not a job-written filesystem.
 Only the helper's root-owned disk role enables the Fill guest operation; Job VMs
-refuse it, and Fill VMs refuse Run admission. Current per-job settings have no
-root-owned fixed-path repository allowlist, so these fills write the shared
-compiler cache only and their disks are deleted, not promoted to
-[build bases](compile-cache.md#fixed-paths-and-local-build-bases) that seed later jobs.
-Promotion requires fixed paths, which per-job hosts do not have yet.
+refuse it, and Fill VMs refuse Run admission. With an eligible root in
+`job_vms.fixed_path_repositories`, a fill can publish a
+[build base](compile-cache.md#fixed-paths-and-local-build-bases). Other fills warm
+the compiler cache and delete their disks. A new workspace disk may be seeded
+from a matching base; an existing disk is never replaced. For a new disk, the
+host waits for Run to identify the repository and selects a base for that exact
+root and the lease's account before boot. The helper creates a separate Job disk
+from the detached base. A missing base or failed seed falls back to normal
+workspace creation.
 
 ### Root remote-cache credential command
 

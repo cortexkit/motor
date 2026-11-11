@@ -243,12 +243,29 @@ implementation with fixtures; root-only tests need a dedicated operator host.
 The helper grants the Fill guest operation only from the root-owned disk role,
 never from a host-supplied start kind alone. Job VMs refuse the Fill operation,
 and Fill VMs refuse Run admission. Fill VMs import verified bundles on a fresh
-disk, never a filesystem written by a job VM. Current per-job fills are
-cache-only and delete their disks instead of promoting
-[build bases](compile-cache.md#fixed-paths-and-local-build-bases) that seed later jobs.
-Promotion requires fixed paths, which per-job hosts do not have yet. See
+disk, never a filesystem written by a job VM. Fills for fixed-path repositories
+can publish [build bases](compile-cache.md#fixed-paths-and-local-build-bases);
+other fills warm the compiler cache and delete their disks. See
 [per-job fill sources](hosted-host.md#per-job-fill-sources) for the byte and time
 limits and VM resource lifetime.
+
+The root-owned helper configuration accepts an optional
+`job_vms.fixed_path_repositories` map, for example:
+
+```json
+{"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV": ["/home/project"]}
+```
+
+Keys must be `acct:` or `org:` account subjects. Values are lists of distinct
+absolute repository roots without whitespace, or `["*"]` alone. A missing map,
+missing account or empty list leaves fixed paths off. Helper startup and the
+read-only `check-config` command refuse malformed maps. The helper uses the
+account in its root-owned workspace registry to supply the same fixed-path
+policy to Job and Fill VMs, never Recovery VMs. Neither a host start request nor
+guest source metadata can add roots. A new workspace disk may be seeded from a
+matching base; an existing disk is never replaced. The host selects a base using
+the lease's account and Run's exact repository root before boot. Missing bases
+and failed seed attempts fall back to normal workspace creation.
 
 The host JSON's required `per_job` settings have no compiled-in defaults:
 

@@ -68,6 +68,7 @@ mod tests {
             uid_count: 254,
             memory_max_bytes: 4096,
             workspace_disk_max_bytes: Some(512),
+            fixed_path_repositories: Default::default(),
         });
         check_settings(&config, &registries, &records).unwrap();
         config.job_vms.as_mut().unwrap().uid_count = 255;

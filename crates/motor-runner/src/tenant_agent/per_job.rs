@@ -136,8 +136,8 @@ pub(super) fn args() -> io::Result<RunnerArgs> {
     } else {
         args.words.push("--per-job".into());
     }
-    // A future root-owned repository allowlist must render the same fixed-path
-    // policy for Job and Fill boots. Guest-exported metadata cannot enable it.
+    // The helper supplies the same root-owned fixed-path policy for Job and Fill
+    // boots. Guest-exported source metadata cannot enable fixed paths.
     Ok(args)
 }
 

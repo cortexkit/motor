@@ -18,6 +18,12 @@ pub struct Reservation {
     pub publication: Option<Vec<motor_protocol::MirrorRef>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SeedPlan {
+    pub request: motor_vm_helper::job::Seed,
+    have: Vec<motor_protocol::MirrorRef>,
+}
+
 impl Host {
     pub(crate) fn fill_permits(&self) -> u32 {
         self.snapshot
@@ -188,6 +194,35 @@ impl Host {
         repository_key: &str,
         now_ms: u64,
     ) -> anyhow::Result<bool> {
+        let Some(plan) = self.job_seed_plan(job, repository_key)? else {
+            return Ok(false);
+        };
+        let control = self
+            .job_storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("storage unavailable"))?;
+        control.seed_workspace(&plan.request)?;
+        self.job_seeded(job, &plan, now_ms)?;
+        Ok(true)
+    }
+
+    /// A prior boot attempt may already have created or warmed this disk.
+    pub(crate) fn job_workspace_is_new(&self, job: &str) -> bool {
+        let execution = &self.snapshot.per_job.executions[job];
+        !self
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .any(|e| e.disk_id == execution.disk_id && e.boot_started && e.claims.jti != job)
+    }
+
+    /// Take this plan under the host lock, then call the helper after releasing it.
+    pub(crate) fn job_seed_plan(
+        &self,
+        job: &str,
+        repository_key: &str,
+    ) -> anyhow::Result<Option<SeedPlan>> {
         let execution = self
             .snapshot
             .per_job
@@ -199,13 +234,13 @@ impl Host {
         anyhow::ensure!(
             !disk.deleted
                 && !disk.quarantined
-                && disk.attached_job.is_none()
-                && !self
-                    .snapshot
-                    .per_job
-                    .executions
-                    .values()
-                    .any(|e| e.disk_id == disk_id && e.boot_started),
+                && disk
+                    .attached_job
+                    .as_deref()
+                    .is_none_or(|owner| owner == job)
+                && !execution.runner_hello
+                && !execution.ended
+                && self.job_workspace_is_new(job),
             "seeding requires a new, unattached workspace"
         );
         let Some((base_id, base)) = self
@@ -220,24 +255,50 @@ impl Host {
             })
             .max_by_key(|(_, b)| b.last_used_ms)
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        let control = self
-            .job_storage
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("storage unavailable"))?;
-        control.seed_workspace(&motor_vm_helper::job::Seed {
-            account: disk.sub.clone(),
-            repository_key: repository_key.into(),
-            base_id: base_id.clone(),
-            disk_id: disk_id.clone(),
-        })?;
-        let have = base.have.clone();
-        let base_id = base_id.clone();
+        Ok(Some(SeedPlan {
+            request: motor_vm_helper::job::Seed {
+                account: disk.sub.clone(),
+                repository_key: repository_key.into(),
+                base_id: base_id.clone(),
+                disk_id,
+            },
+            have: base.have.clone(),
+        }))
+    }
+
+    /// Advertise possession only after the helper has durably published the clone.
+    pub(crate) fn job_seeded(
+        &mut self,
+        job: &str,
+        plan: &SeedPlan,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        let execution = &self.snapshot.per_job.executions[job];
+        let disk = &self.snapshot.per_job.disks[&execution.disk_id];
+        anyhow::ensure!(
+            execution.disk_id == plan.request.disk_id
+                && disk.sub == plan.request.account
+                && !disk.deleted
+                && !disk.quarantined
+                && !execution.ended
+                && disk
+                    .attached_job
+                    .as_deref()
+                    .is_none_or(|owner| owner == job),
+            "workspace changed during seed"
+        );
         let mut next = self.snapshot.clone();
-        next.per_job.disks.get_mut(&disk_id).unwrap().have = have;
-        next.per_job.bases.get_mut(&base_id).unwrap().last_used_ms = now_ms;
+        next.per_job
+            .disks
+            .get_mut(&plan.request.disk_id)
+            .unwrap()
+            .have = plan.have.clone();
+        if let Some(base) = next.per_job.bases.get_mut(&plan.request.base_id) {
+            base.last_used_ms = now_ms;
+        }
         self.save(next)?;
-        Ok(true)
+        Ok(())
     }
 }

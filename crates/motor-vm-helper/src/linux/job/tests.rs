@@ -112,7 +112,7 @@ fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
         drive.1,
         json!({"drive_id":"remote_cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})
     );
-    let encoded: String = runner_args(&start(), 4 << 30, true)
+    let encoded: String = runner_args(&start(), 4 << 30, true, None)
         .unwrap()
         .as_bytes()
         .iter()
@@ -152,6 +152,7 @@ fn isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse(
     let mut jobs = machine(&base);
     jobs.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
+        fixed_path_repositories: Default::default(),
         uid_base: 600001,
         uid_count: 1,
         memory_max_bytes: 1048576,
@@ -381,7 +382,7 @@ fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
         .collect();
     assert!(!tenant_args.is_empty());
     let requests = boot_requests(&start(), Some(17), None, 4 << 30).unwrap();
-    let encoded: String = runner_args(&start(), 4 << 30, false)
+    let encoded: String = runner_args(&start(), 4 << 30, false, None)
         .unwrap()
         .as_bytes()
         .iter()
@@ -391,6 +392,183 @@ fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
         requests[1].1["boot_args"],
         format!("{tenant_args} motor.per_job=1 page_reporting.page_reporting_order=5 motor.runner_args={encoded}")
     );
+}
+
+fn fixed_path_settings(roots: serde_json::Value) -> JobVms {
+    serde_json::from_value(json!({
+        "uid_base": 500000, "uid_count": 128, "memory_max_bytes": 4096,
+        "fixed_path_repositories": roots
+    }))
+    .unwrap()
+}
+
+fn disk_registry(start: &Start) -> Workspace {
+    Workspace {
+        account: start.account.clone(),
+        workspace_disk_id: start.workspace_disk_id.clone(),
+        role: if start.kind == job::VmKind::Fill {
+            job::WorkspaceRole::Fill
+        } else {
+            job::WorkspaceRole::Job
+        },
+    }
+}
+
+fn decoded_runner_args(line: &str) -> Option<String> {
+    let hex = line
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("motor.runner_args="))?;
+    Some(
+        String::from_utf8(
+            hex.as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect(),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn disabled_fixed_paths_preserve_the_boot_line_bytes() {
+    let legacy = concat!(
+        "--backend host --tenant-vm --job-network veth --state-root /tenant/state ",
+        "--max-weight 7 --rustc-slots 7 ",
+        "--return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648 ",
+        "--sccache-size-gib 1 --free-space-floor-bytes 429496729 ",
+        "--free-space-eviction-bytes 1503238553 ",
+        "--workspace-root /Users --owned-workspace-root /Users ",
+        "--workspace-root /home --owned-workspace-root /home"
+    );
+    let encoded: String = legacy.bytes().map(|byte| format!("{byte:02x}")).collect();
+    let expected = format!(
+        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1 page_reporting.page_reporting_order=5 motor.runner_args={encoded}"
+    );
+    let mut shape = start();
+    shape.account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+    let registry = disk_registry(&shape);
+    let absent: JobVms = serde_json::from_value(json!({
+        "uid_base": 500000, "uid_count": 128, "memory_max_bytes": 4096
+    }))
+    .unwrap();
+    for settings in [
+        absent,
+        fixed_path_settings(json!({})),
+        fixed_path_settings(json!({shape.account.clone(): []})),
+    ] {
+        let requests =
+            recorded_boot_requests(&shape, Some(17), None, 4 << 30, &registry, &settings).unwrap();
+        assert_eq!(requests[1].1["boot_args"], expected);
+    }
+}
+
+#[test]
+fn fixed_path_policy_is_shared_by_job_and_fill_but_not_recovery_or_other_accounts() {
+    let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let other = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    for roots in [vec!["/repo/a", "/repo/b"], vec!["*"]] {
+        let settings = fixed_path_settings(json!({account: roots, other: ["/other"]}));
+        for kind in [job::VmKind::Job, job::VmKind::Fill, job::VmKind::Recovery] {
+            let mut shape = start();
+            shape.account = account.into();
+            shape.kind = kind;
+            let registry = disk_registry(&shape);
+            let requests =
+                recorded_boot_requests(&shape, Some(17), None, 4 << 30, &registry, &settings)
+                    .unwrap();
+            let line = requests[1].1["boot_args"].as_str().unwrap();
+            if kind == job::VmKind::Recovery {
+                assert_eq!(line, format!("{JOB_BOOT_ARGS} motor.recovery=1"));
+                continue;
+            }
+            let text = decoded_runner_args(line).unwrap();
+            let words: Vec<_> = text.split_whitespace().collect();
+            assert!(words
+                .windows(2)
+                .any(|pair| pair == ["--account-subject", account]));
+            for root in &roots {
+                assert!(words
+                    .windows(2)
+                    .any(|pair| pair == ["--fixed-path-repository", root]));
+            }
+            assert!(!text.contains("/other"));
+            assert!(!text.contains(other));
+            assert_eq!(line.ends_with(" motor.fill=1"), kind == job::VmKind::Fill);
+            let early = early_boot_command_line(
+                &shape,
+                4 << 30,
+                fixed_path_policy(&settings, &registry, kind),
+            )
+            .unwrap();
+            let actual = recorded_boot_requests(
+                &shape,
+                Some(17),
+                Some(&"0".repeat(32)),
+                4 << 30,
+                &registry,
+                &settings,
+            )
+            .unwrap();
+            assert_eq!(actual[1].1["boot_args"], early);
+
+            shape.account = other.into();
+            assert!(
+                recorded_boot_requests(&shape, None, None, 4 << 30, &registry, &settings).is_err()
+            );
+            let requests = recorded_boot_requests(
+                &shape,
+                None,
+                None,
+                4 << 30,
+                &disk_registry(&shape),
+                &settings,
+            )
+            .unwrap();
+            let text = decoded_runner_args(requests[1].1["boot_args"].as_str().unwrap()).unwrap();
+            assert!(text.contains("--fixed-path-repository /other"));
+            assert!(!text.contains(account));
+            for root in &roots {
+                assert!(!text.split_whitespace().any(|word| word == *root));
+            }
+        }
+        let mut unconfigured = start();
+        unconfigured.account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW".into();
+        let requests = recorded_boot_requests(
+            &unconfigured,
+            None,
+            None,
+            4 << 30,
+            &disk_registry(&unconfigured),
+            &settings,
+        )
+        .unwrap();
+        let text = decoded_runner_args(requests[1].1["boot_args"].as_str().unwrap()).unwrap();
+        assert!(!text.contains("--account-subject"));
+        assert!(!text.contains("--fixed-path-repository"));
+    }
+}
+
+#[test]
+fn configured_fixed_paths_are_included_in_the_early_boot_budget() {
+    let mut shape = start();
+    shape.account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+    for kind in [job::VmKind::Job, job::VmKind::Fill] {
+        shape.kind = kind;
+        let registry = disk_registry(&shape);
+        let settings =
+            fixed_path_settings(json!({shape.account.clone(): [format!("/{}", "x".repeat(1024))]}));
+        assert!(early_boot_command_line(
+            &shape,
+            4 << 30,
+            fixed_path_policy(&settings, &registry, kind)
+        )
+        .unwrap_err()
+        .0
+        .contains("command-line budget"));
+        assert!(recorded_boot_requests(&shape, None, None, 4 << 30, &registry, &settings).is_err());
+    }
 }
 
 #[test]
@@ -413,7 +591,7 @@ print(module.runner_args(dict(vcpu_ceiling=4, disk_quota_bytes=int(sys.argv[2]),
             );
             let mut shape = start();
             shape.vcpus = 4;
-            let actual = runner_args(&shape, disk, cache).unwrap();
+            let actual = runner_args(&shape, disk, cache, None).unwrap();
             assert_eq!(
                 actual.split_whitespace().collect::<Vec<_>>(),
                 std::str::from_utf8(&output.stdout)
@@ -478,10 +656,10 @@ fn early_boot_budget_uses_the_same_checked_line_with_credentials_reserved() {
         for bytes in [4 << 30, u64::MAX - 511] {
             let mut shape = start();
             shape.vcpus = vcpus;
-            let early = early_boot_command_line(&shape, bytes).unwrap();
+            let early = early_boot_command_line(&shape, bytes, None).unwrap();
             let actual = boot_requests(&shape, Some(17), Some(&nonce), bytes).unwrap();
             assert_eq!(actual[1].1["boot_args"], early);
-            assert!(boot_command_line(&shape, None, bytes).unwrap().len() < early.len());
+            assert!(boot_command_line(&shape, None, bytes, None).unwrap().len() < early.len());
             assert!(early.len() < JOB_BOOT_CMDLINE_MAX_BYTES);
         }
     }
@@ -568,6 +746,7 @@ fn attached_disk_is_refused_by_identity_and_inode_until_released() {
     let mut jobs = machine(&base);
     jobs.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
+        fixed_path_repositories: Default::default(),
         uid_base: 500000,
         uid_count: 1,
         memory_max_bytes: 1048576,
@@ -786,6 +965,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         jobs.groups = SLICE.into();
         jobs.settings = Some(JobVms {
             workspace_disk_max_bytes: Some(1073741824),
+            fixed_path_repositories: Default::default(),
             uid_base: 600000,
             uid_count: 254,
             memory_max_bytes: 268435456,
@@ -1035,6 +1215,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     restarted.remove_test_group = None;
     restarted.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
+        fixed_path_repositories: Default::default(),
         uid_base: 600000,
         uid_count: 254,
         memory_max_bytes: 268435456,

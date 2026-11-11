@@ -221,6 +221,7 @@ async fn dax_refusal(runtime: &Arc<Runtime>, fake: &Fake, job: &str) {
     let mut c = claims(job);
     c.workspace_key_hash = Some(motor_lease::base64url(&[job.as_bytes()[job.len() - 1]; 32]));
     let id = claim(runtime, &c);
+    existing_workspace(runtime, job);
     let (mut client, task) = start(runtime.clone(), c, id).await;
     next_type(&mut client, "lease_ok").await;
     write_frame(&mut client, &hello()).await.unwrap();
