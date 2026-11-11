@@ -5,16 +5,14 @@ use crate::replay::Store;
 use crate::state::jobs::storage::ReplayCompletion;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 /// Longest gap between host writes to a job VM's runner channel, well inside
 /// the runner's 60-second wire inactivity limit.
 pub(super) const GUEST_HEARTBEAT: Duration = Duration::from_secs(5);
 
-/// Longest gap between host writes to an attached caller once the job has
-/// started, inside ck-motor's 60-second read inactivity limit. The runner's
-/// own heartbeats are not replay records, so a job that prints nothing for a
-/// minute would otherwise look dead to the caller, which then reconnects and
-/// replays from its cursor over and over.
+/// Longest gap between host writes to an attached caller, inside ck-motor's
+/// 60-second read inactivity limit. Heartbeats are live-only, not replay records.
 pub(super) const CLIENT_HEARTBEAT: Duration = Duration::from_secs(10);
 
 struct Input {
@@ -27,6 +25,7 @@ pub(crate) struct Stream {
     host: Arc<Mutex<Host>>,
     store: Mutex<std::result::Result<Store, String>>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
+    runner_heartbeat: watch::Sender<Option<Vec<u8>>>,
     running: AtomicBool,
     upload_detached: AtomicBool,
     terminal_delivered: AtomicBool,
@@ -178,6 +177,7 @@ impl Runtime {
             host: self.host.clone(),
             store: Mutex::new(store),
             input: Mutex::new(None),
+            runner_heartbeat: watch::channel(None).0,
             running: AtomicBool::new(false),
             upload_detached: AtomicBool::new(false),
             terminal_delivered: AtomicBool::new(false),
@@ -401,6 +401,10 @@ async fn collect(
                     continue;
                 }
                 Some("hello") => continue,
+                Some("heartbeat") => {
+                    store.runner_heartbeat.send_replace(Some(frame.bytes));
+                    continue;
+                }
                 _ => {}
             }
             let terminal = frame.value["type"] == "terminal";
@@ -670,6 +674,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     mut attached: bool,
 ) -> Result<()> {
     let stream = runtime.job_stream(&claims.jti)?;
+    // Subscribing starts after the latest heartbeat: only a new runner frame
+    // can describe the queue state of this caller's live attachment.
+    let mut heartbeats = stream.runner_heartbeat.subscribe();
     stream.expire_chunks(unix_ms())?;
     let _owner = (!hello).then(|| UploadOwner(stream.clone()));
     let _ = publish_settlement(runtime, &claims.jti, &stream);
@@ -692,9 +699,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let (mut read, mut write) = tokio::io::split(client);
     let mut last_write = tokio::time::Instant::now();
-    // Heartbeats carry no queue time, which tells ck-motor to stop timing a
-    // queue; send them only once the runner has started the command. Every
-    // sequenced record (started, output, returned files) comes after that.
+    let mut last_runner_heartbeat = None;
+    // Bare host heartbeats tell ck-motor to stop timing a queue; send those
+    // only once the runner has started the command. Every sequenced record
+    // (started, output, returned files) comes after that.
     let mut started = false;
     loop {
         let s = stream.clone();
@@ -771,6 +779,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         minimum = request.value["from_seq"].as_u64().context("attach cursor")?;
                         position = 0;
                         attached = true;
+                        heartbeats.mark_unchanged();
+                        last_runner_heartbeat = None;
                     }
                     Some("cancel" | "withdraw" | "job_status") => {
                         let ended = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.terminal.clone());
@@ -798,11 +808,26 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     _ => anyhow::bail!("operation_refused"),
                 }
             }
+            _ = heartbeats.changed(), if attached => {
+                let bytes = heartbeats.borrow_and_update().clone();
+                if let Some(bytes) = bytes {
+                    write.write_all(&bytes).await.map_err(anyhow::Error::from).map_err(client_io)?;
+                    last_runner_heartbeat = Some(bytes);
+                    last_write = tokio::time::Instant::now();
+                }
+            }
             _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                if attached && started && last_write.elapsed() >= CLIENT_HEARTBEAT {
-                    write_frame(&mut write, &json!({"type":"heartbeat"}))
-                        .await
-                        .map_err(client_io)?;
+                if attached && last_write.elapsed() >= CLIENT_HEARTBEAT {
+                    if started {
+                        write_frame(&mut write, &json!({"type":"heartbeat"})).await.map_err(client_io)?;
+                    } else if let Some(bytes) = &last_runner_heartbeat {
+                        write.write_all(bytes).await.map_err(anyhow::Error::from).map_err(client_io)?;
+                    } else {
+                        // No live runner queue sample has reached this attachment.
+                        // Keep the caller's capacity-queue budget paused rather
+                        // than clearing its deadline with a bare heartbeat.
+                        write_frame(&mut write, &json!({"type":"heartbeat","queue_wait_ms":0})).await.map_err(client_io)?;
+                    }
                     last_write = tokio::time::Instant::now();
                 }
             }
