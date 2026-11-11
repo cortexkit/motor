@@ -298,6 +298,56 @@ fn a_forwarder_whose_socket_is_gone_closes_the_tools_connection() {
 }
 
 #[test]
+fn a_write_enabled_job_gets_one_create_socket_and_a_read_only_ccache_socket() {
+    let scratch = cortexkit_test_support::ScratchDir::new("cache-transport");
+    let cache = FakeCache::new();
+    let directory = scratch.join("gateway");
+    let port = free_port();
+    let ccache_port = free_port();
+    let sockets = cache
+        .transport(&[(Tool::Sccache, port), (Tool::Ccache, ccache_port)])
+        .open(&directory, Role::JobWrite("job-a"))
+        .unwrap();
+    assert_eq!(
+        sockets.paths(),
+        [
+            directory.join("sccache.sock"),
+            directory.join("ccache.sock")
+        ]
+    );
+    assert_eq!(sockets.listeners().len(), 2);
+    assert_eq!(
+        sockets.listeners()[0].binding().endpoint(),
+        Endpoint::JobCreate
+    );
+    assert_eq!(sockets.listeners()[1].binding().endpoint(), Endpoint::Read);
+    assert!(sockets
+        .listeners()
+        .iter()
+        .all(|listener| listener.binding().ledger().is_none()));
+    let binary = forwarder_binary(scratch.path());
+    let (status, _group) = start_forwarder(&binary, &directory, port, "sccache.sock");
+    assert!(status.success());
+    let (status, _ccache_group) = start_forwarder(&binary, &directory, ccache_port, "ccache.sock");
+    assert!(status.success());
+    assert_eq!(http(port, "PUT", &s3_path("k"), b"cached").unwrap().0, 200);
+    assert_eq!(
+        http(port, "GET", &s3_path("k"), b"").unwrap(),
+        (200, b"cached".to_vec())
+    );
+    assert_eq!(http(ccache_port, "PUT", "/k", b"v").unwrap().0, 403);
+    assert_eq!(
+        cache
+            .store
+            .seen()
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn a_forwarder_that_cannot_bind_its_port_exits_nonzero() {
     let scratch = cortexkit_test_support::ScratchDir::new("cache-transport");
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

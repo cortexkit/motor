@@ -118,21 +118,29 @@ impl Adapter {
     }
 }
 
-/// The two endpoints. Each has its own breaker, shared by every socket of
-/// that endpoint on the host.
+/// Socket permissions. Job-create reads use the read endpoint's policy;
+/// its PUTs have a breaker separate from trusted fill writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Endpoint {
     Read,
     Write,
+    JobCreate,
 }
 
 impl Endpoint {
+    fn for_method(self, method: Method) -> Self {
+        match (self, method) {
+            (Self::JobCreate, Method::Get | Method::Head) => Self::Read,
+            _ => self,
+        }
+    }
+
     /// The answer to a failure before response headers: a miss for readers,
     /// an error for fills.
     fn failure_status(self) -> u16 {
         match self {
             Self::Read => 404,
-            Self::Write => 503,
+            Self::Write | Self::JobCreate => 503,
         }
     }
 }
@@ -224,7 +232,7 @@ pub(crate) struct Binding {
     /// signed for any other tenant's prefix, even after the active
     /// generation moves to another tenant.
     tenant: String,
-    /// Shared by all of a job's read sockets.
+    /// Shared by all of a job's sockets, read-only or job-create.
     owner: Arc<Owner>,
     ledger: Option<Arc<WriteLedger>>,
 }
@@ -424,6 +432,7 @@ struct Shared {
     pool: Pool,
     read_breaker: Arc<Breaker>,
     write_breaker: Arc<Breaker>,
+    job_write_breaker: Arc<Breaker>,
     total_reads: Arc<AtomicUsize>,
     total_connections: Arc<AtomicUsize>,
     jobs: Mutex<HashMap<String, Weak<Owner>>>,
@@ -529,7 +538,7 @@ fn parse_request(head: &RequestHead, endpoint: Endpoint) -> Option<Request> {
     let method = match (head.method.as_str(), endpoint) {
         ("GET", _) => Method::Get,
         ("HEAD", _) => Method::Head,
-        ("PUT", Endpoint::Write) => Method::Put,
+        ("PUT", Endpoint::Write | Endpoint::JobCreate) => Method::Put,
         _ => return None,
     };
     // Any query string is refused, which also refuses ListObjectsV2.
@@ -635,6 +644,7 @@ struct Exchange<'a> {
     credential: &'a Credential,
     canonical_uri: String,
     storage_class: Option<&'a str>,
+    create_only: bool,
     deadline: Instant,
     /// When set, every read from or write to the tool must make progress
     /// within this long, or the request ends as if the tool went away.
@@ -682,6 +692,7 @@ impl Gateway {
                 pool: Pool::default(),
                 read_breaker: Breaker::new(WhileProbing::Answer),
                 write_breaker: Breaker::new(WhileProbing::Hold),
+                job_write_breaker: Breaker::new(WhileProbing::Answer),
                 total_reads: Arc::new(AtomicUsize::new(0)),
                 total_connections: Arc::new(AtomicUsize::new(0)),
                 jobs: Mutex::new(HashMap::new()),
@@ -692,13 +703,29 @@ impl Gateway {
     }
 
     /// A read socket's binding for one job and the cache tenant it was
-    /// created for. Every read binding of a job shares its admission caps.
+    /// created for. Every binding of a job shares its admission caps.
     pub(crate) fn read_binding(
         &self,
         job: &str,
         tenant: &str,
         tool: Tool,
         adapter: Adapter,
+    ) -> Arc<Binding> {
+        self.job_binding(job, tenant, tool, adapter, Endpoint::Read)
+    }
+
+    /// An sccache socket that can create objects but never overwrite them.
+    pub(crate) fn job_create_binding(&self, job: &str, tenant: &str) -> Arc<Binding> {
+        self.job_binding(job, tenant, Tool::Sccache, Adapter::S3, Endpoint::JobCreate)
+    }
+
+    fn job_binding(
+        &self,
+        job: &str,
+        tenant: &str,
+        tool: Tool,
+        adapter: Adapter,
+        endpoint: Endpoint,
     ) -> Arc<Binding> {
         let mut jobs = self.shared.jobs.lock().unwrap();
         jobs.retain(|_, owner| owner.strong_count() > 0);
@@ -711,7 +738,7 @@ impl Gateway {
             }
         };
         Arc::new(Binding {
-            endpoint: Endpoint::Read,
+            endpoint,
             tool,
             adapter,
             tenant: tenant.to_string(),
@@ -758,7 +785,7 @@ impl Gateway {
             limits.max_job_connections,
             true,
         ) else {
-            self.refused(binding, "connection cap");
+            self.refused(binding, binding.endpoint, "connection cap");
             return None;
         };
         let gateway = self.clone();
@@ -824,7 +851,7 @@ impl Gateway {
                     return;
                 }
                 Err(HeadError::Malformed) => {
-                    self.refused(&binding, "malformed request head");
+                    self.refused(&binding, binding.endpoint, "malformed request head");
                     let by = Instant::now() + limits.first_byte_timeout;
                     let _ = client.respond(403, &[], 0, true, by).await;
                     client.shutdown().await;
@@ -863,14 +890,14 @@ impl Gateway {
     /// Counts a refusal. The log line carries only the endpoint, the tool
     /// and a fixed reason, never anything the job sent (paths and headers
     /// can carry anything a job chooses to write into a log).
-    fn refused(&self, binding: &Binding, reason: &'static str) {
+    fn refused(&self, binding: &Binding, endpoint: Endpoint, reason: &'static str) {
         let counters = self.counters(binding.tool);
-        bump(match binding.endpoint {
+        bump(match endpoint {
             Endpoint::Read => &counters.read_refusals,
-            Endpoint::Write => &counters.write_refusals,
+            Endpoint::Write | Endpoint::JobCreate => &counters.write_refusals,
         });
         tracing::debug!(
-            endpoint = ?binding.endpoint,
+            endpoint = ?endpoint,
             tool = binding.tool.id(),
             reason,
             "remote cache request refused"
@@ -924,7 +951,6 @@ impl Gateway {
         let limits = &self.shared.limits;
         let deadline = received + limits.deadline;
         let endpoint = binding.endpoint;
-        let failure = endpoint.failure_status();
         let body_free = head.body_free();
         let mut put = (head.method == "PUT")
             .then(|| binding.ledger.clone())
@@ -936,11 +962,13 @@ impl Gateway {
                 stored: false,
             });
         let Some(request) = parse_request(&head, endpoint) else {
-            self.refused(binding, "method, query or encoding");
+            self.refused(binding, endpoint, "method, query or encoding");
             return self
                 .answer(client, 403, body_free, head.close_requested(), deadline)
                 .await;
         };
+        let endpoint = endpoint.for_method(request.method);
+        let failure = endpoint.failure_status();
         let close_requested = request.close_requested;
         let Some(generation) = self.shared.generations.admit() else {
             return self
@@ -957,20 +985,20 @@ impl Gateway {
                 .await;
         }
         let Some(bare) = binding.adapter.bare_key(&request.path, &generation.bucket) else {
-            self.refused(binding, "path");
+            self.refused(binding, endpoint, "path");
             return self
                 .answer(client, 403, body_free, close_requested, deadline)
                 .await;
         };
         let key = format!("{}{}/{}", generation.prefix, binding.tool.id(), bare);
         if key.len() > limits.max_key_bytes {
-            self.refused(binding, "key length");
+            self.refused(binding, endpoint, "key length");
             return self
                 .answer(client, 403, body_free, close_requested, deadline)
                 .await;
         }
         if request.content_length > limits.max_object_bytes {
-            self.refused(binding, "object size");
+            self.refused(binding, endpoint, "object size");
             return self
                 .answer(client, failure, body_free, close_requested, deadline)
                 .await;
@@ -979,20 +1007,19 @@ impl Gateway {
             Endpoint::Read => match self.admit_read(binding) {
                 Some(slot) => Some(slot),
                 None => {
-                    self.refused(binding, "request cap");
+                    self.refused(binding, endpoint, "request cap");
                     return self
                         .answer(client, failure, body_free, close_requested, deadline)
                         .await;
                 }
             },
-            Endpoint::Write => None,
+            Endpoint::Write | Endpoint::JobCreate => None,
         };
         let credential = match endpoint {
             Endpoint::Read => &generation.read_key,
-            Endpoint::Write => match &generation.write_key {
+            Endpoint::Write | Endpoint::JobCreate => match &generation.write_key {
                 Some(key) => key,
-                // Only the build server holds a write key; without one the
-                // write endpoint cannot sign anything.
+                // Without a write key neither fill nor job PUTs can be signed.
                 None => {
                     return self
                         .answer(client, failure, body_free, close_requested, deadline)
@@ -1008,6 +1035,7 @@ impl Gateway {
         let breaker = match endpoint {
             Endpoint::Read => &self.shared.read_breaker,
             Endpoint::Write => &self.shared.write_breaker,
+            Endpoint::JobCreate => &self.shared.job_write_breaker,
         };
         let mut ticket = match breaker.admit(deadline).await {
             Admission::Admitted(ticket) => ticket,
@@ -1038,6 +1066,7 @@ impl Gateway {
             ),
             storage_class: (request.method == Method::Put)
                 .then_some(generation.storage_class.as_str()),
+            create_only: endpoint == Endpoint::JobCreate,
             deadline,
             // A tool holding the breaker's probe must not hold it by
             // stalling: other jobs' requests wait on, or are refused
@@ -1069,6 +1098,11 @@ impl Gateway {
         }
         if let Some(class) = exchange.storage_class {
             headers.push(("x-amz-storage-class".to_string(), class.to_string()));
+        }
+        // Build the condition here, never from a tool-supplied header, so every
+        // job PUT attempt is signed as a create rather than an overwrite.
+        if exchange.create_only {
+            headers.push(("if-none-match".to_string(), "*".to_string()));
         }
         let method = exchange.request.method.as_str();
         let authorization = sigv4::authorization(
@@ -1230,7 +1264,7 @@ impl Gateway {
         let limits = &self.shared.limits;
         let request = exchange.request;
         let deadline = exchange.deadline;
-        let endpoint = binding.endpoint;
+        let endpoint = binding.endpoint.for_method(request.method);
         let failure = endpoint.failure_status();
         let counters = self.counters(binding.tool);
         let mut body_started = false;

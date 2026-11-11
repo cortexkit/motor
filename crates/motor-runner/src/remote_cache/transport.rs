@@ -54,6 +54,8 @@ pub(crate) struct Transport {
 pub(crate) enum Role<'a> {
     /// A job's read sockets; the job id ties them to one admission owner.
     Job(&'a str),
+    /// A job's create-only sccache socket; ccache remains read-only.
+    JobWrite(&'a str),
     /// A trusted fill's write sockets.
     Fill,
 }
@@ -144,9 +146,13 @@ impl Transport {
         };
         for &(tool, port) in &self.tools {
             let binding = match role {
-                Role::Job(job) => self
-                    .gateway
-                    .read_binding(job, &self.tenant, tool, adapter(tool)),
+                Role::JobWrite(job) if tool == Tool::Sccache => {
+                    self.gateway.job_create_binding(job, &self.tenant)
+                }
+                Role::Job(job) | Role::JobWrite(job) => {
+                    self.gateway
+                        .read_binding(job, &self.tenant, tool, adapter(tool))
+                }
                 Role::Fill => self
                     .gateway
                     .write_binding(&self.tenant, tool, adapter(tool)),

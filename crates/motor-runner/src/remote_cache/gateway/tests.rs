@@ -19,6 +19,9 @@ const MIB: usize = 1 << 20;
 // The fake store
 // ---------------------------------------------------------------------------
 
+#[path = "job_create_tests.rs"]
+mod job_create;
+
 /// How the fake store behaves; tests change it between requests.
 #[derive(Clone, Default)]
 struct Knobs {
