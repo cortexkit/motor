@@ -10,7 +10,7 @@ fn event(job: &str, seq: u64, kind: TenantEventKind) -> TenantEvent {
 fn running(runtime: &Arc<Runtime>, job: &str, delivered: bool, started: bool) {
     let id = claim(runtime, &claims(job));
     let mut host = runtime.host.lock().unwrap();
-    host.begin_job_boot_at(job, 100).unwrap().unwrap();
+    boot_at(&mut host, job, 100);
     host.job_runner_hello(job).unwrap();
     if delivered {
         host.delivered(id).unwrap();
@@ -449,7 +449,7 @@ fn helper_restart_re_adopts_running_jobs_and_keeps_their_outcomes_separate() {
     let id = claim(&runtime, &second);
     {
         let mut host = runtime.host.lock().unwrap();
-        host.begin_job_boot_at(JOB2, 100).unwrap().unwrap();
+        boot_at(&mut host, JOB2, 100);
         host.job_runner_hello(JOB2).unwrap();
         host.delivered(id).unwrap();
         host.event_observed(JOB2, &event(JOB2, 1, TenantEventKind::Admitted), 100, true)

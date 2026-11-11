@@ -142,6 +142,13 @@ fn queued_workspaces_reserve_disk_slots_before_boot() {
         .disks
         .values()
         .all(|disk| disk.attached_job.is_none()));
+    assert_eq!(h.job_free_mem_mib(AT), 99_950);
+    let heartbeat = h.heartbeat(AT, h.job_free_mem_mib(AT), true);
+    assert_eq!(heartbeat.free_mem_mib, 99_950);
+    assert_eq!(heartbeat.queued, 64);
+    assert_eq!(heartbeat.running.len(), 64);
+    assert_eq!(heartbeat.warm.len(), 64);
+    assert!(heartbeat.warm.iter().all(|disk| disk.busy));
     full(h.claim(workspace_job(64), AT));
     for i in 0..64 {
         h.begin_job_boot(&workspace_job(i).jti).unwrap().unwrap();
@@ -298,49 +305,133 @@ fn attach_never_creates_disk_or_execution_live_ended_or_after_restart() {
 }
 
 #[test]
-fn claims_debit_fixed_sample_durably_before_next_claim() {
+fn disk_queued_job_leaves_memory_for_another_checkout() {
+    let mut h = memory_host(290);
+    h.claim(job(JOB), AT).unwrap();
+    h.begin_job_boot(JOB).unwrap().unwrap();
+    assert_eq!(h.job_free_mem_mib(AT), 120);
+
+    assert_eq!(h.claim(job(JOB2), AT).unwrap().1, Admission::Ready);
+    assert!(h.begin_job_boot(JOB2).unwrap().is_none());
+    assert_eq!(h.job_free_mem_mib(AT), 120);
+    let heartbeat = h.heartbeat(AT, h.job_free_mem_mib(AT), true);
+    assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (2, 120));
+    assert!(heartbeat.running.iter().any(|job| job.job_id == JOB2));
+    assert_eq!(heartbeat.warm.len(), 1);
+    assert!(heartbeat.warm[0].busy);
+
+    let mut other = job(JOB3);
+    other.workspace_key_hash = Some(motor_lease::base64url(&[6; 32]));
+    assert_eq!(h.claim(other, AT).unwrap().1, Admission::Ready);
+    h.begin_job_boot(JOB3).unwrap().unwrap();
+    assert_eq!(h.job_free_mem_mib(AT), 0);
+}
+
+#[test]
+fn disk_queued_job_waits_for_memory_before_booting() {
+    let mut h = memory_host(1_000);
+    h.claim(job(JOB), AT).unwrap();
+    h.begin_job_boot(JOB).unwrap().unwrap();
+    h.job_runner_hello(JOB).unwrap();
+    sample(&mut h, 50);
+    // Disk contention admits the job even with no memory available now.
+    h.claim(job(JOB2), AT).unwrap();
+    assert!(h.begin_job_boot(JOB2).unwrap().is_none());
+    h.job_stopped(JOB, false).unwrap();
+
+    // Stated memory fits, but the boot reserve must fit too.
+    sample(&mut h, 169);
+    let waiting = h.snapshot.clone();
+    assert!(h.begin_job_boot_at(JOB2, AT).unwrap().is_none());
+    assert_eq!(h.snapshot, waiting);
+    assert_eq!(h.job_free_mem_mib(AT), 119);
+
+    sample(&mut h, 170);
+    let stale = AT + motor_host::state::MEMORY_FRESH_MS + 1;
+    assert!(h.begin_job_boot_at(JOB2, stale).unwrap().is_none());
+    assert_eq!(h.snapshot, waiting);
+    let launch = h.begin_job_boot_at(JOB2, AT).unwrap().unwrap();
+    assert!(launch.boot_started);
+    assert_eq!(launch.boot_started_at_ms, Some(AT));
+    assert_eq!(h.job_free_mem_mib(AT), 0);
+    h.job_runner_hello(JOB2).unwrap();
+    assert_eq!(h.job_free_mem_mib(AT), 120);
+}
+
+#[test]
+fn restart_keeps_disk_queued_memory_available() {
+    let dir = scratch();
+    let mut h = durable_host(dir.path(), 290);
+    h.claim(job(JOB), AT).unwrap();
+    h.begin_job_boot(JOB).unwrap().unwrap();
+    h.claim(job(JOB2), AT).unwrap();
+    let saved = h.snapshot.clone();
+    drop(h);
+
+    let mut h = durable_host(dir.path(), 290);
+    assert_eq!(h.snapshot, saved);
+    assert_eq!(h.job_free_mem_mib(AT), 120);
+    assert!(!h.snapshot.per_job.executions[JOB2].boot_started);
+    assert_eq!(h.claim(job(JOB2), AT).unwrap().1, Admission::Ready);
+    assert!(h.begin_job_boot(JOB2).unwrap().is_none());
+    assert_eq!(h.job_free_mem_mib(AT), 120);
+    h.job_stopped(JOB, false).unwrap();
+    h.begin_job_boot(JOB2).unwrap().unwrap();
+    assert_eq!(h.job_free_mem_mib(AT), 120);
+}
+
+#[test]
+fn boot_debits_fixed_sample_durably_before_next_launch() {
     let dir = scratch();
     let mut h = durable_host(dir.path(), 289);
     let mut burst = job(JOB);
     burst.mem_burst_mib = Some(50);
     h.claim(burst, AT).unwrap();
+    assert_eq!(h.free_mem_mib(AT), 239);
+    h.begin_job_boot(JOB).unwrap().unwrap();
     // 289 available - 50 host - (100 stated + 20 boot) = 119, not 169 or 69.
     assert_eq!(h.free_mem_mib(AT), 119);
     assert_eq!(h.snapshot.per_job.executions[JOB].memory_debit_mib, 120);
-    full(h.claim(job(JOB2), AT));
-    assert_eq!(h.snapshot.per_job.executions.len(), 1);
+    h.claim(job(JOB2), AT).unwrap();
+    let mut other = job(JOB3);
+    other.workspace_key_hash = Some(motor_lease::base64url(&[6; 32]));
+    full(h.claim(other.clone(), AT));
+    assert_eq!(h.snapshot.per_job.executions.len(), 2);
     let saved = h.snapshot.clone();
     drop(h);
     let mut h = durable_host(dir.path(), 289);
     assert_eq!(h.snapshot, saved);
     assert_eq!(h.free_mem_mib(AT), 119);
-    full(h.claim(job(JOB2), AT));
+    full(h.claim(other.clone(), AT));
     sample(&mut h, 290);
-    h.claim(job(JOB2), AT).unwrap();
+    h.claim(other, AT).unwrap();
+    assert_eq!(h.free_mem_mib(AT), 120);
+    h.begin_job_boot(JOB3).unwrap().unwrap();
     assert_eq!(h.free_mem_mib(AT), 0);
-    assert_eq!(h.snapshot.per_job.disks.len(), 1);
+    assert_eq!(h.snapshot.per_job.disks.len(), 2);
     assert_eq!(
-        h.snapshot.per_job.disks.values().next().unwrap().queue,
+        h.snapshot.per_job.disks[&h.snapshot.per_job.executions[JOB].disk_id].queue,
         [JOB, JOB2]
     );
 }
 
 #[test]
-fn queued_and_booting_debits_end_once_on_hello_not_on_boot() {
+fn only_booting_debits_end_once_on_hello() {
     let mut h = memory_host(1_000);
     h.claim(job(JOB), AT).unwrap();
     h.claim(job(JOB2), AT).unwrap();
-    assert_eq!(h.free_mem_mib(AT), 710);
+    assert_eq!(h.free_mem_mib(AT), 950);
     assert!(h.job_runner_hello(JOB2).is_err());
     h.begin_job_boot(JOB).unwrap().unwrap();
-    assert_eq!(h.free_mem_mib(AT), 710);
-    h.job_runner_hello(JOB).unwrap();
     assert_eq!(h.free_mem_mib(AT), 830);
     h.job_runner_hello(JOB).unwrap();
-    assert_eq!(h.free_mem_mib(AT), 830);
+    assert_eq!(h.free_mem_mib(AT), 950);
+    h.job_runner_hello(JOB).unwrap();
+    assert_eq!(h.free_mem_mib(AT), 950);
     assert!(h.begin_job_boot(JOB2).unwrap().is_none());
     h.job_stopped(JOB, false).unwrap();
     h.begin_job_boot(JOB2).unwrap().unwrap();
+    assert_eq!(h.free_mem_mib(AT), 830);
     h.job_runner_hello(JOB2).unwrap();
     assert_eq!(h.free_mem_mib(AT), 950);
 }
