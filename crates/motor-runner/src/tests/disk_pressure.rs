@@ -562,6 +562,46 @@ fn disk_eviction_failure_is_backed_off_across_admissions() {
 }
 
 #[test]
+fn job_vm_admission_clears_its_own_build_outputs_before_refusing_for_disk() {
+    let f = Fixture::new();
+    let (request, _) = f.run("true");
+    let incoming = PathBuf::from(&request.workspace_key);
+    let outputs = incoming.join("target");
+    // The checkout's own previous build is what keeps the disk under the floor.
+    let filled = outputs.clone();
+    let mut c = config(&f, move |_| Ok(if filled.exists() { 1 } else { 200 }));
+    c.manual_tick = true;
+    c.tenant_vm = true;
+    c.per_job = true;
+    let runner = Runner::open(c).unwrap();
+    // Used 20 minutes ago: well inside the recency protection.
+    workspace(&runner, &incoming, runner.now() - 20 * 60 * 1000);
+    fs::create_dir_all(outputs.join("debug/incremental/unit-1")).unwrap();
+    fs::write(outputs.join("debug/incremental/unit-1/data"), [3; 4096]).unwrap();
+    fs::write(incoming.join("source.rs"), "fn main() {}").unwrap();
+    let admission = match runner.accept(request.clone()).unwrap() {
+        Admission::Accepted(_) => "accepted".to_owned(),
+        Admission::DiskFull(full) => full.diagnostic(),
+        Admission::Refused(reason) => format!("refused: {reason:?}"),
+        Admission::Duplicate => "duplicate".to_owned(),
+    };
+    assert_eq!(
+        admission, "accepted",
+        "a job VM refused while its own idle build outputs filled the disk"
+    );
+    assert!(!outputs.exists(), "the build outputs were not cleared");
+    assert_eq!(
+        fs::read_to_string(incoming.join("source.rs")).unwrap(),
+        "fn main() {}",
+        "the checkout itself must stay"
+    );
+    let inner = runner.core.inner.lock().unwrap();
+    assert!(inner.catalog.workspaces.contains_key(text(&incoming)));
+    assert!(inner.dropping.is_empty());
+    assert_eq!(inner.jobs[&request.job_id].state, JobState::AwaitingBundles);
+}
+
+#[test]
 fn disk_admission_evicts_then_admits_and_reprobes() {
     let f = Fixture::new();
     let idle = f.scratch.join("remote/worktrees/idle");

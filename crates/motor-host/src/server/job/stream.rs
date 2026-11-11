@@ -386,8 +386,14 @@ async fn collect(
         }
     };
     let receive = async {
+        // Whether this connection's runner has answered the Run with
+        // `accepted`. A fresh connection is the only one that ever carries
+        // this execution's Run, so a refusal read before it is the runner's
+        // admission answer and proves the command never started.
+        let mut runner_accepted = false;
         loop {
-            let frame = raw(&mut read).await?;
+            let mut frame = raw(&mut read).await?;
+            let mut refused_before_start = false;
             match frame.value["type"].as_str() {
                 Some("have_reply") if have_replies > 0 => {
                     have_replies -= 1;
@@ -398,6 +404,7 @@ async fn collect(
                     continue;
                 }
                 Some("accepted") => {
+                    runner_accepted = true;
                     let limit = runtime
                         .host
                         .lock()
@@ -410,6 +417,26 @@ async fn collect(
                 Some("heartbeat") => {
                     store.runner_heartbeat.send_replace(Some(frame.bytes));
                     continue;
+                }
+                // The host already told the caller its Run was accepted and
+                // queued while the VM booted. A runner that then refuses the
+                // Run at admission answers with a bare `refusal`, which replay
+                // does not store, and keeps its channel open. Without a stored
+                // terminal the caller would wait on queued heartbeats forever.
+                Some("refusal") if !resume && !runner_accepted => {
+                    if let Some(terminal) = admission_refusal(runtime, &claims.jti, &frame.value) {
+                        tracing::warn!(
+                            jti = claims.jti,
+                            reason = terminal["outcome"]["reason"].as_str(),
+                            "job_runner_refused_before_start"
+                        );
+                        let data = serde_json::to_vec(&terminal)?;
+                        frame = Raw {
+                            bytes: [(data.len() as u32).to_be_bytes().as_slice(), &data].concat(),
+                            value: terminal,
+                        };
+                        refused_before_start = true;
+                    }
                 }
                 _ => {}
             }
@@ -457,6 +484,17 @@ async fn collect(
                     let _ = reply.send(response.bytes);
                 }
             }
+            if refused_before_start {
+                // The runner refused before admission, so there is nothing to
+                // export, and it will not end its own VM: that needs a stored
+                // terminal of its own to acknowledge. Stop the VM here, the
+                // same way as a guest that never acknowledges its terminal.
+                release_export_tip(runtime, &claims.jti);
+                let runtime = runtime.clone();
+                let job = claims.jti.clone();
+                tokio::task::spawn_blocking(move || runtime.stop_job(&job, false, true)).await??;
+                return Ok::<(), anyhow::Error>(());
+            }
             if terminal {
                 let host = runtime.host.clone();
                 let control = runtime.control.clone();
@@ -499,14 +537,7 @@ async fn collect(
                         true
                     }
                 };
-                {
-                    let mut host = runtime.host.lock().expect("host lock");
-                    let mut next = host.snapshot.clone();
-                    next.per_job.export_tips.remove(&claims.jti);
-                    if let Err(error) = host.save(next) {
-                        tracing::warn!(%error, "fill_export_release_failed");
-                    }
-                }
+                release_export_tip(runtime, &claims.jti);
                 if !timed_out {
                     // Once acknowledged, the guest drains its reports, unmounts
                     // its disks and ends its own VM: a clean stop, so the disk
@@ -574,6 +605,55 @@ fn host_terminal_delivery(mut terminal: Value, last_seq: Option<u64>) -> Value {
         }
     }
     terminal
+}
+
+/// The stored terminal for a runner's admission `refusal` of this job's Run:
+/// `refused_before_start` with the runner's reason and detail and `ran: none`,
+/// the shape a runner gives its own no-start terminals. `None` when the frame
+/// is not a well-formed refusal of this job, or the host has recorded a start,
+/// so those keep their existing handling.
+fn admission_refusal(runtime: &Runtime, job: &str, frame: &Value) -> Option<Value> {
+    let motor_protocol::Frame::Refusal(refusal) =
+        serde_json::from_value::<motor_protocol::Frame>(frame.clone()).ok()?
+    else {
+        return None;
+    };
+    if refusal.job_id.map(|id| id.to_string()).as_deref() != Some(job) {
+        return None;
+    }
+    let started = runtime
+        .host
+        .lock()
+        .expect("host lock")
+        .snapshot
+        .leases
+        .get(job)
+        .is_none_or(|lease| lease.started_at_ms.is_some());
+    if started {
+        return None;
+    }
+    let reason = serde_json::to_value(refusal.reason).ok()?;
+    let mut terminal = super::refusal(job, reason.as_str()?, "");
+    match refusal.detail {
+        Some(detail) => terminal["refusal_detail"] = detail.into(),
+        None => {
+            terminal
+                .as_object_mut()
+                .expect("terminal object")
+                .remove("refusal_detail");
+        }
+    }
+    Some(terminal)
+}
+
+/// A finished job no longer pins its default-branch tip for a fill export.
+fn release_export_tip(runtime: &Runtime, job: &str) {
+    let mut host = runtime.host.lock().expect("host lock");
+    let mut next = host.snapshot.clone();
+    next.per_job.export_tips.remove(job);
+    if let Err(error) = host.save(next) {
+        tracing::warn!(%error, "fill_export_release_failed");
+    }
 }
 
 #[cfg(test)]

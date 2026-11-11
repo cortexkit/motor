@@ -1479,6 +1479,17 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
             },
             _ = heartbeat.tick() => {
+                // The host can end a queued execution before its VM boots, for
+                // example when the lease expires while the job still waits
+                // behind another on the same checkout. Its no-start terminal
+                // is then in replay; hand the caller to the replay reader so
+                // it gets that terminal instead of queue heartbeats forever.
+                let ended = runtime.host.lock().expect("host lock").snapshot.per_job.executions[&claims.jti].ended;
+                if ended {
+                    ensure!(accepted, "queued execution ended before its Run");
+                    drop(spool);
+                    return stream::serve(runtime, claims, client, false, reader, true).await;
+                }
                 // Same-workspace ownership and VM setup are not capacity wait.
                 // This host refuses capacity at claim rather than queueing it.
                 let wait = accepted.then(|| queue_clock.observe(false));
