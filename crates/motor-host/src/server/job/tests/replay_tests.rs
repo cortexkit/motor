@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_not_replay_run() {
     let (runtime, fake, storage) = fixture();
-    *fake.hang.lock().unwrap() = "runner";
+    hold_boot(&runtime, &fake, "runner");
     let mut guest = peer(&fake);
     let c = claims(JOB);
     let id = claim(&runtime, &c);
@@ -20,7 +20,8 @@ async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_no
     for index in 0..27 {
         write_frame(&mut client, &json!({"type":"bundle_chunk","index":0,"offset":index * 525_000,"data":"YWFh".repeat(175_000)})).await.unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Spooling 18 MB through a debug build is slow on a small CI machine.
+    tokio::time::timeout(Duration::from_secs(60), async {
         while std::fs::metadata(storage.spool(JOB)).unwrap().len() < 18_000_000 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

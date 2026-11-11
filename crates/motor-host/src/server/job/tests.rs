@@ -575,6 +575,18 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
         .unwrap();
     (runtime, fake, storage)
 }
+/// Holds the VM boot at `stage` until the test opens the gate. The fixture's
+/// 1 s boot deadline is for tests that expect a hung boot to time out; a test
+/// that releases the boot itself raises it, so a slow machine can't end the
+/// session before the test gets there.
+fn hold_boot(runtime: &Arc<Runtime>, fake: &Fake, stage: &'static str) {
+    if let crate::config::HostSettings::PerJob(settings) =
+        &mut runtime.host.lock().unwrap().settings
+    {
+        settings.boot_deadline_ms = 60_000;
+    }
+    *fake.hang.lock().unwrap() = stage;
+}
 fn claim(runtime: &Arc<Runtime>, c: &Claims) -> u64 {
     let mut host = runtime.host.lock().unwrap();
     let id = host.claim(c.clone(), unix_ms()).unwrap().0;
@@ -1541,7 +1553,7 @@ async fn hosted_client_wire_exchange_accepts_pinned_runner_hello_and_runs_after_
         serde_json::to_value(motor_runner::runner_hello(&config, true, true, true)).unwrap();
     *storage.pinned_hello.lock().unwrap() = Some(pinned.clone());
     *fake.hello.lock().unwrap() = Some(pinned);
-    *fake.hang.lock().unwrap() = "boot";
+    hold_boot(&runtime, &fake, "boot");
     struct ReleaseGate(Arc<Fake>);
     impl Drop for ReleaseGate {
         fn drop(&mut self) {
@@ -1793,7 +1805,7 @@ async fn tick_never_adopts_while_helper_start_or_guest_attach_is_in_flight() {
 #[tokio::test]
 async fn run_validated_before_vm_ready_remains_spooled_until_hello() {
     let (runtime, fake, storage) = fixture();
-    *fake.hang.lock().unwrap() = "runner";
+    hold_boot(&runtime, &fake, "runner");
     let c = claims(JOB);
     let id = claim(&runtime, &c);
     existing_workspace(&runtime, JOB);

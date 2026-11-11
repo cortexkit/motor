@@ -7,14 +7,7 @@ use tokio::io::ReadBuf;
 #[tokio::test]
 async fn full_spool_with_buffered_heartbeat_replays_when_vm_becomes_ready() {
     let (runtime, fake, storage) = fixture();
-    // The fixture's 1 s boot deadline would end the session while a slow
-    // machine is still spooling 64 MiB, which deletes the spool.
-    if let crate::config::HostSettings::PerJob(settings) =
-        &mut runtime.host.lock().unwrap().settings
-    {
-        settings.boot_deadline_ms = 60_000;
-    }
-    *fake.hang.lock().unwrap() = "runner";
+    hold_boot(&runtime, &fake, "runner");
     let c = claims(JOB);
     let id = claim(&runtime, &c);
     let mut frames = vec![hello(), run(JOB)];
