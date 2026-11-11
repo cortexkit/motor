@@ -1260,9 +1260,12 @@ name = "motor-vm-helper"
 version = "0.1.0"
 dependencies = [
  "cortexkit-test-support",
+ "ed25519-dalek",
  "libc",
+ "motor-lease",
  "motor-protocol",
  "motor-runner",
+ "reqwest",
  "serde",
  "serde_json",
  "uuid",

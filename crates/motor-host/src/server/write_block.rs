@@ -1,6 +1,30 @@
 use super::*;
 
 impl Runtime {
+    pub(super) fn admit_job_cache_write(&self, first_claim: bool, claims: &Claims, token: &str) {
+        if !first_claim
+            || claims.purpose != Purpose::Run
+            || claims.cache_write != Some(true)
+            || self.sandbox_identity.is_some()
+        {
+            return;
+        }
+        // Serialize the check and helper request with the admin operation that
+        // sets the write block, so it cannot be set between the two.
+        let _operation = self
+            .write_block_operation
+            .lock()
+            .expect("write block operation");
+        if self.remote_cache_write_blocked() {
+            return;
+        }
+        if let Err(error) = self.control.admit_cache_write(token) {
+            // Cache authorization is optional: a helper refusal leaves the
+            // execution read-only, not refused as a compute job.
+            tracing::warn!(jti = %claims.jti, %error, "helper_cache_write_admission_refused");
+        }
+    }
+
     pub(super) fn remote_cache_write_blocked(&self) -> bool {
         self.host
             .lock()

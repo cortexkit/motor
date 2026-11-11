@@ -38,6 +38,12 @@ pub struct JobVms {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Root's registered host identity for independent Job token verification.
+    #[serde(default)]
+    pub host_id: Option<String>,
+    /// Only this root-owned file may override the broker's signing-key endpoint.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
     #[serde(default)]
     pub job_vms: Option<JobVms>,
     #[serde(default)]
@@ -90,6 +96,33 @@ impl Config {
     }
 
     pub(crate) fn validate_resources(&self) -> Result<()> {
+        if self
+            .host_id
+            .as_deref()
+            .is_some_and(|id| !motor_lease::valid_name(id))
+        {
+            return Err(Error("invalid helper host_id".into()));
+        }
+        if let Some(url) = &self.jwks_url {
+            let url =
+                reqwest::Url::parse(url).map_err(|_| Error("invalid helper jwks_url".into()))?;
+            let loopback = url
+                .host_str()
+                .and_then(|host| {
+                    host.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                })
+                .is_some_and(|ip| ip.is_loopback());
+            if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(Error("invalid helper jwks_url".into()));
+            }
+        }
         let count = u32::try_from(self.slots.len()).map_err(|_| Error("too many slots".into()))?;
         let end = self
             .uid_base
@@ -263,6 +296,45 @@ pub(crate) fn cpu_list(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_key_endpoint_requires_https_except_numeric_loopback() {
+        let mut config = job_config();
+        assert!(config.host_id.is_none());
+        assert!(config.jwks_url.is_none());
+        for url in [
+            "https://runners.cortexkit.io/.well-known/jwks.json",
+            "http://127.0.0.1:1234/keys",
+            "http://[::1]:1234/keys",
+        ] {
+            config.jwks_url = Some(url.into());
+            config.validate_resources().unwrap();
+        }
+        for url in [
+            "http://example.com/keys",
+            "http://localhost/keys",
+            "http://192.0.2.1/keys",
+            "file:///keys",
+            "https://user:password@example.com/keys",
+            "https://example.com/keys#fragment",
+        ] {
+            config.jwks_url = Some(url.into());
+            assert!(config
+                .validate_resources()
+                .unwrap_err()
+                .0
+                .contains("jwks_url"));
+        }
+        config.jwks_url = None;
+        for id in ["", "boat:sandbox", "host/other"] {
+            config.host_id = Some(id.into());
+            assert!(config
+                .validate_resources()
+                .unwrap_err()
+                .0
+                .contains("host_id"));
+        }
+    }
 
     fn job_config() -> Config {
         let mut config: Config =

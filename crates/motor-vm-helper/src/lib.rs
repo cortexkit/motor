@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, os::fd::OwnedFd};
 use uuid::Uuid;
 
+pub mod cache_write;
 pub mod config;
 pub mod images;
 pub mod job;
@@ -41,6 +42,9 @@ pub enum Kind {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    AdmitCacheWrite {
+        token: String,
+    },
     PerJobReadiness {},
     PrepareFill {
         fill: job::Fill,
@@ -454,6 +458,9 @@ impl<M: Machine> Helper<M> {
             return Err(Error("helper is stopping".into()));
         }
         match request {
+            Request::AdmitCacheWrite { token } => {
+                self.job(job::Operation::AdmitCacheWrite(token), peer)
+            }
             Request::PerJobReadiness {} => {
                 let job_vms_configured = self.machine.job_vms_configured();
                 let workspace_disk_max_bytes = self.machine.workspace_disk_max_bytes();

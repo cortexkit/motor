@@ -311,6 +311,9 @@ pub(super) fn scratch() -> PathBuf {
 
 pub(super) fn machine(base: &Path) -> LinuxJobs {
     LinuxJobs {
+        cache_write_grants: crate::cache_write::Grants::new(
+            &serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap(),
+        ),
         settings: None,
         groups: base.join("groups"),
         records_path: base.join("records"),

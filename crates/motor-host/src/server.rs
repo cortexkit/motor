@@ -1975,6 +1975,7 @@ where
     };
     let auth_runtime = runtime.clone();
     let auth_requester = requester_jwk.clone();
+    let raw_token = token.clone();
     let authentication = tokio::task::spawn_blocking(move || {
         let result = auth_runtime.authenticate(&token, &auth_requester, unix_ms() / 1000);
         if matches!(
@@ -2074,22 +2075,26 @@ where
         nonces
             .verify(&challenge, &claims, &requester_jwk, &sig, unix_ms() / 1000)
             .map_err(|_| (Error::Refused(Refusal::Auth), "challenge_signature"))?;
-        let (id, execution) = {
+        let (id, execution, first_claim) = {
             let mut host = runtime.host.lock().expect("host lock");
             host.consume_nonce(challenge.nonce, challenge.ts, unix_ms() / 1000)
                 .map_err(|error| (error, "challenge_nonce"))?;
+            let first_claim = !host.snapshot.per_job.executions.contains_key(&claims.jti)
+                && claims.cache_write == Some(true)
+                && !host.snapshot.remote_cache_write_blocked;
             let (id, _) = host
                 .claim(claims.clone(), unix_ms())
                 .map_err(|error| (error, "admission"))?;
             let execution = (matches!(host.settings, crate::config::HostSettings::PerJob(_))
                 && claims.purpose == Purpose::Run)
                 .then(|| host.snapshot.per_job.executions[&claims.jti].clone());
-            (id, execution)
+            (id, execution, first_claim)
         };
         // The image manager takes the host lock itself to read the job's
         // generation, and std's Mutex is not reentrant: acquiring with the guard
         // above still held hangs the first per-job admission and, with it, every
         // later heartbeat and admin request.
+        let helper_admission = execution.is_some() && first_claim;
         if let Some(execution) = execution {
             if let Err(error) = runtime.job_resources.acquire(&execution) {
                 tracing::error!(jti = claims.jti, %error, "job_resources_refused");
@@ -2107,9 +2112,10 @@ where
             id,
             host.watch_connection(id)
                 .map_err(|error| (error, "admission"))?,
+            helper_admission,
         ))
     })();
-    let (id, mut updates) = match verified {
+    let (id, mut updates, helper_admission) = match verified {
         Ok(value) => value,
         Err((Error::Refused(r), check)) => {
             log_refusal("challenge", r, check, Some(&claims.jti));
@@ -2149,6 +2155,13 @@ where
     };
     drop(prelude_guard);
     if runtime.per_job() {
+        if helper_admission {
+            let r = runtime.clone();
+            let c = claims.clone();
+            tokio::task::spawn_blocking(move || r.admit_job_cache_write(true, &c, &raw_token))
+                .await
+                .at(Side::Host, "helper_cache_write_admission")?;
+        }
         let outcome = job::serve(runtime.clone(), &claims, id, &mut client).await;
         connection.finish().await;
         return outcome;
