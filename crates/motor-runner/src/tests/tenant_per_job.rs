@@ -44,31 +44,39 @@ fn job_vm_accepts_one_execution_and_workspace_even_after_completion() {
     assert!(!runner.warm_builds_enabled("tip"));
 }
 
-/// A per-job fill VM exists only to run its fill, so the per-job refusal that
-/// keeps job VMs from queuing fills must not refuse it; the write key and a
-/// tip remain required.
+/// A fill VM's runner starts as a plain tenant runner: the guest agent adds
+/// `--per-job` only on job boots. So the fill check must not depend on the
+/// per-job flag (requiring it refused every real fill on ovh-2), while the
+/// write key and a tip remain required, and job VMs still never queue fills.
 #[cfg(target_os = "linux")]
 #[test]
-fn per_job_fill_vm_may_fill_only_with_a_write_key_and_tip() {
+fn fill_vm_may_fill_only_with_a_write_key_and_tip() {
     let f = Fixture::new();
-    for (key, tip, expected) in [
-        (Some(true), "tip", true),
-        (Some(false), "tip", false),
-        (Some(true), "", false),
+    for (per_job, key, tip, refusal) in [
+        (false, Some(true), "tip", None),
+        (true, Some(true), "tip", None),
+        // Which write-key reason applies depends on the fixture's cache setup.
+        (false, Some(false), "tip", Some("")),
+        (false, Some(true), "", Some("no default-branch tip")),
     ] {
         let mut config = f.config();
         config.manual_tick = true;
         config.tenant_vm = true;
-        config.per_job = true;
+        config.per_job = per_job;
         config.tenant_write_key = key;
         let runner = Runner::open(config).unwrap();
-        assert_eq!(
-            runner.fill_vm_writer_enabled(tip),
-            expected,
-            "{key:?} {tip:?}"
-        );
-        // Job VMs still never queue fills of their own.
-        assert!(!runner.warm_builds_enabled(tip));
+        let got = runner.fill_vm_writer_refusal(tip);
+        match refusal {
+            None => assert_eq!(got, None, "{per_job} {key:?} {tip:?}"),
+            Some(expected) => assert!(
+                got.as_deref().is_some_and(|got| got.contains(expected)),
+                "{per_job} {key:?} {tip:?}: {got:?}"
+            ),
+        }
+        if per_job {
+            // Job VMs still never queue fills of their own.
+            assert!(!runner.warm_builds_enabled(tip));
+        }
         drop(runner);
     }
 }

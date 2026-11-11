@@ -3733,8 +3733,8 @@ impl Runner {
         let repository = paths::fill_source(source).caller;
         let plan = self.base_plan(repository.text(), &source.integration_tip, true);
         let mut inner = self.core.inner.lock().unwrap();
-        if !self.fill_vm_writer_enabled(&source.integration_tip) {
-            return Err(invalid("fill writer unavailable"));
+        if let Some(reason) = self.fill_vm_writer_refusal(&source.integration_tip) {
+            return Err(invalid(format!("fill writer unavailable: {reason}")));
         }
         self.queue_base_planned(&mut inner, repository.text(), repository.text(), plan)?;
         let id = inner
@@ -5604,16 +5604,44 @@ impl Runner {
     }
     /// Whether warm builds may be queued for `tip` at all, from configuration
     /// alone; `queue_base_planned` also checks for a drain under the lock.
-    /// Whether a per-job fill VM may run the fill it was booted for. Such a VM
-    /// exists only for that fill (it refuses every Run), so the per-job refusal
-    /// in `warm_builds_enabled`, which keeps job VMs from queuing fills, does
-    /// not apply; the cache writer and its write key still must be present.
+    /// Why a per-job fill VM may not run the fill it was booted for, or `None`
+    /// when it may. The caller has already proved this is a fill boot
+    /// (`import_fill_source` requires one), and a fill boot's runner starts
+    /// without `--per-job` (see `tenant_agent::per_job::args`), so neither the
+    /// per-job flag nor `warm_builds_enabled`'s refusal of VM instances applies.
+    /// The cache writer and its write key still must be present. The reason is
+    /// returned to the host, whose log is the only record of a fill VM.
     #[cfg(target_os = "linux")]
-    fn fill_vm_writer_enabled(&self, tip: &str) -> bool {
-        !tip.is_empty()
-            && self.core.config.per_job
-            && self.core.config.writer_enabled()
-            && self.core.quarantined.is_empty()
+    pub(crate) fn fill_vm_writer_refusal(&self, tip: &str) -> Option<String> {
+        let config = &self.core.config;
+        if tip.is_empty() {
+            return Some("no default-branch tip".into());
+        }
+        if !self.core.quarantined.is_empty() {
+            return Some("a job record is quarantined".into());
+        }
+        if config.boat_profile {
+            return Some("Boat sandboxes never fill".into());
+        }
+        if config.tenant_vm && !config.tenant_fills() {
+            return Some(if !config.remote_cache {
+                "remote cache is off in the runner arguments".into()
+            } else if let Some(error) = &config.remote_cache_error {
+                format!("remote cache did not start: {error}")
+            } else if config.remote_cache_runtime.is_none() {
+                "remote cache runtime is not running".into()
+            } else {
+                "no cache write key in the installed credentials".into()
+            });
+        }
+        if !config.writer_enabled() {
+            return Some(if config.writer_account.is_none() {
+                "cache writer account unavailable".into()
+            } else {
+                "cache writer disabled".into()
+            });
+        }
+        None
     }
     fn warm_builds_enabled(&self, tip: &str) -> bool {
         if self.core.config.per_job {
