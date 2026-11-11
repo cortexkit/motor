@@ -3,7 +3,7 @@ use super::capacity::TenantCapacity;
 use crate::{Connector, Duplex};
 use motor_lease::{
     fake::{BrokerRequest, FakeBroker, FakeConfig},
-    *,
+    Placement, *,
 };
 use motor_protocol::*;
 use sha2::{Digest, Sha256};

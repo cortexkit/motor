@@ -17,6 +17,8 @@ pub(crate) struct Ssh {
 #[derive(Clone)]
 pub(crate) struct Lease {
     pub response: LeaseResponse,
+    // Display metadata only; transport selection still uses the validated lease.
+    provider: Option<String>,
     pub ssh: Option<Ssh>,
     pub runner_port: Option<u16>,
 }
@@ -54,6 +56,10 @@ impl<'de> Deserialize<'de> for Lease {
         }
         let lease = Self {
             response: serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            provider: provider
+                .as_ref()
+                .and_then(|p| p.as_str())
+                .map(str::to_owned),
             ssh: ssh
                 .map(serde_json::from_value)
                 .transpose()
@@ -72,6 +78,10 @@ impl<'de> Deserialize<'de> for Lease {
     }
 }
 impl Lease {
+    pub(crate) fn caller_placement(&self) -> Option<cortexkit_exec_remote_types::Placement> {
+        caller_placement(self.provider.as_deref(), Some(&self.placement.host))
+    }
+
     fn validate_ssh(&self) -> Result<(), Error> {
         let ssh = self.ssh.as_ref().ok_or(Error::Auth)?;
         let endpoint: SocketAddrV4 = ssh.endpoint.parse().map_err(|_| Error::Auth)?;
@@ -98,6 +108,23 @@ impl Lease {
         Ok(())
     }
 }
+
+fn caller_placement(
+    provider: Option<&str>,
+    host: Option<&str>,
+) -> Option<cortexkit_exec_remote_types::Placement> {
+    use cortexkit_exec_remote_types::Placement;
+    let provider = provider?;
+    if matches!(provider, "boat" | "overflow") {
+        return Some(Placement::new("overflow"));
+    }
+    let mut placement = Placement::new(provider);
+    if let Some(host) = host {
+        placement = placement.with_host(host);
+    }
+    Some(placement)
+}
+
 pub(crate) fn terminal_placement(placement: &motor_lease::Placement) -> String {
     if placement.host.starts_with("boat:") {
         format!("boat/{}", placement.vm.as_deref().unwrap_or_default())
@@ -140,4 +167,85 @@ pub(super) struct FinishReply {
     pub job_id: String,
     pub settled_vcpu_ms: u64,
     pub released_vcpu_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_protocol::Accepted;
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    fn first_party_grant(provider: Option<&str>) -> Lease {
+        let mut grant = json!({
+            "lease_id": "lease-1", "job_id": Uuid::nil().to_string(),
+            "placement": { "host": "host-a", "vm": null },
+            "endpoint": "127.0.0.1:9443", "endpoint_spki_sha256": "key",
+            "job_token": "token", "token_expires_at_ms": 1000,
+            "max_s": 60, "reserved_vcpu_ms": 120000
+        });
+        if let Some(provider) = provider {
+            grant["provider"] = json!(provider);
+        }
+        serde_json::from_value(grant).unwrap()
+    }
+
+    #[test]
+    fn first_party_grant_has_caller_host() {
+        let lease = first_party_grant(Some("first_party"));
+        let accepted =
+            Accepted::new(Uuid::nil(), 0).with_placement(lease.caller_placement().unwrap());
+        assert_eq!(
+            serde_json::to_value(accepted).unwrap()["placement"],
+            json!({ "provider": "first_party", "host": "host-a" })
+        );
+    }
+
+    #[test]
+    fn boat_grant_has_overflow_without_caller_host() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../../../motor-lease/contracts/cloud/boat-lease.json"
+        ))
+        .unwrap();
+        let lease: Lease =
+            serde_json::from_value(vector["booked"]["reply"]["body"].clone()).unwrap();
+        let accepted =
+            Accepted::new(Uuid::nil(), 0).with_placement(lease.caller_placement().unwrap());
+        assert_eq!(
+            serde_json::to_value(accepted).unwrap()["placement"],
+            json!({ "provider": "overflow" })
+        );
+    }
+
+    #[test]
+    fn providerless_grant_does_not_invent_placement() {
+        assert!(first_party_grant(None).caller_placement().is_none());
+    }
+
+    #[test]
+    fn display_mapping_preserves_other_provider_names_and_optional_hosts() {
+        for host in [Some("host-b"), None] {
+            let placement = caller_placement(Some("future_provider"), host).unwrap();
+            let mut expected = json!({ "provider": "future_provider" });
+            if let Some(host) = host {
+                expected["host"] = json!(host);
+            }
+            assert_eq!(serde_json::to_value(placement).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn accepted_without_placement_omits_field_and_round_trips_bytes() {
+        let bytes = br#"{"job_id":"00000000-0000-0000-0000-000000000000","queue_position":0}"#;
+        let accepted: Accepted = serde_json::from_slice(bytes).unwrap();
+        assert!(accepted.placement().is_none());
+        let encoded = serde_json::to_vec(&accepted).unwrap();
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(value.get("placement").is_none());
+        assert_eq!(encoded, bytes);
+        assert_eq!(
+            serde_json::to_vec(&Accepted::new(Uuid::nil(), 0)).unwrap(),
+            bytes
+        );
+    }
 }
