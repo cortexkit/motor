@@ -1696,7 +1696,19 @@ impl Runtime {
     fn remote_cache_admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         let op = request["op"].as_str().unwrap_or("");
         if op == "remote_cache_create_only_probe" {
-            if request != &json!({"op":op,"account":tenant}) {
+            // The gateway names its cache by the tenant's account subject (its
+            // key's store prefix), not by the VM's tenant name, and refuses any
+            // other account itself; this check only keeps an operator typo from
+            // reaching the guest.
+            let subject = self
+                .host
+                .lock()
+                .expect("host lock")
+                .tenants
+                .values()
+                .find(|t| t.tenant == tenant)
+                .map(|t| t.sub.clone());
+            if subject.is_none_or(|sub| request != &json!({"op":op,"account":sub})) {
                 return Ok(
                     json!({"ok":false,"exit_code":1,"cases":[],"error":"remote_cache_invalid_request"}),
                 );
