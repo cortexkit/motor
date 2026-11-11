@@ -541,6 +541,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_only_probe_rejects_unknown_fields_and_invalid_accounts_without_echoing_them() {
+        let lock = tokio::sync::Mutex::new(());
+        for request in [
+            json!({"op":"remote_cache_create_only_probe"}),
+            json!({"op":"remote_cache_create_only_probe","account":""}),
+            json!({"op":"remote_cache_create_only_probe","account":{"PRIVATE-KEY":true}}),
+            json!({"op":"remote_cache_create_only_probe","account":"acct:test","PRIVATE-KEY":true}),
+        ] {
+            let reply = agent_result(dispatch_value(request, &lock).await);
+            assert_eq!(
+                reply,
+                json!({"ok":false,"error":"remote_cache_invalid_request"})
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn remote_cache_busy_refuses_immediately_and_failures_reopen_admission() {
         for cause in [
             "queued",

@@ -1632,11 +1632,29 @@ impl Runtime {
         );
         if matches!(
             request["op"].as_str(),
-            Some("remote_cache_probe" | "set_remote_cache" | "activate_runner_args")
+            Some(
+                "remote_cache_probe"
+                    | "remote_cache_create_only_probe"
+                    | "set_remote_cache"
+                    | "activate_runner_args"
+            )
         ) {
             let operations = self.tenant_operations(tenant)?;
             let _operation = operations.lock().expect("tenant operations lock");
+            if request["op"] == "remote_cache_create_only_probe"
+                && self.remote_cache_write_blocked()
             {
+                return Ok(serde_json::to_value(
+                    motor_protocol::CreateOnlyProbeReport::refused(
+                        motor_protocol::CreateOnlyProbeDetail::RemoteCacheWriteBlocked,
+                    ),
+                )?);
+            }
+            // The store probe has its own object namespace and does not replace
+            // the gateway's store configuration or keys, so serving jobs need
+            // not stop. The tenant operations lock still excludes provisioning
+            // while the probe runs.
+            if request["op"] != "remote_cache_create_only_probe" {
                 let host = self.host.lock().expect("host lock");
                 if !host.snapshot.draining || active_leases(&host) != 0 {
                     return Ok(json!({"ok":false,"error":"remote_cache_host_not_idle"}));
@@ -1671,6 +1689,41 @@ impl Runtime {
 
     fn remote_cache_admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         let op = request["op"].as_str().unwrap_or("");
+        if op == "remote_cache_create_only_probe" {
+            if request != &json!({"op":op,"account":tenant}) {
+                return Ok(
+                    json!({"ok":false,"exit_code":1,"cases":[],"error":"remote_cache_invalid_request"}),
+                );
+            }
+            if self.remote_cache_write_blocked() {
+                return Ok(serde_json::to_value(
+                    motor_protocol::CreateOnlyProbeReport::refused(
+                        motor_protocol::CreateOnlyProbeDetail::RemoteCacheWriteBlocked,
+                    ),
+                )?);
+            }
+            if self.control.wake(tenant, None).is_err() {
+                return Ok(
+                    json!({"ok":false,"exit_code":1,"cases":[],"error":"remote_cache_agent_unavailable"}),
+                );
+            }
+            // Decode a closed diagnostic vocabulary instead of echoing an old
+            // or faulty agent's arbitrary error text to the operator.
+            let report = self
+                .control
+                .admin(tenant, request)
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<motor_protocol::CreateOnlyProbeReport>(value).ok()
+                })
+                .filter(motor_protocol::CreateOnlyProbeReport::valid);
+            return Ok(match report {
+                Some(report) => serde_json::to_value(report)?,
+                None => {
+                    json!({"ok":false,"exit_code":1,"cases":[],"error":"remote_cache_create_only_probe_failed"})
+                }
+            });
+        }
         let _credentials = if op == "set_remote_cache" {
             // Never format serde errors: unknown fields and invalid values can
             // contain credentials, even when decoding fails.

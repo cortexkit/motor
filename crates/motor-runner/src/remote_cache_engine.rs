@@ -5,6 +5,22 @@ use motor_protocol::{
 use sha2::{Digest, Sha256};
 
 impl Runner {
+    pub(crate) async fn remote_cache_create_only_probe(
+        &self,
+        account: &str,
+    ) -> motor_protocol::CreateOnlyProbeReport {
+        #[cfg(unix)]
+        if self.core.config.tenant_vm && !self.core.config.boat_profile {
+            if let Some(runtime) = &self.core.config.remote_cache_runtime {
+                return runtime.gateway.create_only_probe(account).await;
+            }
+        }
+        let _ = account;
+        motor_protocol::CreateOnlyProbeReport::refused(
+            motor_protocol::CreateOnlyProbeDetail::RemoteCacheUnavailable,
+        )
+    }
+
     pub(crate) async fn set_remote_cache_write_block(&self, blocked: bool) {
         #[cfg(unix)]
         if let Some(runtime) = &self.core.config.remote_cache_runtime {

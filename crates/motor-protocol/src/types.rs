@@ -439,6 +439,8 @@ macro_rules! define_frames {
 }
 
 define_frames! {
+    RemoteCacheCreateOnlyProbe { account: String },
+    RemoteCacheCreateOnlyProbeReply(crate::CreateOnlyProbeReport),
     SetRemoteCacheWriteBlock { blocked: bool },
     SetRemoteCacheWriteBlockReply { blocked: bool },
     VerifiedLease(crate::VerifiedLease),

@@ -271,6 +271,21 @@ async fn dispatch_value(value: Value, attach: &tokio::sync::Mutex<()>) -> io::Re
     if value == json!({"op":"remote_cache_probe"}) {
         return Ok(json!({"ok":true,"remote_cache_provisioning":1}));
     }
+    if value["op"] == "remote_cache_create_only_probe" {
+        let account = value["account"]
+            .as_str()
+            .filter(|account| !account.is_empty() && account.len() <= 256)
+            .ok_or_else(|| io::Error::other("remote_cache_invalid_request"))?;
+        if value != json!({"op":"remote_cache_create_only_probe","account":account}) {
+            return Err(io::Error::other("remote_cache_invalid_request"));
+        }
+        // Do not hold the attachment lock over store I/O: emergency write-block
+        // control must still reach the runner while a probe upload is streaming.
+        return forward(Frame::RemoteCacheCreateOnlyProbe {
+            account: account.into(),
+        })
+        .await;
+    }
     if value["op"] == "set_remote_cache" {
         let request = remote_cache::parse(value)?;
         let _guard = attach.lock().await;
@@ -406,6 +421,7 @@ async fn dispatch(
 async fn forward(frame: Frame) -> io::Result<Value> {
     let config = crate::Config::new("/tenant/state", "main");
     let timeout = match frame {
+        Frame::RemoteCacheCreateOnlyProbe { .. } => 55,
         Frame::Drain { deadline_s, .. } => deadline_s.min(86400) + 20,
         _ => 20,
     };
@@ -490,6 +506,10 @@ async fn forward_socket(
                 | (Frame::DrainIfIdle, Frame::DrainIfIdleReply { .. })
                 | (Frame::Resume, Frame::ResumeReply { .. })
                 | (
+                    Frame::RemoteCacheCreateOnlyProbe { .. },
+                    Frame::RemoteCacheCreateOnlyProbeReply(_)
+                )
+                | (
                     Frame::SetRemoteCacheWriteBlock { .. },
                     Frame::SetRemoteCacheWriteBlockReply { .. }
                 )
@@ -500,7 +520,9 @@ async fn forward_socket(
             return Err(io::Error::other("unexpected runner agent reply"));
         }
         let mut value = agent_reply_value(reply)?;
-        value["ok"] = json!(true);
+        if !matches!(frame, Frame::RemoteCacheCreateOnlyProbe { .. }) {
+            value["ok"] = json!(true);
+        }
         return Ok(value);
     }
 }
@@ -1692,6 +1714,16 @@ mod tests {
         let id = Uuid::now_v7();
         let exchanges = [
             (
+                Frame::RemoteCacheCreateOnlyProbe {
+                    account: "acct:test".into(),
+                },
+                Frame::RemoteCacheCreateOnlyProbeReply(
+                    motor_protocol::CreateOnlyProbeReport::refused(
+                        motor_protocol::CreateOnlyProbeDetail::RemoteCacheUnavailable,
+                    ),
+                ),
+            ),
+            (
                 Frame::SetRemoteCacheWriteBlock { blocked: true },
                 Frame::SetRemoteCacheWriteBlockReply { blocked: true },
             ),
@@ -1731,6 +1763,7 @@ mod tests {
             ),
         ];
         for (request, reply) in exchanges {
+            let is_probe = matches!(request, Frame::RemoteCacheCreateOnlyProbe { .. });
             let expected = request.clone();
             let task = async {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -1761,7 +1794,14 @@ mod tests {
                 forward_socket(&path, request, || Ok(Some(std::process::id()))),
                 task
             );
-            assert_eq!(result.unwrap()["ok"], true);
+            let result = result.unwrap();
+            if is_probe {
+                assert_eq!(result["ok"], false);
+                assert_eq!(result["exit_code"], 1);
+                assert_eq!(result["cases"].as_array().unwrap().len(), 4);
+            } else {
+                assert_eq!(result["ok"], true);
+            }
         }
     }
 

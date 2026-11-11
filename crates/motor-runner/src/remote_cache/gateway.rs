@@ -18,6 +18,7 @@
 mod breaker;
 mod inbound;
 mod metrics;
+mod probe;
 mod sigv4;
 mod upstream;
 mod write_block;
@@ -300,6 +301,10 @@ pub(crate) struct Binding {
     owner: Arc<Owner>,
     ledger: Option<Arc<WriteLedger>>,
     job_puts: Option<Arc<Mutex<JobPutState>>>,
+    // Only the in-process admin probe observes store statuses before the job
+    // response policy maps duplicates to 200 and failures to 503.
+    probe_status: Option<Arc<std::sync::atomic::AtomicU16>>,
+    probe_sent: Option<Arc<AtomicUsize>>,
 }
 
 impl Binding {
@@ -800,6 +805,7 @@ struct Exchange<'a> {
     canonical_uri: String,
     storage_class: Option<&'a str>,
     create_only: bool,
+    probe_sent: Option<&'a AtomicUsize>,
     deadline: Instant,
     /// When set, every read from or write to the tool must make progress
     /// within this long, or the request ends as if the tool went away.
@@ -916,6 +922,8 @@ impl Gateway {
             owner,
             ledger: None,
             job_puts,
+            probe_status: None,
+            probe_sent: None,
         })
     }
 
@@ -934,6 +942,8 @@ impl Gateway {
                 idle: Notify::new(),
             })),
             job_puts: None,
+            probe_status: None,
+            probe_sent: None,
         })
     }
 
@@ -1358,6 +1368,7 @@ impl Gateway {
             storage_class: (request.method == Method::Put)
                 .then_some(generation.storage_class.as_str()),
             create_only: endpoint == Endpoint::JobCreate,
+            probe_sent: binding.probe_sent.as_deref(),
             deadline,
             // A tool holding the breaker's probe must not hold it by
             // stalling: other jobs' requests wait on, or are refused
@@ -1526,7 +1537,11 @@ impl Gateway {
                         Err(_) => return Err(AttemptError::Upstream(Failure::Deadline)),
                         Ok(Err(_)) if exchange.create_only => break 'upload,
                         Ok(Err(_)) => return Err(AttemptError::Upstream(Failure::Transport)),
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            if let Some(sent) = exchange.probe_sent {
+                                sent.fetch_add(n, Ordering::Release);
+                            }
+                        }
                     }
                     left -= n as u64;
                 }
@@ -1669,6 +1684,9 @@ impl Gateway {
         // Closing also avoids pooling an upstream with a partly sent request.
         let close_requested = request.close_requested || !body_complete;
         let status = head.status;
+        if let Some(observer) = &binding.probe_status {
+            observer.store(status, Ordering::Release);
+        }
         if endpoint == Endpoint::JobCreate {
             if status == 412 {
                 ticket.report(Outcome::Success);

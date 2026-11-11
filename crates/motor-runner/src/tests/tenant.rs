@@ -10,6 +10,8 @@ mod cancellation;
 #[cfg(target_os = "linux")]
 mod memory;
 
+#[path = "tenant_create_only_probe.rs"]
+mod create_only_probe;
 #[path = "tenant_have_reports.rs"]
 mod have_reports;
 #[path = "tenant_per_job.rs"]

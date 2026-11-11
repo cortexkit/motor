@@ -115,6 +115,7 @@ impl Control for Fake {
     }
 }
 
+mod create_only_probe;
 mod write_block;
 
 /// A drained host whose leases have all ended is idle, even while the ended

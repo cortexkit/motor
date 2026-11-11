@@ -4,6 +4,7 @@
 //! Unknown object fields are deliberately ignored for additive compatibility.
 
 mod codec;
+mod create_only_probe;
 mod environment;
 mod fill_source;
 pub mod logging;
@@ -15,6 +16,7 @@ pub use codec::{
     decode_frame, read_frame, read_frame_async, read_record, read_record_async, write_frame,
     write_frame_async, DecodedFrame, MAX_FRAME_BYTES,
 };
+pub use create_only_probe::*;
 pub use environment::allowed_env;
 pub use tenant::*;
 pub use types::*;
