@@ -378,6 +378,11 @@ pub struct Config {
     /// Cargo home used by fixture jobs in the non-isolated host test backend.
     #[cfg(test)]
     pub(crate) fixture_cargo_home: Option<PathBuf>,
+    /// Attachment marker and resolver-directory paths under fixture scratch.
+    /// The helper validates the marker and mounts the directory's resolv.conf
+    /// over /etc/resolv.conf, just as with the service's fixed /run paths.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fixture_tenant_dns: Option<(PathBuf, PathBuf)>,
     /// Called with an operation label so tests can hold filesystem work or the
     /// admission handoff open without holding the runner state lock.
     #[cfg(test)]
@@ -719,6 +724,8 @@ impl Config {
             test_processes: None,
             #[cfg(test)]
             fixture_cargo_home: None,
+            #[cfg(all(test, target_os = "linux"))]
+            fixture_tenant_dns: None,
             #[cfg(test)]
             long_work: None,
             #[cfg(all(test, target_os = "linux"))]

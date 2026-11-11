@@ -93,6 +93,12 @@ impl TenantCache {
         config.isolate_jobs = true;
         config.tenant_vm = true;
         config.disable_warm_builds = true;
+        let dns = f.scratch.join("tenant-attachment");
+        fs::create_dir(&dns).unwrap();
+        let marker = dns.join("generation");
+        fs::write(&marker, "1\n").unwrap();
+        fs::write(dns.join("resolv.conf"), "nameserver 127.0.0.1\n").unwrap();
+        config.fixture_tenant_dns = Some((marker, dns));
         config.account_subject = Some(TENANT.into());
         config.remote_cache = true;
         config.remote_cache_runtime = Some(cache.clone());
