@@ -11077,6 +11077,10 @@ impl Runner {
         }
         self.release_return_reservations();
         self.prune_refs()?;
+        // The finalizing guard also takes the state lock when it is dropped.
+        // Signal test completion only after all post-terminal lock holds end.
+        drop(_finalizing);
+        self.long_work("job_finish_complete");
         Ok(())
     }
 
