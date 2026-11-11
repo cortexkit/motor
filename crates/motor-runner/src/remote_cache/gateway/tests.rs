@@ -21,6 +21,8 @@ const MIB: usize = 1 << 20;
 
 #[path = "job_create_tests.rs"]
 mod job_create;
+#[path = "store_answers_tests.rs"]
+mod store_answers;
 
 /// How the fake store behaves; tests change it between requests.
 #[derive(Clone, Default)]
@@ -36,6 +38,10 @@ struct Knobs {
     reset_next: usize,
     /// Every request is answered with this status and an error body.
     status: Option<u16>,
+    /// Answer a PUT after its head, then close without reading its body.
+    early_status: Option<u16>,
+    /// Fail body writes independently of when the early response arrives.
+    reject_body_writes: bool,
     /// Each answer waits this long first.
     respond_after: Option<Duration>,
     /// GET bodies are sent this many bytes at a time, with this pause after
@@ -157,6 +163,23 @@ impl FakeStore {
                 .map(|(_, value)| value.parse().unwrap())
                 .unwrap_or(0);
             let knobs = self.knobs();
+            if let Some(status) = knobs.early_status.filter(|_| method == "PUT") {
+                self.seen.lock().unwrap().push(Seen {
+                    method,
+                    path,
+                    headers,
+                    body: Vec::new(),
+                });
+                if let Some(delay) = knobs.respond_after {
+                    tokio::time::sleep(delay).await;
+                }
+                let answer = format!(
+                    "HTTP/1.1 {status} Early\r\netag: secret\r\ncontent-type: application/xml\r\ncontent-length: {}\r\n\r\n{LEAK}",
+                    LEAK.len()
+                );
+                let _ = io.write_all(answer.as_bytes()).await;
+                return;
+            }
             let mut body = Vec::new();
             while body.len() < content_length {
                 if !buf.is_empty() {
@@ -178,7 +201,7 @@ impl FakeStore {
             self.seen.lock().unwrap().push(Seen {
                 method: method.clone(),
                 path: path.clone(),
-                headers,
+                headers: headers.clone(),
                 body: body.clone(),
             });
             let script = self.knobs.lock().unwrap().script.take();
@@ -204,7 +227,24 @@ impl FakeStore {
                     return;
                 }
             }
-            if let Some(status) = knobs.status {
+            let status = if method == "PUT" && knobs.status.is_none() {
+                let create_only = headers
+                    .iter()
+                    .any(|(name, value)| name == "if-none-match" && value == "*");
+                let mut objects = self.objects.lock().unwrap();
+                if create_only
+                    && (objects.contains_key(&path)
+                        || self.sized.lock().unwrap().contains_key(&path))
+                {
+                    Some(412)
+                } else {
+                    objects.insert(path.clone(), body.clone());
+                    None
+                }
+            } else {
+                knobs.status
+            };
+            if let Some(status) = status {
                 let error = format!("<Error><AccessKeyId>{LEAK}</AccessKeyId></Error>");
                 let head = format!(
                     "HTTP/1.1 {status} Error\r\ncontent-type: application/xml\r\nx-amz-request-id: R1\r\ncontent-length: {}\r\n\r\n",
@@ -220,7 +260,6 @@ impl FakeStore {
                 continue;
             }
             if method == "PUT" {
-                self.put_object(&path, &body);
                 let head = "HTTP/1.1 200 OK\r\netag: \"put-etag\"\r\nx-amz-request-id: R2\r\nx-amz-id-2: internal\r\ncontent-length: 0\r\n\r\n";
                 if io.write_all(head.as_bytes()).await.is_err() {
                     return;
@@ -282,6 +321,53 @@ impl FakeStore {
 
 pub(crate) struct FakeConnector(pub(crate) Arc<FakeStore>);
 
+struct HeadOnlyIo {
+    io: DuplexStream,
+    head_sent: bool,
+}
+
+impl AsyncRead for HeadOnlyIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HeadOnlyIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.head_sent {
+            return std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        let result = std::pin::Pin::new(&mut self.io).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = result {
+            assert_eq!(n, buf.len(), "the fixture head fits in the duplex buffer");
+            self.head_sent = true;
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
 impl Connector for FakeConnector {
     fn connect<'a>(&'a self, target: &'a Target) -> ConnectFuture<'a> {
         let store = self.0.clone();
@@ -298,6 +384,12 @@ impl Connector for FakeConnector {
             }
             let (client, server) = tokio::io::duplex(64 * 1024);
             tokio::spawn(store.serve(server));
+            if knobs.reject_body_writes {
+                return Ok(Box::new(HeadOnlyIo {
+                    io: client,
+                    head_sent: false,
+                }) as BoxedIo);
+            }
             Ok(Box::new(client) as BoxedIo)
         })
     }

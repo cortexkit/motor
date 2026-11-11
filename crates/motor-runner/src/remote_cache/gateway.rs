@@ -235,6 +235,7 @@ pub(crate) struct Binding {
     /// Shared by all of a job's sockets, read-only or job-create.
     owner: Arc<Owner>,
     ledger: Option<Arc<WriteLedger>>,
+    job_puts: Option<Arc<Mutex<JobPutTotals>>>,
 }
 
 impl Binding {
@@ -351,6 +352,49 @@ struct PutRecord {
     stored: bool,
 }
 
+/// Job-create PUT outcomes, kept by job id across sockets and key rotations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct JobPutTotals {
+    pub(crate) accepted: u64,
+    pub(crate) duplicate: u64,
+    pub(crate) failed: u64,
+    pub(crate) refused: u64,
+    /// Content-Length summed only for PUTs the store answered with 2xx.
+    pub(crate) accepted_bytes: u64,
+}
+
+enum JobPutOutcome {
+    Accepted(u64),
+    Duplicate,
+    Failed,
+    Refused,
+}
+
+struct JobPutRecord {
+    totals: Arc<Mutex<JobPutTotals>>,
+    outcome: JobPutOutcome,
+}
+
+impl Drop for JobPutRecord {
+    fn drop(&mut self) {
+        let mut totals = self.totals.lock().unwrap();
+        match self.outcome {
+            JobPutOutcome::Accepted(bytes) => {
+                totals.accepted += 1;
+                totals.accepted_bytes += bytes;
+            }
+            JobPutOutcome::Duplicate => totals.duplicate += 1,
+            JobPutOutcome::Failed => totals.failed += 1,
+            JobPutOutcome::Refused => totals.refused += 1,
+        }
+    }
+}
+
+struct PutRecords {
+    fill: Option<PutRecord>,
+    job: Option<JobPutRecord>,
+}
+
 impl Drop for PutRecord {
     fn drop(&mut self) {
         let mut state = self.ledger.state.lock().unwrap();
@@ -436,6 +480,7 @@ struct Shared {
     total_reads: Arc<AtomicUsize>,
     total_connections: Arc<AtomicUsize>,
     jobs: Mutex<HashMap<String, Weak<Owner>>>,
+    job_puts: Mutex<HashMap<String, Arc<Mutex<JobPutTotals>>>>,
     counters: [ToolCounters; 2],
     origin: Instant,
 }
@@ -696,6 +741,7 @@ impl Gateway {
                 total_reads: Arc::new(AtomicUsize::new(0)),
                 total_connections: Arc::new(AtomicUsize::new(0)),
                 jobs: Mutex::new(HashMap::new()),
+                job_puts: Mutex::new(HashMap::new()),
                 counters: Default::default(),
                 origin: Instant::now(),
             }),
@@ -744,6 +790,15 @@ impl Gateway {
             tenant: tenant.to_string(),
             owner,
             ledger: None,
+            job_puts: (endpoint == Endpoint::JobCreate).then(|| {
+                self.shared
+                    .job_puts
+                    .lock()
+                    .unwrap()
+                    .entry(job.to_string())
+                    .or_default()
+                    .clone()
+            }),
         })
     }
 
@@ -761,6 +816,7 @@ impl Gateway {
                 state: Mutex::new(LedgerSummary::default()),
                 idle: Notify::new(),
             })),
+            job_puts: None,
         })
     }
 
@@ -873,6 +929,17 @@ impl Gateway {
         self.shared.counters[tool.index()].snapshot(self.shared.origin)
     }
 
+    /// Job-create PUT totals, including refusals before contacting the store.
+    pub(crate) fn job_put_totals(&self, job: &str) -> JobPutTotals {
+        self.shared
+            .job_puts
+            .lock()
+            .unwrap()
+            .get(job)
+            .map(|totals| totals.lock().unwrap().clone())
+            .unwrap_or_default()
+    }
+
     /// The end of the write breaker's open window while it is open.
     pub(crate) fn write_breaker_open_until(&self) -> Option<Instant> {
         self.shared.write_breaker.open_until()
@@ -952,7 +1019,7 @@ impl Gateway {
         let deadline = received + limits.deadline;
         let endpoint = binding.endpoint;
         let body_free = head.body_free();
-        let mut put = (head.method == "PUT")
+        let fill = (head.method == "PUT")
             .then(|| binding.ledger.clone())
             .flatten()
             .map(|ledger| PutRecord {
@@ -961,6 +1028,14 @@ impl Gateway {
                 key: None,
                 stored: false,
             });
+        let job = (head.method == "PUT")
+            .then(|| binding.job_puts.clone())
+            .flatten()
+            .map(|totals| JobPutRecord {
+                totals,
+                outcome: JobPutOutcome::Refused,
+            });
+        let mut put = PutRecords { fill, job };
         let Some(request) = parse_request(&head, endpoint) else {
             self.refused(binding, endpoint, "method, query or encoding");
             return self
@@ -1046,7 +1121,7 @@ impl Gateway {
                     .await;
             }
         };
-        if let Some(put) = &mut put {
+        if let Some(put) = &mut put.fill {
             // Every PUT is tagged with the store identity of the generation
             // that signs it, so a fill can tell whether all of its PUTs went
             // to the store it started with.
@@ -1075,7 +1150,7 @@ impl Gateway {
         };
         let probe = binding.tool == Tool::Sccache && bare == SCCACHE_CHECK_KEY;
         let next = self
-            .exchange(binding, client, &exchange, &mut ticket, put.as_mut(), probe)
+            .exchange(binding, client, &exchange, &mut ticket, &mut put, probe)
             .await;
         self.counters(binding.tool)
             .record_latency(self.shared.origin, received.elapsed());
@@ -1138,7 +1213,7 @@ impl Gateway {
         exchange: &Exchange<'_>,
         body_started: &mut bool,
         continue_sent: &mut bool,
-    ) -> Result<(Conn, ResponseHead), AttemptError>
+    ) -> Result<(Conn, ResponseHead, bool), AttemptError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1191,50 +1266,64 @@ impl Gateway {
         .await;
         match sent {
             Err(_) => return Err(AttemptError::Upstream(waiting_limit(first_byte_by))),
+            Ok(Err(_)) if exchange.create_only => {
+                let head = conn
+                    .read_head(Instant::now() + limits.first_byte_timeout, deadline, false)
+                    .await
+                    .map_err(AttemptError::Upstream)?;
+                return Ok((conn, head, exchange.request.content_length == 0));
+            }
             Ok(Err(_)) => return Err(AttemptError::Upstream(Failure::BeforeResponse)),
             Ok(Ok(())) => {}
         }
         let mut first_byte_by = first_byte_by;
+        let mut body_complete = !is_put;
         if is_put {
-            let mut left = exchange.request.content_length;
-            if left > 0 && exchange.request.expect_continue && !*continue_sent {
-                *continue_sent = true;
-                if client
-                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n", exchange.client_by())
-                    .await
-                    .is_err()
-                {
-                    return Err(AttemptError::Client);
+            'upload: {
+                let mut left = exchange.request.content_length;
+                if left > 0 && exchange.request.expect_continue && !*continue_sent {
+                    *continue_sent = true;
+                    if client
+                        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n", exchange.client_by())
+                        .await
+                        .is_err()
+                    {
+                        return Err(AttemptError::Client);
+                    }
                 }
-            }
-            let size = (limits.stream_buffer_bytes as u64).min(left).max(1) as usize;
-            let mut buf = vec![0u8; size];
-            while left > 0 {
-                let want = (buf.len() as u64).min(left) as usize;
-                let n = match tokio::time::timeout_at(
-                    exchange.client_by(),
-                    client.read_body(&mut buf[..want]),
-                )
-                .await
-                {
-                    Ok(Ok(n)) if n > 0 => n,
-                    _ => return Err(AttemptError::Client),
-                };
-                *body_started = true;
-                match tokio::time::timeout_at(deadline, conn.io.write_all(&buf[..n])).await {
+                let size = (limits.stream_buffer_bytes as u64).min(left).max(1) as usize;
+                let mut buf = vec![0u8; size];
+                while left > 0 {
+                    let want = (buf.len() as u64).min(left) as usize;
+                    let n = match tokio::time::timeout_at(
+                        exchange.client_by(),
+                        client.read_body(&mut buf[..want]),
+                    )
+                    .await
+                    {
+                        Ok(Ok(n)) if n > 0 => n,
+                        _ => return Err(AttemptError::Client),
+                    };
+                    *body_started = true;
+                    match tokio::time::timeout_at(deadline, conn.io.write_all(&buf[..n])).await {
+                        Err(_) => return Err(AttemptError::Upstream(Failure::Deadline)),
+                        Ok(Err(_)) if exchange.create_only => break 'upload,
+                        Ok(Err(_)) => return Err(AttemptError::Upstream(Failure::Transport)),
+                        Ok(Ok(())) => {}
+                    }
+                    left -= n as u64;
+                }
+                match tokio::time::timeout_at(deadline, conn.io.flush()).await {
                     Err(_) => return Err(AttemptError::Upstream(Failure::Deadline)),
+                    Ok(Err(_)) if exchange.create_only => break 'upload,
                     Ok(Err(_)) => return Err(AttemptError::Upstream(Failure::Transport)),
                     Ok(Ok(())) => {}
                 }
-                left -= n as u64;
+                body_complete = true;
             }
-            match tokio::time::timeout_at(deadline, conn.io.flush()).await {
-                Err(_) => return Err(AttemptError::Upstream(Failure::Deadline)),
-                Ok(Err(_)) => return Err(AttemptError::Upstream(Failure::Transport)),
-                Ok(Ok(())) => {}
-            }
-            // The first-byte limit restarts once the whole body is sent: a
-            // large upload is bounded by the overall deadline instead.
+            // A store can close its receive side after an early answer. Even
+            // after a write error, read that answer under the first-byte limit.
+            // The overall deadline still bounds the upload and the answer.
             first_byte_by = Instant::now() + limits.first_byte_timeout;
         }
         let head_request = exchange.request.method == Method::Head;
@@ -1245,7 +1334,7 @@ impl Gateway {
                 Err(AttemptError::Upstream(Failure::Transport))
             }
             Err(failure) => Err(AttemptError::Upstream(failure)),
-            Ok(head) => Ok((conn, head)),
+            Ok(head) => Ok((conn, head, body_complete)),
         }
     }
 
@@ -1255,7 +1344,7 @@ impl Gateway {
         client: &mut Inbound<S>,
         exchange: &Exchange<'_>,
         ticket: &mut Ticket,
-        mut put: Option<&mut PutRecord>,
+        put: &mut PutRecords,
         probe: bool,
     ) -> Next
     where
@@ -1267,10 +1356,13 @@ impl Gateway {
         let endpoint = binding.endpoint.for_method(request.method);
         let failure = endpoint.failure_status();
         let counters = self.counters(binding.tool);
+        if let Some(job) = &mut put.job {
+            job.outcome = JobPutOutcome::Failed;
+        }
         let mut body_started = false;
         let mut continue_sent = false;
         let mut retries = 0;
-        let (mut conn, head) = loop {
+        let (mut conn, head, body_complete) = loop {
             match self
                 .attempt(client, exchange, &mut body_started, &mut continue_sent)
                 .await
@@ -1304,8 +1396,30 @@ impl Gateway {
                 }
             }
         };
-        let close_requested = request.close_requested;
+        // Never parse another request over bytes of an unfinished PUT body.
+        // Closing also avoids pooling an upstream with a partly sent request.
+        let close_requested = request.close_requested || !body_complete;
         let status = head.status;
+        if endpoint == Endpoint::JobCreate {
+            if status == 412 {
+                ticket.report(Outcome::Success);
+                if let Some(job) = &mut put.job {
+                    job.outcome = JobPutOutcome::Duplicate;
+                }
+                return self
+                    .answer(client, 200, body_complete, close_requested, deadline)
+                    .await;
+            }
+            if !(200..300).contains(&status) {
+                self.fail(ticket, binding.tool);
+                return self
+                    .answer(client, failure, body_complete, close_requested, deadline)
+                    .await;
+            }
+            if let Some(job) = &mut put.job {
+                job.outcome = JobPutOutcome::Accepted(request.content_length);
+            }
+        }
         if status >= 500 {
             self.fail(ticket, binding.tool);
             return self
@@ -1315,13 +1429,13 @@ impl Gateway {
         // The store answered; whatever follows, it is reachable.
         if request.method == Method::Put {
             ticket.report(Outcome::Success);
-            let reusable = conn.discard(&head, deadline).await;
+            let reusable = body_complete && conn.discard(&head, deadline).await;
             if !(200..300).contains(&status) {
                 return self
                     .answer(client, failure, true, close_requested, deadline)
                     .await;
             }
-            if let Some(put) = put.as_mut() {
+            if let Some(put) = put.fill.as_mut() {
                 put.stored = true;
             }
             if reusable {
