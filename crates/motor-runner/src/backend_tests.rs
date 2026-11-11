@@ -5,6 +5,62 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(unix)]
+#[test]
+fn job_write_environment_changes_only_sccache_mode_and_never_exposes_keys() {
+    use crate::remote_cache::{
+        environment::Mode, gateway::Tool, provisioning::HostRole, transport::Forwarder,
+    };
+    let generation = crate::remote_cache::gateway::tests::generation("environment", "tenant");
+    let forwarders = [
+        Forwarder::new(Tool::Sccache, 4181),
+        Forwarder::new(Tool::Ccache, 4182),
+    ];
+    for role in [HostRole::BuildServer, HostRole::Boat, HostRole::TenantVm] {
+        let environment = |mode| {
+            let mut env = BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
+            remote_cache_job_environment(
+                role,
+                &forwarders,
+                &generation,
+                mode,
+                "/caller/project",
+                &mut env,
+            );
+            env
+        };
+        let mut expected = environment(Mode::JobRead);
+        if role == HostRole::TenantVm {
+            expected.insert("SCCACHE_S3_RW_MODE".into(), "READ_WRITE".into());
+        }
+        let written = environment(Mode::JobWrite);
+        assert_eq!(written, expected, "{role:?}");
+        assert_eq!(written["SCCACHE_ENDPOINT"], "http://127.0.0.1:4181");
+        assert_eq!(written["AWS_ACCESS_KEY_ID"], "remote-cache");
+        assert_eq!(written["AWS_SECRET_ACCESS_KEY"], "remote-cache");
+        assert!(!written.contains_key("SCCACHE_RECACHE"));
+        assert!(!written.contains_key("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY"));
+        for credential in [&generation.read_key, generation.write_key.as_ref().unwrap()] {
+            assert!(!written.values().any(|value| {
+                value.contains(&credential.access_key_id)
+                    || value.contains(&credential.secret_access_key)
+            }));
+        }
+        assert!(!written
+            .values()
+            .any(|value| value.contains(&generation.endpoint)));
+        if crate::remote_cache::ccache::installed(role) {
+            assert_eq!(
+                written["CCACHE_REMOTE_STORAGE"],
+                "http://127.0.0.1:4182|read-only"
+            );
+        } else {
+            assert!(!written.keys().any(|key| key.starts_with("CCACHE_")));
+        }
+        assert!(!written.contains_key("CCACHE_RECACHE"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct ArgumentIsolationLauncher {
     scratch: PathBuf,

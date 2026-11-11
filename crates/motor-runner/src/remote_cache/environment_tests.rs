@@ -19,7 +19,9 @@ spec = importlib.util.spec_from_file_location('remote_cache_environment', sys.ar
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 print(json.dumps(
-    {role: module.environment(role) for role in module.JOB_ENVIRONMENT_BY_ROLE},
+    {role: {mode: module.environment(role, mode=mode)
+            for mode in ('job-read', 'job-write', 'fill')}
+     for role in module.JOB_ENVIRONMENT_BY_ROLE},
     sort_keys=True,
 ))
 "#;
@@ -33,24 +35,31 @@ print(json.dumps(
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let written: BTreeMap<String, BTreeMap<String, String>> =
+    let written: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>> =
         serde_json::from_slice(&output.stdout).unwrap();
     for (role, expected) in [
         ("build-server", HostRole::BuildServer),
         ("boat", HostRole::Boat),
         ("tenant", HostRole::TenantVm),
     ] {
-        let forwarder = Forwarder::new(Tool::Sccache, 4181);
-        let here = delta(
-            expected,
-            &[forwarder],
-            "<remote-cache-bucket>",
-            "<remote-cache-region>",
-        );
-        assert_eq!(
-            written[role], here,
-            "the Rust and Python copies of the {role} delta disagree"
-        );
+        for (mode, rust_mode) in [
+            ("job-read", Mode::JobRead),
+            ("job-write", Mode::JobWrite),
+            ("fill", Mode::Fill),
+        ] {
+            let forwarder = Forwarder::new(Tool::Sccache, 4181);
+            let here = delta_for_mode(
+                expected,
+                rust_mode,
+                &[forwarder],
+                "<remote-cache-bucket>",
+                "<remote-cache-region>",
+            );
+            assert_eq!(
+                written[role][mode], here,
+                "the Rust and Python copies of the {role} {mode} delta disagree"
+            );
+        }
     }
 }
 
@@ -113,8 +122,23 @@ fn each_roles_switch_on_job_environment_is_its_baseline_plus_the_delta() {
     }
 }
 
-/// A fill writes every writable level and waits for each of them, and it is
-/// the only unit with read-write access to the store.
+#[test]
+fn a_job_write_delta_changes_only_the_sccache_write_mode() {
+    let forwarders = [Forwarder::new(Tool::Sccache, 4181)];
+    for role in [HostRole::BuildServer, HostRole::Boat, HostRole::TenantVm] {
+        let mut expected = delta(role, &forwarders, "bucket", "region");
+        if role == HostRole::TenantVm {
+            expected.insert("SCCACHE_S3_RW_MODE".into(), "READ_WRITE".into());
+        }
+        let written = delta_for_mode(role, Mode::JobWrite, &forwarders, "bucket", "region");
+        assert_eq!(written, expected, "{role:?}");
+        assert!(!written.contains_key("SCCACHE_RECACHE"));
+        assert!(!written.contains_key("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY"));
+    }
+}
+
+/// A fill writes every writable level and waits for each of them so its
+/// statistics include remote write failures.
 #[test]
 fn a_fill_adds_the_write_error_policy_and_writes_every_level() {
     assert_eq!(
@@ -128,25 +152,41 @@ fn a_fill_adds_the_write_error_policy_and_writes_every_level() {
         !small_values(HostRole::BuildServer).contains_key("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY")
     );
     assert!(!small_values(HostRole::Boat).contains_key("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY"));
-    // A fill is the only unit that may write, and it is never read-only.
     assert_eq!(READ_ONLY_MODE, "READ_ONLY");
     assert_eq!(READ_WRITE_MODE, "READ_WRITE");
     assert_eq!(
         small_values(HostRole::Boat)["SCCACHE_S3_RW_MODE"],
         READ_ONLY_MODE
     );
+    for role in [HostRole::BuildServer, HostRole::TenantVm] {
+        let forwarders = [Forwarder::new(Tool::Sccache, 4181)];
+        let mut expected = delta(role, &forwarders, "bucket", "region");
+        expected.extend([
+            ("SCCACHE_S3_RW_MODE".into(), "READ_WRITE".into()),
+            ("SCCACHE_RECACHE".into(), "1".into()),
+            ("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY".into(), "all".into()),
+        ]);
+        assert_eq!(
+            delta_for_mode(role, Mode::Fill, &forwarders, "bucket", "region"),
+            expected,
+            "{role:?}"
+        );
+    }
 }
 
 /// A forwarder for a tool the unit does not run must not become the endpoint.
 #[test]
 fn a_unit_without_an_sccache_socket_gets_no_endpoint() {
-    let env = delta(
-        HostRole::Boat,
-        &[Forwarder::new(Tool::Ccache, 4182)],
-        "b",
-        "r",
-    );
-    assert!(!env.contains_key("SCCACHE_ENDPOINT"));
-    let env = delta(HostRole::Boat, &[], "b", "r");
-    assert!(!env.contains_key("SCCACHE_ENDPOINT"));
+    for mode in [Mode::JobRead, Mode::JobWrite, Mode::Fill] {
+        let env = delta_for_mode(
+            HostRole::TenantVm,
+            mode,
+            &[Forwarder::new(Tool::Ccache, 4182)],
+            "b",
+            "r",
+        );
+        assert!(env.is_empty());
+        let env = delta_for_mode(HostRole::TenantVm, mode, &[], "b", "r");
+        assert!(env.is_empty());
+    }
 }
