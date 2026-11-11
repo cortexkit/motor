@@ -60,7 +60,7 @@ fn hello_with_gate_jobs(gate_jobs: bool) -> Frame {
         platforms: vec![],
     }
 }
-async fn frame(socket: &mut DuplexStream) -> Option<Frame> {
+async fn frame(socket: &mut (impl tokio::io::AsyncRead + Unpin)) -> Option<Frame> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match motor_protocol::read_frame_async(socket).await.unwrap() {

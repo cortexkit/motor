@@ -1,6 +1,14 @@
 use super::*;
 
 impl Runtime {
+    pub(super) fn remote_cache_write_blocked(&self) -> bool {
+        self.host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .remote_cache_write_blocked
+    }
+
     pub(super) fn set_remote_cache_write_block(&self, request: &Value) -> Result<Value> {
         let blocked = request["blocked"]
             .as_bool()

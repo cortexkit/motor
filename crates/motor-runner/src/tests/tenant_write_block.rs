@@ -55,13 +55,20 @@ async fn emergency_control_is_acknowledged_on_local_owner_admin_channel() {
     let (path, task) = super::super::listener(&f, &runner);
     for blocked in [true, false] {
         let mut client = tokio::net::UnixStream::connect(&*path).await.unwrap();
+        // Wait for the writer's initial heartbeat before sending Hello, so the
+        // valid heartbeat-before-handshake ordering is exercised without load.
+        tokio::time::timeout(Duration::from_secs(10), client.readable())
+            .await
+            .expect("owner channel did not send its initial heartbeat")
+            .unwrap();
         motor_protocol::write_frame_async(&mut client, &hello())
             .await
             .unwrap();
-        assert!(matches!(
-            motor_protocol::read_frame_async(&mut client).await.unwrap(),
-            Some(Frame::Hello { .. })
-        ));
+        let first = frame(&mut client).await;
+        assert!(
+            matches!(&first, Some(Frame::Hello { .. })),
+            "first owner frame: {first:?}"
+        );
         motor_protocol::write_frame_async(
             &mut client,
             &Frame::SetRemoteCacheWriteBlock { blocked },
@@ -69,7 +76,7 @@ async fn emergency_control_is_acknowledged_on_local_owner_admin_channel() {
         .await
         .unwrap();
         assert_eq!(
-            motor_protocol::read_frame_async(&mut client).await.unwrap(),
+            frame(&mut client).await,
             Some(Frame::SetRemoteCacheWriteBlockReply { blocked })
         );
     }
