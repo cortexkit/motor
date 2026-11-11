@@ -58,6 +58,12 @@ impl Stream {
             .and_then(|lease| lease.ended_at_ms);
         if end.is_some_and(|end| now_ms.saturating_sub(end) >= crate::billing::RECORD_RETENTION_MS)
         {
+            // A quarantined replay keeps its files as evidence and has no
+            // open store to expire. Reporting that as an error would fail
+            // every host tick for as long as the stream stays loaded.
+            if self.store.lock().expect("replay store").is_err() {
+                return Ok(());
+            }
             self.with_store(Store::expire_chunks)?;
         }
         Ok(())

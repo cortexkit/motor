@@ -269,6 +269,22 @@ fn replay_quarantine_releases_final_hold_and_survives_restart() {
         again.host.lock().unwrap().snapshot.per_job.executions[JOB].final_replay_reservation_bytes,
         None
     );
+    // Chunk expiry past retention skips a quarantined replay instead of
+    // failing every host tick.
+    again
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .leases
+        .get_mut(JOB)
+        .unwrap()
+        .ended_at_ms = Some(0);
+    again
+        .job_stream(JOB)
+        .unwrap()
+        .expire_chunks(u64::MAX)
+        .unwrap();
 }
 
 #[tokio::test]
