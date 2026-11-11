@@ -1,5 +1,10 @@
 # Runners wire contract
 
+An operator may later lower a settled job's measured usage with evidence. The original settlement
+and its reply remain immutable; a separate correction adjusts tenant accounting and, when
+metered, restates the settlement hour in the usage ledger. Hosts and clients have no new wire
+fields, routes or resend semantics: a different usage report still receives `usage_conflict`.
+
 The broker is `https://runners.cortexkit.io` (`workers/runners`). It is a control plane only:
 ck-motor receives a lease and connects directly to the placed host. Job bytes never pass through
 the broker. [runners.md](runners.md) covers architecture, operator commands, deployment and key
@@ -863,15 +868,18 @@ machine that runs its jobs:
   work for lack of storage.
 - `free_mem_mib` is the memory available to the tenant machine that runs jobs, not to the host:
   the tenant guest's available memory as its runner reports it, floored to MiB, minus the host's
-  configured tenant memory reserve (rounded up to MiB), and 0 if that would be negative. A host
-  without a valid capacity configuration reports 0. A stopped or suspended tenant reports its full
-  RAM minus the reserve, so the lease that wakes it can be placed. A running tenant without a fresh
-  sample (older than 30,000 ms, or a failed probe) reports 0.
+  configured tenant memory reserve (rounded up to MiB), minus the `mem_mib` of every lease the host
+  lists `reserved`, and 0 if that would be negative. A host without a valid capacity configuration
+  reports 0. A stopped or suspended tenant uses its full RAM in place of the guest sample, so the
+  lease that wakes it can be placed. A running tenant without a fresh sample (older than 30,000 ms,
+  or a failed probe) reports 0.
 - A host with several tenants reports, for each field independently, the maximum over its tenants.
 
-The broker subtracts each placed job's vCPUs until the host's latest accepted snapshot lists it
-in `running` in any state (`reserved`, `admitted` or `started`), and its memory until `admitted`
-or `started`, from that host's reported free capacity before comparing (see the in-flight ledger under
+In both host modes, `free_mem_mib` accounts for every job the heartbeat lists, by debit before it
+runs or by measurement after. The broker holds memory only for placed jobs the host does not list
+yet. It subtracts each placed job's vCPUs and memory from that host's reported free capacity until
+the host's latest accepted snapshot lists it in `running` in any state (`reserved`, `admitted` or
+`started`). It compares the resulting capacity (see the in-flight ledger under
 [Placement, deadlines and metering](#placement-deadlines-and-metering)), so several leases placed
 within one heartbeat interval don't all pass against the same values. The figures are still a
 snapshot, not a lock: the host's own admission is the real limit, and a lease it can't take is
@@ -887,14 +895,14 @@ the same way. A host in tenant-VM mode keeps the meanings above. In per-job mode
   VMs, and also its own cache-fill and disk-recovery VMs. It is 0 while the host refuses new work
   for lack of storage.
 - `free_mem_mib` is the host's real available memory, floored to MiB, minus its configured reserve
-  (rounded up to MiB), minus the `mem_mib` of every admitted job whose VM has not finished booting,
-  and 0 if that would be negative. A booted VM uses host memory only as its guest touches it, so
-  the host deliberately overcommits job memory limits, as one shared tenant VM does today. The host
+  (rounded up to MiB), minus each listed job's memory debit (its `mem_mib` plus the host's boot
+  reserve) until its VM's runner has started, including jobs queued behind a busy workspace disk.
+  The same debit applies to the host's own cache-fill and recovery VMs until their runners start.
+  The figure is 0 if that would be negative. A running VM uses host memory only as its guest touches
+  it, so the host deliberately overcommits job memory limits, as one shared tenant VM does. The host
   enforces this itself: its admission uses the same figure, it reclaims memory first from the VMs
   furthest over their stated memory, and a VM that cannot give memory back is stopped and reported
-  with `oom_kill: "host_pressure"`. The broker's in-flight ledger still holds a placed job's memory
-  until the job is `admitted` or `started`, which is where the host's booting-job subtraction
-  takes over.
+  with `oom_kill: "host_pressure"`.
 - `tenant_disk` is omitted, since disk space is held per workspace disk. Placement then applies
   no disk rule to the host, and the storage refusal in `free_vcpus` is the guard.
 - `warm` lists the workspace disks on the host, one per tenant and `workspace_key_hash`. `vm` is
@@ -1077,14 +1085,13 @@ filling one, the placement object keeps a ledger: when it answers a placement a 
 same storage transaction as the decision. A host's effective free vCPUs and memory are its last
 accepted heartbeat's `free_vcpus` and `free_mem_mib` minus the resources its live entries still
 hold. A job listed in that host's latest accepted `running` list in any state (`reserved`,
-`admitted` or `started`) no longer holds vCPUs: the host already counts its reservation.
-Memory stays held until `admitted` or `started`, because a queued job uses no guest memory yet.
+`admitted` or `started`) no longer holds vCPUs or memory: the host already accounts for both.
 A job not reported by that host still holds both resources. The fit check and ordering both use
 these effective figures. An entry is removed on any of these events (the 1024-entry cap below can also evict one):
 
 - on the first heartbeat from H whose `running` list shows the job `admitted` or `started`, the
-  point from which the host's own figures count both resources. A heartbeat that shows the job
-  `reserved` keeps the entry for memory and clears its absence evidence;
+  point from which the heartbeat's workspace busy flag takes over. A heartbeat that shows the job
+  `reserved` keeps the entry for its workspace busy mark and clears its absence evidence;
 - after two consecutive counted absences from H's accepted, strictly newer snapshots at the same
   host generation. Each entry durably records the broker-time origin of its unobserved episode,
   absence count and host generation. New placements start the episode at creation; an absence
@@ -1100,7 +1107,7 @@ these effective figures. An entry is removed on any of these events (the 1024-en
   token, so the job can no longer be admitted. When a re-signed run token's refresh reaches the
   placement object, it extends an existing entry's expiry without changing its absence origin or
   count. It recreates a missing entry only when the latest accepted heartbeat lists the job
-  `reserved`, since that job still needs a memory hold; no fit check is needed for this host-held
+  `reserved`, since that job still needs a workspace busy mark; no fit check is needed for this host-held
   reservation. A job absent from that snapshot gets no new hold. Admission or a committed entry
   for another host still suppresses refresh as before.
 
