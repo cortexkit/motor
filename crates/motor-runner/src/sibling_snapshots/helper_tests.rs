@@ -209,6 +209,29 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn fixture_tenant_dns_paths_keep_attachment_and_file_checks() {
+    let scratch = ScratchDir::new("tenant-fixture-dns");
+    let mut config = Config::new(&*scratch, "main");
+    config.tenant_vm = true;
+    let marker = scratch.join("generation");
+    let directory = scratch.join("dns");
+    config.fixture_tenant_dns = Some((marker.clone(), directory.clone()));
+    assert!(TenantResolver::new(&config).resolver().is_err());
+    fs::write(&marker, "1\n").unwrap();
+    assert!(TenantResolver::new(&config).resolver().is_err());
+    fs::create_dir(&directory).unwrap();
+    let resolver = directory.join("resolv.conf");
+    fs::write(&resolver, "nameserver 127.0.0.1\n").unwrap();
+    assert_eq!(
+        TenantResolver::new(&config).resolver().unwrap(),
+        Some(resolver)
+    );
+    fs::write(&marker, "").unwrap();
+    assert!(TenantResolver::new(&config).resolver().is_err());
+}
+
+#[test]
 fn snapshot_helper_units_do_not_set_the_job_nofile_limit() {
     let scratch = ScratchDir::new("snapshot-helper-nofile");
     let config = Config::new(&*scratch, "main");

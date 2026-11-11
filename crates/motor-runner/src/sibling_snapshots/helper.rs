@@ -349,6 +349,10 @@ pub(crate) enum TenantResolver {
 
 impl TenantResolver {
     pub(crate) fn new(config: &Config) -> Self {
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some((marker, directory)) = &config.fixture_tenant_dns {
+            return Self::under(config.tenant_vm, config.boat_profile, marker, directory);
+        }
         Self::under(
             config.tenant_vm,
             config.boat_profile,
