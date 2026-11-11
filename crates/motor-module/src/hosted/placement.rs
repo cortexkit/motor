@@ -79,7 +79,10 @@ impl<'de> Deserialize<'de> for Lease {
 }
 impl Lease {
     pub(crate) fn caller_placement(&self) -> Option<cortexkit_exec_remote_types::Placement> {
-        caller_placement(self.provider.as_deref(), Some(&self.placement.host))
+        // The broker names a provider only for Boat; a lease without one is a
+        // registered first-party host (see the deserializer above).
+        let provider = self.provider.as_deref().unwrap_or("first_party");
+        caller_placement(Some(provider), Some(&self.placement.host))
     }
 
     fn validate_ssh(&self) -> Result<(), Error> {
@@ -217,9 +220,22 @@ mod tests {
         );
     }
 
+    /// Real first-party grants carry no provider field (only Boat grants do;
+    /// see contracts/cloud/boat-lease.json), so a grant without one must still
+    /// name its registered host.
     #[test]
-    fn providerless_grant_does_not_invent_placement() {
-        assert!(first_party_grant(None).caller_placement().is_none());
+    fn providerless_grant_is_a_first_party_host() {
+        let accepted = Accepted::new(Uuid::nil(), 0)
+            .with_placement(first_party_grant(None).caller_placement().unwrap());
+        assert_eq!(
+            serde_json::to_value(accepted).unwrap()["placement"],
+            json!({ "provider": "first_party", "host": "host-a" })
+        );
+    }
+
+    #[test]
+    fn display_mapping_without_a_provider_is_absent() {
+        assert!(caller_placement(None, Some("host-a")).is_none());
     }
 
     #[test]
