@@ -1066,12 +1066,26 @@ fn a_lease_body_stored_before_avoid_host_existed_loads_as_avoiding_none() {
     assert_eq!(state(&body).avoid_host, None);
 }
 
+/// This crate's directory at a path hosted checks accept. A remote Linux job
+/// with fixed checkout paths builds the crate under `/w/...`, which is not
+/// under /Users or /home; the same checkout stays reachable at the caller's
+/// path, which the runner names in `MOTOR_CALLER_WORKSPACE`.
+fn crate_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    match std::env::var_os("MOTOR_CALLER_WORKSPACE") {
+        Some(caller) if !allowed_path(manifest) => {
+            std::path::PathBuf::from(caller).join("crates/motor-module")
+        }
+        _ => manifest.to_path_buf(),
+    }
+}
+
 /// A git checkout with one commit below this crate's target directory. Hosted
 /// workspace paths must be under /Users or /home, so the tests using it need a
 /// checkout in one of those roots, which test scratch directories are not.
 pub(crate) fn committed_repo() -> (tests::harness::Scratch, std::path::PathBuf) {
     let scratch = tests::harness::Scratch(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        crate_dir()
             .join("target")
             .join(format!("hosted-fixture-{}", Uuid::now_v7())),
     );
