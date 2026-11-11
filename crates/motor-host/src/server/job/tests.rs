@@ -77,7 +77,6 @@ struct Fake {
     seeds: Mutex<Vec<motor_vm_helper::job::Seed>>,
     fail_seed: AtomicBool,
     workspace_contents: Mutex<BTreeMap<String, Option<String>>>,
-    seed_runtime: Mutex<Option<std::sync::Weak<Runtime>>>,
     calls: Mutex<Vec<String>>,
     inputs: Arc<Mutex<Vec<Vec<u8>>>>,
     gate: (Mutex<bool>, Condvar),
@@ -207,18 +206,7 @@ impl Control for Fake {
         Ok(())
     }
     fn seed_workspace(&self, seed: &motor_vm_helper::job::Seed) -> Result<()> {
-        if let Some(runtime) = self
-            .seed_runtime
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        {
-            assert!(
-                runtime.host.try_lock().is_ok(),
-                "helper called under host lock"
-            );
-        }
+        self.wait("seed");
         self.seeds.lock().unwrap().push(seed.clone());
         ensure!(
             !self.fail_seed.load(Ordering::SeqCst),
@@ -653,7 +641,7 @@ async fn next_type(client: &mut tokio::io::DuplexStream, kind: &str) -> Value {
         if frame["type"] == kind {
             return frame;
         }
-        assert_eq!(frame["type"], "heartbeat", "{frame}");
+        assert_eq!(frame["type"], "heartbeat", "expected {kind}, got {frame}");
     }
 }
 async fn queued(client: &mut tokio::io::DuplexStream, job: &str) {

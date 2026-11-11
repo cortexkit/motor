@@ -130,10 +130,50 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
         .unwrap()
         .iter()
         .any(|call| call.starts_with("start:")));
+    let terminal = loop {
+        let frame = raw(&mut client).await.unwrap();
+        if frame.value["type"] != "heartbeat" {
+            break frame;
+        }
+    };
+    assert_eq!(terminal.value["type"], "terminal");
+    assert_eq!(terminal.value["ran"], "none");
     assert_eq!(
-        next_type(&mut client, "lease_refused").await["reason"],
-        "internal_failure"
+        terminal.value["outcome"],
+        json!({
+            "type":"refused_before_start", "reason":"internal_failure"
+        })
     );
+    let stored = runtime
+        .job_stream(JOB)
+        .unwrap()
+        .with_store(|store| Ok(store.cursor_frame(0, 0)?.unwrap().1))
+        .unwrap();
+    assert_eq!(terminal.bytes, stored);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn ended_lease_during_preparation_replays_its_stored_terminal() {
+    let (runtime, _, storage) = fixture();
+    storage.pause_prepare.store(true, Ordering::Release);
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    queued(&mut client, JOB).await;
+    storage.prepare_entered.notified().await;
+    next_type(&mut client, "heartbeat").await;
+    runtime.stop_job(JOB, true, false).unwrap();
+    {
+        let host = runtime.host.lock().unwrap();
+        assert_eq!(host.snapshot.leases[JOB].state, LeaseState::Ended);
+        assert!(!host.snapshot.per_job.executions[JOB].ended);
+    }
+    *storage.prepare_gate.0.lock().unwrap() = true;
+    storage.prepare_gate.1.notify_all();
+    let terminal = next_type(&mut client, "terminal").await;
+    assert_eq!(terminal["ran"], "none");
+    assert_eq!(terminal["outcome"]["type"], "refused_before_start");
     task.await.unwrap().unwrap();
 }
 
