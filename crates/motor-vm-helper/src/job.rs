@@ -220,7 +220,6 @@ pub struct ExitReport {
 }
 
 pub enum Operation {
-    AdmitCacheWrite(String),
     PrepareFill(Fill),
     FinishFill {
         fill: Fill,
@@ -257,7 +256,6 @@ pub enum Operation {
 impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::AdmitCacheWrite(_) => Ok(()),
             Self::PrepareFill(fill) | Self::FinishFill { fill, .. } => fill.validate(),
             Self::SeedWorkspace(seed) => {
                 validate_account(&seed.account)?;

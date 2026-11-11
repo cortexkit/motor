@@ -110,7 +110,7 @@ enum CollectionFailure {
 }
 
 pub struct LinuxJobs {
-    cache_write_grants: crate::cache_write::Grants,
+    pub(super) cache_write_grants: crate::cache_write::Authority,
     settings: Option<JobVms>,
     groups: PathBuf,
     records_path: PathBuf,
@@ -166,7 +166,9 @@ impl LinuxJobs {
     }
     pub fn new(config: &Config) -> Self {
         Self {
-            cache_write_grants: crate::cache_write::Grants::new(config),
+            cache_write_grants: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::cache_write::Grants::new(config),
+            )),
             settings: config.job_vms.clone(),
             groups: cgroup::JOB_SLICE.into(),
             records_path: job::RECORDS.into(),
@@ -409,7 +411,6 @@ impl LinuxJobs {
     }
 
     pub fn maintain(&mut self) -> Result<()> {
-        self.cache_write_grants.maintain();
         self.maintain_at(SystemTime::now())
     }
 
@@ -596,10 +597,6 @@ impl LinuxJobs {
             self.collect_exits()?;
         }
         match op {
-            Operation::AdmitCacheWrite(token) => {
-                self.cache_write_grants.admit(&token)?;
-                Ok(Response::new(Reply::Ok))
-            }
             Operation::PrepareFill(fill) => {
                 self.check_workspace_size(fill.size_bytes)?;
                 self.disk_available_identity(&fill.disk_id())?;

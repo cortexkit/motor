@@ -4,6 +4,7 @@ use motor_lease::{verify_token, AuthError, Jwks, KeySet, Purpose, JWKS_URL};
 use std::{
     collections::BTreeMap,
     io::Read,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +14,10 @@ pub struct Grant {
     pub jti: String,
     pub workspace_key_hash: String,
 }
+
+/// Shared only inside the helper. Network work holds this lock, never the
+/// global lifecycle lock, so a slow broker cannot delay VM stop or memory controls.
+pub type Authority = Arc<Mutex<Grants>>;
 
 /// Memory belongs to the root helper, not the host ledger. Restart loses grants
 /// and therefore falls back to read-only rather than trusting restored host state.
@@ -58,9 +63,6 @@ impl Grants {
             return Err(Error("cache-write token does not grant writes".into()));
         }
         validate_start_window(&claims.jti, now)?;
-        if self.grants.contains_key(&claims.jti) {
-            return Err(Error("cache-write grant already recorded".into()));
-        }
         let grant = Grant {
             sub: claims.sub,
             jti: claims.jti,
@@ -68,6 +70,14 @@ impl Grants {
                 .workspace_key_hash
                 .ok_or_else(|| Error("cache-write token has no workspace hash".into()))?,
         };
+        if let Some(existing) = self.grants.get(&grant.jti) {
+            if existing != &grant {
+                return Err(Error(
+                    "cache-write grant already recorded with another binding".into(),
+                ));
+            }
+            return Ok(());
+        }
         self.grants.insert(grant.jti.clone(), grant);
         Ok(())
     }

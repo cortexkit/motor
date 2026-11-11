@@ -62,6 +62,8 @@ struct Server {
     broker: Arc<Mutex<FakeBroker>>,
     requests: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    arrived: std::sync::mpsc::Receiver<()>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -74,6 +76,9 @@ impl Server {
         let requests = Arc::new(AtomicUsize::new(0));
         let fail = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (arrived_tx, arrived) = std::sync::mpsc::channel();
+        let fetch_gate = gate.clone();
         let (b, r, f, s) = (broker.clone(), requests.clone(), fail.clone(), stop.clone());
         let thread = std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -96,6 +101,12 @@ impl Server {
                     }
                 }
                 r.fetch_add(1, Ordering::SeqCst);
+                arrived_tx.send(()).unwrap();
+                let mut held = fetch_gate.0.lock().unwrap();
+                while *held {
+                    held = fetch_gate.1.wait(held).unwrap();
+                }
+                drop(held);
                 let reply = b.lock().unwrap().handle(
                     BrokerRequest {
                         method: "GET",
@@ -122,6 +133,8 @@ impl Server {
             broker,
             requests,
             fail,
+            gate,
+            arrived,
             stop,
             thread: Some(thread),
         }
@@ -139,6 +152,8 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        *self.gate.0.lock().unwrap() = false;
+        self.gate.1.notify_all();
         self.stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.address);
         self.thread.take().unwrap().join().unwrap();
@@ -180,6 +195,7 @@ fn invalid_credentials_never_record_a_grant() {
         assert!(grants.admit_with_clock(&token, now).is_err());
         assert!(grants.grants.is_empty());
     }
+    server.arrived.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
 }
 
@@ -195,7 +211,7 @@ fn valid_admission_is_immutable_and_survives_token_expiry_until_start_window_end
         workspace_key_hash: c.workspace_key_hash.clone().unwrap(),
     };
     assert_eq!(grants.get_at(&c.jti, now()), Some(&expected));
-    assert!(grants.admit_with_clock(&token(&c), now).is_err());
+    grants.admit_with_clock(&token(&c), now).unwrap();
     let mut changed = c.clone();
     changed.sub = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
     changed.workspace_key_hash = Some(base64url(&[8; 32]));
@@ -326,4 +342,129 @@ fn key_refresh_uses_ten_minute_cadence_and_throttled_unknown_kid_refetch() {
         .admit_with_clock(&token, || now() + Duration::from_secs(1260))
         .is_err());
     assert!(!grants.grants.contains_key(&c.jti));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_jwks_fetch_does_not_block_stop_and_concurrent_admissions_share_one_grant() {
+    use crate::{Helper, Kind, Lease, Machine, Reply};
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+    struct LifecycleMachine {
+        authority: Authority,
+        stopped: Arc<AtomicBool>,
+    }
+    impl Machine for LifecycleMachine {
+        fn cache_write_authority(&self) -> Option<Authority> {
+            Some(self.authority.clone())
+        }
+        fn reconcile(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn start(&mut self, _: usize, _: &Lease, _: Kind) -> Result<Vec<OwnedFd>> {
+            Ok(vec![])
+        }
+        fn stop(&mut self, _: usize, _: &Lease, _: bool) -> Result<()> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn cleanup(&mut self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn alive(&mut self, _: usize) -> bool {
+            true
+        }
+    }
+    fn connection(
+        helper: &Arc<Mutex<Helper<LifecycleMachine>>>,
+    ) -> (BufReader<UnixStream>, JoinHandle<()>) {
+        let (client, stream) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let peer = crate::linux::server::peer(&stream).unwrap();
+        let id = helper.lock().unwrap().connect(peer).unwrap();
+        let helper = helper.clone();
+        let worker = std::thread::spawn(move || {
+            crate::linux::server::connection_loop(&helper, id, stream).unwrap();
+            helper.lock().unwrap().disconnect(id);
+        });
+        (BufReader::new(client), worker)
+    }
+    fn send(client: &mut BufReader<UnixStream>, request: serde_json::Value) {
+        writeln!(client.get_mut(), "{request}").unwrap();
+    }
+    fn receive(client: &mut BufReader<UnixStream>) -> serde_json::Value {
+        let mut line = String::new();
+        client.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    let server = Server::new();
+    let authority = Arc::new(Mutex::new(Grants::new(&server.config())));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let helper = Arc::new(Mutex::new(
+        Helper::new(
+            LifecycleMachine {
+                authority: authority.clone(),
+                stopped: stopped.clone(),
+            },
+            1,
+            vec![unsafe { libc::geteuid() }],
+        )
+        .unwrap(),
+    ));
+    let (mut lifecycle, lifecycle_thread) = connection(&helper);
+    let job = crate::job::test_id(100);
+    send(
+        &mut lifecycle,
+        json!({"op":"acquire","instance":"test","job_id":job}),
+    );
+    assert_eq!(
+        receive(&mut lifecycle),
+        json!({"result":"acquired","slot":0})
+    );
+    send(
+        &mut lifecycle,
+        json!({"op":"start","slot":0,"instance":"test","job_id":job,"kind":"job"}),
+    );
+    assert_eq!(
+        receive(&mut lifecycle),
+        serde_json::to_value(Reply::Started { fd_count: 0 }).unwrap()
+    );
+
+    *server.gate.0.lock().unwrap() = true;
+    let (mut first, first_thread) = connection(&helper);
+    let (mut second, second_thread) = connection(&helper);
+    let mut c = claims();
+    c.jti = crate::job::test_id(101);
+    c.iat = seconds(SystemTime::now()).unwrap();
+    c.exp = c.iat + 300;
+    let request = json!({"op":"admit_cache_write","token":token(&c)});
+    send(&mut first, request.clone());
+    server.arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+    send(&mut second, request);
+    // Both admissions use the authority lock. Lifecycle requests use only the
+    // global Helper lock and must complete while the broker is still held.
+    send(
+        &mut lifecycle,
+        json!({"op":"stop","slot":0,"instance":"test","job_id":job,"export":false}),
+    );
+    let stop_reply = receive(&mut lifecycle);
+    assert!(stopped.load(Ordering::SeqCst));
+    assert_eq!(stop_reply, json!({"result":"ok"}));
+    *server.gate.0.lock().unwrap() = false;
+    server.gate.1.notify_all();
+    assert_eq!(receive(&mut first), json!({"result":"ok"}));
+    assert_eq!(receive(&mut second), json!({"result":"ok"}));
+    assert_eq!(authority.lock().unwrap().grants.len(), 1);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.lock().unwrap().get(&c.jti).unwrap().sub, c.sub);
+    assert!(helper.lock().unwrap().admission_work(u64::MAX).is_err());
+    helper.lock().unwrap().shutdown().unwrap();
+    assert!(helper.lock().unwrap().admission_work(1).is_err());
+    drop((first, second, lifecycle));
+    first_thread.join().unwrap();
+    second_thread.join().unwrap();
+    lifecycle_thread.join().unwrap();
 }

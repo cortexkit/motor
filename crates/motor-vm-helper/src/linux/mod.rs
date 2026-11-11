@@ -97,6 +97,9 @@ impl LinuxMachine {
     }
 }
 impl Machine for LinuxMachine {
+    fn cache_write_authority(&self) -> Option<crate::cache_write::Authority> {
+        Some(self.jobs.cache_write_grants.clone())
+    }
     fn reconcile(&mut self) -> Result<()> {
         // Check no-internal-process constraints even before cleanup. Never fix
         // incorrect placement by moving an unrecognised root service process.
