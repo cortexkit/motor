@@ -23,12 +23,16 @@ SHA-256 digests of the imported files (paths relative to this directory):
 | `tests/it/lifecycle.py` | `a739a77e92a7f2409e320339e500a97d753efa635d4ce780b56c3aaf67805c75` |
 | `tests/it/main.rs` | `ade87a9b10a94604d1a619f4b3648cb1ec4978a2ed8a96dc4996006c1f7e88b8` |
 | `tests/it/wrapper.rs` | `be3f0086c067a044ba811954ce3597ed0d539554b094a86ea3b674024c4ac4eb` |
-| `../../scripts/tests/test_build_budget.py` | `577f98512fa637b0c75cac555bfc5da4e5169185c44587e31e8227fff37f0d6b` |
+| `../../scripts/tests/test_build_budget.py` | `9bc387a08d6a036b91013993570ae891a99130e419ed623b2e5d5dc23793a994` |
 
 The filtered import of motor's history from prefrontal omitted
 `scripts/tests/test_build_budget.py`, the standard-library-only base fixture
-required to run the supervisor's lifecycle tests. It was restored unchanged
-from prefrontal's frozen source revision, `d529e17eb`.
+required to run the supervisor's lifecycle tests. It was restored from
+prefrontal's frozen source revision, `d529e17eb`, with one later test fix:
+`stderr_lines()` counts only newline-terminated lines, so a notice the wrapper
+is still writing is never read as a whole line. Prefrontal made the same change
+in its own copy (prefrontal `c6a936d240`). The supervisor itself is unchanged
+from `d529e17eb`.
 
 This receipt excludes itself. A cross-repository parity gate is a separate
 follow-up; these digests record the imported bytes, not an independent check of

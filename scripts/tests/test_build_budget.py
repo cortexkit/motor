@@ -124,7 +124,9 @@ class BuildBudgetTests(unittest.TestCase):
         self.await_file('second')
 
     def stderr_lines(self, name):
-        return (self.root / (name + '.stderr')).read_text().splitlines()
+        # Count only finished lines: the wrapper may still be writing the last one.
+        text = (self.root / (name + '.stderr')).read_text()
+        return text[:text.rfind('\n') + 1].splitlines()
 
     def await_stderr_lines(self, name, count):
         deadline = time.monotonic() + 5
