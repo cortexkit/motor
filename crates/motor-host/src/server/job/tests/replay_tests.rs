@@ -87,6 +87,156 @@ async fn launched_with_returns(
         .unwrap();
     (client, task, guest)
 }
+
+async fn observer(
+    runtime: &Arc<Runtime>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<()>>,
+    u64,
+) {
+    let mut c = claims(JOB);
+    c.purpose = Purpose::Attach;
+    let id = claim(runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(
+        &mut client,
+        &json!({"type":"attach","job_id":JOB,"from_seq":0}),
+    )
+    .await
+    .unwrap();
+    (client, task, id)
+}
+
+async fn runner_heartbeat(client: &mut tokio::io::DuplexStream, wait: u64) -> Raw {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = raw(client).await.unwrap();
+            assert_eq!(frame.value["type"], "heartbeat");
+            if frame.value["queue_wait_ms"] == wait {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("runner queue heartbeat did not reach the caller before any sequenced record")
+}
+
+#[tokio::test]
+async fn runner_queue_heartbeat_reaches_caller_before_records_without_entering_replay() {
+    let (runtime, fake, _) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    let beat = bytes(br#"{ "type":"heartbeat", "queue_wait_ms":12345, "extension":"raw" }"#);
+    guest.write_all(&beat).await.unwrap();
+    assert_eq!(runner_heartbeat(&mut client, 12345).await.bytes, beat);
+    let stream = runtime.job_stream(JOB).unwrap();
+    assert_eq!(stream.with_store(|s| Ok(s.len())).unwrap(), 0);
+    assert_eq!(stream.with_store(|s| Ok(s.last_seq())).unwrap(), None);
+
+    for frame in records() {
+        guest.write_all(&frame).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for frame in records() {
+            assert_eq!(next_record(&mut client).await.bytes, frame);
+        }
+    })
+    .await
+    .expect("sequenced replay records did not follow the live heartbeat");
+    ack(&runtime, &mut guest).await;
+    assert_eq!(stream.with_store(|s| Ok(s.len())).unwrap(), records().len());
+    task.await.unwrap().unwrap();
+    power_off(&runtime, &fake);
+    assert_eq!(replayed(&runtime).await, records());
+}
+
+#[tokio::test]
+async fn reattach_waits_for_a_new_runner_heartbeat_instead_of_replaying_the_old_one() {
+    let (runtime, fake, _) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    write_frame(
+        &mut guest,
+        &json!({"type":"heartbeat","queue_wait_ms":12345}),
+    )
+    .await
+    .unwrap();
+    runner_heartbeat(&mut client, 12345).await;
+    drop(client);
+    task.await.unwrap().unwrap();
+    let (mut client, task, id) = observer(&runtime).await;
+    let beat = tokio::time::timeout(
+        super::super::stream::CLIENT_HEARTBEAT + Duration::from_secs(3),
+        read_frame(&mut client),
+    )
+    .await
+    .expect("quiet attachment did not receive a keepalive")
+    .unwrap();
+    assert_eq!(beat, json!({"type":"heartbeat","queue_wait_ms":0}));
+    write_frame(
+        &mut guest,
+        &json!({"type":"heartbeat","queue_wait_ms":54321}),
+    )
+    .await
+    .unwrap();
+    runner_heartbeat(&mut client, 54321).await;
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.host.lock().unwrap().close(id).unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn quiet_prestart_attachment_repeats_only_its_live_runner_queue_sample() {
+    let (runtime, fake, _) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    let beat = bytes(br#"{ "type":"heartbeat", "queue_wait_ms":12345 }"#);
+    guest.write_all(&beat).await.unwrap();
+    runner_heartbeat(&mut client, 12345).await;
+    let repeated = tokio::time::timeout(
+        super::super::stream::CLIENT_HEARTBEAT + Duration::from_secs(3),
+        raw(&mut client),
+    )
+    .await
+    .expect("quiet preparation did not receive a keepalive")
+    .unwrap();
+    assert_eq!(repeated.bytes, beat);
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn busy_disk_observer_keepalive_pauses_instead_of_clearing_the_queue_budget() {
+    let (runtime, _, _) = fixture();
+    claim(&runtime, &claims(JOB));
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let disk = host.snapshot.per_job.executions[JOB].disk_id.clone();
+        host.snapshot
+            .per_job
+            .disks
+            .get_mut(&disk)
+            .unwrap()
+            .attached_job = Some("holder".into());
+    }
+    let (mut client, task, id) = observer(&runtime).await;
+    let beat = tokio::time::timeout(
+        super::super::stream::CLIENT_HEARTBEAT + Duration::from_secs(3),
+        read_frame(&mut client),
+    )
+    .await
+    .expect("busy-disk observer did not receive a keepalive")
+    .unwrap();
+    assert_eq!(beat, json!({"type":"heartbeat","queue_wait_ms":0}));
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].boot_started);
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.host.lock().unwrap().close(id).unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
 async fn ack(runtime: &Arc<Runtime>, guest: &mut tokio::net::UnixStream) {
     ack_at(runtime, guest, 4).await;
 }

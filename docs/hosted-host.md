@@ -349,6 +349,15 @@ attachment slot until admitted again.
 Warm heartbeat entries describe workspace disks, busy while attached or
 quarantined; `tenant_disk` is omitted. Recovery and fills consume capacity too.
 
+Per-job callers read sequenced job records from the host's replay store. Runner
+heartbeats are forwarded live with their queue timing unchanged; they are not
+stored or replayed on reattach. Quiet attached streams get a keepalive about
+every 10 seconds. Before the command starts, the host repeats only a runner
+heartbeat already delivered to that attachment, or sends `queue_wait_ms: 0`
+until a fresh runner sample arrives, preserving the paused capacity-queue budget
+used during workspace-disk ownership waits and VM setup. After command start,
+the host can send a bare keepalive.
+
 ### Switch a drained host between modes
 
 Per-job mode can now start through the executable, but has not served production
