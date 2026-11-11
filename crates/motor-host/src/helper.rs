@@ -792,6 +792,8 @@ pub fn control_read_deadline(request: &Value) -> Duration {
             + motor_protocol::TENANT_RECOVERY_REPLY_MARGIN
     } else if request["recovery_required"] == true {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE + motor_protocol::TENANT_RECOVERY_ALLOWANCE
+    } else if request["op"] == "remote_cache_create_only_probe" {
+        Duration::from_secs(60)
     } else if request["op"] == "set_remote_cache" {
         // Stop plus restart can use the full runner readiness budget. Do not
         // abandon a credential swap after the ordinary 30-second query window.

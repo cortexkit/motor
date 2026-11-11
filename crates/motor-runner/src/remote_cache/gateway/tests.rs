@@ -4,6 +4,9 @@
 use super::breaker::{FAILURES_TO_OPEN, OPEN_WINDOW};
 use super::upstream::{BoxedIo, ConnectFuture};
 use super::*;
+
+#[path = "probe_tests.rs"]
+mod probe_tests;
 use crate::remote_cache::provisioning::{derived_prefix, Generation, HostRole, KeyRole, Layout};
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -33,6 +36,7 @@ mod write_budgets;
 /// How the fake store behaves; tests change it between requests.
 #[derive(Clone, Default)]
 struct Knobs {
+    probe_fault: Option<probe_tests::Fault>,
     /// Connections are refused.
     refuse: bool,
     /// Connecting never completes.
@@ -173,6 +177,11 @@ impl FakeStore {
                 .unwrap_or(0);
             let knobs = self.knobs();
             if method == "PUT" {
+                if knobs.probe_fault == Some(probe_tests::Fault::PartialObject)
+                    && path.ends_with("/interrupted")
+                {
+                    self.put_object(&path, b"partial");
+                }
                 self.put_heads.lock().unwrap().push(path.clone());
                 self.upload_changed.notify_one();
             }
@@ -243,17 +252,43 @@ impl FakeStore {
                 }
             }
             let status = if method == "PUT" && knobs.status.is_none() {
-                let create_only = headers
-                    .iter()
-                    .any(|(name, value)| name == "if-none-match" && value == "*");
+                let create_only = knobs.probe_fault != Some(probe_tests::Fault::IgnoreCondition)
+                    && headers
+                        .iter()
+                        .any(|(name, value)| name == "if-none-match" && value == "*");
                 let mut objects = self.objects.lock().unwrap();
                 if create_only
                     && (objects.contains_key(&path)
                         || self.sized.lock().unwrap().contains_key(&path))
                 {
-                    Some(412)
+                    if knobs.probe_fault == Some(probe_tests::Fault::OverwriteDespite412)
+                        && path.ends_with("/existing")
+                    {
+                        objects.insert(path.clone(), body.clone());
+                    }
+                    Some(
+                        if knobs.probe_fault == Some(probe_tests::Fault::Concurrent409)
+                            && path.ends_with("/concurrent")
+                        {
+                            409
+                        } else {
+                            412
+                        },
+                    )
                 } else {
-                    objects.insert(path.clone(), body.clone());
+                    let corrupt = (knobs.probe_fault == Some(probe_tests::Fault::WrongWinner)
+                        && path.ends_with("/concurrent"))
+                        || (knobs.probe_fault == Some(probe_tests::Fault::MixedFill)
+                            && path.ends_with("/race")
+                            && !create_only);
+                    objects.insert(
+                        path.clone(),
+                        if corrupt {
+                            b"mixed-or-wrong".to_vec()
+                        } else {
+                            body.clone()
+                        },
+                    );
                     None
                 }
             } else {

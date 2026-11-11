@@ -185,6 +185,12 @@ fn remote_cache_credentials_cross_only_the_helper_relay_and_fail_without_logging
 #[test]
 fn fresh_attach_read_deadline_outlasts_guest_runner_readiness_wait() {
     let attach = control_read_deadline(&json!({"op":"attach_tenant"}));
+    assert_eq!(
+        control_read_deadline(
+            &json!({"op":"remote_cache_create_only_probe","account":"acct:test"})
+        ),
+        std::time::Duration::from_secs(60)
+    );
     assert!(attach > std::time::Duration::from_secs(15 * 60));
     assert_eq!(attach, motor_protocol::TENANT_ATTACH_READ_DEADLINE);
     assert!(control_read_deadline(&json!({"op":"set_remote_cache"})) > attach);

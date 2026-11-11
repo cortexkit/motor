@@ -1044,6 +1044,11 @@ async fn session(
                 send(tx, Frame::ResumeReply { resumed }).await?;
                 return Ok(());
             }
+            Frame::RemoteCacheCreateOnlyProbe { account } if tenant.is_none() => {
+                let report = runner.remote_cache_create_only_probe(&account).await;
+                send(tx, Frame::RemoteCacheCreateOnlyProbeReply(report)).await?;
+                return Ok(());
+            }
             Frame::SetRemoteCacheWriteBlock { blocked } if tenant.is_none() => {
                 runner.set_remote_cache_write_block(blocked).await;
                 send(tx, Frame::SetRemoteCacheWriteBlockReply { blocked }).await?;
