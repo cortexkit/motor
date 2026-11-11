@@ -23,6 +23,8 @@ const MIB: usize = 1 << 20;
 mod job_create;
 #[path = "store_answers_tests.rs"]
 mod store_answers;
+#[path = "write_budget_tests.rs"]
+mod write_budgets;
 
 /// How the fake store behaves; tests change it between requests.
 #[derive(Clone, Default)]

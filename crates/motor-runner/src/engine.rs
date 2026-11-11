@@ -251,6 +251,12 @@ pub struct Config {
     pub isolate_jobs: bool,
     /// Opt in to the runner-owned remote cache. Ignored without job isolation.
     pub remote_cache: bool,
+    /// Accepted or reserved cache objects per job; zero allows only `.sccache_check` PUTs.
+    pub remote_cache_max_job_put_objects: u64,
+    /// Reserved cache upload bytes per job; duplicates and failures stay charged.
+    pub remote_cache_max_job_put_bytes: u64,
+    /// Concurrent cache PUTs per job, shared across its sockets.
+    pub remote_cache_max_job_puts: usize,
     /// Distinct loopback ports inside each unit's private network namespace.
     pub remote_cache_forwarder_ports: BTreeMap<String, u16>,
     #[cfg(unix)]
@@ -630,6 +636,9 @@ impl Config {
             free_space_probe: Arc::new(|path| fs2::available_space(path)),
             isolate_jobs: false,
             remote_cache: false,
+            remote_cache_max_job_put_objects: crate::remote_cache::DEFAULT_JOB_PUT_OBJECTS,
+            remote_cache_max_job_put_bytes: crate::remote_cache::DEFAULT_JOB_PUT_BYTES,
+            remote_cache_max_job_puts: crate::remote_cache::DEFAULT_JOB_PUTS,
             remote_cache_forwarder_ports: BTreeMap::from([
                 ("sccache".into(), 3893),
                 ("ccache".into(), 3894),

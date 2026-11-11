@@ -158,6 +158,12 @@ pub(crate) struct Limits {
     pub(crate) max_job_requests: usize,
     /// In-flight read requests across the gateway.
     pub(crate) max_total_requests: usize,
+    /// Accepted or reserved job PUT objects, including duplicates and failures.
+    pub(crate) max_job_put_objects: u64,
+    /// Content-Length bytes reserved by job PUTs.
+    pub(crate) max_job_put_bytes: u64,
+    /// In-flight PUT requests one job may hold.
+    pub(crate) max_job_puts: usize,
     /// Time to the first response byte, connecting included.
     pub(crate) first_byte_timeout: Duration,
     /// From receipt of a request to its last byte, retries included.
@@ -187,6 +193,9 @@ impl Default for Limits {
             stream_buffer_bytes: 1 << 20,
             max_job_requests: 16,
             max_total_requests: 128,
+            max_job_put_objects: super::DEFAULT_JOB_PUT_OBJECTS,
+            max_job_put_bytes: super::DEFAULT_JOB_PUT_BYTES,
+            max_job_puts: super::DEFAULT_JOB_PUTS,
             first_byte_timeout: Duration::from_secs(5),
             deadline: Duration::from_secs(120),
             max_retries: 1,
@@ -195,6 +204,17 @@ impl Default for Limits {
             head_timeout: Duration::from_secs(10),
             max_job_connections: 64,
             max_total_connections: 512,
+        }
+    }
+}
+
+impl Limits {
+    pub(crate) fn for_config(config: &crate::Config) -> Self {
+        Self {
+            max_job_put_objects: config.remote_cache_max_job_put_objects,
+            max_job_put_bytes: config.remote_cache_max_job_put_bytes,
+            max_job_puts: config.remote_cache_max_job_puts,
+            ..Self::default()
         }
     }
 }
@@ -235,7 +255,7 @@ pub(crate) struct Binding {
     /// Shared by all of a job's sockets, read-only or job-create.
     owner: Arc<Owner>,
     ledger: Option<Arc<WriteLedger>>,
-    job_puts: Option<Arc<Mutex<JobPutTotals>>>,
+    job_puts: Option<Arc<Mutex<JobPutState>>>,
 }
 
 impl Binding {
@@ -370,14 +390,55 @@ enum JobPutOutcome {
     Refused,
 }
 
+#[derive(Debug, Default)]
+struct JobPutState {
+    totals: JobPutTotals,
+    objects: u64,
+    bytes: u64,
+    active: usize,
+}
+
 struct JobPutRecord {
-    totals: Arc<Mutex<JobPutTotals>>,
+    state: Arc<Mutex<JobPutState>>,
     outcome: JobPutOutcome,
+    reserved: bool,
+}
+
+impl JobPutRecord {
+    fn reserve(&mut self, limits: &Limits, bytes: u64, probe: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.active >= limits.max_job_puts {
+            return false;
+        }
+        if !probe {
+            let Some(objects) = state.objects.checked_add(1) else {
+                return false;
+            };
+            let Some(bytes) = state.bytes.checked_add(bytes) else {
+                return false;
+            };
+            if objects > limits.max_job_put_objects || bytes > limits.max_job_put_bytes {
+                return false;
+            }
+            // Reserve both totals and the concurrency slot under one lock.
+            // Only the slot is released: duplicate and failed attempts cost
+            // budget too, so retries cannot produce unbounded store traffic.
+            state.objects = objects;
+            state.bytes = bytes;
+        }
+        state.active += 1;
+        self.reserved = true;
+        true
+    }
 }
 
 impl Drop for JobPutRecord {
     fn drop(&mut self) {
-        let mut totals = self.totals.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        if self.reserved {
+            state.active -= 1;
+        }
+        let totals = &mut state.totals;
         match self.outcome {
             JobPutOutcome::Accepted(bytes) => {
                 totals.accepted += 1;
@@ -480,7 +541,10 @@ struct Shared {
     total_reads: Arc<AtomicUsize>,
     total_connections: Arc<AtomicUsize>,
     jobs: Mutex<HashMap<String, Weak<Owner>>>,
-    job_puts: Mutex<HashMap<String, Arc<Mutex<JobPutTotals>>>>,
+    // Keep budgets even when the last binding is dropped, so rebinding the
+    // same job id cannot reset its spend. Rotating store credentials must not
+    // reset the job's PUT budget either.
+    job_puts: Mutex<HashMap<String, Arc<Mutex<JobPutState>>>>,
     counters: [ToolCounters; 2],
     origin: Instant,
 }
@@ -936,7 +1000,7 @@ impl Gateway {
             .lock()
             .unwrap()
             .get(job)
-            .map(|totals| totals.lock().unwrap().clone())
+            .map(|state| state.lock().unwrap().totals.clone())
             .unwrap_or_default()
     }
 
@@ -1031,9 +1095,10 @@ impl Gateway {
         let job = (head.method == "PUT")
             .then(|| binding.job_puts.clone())
             .flatten()
-            .map(|totals| JobPutRecord {
-                totals,
+            .map(|state| JobPutRecord {
+                state,
                 outcome: JobPutOutcome::Refused,
+                reserved: false,
             });
         let mut put = PutRecords { fill, job };
         let Some(request) = parse_request(&head, endpoint) else {
@@ -1121,6 +1186,15 @@ impl Gateway {
                     .await;
             }
         };
+        let probe = binding.tool == Tool::Sccache && bare == SCCACHE_CHECK_KEY;
+        if let Some(job) = &mut put.job {
+            if !job.reserve(limits, request.content_length, probe) {
+                self.refused(binding, endpoint, "job PUT budget");
+                return self
+                    .answer(client, failure, body_free, close_requested, deadline)
+                    .await;
+            }
+        }
         if let Some(put) = &mut put.fill {
             // Every PUT is tagged with the store identity of the generation
             // that signs it, so a fill can tell whether all of its PUTs went
@@ -1148,7 +1222,6 @@ impl Gateway {
             // behind, its outcome.
             client_stall: ticket.is_probe().then_some(limits.first_byte_timeout),
         };
-        let probe = binding.tool == Tool::Sccache && bare == SCCACHE_CHECK_KEY;
         let next = self
             .exchange(binding, client, &exchange, &mut ticket, &mut put, probe)
             .await;
