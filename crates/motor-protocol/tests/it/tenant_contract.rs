@@ -152,6 +152,40 @@ fn burst_lease_is_additive_for_old_guest_readers() {
 }
 
 #[test]
+fn cache_write_lease_is_opt_in_and_ignored_by_older_runners() {
+    #[derive(serde::Deserialize)]
+    struct OldLease {
+        jti: Uuid,
+        purpose: LeasePurpose,
+    }
+    let legacy = r#"{"type":"verified_lease","jti":"019e4567-89ab-7cde-8012-3456789abcde","purpose":"run","sub":"acct:test","vcpus":2,"platform":"linux-x64","net":false,"max_s":30,"exp":1800000000}"#;
+    let Frame::VerifiedLease(mut lease) = serde_json::from_str::<Frame>(legacy).unwrap() else {
+        panic!("expected verified lease")
+    };
+    assert!(!lease.cache_write);
+    assert_eq!(
+        serde_json::to_string(&Frame::VerifiedLease(lease.clone())).unwrap(),
+        legacy
+    );
+    let mut explicit_false: serde_json::Value = serde_json::from_str(legacy).unwrap();
+    explicit_false["cache_write"] = json!(false);
+    assert_eq!(
+        serde_json::from_value::<Frame>(explicit_false).unwrap(),
+        Frame::VerifiedLease(lease.clone())
+    );
+    lease.cache_write = true;
+    let value = serde_json::to_value(Frame::VerifiedLease(lease.clone())).unwrap();
+    assert_eq!(value["cache_write"], true);
+    let old: OldLease = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(old.jti, lease.jti);
+    assert_eq!(old.purpose, LeasePurpose::Run);
+    assert_eq!(
+        serde_json::from_value::<Frame>(value).unwrap(),
+        Frame::VerifiedLease(lease)
+    );
+}
+
+#[test]
 fn memory_samples_and_terminal_overage_preserve_absent_null_and_zero() {
     for over in [None, Some(None), Some(Some(0)), Some(Some(1_234_567))] {
         for kind in ["memory_sample", "event"] {

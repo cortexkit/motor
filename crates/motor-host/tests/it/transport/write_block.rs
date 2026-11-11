@@ -67,7 +67,8 @@ fn admin_block_persists_and_names_all_unacknowledged_runners() {
 }
 
 async fn wake_with_block(acknowledges: bool) {
-    let (runtime, fake, broker, requester, c) = fixture();
+    let (runtime, fake, broker, requester, mut c) = fixture();
+    c.cache_write = Some(true);
     assert_eq!(
         runtime
             .host_admin(&json!({"op":"set_remote_cache_write_block","blocked":true}))

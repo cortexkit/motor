@@ -152,6 +152,14 @@ pub(crate) fn queue_clock_at(entry: &AtomicU64, elapsed: &AtomicU64, now: u64) -
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Job {
     pub id: Uuid,
+    /// Final cache grant fixed at first tenant admission: host permission plus an
+    /// active account-bound write key and a cleared emergency cache-write block.
+    /// Later frames or keys cannot upgrade it; revocation can still deny PUTs
+    /// through the gateway.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_write: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_account: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mappings: Vec<crate::caller_path::CallerRoot>,
     pub request: Option<Run>,
@@ -354,6 +362,8 @@ impl Job {
     pub fn new(id: Uuid, request: Option<Run>, now: u64, order: u64, weight: u32) -> Self {
         Self {
             id,
+            cache_write: false,
+            cache_write_account: None,
             mappings: vec![],
             request,
             state: JobState::AwaitingBundles,

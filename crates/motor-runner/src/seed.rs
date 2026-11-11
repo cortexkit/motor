@@ -1160,6 +1160,7 @@ mod tests {
             let id = motor_protocol::Uuid::now_v7();
             let cwd = fixture.workspace.to_string_lossy().into_owned();
             let setup = Setup {
+                cache_write_account: None,
                 id,
                 cpus: vec![0],
                 memory_mib: None,

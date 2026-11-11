@@ -714,12 +714,18 @@ async fn session(
                 }
                 request.gate_job &= supports_gate_jobs;
                 let admitted = request.clone();
-                let tenant_memory = tenant.map(|ctx| (ctx.lease.mem_mib, ctx.lease.mem_burst_mib));
+                let tenant_memory = tenant.map(|ctx| {
+                    (
+                        ctx.lease.mem_mib,
+                        ctx.lease.mem_burst_mib,
+                        ctx.lease.cache_write.then(|| ctx.lease.sub.clone()),
+                    )
+                });
                 match locked(&runner, move |r| {
                     if qualification {
                         r.accept_for_qualification(admitted)
-                    } else if let Some((memory, burst)) = tenant_memory {
-                        r.accept_tenant(admitted, memory, burst)
+                    } else if let Some((memory, burst, cache_account)) = tenant_memory {
+                        r.accept_tenant(admitted, memory, burst, cache_account.as_deref())
                     } else {
                         r.accept(admitted)
                     }

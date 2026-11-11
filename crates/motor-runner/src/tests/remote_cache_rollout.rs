@@ -9,20 +9,33 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 
-fn provision(layout: &Layout, enabled: bool) {
-    let generation = generation("1", TENANT);
+pub(super) fn provision(layout: &Layout, enabled: bool) {
+    provision_as(layout, enabled, TENANT);
+}
+
+pub(super) fn provision_as(layout: &Layout, enabled: bool, tenant: &str) {
+    provision_generation(layout, enabled, tenant, "1");
+}
+
+pub(super) fn provision_generation(
+    layout: &Layout,
+    enabled: bool,
+    tenant: &str,
+    generation_id: &str,
+) {
+    let generation = generation(generation_id, tenant);
     for (name, key) in [
         ("read-key", &generation.read_key),
         ("write-key", generation.write_key.as_ref().unwrap()),
     ] {
-        let value = serde_json::json!({"generation":"1", "access_key_id":key.access_key_id, "secret_access_key":key.secret_access_key});
+        let value = serde_json::json!({"generation":generation_id, "access_key_id":key.access_key_id, "secret_access_key":key.secret_access_key});
         let path = layout.directory().join(name);
         let temporary = layout.directory().join(format!(".{name}-new"));
         fs::write(&temporary, value.to_string()).unwrap();
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o400)).unwrap();
         fs::rename(temporary, path).unwrap();
     }
-    let value = serde_json::json!({"generation":"1", "tenant":TENANT,
+    let value = serde_json::json!({"generation":generation_id, "tenant":tenant,
         "endpoint":generation.endpoint, "region":generation.region, "bucket":generation.bucket,
         "prefix":generation.prefix, "storage_class":generation.storage_class, "enabled":enabled});
     let path = layout.config_path();
@@ -36,7 +49,7 @@ fn runtime(layout: &Layout) -> Arc<Runtime> {
     runtime_with_store(layout).0
 }
 
-fn runtime_with_store(layout: &Layout) -> (Arc<Runtime>, Arc<FakeStore>) {
+pub(super) fn runtime_with_store(layout: &Layout) -> (Arc<Runtime>, Arc<FakeStore>) {
     let watch = Watch::new(layout.clone());
     let store = Arc::new(FakeStore::default());
     let gateway = Gateway::with_connector(
@@ -409,6 +422,7 @@ fn boat_job_environment(f: &Fixture, config: &Config, phase: &str) -> BTreeMap<S
     let (mut request, _) = f.run("exit 23");
     request.base_commit = Some("f".repeat(40));
     let setup = Setup {
+        cache_write_account: None,
         id: request.job_id,
         memory_mib: None,
         request,
@@ -458,6 +472,7 @@ fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
     let (mut request, _) = f.run("exit 23");
     request.base_commit = Some("f".repeat(40));
     let setup = Setup {
+        cache_write_account: None,
         id: request.job_id,
         memory_mib: None,
         request,

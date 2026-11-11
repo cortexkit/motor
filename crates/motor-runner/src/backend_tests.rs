@@ -5,6 +5,49 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(target_os = "linux")]
+#[test]
+fn stored_job_grant_selects_write_environment_only_for_its_keyed_account() {
+    use crate::remote_cache::{gateway::Tool, transport::Forwarder};
+    let scratch = ScratchDir::new("cache-write-environment");
+    let mut config = Config::new(scratch.join("state"), "tenant");
+    config.tenant_vm = true;
+    let mut setup = setup(scratch.path());
+    setup.cache_write_account = Some("acct:admitted".into());
+    let mut generation = crate::remote_cache::gateway::tests::generation("1", "acct:admitted");
+    let forwarders = [Forwarder::new(Tool::Sccache, 4181)];
+    for case in ["keyed", "keyless", "other-account", "no-account"] {
+        if case == "keyless" {
+            generation.write_key = None;
+        }
+        if case == "other-account" {
+            generation = crate::remote_cache::gateway::tests::generation("2", "acct:other");
+        }
+        if case == "no-account" {
+            generation = crate::remote_cache::gateway::tests::generation("3", "acct:admitted");
+            setup.cache_write_account = None;
+        }
+        let inputs = EnvironmentInputs {
+            host_cwd: scratch.path(),
+            target: scratch.path(),
+            wrapper: None,
+            remote: Some((&generation, &forwarders)),
+        };
+        let mut env = BTreeMap::new();
+        remote_cache_environment(&config, &setup, &inputs, &mut env).unwrap();
+        assert_eq!(
+            env["SCCACHE_S3_RW_MODE"],
+            if case == "keyed" {
+                "READ_WRITE"
+            } else {
+                "READ_ONLY"
+            }
+        );
+        assert!(!env.contains_key("SCCACHE_RECACHE"));
+        assert!(!env.contains_key("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn job_write_environment_changes_only_sccache_mode_and_never_exposes_keys() {
@@ -474,6 +517,7 @@ fn setup(cwd: &Path) -> Setup {
     let cwd = cwd.to_string_lossy().into_owned();
     let id = Uuid::now_v7();
     Setup {
+        cache_write_account: None,
         id,
         memory_mib: None,
         cpus: vec![1, 17],

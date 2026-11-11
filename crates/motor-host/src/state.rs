@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::io;
 
 mod advertise;
+#[cfg(test)]
+mod cache_write_tests;
 pub mod jobs;
 pub mod settlement;
 pub use advertise::{MemoryCase, MEMORY_FRESH_MS, MEMORY_PROBE_MS, START_RETRY_MS};
@@ -40,6 +42,11 @@ pub enum LeaseState {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Lease {
     pub claims: Claims,
+    /// Immutable host permission ceiling from first claim, not a promise of writes.
+    /// The runner additionally requires its account's active write key and a cleared
+    /// emergency cache-write block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_write: bool,
     pub tenant: String,
     pub state: LeaseState,
     pub delivered: bool,
@@ -768,6 +775,14 @@ impl Host {
                 claims.jti.clone(),
                 Lease {
                     claims: claims.clone(),
+                    cache_write: old.as_ref().map_or_else(
+                        || {
+                            claims.cache_write == Some(true)
+                                && !self.provider_managed
+                                && !self.snapshot.remote_cache_write_blocked
+                        },
+                        |lease| lease.cache_write,
+                    ),
                     tenant: tenant.tenant.clone(),
                     state: LeaseState::Reserved,
                     delivered,

@@ -133,6 +133,7 @@ fn refusal_logs_preserve_errors_from_transfer_fetch_setup_restart_and_attach() {
         runner
             .launch_without_dispatch(
                 Setup {
+                    cache_write_account: None,
                     id: setup.job_id,
                     memory_mib: None,
                     cpus: vec![1, 17],

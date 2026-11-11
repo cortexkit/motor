@@ -4,6 +4,34 @@ use motor_protocol::{
 };
 use sha2::{Digest, Sha256};
 
+impl Config {
+    pub(super) fn tenant_cache_grant(&self, job: Uuid, account: Option<&str>) -> Option<String> {
+        let account = account?;
+        #[cfg(target_os = "linux")]
+        let allowed = self.tenant_vm
+            && !self.per_job
+            && !self.boat_profile
+            && self
+                .unit_remote_cache(false)
+                .is_some_and(|(generation, _)| {
+                    generation.tenant == account && generation.write_key.is_some()
+                })
+            && self
+                .remote_cache_runtime
+                .as_ref()
+                .is_some_and(|runtime| !runtime.gateway.job_write_blocked());
+        #[cfg(not(target_os = "linux"))]
+        let allowed = {
+            let _ = account;
+            false
+        };
+        if !allowed {
+            tracing::warn!(job_id = %job, "job cache writes unavailable; admitting read-only (requires tenant mode, a matching active write key and no write block)");
+        }
+        allowed.then(|| account.to_owned())
+    }
+}
+
 impl Runner {
     pub(crate) async fn remote_cache_create_only_probe(
         &self,

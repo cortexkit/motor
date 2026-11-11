@@ -5600,6 +5600,7 @@ fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
     runner
         .launch_without_dispatch(
             Setup {
+                cache_write_account: None,
                 id: request.job_id,
                 memory_mib: None,
                 cpus: vec![1, 17],
@@ -5645,6 +5646,7 @@ mod seeding {
         let (request, _) = f.run("true");
         let siblings = request.siblings.clone();
         let mut setup = Setup {
+            cache_write_account: None,
             id: request.job_id,
             request,
             cpus: vec![0],
@@ -5700,6 +5702,7 @@ mod seeding {
         let (request, bytes) = f.run("true");
         f.submit(&runner, &request, &bytes);
         let setup = Setup {
+            cache_write_account: None,
             id: request.job_id,
             request,
             cpus: vec![0],
@@ -6597,6 +6600,7 @@ mod base_scheduling {
                 configure_remote(&f, &mut config);
             }
             let setup = Setup {
+                cache_write_account: None,
                 id: Uuid::now_v7(),
                 cpus: vec![],
                 memory_mib: None,
@@ -6676,6 +6680,7 @@ mod base_scheduling {
         let runner = open(config.clone());
         let tip = desired(&f, &runner);
         let setup = Setup {
+            cache_write_account: None,
             id: Uuid::nil(),
             cpus: vec![],
             memory_mib: None,

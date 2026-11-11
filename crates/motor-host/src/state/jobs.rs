@@ -415,6 +415,7 @@ impl Host {
                 claims.jti.clone(),
                 super::Lease {
                     claims: claims.clone(),
+                    cache_write: false,
                     tenant: claims.jti.clone(),
                     state: super::LeaseState::Reserved,
                     delivered: false,

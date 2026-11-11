@@ -177,6 +177,11 @@ pub struct VerifiedLease {
     /// Opt in to durable mirror-ref reports on the tenant event channel.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mirror_reports: bool,
+    /// Immutable host permission ceiling from first claim, not a promise of writes.
+    /// The runner additionally requires its account's active write key and a cleared
+    /// emergency cache-write block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_write: bool,
     pub platform: String,
     pub net: bool,
     pub max_s: u64,

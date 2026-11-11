@@ -1427,6 +1427,7 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
             git(&mirror, &["fetch", text(local), "HEAD"]);
         }
         let setup = Setup {
+            cache_write_account: None,
             id: r.job_id,
             memory_mib: None,
             cpus: vec![12, 13, 14, 15],
@@ -2028,6 +2029,7 @@ fn detached_setup(runner: &Runner, f: &Fixture, r: Run) -> Setup {
     runner.save(&job).unwrap();
     runner.core.inner.lock().unwrap().jobs.insert(r.job_id, job);
     Setup {
+        cache_write_account: None,
         id: r.job_id,
         memory_mib: None,
         cpus: vec![12, 13, 14, 15],
@@ -3226,6 +3228,7 @@ async fn windows_backend_unreleased_prepared_and_execution_drop_each_clean_once(
             git(&mirror, &["fetch", text(local), "HEAD"]);
         }
         let setup = Setup {
+            cache_write_account: None,
             id: r.job_id,
             memory_mib: None,
             request: r,

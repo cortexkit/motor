@@ -115,6 +115,7 @@ impl Control for Fake {
     }
 }
 
+mod cache_write;
 mod create_only_probe;
 mod write_block;
 

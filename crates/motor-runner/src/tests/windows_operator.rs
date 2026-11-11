@@ -96,6 +96,7 @@ fn prepare_with_returns(
         git(&mirror, &["fetch", text(local), "HEAD"]);
     }
     let setup = Setup {
+        cache_write_account: None,
         id: request.job_id,
         memory_mib: None,
         request,
@@ -1069,6 +1070,7 @@ fn windows_qualification_one_vm_slot_lock_refuses_without_boot() {
         git(&mirror, &["fetch", text(local), "HEAD"]);
     }
     let setup = Setup {
+        cache_write_account: None,
         id: request.job_id,
         memory_mib: None,
         request,
