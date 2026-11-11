@@ -782,6 +782,7 @@ fn publish_after_link_check(
     success: bool,
     check_links: impl FnOnce(&str) -> io::Result<()>,
 ) -> io::Result<()> {
+    let started = std::time::Instant::now();
     let launch = publication_eligible(job, success)?;
     let request = job
         .request
@@ -817,7 +818,9 @@ fn publish_after_link_check(
         fill_start: launch.reference,
         newest_mtime: newest_mtime(&target)?,
     };
-    publish_record(&generation, &record)
+    publish_record(&generation, &record)?;
+    tracing::info!(job_id = %job.id, elapsed_ms = started.elapsed().as_millis() as u64, tip = %record.commit, repository = %repository, "build base published");
+    Ok(())
 }
 
 /// Called only after the link, checkout, ownership and build-output checks.

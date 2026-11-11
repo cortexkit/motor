@@ -8026,9 +8026,9 @@ impl Runner {
         };
         #[cfg(not(target_os = "linux"))]
         let kind = "compile_cache_fill";
-        tracing::info!(job_id = %job.id, repository, unit = unit.as_deref().unwrap_or("not_started"),
+        tracing::info!(job_id = %job.id, unit = unit.as_deref().unwrap_or("not_started"),
             kind, event, started_ms = job.started_ms, age_ms = job.started_ms.map(|start| self.now().saturating_sub(start)),
-            outcome = ?job.terminal.as_ref().map(|terminal| &terminal.outcome), kill = ?job.kill,
+            outcome = ?job.terminal.as_ref().map(|terminal| &terminal.outcome), kill = ?job.kill, repository,
             "writer lifecycle");
     }
 
