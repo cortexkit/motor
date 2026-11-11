@@ -1866,11 +1866,41 @@ pub(crate) fn job_cache_write(
     setup: &Setup,
     generation: &crate::remote_cache::provisioning::ActiveGeneration,
 ) -> bool {
-    setup.cache_write_account.as_deref() == Some(generation.tenant.as_str())
-        && config.tenant_vm
-        && !config.boat_profile
-        && !config.per_job
-        && generation.write_key.is_some()
+    #[cfg(target_os = "linux")]
+    let boot = config
+        .per_job
+        .then(|| std::fs::read_to_string("/proc/cmdline").ok())
+        .flatten();
+    #[cfg(not(target_os = "linux"))]
+    let boot: Option<String> = None;
+    job_cache_write_for_boot(config, setup, generation, boot.as_deref().unwrap_or(""))
+}
+
+#[cfg(unix)]
+pub(crate) fn job_cache_write_for_boot(
+    config: &Config,
+    setup: &Setup,
+    generation: &crate::remote_cache::provisioning::ActiveGeneration,
+    cmdline: &str,
+) -> bool {
+    // A Job VM takes authority only from root's boot channel and credential
+    // disk, never from the host-provided setup value. Duplicate flags fail closed.
+    let granted = if config.per_job {
+        let flags: Vec<_> = cmdline
+            .split_whitespace()
+            .filter(|word| word.starts_with("motor.cache_write="))
+            .collect();
+        flags == ["motor.cache_write=1"]
+            && cmdline
+                .split_whitespace()
+                .any(|word| word == "motor.per_job=1")
+            && !cmdline
+                .split_whitespace()
+                .any(|word| word == "motor.fill=1")
+    } else {
+        setup.cache_write_account.as_deref() == Some(generation.tenant.as_str())
+    };
+    granted && config.tenant_vm && !config.boat_profile && generation.write_key.is_some()
 }
 
 /// Apply one host type's remote cache delta to `env`: exactly the difference

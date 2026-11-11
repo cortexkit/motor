@@ -18,6 +18,11 @@ use std::{
 use zeroize::Zeroizing;
 
 mod store;
+
+#[cfg(feature = "linux-root-tests")]
+pub(super) fn install_fixture(path: &Path, account: &str, set: &RemoteCacheRequest) -> Result<()> {
+    store::install(path, account, set)
+}
 pub(super) const STORE: &str = "/var/lib/motor-vm/remote-cache";
 pub(super) const IMAGE: &str = "remote-cache.img";
 const FILE_LIMIT: u64 = 65536;

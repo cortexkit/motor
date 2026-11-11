@@ -260,3 +260,68 @@ fn account_rotation_between_admission_and_setup_binds_only_read_sockets() {
         assert_eq!(decision(&runner, id), (true, Some(TENANT.into())));
     }
 }
+
+#[test]
+fn job_vm_socket_grant_requires_both_trusted_boot_flag_and_credential_write_key() {
+    use crate::remote_cache::{
+        gateway::{Endpoint, Tool},
+        transport::Role,
+    };
+    for keyed in [true, false] {
+        let (f, runner, cache, _) = provisioned(keyed);
+        let mut config = eligibility_config(&runner, &cache);
+        config.per_job = true;
+        let run = request(&f);
+        let id = run.job_id;
+        let mut setup = Setup {
+            id,
+            request: run,
+            cache_write_account: None,
+            cpus: vec![1],
+            memory_mib: None,
+            base: false,
+            recorded: BTreeMap::new(),
+            snapshots: None,
+        };
+        let generation = cache.watch.admit().unwrap();
+        for (index, boot) in [
+            "motor.per_job=1 motor.cache_write=1",
+            "motor.per_job=1",
+            "motor.cache_write=1",
+            "motor.per_job=1 motor.cache_write=0",
+            "motor.per_job=1 motor.cache_write=1 motor.cache_write=1",
+            "motor.per_job=1 motor.cache_write=1 motor.fill=1",
+        ]
+        .iter()
+        .enumerate()
+        {
+            // Even a host frame claiming writes cannot supply boot authority.
+            setup.cache_write_account = Some(TENANT.into());
+            let granted = backend::job_cache_write_for_boot(&config, &setup, &generation, boot);
+            assert_eq!(granted, keyed && index == 0, "keyed={keyed} boot={boot}");
+            let transport = cache
+                .transport(TENANT, &[Tool::Sccache, Tool::Ccache])
+                .unwrap()
+                .job_write(granted);
+            let sockets = transport
+                .open(
+                    &f.scratch.join(format!("guest-{index}")),
+                    Role::Job(&id.to_string()),
+                )
+                .unwrap();
+            assert_eq!(
+                sockets.listeners()[0].binding().endpoint(),
+                if keyed && index == 0 {
+                    Endpoint::JobCreate
+                } else {
+                    Endpoint::Read
+                }
+            );
+            assert_eq!(sockets.listeners()[1].binding().endpoint(), Endpoint::Read);
+            assert!(sockets
+                .listeners()
+                .iter()
+                .all(|listener| listener.binding().ledger().is_none()));
+        }
+    }
+}

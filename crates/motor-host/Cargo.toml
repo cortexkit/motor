@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+job-cache-vm-tests = ["motor-vm-helper/linux-root-tests"]
+
 [dependencies]
 anyhow = "1"
 # The fleet's shared SQLite layer: single-writer lease, migrations and the
