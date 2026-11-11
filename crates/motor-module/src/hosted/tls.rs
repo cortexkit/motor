@@ -93,6 +93,7 @@ pub(super) fn claims(
                 || lease.token_expires_at_ms <= now.saturating_mul(1000),
         ),
         ("cnf", motor_lease::bind_requester(&claims, &jwk).is_err()),
+        ("cache_write", !claims.cache_write_accepted()),
         ("mem_burst_mib", !claims.mem_burst_mib_accepted()),
         (
             "workspace_key_hash",
@@ -388,6 +389,117 @@ mod mem_burst_claim_tests {
                         Err(Error::Auth)
                     ));
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_write_claim_tests {
+    use super::*;
+
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../motor-lease/contracts/cloud/job-tokens-cache-write.json"
+        ))
+        .unwrap()
+    }
+
+    fn requester() -> SigningKey {
+        SigningKey::from_bytes(&std::array::from_fn(|i| 32 + i as u8))
+    }
+
+    fn lease(c: &mut Claims) -> LeaseResponse {
+        c.iat = now_s();
+        c.exp = c.iat + 300;
+        LeaseResponse {
+            lease_id: c.jti.clone(),
+            job_id: c.jti.clone(),
+            placement: c.placement.clone(),
+            endpoint: "unused".into(),
+            endpoint_spki_sha256: String::new(),
+            job_token: motor_lease::sign_token(c, "test", &requester()).unwrap(),
+            token_expires_at_ms: c.exp * 1000,
+            max_s: c.max_s,
+            reserved_vcpu_ms: 0,
+        }
+    }
+
+    #[test]
+    fn hosted_reader_accepts_published_registered_cache_write_claims() {
+        let v = fixture();
+        for case in v["registered"].as_array().unwrap() {
+            for (name, purpose) in [
+                ("run_bytes", Purpose::Run),
+                ("attach_bytes", Purpose::Attach),
+            ] {
+                let mut c: Claims =
+                    serde_json::from_str(case[name]["claims"].as_str().unwrap()).unwrap();
+                let lease = lease(&mut c);
+                assert_eq!(
+                    claims(
+                        Uuid::parse_str(&c.jti).unwrap(),
+                        &lease,
+                        &requester(),
+                        purpose
+                    )
+                    .unwrap(),
+                    c
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_reader_applies_published_boolean_rules_and_boat_refusal() {
+        let v = fixture();
+        for case in v["reader_cases"].as_array().unwrap() {
+            let mut raw: serde_json::Value =
+                serde_json::from_str(case["claims"].as_str().unwrap()).unwrap();
+            let mut base = raw.clone();
+            base.as_object_mut().unwrap().remove("cache_write");
+            let mut c: Claims = serde_json::from_value(base).unwrap();
+            let mut lease = lease(&mut c);
+            raw["iat"] = c.iat.into();
+            raw["exp"] = c.exp.into();
+            // The requester parses a broker-authenticated response; the host,
+            // not this reader, verifies the compact token's signature.
+            lease.job_token = format!(
+                "unused.{}.unused",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&raw).unwrap())
+            );
+            let result = claims(
+                Uuid::parse_str(&c.jti).unwrap(),
+                &lease,
+                &requester(),
+                Purpose::Run,
+            );
+            assert_eq!(
+                result.is_ok(),
+                case["registered_accepts"].as_bool().unwrap()
+            );
+            if let Ok(c) = result {
+                assert_eq!(c.cache_write, Some(false));
+            }
+        }
+        for (name, purpose) in [("run", Purpose::Run), ("attach", Purpose::Attach)] {
+            let token = v["boat"][name]["body"]["job_token"].as_str().unwrap();
+            let mut c: Claims = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(token.split('.').nth(1).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            for value in [None, Some(false), Some(true)] {
+                c.cache_write = value;
+                let lease = lease(&mut c);
+                let result = claims(
+                    Uuid::parse_str(&c.jti).unwrap(),
+                    &lease,
+                    &requester(),
+                    purpose,
+                );
+                assert_eq!(result.is_ok(), value.is_none());
             }
         }
     }

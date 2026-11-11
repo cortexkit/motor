@@ -326,6 +326,7 @@ pub fn check_token(
             claims.iat > MAX_SAFE_INTEGER || claims.exp > MAX_SAFE_INTEGER,
         ),
         ("mem_mib", !memory_ok),
+        ("cache_write", !claims.cache_write_accepted()),
         ("mem_burst_mib", !claims.mem_burst_mib_accepted()),
         (
             "max_s",

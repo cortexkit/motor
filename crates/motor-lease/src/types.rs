@@ -115,6 +115,14 @@ pub struct Claims {
         deserialize_with = "present_workspace_hash"
     )]
     pub workspace_key_hash: Option<String>,
+    /// Only an explicit true authorizes job cache writes on registered hosts.
+    /// Preserve false separately from absence so signed claim bytes round-trip.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_boolean"
+    )]
+    pub cache_write: Option<bool>,
     /// When enabled by the broker, on registered-host placements only:
     /// `min(floor(mem_mib / 2), 8192)` whole MiB, derived from this token's
     /// `mem_mib`; always the last payload key.
@@ -127,6 +135,10 @@ pub struct Claims {
 }
 
 impl Claims {
+    pub fn cache_write_accepted(&self) -> bool {
+        self.cache_write.is_none() || !self.aud.starts_with("boat:")
+    }
+
     pub fn mem_burst_mib_accepted(&self) -> bool {
         self.mem_burst_mib.is_none_or(|burst| {
             !self.aud.starts_with("boat:") && burst == (self.mem_mib / 2).min(8192)

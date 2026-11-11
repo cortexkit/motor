@@ -199,6 +199,40 @@ fn disk_identity_uses_account_and_hash_ignoring_cold_and_foreign_hints() {
 }
 
 #[test]
+fn cache_write_admission_is_persisted_and_not_changed_by_reconnect_or_attach() {
+    for admitted in [None, Some(false), Some(true)] {
+        let root = cortexkit_test_support::scratch_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let mut h = durable_host(dir.path(), 10_000);
+        let mut c = job(JOB);
+        c.cache_write = admitted;
+        let (connection, _) = h.claim(c.clone(), AT).unwrap();
+        assert_eq!(h.snapshot.per_job.executions[JOB].claims, c);
+        h.close(connection).unwrap();
+        drop(h);
+
+        let mut h = durable_host(dir.path(), 10_000);
+        assert_eq!(h.snapshot.per_job.executions[JOB].claims, c);
+        for purpose in [Purpose::Run, Purpose::Attach] {
+            for later in [None, Some(false), Some(true)] {
+                let mut reconnect = c.clone();
+                reconnect.purpose = purpose;
+                reconnect.cache_write = later;
+                let (connection, admission) = h.claim(reconnect, AT).unwrap();
+                assert_eq!(admission, Admission::Ready);
+                assert_eq!(h.snapshot.per_job.executions[JOB].claims, c);
+                h.close(connection).unwrap();
+            }
+        }
+        drop(h);
+        let (_, snapshot) = SqliteJournal::open(dir.path()).unwrap();
+        assert_eq!(snapshot.per_job.executions[JOB].claims, c);
+        assert_eq!(snapshot.leases[JOB].claims.cache_write, admitted);
+    }
+}
+
+#[test]
 fn reconnect_uses_recorded_disk_and_rejects_another_account_or_hash() {
     let mut h = memory_host(10_000);
     let (id, _) = h.claim(job(JOB), AT).unwrap();
