@@ -447,6 +447,7 @@ fn journal_message(message: &str) -> String {
         "build base seed failed; building without seed",
         "build base seed environment changed during sandbox preparation; building without seed",
         "build base seed succeeded",
+        "build base seed skipped",
         "build base published",
         // Job-stream lifecycle on the tenant boundary: why a connection from
         // motor-host closed, and on which side. Their fields are the runner's
@@ -506,6 +507,20 @@ fn journal_message(message: &str) -> String {
         let valid = match key {
             "job_id" => uuid::Uuid::parse_str(value).is_ok(),
             "cache_fill" | "success" => matches!(value, "true" | "false"),
+            "reason" if *name == "build base seed skipped" => matches!(
+                value,
+                "no_base"
+                    | "unreadable_record"
+                    | "siblings"
+                    | "base_job"
+                    | "not_fixed_path"
+                    | "not_isolated"
+                    | "target_not_empty"
+                    | "workspace_not_tracked"
+                    | "record_mismatch"
+                    | "symlink_change"
+                    | "seed_failed"
+            ),
             "inputs_match" | "times_valid"
                 if *name == "build base seed refused: record mismatch" =>
             {
@@ -1084,6 +1099,27 @@ mod tests {
             journal_message(&format!("[runner] INFO motor_runner::seed: build base seed succeeded job_id={job} elapsed_ms=42 workspace=/secret elapsed_ms=123")),
             format!("build base seed succeeded job_id={job} elapsed_ms=42")
         );
+    }
+
+    #[test]
+    fn journal_seed_skip_keeps_only_closed_reasons() {
+        let job = "018d0d3b-a338-7181-8fcc-88e901ef438c";
+        for reason in [
+            "no_base",
+            "unreadable_record",
+            "siblings",
+            "base_job",
+            "not_fixed_path",
+            "not_isolated",
+            "target_not_empty",
+            "workspace_not_tracked",
+            "record_mismatch",
+            "symlink_change",
+            "seed_failed",
+        ] {
+            assert_eq!(journal_message(&format!("[runner] INFO motor_runner::seed: build base seed skipped job_id={job} reason={reason} workspace=/secret elapsed_ms=123")), format!("build base seed skipped job_id={job} reason={reason}"));
+        }
+        assert_eq!(journal_message(&format!("[runner] INFO motor_runner::seed: build base seed skipped job_id={job} reason=SECRET_LABEL workspace=/secret")), format!("build base seed skipped job_id={job}"));
     }
 
     #[test]

@@ -397,7 +397,12 @@ fn clone_contents(
     staged.sync_all()
 }
 
-fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
+fn skipped(job: motor_protocol::Uuid, reason: &'static str) -> bool {
+    tracing::info!(job_id = %job, reason, "build base seed skipped");
+    false
+}
+
+fn run(attempt: &Attempt<'_>, ops: &Operations<'_>, job: motor_protocol::Uuid) -> io::Result<bool> {
     let workspace = root(attempt.workspace)?;
     // mkdirat refuses an existing link or directory; never create target through
     // a workspace entry, even in a checkout that passed content verification.
@@ -409,7 +414,7 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
     }
     let target = directory(&workspace, c"target")?;
     if !children(&target)?.is_empty() {
-        return Ok(false);
+        return Ok(skipped(job, "target_not_empty"));
     }
     let entries = tree(attempt.mirror, attempt.tree)?;
     if !only_tracked(
@@ -418,18 +423,28 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
         &entries,
         Identity::of(&workspace)?.device,
     )? {
-        return Ok(false);
+        return Ok(skipped(job, "workspace_not_tracked"));
     }
     let base = match build_base::pin_current(attempt.store) {
         Ok(base) => base,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(skipped(job, "no_base"))
+        }
         Err(error) => return Err(error),
     };
-    let record: Record =
-        match serde_json::from_reader(open(&base.directory, c"base.json", libc::O_RDONLY)?) {
-            Ok(record) => record,
-            Err(_) => return Ok(false),
-        };
+    let record_file = match open(&base.directory, c"base.json", libc::O_RDONLY) {
+        Ok(file) => file,
+        Err(_) => {
+            // Settle any interrupted seed before allowing a cold build when
+            // the base record cannot be opened.
+            settle(attempt.state, attempt.workspace)?;
+            return Ok(skipped(job, "unreadable_record"));
+        }
+    };
+    let record: Record = match serde_json::from_reader(record_file) {
+        Ok(record) => record,
+        Err(_) => return Ok(skipped(job, "unreadable_record")),
+    };
     if !record_matches(
         &record,
         attempt,
@@ -442,7 +457,7 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
             workspace = %attempt.workspace.display(),
             "build base seed refused: record mismatch"
         );
-        return Ok(false);
+        return Ok(skipped(job, "record_mismatch"));
     }
     let old = tree(attempt.mirror, &record.tree)?;
     if entries
@@ -450,7 +465,7 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
         .chain(old.iter())
         .any(|(path, (mode, _))| mode == "120000" && entries.get(path) != old.get(path))
     {
-        return Ok(false);
+        return Ok(skipped(job, "symlink_change"));
     }
     (ops.hook)("validated");
     let intent_path = intent_path(attempt.state, attempt.workspace);
@@ -510,6 +525,25 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
     Ok(true)
 }
 
+fn eligibility_skip(
+    isolated: bool,
+    base: bool,
+    siblings: bool,
+    fixed: bool,
+) -> Option<&'static str> {
+    if !isolated {
+        Some("not_isolated")
+    } else if base {
+        Some("base_job")
+    } else if siblings {
+        Some("siblings")
+    } else if !fixed {
+        Some("not_fixed_path")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn seed(
     config: &crate::Config,
     trees: &crate::workspace::Trees,
@@ -518,11 +552,15 @@ pub(crate) fn seed(
     env: &std::collections::BTreeMap<String, String>,
 ) -> io::Result<bool> {
     let request = &setup.request;
-    let Some(fixed) =
-        fixed.filter(|_| config.isolate_jobs && !setup.base && request.siblings.is_empty())
-    else {
-        return Ok(false);
-    };
+    if let Some(reason) = eligibility_skip(
+        config.isolate_jobs,
+        setup.base,
+        !request.siblings.is_empty(),
+        fixed.is_some(),
+    ) {
+        return Ok(skipped(setup.id, reason));
+    }
+    let fixed = fixed.expect("fixed path checked above");
     let workspace = crate::caller_path::host_run(config, request).host_workspace;
     let repository = crate::caller_path::request(request)
         .caller_repository_root
@@ -577,7 +615,7 @@ fn execute(
     job: motor_protocol::Uuid,
 ) -> io::Result<bool> {
     let started = std::time::Instant::now();
-    match run(attempt, operations) {
+    match run(attempt, operations, job) {
         Ok(true) => {
             tracing::info!(job_id = %job, elapsed_ms = started.elapsed().as_millis() as u64, "build base seed succeeded");
             Ok(true)
@@ -586,6 +624,7 @@ fn execute(
         Err(error) => {
             let cleanup = settle(attempt.state, attempt.workspace);
             tracing::warn!(job_id = %job, %error, ?cleanup, "build base seed failed; building without seed");
+            skipped(job, "seed_failed");
             // Never launch with partial artifacts if cleanup itself failed.
             cleanup?;
             Ok(false)
@@ -720,6 +759,67 @@ mod tests {
         assert!(source.starts_with("/proc/self/fd"));
         fs::create_dir_all(target)?;
         fs::write(target.join("artifact"), fs::read(source.join("artifact"))?)
+    }
+
+    #[test]
+    fn skipped_attempts_report_one_closed_reason_and_job_id() {
+        for (case, expected) in [
+            ("no_base", "no_base"),
+            ("missing_record", "unreadable_record"),
+            ("invalid_record", "unreadable_record"),
+            ("nonempty", "target_not_empty"),
+            ("untracked", "workspace_not_tracked"),
+            ("mismatch", "record_mismatch"),
+        ] {
+            let mut fixture = Fixture::new();
+            match case {
+                "no_base" => fs::remove_dir_all(fixture.store.join("current")).unwrap(),
+                "missing_record" => {
+                    fs::remove_file(fixture.store.join("current/base.json")).unwrap()
+                }
+                "invalid_record" => {
+                    fs::write(fixture.store.join("current/base.json"), b"invalid").unwrap()
+                }
+                "nonempty" => {
+                    fs::create_dir(fixture.workspace.join("target")).unwrap();
+                    fs::write(fixture.workspace.join("target/artifact"), b"keep").unwrap();
+                }
+                "untracked" => fs::write(fixture.workspace.join("ignored"), b"keep").unwrap(),
+                "mismatch" => {
+                    fixture.record.format = 2;
+                    fixture.save_record();
+                }
+                _ => unreachable!(),
+            }
+            let job = motor_protocol::Uuid::now_v7();
+            let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                motor_protocol::logging::LineSubscriber::new("[runner]", Log(bytes.clone()));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(!execute(&fixture.attempt(), &fixture.ops(), job).unwrap());
+            });
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                logs.matches("build base seed skipped").count(),
+                1,
+                "{case}: {logs}"
+            );
+            assert!(
+                logs.contains(&format!("job_id={job} reason={expected}")),
+                "{case}: {logs}"
+            );
+        }
+        assert_eq!(
+            eligibility_skip(false, false, false, true),
+            Some("not_isolated")
+        );
+        assert_eq!(eligibility_skip(true, true, false, true), Some("base_job"));
+        assert_eq!(eligibility_skip(true, false, true, true), Some("siblings"));
+        assert_eq!(
+            eligibility_skip(true, false, false, false),
+            Some("not_fixed_path")
+        );
+        assert_eq!(eligibility_skip(true, false, false, true), None);
     }
 
     #[test]
@@ -864,7 +964,7 @@ mod tests {
         };
         let mut ops = fixture.ops();
         ops.times = &apply;
-        assert!(run(&fixture.attempt(), &ops).unwrap());
+        assert!(run(&fixture.attempt(), &ops, motor_protocol::Uuid::nil()).unwrap());
         assert_eq!(
             fs::read_to_string(fixture.workspace.join("target/artifact")).unwrap(),
             "old generation"
@@ -876,7 +976,7 @@ mod tests {
                 .mtime(),
             fixture.record.fill_start.seconds
         );
-        assert!(!run(&fixture.attempt(), &ops).unwrap());
+        assert!(!run(&fixture.attempt(), &ops, motor_protocol::Uuid::nil()).unwrap());
         assert_eq!(times.get(), 1);
     }
 
@@ -885,7 +985,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut ops = fixture.ops();
         ops.clone = &crate::platform::clone_target;
-        assert!(run(&fixture.attempt(), &ops).unwrap());
+        assert!(run(&fixture.attempt(), &ops, motor_protocol::Uuid::nil()).unwrap());
         fs::write(
             fixture.workspace.join("target/artifact"),
             "job changed bytes",
@@ -950,7 +1050,10 @@ mod tests {
             }
             let mut ops = fixture.ops();
             ops.clone = &|_, _| panic!("ineligible seed reached clone");
-            assert!(!run(&fixture.attempt(), &ops).unwrap(), "{case}");
+            assert!(
+                !run(&fixture.attempt(), &ops, motor_protocol::Uuid::nil()).unwrap(),
+                "{case}"
+            );
             assert!(!intent_path(&fixture.scratch, &fixture.workspace).exists());
         }
     }
@@ -970,7 +1073,12 @@ mod tests {
             );
             fixture.compatibility = Compatibility::Available(inputs);
             assert!(
-                run(&fixture.attempt(), &fixture.ops()).unwrap(),
+                run(
+                    &fixture.attempt(),
+                    &fixture.ops(),
+                    motor_protocol::Uuid::nil()
+                )
+                .unwrap(),
                 "{variable}"
             );
         }
@@ -992,7 +1100,20 @@ mod tests {
             let tree = fixture.snapshot();
             let mut attempt = fixture.attempt();
             attempt.tree = &tree;
-            assert!(!run(&attempt, &fixture.ops()).unwrap(), "{case}");
+            let job = motor_protocol::Uuid::now_v7();
+            let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                motor_protocol::logging::LineSubscriber::new("[runner]", Log(bytes.clone()));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(!run(&attempt, &fixture.ops(), job).unwrap(), "{case}");
+            });
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains(&format!(
+                    "build base seed skipped job_id={job} reason=symlink_change"
+                )),
+                "{case}: {logs}"
+            );
         }
     }
 
@@ -1081,7 +1202,7 @@ mod tests {
             let mut ops = fixture.ops();
             ops.hook = &hook;
             ops.clone = &clone;
-            assert!(run(&fixture.attempt(), &ops).unwrap());
+            assert!(run(&fixture.attempt(), &ops, motor_protocol::Uuid::nil()).unwrap());
             assert_eq!(
                 fs::read_to_string(fixture.workspace.join("target/artifact")).unwrap(),
                 "old generation"
@@ -1224,7 +1345,12 @@ mod tests {
                 crate::compile_cache::environment_fingerprint(&planned);
             fixture.compatibility = Compatibility::Available(fixture.record.inputs.clone());
             fixture.save_record();
-            assert!(run(&fixture.attempt(), &fixture.ops()).unwrap());
+            assert!(run(
+                &fixture.attempt(),
+                &fixture.ops(),
+                motor_protocol::Uuid::nil()
+            )
+            .unwrap());
             let pin = pin_target(&fixture.workspace).unwrap();
             let launched = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
             // A prepared sandbox reports no generation if socket setup failed.
@@ -1285,7 +1411,12 @@ mod tests {
     #[test]
     fn post_prepare_discard_uses_held_directory_not_replacement_path() {
         let fixture = Fixture::new();
-        assert!(run(&fixture.attempt(), &fixture.ops()).unwrap());
+        assert!(run(
+            &fixture.attempt(),
+            &fixture.ops(),
+            motor_protocol::Uuid::nil()
+        )
+        .unwrap());
         let pin = pin_target(&fixture.workspace).unwrap();
         let detached = fixture.workspace.join("detached");
         fs::rename(fixture.workspace.join("target"), &detached).unwrap();
@@ -1380,6 +1511,12 @@ mod tests {
                 "{case}: {logs}"
             );
             assert_eq!(
+                logs.matches("build base seed skipped").count(),
+                1,
+                "{case}: {logs}"
+            );
+            assert!(logs.contains("reason=seed_failed"), "{case}: {logs}");
+            assert_eq!(
                 calls.get(),
                 usize::from(case != "identity"),
                 "no clone retry or copy fallback"
@@ -1415,7 +1552,12 @@ mod tests {
             "keep ignored",
         )
         .unwrap();
-        assert!(!run(&fixture.attempt(), &fixture.ops()).unwrap());
+        assert!(!run(
+            &fixture.attempt(),
+            &fixture.ops(),
+            motor_protocol::Uuid::nil()
+        )
+        .unwrap());
         settle(&fixture.scratch, &fixture.workspace).unwrap();
         assert_eq!(
             fs::read_to_string(fixture.workspace.join(".motor-seed-b/ignored")).unwrap(),
@@ -1435,7 +1577,12 @@ mod tests {
         fixture.record.tree = fixture.snapshot();
         fixture.save_record();
         fs::write(fixture.workspace.join(".motor-seed-b"), "ignored file").unwrap();
-        assert!(!run(&fixture.attempt(), &fixture.ops()).unwrap());
+        assert!(!run(
+            &fixture.attempt(),
+            &fixture.ops(),
+            motor_protocol::Uuid::nil()
+        )
+        .unwrap());
         settle(&fixture.scratch, &fixture.workspace).unwrap();
         assert_eq!(
             fs::read_to_string(fixture.workspace.join(".motor-seed-a")).unwrap(),
@@ -1460,7 +1607,8 @@ mod tests {
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(
                 &fixture.attempt(),
-                &ops
+                &ops,
+                motor_protocol::Uuid::nil(),
             )))
             .is_err()
         );
@@ -1553,6 +1701,7 @@ mod tests {
                 },
                 staging: ".motor-seed-test".into(),
             },
+            motor_protocol::Uuid::nil(),
         )
         .unwrap();
         panic!("crash boundary was not reached");
@@ -1581,7 +1730,7 @@ mod tests {
             if boundary == "committed" {
                 let mut ops = fixture.ops();
                 ops.times = &|_| panic!("kept folder must not be time-set");
-                assert!(!run(&fixture.attempt(), &ops).unwrap());
+                assert!(!run(&fixture.attempt(), &ops, motor_protocol::Uuid::nil()).unwrap());
                 assert!(fixture.workspace.join("target/artifact").exists());
             } else {
                 fixture.assert_settled();
