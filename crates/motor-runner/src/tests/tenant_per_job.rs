@@ -46,7 +46,7 @@ fn job_vm_accepts_one_execution_and_workspace_even_after_completion() {
 
 /// A fill VM's runner starts as a plain tenant runner: the guest agent adds
 /// `--per-job` only on job boots. So the fill check must not depend on the
-/// per-job flag (requiring it refused every real fill on ovh-2), while the
+/// per-job flag (requiring it refused every real fill VM), while the
 /// write key and a tip remain required, and job VMs still never queue fills.
 #[cfg(target_os = "linux")]
 #[test]
