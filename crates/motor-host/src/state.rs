@@ -10,7 +10,9 @@ mod advertise;
 mod cache_write_tests;
 pub mod jobs;
 pub mod settlement;
+pub mod table;
 pub use advertise::{MemoryCase, MEMORY_FRESH_MS, MEMORY_PROBE_MS, START_RETRY_MS};
+pub use table::Table;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -73,15 +75,15 @@ pub struct Snapshot {
     pub per_job: jobs::Ledger,
     /// Independent of finished-job retention: old tokens stay fenced until expiry.
     #[serde(default)]
-    pub revocations: BTreeMap<String, Revocation>,
-    pub leases: BTreeMap<String, Lease>,
-    pub nonces: BTreeMap<String, u64>,
-    pub vms: BTreeMap<String, Vm>,
+    pub revocations: Table<Revocation>,
+    pub leases: Table<Lease>,
+    pub nonces: Table<u64>,
+    pub vms: Table<Vm>,
     /// No-start reports are durable inputs to the signed usage outbox.
-    pub zero_usage: BTreeMap<String, Usage>,
-    pub pending_cancels: BTreeMap<String, String>,
+    pub zero_usage: Table<Usage>,
+    pub pending_cancels: Table<String>,
     #[serde(default)]
-    pub billing: BTreeMap<String, crate::billing::JobBilling>,
+    pub billing: Table<crate::billing::JobBilling>,
     #[serde(default)]
     pub outbox: Vec<crate::billing::Request>,
     #[serde(default)]
@@ -97,13 +99,50 @@ pub struct Snapshot {
     pub last_alive: u64,
     /// Tenants whose accounts the broker reported closed, by tenant name.
     #[serde(default)]
-    pub closed: BTreeMap<String, crate::closure::ClosedTenant>,
+    pub closed: Table<crate::closure::ClosedTenant>,
     /// Keep fleet placement paused across host and helper restarts during an update.
     #[serde(default)]
     pub draining: bool,
     /// Fixed admission deadline while emptying the host without stopping short jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accept_until_ms: Option<u64>,
+}
+
+impl Snapshot {
+    /// Folds every table's changes into its base; see [`Table::commit`].
+    /// Only [`Host::save`], once the journal has stored this snapshot, and
+    /// the journal's loader call this, so a base always holds contents the
+    /// journal has stored.
+    pub(crate) fn commit(&mut self) {
+        let Self {
+            remote_cache_write_blocked: _,
+            per_job,
+            revocations,
+            leases,
+            nonces,
+            vms,
+            zero_usage,
+            pending_cancels,
+            billing,
+            outbox: _,
+            expired_outbox: _,
+            rejected_outbox: _,
+            counter: _,
+            last_alive: _,
+            closed,
+            draining: _,
+            accept_until_ms: _,
+        } = self;
+        revocations.commit();
+        leases.commit();
+        nonces.commit();
+        vms.commit();
+        zero_usage.commit();
+        pending_cancels.commit();
+        billing.commit();
+        closed.commit();
+        per_job.commit();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -245,6 +284,10 @@ pub struct Host {
     fill_capacity_refused_at_ms: Option<u64>,
     host_resources_failed: std::cell::Cell<bool>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
+    /// The jobs whose lease has not ended, kept in step with `snapshot` by
+    /// [`Host::save`], so a save checks drain completion and overlapping
+    /// leases without reading every finished job's lease.
+    unended: std::collections::BTreeSet<String>,
 }
 impl Host {
     pub fn set_remote_cache_write_block(&mut self, blocked: bool) -> Result<(), Error> {
@@ -285,7 +328,13 @@ impl Host {
             fill_capacity_refused_at_ms: None,
             host_resources_failed: std::cell::Cell::new(false),
             job_storage: None,
+            unended: std::collections::BTreeSet::new(),
         }
+        .with_unended_index()
+    }
+    fn with_unended_index(mut self) -> Self {
+        self.unended = unended_leases(&self.snapshot.leases);
+        self
     }
     /// Replaces the journal, so tests can make writes fail the way a full
     /// disk does. Production never swaps the journal of a running host.
@@ -313,24 +362,46 @@ impl Host {
         host.provider_managed = true;
         host
     }
+    /// Makes `next` the host's state once the journal has stored it. `next`
+    /// is normally a copy of `self.snapshot` with some records changed; the
+    /// cost of a save follows the number of changed records, not the number
+    /// of records the host holds.
     pub(crate) fn save(&mut self, mut next: Snapshot) -> Result<(), Error> {
-        if next.accept_until_ms.is_some()
-            && (next.draining
-                || next
+        let unended = if next.leases.version() == self.snapshot.leases.version() {
+            // Every key changed since the current base is a changed key of
+            // `next`, including direct edits of `self.snapshot`.
+            let mut unended = self.unended.clone();
+            for job in next.leases.changed_keys() {
+                if next
                     .leases
-                    .values()
-                    .all(|lease| lease.state == LeaseState::Ended))
-        {
+                    .get(job)
+                    .is_some_and(|lease| lease.state != LeaseState::Ended)
+                {
+                    unended.insert(job.clone());
+                } else {
+                    unended.remove(job);
+                }
+            }
+            unended
+        } else {
+            unended_leases(&next.leases)
+        };
+        if next.accept_until_ms.is_some() && (next.draining || unended.is_empty()) {
             // Publish the last lease's end and the full drain in one durable write.
             // Clearing the bound restores the existing full-drain canary admission.
             next.accept_until_ms = None;
             next.draining = true;
         }
         if !self.provider_managed {
-            crate::billing::mark_overlap(&mut next);
+            crate::billing::mark_overlap(&mut next, &unended);
         }
         self.journal.store(&next)?;
         self.snapshot = next;
+        // The previous snapshot is gone, so its bases are normally owned by
+        // this snapshot alone and the changes fold in place.
+        self.snapshot.commit();
+        self.journal.committed(&self.snapshot);
+        self.unended = unended;
         self.publish_connections();
         Ok(())
     }
@@ -1349,6 +1420,14 @@ impl Host {
         );
     }
 }
+fn unended_leases(leases: &Table<Lease>) -> std::collections::BTreeSet<String> {
+    leases
+        .iter()
+        .filter(|(_, lease)| lease.state != LeaseState::Ended)
+        .map(|(job, _)| job.clone())
+        .collect()
+}
+
 fn same_reservation(a: &Claims, b: &Claims) -> bool {
     a.jti == b.jti
         && a.sub == b.sub

@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 
 pub trait Journal: Send {
     fn store(&mut self, snapshot: &Snapshot) -> io::Result<()>;
+    /// Called after a successful [`Journal::store`] of `snapshot`, once its
+    /// tables have folded their changes into their bases (see
+    /// [`crate::state::Table::commit`]). A journal that writes only changed
+    /// keys learns here that those bases now hold what it stored.
+    fn committed(&mut self, _snapshot: &Snapshot) {}
     fn directory(&self) -> Option<PathBuf> {
         None
     }

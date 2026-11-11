@@ -548,7 +548,13 @@ impl Runtime {
             .map(|(job, _)| job.clone())
             .collect();
         // Retry a manager failure after the VM's stopped record was committed.
-        // Release is durable and idempotent, including across host restarts.
+        // Release is durable and idempotent, including across host restarts,
+        // so a job released once by this process is not released again on
+        // every tick for as long as its finished record is kept.
+        self.released_jobs
+            .lock()
+            .expect("released jobs")
+            .retain(|job| ended.binary_search(job).is_ok());
         for job in ended {
             self.forget_helper_stop(&job);
             if self
@@ -567,7 +573,21 @@ impl Runtime {
                     self.publish_job_settlement(&job),
                 );
             }
-            tick_step(&mut failure, "release", self.job_resources.release(&job));
+            if !self
+                .released_jobs
+                .lock()
+                .expect("released jobs")
+                .contains(&job)
+            {
+                let result = self.job_resources.release(&job);
+                if result.is_ok() {
+                    self.released_jobs
+                        .lock()
+                        .expect("released jobs")
+                        .insert(job.clone());
+                }
+                tick_step(&mut failure, "release", result);
+            }
             let expire = {
                 let host = self.host.lock().expect("host lock");
                 host.snapshot
@@ -1395,6 +1415,26 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
         .job_workspace_is_new(&claims.jti);
     let mut repository_root = None;
     loop {
+        // The host can end a queued execution before its VM boots, for
+        // example when a job waiting for memory reaches its pre-start
+        // deadline. Its no-start terminal is then in replay; hand the caller
+        // to the replay reader so it gets that terminal instead of queue
+        // heartbeats forever. This is checked after every wake-up, not only
+        // on the heartbeat, and whether or not a Run was accepted: a caller
+        // still uploading its request gets the same terminal, rather than
+        // queue heartbeats with no end.
+        let ended = runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions[&claims.jti]
+            .ended;
+        if ended {
+            drop(spool);
+            return stream::serve(runtime, claims, client, false, reader, true).await;
+        }
         // Drain buffered frames into the spool only while it has room. Once
         // full, hand them to the live reader or neither side can make progress.
         if accepted
@@ -1418,7 +1458,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             )
             .await;
         }
-        let (launch, ended) = if preparing.is_none()
+        let (launch, cancelled) = if preparing.is_none()
             && starting.is_none()
             && ready.is_none()
             && (!new_workspace || repository_root.is_some())
@@ -1441,8 +1481,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
         } else {
             (None, false)
         };
-        if ended {
-            ensure!(accepted, "queued execution ended before its Run");
+        if cancelled {
+            // The lease ended before the execution record did. Stored replay
+            // gives the terminal once it is written, as above.
             drop(spool);
             return stream::serve(runtime, claims, client, false, reader, true).await;
         }
@@ -1517,17 +1558,6 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
             },
             _ = heartbeat.tick() => {
-                // The host can end a queued execution before its VM boots, for
-                // example when a job waiting for memory reaches its pre-start
-                // deadline. Its no-start terminal is then in replay; hand the
-                // caller to the replay reader so it gets that terminal instead
-                // of queue heartbeats forever.
-                let ended = runtime.host.lock().expect("host lock").snapshot.per_job.executions[&claims.jti].ended;
-                if ended {
-                    ensure!(accepted, "queued execution ended before its Run");
-                    drop(spool);
-                    return stream::serve(runtime, claims, client, false, reader, true).await;
-                }
                 // Admitted workspace queues, including a memory recheck before
                 // boot, keep the same paused caller queue clock as VM setup.
                 let wait = accepted.then(|| queue_clock.observe(false));

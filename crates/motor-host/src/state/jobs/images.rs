@@ -188,7 +188,7 @@ impl Host {
             "publication must copy newly admitted accounts"
         );
         let mut next = self.snapshot.clone();
-        for (key, generation) in &mut next.per_job.images {
+        for (key, generation) in next.per_job.images.iter_mut() {
             generation.current = key == id;
             if key == id {
                 generation.pending = false;
@@ -297,23 +297,55 @@ impl Host {
         {
             return Err(Error::Refused(crate::state::Refusal::InternalFailure));
         }
-        let mut next = self.snapshot.clone();
-        for generation in next.per_job.images.values_mut() {
-            generation.recovery_holders.remove(job);
-        }
-        for (id, generation) in &mut next.per_job.images {
-            if generation.pending {
-                continue;
-            }
-            generation.accounts.retain(|account, ready| {
-                *ready
-                    || generation.recovery_holders.values().any(|a| a == account)
-                    || self.snapshot.per_job.executions.values().any(|e| {
-                        !e.ended
-                            && e.image_generation.as_ref() == Some(id)
-                            && &e.claims.sub == account
+        // Which accounts' copies of each generation unfinished jobs still use,
+        // read once rather than once per account and generation.
+        let in_use: std::collections::BTreeSet<(&str, &str)> = self
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .filter(|e| !e.ended)
+            .filter_map(|e| Some((e.image_generation.as_deref()?, e.claims.sub.as_str())))
+            .collect();
+        // This job stops holding any generation for recovery, and a
+        // generation drops every account copy that is not ready and that no
+        // other holder or unfinished job still uses.
+        let mut changes = Vec::new();
+        for (id, generation) in &self.snapshot.per_job.images {
+            let held = generation.recovery_holders.contains_key(job);
+            let unused: Vec<String> = if generation.pending {
+                Vec::new()
+            } else {
+                generation
+                    .accounts
+                    .iter()
+                    .filter(|(account, ready)| {
+                        !**ready
+                            && !generation
+                                .recovery_holders
+                                .iter()
+                                .any(|(holder, a)| holder != job && a == *account)
+                            && !in_use.contains(&(id.as_str(), account.as_str()))
                     })
-            });
+                    .map(|(account, _)| account.clone())
+                    .collect()
+            };
+            if held || !unused.is_empty() {
+                changes.push((id.clone(), unused));
+            }
+        }
+        // Releasing a job that holds nothing is the common case: the tick
+        // retries every finished job's release. It writes nothing.
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.snapshot.clone();
+        for (id, unused) in changes {
+            let generation = next.per_job.images.get_mut(&id).expect("listed generation");
+            generation.recovery_holders.remove(job);
+            for account in unused {
+                generation.accounts.remove(&account);
+            }
         }
         self.save(next)
     }

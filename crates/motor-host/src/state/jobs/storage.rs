@@ -180,7 +180,7 @@ impl Host {
                     .checked_add(fill.fill.size_bytes - exclusive)
                     .ok_or(RefusalCause::Storage)?;
             }
-            for (id, disk) in &mut next.per_job.disks {
+            for (id, disk) in next.per_job.disks.iter_mut() {
                 let active = !disk.deleted
                     && (disk.attached_job.is_some()
                         || !disk.queue.is_empty()
