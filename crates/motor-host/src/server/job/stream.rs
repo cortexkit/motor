@@ -424,8 +424,7 @@ async fn collect(
                 // does not store, and keeps its channel open. Without a stored
                 // terminal the caller would wait on queued heartbeats forever.
                 Some("refusal") if !resume && !runner_accepted => {
-                    if let Some(terminal) = admission_refusal(runtime, &claims.jti, &frame.value)
-                    {
+                    if let Some(terminal) = admission_refusal(runtime, &claims.jti, &frame.value) {
                         tracing::warn!(
                             jti = claims.jti,
                             reason = terminal["outcome"]["reason"].as_str(),
@@ -656,6 +655,8 @@ fn release_export_tip(runtime: &Runtime, job: &str) {
         tracing::warn!(%error, "fill_export_release_failed");
     }
 }
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

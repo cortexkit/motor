@@ -1999,9 +1999,10 @@ async fn runner_refusal_after_host_acceptance(large_upload: bool) {
         *fake.gate.0.lock().unwrap() = true;
         fake.gate.1.notify_all();
     }
-    let terminal = tokio::time::timeout(Duration::from_secs(10), next_type(&mut client, "terminal"))
-        .await
-        .expect("the runner's refusal reaches the caller as a terminal");
+    let terminal =
+        tokio::time::timeout(Duration::from_secs(10), next_type(&mut client, "terminal"))
+            .await
+            .expect("the runner's refusal reaches the caller as a terminal");
     assert_eq!(
         terminal["outcome"],
         json!({"type":"refused_before_start","reason":"runner_disk_full"})
@@ -2034,7 +2035,10 @@ async fn runner_refusal_after_host_acceptance(large_upload: bool) {
         assert!(lease.delivered);
         assert!(lease.started_at_ms.is_none());
         assert_eq!(lease.state, LeaseState::Ended);
-        assert_eq!(host.snapshot.billing[JOB].terminal.as_ref(), Some(&terminal));
+        assert_eq!(
+            host.snapshot.billing[JOB].terminal.as_ref(),
+            Some(&terminal)
+        );
         assert!(host.snapshot.per_job.executions[JOB].ended);
         host.close(id).unwrap();
     }
@@ -2067,6 +2071,94 @@ async fn runner_refusal_after_host_acceptance(large_upload: bool) {
 #[tokio::test]
 async fn runner_refusal_after_host_acceptance_is_a_stored_no_start_terminal() {
     runner_refusal_after_host_acceptance(false).await;
+}
+
+/// A Run accepted into the queue behind another job on the same checkout can
+/// end before its VM boots, when the host gives up on it at the lease's
+/// expiry. The caller still attached to the queued session, and any caller
+/// that reattaches later, must get a stored no-start terminal rather than
+/// queued heartbeats with no end.
+#[tokio::test]
+async fn queued_job_ended_before_boot_reaches_live_and_reattached_callers() {
+    let (runtime, fake, storage) = fixture();
+    // Keep the job holding the checkout from timing out its own boot.
+    hold_boot(&runtime, &fake, "none");
+    claim(&runtime, &claims(JOB));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    let mut c = claims(JOB2);
+    c.exp = unix_ms() / 1000 + 3;
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c.clone(), id).await;
+    queued(&mut client, JOB2).await;
+    let r = runtime.clone();
+    let expired = c.exp * 1000 + 1;
+    tokio::task::spawn_blocking(move || r.tick_jobs(expired))
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = runtime.host.lock().unwrap().snapshot.billing[JOB2]
+        .terminal
+        .clone()
+        .expect("the ended queued job has a durable terminal");
+    assert!(runtime
+        .job_stream(JOB2)
+        .unwrap()
+        .with_store(|s| Ok(s.ended()))
+        .unwrap());
+    let terminal =
+        tokio::time::timeout(Duration::from_secs(10), next_type(&mut client, "terminal"))
+            .await
+            .expect("the queued caller gets the ended job's terminal");
+    assert_eq!(terminal, stored);
+    assert_eq!(terminal["ran"], "none");
+    assert_eq!(terminal["outcome"]["type"], "refused_before_start");
+    next_type(&mut client, "hosted_terminal").await;
+    task.await.unwrap().unwrap();
+    drop(client);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.per_job.executions[JOB2].ended);
+        assert!(!host.snapshot.per_job.executions[JOB2].boot_started);
+        assert!(!host.snapshot.leases[JOB2].delivered);
+        assert_eq!(
+            host.snapshot.billing[JOB2].terminal.as_ref(),
+            Some(&terminal)
+        );
+        host.close(id).unwrap();
+    }
+    assert!(!storage.spool(JOB2).exists());
+
+    c.purpose = Purpose::Attach;
+    c.exp = unix_ms() / 1000 + 300;
+    let id = runtime
+        .host
+        .lock()
+        .unwrap()
+        .claim(c.clone(), unix_ms())
+        .unwrap()
+        .0;
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(
+        &mut client,
+        &json!({"type":"attach","job_id":JOB2,"from_seq":0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next_type(&mut client, "terminal").await, terminal);
+    next_type(&mut client, "hosted_terminal").await;
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.host.lock().unwrap().close(id).unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
 }
 
 #[tokio::test]
