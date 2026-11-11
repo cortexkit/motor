@@ -1013,6 +1013,50 @@ class ParityTests(unittest.TestCase):
                 self.assertIn('missing apt package: musl-tools',
                               parity.differences(manifest, actual, role=role))
 
+    def test_cmake_is_required_on_every_linux_role(self):
+        self.assertIn('cmake', self.manifest['apt_packages']['required'])
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role):
+                actual = self.observed_host(role)
+                self.assertEqual([], parity.differences(self.manifest, actual, role=role))
+                del actual['apt_packages']['cmake']
+                self.assertIn('missing apt package: cmake',
+                              parity.differences(self.manifest, actual, role=role))
+
+    def test_cmake_is_required_on_every_linux_host_and_job_path(self):
+        self.assertIn('cmake', self.manifest['tools'])
+        self.assertEqual('/usr/bin/cmake', self.manifest['tools']['cmake']['path'])
+        for role in ('build-server', 'boat', 'tenant'):
+            for job in (False, True):
+                for drift in ('missing', 'path', 'exit_code', 'version'):
+                    with self.subTest(role=role, job=job, drift=drift):
+                        actual = self.observed(role, job=True) if job else self.observed_host(role)
+                        actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                        self.assertEqual([], parity.differences(self.manifest, actual, role, job,
+                                                               gnu_test_sha256='package-qualified-test'))
+                        if drift == 'missing':
+                            actual['tools']['cmake'] = None
+                        else:
+                            actual['tools']['cmake'][drift] = {
+                                'path': '/usr/local/bin/cmake',
+                                'exit_code': 1,
+                                'version': 'not cmake',
+                            }[drift]
+                        errors = parity.differences(self.manifest, actual, role, job,
+                                                   gnu_test_sha256='package-qualified-test')
+                        self.assertTrue(any('cmake' in error for error in errors), errors)
+
+    def test_cmake_accepts_distribution_versions(self):
+        for role in ('build-server', 'boat', 'tenant'):
+            for job in (False, True):
+                for version in ('cmake version 3.28.3', 'cmake version 3.31.6', 'cmake version 4.2.3'):
+                    with self.subTest(role=role, job=job, version=version):
+                        actual = self.observed(role, job=True) if job else self.observed_host(role)
+                        actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                        actual['tools']['cmake']['version'] = version
+                        self.assertEqual([], parity.differences(self.manifest, actual, role, job,
+                                                               gnu_test_sha256='package-qualified-test'))
+
     def test_python3_venv_is_required_only_on_boat_and_tenant_roles(self):
         manifest = self.manifest
         self.assertNotIn('python3-venv', manifest['apt_packages']['required'])

@@ -90,6 +90,7 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(set(install[4:]), expected)
         self.assertIn('libwebkit2gtk-4.1-dev', install[4:])
         self.assertIn('musl-tools', install[4:])
+        self.assertIn('cmake', install[4:])
         self.assertIn('python3-venv', install[4:])
         self.assertIn('Acquire::Retries "3";', written['/etc/apt/apt.conf.d/99snapshot'])
         self.assertIn('APT::Update::Error-Mode "any";', written['/etc/apt/apt.conf.d/99snapshot'])
