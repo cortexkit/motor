@@ -42,7 +42,8 @@ Payload keys occur in this order, without whitespace:
 | `max_s` | Run limit enforced by the host from job start, not token issue |
 | `cnf` | `{"jkt":"<thumbprint>"}` |
 | `purpose` | `"run"` from lease; `"attach"` from reattach |
-| `workspace_key_hash` | When enabled by the broker, on registered-host placements only: the lease request's `workspace_key_hash` verbatim (`^[A-Za-z0-9_-]{43}$`); after `purpose`, before `mem_burst_mib` when that claim is present |
+| `workspace_key_hash` | When enabled by the broker, on registered-host placements only: the lease request's `workspace_key_hash` verbatim (`^[A-Za-z0-9_-]{43}$`); after `purpose`, before `cache_write` and `mem_burst_mib` when those claims are present |
+| `cache_write` | Optional Boolean on eligible registered-host jobs when enabled by the broker; after `workspace_key_hash` when present, otherwise after `purpose`, and before `mem_burst_mib` |
 | `mem_burst_mib` | When enabled by the broker, on registered-host placements only: `min(floor(mem_mib / 2), 8192)` whole MiB, derived from this token's `mem_mib`; always the last payload key |
 
 The temporary broker rollout switch `JOB_TOKEN_WORKSPACE_HASH` emits `workspace_key_hash` only
@@ -54,12 +55,36 @@ it: the broker chooses Boat sandboxes by workspace itself, so the sandbox has no
 and Boat token readers keep rejecting it as an unknown claim. While the claim is optional, a token for a job recorded before the broker stored its
 hash may omit it, even with the switch on. The broker stores a hash for every newly recorded job.
 
+The rollout switch `JOB_TOKEN_CACHE_WRITE` defaults off and emits only when its value is exactly
+the string `"true"`. Registered-host readers must accept the optional Boolean `cache_write`
+before emission: leave the switch off until MOTOR confirms every registered-host reader accepts
+it. Absence and `false` grant no job cache writes; `null` and non-Booleans are invalid. The broker
+never emits `cache_write:false`; `false` exists only as a reader rule. Boat tokens never contain
+the claim and Boat readers reject it.
+
+With `JOB_TOKEN_CACHE_WRITE` off, existing payload and signature bytes remain unchanged. With it
+on, emit `cache_write:true` only for registered-host jobs whose account setting allows writes.
+The account setting defaults off and is broker-controlled, never client-supplied. The broker
+records eligibility with each new job; legacy jobs without it remain off. Run/attach reissue,
+re-request, re-sign, move and replace preserve stored eligibility while emission remains enabled;
+none re-reads the account setting for eligibility. Disabling emission omits the claim even for
+eligible jobs. The claim follows `workspace_key_hash` when present, otherwise `purpose`, and
+precedes `mem_burst_mib`, which remains last.
+
+A run admission snapshots the authorization for that execution. Attach never starts an execution
+or upgrades its cache access. Hosts enforce create-only writes through a runner-held credential
+scoped to the account's shared compile-cache object-key prefix, selected by the token's `sub`;
+the claim never grants delete, overwrite or cross-account access. Account disable affects new
+jobs; disable emission plus stop/revoke existing writers for immediate
+rollback. Usage bodies and billing remain unchanged.
+
 The separate rollout switch `JOB_TOKEN_MEM_BURST` emits `mem_burst_mib` only when its value is
 exactly the string `"true"`; it ships as `"false"`. Hosts must accept the optional claim before
 the broker emits it: leave the switch off until MOTOR (the host owner) confirms every live host
 verifier accepts it. With the switch off, existing payload and signed token bytes are unchanged. With it on,
-registered-host run and attach tokens append the claim after `workspace_key_hash` when present,
-or after `purpose` otherwise. Boat placements never carry it. The value stays the same across
+registered-host run and attach tokens append the claim after `cache_write` when present,
+otherwise after `workspace_key_hash` when present, or after `purpose` otherwise. Boat placements
+never carry it. The value stays the same across
 re-request, re-sign, reattach and replace because it is derived from the job's stored `mem_mib`.
 The host may let the working set exceed `mem_mib` by this bounded amount, but may stop a burst
 job first under host memory pressure. File cache never counts towards the working set. Placement,
@@ -70,7 +95,9 @@ host fit and the in-flight ledger reserve only `mem_mib`, never the burst allowa
 
 Hosts check expiration at connect only. They reject any other `alg` or `typ`, unknown `kid`, any
 `crit` header, wrong `iss` or `aud`, any purpose other than `run` or `attach`, and extra or missing
-claims, except that hosts must accept `mem_burst_mib` as optional before its rollout and validate
+claims, except that registered-host readers must accept optional Boolean `cache_write` before
+its emission as described above, and hosts must accept `mem_burst_mib` as optional before its
+rollout and validate
 its whole-MiB value against the formula above when present. Hosts must also accept
 `workspace_key_hash` as optional during rollout and validate
 it against `^[A-Za-z0-9_-]{43}$` when present. Hosts may require it only after the operator announces

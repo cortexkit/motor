@@ -227,6 +227,7 @@ async fn hosted_relay(scratch: &Path) -> HostedRelay {
         "linux-x64"
     };
     let claims = Claims {
+        cache_write: None,
         mem_burst_mib: None,
         // Registered hosts refuse run tokens without a workspace hash.
         workspace_key_hash: Some("w".repeat(43)),

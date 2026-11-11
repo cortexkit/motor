@@ -413,6 +413,7 @@ impl FakeBroker {
             return BrokerReply::error(400, "bad_request");
         };
         let claims = Claims {
+            cache_write: None,
             mem_burst_mib: None,
             workspace_key_hash: (!self.config.placement.host.starts_with("boat:"))
                 .then(|| job.request.workspace_key_hash.clone()),

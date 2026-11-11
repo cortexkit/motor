@@ -27,6 +27,7 @@ impl crate::journal::Journal for Journal {
 
 fn claims(job: &str) -> Claims {
     Claims {
+        cache_write: None,
         iss: motor_lease::ISSUER.into(),
         aud: "host".into(),
         jti: job.into(),

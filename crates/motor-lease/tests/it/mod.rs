@@ -1,5 +1,6 @@
 mod auth;
 mod broker;
+mod cache_write;
 mod cloud;
 mod common;
 mod mem_burst;

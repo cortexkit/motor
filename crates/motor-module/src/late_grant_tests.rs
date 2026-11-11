@@ -423,6 +423,7 @@ impl Harness {
                     };
                     let now = crate::hosted::now_s();
                     let claims = Claims {
+                        cache_write: None,
                         workspace_key_hash: None,
                         mem_burst_mib: None,
                         iss: motor_lease::ISSUER.into(), aud: host.into(), sub: "acct:test".into(),
