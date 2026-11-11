@@ -7,10 +7,12 @@ use motor_host::state::{Error, Refusal};
 use motor_lease::{Challenge, Jwks, JwksKey, RequesterJwk};
 use serde_json::{json, Value};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Default)]
 struct Fake {
+    running: AtomicBool,
     admin_reply: Mutex<Option<Value>>,
     fail: Mutex<Option<&'static str>>,
     quota_ceiling: Mutex<Option<u32>>,
@@ -34,7 +36,7 @@ impl Control for Fake {
         Ok(4)
     }
     fn adopt(&self, _: &str) -> Result<bool> {
-        Ok(false)
+        Ok(self.running.load(Ordering::Acquire))
     }
     fn wake(&self, _: &str, _: Option<u64>) -> Result<u64> {
         self.calls.lock().unwrap().push("wake".into());
@@ -93,12 +95,13 @@ impl Control for Fake {
             .lock()
             .unwrap()
             .push(format!("admin:{}", request["op"].as_str().unwrap()));
-        Ok(self
-            .admin_reply
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or(json!({"ok":true})))
+        Ok(self.admin_reply.lock().unwrap().clone().unwrap_or_else(|| {
+            if request["op"] == "set_remote_cache_write_block" {
+                json!({"ok":true,"blocked":request["blocked"]})
+            } else {
+                json!({"ok":true})
+            }
+        }))
     }
     fn suspend(&self, _: &str) -> Result<()> {
         self.calls.lock().unwrap().push("suspend".into());
@@ -111,6 +114,8 @@ impl Control for Fake {
         Ok(u64::MAX)
     }
 }
+
+mod write_block;
 
 /// A drained host whose leases have all ended is idle, even while the ended
 /// leases are still kept as usage evidence; an unended one keeps it busy.

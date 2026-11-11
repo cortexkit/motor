@@ -180,6 +180,7 @@ fn log_refusal(stage: &'static str, reason: Refusal, check: &str, jti: Option<&s
 }
 
 pub struct Runtime {
+    write_block_operation: Mutex<()>,
     job_resolvers: Arc<RwLock<Vec<String>>>,
     image_generations: Option<Arc<crate::jobs::images::Images>>,
     job_resources: Arc<dyn crate::jobs::Resources>,
@@ -454,6 +455,7 @@ impl Runtime {
         let host = Arc::new(Mutex::new(host));
         let job_resolvers = Arc::new(RwLock::new(Vec::new()));
         Arc::new(Self {
+            write_block_operation: Mutex::new(()),
             job_resolvers: job_resolvers.clone(),
             job_resources: Arc::new(crate::jobs::Unavailable),
             image_generations: None,
@@ -1525,6 +1527,9 @@ impl Runtime {
     }
     pub fn host_admin(&self, request: &Value) -> Result<Value> {
         let op = request["op"].as_str().context("admin operation")?;
+        if op == "set_remote_cache_write_block" {
+            return self.set_remote_cache_write_block(request);
+        }
         if op == "publish_job_images" {
             // A per-job image rollout: new jobs boot the new generation while
             // running ones keep theirs, so no drain or restart is needed. The
@@ -1792,6 +1797,7 @@ impl Runtime {
             Err(std::sync::TryLockError::Poisoned(_)) => panic!("tenant operations lock poisoned"),
         };
         self.ensure_locked(&tenant, unix_ms())?;
+        self.sync_remote_cache_write_block(&tenant, false);
         self.start_events(tenant.clone());
         let mut stream = self.control.relay(&tenant, 52).map_err(|error| {
             tracing::error!(tenant, port = 52, detail = %error, "tenant_job_relay_failed");
@@ -1814,6 +1820,7 @@ impl Runtime {
 
 mod job;
 mod rollback;
+mod write_block;
 pub(crate) use job::host_available_mib;
 #[cfg(target_os = "linux")]
 pub(crate) use job::job_vm_headroom_mib;

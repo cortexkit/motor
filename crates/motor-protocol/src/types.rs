@@ -439,6 +439,8 @@ macro_rules! define_frames {
 }
 
 define_frames! {
+    SetRemoteCacheWriteBlock { blocked: bool },
+    SetRemoteCacheWriteBlockReply { blocked: bool },
     VerifiedLease(crate::VerifiedLease),
     Event(crate::TenantEvent),
     MemorySample(crate::MemorySample),

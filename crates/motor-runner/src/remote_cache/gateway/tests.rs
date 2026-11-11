@@ -23,6 +23,8 @@ const MIB: usize = 1 << 20;
 mod job_create;
 #[path = "store_answers_tests.rs"]
 mod store_answers;
+#[path = "write_block_tests.rs"]
+mod write_block;
 #[path = "write_budget_tests.rs"]
 mod write_budgets;
 
@@ -92,6 +94,9 @@ pub(crate) struct FakeStore {
     sized: Mutex<HashMap<String, u64>>,
     seen: Mutex<Vec<Seen>>,
     connects: AtomicUsize,
+    put_heads: Mutex<Vec<String>>,
+    interrupted_puts: Mutex<Vec<String>>,
+    upload_changed: Notify,
 }
 
 impl FakeStore {
@@ -165,6 +170,10 @@ impl FakeStore {
                 .map(|(_, value)| value.parse().unwrap())
                 .unwrap_or(0);
             let knobs = self.knobs();
+            if method == "PUT" {
+                self.put_heads.lock().unwrap().push(path.clone());
+                self.upload_changed.notify_one();
+            }
             if let Some(status) = knobs.early_status.filter(|_| method == "PUT") {
                 self.seen.lock().unwrap().push(Seen {
                     method,
@@ -193,6 +202,8 @@ impl FakeStore {
                 let mut chunk = vec![0u8; piece.min(content_length - body.len())];
                 // A whole piece per pause, however the transport splits it.
                 if io.read_exact(&mut chunk).await.is_err() {
+                    self.interrupted_puts.lock().unwrap().push(path);
+                    self.upload_changed.notify_one();
                     return;
                 }
                 body.extend_from_slice(&chunk);

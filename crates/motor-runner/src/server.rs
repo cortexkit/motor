@@ -1044,6 +1044,11 @@ async fn session(
                 send(tx, Frame::ResumeReply { resumed }).await?;
                 return Ok(());
             }
+            Frame::SetRemoteCacheWriteBlock { blocked } if tenant.is_none() => {
+                runner.set_remote_cache_write_block(blocked).await;
+                send(tx, Frame::SetRemoteCacheWriteBlockReply { blocked }).await?;
+                return Ok(());
+            }
             Frame::DrainForActivation => {
                 let caller_work =
                     locked(&runner, |runner| Ok(runner.drain_for_activation())).await?;

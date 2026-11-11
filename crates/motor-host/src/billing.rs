@@ -1005,6 +1005,7 @@ impl Host {
         };
         let now_s = now_ms / 1000;
         let mut next = Snapshot {
+            remote_cache_write_blocked: snapshot.remote_cache_write_blocked,
             per_job: snapshot.per_job.clone(),
             revocations: snapshot
                 .revocations

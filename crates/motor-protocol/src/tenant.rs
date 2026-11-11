@@ -351,6 +351,9 @@ pub enum TenantAgentRequest {
         exit_after: bool,
     },
     Resume,
+    SetRemoteCacheWriteBlock {
+        blocked: bool,
+    },
     Status,
     Diagnostics {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -2,6 +2,44 @@ use motor_protocol::*;
 use serde_json::json;
 
 #[test]
+fn emergency_write_block_controls_require_explicit_boolean_and_round_trip() {
+    for blocked in [false, true] {
+        let value = json!({"op":"set_remote_cache_write_block","blocked":blocked});
+        let request: TenantAgentRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            request,
+            TenantAgentRequest::SetRemoteCacheWriteBlock { blocked }
+        );
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for kind in [
+            "set_remote_cache_write_block",
+            "set_remote_cache_write_block_reply",
+        ] {
+            let value = json!({"type":kind,"blocked":blocked});
+            let frame: Frame = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(frame).unwrap(), value);
+        }
+    }
+    for invalid in [serde_json::Value::Null, json!(1), json!("true")] {
+        assert!(serde_json::from_value::<TenantAgentRequest>(
+            json!({"op":"set_remote_cache_write_block","blocked":invalid})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<Frame>(
+            json!({"type":"set_remote_cache_write_block","blocked":invalid})
+        )
+        .is_err());
+    }
+    assert!(serde_json::from_value::<TenantAgentRequest>(
+        json!({"op":"set_remote_cache_write_block"})
+    )
+    .is_err());
+    assert!(
+        serde_json::from_value::<Frame>(json!({"type":"set_remote_cache_write_block"})).is_err()
+    );
+}
+
+#[test]
 fn recovery_operation_is_additive_and_existing_agent_bytes_are_unchanged() {
     for bytes in [
         r#"{"op":"attach_tenant","generation":1,"unix_ms":2,"seed":"seed","address":"10.200.1.2/30","gateway":"10.200.1.1","resolvers":["1.1.1.1"],"hostname":"host","machine_id":"id"}"#,

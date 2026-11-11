@@ -151,6 +151,10 @@ pub(crate) async fn admin_session(runner: Runner, mut socket: UnixStream) -> io:
 
 async fn dispatch(runner: Runner, request: TenantAgentRequest) -> io::Result<Value> {
     match request {
+        TenantAgentRequest::SetRemoteCacheWriteBlock { blocked } => {
+            runner.set_remote_cache_write_block(blocked).await;
+            Ok(json!({"ok":true,"blocked":blocked}))
+        }
         TenantAgentRequest::Cancel { job_id } => tokio::task::spawn_blocking(move || {
             runner.cancel(job_id)?;
             Ok(json!({"ok":true}))

@@ -14,6 +14,7 @@ mod seed_tests;
 mod startup_tests;
 #[path = "upload_tests.rs"]
 mod upload_tests;
+mod write_block_tests;
 
 const JOB: &str = "00000000-0000-7000-8000-000000000001";
 const JOB2: &str = "00000000-0000-7000-8000-000000000002";
@@ -99,6 +100,7 @@ struct Fake {
     init_reply: Mutex<Option<Value>>,
     guest_identity: Mutex<Vec<Value>>,
     admin_requests: Mutex<Vec<(String, Value)>>,
+    write_block_reply: Mutex<Option<Value>>,
     recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
 }
 impl Fake {
@@ -278,6 +280,18 @@ impl Control for Fake {
         Ok(json!({"result":"job","running":true,"tap_index":1}))
     }
     fn job_admin(&self, job: &str, request: &Value) -> Result<Value> {
+        if request["op"] == "set_remote_cache_write_block" {
+            self.admin_requests
+                .lock()
+                .unwrap()
+                .push((job.into(), request.clone()));
+            return Ok(self
+                .write_block_reply
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| json!({"ok":true,"blocked":request["blocked"]})));
+        }
         if matches!(
             request["op"].as_str(),
             Some("status" | "cancel" | "diagnostics")
