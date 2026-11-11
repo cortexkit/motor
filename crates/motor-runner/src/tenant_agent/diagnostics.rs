@@ -344,6 +344,72 @@ fn flocks(proc: &Path, state: &Path) -> io::Result<(Vec<Value>, bool)> {
     Ok((locks, truncated))
 }
 
+fn writer_outcome(value: &str) -> Option<String> {
+    if matches!(
+        value,
+        "None" | "Some(Cancelled)" | "Some(OutcomeUnknown)" | "Some(HistoryExpired)"
+    ) {
+        return Some(value.into());
+    }
+    if let Some(reason) = value
+        .strip_prefix("Some(RefusedBeforeStart { reason: ")
+        .and_then(|v| v.strip_suffix(" })"))
+    {
+        if matches!(
+            reason,
+            "Unreachable"
+                | "RunnerVersionMismatch"
+                | "SnapshotFailed"
+                | "WorkspaceKeyRejected"
+                | "RunnerFull"
+                | "RunnerDraining"
+                | "RunnerDiskFull"
+                | "QueueWaitExceeded"
+                | "TransferInterrupted"
+                | "TreeHashMismatch"
+                | "BundleRejected"
+                | "WorkspaceSetupFailed"
+                | "NetworkUnsupported"
+                | "PlatformUnsupported"
+                | "LostToRestart"
+                | "RequestRejected"
+                | "RunnerAuthenticationFailed"
+                | "SubmissionNeverAccepted"
+        ) {
+            return Some(value.into());
+        }
+    }
+    for (prefix, signed) in [
+        ("Some(Exit { code: ", true),
+        ("Some(WindowsExit { code: ", false),
+        ("Some(Signal { signal: ", true),
+    ] {
+        if let Some(number) = value
+            .strip_prefix(prefix)
+            .and_then(|v| v.strip_suffix(" })"))
+        {
+            if if signed {
+                number.parse::<i32>().is_ok()
+            } else {
+                number.parse::<u32>().is_ok()
+            } {
+                return Some(value.into());
+            }
+        }
+    }
+    None
+}
+
+fn writer_kill(value: &str) -> bool {
+    value == "None"
+        || ["Deadline", "Cancel"].iter().any(|reason| {
+            value
+                .strip_prefix(&format!("Some(({reason}, "))
+                .and_then(|v| v.strip_suffix("))"))
+                .is_some_and(|number| number.parse::<u64>().is_ok())
+        })
+}
+
 fn journal_message(message: &str) -> String {
     // Journal entries and subprocess errors can quote uploaded text. Only the
     // runner's fixed setup messages and numeric/allowlisted fields cross vsock.
@@ -376,6 +442,12 @@ fn journal_message(message: &str) -> String {
         "placed job CPUs",
         "runner deadline signal was late",
         "runner maintenance pass exceeded ten seconds",
+        "writer lifecycle",
+        "build base seed refused: record mismatch",
+        "build base seed failed; building without seed",
+        "build base seed environment changed during sandbox preparation; building without seed",
+        "build base seed succeeded",
+        "build base published",
         // Job-stream lifecycle on the tenant boundary: why a connection from
         // motor-host closed, and on which side. Their fields are the runner's
         // own labels, counters and job ids, never frame contents.
@@ -392,17 +464,78 @@ fn journal_message(message: &str) -> String {
         "tenant frame read failed",
         "tenant_job_stream_ended",
     ];
-    let Some(name) = names.iter().find(|name| rest.starts_with(**name)) else {
+    let Some(name) = names.iter().find(|name| {
+        rest.strip_prefix(**name).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix(' ').is_some_and(|fields| {
+                    !name.starts_with("build base ")
+                        || fields
+                            .split_whitespace()
+                            .next()
+                            .is_some_and(|t| t.contains('='))
+                })
+        })
+    }) else {
         return "[message omitted]".into();
     };
     let mut output = name.to_string();
-    for token in rest[name.len()..].split_whitespace() {
+    let fields = &rest[name.len()..];
+    let (fields, writer_debug) = if *name == "writer lifecycle" {
+        fields
+            .split_once(" outcome=")
+            .map_or((fields, None), |(before, after)| (before, Some(after)))
+    } else {
+        (fields, None)
+    };
+    let mut stopped = false;
+    for token in fields.split_whitespace() {
         let Some((key, value)) = token.split_once('=') else {
             continue;
         };
+        // These events contain unquoted paths or Debug values with spaces. Once
+        // one begins, later whitespace-delimited text is not a reliable field.
+        if (name.starts_with("build base ") || *name == "writer lifecycle")
+            && matches!(
+                key,
+                "repository" | "workspace" | "outcome" | "kill" | "error" | "cleanup" | "inputs"
+            )
+        {
+            stopped = true;
+            break;
+        }
         let valid = match key {
             "job_id" => uuid::Uuid::parse_str(value).is_ok(),
             "cache_fill" | "success" => matches!(value, "true" | "false"),
+            "inputs_match" | "times_valid"
+                if *name == "build base seed refused: record mismatch" =>
+            {
+                matches!(value, "true" | "false")
+            }
+            "tip" if *name == "build base published" => {
+                value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+            }
+            "event" if *name == "writer lifecycle" => matches!(
+                value,
+                "started" | "kill_requested" | "runtime_expired" | "finished"
+            ),
+            "kind" if *name == "writer lifecycle" => {
+                matches!(value, "base_build" | "compile_cache_fill")
+            }
+            "started_ms" | "age_ms" if *name == "writer lifecycle" => {
+                value == "None"
+                    || value.parse::<u64>().is_ok()
+                    || value
+                        .strip_prefix("Some(")
+                        .and_then(|v| v.strip_suffix(')'))
+                        .is_some_and(|v| v.parse::<u64>().is_ok())
+            }
+            "unit" if *name == "writer lifecycle" => {
+                value == "not_started"
+                    || value
+                        .strip_prefix("motor-job-")
+                        .and_then(|v| v.strip_suffix(".service"))
+                        .is_some_and(|v| uuid::Uuid::parse_str(v).is_ok())
+            }
             "lock" => matches!(
                 value.trim_matches('"'),
                 "tree_access" | "dependency_mirror" | "build_wrapper"
@@ -450,9 +583,28 @@ fn journal_message(message: &str) -> String {
             }
             _ => false,
         };
+        if *name == "writer lifecycle" && key == "unit" && !valid {
+            stopped = true;
+            break;
+        }
         if valid {
             output.push(' ');
             output.push_str(token);
+        }
+    }
+    if let Some((outcome, rest)) = writer_debug
+        .filter(|_| !stopped)
+        .and_then(|fields| fields.split_once(" kill="))
+    {
+        if let Some(outcome) = writer_outcome(outcome) {
+            output.push_str(" outcome=");
+            output.push_str(&outcome);
+            if let Some((kill, _)) = rest.split_once(" repository=") {
+                if writer_kill(kill) {
+                    output.push_str(" kill=");
+                    output.push_str(kill);
+                }
+            }
         }
     }
     output
@@ -872,6 +1024,92 @@ mod tests {
         );
         let quoted = journal_message("[motor-runner] WARN motor_runner::server: operation_refused jti=x frame=TOP-SECRET! reason=TOP_SECRET_LABEL_THAT_IS_FAR_TOO_LONG_TO_BE_A_LABEL");
         assert_eq!(quoted, "operation_refused");
+    }
+
+    #[test]
+    fn journal_writer_lifecycle_stops_at_path_and_debug_values() {
+        let job = "018d0d3b-a338-7181-8fcc-88e901ef438c";
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::engine: writer lifecycle job_id={job} unit=motor-job-{job}.service kind=base_build event=finished started_ms=123 age_ms=456 outcome=Some(Exit {{ code: 0 }}) kill=Some((Deadline, 789)) repository=/secret elapsed_ms=123")),
+            format!("writer lifecycle job_id={job} unit=motor-job-{job}.service kind=base_build event=finished started_ms=123 age_ms=456 outcome=Some(Exit {{ code: 0 }}) kill=Some((Deadline, 789))")
+        );
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::engine: writer lifecycle job_id={job} repository=/secret elapsed_ms=123 unit=other kind=base_build outcome=Some(Exit {{ code: 0 }}) kill=None")),
+            format!("writer lifecycle job_id={job}")
+        );
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::engine: writer lifecycle job_id={job} outcome=Some(Exit {{ elapsed_ms=123 }}) kill=Some(Deadline)")),
+            format!("writer lifecycle job_id={job}")
+        );
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::engine: writer lifecycle job_id={job} outcome=Some(Unknown {{ kind: \"secret elapsed_ms=999 kill=None repository=/secret\" }}) kill=None repository=/secret")),
+            format!("writer lifecycle job_id={job}")
+        );
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::engine: writer lifecycle job_id={job} unit=/secret elapsed_ms=999 outcome=None kill=None repository=/secret")),
+            format!("writer lifecycle job_id={job}")
+        );
+    }
+
+    #[test]
+    fn journal_seed_record_mismatch_keeps_booleans_not_workspace() {
+        assert_eq!(
+            journal_message("[runner] INFO motor_runner::seed: build base seed refused: record mismatch inputs_match=false times_valid=true workspace=/secret elapsed_ms=123"),
+            "build base seed refused: record mismatch inputs_match=false times_valid=true"
+        );
+    }
+
+    #[test]
+    fn journal_seed_failure_stops_at_error() {
+        let job = "018d0d3b-a338-7181-8fcc-88e901ef438c";
+        assert_eq!(
+            journal_message(&format!("[runner] WARN motor_runner::seed: build base seed failed; building without seed job_id={job} error=/secret elapsed_ms=123")),
+            format!("build base seed failed; building without seed job_id={job}")
+        );
+    }
+
+    #[test]
+    fn journal_seed_environment_change_stops_at_inputs() {
+        let job = "018d0d3b-a338-7181-8fcc-88e901ef438c";
+        assert_eq!(
+            journal_message(&format!("[runner] WARN motor_runner::seed: build base seed environment changed during sandbox preparation; building without seed job_id={job} inputs=[\"/secret elapsed_ms=123\"]")),
+            format!("build base seed environment changed during sandbox preparation; building without seed job_id={job}")
+        );
+    }
+
+    #[test]
+    fn journal_seed_success_keeps_job_and_duration_not_path() {
+        let job = "018d0d3b-a338-7181-8fcc-88e901ef438c";
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::seed: build base seed succeeded job_id={job} elapsed_ms=42 workspace=/secret elapsed_ms=123")),
+            format!("build base seed succeeded job_id={job} elapsed_ms=42")
+        );
+    }
+
+    #[test]
+    fn journal_base_publication_keeps_tip_and_duration_not_path() {
+        let job = "018d0d3b-a338-7181-8fcc-88e901ef438c";
+        let tip = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            journal_message(&format!("[runner] INFO motor_runner::build_base: build base published job_id={job} elapsed_ms=42 tip={tip} repository=/secret elapsed_ms=123")),
+            format!("build base published job_id={job} elapsed_ms=42 tip={tip}")
+        );
+    }
+
+    #[test]
+    fn journal_omits_unlisted_build_base_variant() {
+        assert_eq!(
+            journal_message("[runner] INFO motor_runner::seed: build base seed refused: another reason workspace=/secret"),
+            "[message omitted]"
+        );
+        assert_eq!(
+            journal_message("[runner] INFO motor_runner::seed: build base seed succeeded_unexpected workspace=/secret"),
+            "[message omitted]"
+        );
+        assert_eq!(
+            journal_message("[runner] INFO motor_runner::seed: build base seed succeeded unexpectedly workspace=/secret"),
+            "[message omitted]"
+        );
     }
 
     #[test]

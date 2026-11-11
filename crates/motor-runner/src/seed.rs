@@ -437,9 +437,9 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>) -> io::Result<bool> {
         Identity::of(&target)?.device,
     )? {
         tracing::info!(
-            workspace = %attempt.workspace.display(),
             inputs_match = attempt.compatibility.for_seed().is_ok_and(|inputs| record.inputs == *inputs),
             times_valid = record.times_valid(),
+            workspace = %attempt.workspace.display(),
             "build base seed refused: record mismatch"
         );
         return Ok(false);
@@ -576,7 +576,12 @@ fn execute(
     operations: &Operations<'_>,
     job: motor_protocol::Uuid,
 ) -> io::Result<bool> {
+    let started = std::time::Instant::now();
     match run(attempt, operations) {
+        Ok(true) => {
+            tracing::info!(job_id = %job, elapsed_ms = started.elapsed().as_millis() as u64, "build base seed succeeded");
+            Ok(true)
+        }
         Ok(seeded) => Ok(seeded),
         Err(error) => {
             let cleanup = settle(attempt.state, attempt.workspace);
