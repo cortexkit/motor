@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::sync::Condvar;
 
+mod admin_tests;
+mod deadline_tests;
 mod heartbeat_tests;
 mod recovery_tests;
 mod seed_tests;
@@ -96,6 +98,7 @@ struct Fake {
     recovery_reply: Mutex<Option<Value>>,
     init_reply: Mutex<Option<Value>>,
     guest_identity: Mutex<Vec<Value>>,
+    admin_requests: Mutex<Vec<(String, Value)>>,
     recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
 }
 impl Fake {
@@ -274,7 +277,17 @@ impl Control for Fake {
         }
         Ok(json!({"result":"job","running":true,"tap_index":1}))
     }
-    fn job_admin(&self, _: &str, request: &Value) -> Result<Value> {
+    fn job_admin(&self, job: &str, request: &Value) -> Result<Value> {
+        if matches!(
+            request["op"].as_str(),
+            Some("status" | "cancel" | "diagnostics")
+        ) {
+            self.admin_requests
+                .lock()
+                .unwrap()
+                .push((job.into(), request.clone()));
+            return Ok(json!({"ok":true}));
+        }
         if request["op"] == "attach_tenant" {
             self.guest_identity.lock().unwrap().push(request.clone());
         }

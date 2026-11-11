@@ -1,5 +1,93 @@
 use super::*;
 
+#[tokio::test]
+async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_not_replay_run() {
+    let (runtime, fake, storage) = fixture();
+    *fake.hang.lock().unwrap() = "runner";
+    let mut guest = peer(&fake);
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    let mut request = run(JOB);
+    request["bundles"].as_array_mut().unwrap().truncate(1);
+    request["bundles"][0]["length"] = json!(20_000_000);
+    write_frame(&mut client, &request).await.unwrap();
+    next_type(&mut client, "accepted").await;
+    assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    for index in 0..27 {
+        write_frame(&mut client, &json!({"type":"bundle_chunk","index":0,"offset":index * 525_000,"data":"YWFh".repeat(175_000)})).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while std::fs::metadata(storage.spool(JOB)).unwrap().len() < 18_000_000 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    handshake(&mut guest).await;
+    assert_eq!(guest_frame(&mut guest).await["type"], "run");
+    write_frame(&mut guest, &json!({"type":"accepted","job_id":JOB}))
+        .await
+        .unwrap();
+    for index in 0..27 {
+        let frame = guest_frame(&mut guest).await;
+        assert_eq!(frame["type"], "bundle_chunk");
+        assert_eq!(frame["offset"], index * 525_000);
+    }
+    assert!(!storage.spool(JOB).exists());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.host.lock().unwrap().close(id).unwrap();
+    // The unfinished upload is half-closed, not replayed on an attachment.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(frame) = read_frame(&mut guest).await {
+            assert_eq!(frame["type"], "heartbeat");
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..3 {
+        let (client, task, id) = observer(&runtime).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        drop(client);
+        task.await.unwrap().unwrap();
+        runtime.host.lock().unwrap().close(id).unwrap();
+    }
+    let mut terminal: Value = serde_json::from_slice(&records()[5][4..]).unwrap();
+    terminal["outcome"] = json!({"type":"refused_before_start","reason":"transfer_interrupted"});
+    terminal["ran"] = json!("none");
+    terminal["wall_ms"] = json!(0);
+    terminal["last_seq"] = Value::Null;
+    write_frame(&mut guest, &terminal).await.unwrap();
+    let (mut client, task, _) = observer(&runtime).await;
+    assert_eq!(
+        next_type(&mut client, "terminal").await["outcome"]["type"],
+        "refused_before_start"
+    );
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, false, true).unwrap();
+    assert_eq!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("start:"))
+            .count(),
+        1
+    );
+}
+
 fn bytes(text: &[u8]) -> Vec<u8> {
     [(text.len() as u32).to_be_bytes().as_slice(), text].concat()
 }

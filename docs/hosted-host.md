@@ -1014,6 +1014,12 @@ sudo python3 /srv/build/src/motor/script/hosted-host/hosted_host.py runner-log \
   --job <job id>
 ```
 
+In per-job mode, use the execution's job id for `--tenant` (and the same id for
+`--job`, if supplied). The local admin socket also accepts `status` and `cancel`
+for that execution; `cancel.job_id` must match it. Only `status`, `cancel`, and
+`diagnostics` are forwarded to a job VM; tenant lifecycle and provisioning
+operations remain refused.
+
 `--since` and `--until` take Unix seconds or ISO 8601 (UTC when no zone is
 given); `--job` keeps only entries naming that job id. The guest returns at
 most 1000 entries and ends the output with a `# truncated` line when the window

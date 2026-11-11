@@ -16,6 +16,7 @@ struct Policy {
     eviction: Option<Value>,
     idle_since: Option<u64>,
     last_trim: u64,
+    unsupported: bool,
 }
 
 async fn poll<F: Future<Output = io::Result<()>>>(
@@ -25,7 +26,15 @@ async fn poll<F: Future<Output = io::Result<()>>>(
     trim: impl FnOnce() -> F,
 ) -> io::Result<()> {
     if policy.due(status, now) {
-        trim().await?;
+        if let Err(error) = trim().await {
+            // fstrim reports an unsupported discard operation through stderr, not errno.
+            // Other failures remain retryable, including a temporarily busy disk.
+            let message = error.to_string();
+            policy.unsupported = error.kind() == io::ErrorKind::Unsupported
+                || message.ends_with(": the discard operation is not supported")
+                || message.ends_with(": discard operation is not supported");
+            return Err(error);
+        }
         policy.trimmed(status, now);
     }
     Ok(())
@@ -33,6 +42,9 @@ async fn poll<F: Future<Output = io::Result<()>>>(
 
 impl Policy {
     fn due(&mut self, status: &Value, now: u64) -> bool {
+        if self.unsupported {
+            return false;
+        }
         if status["ok"] != true {
             self.idle_since = None;
             return false;
@@ -84,6 +96,10 @@ pub(super) async fn watch(lock: Arc<tokio::sync::Mutex<()>>) {
         })
         .await
         {
+            if policy.unsupported {
+                tracing::info!(%error, "tenant fstrim unsupported; disabling trim");
+                return;
+            }
             tracing::warn!(%error, "tenant fstrim failed; will retry");
         }
     }
@@ -139,6 +155,29 @@ mod tests {
             .unwrap();
         }
         assert_eq!(trims, [300, 600]);
+    }
+
+    #[tokio::test]
+    async fn unsupported_discard_is_attempted_only_once() {
+        let mut policy = Policy::default();
+        let evicted = status(json!({"path":"/tenant/workspace","evicted_ms":10}));
+        let mut attempts = 0;
+        let mut failures = 0;
+        for now in [5, 10, 305] {
+            if poll(&mut policy, &evicted, now, || {
+                attempts += 1;
+                std::future::ready(Err(io::Error::other(
+                    "fstrim failed: fstrim: /tenant: the discard operation is not supported",
+                )))
+            })
+            .await
+            .is_err()
+            {
+                failures += 1;
+            }
+        }
+        assert_eq!(attempts, 1);
+        assert_eq!(failures, 1, "only one diagnostic should be logged");
     }
 
     #[test]

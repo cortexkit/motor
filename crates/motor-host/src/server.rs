@@ -1613,6 +1613,9 @@ impl Runtime {
         Ok(reply)
     }
     pub fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
+        if self.per_job() {
+            return self.job_admin(tenant, request);
+        }
         ensure!(
             self.host
                 .lock()

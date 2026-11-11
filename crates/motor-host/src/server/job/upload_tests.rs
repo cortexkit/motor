@@ -4,6 +4,63 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 
+#[tokio::test]
+async fn full_spool_with_buffered_heartbeat_replays_when_vm_becomes_ready() {
+    let (runtime, fake, storage) = fixture();
+    *fake.hang.lock().unwrap() = "runner";
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let mut frames = vec![hello(), run(JOB)];
+    let mut spooled: u64 = frames
+        .iter()
+        .map(|f| serde_json::to_vec(f).unwrap().len() as u64 + 4)
+        .sum();
+    let threshold = SPOOL_LIMIT - FRAME_LIMIT as u64 - 4;
+    while spooled <= threshold {
+        let chunk =
+            json!({"type":"bundle_chunk","index":0,"offset":0,"data":"YWFh".repeat(175_000)});
+        spooled += serde_json::to_vec(&chunk).unwrap().len() as u64 + 4;
+        frames.push(chunk);
+        if spooled > threshold {
+            // CutClient reads 8192 bytes at a time. Ensure the next heartbeat
+            // is already buffered when the last spool append closes admission.
+            assert!(spooled % 8192 < 8100);
+            frames.push(json!({"type":"heartbeat"}));
+            break;
+        }
+        let heartbeat = json!({"type":"heartbeat"});
+        spooled += serde_json::to_vec(&heartbeat).unwrap().len() as u64 + 4;
+        frames.push(heartbeat);
+    }
+    let mut client = CutClient::new(&frames, Cut::Write("output"));
+    let r = runtime.clone();
+    let mut task = tokio::spawn(async move { serve(r, &c, id, &mut client).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::metadata(storage.spool(JOB)).is_ok_and(|m| m.len() > threshold) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    let completed = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
+    if completed.is_err() {
+        task.abort();
+    }
+    let delivered = runtime.host.lock().unwrap().snapshot.leases[JOB].delivered;
+    runtime.stop_job(JOB, true, true).unwrap();
+    assert!(
+        completed.is_ok(),
+        "a buffered heartbeat must not pin a full spool after boot"
+    );
+    completed.unwrap().unwrap().unwrap();
+    assert!(delivered, "the queued Run must reach the guest");
+}
+
 #[derive(Clone, Copy)]
 enum Cut {
     Read(ErrorKind),

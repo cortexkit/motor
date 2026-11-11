@@ -12,6 +12,7 @@ pub(super) struct Launch {
     in_flight: AtomicBool,
     cancelled: AtomicBool,
     pending: AtomicBool,
+    prestart_limit_ms: Mutex<Option<u64>>,
 }
 
 struct LaunchSession(Arc<Launch>);
@@ -34,6 +35,47 @@ fn tick_step<T, E: Into<anyhow::Error>>(
 }
 
 impl Runtime {
+    pub(super) fn job_admin(&self, job: &str, request: &Value) -> Result<Value> {
+        let id = uuid::Uuid::parse_str(job)?;
+        ensure!(id.to_string() == job, "invalid execution id");
+        ensure!(
+            self.host
+                .lock()
+                .expect("host lock")
+                .snapshot
+                .per_job
+                .executions
+                .contains_key(job),
+            "unknown execution"
+        );
+        // Preserve the provisioning boundary of tenant administration: local
+        // operators can inspect or cancel this VM, never change its identity,
+        // disks, or admission policy through this route.
+        let fields: &[&str] = match request["op"].as_str() {
+            Some("status") => &["op"],
+            Some("cancel") => &["op", "job_id"],
+            Some("diagnostics") => &["op", "https", "since_unix_s", "until_unix_s", "jti"],
+            _ => anyhow::bail!("invalid job admin operation"),
+        };
+        ensure!(
+            request
+                .as_object()
+                .is_some_and(|map| map.keys().all(|key| fields.contains(&key.as_str()))),
+            "unknown job admin field"
+        );
+        let request: motor_protocol::TenantAgentRequest = serde_json::from_value(request.clone())?;
+        match &request {
+            motor_protocol::TenantAgentRequest::Cancel { job_id } => {
+                ensure!(*job_id == id, "foreign job cancellation")
+            }
+            motor_protocol::TenantAgentRequest::Diagnostics { jti, .. } => {
+                ensure!(jti.is_none_or(|jti| jti == id), "foreign job diagnostics")
+            }
+            _ => {}
+        }
+        self.control.job_admin(job, &serde_json::to_value(request)?)
+    }
+
     fn launch_phase(&self, job: &str, starts_vm: bool) -> Result<Arc<Launch>> {
         let operations = self
             .job_stops
@@ -341,18 +383,60 @@ impl Runtime {
                 .executions
                 .values()
                 .filter(|e| {
-                    !e.ended
-                        && ((e.boot_started
-                            && !e.runner_hello
-                            && e.boot_started_at_ms.is_none_or(|at| {
-                                now_ms >= at.saturating_add(settings.boot_deadline_ms)
-                            }))
-                            || (!e.boot_started && now_ms >= e.claims.exp.saturating_mul(1000)))
+                    if e.ended {
+                        return false;
+                    }
+                    let lease = &host.snapshot.leases[&e.claims.jti];
+                    let started = lease.started_at_ms;
+                    // A stalled upload or admission has no Started clock. Bound
+                    // it by the caller's queue budget; after restart only the
+                    // signed max_s remains available, so use that as the bound.
+                    let prestart_limit = self
+                        .job_launches
+                        .lock()
+                        .expect("job launches")
+                        .get(&e.claims.jti)
+                        .and_then(|launch| {
+                            *launch.prestart_limit_ms.lock().expect("prestart limit")
+                        })
+                        .unwrap_or_else(|| e.claims.max_s.saturating_mul(1000));
+                    let deadline = started
+                        .unwrap_or_else(|| {
+                            e.boot_started_at_ms
+                                .unwrap_or_else(|| e.claims.iat.saturating_mul(1000))
+                        })
+                        .saturating_add(if started.is_some() {
+                            e.claims.max_s.saturating_mul(1000)
+                        } else {
+                            prestart_limit
+                        })
+                        .saturating_add(crate::billing::BACKSTOP_CANCEL_GRACE_MS);
+                    (e.boot_started
+                        && !e.runner_hello
+                        && e.boot_started_at_ms.is_none_or(|at| {
+                            now_ms >= at.saturating_add(settings.boot_deadline_ms)
+                        }))
+                        || (!e.boot_started && now_ms >= e.claims.exp.saturating_mul(1000))
+                        || (e.boot_started && now_ms >= deadline)
                 })
-                .map(|e| e.claims.jti.clone())
+                .map(|e| (e.claims.jti.clone(), e.runner_hello))
                 .collect()
         };
-        for job in due {
+        for (job, hello) in due {
+            // If a VM disappeared while the host was down, still allow time
+            // for a delayed helper exit report. The execution deadline alone
+            // cannot prove how the VM ended.
+            if hello && matches!(self.control.adopt_job(&job), Ok(false)) {
+                tick_step(
+                    &mut failure,
+                    "expired_vmm_gone",
+                    self.host
+                        .lock()
+                        .expect("host lock")
+                        .job_vmm_gone(&job, now_ms),
+                );
+                continue;
+            }
             tick_step(
                 &mut failure,
                 "stop_expired",
@@ -1280,7 +1364,12 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
         .job_workspace_is_new(&claims.jti);
     let mut repository_root = None;
     loop {
-        if accepted && ready.is_some() && !buffered_frame_ready(&reader.buffered) {
+        // Drain buffered frames into the spool only while it has room. Once
+        // full, hand them to the live reader or neither side can make progress.
+        if accepted
+            && ready.is_some()
+            && (!buffered_frame_ready(&reader.buffered) || !spool.has_room())
+        {
             return replay(
                 runtime,
                 claims,
@@ -1365,6 +1454,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         // the account remains the verified lease's subject.
                         repository_root = Some(run.repository_root.clone());
                         queue_limit_ms = Some(run.queue_wait_limit_s.saturating_mul(1000));
+                        *launch_session.0.prestart_limit_ms.lock().expect("prestart limit") = queue_limit_ms;
                         let position = {
                             let host = runtime.host.lock().expect("host lock");
                             host.snapshot.per_job.disks[&execution.disk_id].queue.iter().position(|j| j == &claims.jti).unwrap_or(0)
