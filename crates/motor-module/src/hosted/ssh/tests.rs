@@ -23,9 +23,6 @@ impl Sshd {
         )
         .unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o600)).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
         let user = String::from_utf8(
             std::process::Command::new("id")
                 .arg("-un")
@@ -39,40 +36,55 @@ impl Sshd {
         let authorized = scratch.join("authorized_keys");
         fs::write(&authorized, "").unwrap();
         let config = scratch.join("sshd_config");
-        fs::write(&config, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nPidFile {}\nLogLevel ERROR\nAllowUsers {user}\n", host.display(), authorized.display(), scratch.join("pid").display())).unwrap();
-        let mut child = Command::new("/usr/sbin/sshd")
-            .args(["-D", "-e", "-f"])
-            .arg(&config)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    let mut message = String::new();
-                    child
-                        .stderr
-                        .take()
-                        .unwrap()
-                        .read_to_string(&mut message)
+        // A free port found by binding to port 0 can be taken by a parallel test
+        // before sshd binds it, so try a fresh port when sshd reports that one.
+        let mut attempts = 0;
+        let (port, child) = loop {
+            attempts += 1;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            fs::write(&config, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nPidFile {}\nLogLevel ERROR\nAllowUsers {user}\n", host.display(), authorized.display(), scratch.join("pid").display())).unwrap();
+            let mut child = Command::new("/usr/sbin/sshd")
+                .args(["-D", "-e", "-f"])
+                .arg(&config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let exited = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        let mut message = String::new();
+                        child
+                            .stderr
+                            .take()
+                            .unwrap()
+                            .read_to_string(&mut message)
+                            .await
+                            .unwrap();
+                        return Some((status, message));
+                    }
+                    if tokio::net::TcpStream::connect(("127.0.0.1", port))
                         .await
-                        .unwrap();
-                    panic!("sshd fixture exited {status}: {message}");
+                        .is_ok()
+                    {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .is_ok()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            })
+            .await
+            .unwrap();
+            match exited {
+                None => break (port, child),
+                Some((_, message))
+                    if attempts < 5 && message.contains("Address already in use") => {}
+                Some((status, message)) => panic!("sshd fixture exited {status}: {message}"),
             }
-        })
-        .await
-        .unwrap();
+        };
         Self {
             endpoint: format!("127.0.0.1:{port}"),
             host_key: key.public_key().to_openssh().unwrap(),
