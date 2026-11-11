@@ -13,6 +13,9 @@ mod memory;
 #[path = "tenant_cache_write.rs"]
 #[cfg(target_os = "linux")]
 mod cache_write;
+#[cfg(target_os = "linux")]
+#[path = "tenant_cache_write_isolated.rs"]
+mod cache_write_isolated;
 #[path = "tenant_create_only_probe.rs"]
 mod create_only_probe;
 #[path = "tenant_have_reports.rs"]

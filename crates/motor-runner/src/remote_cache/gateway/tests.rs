@@ -76,7 +76,7 @@ pub(crate) struct Seen {
 }
 
 impl Seen {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(key, _)| key == name)
@@ -106,6 +106,22 @@ pub(crate) struct FakeStore {
 }
 
 impl FakeStore {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn objects(&self) -> HashMap<String, Vec<u8>> {
+        self.objects.lock().unwrap().clone()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn slow_uploads(&self, piece: usize, pause: Duration) {
+        self.set(|knobs| knobs.slow_put = Some((piece, pause)));
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn upload_heads(&self) -> Vec<String> {
+        self.put_heads.lock().unwrap().clone()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn interrupted_uploads(&self) -> Vec<String> {
+        self.interrupted_puts.lock().unwrap().clone()
+    }
     pub(crate) fn status(&self, status: Option<u16>) {
         self.set(|knobs| knobs.status = status);
     }
