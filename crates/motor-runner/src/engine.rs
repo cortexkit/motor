@@ -10622,12 +10622,20 @@ impl Runner {
             Ok(())
         };
         #[cfg(unix)]
-        let remote_cache_totals = if self.core.config.tenant_vm
+        let job_puts = self
+            .core
+            .config
+            .remote_cache_runtime
+            .as_ref()
+            .map(|runtime| runtime.finish_job(&id.to_string()))
+            .unwrap_or_default();
+        #[cfg(unix)]
+        let remote_cache_totals = if (self.core.config.tenant_vm && job.durable_output
+            || job_puts != crate::remote_cache::gateway::JobPutTotals::default())
             && self.core.config.remote_cache
             && self.core.config.remote_cache_runtime.is_some()
-            && job.durable_output
         {
-            crate::remote_cache::job_totals::read(&self.core.trees.state, id)
+            crate::remote_cache::job_totals::read(&self.core.trees.state, id, job_puts)
         } else {
             None
         };

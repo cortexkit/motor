@@ -1036,6 +1036,11 @@ impl Host {
                         if let Some(totals) = event.remote_cache_totals {
                             tracing::info!(job_id = %job,
                                 hits = totals.hits, misses = totals.misses, errors = totals.errors,
+                                puts_accepted = totals.puts_accepted,
+                                puts_duplicate = totals.puts_duplicate,
+                                puts_failed = totals.puts_failed,
+                                puts_refused = totals.puts_refused,
+                                put_bytes_accepted = totals.put_bytes_accepted,
                                 "job remote cache totals (guest-reported)");
                         }
                     }

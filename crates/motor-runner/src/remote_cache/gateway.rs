@@ -235,12 +235,55 @@ impl Generations for Watch {
 
 /// What a job's read sockets, or one fill's write socket, hold between them;
 /// the admission caps apply to these counts.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Owner {
     /// In-flight read requests.
     requests: AtomicUsize,
     /// Open connections.
     connections: AtomicUsize,
+    listeners: AtomicUsize,
+    stopped: tokio::sync::watch::Sender<bool>,
+    idle: Notify,
+}
+
+impl Default for Owner {
+    fn default() -> Self {
+        Self {
+            requests: AtomicUsize::new(0),
+            connections: AtomicUsize::new(0),
+            listeners: AtomicUsize::new(0),
+            stopped: tokio::sync::watch::channel(false).0,
+            idle: Notify::new(),
+        }
+    }
+}
+
+struct ServingSocket {
+    owner: Arc<Owner>,
+    file: Arc<SocketFile>,
+}
+
+struct SocketFile {
+    path: PathBuf,
+    removed: Mutex<bool>,
+}
+
+impl SocketFile {
+    fn remove(&self) {
+        let mut removed = self.removed.lock().unwrap();
+        if !*removed {
+            let _ = std::fs::remove_file(&self.path);
+            *removed = true;
+        }
+    }
+}
+
+impl Drop for ServingSocket {
+    fn drop(&mut self) {
+        self.file.remove();
+        self.owner.listeners.fetch_sub(1, Ordering::AcqRel);
+        self.owner.idle.notify_one();
+    }
 }
 
 /// What one socket serves.
@@ -528,6 +571,7 @@ impl Drop for Slot {
         };
         count.fetch_sub(1, Ordering::AcqRel);
         self.total.fetch_sub(1, Ordering::AcqRel);
+        self.owner.idle.notify_one();
     }
 }
 
@@ -558,16 +602,16 @@ pub(crate) struct Gateway {
 }
 
 /// A bound socket, served until dropped; dropping removes the socket file.
-/// Connections already accepted finish their current requests.
+/// Dropping it also closes its accepted connections.
 pub(crate) struct Listener {
-    path: PathBuf,
+    file: Arc<SocketFile>,
     binding: Arc<Binding>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Listener {
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        &self.file.path
     }
     pub(crate) fn binding(&self) -> &Arc<Binding> {
         &self.binding
@@ -577,7 +621,7 @@ impl Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
+        self.file.remove();
     }
 }
 
@@ -855,6 +899,15 @@ impl Gateway {
                 owner
             }
         };
+        let job_puts = (endpoint == Endpoint::JobCreate && !*owner.stopped.borrow()).then(|| {
+            self.shared
+                .job_puts
+                .lock()
+                .unwrap()
+                .entry(job.to_string())
+                .or_default()
+                .clone()
+        });
         Arc::new(Binding {
             endpoint,
             tool,
@@ -862,15 +915,7 @@ impl Gateway {
             tenant: tenant.to_string(),
             owner,
             ledger: None,
-            job_puts: (endpoint == Endpoint::JobCreate).then(|| {
-                self.shared
-                    .job_puts
-                    .lock()
-                    .unwrap()
-                    .entry(job.to_string())
-                    .or_default()
-                    .clone()
-            }),
+            job_puts,
         })
     }
 
@@ -905,6 +950,10 @@ impl Gateway {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let mut stopped = binding.owner.stopped.subscribe();
+        if *stopped.borrow() {
+            return None;
+        }
         let limits = &self.shared.limits;
         let Some(slot) = Slot::take(
             &self.shared.total_connections,
@@ -920,7 +969,11 @@ impl Gateway {
         let binding = binding.clone();
         Some(async move {
             let _slot = slot;
-            gateway.serve(binding, stream).await
+            tokio::select! {
+                biased;
+                _ = async { let _ = stopped.wait_for(|stopped| *stopped).await; } => {},
+                _ = gateway.serve(binding, stream) => {},
+            }
         })
     }
 
@@ -929,15 +982,31 @@ impl Gateway {
     /// runner binds it into. Dropping the returned listener also ends every
     /// connection accepted on it.
     pub(crate) fn listen(&self, path: &Path, binding: Arc<Binding>) -> io::Result<Listener> {
+        let mut stopped = binding.owner.stopped.subscribe();
+        if *stopped.borrow() {
+            return Err(io::Error::other("job cache sockets are stopped"));
+        }
         let listener = bind_unix(path)?;
+        binding.owner.listeners.fetch_add(1, Ordering::AcqRel);
+        let file = Arc::new(SocketFile {
+            path: path.to_path_buf(),
+            removed: Mutex::new(false),
+        });
+        let socket = ServingSocket {
+            owner: binding.owner.clone(),
+            file: file.clone(),
+        };
         let gateway = self.clone();
         let served = binding.clone();
         let task = tokio::spawn(async move {
+            let _socket = socket;
             // Connection tasks live in this set, so aborting the accept task
             // (when the listener is dropped) aborts them too.
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
+                    biased;
+                    _ = async { let _ = stopped.wait_for(|stopped| *stopped).await; } => break,
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _)) => {
                             if let Some(serve) = gateway.admit_connection(&served, stream) {
@@ -951,9 +1020,11 @@ impl Gateway {
                     Some(_) = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         });
         Ok(Listener {
-            path: path.to_path_buf(),
+            file,
             binding,
             task,
         })
@@ -1008,6 +1079,63 @@ impl Gateway {
             .lock()
             .unwrap()
             .get(job)
+            .map(|state| state.lock().unwrap().totals.clone())
+            .unwrap_or_default()
+    }
+
+    /// Stop every socket of a finished job before taking its final PUT counts.
+    /// Cancellation drops request guards, including PUTs waiting on the store.
+    /// A stalled executor must not hold up job finalization indefinitely.
+    pub(crate) async fn finish_job(&self, job: &str) -> JobPutTotals {
+        let owner = self
+            .shared
+            .jobs
+            .lock()
+            .unwrap()
+            .get(job)
+            .and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            owner.stopped.send_replace(true);
+            let drained = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let idle = owner.idle.notified();
+                    if owner.connections.load(Ordering::Acquire) == 0
+                        && owner.listeners.load(Ordering::Acquire) == 0
+                    {
+                        break;
+                    }
+                    idle.await;
+                }
+            })
+            .await;
+            if drained.is_err() {
+                tracing::warn!(
+                    job_id = job,
+                    "remote cache shutdown timed out; late PUTs may be uncounted"
+                );
+            }
+        }
+        // Existing bindings retain a stopped owner and their detached state;
+        // late guard drops cannot insert the finished job back into this map.
+        self.take_job_put_totals(job)
+    }
+
+    pub(crate) fn take_job_put_totals(&self, job: &str) -> JobPutTotals {
+        if let Some(owner) = self
+            .shared
+            .jobs
+            .lock()
+            .unwrap()
+            .get(job)
+            .and_then(Weak::upgrade)
+        {
+            owner.stopped.send_replace(true);
+        }
+        self.shared
+            .job_puts
+            .lock()
+            .unwrap()
+            .remove(job)
             .map(|state| state.lock().unwrap().totals.clone())
             .unwrap_or_default()
     }

@@ -321,6 +321,7 @@ fn remote_cache_totals_are_additive_for_old_lifecycle_readers() {
             hits: 7,
             misses: 3,
             errors: u64::MAX,
+            ..Default::default()
         }),
     ] {
         let mut value = json!({"type":"event","event_seq":3,"event":"terminal","jti":"00000000-0000-4000-8000-000000000001","mem_peak_mib":1600,"mem_working_peak_mib":513});
@@ -347,6 +348,34 @@ fn remote_cache_totals_are_additive_for_old_lifecycle_readers() {
         };
         assert_eq!(new, direct);
         assert_eq!(serde_json::to_value(Frame::Event(new)).unwrap(), value);
+    }
+}
+
+#[test]
+fn job_put_totals_default_individually_and_read_only_events_keep_their_bytes() {
+    use motor_protocol::{RemoteCacheTotals, TenantEvent};
+    let old = r#"{"event_seq":3,"event":"terminal","jti":"00000000-0000-4000-8000-000000000001","remote_cache_totals":{"hits":7,"misses":3,"errors":1}}"#;
+    let event: TenantEvent = serde_json::from_str(old).unwrap();
+    assert_eq!(serde_json::to_string(&event).unwrap(), old);
+    assert_eq!(
+        serde_json::to_string(&event.remote_cache_totals.unwrap()).unwrap(),
+        r#"{"hits":7,"misses":3,"errors":1}"#
+    );
+    for field in [
+        "puts_accepted",
+        "puts_duplicate",
+        "puts_failed",
+        "puts_refused",
+        "put_bytes_accepted",
+    ] {
+        let mut value = json!({"hits":0,"misses":0,"errors":0});
+        value[field] = json!(u64::MAX);
+        let totals: RemoteCacheTotals = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(totals).unwrap(), value);
+        let mut terminal = serde_json::from_str::<serde_json::Value>(old).unwrap();
+        terminal["remote_cache_totals"] = value;
+        let new: TenantEvent = serde_json::from_value(terminal.clone()).unwrap();
+        assert_eq!(serde_json::to_value(new).unwrap(), terminal);
     }
 }
 

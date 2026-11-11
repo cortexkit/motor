@@ -33,19 +33,24 @@ fn provision(layout: &Layout, enabled: bool) {
 }
 
 fn runtime(layout: &Layout) -> Arc<Runtime> {
+    runtime_with_store(layout).0
+}
+
+fn runtime_with_store(layout: &Layout) -> (Arc<Runtime>, Arc<FakeStore>) {
     let watch = Watch::new(layout.clone());
     let store = Arc::new(FakeStore::default());
     let gateway = Gateway::with_connector(
         Limits::default(),
         Arc::new(watch.clone()),
-        Arc::new(FakeConnector(store)),
+        Arc::new(FakeConnector(store.clone())),
     );
-    Runtime::with_gateway(
+    let runtime = Runtime::with_gateway(
         watch,
         gateway,
         vec![(Tool::Sccache, 3893), (Tool::Ccache, 3894)],
     )
-    .unwrap()
+    .unwrap();
+    (runtime, store)
 }
 
 fn request(sockets: &Sockets, tool: Tool, method: &str, key: &str) -> u16 {
@@ -963,36 +968,62 @@ fn tenant_remote_cache_totals_are_job_private_and_durable() {
     let layout = Layout::new(provisioned.scratch.join("provisioning"), HostRole::TenantVm);
     layout.prepare().unwrap();
     provision(&layout, true);
-    let gateway_runtime = runtime(&layout);
+    let (gateway_runtime, store) = runtime_with_store(&layout);
     gateway_runtime.watch.reread();
 
-    for (enabled, durable, stats, expected) in [
+    let writes = RemoteCacheTotals {
+        puts_accepted: 1,
+        puts_duplicate: 1,
+        puts_failed: 1,
+        puts_refused: 1,
+        put_bytes_accepted: 5,
+        ..Default::default()
+    };
+    for (enabled, durable, stats, write, expected) in [
         (
             true,
             true,
             Some(
                 r#"{"stats":{"cache_hits":{"counts":{"Rust":7}},"cache_misses":{"counts":{"Rust":3}},"cache_errors":1}}"#,
             ),
+            false,
             Some(RemoteCacheTotals {
                 hits: 7,
                 misses: 3,
                 errors: 1,
+                ..Default::default()
             }),
         ),
         (
             false,
             true,
             Some(r#"{"cache_hits":7,"cache_misses":3,"cache_errors":1}"#),
+            false,
             None,
         ),
         (
             true,
             false,
             Some(r#"{"cache_hits":7,"cache_misses":3,"cache_errors":1}"#),
+            false,
             None,
         ),
-        (true, true, Some("invalid"), None),
-        (true, true, None, None),
+        (true, true, Some("invalid"), false, None),
+        (true, true, None, false, None),
+        (true, true, None, true, Some(writes)),
+        (true, false, None, true, Some(writes)),
+        (
+            true,
+            true,
+            Some(r#"{"cache_hits":7,"cache_misses":3,"cache_errors":1}"#),
+            true,
+            Some(RemoteCacheTotals {
+                hits: 7,
+                misses: 3,
+                errors: 1,
+                ..writes
+            }),
+        ),
     ] {
         let f = Fixture::new();
         let mut config = f.config();
@@ -1009,6 +1040,34 @@ fn tenant_remote_cache_totals_are_job_private_and_durable() {
         register_runner(&runner);
         let (request, _) = f.run("true");
         let id = request.job_id;
+        let sockets = write.then(|| {
+            let transport = gateway_runtime
+                .transport(TENANT, &[Tool::Sccache, Tool::Ccache])
+                .unwrap();
+            let sockets = transport
+                .open(
+                    &f.scratch.join("job-cache"),
+                    Role::JobWrite(&id.to_string()),
+                )
+                .unwrap();
+            let key = format!("{id}-entry");
+            assert_eq!(self::request(&sockets, Tool::Sccache, "PUT", &key), 200);
+            assert_eq!(self::request(&sockets, Tool::Sccache, "PUT", &key), 200);
+            store.status(Some(409));
+            assert_eq!(self::request(&sockets, Tool::Sccache, "PUT", "failed"), 503);
+            store.status(None);
+            gateway_runtime
+                .handle
+                .block_on(gateway_runtime.gateway.set_job_write_block(true));
+            assert_eq!(
+                self::request(&sockets, Tool::Sccache, "PUT", "blocked"),
+                503
+            );
+            gateway_runtime
+                .handle
+                .block_on(gateway_runtime.gateway.set_job_write_block(false));
+            sockets
+        });
         if let Some(stats) = stats {
             let output = runner
                 .core
@@ -1036,8 +1095,32 @@ fn tenant_remote_cache_totals_are_job_private_and_durable() {
         runner
             .finish(id, Ok(std::process::ExitStatus::from_raw(0)))
             .unwrap();
+        if let Some(sockets) = sockets {
+            for path in sockets.paths() {
+                assert!(!path.exists(), "finished job socket must be gone");
+            }
+            assert_eq!(
+                gateway_runtime.gateway.job_put_totals(&id.to_string()),
+                Default::default()
+            );
+        }
         let disk: Job = crate::storage::read_json(&runner.record_path(id)).unwrap();
         assert_eq!(disk.remote_cache_totals, expected);
+        if !write {
+            let bytes = serde_json::to_string(&disk).unwrap();
+            for field in [
+                "puts_accepted",
+                "puts_duplicate",
+                "puts_failed",
+                "puts_refused",
+                "put_bytes_accepted",
+            ] {
+                assert!(
+                    !bytes.contains(field),
+                    "read-only job record changed: {bytes}"
+                );
+            }
+        }
         assert_eq!(
             runner.core.inner.lock().unwrap().jobs[&id].remote_cache_totals,
             expected
