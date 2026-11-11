@@ -910,6 +910,29 @@ impl Runtime {
         }
         Ok(())
     }
+    /// Re-attaches the guest even when it is running, which also lowers the
+    /// VM's CPU quota to the idle one vCPU. The host state is then told the
+    /// guest is ready again, which clears its applied quota, so the
+    /// lease-derived quota is written back at once. Without that the VM stays
+    /// at one vCPU until the lease count changes: on 11 Nov 2026 a busy ovh-1
+    /// ran at one vCPU for 26 minutes. The caller owns the tenant operation
+    /// lock.
+    fn reinitialize_locked(&self, tenant: &str) -> Result<()> {
+        let generation = self.control.wake(tenant, None)?;
+        self.host
+            .lock()
+            .expect("host lock")
+            .guest_ready(tenant, generation)?;
+        let update = self
+            .host
+            .lock()
+            .expect("host lock")
+            .quota_update(tenant, unix_ms())?;
+        if let Some(update) = update {
+            self.apply_quota_locked(&update)?;
+        }
+        Ok(())
+    }
     pub(crate) fn apply_quota(&self, requested: QuotaUpdate) -> Result<()> {
         let operations = self.tenant_operations(&requested.tenant)?;
         let _operation = operations.lock().expect("tenant operations lock");
@@ -1720,7 +1743,10 @@ impl Runtime {
                     ),
                 )?);
             }
-            if self.control.wake(tenant, None).is_err() {
+            // The probe runs on a serving host, so wake only a tenant that is
+            // not ready. A forced re-initialization would cap a busy VM at the
+            // idle one-vCPU quota (see `reinitialize_locked`).
+            if self.ensure_locked(tenant, unix_ms()).is_err() {
                 return Ok(
                     json!({"ok":false,"exit_code":1,"cases":[],"error":"remote_cache_agent_unavailable"}),
                 );
@@ -1759,7 +1785,7 @@ impl Runtime {
         // request, so they are safe to log. The admin reply keeps a fixed name;
         // the operator reads the cause from this host's journal.
         if op == "activate_runner_args" {
-            return Ok(match self.control.wake(tenant, None) {
+            return Ok(match self.reinitialize_locked(tenant) {
                 Ok(_) => json!({"ok":true}),
                 Err(error) => {
                     tracing::error!(tenant, detail = %format!("{error:#}"), "remote_cache_activation_failed");
@@ -1768,7 +1794,7 @@ impl Runtime {
             });
         }
         if op == "remote_cache_probe" {
-            if let Err(error) = self.control.wake(tenant, None) {
+            if let Err(error) = self.reinitialize_locked(tenant) {
                 tracing::error!(tenant, detail = %format!("{error:#}"), "remote_cache_agent_unavailable");
                 return Ok(json!({"ok":false,"error":"remote_cache_agent_unavailable"}));
             }

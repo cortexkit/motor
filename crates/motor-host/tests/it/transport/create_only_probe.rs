@@ -50,6 +50,9 @@ fn probe_runs_with_an_active_lease_and_bound_account_without_recording_reports()
         fake.calls.lock().unwrap().last().map(String::as_str),
         Some("admin:remote_cache_create_only_probe")
     );
+    // A ready tenant is not woken: a forced re-initialization caps the busy
+    // VM at one vCPU.
+    assert!(!fake.calls.lock().unwrap().iter().any(|call| call == "wake"));
     let mut cases = failed.cases;
     for case in &mut cases {
         case.ok = true;
@@ -67,6 +70,28 @@ fn probe_runs_with_an_active_lease_and_bound_account_without_recording_reports()
         );
     }
     assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn forced_reinitialization_writes_the_quota_back() {
+    let (runtime, fake, _, _, _) = fixture();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.guest_ready("tenant", 1).unwrap();
+        host.set_draining(true).unwrap();
+    }
+    fake.calls.lock().unwrap().clear();
+    runtime
+        .admin("tenant", &json!({"op":"remote_cache_probe"}))
+        .unwrap();
+    // The wake lowers the real VM to the idle quota; the host must write its
+    // own target right after, not wait for the lease count to change.
+    let calls = fake.calls.lock().unwrap().clone();
+    let wake = calls.iter().position(|call| call == "wake").expect("wake");
+    assert!(
+        calls[wake..].iter().any(|call| call.starts_with("quota:")),
+        "{calls:?}"
+    );
 }
 
 #[test]
