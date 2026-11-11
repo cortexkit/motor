@@ -96,6 +96,7 @@ pub(crate) fn select(config: &Config) -> io::Result<Box<dyn Backend>> {
 /// holding the engine's state lock.
 pub(crate) struct Setup {
     pub id: Uuid,
+    pub cache_write_account: Option<String>,
     pub cpus: Vec<u32>,
     pub memory_mib: Option<u64>,
     pub request: Run,
@@ -938,11 +939,19 @@ impl Backend for HostBackend {
             if tools.is_empty() {
                 None
             } else {
-                runtime.transport(&generation.tenant, &tools).ok()
+                job_cache_transport(config, s, generation, runtime, &tools).ok()
             }
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        if s.cache_write_account.is_some()
+            && remote_plan
+                .as_ref()
+                .is_none_or(|(generation, _)| !job_cache_write(config, s, generation))
+        {
+            tracing::warn!(job_id = %s.id, "job cache write credentials unavailable or account changed; binding read-only");
+        }
         #[cfg(target_os = "linux")]
         let mut seeded_environment = None;
         #[cfg(target_os = "linux")]
@@ -1819,6 +1828,8 @@ fn remote_cache_environment(
         generation,
         if setup.base {
             crate::remote_cache::environment::Mode::Fill
+        } else if job_cache_write(config, setup, generation) {
+            crate::remote_cache::environment::Mode::JobWrite
         } else {
             crate::remote_cache::environment::Mode::JobRead
         },
@@ -1830,6 +1841,32 @@ fn remote_cache_environment(
         env,
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn job_cache_transport(
+    config: &Config,
+    setup: &Setup,
+    generation: &crate::remote_cache::provisioning::ActiveGeneration,
+    runtime: &crate::remote_cache::runtime::Runtime,
+    tools: &[crate::remote_cache::gateway::Tool],
+) -> io::Result<crate::remote_cache::transport::Transport> {
+    runtime
+        .transport(&generation.tenant, tools)
+        .map(|transport| transport.job_write(job_cache_write(config, setup, generation)))
+}
+
+#[cfg(unix)]
+pub(crate) fn job_cache_write(
+    config: &Config,
+    setup: &Setup,
+    generation: &crate::remote_cache::provisioning::ActiveGeneration,
+) -> bool {
+    setup.cache_write_account.as_deref() == Some(generation.tenant.as_str())
+        && config.tenant_vm
+        && !config.boat_profile
+        && !config.per_job
+        && generation.write_key.is_some()
 }
 
 /// Apply one host type's remote cache delta to `env`: exactly the difference

@@ -4273,11 +4273,11 @@ impl Runner {
     }
 
     pub(crate) fn accept(&self, request: Run) -> io::Result<Admission> {
-        self.accept_from(request, false, None, None)
+        self.accept_from(request, false, None, None, |_| None)
     }
 
     pub(crate) fn accept_for_qualification(&self, request: Run) -> io::Result<Admission> {
-        self.accept_from(request, true, None, None)
+        self.accept_from(request, true, None, None, |_| None)
     }
 
     pub(crate) fn accept_tenant(
@@ -4285,12 +4285,15 @@ impl Runner {
         request: Run,
         memory_mib: Option<u64>,
         burst_mib: Option<u64>,
+        cache_account: Option<&str>,
     ) -> io::Result<Admission> {
         let memory_mib = memory_mib.filter(|memory| {
             *memory > 0 && self.core.config.tenant_vm && !self.core.config.boat_profile
         });
         let burst_mib = burst_mib.filter(|_| memory_mib.is_some());
-        self.accept_from(request, false, memory_mib, burst_mib)
+        self.accept_from(request, false, memory_mib, burst_mib, |id| {
+            self.core.config.tenant_cache_grant(id, cache_account)
+        })
     }
 
     fn accept_from(
@@ -4299,6 +4302,7 @@ impl Runner {
         qualification: bool,
         memory_mib: Option<u64>,
         burst_mib: Option<u64>,
+        cache_grant: impl FnOnce(Uuid) -> Option<String>,
     ) -> io::Result<Admission> {
         if self.core.quarantined.contains_key(&request.job_id) {
             return Ok(Admission::Duplicate);
@@ -4377,6 +4381,9 @@ impl Runner {
             },
         );
         job.memory_stated_mib = memory_mib;
+        let cache_grant = cache_grant(request.job_id);
+        job.cache_write = cache_grant.is_some();
+        job.cache_write_account = cache_grant;
         job.memory_burst_mib = burst_mib;
         job.mem_over_mib_ms = burst_mib.map(|_| Default::default());
         // If another pressure pass had already chosen this request's workspace
@@ -5761,6 +5768,7 @@ impl Runner {
         );
         let fixed = paths::fixed_paths(config, &request).ok().flatten()?;
         let setup = Setup {
+            cache_write_account: None,
             id: request.job_id,
             request,
             cpus: vec![],
@@ -8688,6 +8696,10 @@ impl Runner {
         // while the workspace is reserved. A warm build mounts no siblings.
         let snapshot_mode = self.core.config.sibling_snapshot_mode();
         let setup = Setup {
+            cache_write_account: job
+                .cache_write
+                .then(|| job.cache_write_account.clone())
+                .flatten(),
             id,
             cpus,
             memory_mib: job.memory_limit_mib(),

@@ -92,6 +92,7 @@ async fn hosted_channel_heartbeats_keep_a_tenant_job_streaming_to_its_terminal()
         mem_mib: Some(16384),
         mem_burst_mib: None,
         mirror_reports: false,
+        cache_write: false,
         platform: if cfg!(target_arch = "aarch64") {
             "linux-arm64"
         } else {

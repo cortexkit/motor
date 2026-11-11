@@ -1856,7 +1856,7 @@ impl Runtime {
             tracing::error!(tenant, port = 52, detail = %error, "tenant_job_relay_failed");
             Error::Refused(Refusal::InternalFailure)
         })?;
-        {
+        let cache_write = {
             let mut host = self.host.lock().expect("host lock");
             ensure!(host.connection_live(id), "connection superseded");
             ensure!(
@@ -1864,9 +1864,14 @@ impl Runtime {
                 "client closed before delivery"
             );
             host.delivered(id)?;
-        }
+            host.snapshot.leases[&claims.jti].cache_write
+        };
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        write_json(&mut stream, &verified_lease(claims, false))?;
+        let mut lease = verified_lease(claims, false);
+        if cache_write {
+            lease["cache_write"] = json!(true);
+        }
+        write_json(&mut stream, &lease)?;
         Ok(stream)
     }
 }

@@ -4,8 +4,8 @@
 //! host can reach them. Instead the runner creates, per unit, one Unix socket
 //! per active tool in the unit's private runtime directory and binds that
 //! directory read-only into the unit's sandbox at [`SANDBOX_SOCKETS`]. A job's
-//! sockets are read sockets owned by that job, so every read connection is
-//! attributed to exactly one job; a fill's sockets are write sockets, each
+//! sockets are read or create-only sockets owned by that job, so every read
+//! connection is attributed to exactly one job; a fill's sockets are write sockets, each
 //! with its own PUT ledger. No socket is ever bound into another unit's
 //! sandbox, so a job has no path at all to a fill's write endpoint.
 //!
@@ -46,13 +46,15 @@ pub(crate) struct Transport {
     runtime: tokio::runtime::Handle,
     tenant: String,
     tools: Vec<(Tool, u16)>,
+    job_write: bool,
     fault: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 /// Whose sockets a unit gets.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Role<'a> {
-    /// A job's read sockets; the job id ties them to one admission owner.
+    /// A job's sockets; read-only unless its transport carries a stored write grant.
+    /// The job id identifies the job these sockets belong to.
     Job(&'a str),
     /// A job's create-only sccache socket; ccache remains read-only.
     JobWrite(&'a str),
@@ -100,8 +102,17 @@ impl Transport {
             runtime,
             tenant: tenant.to_string(),
             tools: tools.to_vec(),
+            job_write: false,
             fault: None,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    /// The trusted backend selects this from the job's recorded grant and keys.
+    /// It changes only a job's sccache socket, never ccache or a fill endpoint.
+    pub(crate) fn job_write(mut self, enabled: bool) -> Self {
+        self.job_write = enabled;
+        self
     }
 
     pub(crate) fn reporting(
@@ -135,6 +146,10 @@ impl Transport {
     /// [`SANDBOX_SOCKETS`] in that unit's sandbox only. Each socket is served
     /// until the returned value is dropped.
     pub(crate) fn open(&self, directory: &Path, role: Role<'_>) -> io::Result<Sockets> {
+        let role = match role {
+            Role::Job(job) if self.job_write => Role::JobWrite(job),
+            role => role,
+        };
         std::fs::DirBuilder::new().mode(0o755).create(directory)?;
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))?;
         // Binding a listener spawns its accept task on the runner's runtime;

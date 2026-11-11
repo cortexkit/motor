@@ -339,6 +339,7 @@ async fn accepted_hosted_job_queued_past_read_inactivity_keeps_heartbeats_and_de
             mem_mib: Some(16384),
             mem_burst_mib: None,
             mirror_reports: false,
+            cache_write: false,
             platform: if cfg!(target_arch = "aarch64") {
                 "linux-arm64"
             } else {

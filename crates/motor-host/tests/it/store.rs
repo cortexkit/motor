@@ -14,6 +14,7 @@ fn scratch() -> tempfile::TempDir {
 fn lease(job: &str, state: LeaseState) -> Lease {
     Lease {
         claims: claims(job),
+        cache_write: true,
         tenant: "tenant".into(),
         state,
         delivered: true,

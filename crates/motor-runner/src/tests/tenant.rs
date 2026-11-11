@@ -10,6 +10,9 @@ mod cancellation;
 #[cfg(target_os = "linux")]
 mod memory;
 
+#[path = "tenant_cache_write.rs"]
+#[cfg(target_os = "linux")]
+mod cache_write;
 #[path = "tenant_create_only_probe.rs"]
 mod create_only_probe;
 #[path = "tenant_have_reports.rs"]
@@ -34,6 +37,7 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
         mem_mib: Some(16384),
         mem_burst_mib: None,
         mirror_reports: false,
+        cache_write: false,
         platform: crate::tenant::host_platform()
             .unwrap_or("unsupported")
             .into(),
@@ -162,9 +166,11 @@ fn burst_job_record_preserves_attribution_and_job_local_limits_on_reopen() {
     let burst_id = burst_run.job_id;
     let legacy_id = legacy_run.job_id;
     runner
-        .accept_tenant(burst_run, Some(6144), Some(3072))
+        .accept_tenant(burst_run, Some(6144), Some(3072), None)
         .unwrap();
-    runner.accept_tenant(legacy_run, Some(4096), None).unwrap();
+    runner
+        .accept_tenant(legacy_run, Some(4096), None, None)
+        .unwrap();
     let legacy_bytes = fs::read(runner.record_path(legacy_id)).unwrap();
     let legacy: serde_json::Value = serde_json::from_slice(&legacy_bytes).unwrap();
     assert!(legacy.get("memory_burst_mib").is_none());

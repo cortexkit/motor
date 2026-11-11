@@ -704,6 +704,7 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
         job.into(),
         crate::state::Lease {
             claims: claims.clone(),
+            cache_write: false,
             tenant: job.into(),
             state: crate::state::LeaseState::Reserved,
             delivered: false,

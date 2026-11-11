@@ -870,6 +870,11 @@ impl Gateway {
         self.shared.job_write_block.set(blocked).await;
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn job_write_blocked(&self) -> bool {
+        self.shared.job_write_block.blocked()
+    }
+
     /// A read socket's binding for one job and the cache tenant it was
     /// created for. Every binding of a job shares its admission caps.
     pub(crate) fn read_binding(
