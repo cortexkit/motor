@@ -7,6 +7,10 @@
 //! unit's sandbox. The runtime starts them only for an isolated, opted-in runner.
 //! Records and publication policy are shared across platforms; provisioning
 //! file access, gateways and sandbox transports are Unix-only.
+pub(crate) const DEFAULT_JOB_PUT_OBJECTS: u64 = 5_000;
+pub(crate) const DEFAULT_JOB_PUT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_JOB_PUTS: usize = 16;
+
 #[cfg(unix)]
 pub(crate) mod ccache;
 #[cfg(unix)]

@@ -491,6 +491,16 @@ fn configure_options(
             "--account-subject" => config.account_subject = Some(value),
             "--fixed-path-repository" => config.fixed_path_repositories.push(value),
             "--remote-cache" => config.remote_cache = value.parse().map_err(io::Error::other)?,
+            "--remote-cache-max-job-put-objects" => {
+                config.remote_cache_max_job_put_objects =
+                    value.parse().map_err(io::Error::other)?;
+            }
+            "--remote-cache-max-job-put-bytes" => {
+                config.remote_cache_max_job_put_bytes = value.parse().map_err(io::Error::other)?;
+            }
+            "--remote-cache-max-job-puts" => {
+                config.remote_cache_max_job_puts = value.parse().map_err(io::Error::other)?;
+            }
             "--remote-cache-forwarder-port" => {
                 let (tool, port) = value
                     .split_once(':')
@@ -820,6 +830,76 @@ fn remote_cache_requires_explicit_opt_in() {
     )
     .unwrap();
     assert!(!config.remote_cache);
+}
+
+#[cfg(test)]
+mod remote_cache_write_budget_tests {
+    use super::*;
+
+    #[test]
+    fn flags_override_each_write_budget_and_allow_zero() {
+        let mut config = Config::new("unused-write-budget-state", "main");
+        assert_eq!(config.remote_cache_max_job_put_objects, 5_000);
+        assert_eq!(
+            config.remote_cache_max_job_put_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(config.remote_cache_max_job_puts, 16);
+        configure_options(
+            &mut config,
+            [
+                "--remote-cache-max-job-put-objects",
+                "7",
+                "--remote-cache-max-job-put-bytes",
+                "8589934593",
+                "--remote-cache-max-job-puts",
+                "2",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(config.remote_cache_max_job_put_objects, 7);
+        assert_eq!(config.remote_cache_max_job_put_bytes, 8_589_934_593);
+        assert_eq!(config.remote_cache_max_job_puts, 2);
+        configure_options(
+            &mut config,
+            [
+                "--remote-cache-max-job-put-objects",
+                "0",
+                "--remote-cache-max-job-put-bytes",
+                "0",
+                "--remote-cache-max-job-puts",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(config.remote_cache_max_job_put_objects, 0);
+        assert_eq!(config.remote_cache_max_job_put_bytes, 0);
+        assert_eq!(config.remote_cache_max_job_puts, 0);
+    }
+
+    #[test]
+    fn write_budget_flags_require_nonnegative_integer_values() {
+        for flag in [
+            "--remote-cache-max-job-put-objects",
+            "--remote-cache-max-job-put-bytes",
+            "--remote-cache-max-job-puts",
+        ] {
+            for value in ["-1", "no", "18446744073709551616"] {
+                let mut config = Config::new("unused-write-budget-state", "main");
+                assert!(
+                    configure_options(&mut config, [flag, value].into_iter().map(str::to_owned))
+                        .is_err(),
+                    "{flag} {value}"
+                );
+            }
+            let mut config = Config::new("unused-write-budget-state", "main");
+            assert!(configure_options(&mut config, [flag].into_iter().map(str::to_owned)).is_err());
+        }
+    }
 }
 
 fn drain_transport_timeout(deadline_s: u64) -> std::time::Duration {

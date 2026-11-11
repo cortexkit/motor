@@ -30,7 +30,7 @@ impl Runtime {
             .prepare()
             .map_err(|e| failure("provisioning directory", &e))?;
         let watch = Watch::new(layout);
-        let gateway = Gateway::new(Limits::default(), Arc::new(watch.clone()))
+        let gateway = Gateway::new(Limits::for_config(config), Arc::new(watch.clone()))
             .map_err(|e| failure("gateway initialization", &e))?;
         let role = super::provisioning::HostRole::of(config);
         let mut tools = Vec::new();
