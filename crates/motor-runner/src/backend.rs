@@ -96,6 +96,10 @@ pub(crate) fn select(config: &Config) -> io::Result<Box<dyn Backend>> {
 /// holding the engine's state lock.
 pub(crate) struct Setup {
     pub id: Uuid,
+    /// The cache account this job may write to, fixed at first admission.
+    /// Only the Unix remote-cache setup reads it; Windows jobs never write
+    /// the compile cache.
+    #[cfg_attr(windows, allow(dead_code))]
     pub cache_write_account: Option<String>,
     pub cpus: Vec<u32>,
     pub memory_mib: Option<u64>,
