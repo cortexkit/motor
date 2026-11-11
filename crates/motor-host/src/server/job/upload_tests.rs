@@ -35,7 +35,9 @@ async fn full_spool_with_buffered_heartbeat_replays_when_vm_becomes_ready() {
     let mut client = CutClient::new(&frames, Cut::Write("output"));
     let r = runtime.clone();
     let mut task = tokio::spawn(async move { serve(r, &c, id, &mut client).await });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Spooling 64 MiB through a debug build takes several seconds on a small
+    // CI machine; these bounds only catch a stall, which never completes.
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if std::fs::metadata(storage.spool(JOB)).is_ok_and(|m| m.len() > threshold) {
                 break;
@@ -47,7 +49,7 @@ async fn full_spool_with_buffered_heartbeat_replays_when_vm_becomes_ready() {
     .unwrap();
     *fake.gate.0.lock().unwrap() = true;
     fake.gate.1.notify_all();
-    let completed = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
+    let completed = tokio::time::timeout(Duration::from_secs(30), &mut task).await;
     if completed.is_err() {
         task.abort();
     }
