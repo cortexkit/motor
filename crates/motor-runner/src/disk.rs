@@ -1581,8 +1581,117 @@ impl Runner {
     /// There every idle workspace is evicted before admission, whatever the
     /// free space. The request's own workspace and siblings stay, because the
     /// caller registered them as admitting before this pass.
-    pub(super) fn ensure_admission_disk_space(&self) -> io::Result<Option<RunnerDiskFull>> {
-        self.reclaim_disk_space(self.core.config.boat_profile)
+    pub(super) fn ensure_admission_disk_space(
+        &self,
+        request: &Run,
+    ) -> io::Result<Option<RunnerDiskFull>> {
+        let _pressure = self.core.disk.lock().unwrap();
+        let full = self.reclaim_disk_space_in_pass(
+            self.core.config.boat_profile,
+            &mut PressurePass::default(),
+        )?;
+        if full.is_none() || !self.core.config.per_job {
+            return Ok(full);
+        }
+        self.clear_admitting_build_outputs(request, full)
+    }
+
+    /// A job VM serves one job, on a disk that holds only its own account's
+    /// checkouts. When that disk is still under the floor after the ordinary
+    /// pass, what fills it is usually the request's own checkout: its previous
+    /// build, which admission protects. Refusing then does not save it: once
+    /// the refusal drops that protection, the pressure timer deletes the whole
+    /// workspace. So delete its build outputs instead, keep the checkout, and
+    /// admit if the floor is met. Incremental caches go first, then the whole
+    /// `target` folder. Nothing else can be using the workspace, because a job
+    /// VM admits no other job.
+    ///
+    /// Shared tenant VMs keep refusing: there other queued or future jobs
+    /// share the workspace, and other workspaces on the disk can still free
+    /// space before the caller retries.
+    fn clear_admitting_build_outputs(
+        &self,
+        request: &Run,
+        full: Option<RunnerDiskFull>,
+    ) -> io::Result<Option<RunnerDiskFull>> {
+        let floor = self.core.config.free_space_floor_bytes;
+        let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
+        let key = crate::caller_path::request(request)
+            .caller_workspace_key
+            .text()
+            .clone();
+        let path = crate::caller_path::host_path(&self.core.config, &key);
+        let target = path.join("target");
+        if !fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
+            return Ok(full);
+        }
+        let candidate = {
+            let mut inner = self.core.inner.lock().unwrap();
+            let Some(workspace) = inner.catalog.workspaces.get(&key) else {
+                return Ok(full);
+            };
+            let last_used_ms = workspace.used_ms;
+            if inner.dropping.contains(&key)
+                || inner.reserved.contains_key(&key)
+                || !inner.starting.is_empty()
+                || !inner.preparing.is_empty()
+                || inner.jobs.values().any(|job| job.terminal.is_none())
+            {
+                return Ok(full);
+            }
+            inner.dropping.insert(key.clone());
+            Candidate {
+                path: path.clone(),
+                workspace: Some(key.clone()),
+                last_used_ms,
+                cache_disk: false,
+                snapshot: false,
+            }
+        };
+        let _claim = WorkspaceDrop {
+            runner: self.clone(),
+            key: key.clone(),
+        };
+        let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&path)) else {
+            return Ok(full);
+        };
+        #[cfg(target_os = "linux")]
+        self.core.config.source_seals.check_host(&path)?;
+        self.build_folder_access(&candidate)?;
+        let device = crate::filesystem::device(&path)?;
+        let before = allocated_bytes(&target, device)?;
+        let mut free = probe()?;
+        for stage in [crate::cargo_gc::incremental(&target)?, vec![target.clone()]] {
+            if free >= floor {
+                break;
+            }
+            for output in stage {
+                self.remove_build_paths(&candidate, &[output], device)?;
+            }
+            free = probe()?;
+        }
+        let bytes = before.saturating_sub(allocated_bytes(&target, device).unwrap_or(0));
+        let now = self.now();
+        self.core.health.lock().unwrap().record(now, |c| {
+            c.evictions += 1;
+            c.eviction_bytes += bytes;
+        });
+        {
+            let mut inner = self.core.inner.lock().unwrap();
+            inner.build_folder_sizes.remove(&key);
+            inner.last_eviction = Some(DiskEviction {
+                path: target.to_string_lossy().into_owned(),
+                bytes,
+                last_used_ms: candidate.last_used_ms,
+                evicted_ms: now,
+            });
+        }
+        tracing::info!(path = %target.display(), bytes, free_bytes = free, floor_bytes = floor,
+            "runner admission cleared its own build outputs");
+        Ok((free < floor).then_some(RunnerDiskFull {
+            free_bytes: free,
+            floor_bytes: floor,
+        }))
     }
 
     fn quarantine_cleanup_blockers(&self) -> Vec<Uuid> {

@@ -4345,7 +4345,7 @@ impl Runner {
         // occupied the workspace or queue while deletion ran off the state lock.
         // A request the access repair may have cleared gets the disk check too.
         let disk_full = if initial_refusal.is_none() || access.restored_any() {
-            self.ensure_admission_disk_space()?
+            self.ensure_admission_disk_space(&request)?
         } else {
             None
         };
