@@ -31,6 +31,18 @@ impl TenantCache {
             "requires the image's pinned sccache"
         );
         let f = Fixture::new();
+        // Production installs the Rust cache integration for Cargo workspaces.
+        // The compile below invokes rustc directly to avoid Cargo freshness hits.
+        fs::write(
+            f.main.join("Cargo.toml"),
+            "[package]\nname = \"tenant-cache-inputs\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"dep.rs\"\n",
+        )
+        .unwrap();
+        fs::write(
+            f.main.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"tenant-cache-inputs\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         for name in ["dep", "denied", "budget", "blocked"] {
             fs::write(
                 f.main.join(format!("{name}.rs")),
@@ -176,6 +188,7 @@ impl TenantCache {
 fn compile(name: &str, writable: bool, wait_write: bool) -> String {
     format!(
         r#"set -eu
+test "$(sccache --version)" = 'sccache 0.18.0'
 test "$SCCACHE_S3_RW_MODE" = {mode}
 test -z "${{SCCACHE_RECACHE+x}}"
 test -z "${{SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY+x}}"
@@ -401,13 +414,26 @@ async fn isolated_tenant_cache_denials_survive_later_credentials_and_attach() {
     token.sub = TENANT.into();
     token.cache_write = true;
     let (mut client, task) = connect(&h.runner, token).await;
+    assert!(!h.runner.has_job_record(id));
     motor_protocol::write_frame_async(&mut client, &Frame::Attach(AttachRequest::new(id, 0)))
         .await
         .unwrap();
-    // An unknown attach has no execution to authorize, even with the claim.
-    while frame(&mut client).await.is_some() {}
+    // Unknown Attach permanently fences the id with a request-less tombstone;
+    // the claim cannot authorize an execution or a cache socket.
+    assert!(
+        matches!(frame(&mut client).await, Some(Frame::Terminal(record))
+        if record.outcome == Outcome::RefusedBeforeStart {
+            reason: RefusalReason::TransferInterrupted,
+        })
+    );
+    assert!(frame(&mut client).await.is_none());
     task.await.unwrap().unwrap();
-    assert!(!h.runner.has_job_record(id));
+    let tombstone: Job = read_json(&h.runner.record_path(id)).unwrap();
+    assert_eq!(tombstone.state, JobState::Tombstone);
+    assert!(tombstone.request.is_none());
+    assert!(tombstone.process.is_none());
+    assert!(!tombstone.cache_write);
+    assert!(tombstone.cache_write_account.is_none());
 
     for (index, cause) in ["keyless", "blocked", "wrong-account", "rotation"]
         .into_iter()
