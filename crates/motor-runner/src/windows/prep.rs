@@ -793,6 +793,7 @@ fn validate_staged_manifests(
     plan: &Plan,
     roots: &[PathBuf],
     regular_files: &BTreeSet<String>,
+    git_routes: Option<&BTreeMap<String, PathBuf>>,
 ) -> io::Result<PathBuf> {
     let workspace = plan.staging.join(mapped(&plan.workspace)?);
     let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
@@ -809,7 +810,7 @@ fn validate_staged_manifests(
             .iter()
             .map(|name| plan.staging.join(name))
             .collect();
-        validate_manifests(root, roots, &plan.routes, &files)?;
+        validate_manifests(root, roots, git_routes, &files)?;
     }
     for name in ["cargo-home", "home", "fetch-temp"] {
         let path = plan.staging.join(name);
@@ -830,7 +831,7 @@ pub(crate) fn execute_with_fetch(
             stage_snapshots(&plan)
         })?;
     let workspace = super::prep_error::step("validate manifests", &plan.staging, || {
-        validate_staged_manifests(&plan, &roots, &regular_files)
+        validate_staged_manifests(&plan, &roots, &regular_files, Some(&plan.routes))
     })?;
     if workspace.join("Cargo.lock").is_file() {
         super::prep_error::step("fetch dependencies", &plan.staging, || {
@@ -970,7 +971,12 @@ pub(crate) fn execute_with_registry(
             stage_snapshots(&plan)
         })?;
     let workspace = super::prep_error::step("validate manifests", &plan.staging, || {
-        let workspace = validate_staged_manifests(&plan, &roots, &regular_files)?;
+        // Local-registry preparation never runs Cargo on the host. Root lockfile
+        // Git sources already require routes in prepare's validate_lock call;
+        // unused manifest entries need no bundle. The guest has no network and
+        // permits only file Git transports if an unlocked source is later needed.
+        // Keep the manifest allowlist on the separate networked fetch path.
+        let workspace = validate_staged_manifests(&plan, &roots, &regular_files, None)?;
         validate_repository_cargo_sources(&plan.staging)?;
         Ok(workspace)
     })?;
@@ -1062,18 +1068,18 @@ fn validate_repository_cargo_sources(staging: &Path) -> io::Result<()> {
 fn validate_manifests(
     root: &Path,
     roots: &[PathBuf],
-    routes: &BTreeMap<String, PathBuf>,
+    git_routes: Option<&BTreeMap<String, PathBuf>>,
     files: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_dir() {
-            validate_manifests(&path, roots, routes, files)?;
+            validate_manifests(&path, roots, git_routes, files)?;
         } else if path.file_name().is_some_and(|n| n == "Cargo.toml") {
             let value: toml::Value =
                 toml::from_str(&fs::read_to_string(&path)?).map_err(invalid)?;
-            validate_dependencies(&value, path.parent().unwrap(), roots, routes, files)?;
+            validate_dependencies(&value, path.parent().unwrap(), roots, git_routes, files)?;
         }
     }
     Ok(())
@@ -1082,7 +1088,7 @@ fn validate_dependencies(
     value: &toml::Value,
     manifest: &Path,
     roots: &[PathBuf],
-    routes: &BTreeMap<String, PathBuf>,
+    git_routes: Option<&BTreeMap<String, PathBuf>>,
     files: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     if let Some(table) = value.as_table() {
@@ -1091,9 +1097,9 @@ fn validate_dependencies(
                 key.as_str(),
                 "dependencies" | "dev-dependencies" | "build-dependencies" | "patch" | "replace"
             ) {
-                check_sources(value, manifest, roots, routes, files)?;
+                check_sources(value, manifest, roots, git_routes, files)?;
             } else {
-                validate_dependencies(value, manifest, roots, routes, files)?;
+                validate_dependencies(value, manifest, roots, git_routes, files)?;
             }
         }
     }
@@ -1103,7 +1109,7 @@ fn check_sources(
     value: &toml::Value,
     manifest: &Path,
     roots: &[PathBuf],
-    routes: &BTreeMap<String, PathBuf>,
+    git_routes: Option<&BTreeMap<String, PathBuf>>,
     files: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     if let Some(table) = value.as_table() {
@@ -1114,7 +1120,7 @@ fn check_sources(
             }
         }
         if let Some(url) = table.get("git").and_then(toml::Value::as_str) {
-            if !routes.contains_key(url) {
+            if git_routes.is_some_and(|routes| !routes.contains_key(url)) {
                 return Err(invalid(format!(
                     "unsupported or undeclared git dependency: {url}"
                 )));
@@ -1126,7 +1132,7 @@ fn check_sources(
             }
         }
         for value in table.values() {
-            check_sources(value, manifest, roots, routes, files)?;
+            check_sources(value, manifest, roots, git_routes, files)?;
         }
     }
     Ok(())
@@ -1145,7 +1151,7 @@ mod security_path_tests {
             &value,
             &root.join("project"),
             std::slice::from_ref(&root),
-            &routes,
+            Some(&routes),
             &files,
         )
         .unwrap();
@@ -1165,7 +1171,7 @@ mod security_path_tests {
                 &value,
                 &root.join("project"),
                 std::slice::from_ref(&root),
-                &routes,
+                Some(&routes),
                 &files
             )
             .is_err());
@@ -1638,11 +1644,172 @@ mod trusted_cargo_config_tests {
 #[cfg(test)]
 mod git_source_validation_tests {
     use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    fn workspace_with_unused_git_dependency(scratch: &Path) -> PathBuf {
+        let repository = scratch.join("repository");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join("crates_old/nonmember/src")).unwrap();
+        fs::write(
+            repository.join("Cargo.toml"),
+            "[workspace]\nmembers = ['.']\nexclude = ['crates_old/nonmember']\n[workspace.dependencies]\nunused = { git = 'https://example.invalid/unused.git', rev = '0123456789012345678901234567890123456789' }\n[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+        )
+        .unwrap();
+        fs::write(repository.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            repository.join("crates_old/nonmember/Cargo.toml"),
+            "[package]\nname = 'nonmember'\nversion = '0.1.0'\n[dependencies]\nunused.workspace = true\n",
+        )
+        .unwrap();
+        fs::write(repository.join("crates_old/nonmember/src/lib.rs"), "").unwrap();
+        fs::write(
+            repository.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = 'fixture'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init"]);
+        git(&["add", "."]);
+        git(&["commit", "-m", "fixture"]);
+        let staging = scratch.join("staging");
+        fs::create_dir(&staging).unwrap();
+        let plan = Plan {
+            staging: staging.clone(),
+            snapshots: vec![Snapshot {
+                mirror: repository.join(".git"),
+                commit: git(&["rev-parse", "HEAD"]),
+                destination: "/repository".into(),
+            }],
+            routes: BTreeMap::new(),
+            workspace: "/repository".into(),
+            tree_hash: git(&["rev-parse", "HEAD^{tree}"]),
+            cargo: PathBuf::new(),
+            rustup: PathBuf::new(),
+            toolchain_bin: PathBuf::new(),
+            toolchain_source: PathBuf::new(),
+        };
+        let path = staging.join("prepare.json");
+        atomic_json(&path, &plan).unwrap();
+        path
+    }
+
+    #[test]
+    fn unused_workspace_git_dependency_passes_local_registry_prep() {
+        let scratch = ScratchDir::new("windows-prep-unused-workspace-git");
+        let plan_path = workspace_with_unused_git_dependency(scratch.path());
+        let mut registry_called = false;
+        execute_with_registry(&plan_path, |_, _, lockfile, routes| {
+            assert!(routes.is_empty());
+            assert!(!lockfile.contains("git+"));
+            validate_lock(lockfile, routes)?;
+            registry_called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(registry_called);
+    }
+
+    #[test]
+    fn unused_workspace_git_dependency_is_refused_before_networked_fetch() {
+        let scratch = ScratchDir::new("windows-prep-unused-git-fetch");
+        let plan_path = workspace_with_unused_git_dependency(scratch.path());
+        let mut fetch_called = false;
+        let error = execute_with_fetch(&plan_path, |_| {
+            fetch_called = true;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "unsupported or undeclared git dependency: https://example.invalid/unused.git"
+            ),
+            "unexpected fetch preparation error: {error}"
+        );
+        assert!(!fetch_called, "Cargo fetch ran before manifest refusal");
+    }
+
+    #[test]
+    fn local_registry_manifest_validation_keeps_path_and_registry_checks() {
+        let root = PathBuf::from("unmaterialized-checkout");
+        let files = BTreeSet::from([root.join("vendor/Cargo.toml")]);
+        for (dependency, expected) in [
+            ("path = '../vendor'", None),
+            (
+                "path = '../missing'",
+                Some("path dependency has no tracked Cargo.toml"),
+            ),
+            ("registry = 'crates-io'", None),
+            (
+                "registry = 'private'",
+                Some("off-registry dependency: private"),
+            ),
+        ] {
+            let value = toml::from_str(dependency).unwrap();
+            let result = check_sources(
+                &value,
+                &root.join("project"),
+                std::slice::from_ref(&root),
+                None,
+                &files,
+            );
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap_err().to_string(), expected);
+            } else {
+                result.unwrap();
+            }
+        }
+    }
 
     fn lock_with_source(source: &str) -> String {
         format!(
             "[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\nsource = \"git+{source}?rev=main#0123456789012345678901234567890123456789\"\n"
         )
+    }
+
+    #[test]
+    fn locked_git_source_requires_route_independently_of_manifest_spelling() {
+        let locked_url = "https://example.invalid/fixture.git";
+        let lock = lock_with_source(locked_url);
+        let routes =
+            BTreeMap::from([(locked_url.to_owned(), PathBuf::from("git-mirrors/fixture"))]);
+        for manifest_url in [
+            locked_url,
+            "https://example.invalid/fixture",
+            "https://example.invalid/fixture.git/",
+            "https://example.invalid/fixture.git?rev=main",
+        ] {
+            let value = toml::from_str(&format!("git = '{manifest_url}'")).unwrap();
+            check_sources(&value, Path::new("repository"), &[], None, &BTreeSet::new()).unwrap();
+            validate_lock(&lock, &routes).unwrap();
+            let error = validate_lock(&lock, &BTreeMap::new())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("unsupported or undeclared dependency source: git+")
+                    && error.contains(locked_url),
+                "locked Git source was not refused for manifest URL {manifest_url}: {error}"
+            );
+        }
     }
 
     #[test]
