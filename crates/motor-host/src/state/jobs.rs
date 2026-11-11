@@ -465,14 +465,20 @@ impl Host {
     }
 
     pub(crate) fn job_boot_disk_ready(&self, job: &str) -> bool {
-        self.snapshot.per_job.executions.get(job).is_some_and(|e| {
-            let disk = &self.snapshot.per_job.disks[&e.disk_id];
-            !e.boot_started
-                && !e.ended
-                && !disk.quarantined
-                && disk.attached_job.is_none()
-                && disk.queue.first().map(String::as_str) == Some(job)
-        })
+        // Cancellation ends the lease before execution cleanup finishes, so
+        // both records must still permit a boot when authorization is issued.
+        self.snapshot
+            .leases
+            .get(job)
+            .is_some_and(|lease| lease.state != super::LeaseState::Ended)
+            && self.snapshot.per_job.executions.get(job).is_some_and(|e| {
+                let disk = &self.snapshot.per_job.disks[&e.disk_id];
+                !e.boot_started
+                    && !e.ended
+                    && !disk.quarantined
+                    && disk.attached_job.is_none()
+                    && disk.queue.first().map(String::as_str) == Some(job)
+            })
     }
 
     pub fn begin_job_boot_at(

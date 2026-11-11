@@ -16,6 +16,7 @@ fn base(runtime: &Arc<Runtime>, id: &str, account: &str, repository: &str) {
 #[tokio::test]
 async fn new_workspace_seeds_matching_base_before_boot_without_the_host_lock() {
     let (runtime, fake, _) = fixture();
+    hold_boot(&runtime, &fake, "seed");
     let c = claims(JOB);
     let request = run(JOB);
     let root = request["repository_root"].as_str().unwrap();
@@ -24,7 +25,6 @@ async fn new_workspace_seeds_matching_base_before_boot_without_the_host_lock() {
     let disk = runtime.host.lock().unwrap().snapshot.per_job.executions[JOB]
         .disk_id
         .clone();
-    *fake.seed_runtime.lock().unwrap() = Some(Arc::downgrade(&runtime));
     let (mut client, task) = start(runtime.clone(), c.clone(), id).await;
     next_type(&mut client, "lease_ok").await;
     write_frame(&mut client, &hello()).await.unwrap();
@@ -40,6 +40,20 @@ async fn new_workspace_seeds_matching_base_before_boot_without_the_host_lock() {
     assert!(fake.calls.lock().unwrap().is_empty());
     write_frame(&mut client, &request).await.unwrap();
     next_type(&mut client, "accepted").await;
+    fake.entered.notified().await;
+    // The copy call stays in flight while this probe waits out any brief
+    // session reads. It must acquire the lock before the copy can finish.
+    let r = runtime.clone();
+    let unlocked_during_copy = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || drop(r.host.lock().unwrap())),
+    )
+    .await;
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    unlocked_during_copy
+        .expect("host lock available while the helper copies the seed")
+        .unwrap();
     next_type(&mut client, "output").await;
     assert_eq!(
         *fake.seeds.lock().unwrap(),

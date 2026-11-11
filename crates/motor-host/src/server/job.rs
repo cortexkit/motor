@@ -1402,29 +1402,34 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             )
             .await;
         }
-        let launch = if preparing.is_none()
+        let (launch, ended) = if preparing.is_none()
             && starting.is_none()
             && ready.is_none()
             && (!new_workspace || repository_root.is_some())
         {
             let mut host = runtime.host.lock().expect("host lock");
-            ensure!(
-                host.snapshot.leases[&claims.jti].state != LeaseState::Ended,
-                "job cancelled before boot"
-            );
-            let now_ms = unix_ms();
-            if host.job_boot_disk_ready(&claims.jti) {
-                launch_session
-                    .0
-                    .boot_ready_at_ms
-                    .lock()
-                    .expect("boot ready time")
-                    .get_or_insert(now_ms);
+            if host.snapshot.leases[&claims.jti].state == LeaseState::Ended {
+                (None, true)
+            } else {
+                let now_ms = unix_ms();
+                if host.job_boot_disk_ready(&claims.jti) {
+                    launch_session
+                        .0
+                        .boot_ready_at_ms
+                        .lock()
+                        .expect("boot ready time")
+                        .get_or_insert(now_ms);
+                }
+                (host.begin_job_boot_at(&claims.jti, now_ms)?, false)
             }
-            host.begin_job_boot_at(&claims.jti, now_ms)?
         } else {
-            None
+            (None, false)
         };
+        if ended {
+            ensure!(accepted, "queued execution ended before its Run");
+            drop(spool);
+            return stream::serve(runtime, claims, client, false, reader, true).await;
+        }
         if let Some(execution) = launch {
             let deadline =
                 tokio::time::Instant::now() + runtime.boot_remaining(&execution, unix_ms());

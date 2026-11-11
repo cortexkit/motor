@@ -1,6 +1,6 @@
 use super::*;
 use motor_host::state::jobs::{guest_ram_mib, memory_limit_mib, HostResources};
-use motor_host::state::{Admission, Error, Refusal};
+use motor_host::state::{Admission, Error, LeaseState, Refusal};
 use motor_host::store::SqliteJournal;
 mod fill_sources;
 mod fills;
@@ -302,6 +302,29 @@ fn attach_never_creates_disk_or_execution_live_ended_or_after_restart() {
     auth(h.claim(unknown, AT));
     assert_eq!(h.snapshot, before);
     assert!(h.begin_job_boot(JOB).unwrap().is_none());
+}
+
+#[test]
+fn cancelled_lease_cannot_boot_before_execution_cleanup() {
+    let mut h = memory_host(1_000);
+    h.claim(job(JOB), AT).unwrap();
+    assert!(h.job_boot_disk_ready(JOB));
+    h.job_refused(
+        JOB,
+        serde_json::json!({
+            "type":"terminal", "job_id":JOB, "outcome":{"type":"cancelled"},
+            "ran":"none", "wall_ms":0, "queue_wait_ms":0, "bundle_bytes":0,
+            "tree_hash":null, "workspace_changes":null
+        }),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(h.snapshot.leases[JOB].state, LeaseState::Ended);
+    assert!(!h.snapshot.per_job.executions[JOB].ended);
+    let cancelled = h.snapshot.clone();
+    assert!(h.begin_job_boot_at(JOB, AT).unwrap().is_none());
+    assert_eq!(h.snapshot, cancelled);
+    assert_eq!(h.job_free_mem_mib(AT), 950);
 }
 
 #[test]
