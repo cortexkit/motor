@@ -448,6 +448,7 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
 /// The last 2 KiB of a failed fill's output, on one line. A fill VM and its
 /// disk are gone moments after a failure, so the refusal the host logs is the
 /// only record of why the trusted build failed.
+#[cfg(target_os = "linux")]
 fn output_tail(runner: &Runner, id: motor_protocol::Uuid) -> String {
     const TAIL_BYTES: usize = 2048;
     let Ok(frames) = runner.replay(id, 0) else {
