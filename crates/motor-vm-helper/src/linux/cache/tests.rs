@@ -355,3 +355,74 @@ mod root {
         std::fs::remove_dir_all(base).unwrap();
     }
 }
+
+#[test]
+fn job_credential_staging_requires_matching_grant_and_keeps_read_key() {
+    use crate::job::{Start, Workspace, WorkspaceRole};
+    let start = Start {
+        kind: VmKind::Job,
+        job_id: crate::job::test_id(90),
+        account: "account-1".into(),
+        workspace_disk_id: "disk-1".into(),
+        image_generation_id: "gen-1".into(),
+        vcpus: 1,
+        memory_mib: 1024,
+        burst_mib: None,
+        cache_write_blocked: false,
+    };
+    let disk = Workspace {
+        account: start.account.clone(),
+        workspace_disk_id: start.workspace_disk_id.clone(),
+        role: WorkspaceRole::Job,
+        workspace_key_hash: Some("bound-hash".into()),
+    };
+    let grant = crate::cache_write::Grant {
+        sub: start.account.clone(),
+        jti: start.job_id.clone(),
+        workspace_key_hash: "bound-hash".into(),
+    };
+    for case in [
+        "matching",
+        "job-a-for-b",
+        "other-workspace",
+        "legacy",
+        "other-account",
+        "blocked",
+        "missing-write-key",
+    ] {
+        let mut start = start.clone();
+        let mut disk = disk.clone();
+        let mut keys = set("account-1", "new");
+        match case {
+            "job-a-for-b" => start.job_id = crate::job::test_id(91),
+            "other-workspace" => disk.workspace_key_hash = Some("other-hash".into()),
+            "legacy" => disk.workspace_key_hash = None,
+            "other-account" => {
+                disk.account = "account-2".into();
+                start.account = disk.account.clone();
+            }
+            "blocked" => start.cache_write_blocked = true,
+            "missing-write-key" => keys.write_key = None,
+            _ => {}
+        }
+        let (staged, write_boot) =
+            credentials_for_boot(keys, start.kind, grant.permits(&start, &disk));
+        let payload = serde_json::to_string(&staged).unwrap();
+        assert!(payload.contains("READ-SECRET-new"), "{case}");
+        assert_eq!(write_boot, case == "matching", "{case}");
+        assert_eq!(
+            payload.contains("WRITE-SECRET-new"),
+            case == "matching",
+            "{case}"
+        );
+        assert_eq!(staged.write_key.is_some(), case == "matching", "{case}");
+    }
+    let (staged, write_boot) = credentials_for_boot(set("account-1", "new"), VmKind::Job, false);
+    assert!(staged.write_key.is_none());
+    assert!(!write_boot);
+    for kind in [VmKind::Fill, VmKind::BaseBuild] {
+        let (staged, write_boot) = credentials_for_boot(set("account-1", "new"), kind, false);
+        assert!(staged.write_key.is_some());
+        assert!(!write_boot);
+    }
+}

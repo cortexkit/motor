@@ -42,7 +42,11 @@ pub(super) fn open_disk(root: &Path, account: &str, disk_id: &str) -> Result<(Wo
     Ok((registry, disk))
 }
 
-pub(super) fn ensure(root: &Path, request: job::CreateWorkspace) -> Result<()> {
+pub(super) fn ensure_bound(
+    root: &Path,
+    request: job::CreateWorkspace,
+    grant: Option<&crate::cache_write::Grant>,
+) -> Result<()> {
     if root.join(&request.workspace_disk_id).try_exists()? {
         let (registry, disk) = open_disk(root, &request.account, &request.workspace_disk_id)?;
         if registry.role != job::WorkspaceRole::Job
@@ -55,7 +59,7 @@ pub(super) fn ensure(root: &Path, request: job::CreateWorkspace) -> Result<()> {
         }
         return Ok(());
     }
-    create(root, request, job::WorkspaceRole::Job)
+    create_bound(root, request, job::WorkspaceRole::Job, grant)
 }
 
 pub(super) fn base_lease(
@@ -151,6 +155,25 @@ pub(super) fn create(
     request: job::CreateWorkspace,
     role: job::WorkspaceRole,
 ) -> Result<()> {
+    create_bound(root, request, role, None)
+}
+
+fn binding(
+    account: &str,
+    role: job::WorkspaceRole,
+    grant: Option<&crate::cache_write::Grant>,
+) -> Option<String> {
+    grant
+        .filter(|g| g.sub == account && role == job::WorkspaceRole::Job)
+        .map(|g| g.workspace_key_hash.clone())
+}
+
+pub(super) fn create_bound(
+    root: &Path,
+    request: job::CreateWorkspace,
+    role: job::WorkspaceRole,
+    grant: Option<&crate::cache_write::Grant>,
+) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(Error("workspace provisioning requires root".into()));
     }
@@ -192,6 +215,7 @@ pub(super) fn create(
     )?;
     registry.write_all(
         &serde_json::to_vec(&Workspace {
+            workspace_key_hash: binding(&request.account, role, grant),
             account: request.account,
             workspace_disk_id: request.workspace_disk_id,
             role,
@@ -217,6 +241,7 @@ pub(super) fn prepare_fill(root: &Path, fill: &job::Fill) -> Result<()> {
     create(
         root,
         job::CreateWorkspace {
+            cache_write_job_id: None,
             account: fill.account.clone(),
             workspace_disk_id: id.clone(),
             size_bytes: fill.size_bytes,
@@ -256,16 +281,31 @@ pub(super) fn promote(root: &Path, fill: &job::Fill) -> Result<()> {
     )
 }
 
+#[cfg(all(test, feature = "linux-root-tests"))]
 pub(super) fn seed(root: &Path, seed: &job::Seed) -> Result<()> {
+    seed_bound(root, seed, None)
+}
+
+pub(super) fn seed_bound(
+    root: &Path,
+    seed: &job::Seed,
+    grant: Option<&crate::cache_write::Grant>,
+) -> Result<()> {
     let id = &seed.disk_id;
     if root.join(id).try_exists()? {
         let (registry, disk) = open_disk(root, &seed.account, id)?;
         let previous: job::Seed =
             serde_json::from_reader(fs::trusted_file(&root.join(id).join("seed.json"))?)
                 .map_err(|e| Error(e.to_string()))?;
+        // cache_write_job_id selects a verified grant when creating a new disk.
+        // Ignore that field on an existing disk: retries must not replace its
+        // stored workspace hash or add a hash to a legacy registry.
         if registry.role != job::WorkspaceRole::Job
             || disk.metadata()?.uid() != 0
-            || previous != *seed
+            || previous.account != seed.account
+            || previous.repository_key != seed.repository_key
+            || previous.base_id != seed.base_id
+            || previous.disk_id != seed.disk_id
         {
             return Err(Error("seed identity mismatch".into()));
         }
@@ -303,6 +343,7 @@ pub(super) fn seed(root: &Path, seed: &job::Seed) -> Result<()> {
         tenant::durable_write(
             &path.join("registry.json"),
             &serde_json::to_vec(&Workspace {
+                workspace_key_hash: binding(&seed.account, job::WorkspaceRole::Job, grant),
                 account: seed.account.clone(),
                 workspace_disk_id: id.clone(),
                 role: job::WorkspaceRole::Job,
@@ -323,6 +364,9 @@ pub(super) fn seed(root: &Path, seed: &job::Seed) -> Result<()> {
 mod fill_tests;
 
 #[cfg(all(test, feature = "linux-root-tests"))]
+mod binding_tests;
+
+#[cfg(all(test, feature = "linux-root-tests"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
@@ -333,6 +377,7 @@ mod tests {
         let base = super::super::tests::scratch();
         let root = base.join("workspaces");
         let request = || job::CreateWorkspace {
+            cache_write_job_id: None,
             account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
             workspace_disk_id: "disk-1".into(),
             size_bytes: 4096,
@@ -401,6 +446,7 @@ mod tests {
         let account = record.start.account.clone();
         let disk_id = record.start.workspace_disk_id.clone();
         let request = || job::CreateWorkspace {
+            cache_write_job_id: None,
             account: account.clone(),
             workspace_disk_id: disk_id.clone(),
             size_bytes: 4096,
@@ -451,6 +497,7 @@ mod tests {
         });
         let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let op = |size_bytes| Operation::EnsureWorkspace {
+            cache_write_job_id: None,
             account: account.into(),
             disk_id: "disk-1".into(),
             size_bytes,
@@ -470,6 +517,7 @@ mod tests {
         assert!(jobs
             .handle(
                 Operation::EnsureWorkspace {
+                    cache_write_job_id: None,
                     account: "other".into(),
                     disk_id: "disk-1".into(),
                     size_bytes: 8192
@@ -541,6 +589,7 @@ mod tests {
             disk_id: "disk-1".into(),
         };
         let request = || job::CreateWorkspace {
+            cache_write_job_id: None,
             account: account.into(),
             workspace_disk_id: "disk-1".into(),
             size_bytes: 8192,

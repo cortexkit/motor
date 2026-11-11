@@ -58,6 +58,7 @@ async fn new_workspace_seeds_matching_base_before_boot_without_the_host_lock() {
     assert_eq!(
         *fake.seeds.lock().unwrap(),
         [motor_vm_helper::job::Seed {
+            cache_write_job_id: None,
             account: c.sub,
             repository_key: crate::jobs::fill_source::repository_key(root),
             base_id: "matching".into(),

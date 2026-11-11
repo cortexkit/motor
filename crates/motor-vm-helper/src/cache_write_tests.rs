@@ -17,7 +17,7 @@ use std::{
 };
 
 const NOW: u64 = 1_700_000_000;
-const ACCOUNT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+pub(crate) const ACCOUNT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(NOW)
@@ -162,6 +162,20 @@ impl Drop for Server {
 
 fn token(c: &Claims) -> String {
     sign_token(c, "current", &SigningKey::from_bytes(&[1; 32])).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn with_fresh_token(jti: &str, account: &str, run: impl FnOnce(&Config, &str)) {
+    let server = Server::new();
+    let mut c = claims();
+    c.jti = jti.into();
+    c.sub = account.into();
+    c.iat = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    c.exp = c.iat + 300;
+    run(&server.config(), &token(&c));
 }
 
 #[test]
@@ -467,4 +481,74 @@ fn held_jwks_fetch_does_not_block_stop_and_concurrent_admissions_share_one_grant
     first_thread.join().unwrap();
     second_thread.join().unwrap();
     lifecycle_thread.join().unwrap();
+}
+
+#[test]
+fn verified_grant_retries_before_boot_but_cannot_be_rearmed_after_consumption() {
+    let server = Server::new();
+    let mut grants = Grants::new(&server.config());
+    let c = claims();
+    grants.admit_with_clock(&token(&c), now).unwrap();
+    let first = grants.get_at(&c.jti, now()).unwrap().clone();
+    assert_eq!(grants.get_at(&c.jti, now()), Some(&first));
+    grants.consume(&c.jti);
+    assert!(grants.get_at(&c.jti, now()).is_none());
+    grants.admit_with_clock(&token(&c), now).unwrap();
+    assert!(grants.get_at(&c.jti, now()).is_none());
+}
+
+#[test]
+fn verified_grant_binds_exact_job_subject_workspace_and_deny_flag() {
+    let server = Server::new();
+    let mut grants = Grants::new(&server.config());
+    let c = claims();
+    grants.admit_with_clock(&token(&c), now).unwrap();
+    let grant = grants.get_at(&c.jti, now()).unwrap();
+    let start = crate::job::Start {
+        kind: crate::job::VmKind::Job,
+        job_id: c.jti.clone(),
+        account: c.sub.clone(),
+        workspace_disk_id: "disk-1".into(),
+        image_generation_id: "gen-1".into(),
+        vcpus: 2,
+        memory_mib: 16384,
+        burst_mib: None,
+        cache_write_blocked: false,
+    };
+    let disk = crate::job::Workspace {
+        account: c.sub.clone(),
+        workspace_disk_id: start.workspace_disk_id.clone(),
+        role: crate::job::WorkspaceRole::Job,
+        workspace_key_hash: c.workspace_key_hash.clone(),
+    };
+    assert!(grant.permits(&start, &disk));
+    for case in [
+        "job",
+        "workspace",
+        "legacy",
+        "account",
+        "block",
+        "fill",
+        "recovery",
+    ] {
+        let mut start = start.clone();
+        let mut disk = disk.clone();
+        match case {
+            "job" => start.job_id = crate::job::test_id(83),
+            "workspace" => disk.workspace_key_hash = Some(base64url(&[9; 32])),
+            "legacy" => disk.workspace_key_hash = None,
+            "account" => {
+                disk.account = "other-account".into();
+                start.account = disk.account.clone();
+            }
+            "block" => start.cache_write_blocked = true,
+            "fill" => {
+                start.kind = crate::job::VmKind::Fill;
+                disk.role = crate::job::WorkspaceRole::Fill;
+            }
+            "recovery" => start.kind = crate::job::VmKind::Recovery,
+            _ => unreachable!(),
+        }
+        assert!(!grant.permits(&start, &disk), "{case}");
+    }
 }

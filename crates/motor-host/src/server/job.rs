@@ -1098,7 +1098,9 @@ async fn boot(
                     Err(error) => tracing::warn!(jti = %e.claims.jti, %error, "workspace_base_seed_failed; ensuring workspace without seed"),
                 }
             }
-            if let Err(error) = r.control.ensure_workspace(&e.claims.sub, &e.disk_id, cap) {
+            let selector = (e.claims.cache_write == Some(true) && !r.remote_cache_write_blocked())
+                .then_some(e.claims.jti.as_str());
+            if let Err(error) = r.control.ensure_workspace_for_job(&e.claims.sub, &e.disk_id, cap, selector) {
                 r.host
                     .lock()
                     .expect("host lock")
@@ -1114,7 +1116,8 @@ async fn boot(
         result
     })
     .await??;
-    let start = motor_vm_helper::job::Start {
+    let mut start = motor_vm_helper::job::Start {
+        cache_write_blocked: false,
         kind: motor_vm_helper::job::VmKind::Job,
         job_id: execution.claims.jti.clone(),
         account: execution.claims.sub.clone(),
@@ -1128,6 +1131,11 @@ async fn boot(
     let launch = runtime.launch_phase(&execution.claims.jti, true)?;
     let r = runtime.clone();
     let reply = tokio::task::spawn_blocking(move || {
+        let _operation = r
+            .write_block_operation
+            .lock()
+            .expect("write block operation");
+        start.cache_write_blocked = r.remote_cache_write_blocked();
         let result = control.start_job(&start);
         launch.in_flight.store(false, Ordering::SeqCst);
         if launch.cancelled.load(Ordering::SeqCst) {

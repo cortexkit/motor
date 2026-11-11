@@ -77,6 +77,8 @@ struct Fake {
     slice_headroom_mib: Mutex<Option<u64>>,
     fail_ensure: AtomicBool,
     ensured_caps: Mutex<Vec<u64>>,
+    workspace_grant_selectors: Mutex<Vec<Option<String>>>,
+    job_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
     seeds: Mutex<Vec<motor_vm_helper::job::Seed>>,
     fail_seed: AtomicBool,
     workspace_contents: Mutex<BTreeMap<String, Option<String>>>,
@@ -273,6 +275,7 @@ impl Control for Fake {
         Ok(())
     }
     fn start_job(&self, start: &motor_vm_helper::job::Start) -> Result<Value> {
+        self.job_starts.lock().unwrap().push(start.clone());
         assert_eq!(start.account, "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert!([200, 32768].contains(&start.memory_mib));
         self.calls
@@ -285,6 +288,19 @@ impl Control for Fake {
             return Ok(json!({"result":"job","running":true}));
         }
         Ok(json!({"result":"job","running":true,"tap_index":1}))
+    }
+    fn ensure_workspace_for_job(
+        &self,
+        account: &str,
+        disk: &str,
+        cap: u64,
+        job: Option<&str>,
+    ) -> Result<()> {
+        self.workspace_grant_selectors
+            .lock()
+            .unwrap()
+            .push(job.map(str::to_owned));
+        self.ensure_workspace(account, disk, cap)
     }
     fn job_admin(&self, job: &str, request: &Value) -> Result<Value> {
         if request["op"] == "set_remote_cache_write_block" {
