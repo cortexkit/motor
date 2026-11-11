@@ -2138,13 +2138,13 @@ async fn queued_job_ended_before_boot_reaches_live_and_reattached_callers() {
         .unwrap()
         .unwrap();
     let mut c = claims(JOB2);
-    c.exp = unix_ms() / 1000 + 3;
     let id = claim(&runtime, &c);
     let (mut client, task) = start(runtime.clone(), c.clone(), id).await;
     queued(&mut client, JOB2).await;
+    // End the waiting execution from the host side, the way a pre-start
+    // deadline or an operator cancel does, while its caller is still queued.
     let r = runtime.clone();
-    let expired = c.exp * 1000 + 1;
-    tokio::task::spawn_blocking(move || r.tick_jobs(expired))
+    tokio::task::spawn_blocking(move || r.stop_job(JOB2, true, true))
         .await
         .unwrap()
         .unwrap();
