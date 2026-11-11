@@ -311,11 +311,16 @@ pub(super) fn scratch() -> PathBuf {
 }
 
 pub(super) fn machine(base: &Path) -> LinuxJobs {
+    machine_with_config(
+        base,
+        &serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap(),
+    )
+}
+
+pub(super) fn machine_with_config(base: &Path, config: &Config) -> LinuxJobs {
     LinuxJobs {
         cache_write_grants: std::sync::Arc::new(std::sync::Mutex::new(
-            crate::cache_write::Grants::new(
-                &serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap(),
-            ),
+            crate::cache_write::Grants::new(config),
         )),
         settings: None,
         groups: base.join("groups"),
@@ -1295,10 +1300,7 @@ fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
     let account = record.start.account.clone();
     crate::cache_write::tests::with_fresh_token(&id, &account, |config, token| {
         for tombstone in [false, true] {
-            let mut first = machine(&base);
-            first.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::cache_write::Grants::new(config),
-            ));
+            let mut first = machine_with_config(&base, config);
             first
                 .cache_write_grants
                 .lock()
@@ -1317,13 +1319,10 @@ fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
             assert!(!first.boundary(&id).exists());
             let path = first.records_path.join(format!("{id}.json"));
             drop(first);
-            let mut restarted = machine(&base);
+            let mut restarted = machine_with_config(&base, config);
             restarted.settings = Some(fixed_path_settings(json!({})));
             let saved = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             restarted.adopt_record(saved).unwrap();
-            restarted.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::cache_write::Grants::new(config),
-            ));
             restarted
                 .cache_write_grants
                 .lock()
@@ -1405,13 +1404,10 @@ fn write_boot_flag_requires_job_role_and_staged_credentials_without_granting_fil
 #[test]
 fn start_retry_before_durable_intent_reuses_grant_for_write_boot_configuration() {
     let base = scratch();
-    let mut jobs = machine(&base);
     let mut start = start();
     start.account = crate::cache_write::tests::ACCOUNT.into();
     crate::cache_write::tests::with_fresh_token(&start.job_id, &start.account, |config, token| {
-        jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::cache_write::Grants::new(config),
-        ));
+        let mut jobs = machine_with_config(&base, config);
         jobs.cache_write_grants
             .lock()
             .unwrap()

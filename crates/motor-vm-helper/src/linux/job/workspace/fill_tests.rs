@@ -2,9 +2,16 @@ use super::*;
 use crate::linux::root_test_support::ReflinkStore;
 
 fn fixture() -> (PathBuf, LinuxJobs, job::Fill) {
+    fixture_with_config(None)
+}
+
+fn fixture_with_config(config: Option<&Config>) -> (PathBuf, LinuxJobs, job::Fill) {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let base = super::super::tests::scratch();
-    let mut jobs = super::super::tests::machine(&base);
+    let mut jobs = match config {
+        Some(config) => super::super::tests::machine_with_config(&base, config),
+        None => super::super::tests::machine(&base),
+    };
     jobs.settings = Some(JobVms {
         uid_base: 500000,
         uid_count: 2,
@@ -135,97 +142,100 @@ fn isolated_fill_promotion_requires_publication_clean_exit_evidence_and_detachme
 
 #[test]
 fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_base() {
-    let (base, mut jobs, mut fill) = fixture();
-    fill.account = crate::cache_write::tests::ACCOUNT.into();
-    // Root scratch may be ext4; exercise real reflinks on a disposable XFS store.
-    let store = ReflinkStore::new(&base);
-    jobs.workspaces = store.0.join("workspaces");
-    prepare_fill(&jobs.workspaces, &fill).unwrap();
-    let source = jobs.workspaces.join(fill.disk_id()).join("workspace.img");
-    std::fs::write(&source, vec![42; 4096]).unwrap();
-    exited(&mut jobs, &fill, Some(true), Some(0));
-    assert!(jobs.finish_fill(&fill, true).unwrap());
-    let request = job::Seed {
-        cache_write_job_id: None,
-        account: fill.account.clone(),
-        repository_key: fill.repository_key.clone(),
-        base_id: fill.disk_id(),
-        disk_id: "new-job".into(),
-    };
-    for (account, repository_key) in [("foreign", "repo"), (fill.account.as_str(), "foreign")] {
-        let mut wrong = request.clone();
-        wrong.account = account.into();
-        wrong.repository_key = repository_key.into();
-        assert!(seed(&jobs.workspaces, &wrong).is_err());
-        assert!(!jobs.workspaces.join("new-job").exists());
-    }
-    let peer = Peer { uid: 0, gid: 0 };
-    jobs.handle(Operation::SeedWorkspace(request.clone()), peer)
-        .unwrap();
-    jobs.handle(Operation::SeedWorkspace(request.clone()), peer)
-        .unwrap();
     let id = job::test_id(704);
-    crate::cache_write::tests::with_fresh_token(&id, &fill.account, |config, token| {
-        jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::cache_write::Grants::new(config),
-        ));
-        jobs.cache_write_grants
-            .lock()
-            .unwrap()
-            .admit(token)
-            .unwrap();
-        let mut bound = request.clone();
-        bound.cache_write_job_id = Some(id.clone());
-        jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)
-            .unwrap();
-        assert!(open_disk(&jobs.workspaces, &fill.account, "new-job")
-            .unwrap()
-            .0
-            .workspace_key_hash
-            .is_none());
-        bound.disk_id = "new-bound-job".into();
-        jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)
-            .unwrap();
-        assert!(open_disk(&jobs.workspaces, &fill.account, &bound.disk_id)
-            .unwrap()
-            .0
-            .workspace_key_hash
-            .is_some());
-    });
-    let (registry, clone) = open_disk(&jobs.workspaces, &fill.account, "new-job").unwrap();
-    let original = File::open(&source).unwrap();
-    assert_eq!(registry.role, job::WorkspaceRole::Job);
-    assert_ne!(
-        clone.metadata().unwrap().ino(),
-        original.metadata().unwrap().ino()
-    );
-    assert_eq!(exclusive_bytes(&clone).unwrap(), 0);
-    let destination = jobs.workspaces.join("new-job/workspace.img");
-    assert_eq!(std::fs::read(&destination).unwrap(), vec![42; 4096]);
-    std::fs::write(destination, vec![7; 4096]).unwrap();
-    assert_eq!(std::fs::read(&source).unwrap(), vec![42; 4096]);
-    assert!(!job::WorkspaceRole::Base.permits(job::VmKind::Job));
-    assert!(!job::WorkspaceRole::Base.permits(job::VmKind::Fill));
-    let denied = jobs
-        .handle(
-            Operation::Start(Start {
-                cache_write_blocked: false,
-                kind: job::VmKind::BaseBuild,
-                job_id: job::test_id(702),
+    crate::cache_write::tests::with_fresh_token(
+        &id,
+        crate::cache_write::tests::ACCOUNT,
+        |config, token| {
+            let (base, mut jobs, mut fill) = fixture_with_config(Some(config));
+            fill.account = crate::cache_write::tests::ACCOUNT.into();
+            // Root scratch may be ext4; exercise real reflinks on a disposable XFS store.
+            let store = ReflinkStore::new(&base);
+            jobs.workspaces = store.0.join("workspaces");
+            prepare_fill(&jobs.workspaces, &fill).unwrap();
+            let source = jobs.workspaces.join(fill.disk_id()).join("workspace.img");
+            std::fs::write(&source, vec![42; 4096]).unwrap();
+            exited(&mut jobs, &fill, Some(true), Some(0));
+            assert!(jobs.finish_fill(&fill, true).unwrap());
+            let request = job::Seed {
+                cache_write_job_id: None,
                 account: fill.account.clone(),
-                workspace_disk_id: fill.disk_id(),
-                image_generation_id: "image".into(),
-                vcpus: 1,
-                memory_mib: 128,
-                burst_mib: None,
-            }),
-            peer,
-        )
-        .unwrap();
-    assert!(matches!(denied.reply, Reply::StartRefused { .. }));
-    drop((clone, original));
-    drop(store);
-    std::fs::remove_dir_all(base).unwrap();
+                repository_key: fill.repository_key.clone(),
+                base_id: fill.disk_id(),
+                disk_id: "new-job".into(),
+            };
+            for (account, repository_key) in
+                [("foreign", "repo"), (fill.account.as_str(), "foreign")]
+            {
+                let mut wrong = request.clone();
+                wrong.account = account.into();
+                wrong.repository_key = repository_key.into();
+                assert!(seed(&jobs.workspaces, &wrong).is_err());
+                assert!(!jobs.workspaces.join("new-job").exists());
+            }
+            let peer = Peer { uid: 0, gid: 0 };
+            jobs.handle(Operation::SeedWorkspace(request.clone()), peer)
+                .unwrap();
+            jobs.handle(Operation::SeedWorkspace(request.clone()), peer)
+                .unwrap();
+            jobs.cache_write_grants
+                .lock()
+                .unwrap()
+                .admit(token)
+                .unwrap();
+            let mut bound = request.clone();
+            bound.cache_write_job_id = Some(id.clone());
+            jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)
+                .unwrap();
+            assert!(open_disk(&jobs.workspaces, &fill.account, "new-job")
+                .unwrap()
+                .0
+                .workspace_key_hash
+                .is_none());
+            bound.disk_id = "new-bound-job".into();
+            jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)
+                .unwrap();
+            assert!(open_disk(&jobs.workspaces, &fill.account, &bound.disk_id)
+                .unwrap()
+                .0
+                .workspace_key_hash
+                .is_some());
+            let (registry, clone) = open_disk(&jobs.workspaces, &fill.account, "new-job").unwrap();
+            let original = File::open(&source).unwrap();
+            assert_eq!(registry.role, job::WorkspaceRole::Job);
+            assert_ne!(
+                clone.metadata().unwrap().ino(),
+                original.metadata().unwrap().ino()
+            );
+            assert_eq!(exclusive_bytes(&clone).unwrap(), 0);
+            let destination = jobs.workspaces.join("new-job/workspace.img");
+            assert_eq!(std::fs::read(&destination).unwrap(), vec![42; 4096]);
+            std::fs::write(destination, vec![7; 4096]).unwrap();
+            assert_eq!(std::fs::read(&source).unwrap(), vec![42; 4096]);
+            assert!(!job::WorkspaceRole::Base.permits(job::VmKind::Job));
+            assert!(!job::WorkspaceRole::Base.permits(job::VmKind::Fill));
+            let denied = jobs
+                .handle(
+                    Operation::Start(Start {
+                        cache_write_blocked: false,
+                        kind: job::VmKind::BaseBuild,
+                        job_id: job::test_id(702),
+                        account: fill.account.clone(),
+                        workspace_disk_id: fill.disk_id(),
+                        image_generation_id: "image".into(),
+                        vcpus: 1,
+                        memory_mib: 128,
+                        burst_mib: None,
+                    }),
+                    peer,
+                )
+                .unwrap();
+            assert!(matches!(denied.reply, Reply::StartRefused { .. }));
+            drop((clone, original));
+            drop(store);
+            std::fs::remove_dir_all(base).unwrap();
+        },
+    );
 }
 
 #[test]

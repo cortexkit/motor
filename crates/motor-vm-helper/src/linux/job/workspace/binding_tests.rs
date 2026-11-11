@@ -4,8 +4,7 @@ use super::*;
 fn isolated_workspace_binding_is_created_from_verified_grant_and_never_backfilled() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let base = super::super::tests::scratch();
-    let mut jobs = super::super::tests::machine(&base);
-    jobs.settings = Some(
+    let settings = Some(
         serde_json::from_value(json!({
             "uid_base":500000, "uid_count":1, "memory_max_bytes":1048576,
             "workspace_disk_max_bytes":4096
@@ -15,9 +14,8 @@ fn isolated_workspace_binding_is_created_from_verified_grant_and_never_backfille
     let id = job::test_id(97);
     let account = crate::cache_write::tests::ACCOUNT;
     crate::cache_write::tests::with_fresh_token(&id, account, |config, token| {
-        jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::cache_write::Grants::new(config),
-        ));
+        let mut jobs = super::super::tests::machine_with_config(&base, config);
+        jobs.settings = settings;
         jobs.cache_write_grants
             .lock()
             .unwrap()
@@ -99,7 +97,6 @@ fn isolated_workspace_binding_is_created_from_verified_grant_and_never_backfille
 fn isolated_pre_intent_retry_stages_write_key_and_read_only_credential_drive() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let base = super::super::tests::scratch();
-    let mut jobs = super::super::tests::machine(&base);
     let start = Start {
         kind: job::VmKind::Job,
         job_id: job::test_id(99),
@@ -112,9 +109,7 @@ fn isolated_pre_intent_retry_stages_write_key_and_read_only_credential_drive() {
         cache_write_blocked: false,
     };
     crate::cache_write::tests::with_fresh_token(&start.job_id, &start.account, |config, token| {
-        jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::cache_write::Grants::new(config),
-        ));
+        let mut jobs = super::super::tests::machine_with_config(&base, config);
         jobs.cache_write_grants
             .lock()
             .unwrap()
