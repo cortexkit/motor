@@ -592,8 +592,9 @@ impl Host {
     /// place the lease that wakes it; a running tenant advertises its guest's
     /// measured available memory. Both are floored to MiB and reduced by
     /// `tenant_memory_reserve_bytes` rounded up to whole MiB and this tenant's
-    /// reserved leases' requested memory, saturating at 0. Reserved leases are
-    /// debited because the broker ends its memory hold once a job is listed.
+    /// reserved leases' requested memory, saturating at 0. Debiting reserved
+    /// leases makes the figure account for every job the heartbeat lists: in any
+    /// later state the guest's measured memory counts the job instead.
     /// A running tenant without a usable sample, a pending/refused start or stop,
     /// and any tenant while no valid capacity file has been read advertise 0.
     /// Logs each running tenant's unusable-sample case once when it starts.
