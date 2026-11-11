@@ -14,6 +14,8 @@ mod memory;
 mod have_reports;
 #[path = "tenant_per_job.rs"]
 mod per_job;
+#[path = "tenant_write_block.rs"]
+mod write_block;
 
 fn open(f: &Fixture) -> Runner {
     let mut config = f.config();

@@ -249,6 +249,17 @@ fn agent_result(result: io::Result<Value>) -> Value {
 }
 
 async fn dispatch_value(value: Value, attach: &tokio::sync::Mutex<()>) -> io::Result<Value> {
+    if value["op"] == "set_remote_cache_write_block" {
+        let request: TenantAgentRequest = serde_json::from_value(value.clone())?;
+        let TenantAgentRequest::SetRemoteCacheWriteBlock { blocked } = request else {
+            unreachable!()
+        };
+        if value != json!({"op":"set_remote_cache_write_block","blocked":blocked}) {
+            return Err(io::Error::other("invalid write block request"));
+        }
+        let _guard = attach.lock().await;
+        return forward(Frame::SetRemoteCacheWriteBlock { blocked }).await;
+    }
     if crate::fill_source::fill_boot(&fs::read_to_string("/proc/cmdline")?)
         && value["op"] != "attach_tenant"
     {
@@ -353,6 +364,9 @@ async fn dispatch(
             .await
         }
         TenantAgentRequest::Resume => forward(Frame::Resume).await,
+        TenantAgentRequest::SetRemoteCacheWriteBlock { blocked } => {
+            forward(Frame::SetRemoteCacheWriteBlock { blocked }).await
+        }
         TenantAgentRequest::Status => forward(Frame::Status).await,
         TenantAgentRequest::Diagnostics {
             https,
@@ -475,6 +489,10 @@ async fn forward_socket(
                 | (Frame::DrainForActivation, Frame::DrainReply { .. })
                 | (Frame::DrainIfIdle, Frame::DrainIfIdleReply { .. })
                 | (Frame::Resume, Frame::ResumeReply { .. })
+                | (
+                    Frame::SetRemoteCacheWriteBlock { .. },
+                    Frame::SetRemoteCacheWriteBlockReply { .. }
+                )
                 | (Frame::Status, Frame::StatusReply(_))
                 | (Frame::JobStatus { .. }, Frame::JobStatusReply(_))
         );
@@ -1674,6 +1692,14 @@ mod tests {
         let id = Uuid::now_v7();
         let exchanges = [
             (
+                Frame::SetRemoteCacheWriteBlock { blocked: true },
+                Frame::SetRemoteCacheWriteBlockReply { blocked: true },
+            ),
+            (
+                Frame::SetRemoteCacheWriteBlock { blocked: false },
+                Frame::SetRemoteCacheWriteBlockReply { blocked: false },
+            ),
+            (
                 Frame::Drain {
                     deadline_s: 7,
                     exit_after: false,
@@ -1737,6 +1763,31 @@ mod tests {
             );
             assert_eq!(result.unwrap()["ok"], true);
         }
+    }
+
+    #[tokio::test]
+    async fn older_runner_closing_on_unknown_block_control_is_not_acknowledged() {
+        let root = cortexkit_test_support::ScratchDir::new("motor-block-old-runner");
+        let path = root.join("runner.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let peer = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let hello = read_frame_async(&mut socket).await.unwrap().unwrap();
+            write_frame_async(&mut socket, &hello).await.unwrap();
+            assert!(matches!(
+                read_frame_async(&mut socket).await.unwrap(),
+                Some(Frame::SetRemoteCacheWriteBlock { blocked: true })
+            ));
+        };
+        let (result, ()) = tokio::join!(
+            forward_socket(
+                &path,
+                Frame::SetRemoteCacheWriteBlock { blocked: true },
+                || Ok(Some(std::process::id()))
+            ),
+            peer
+        );
+        assert_eq!(agent_result(result)["ok"], false);
     }
 
     #[test]

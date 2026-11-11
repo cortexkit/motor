@@ -291,6 +291,7 @@ fn diff_value<T: Serialize + PartialEq>(
 /// adding it here and in [`load`]; the round-trip test fails otherwise.
 fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite::Result<()> {
     let Snapshot {
+        remote_cache_write_blocked,
         revocations,
         leases,
         nonces,
@@ -322,6 +323,16 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
     diff_value(tx, "counter", &old.counter, counter)?;
     diff_value(tx, "last_alive", &old.last_alive, last_alive)?;
     diff_value(tx, "draining", &old.draining, draining)?;
+    if old.remote_cache_write_blocked != *remote_cache_write_blocked {
+        if *remote_cache_write_blocked {
+            diff_value(tx, "remote_cache_write_blocked", &false, &true)?;
+        } else {
+            tx.execute(
+                "DELETE FROM host_values WHERE name = 'remote_cache_write_blocked'",
+                [],
+            )?;
+        }
+    }
     diff_value(tx, "accept_until_ms", &old.accept_until_ms, accept_until_ms)?;
     write_job_ledger(tx, &old.per_job, per_job)
 }
@@ -508,6 +519,9 @@ fn load(conn: &Connection) -> rusqlite::Result<Snapshot> {
             "counter" => snapshot.counter = from_json(&value)?,
             "last_alive" => snapshot.last_alive = from_json(&value)?,
             "draining" => snapshot.draining = from_json(&value)?,
+            "remote_cache_write_blocked" => {
+                snapshot.remote_cache_write_blocked = from_json(&value)?
+            }
             "accept_until_ms" => snapshot.accept_until_ms = from_json(&value)?,
             IMPORTED => {}
             _ => return Err(unknown("value", &name)),
@@ -585,6 +599,41 @@ mod rollback_tests {
         journal.store(&reopened).unwrap();
         drop(journal);
         assert_eq!(SqliteJournal::open(dir.path()).unwrap().1, legacy);
+    }
+
+    #[test]
+    fn emergency_write_block_survives_restart_and_off_state_is_unchanged() {
+        let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+        let legacy_bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(!serde_json::to_value(&snapshot)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("remote_cache_write_blocked"));
+        let old: Snapshot = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert!(!old.remote_cache_write_blocked);
+        snapshot.remote_cache_write_blocked = true;
+        journal.store(&snapshot).unwrap();
+        drop(journal);
+        let (mut journal, mut reopened) = SqliteJournal::open(dir.path()).unwrap();
+        assert_eq!(reopened, snapshot);
+        reopened.remote_cache_write_blocked = false;
+        journal.store(&reopened).unwrap();
+        drop(journal);
+        assert_eq!(
+            serde_json::to_vec(&SqliteJournal::open(dir.path()).unwrap().1).unwrap(),
+            legacy_bytes
+        );
+        let conn = Connection::open(dir.path().join("store.db")).unwrap();
+        let count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM host_values WHERE name = 'remote_cache_write_blocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

@@ -1171,7 +1171,12 @@ async fn boot(
     runtime.start_job_events(execution.claims.jti.clone());
     let control = runtime.control.clone();
     let job = execution.claims.jti.clone();
-    let stream = tokio::task::spawn_blocking(move || control.job_relay(&job, 52)).await??;
+    let r = runtime.clone();
+    let stream = tokio::task::spawn_blocking(move || {
+        r.sync_remote_cache_write_block(&job, true);
+        control.job_relay(&job, 52)
+    })
+    .await??;
     stream.set_nonblocking(true)?;
     let mut stream = tokio::net::UnixStream::from_std(stream)?;
     let mut lease = verified_lease(&execution.claims, true);

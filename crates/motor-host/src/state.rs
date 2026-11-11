@@ -60,6 +60,8 @@ pub struct Vm {
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Snapshot {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_cache_write_blocked: bool,
     #[serde(default, skip_serializing_if = "jobs::Ledger::is_empty")]
     pub per_job: jobs::Ledger,
     /// Independent of finished-job retention: old tokens stay fenced until expiry.
@@ -238,6 +240,12 @@ pub struct Host {
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
 }
 impl Host {
+    pub fn set_remote_cache_write_block(&mut self, blocked: bool) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        next.remote_cache_write_blocked = blocked;
+        self.save(next)
+    }
+
     pub(crate) fn journal_directory(&self) -> Option<std::path::PathBuf> {
         self.journal.directory()
     }

@@ -5,6 +5,15 @@ use motor_protocol::{
 use sha2::{Digest, Sha256};
 
 impl Runner {
+    pub(crate) async fn set_remote_cache_write_block(&self, blocked: bool) {
+        #[cfg(unix)]
+        if let Some(runtime) = &self.core.config.remote_cache_runtime {
+            runtime.gateway.set_job_write_block(blocked).await;
+        }
+        #[cfg(not(unix))]
+        let _ = blocked;
+    }
+
     #[cfg(unix)]
     pub(super) fn start_remote_cache(&self) {
         let Some(runtime) = &self.core.config.remote_cache_runtime else {

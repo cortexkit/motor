@@ -20,6 +20,7 @@ mod inbound;
 mod metrics;
 mod sigv4;
 mod upstream;
+mod write_block;
 
 pub(crate) use metrics::ToolStats;
 pub(crate) use upstream::{Connector, Target, TcpConnector};
@@ -538,6 +539,7 @@ struct Shared {
     read_breaker: Arc<Breaker>,
     write_breaker: Arc<Breaker>,
     job_write_breaker: Arc<Breaker>,
+    job_write_block: write_block::WriteBlock,
     total_reads: Arc<AtomicUsize>,
     total_connections: Arc<AtomicUsize>,
     jobs: Mutex<HashMap<String, Weak<Owner>>>,
@@ -773,6 +775,7 @@ impl Exchange<'_> {
 /// How an attempt to get a response head failed.
 enum AttemptError {
     Upstream(Failure),
+    Blocked,
     /// The tool went away, or stopped sending its body, during a PUT.
     Client,
 }
@@ -802,6 +805,7 @@ impl Gateway {
                 read_breaker: Breaker::new(WhileProbing::Answer),
                 write_breaker: Breaker::new(WhileProbing::Hold),
                 job_write_breaker: Breaker::new(WhileProbing::Answer),
+                job_write_block: Default::default(),
                 total_reads: Arc::new(AtomicUsize::new(0)),
                 total_connections: Arc::new(AtomicUsize::new(0)),
                 jobs: Mutex::new(HashMap::new()),
@@ -810,6 +814,10 @@ impl Gateway {
                 origin: Instant::now(),
             }),
         }
+    }
+
+    pub(crate) async fn set_job_write_block(&self, blocked: bool) {
+        self.shared.job_write_block.set(blocked).await;
     }
 
     /// A read socket's binding for one job and the cache tenant it was
@@ -1110,6 +1118,12 @@ impl Gateway {
         let endpoint = endpoint.for_method(request.method);
         let failure = endpoint.failure_status();
         let close_requested = request.close_requested;
+        if endpoint == Endpoint::JobCreate && self.shared.job_write_block.blocked() {
+            self.refused(binding, endpoint, "emergency write block");
+            return self
+                .answer(client, 503, body_free, close_requested, deadline)
+                .await;
+        }
         let Some(generation) = self.shared.generations.admit() else {
             return self
                 .answer(client, failure, body_free, close_requested, deadline)
@@ -1277,16 +1291,13 @@ impl Gateway {
         text.into_bytes()
     }
 
-    /// One attempt at getting a response head from the store. For a PUT it
-    /// also streams the tool's body; `body_started` is set once any of it
-    /// has been read, after which the request cannot be retried.
-    async fn attempt<S>(
+    async fn send_request<S>(
         &self,
         client: &mut Inbound<S>,
         exchange: &Exchange<'_>,
         body_started: &mut bool,
         continue_sent: &mut bool,
-    ) -> Result<(Conn, ResponseHead, bool), AttemptError>
+    ) -> Result<(Conn, Option<ResponseHead>, bool, Instant), AttemptError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1344,7 +1355,12 @@ impl Gateway {
                     .read_head(Instant::now() + limits.first_byte_timeout, deadline, false)
                     .await
                     .map_err(AttemptError::Upstream)?;
-                return Ok((conn, head, exchange.request.content_length == 0));
+                return Ok((
+                    conn,
+                    Some(head),
+                    exchange.request.content_length == 0,
+                    first_byte_by,
+                ));
             }
             Ok(Err(_)) => return Err(AttemptError::Upstream(Failure::BeforeResponse)),
             Ok(Ok(())) => {}
@@ -1399,6 +1415,42 @@ impl Gateway {
             // The overall deadline still bounds the upload and the answer.
             first_byte_by = Instant::now() + limits.first_byte_timeout;
         }
+        Ok((conn, None, body_complete, first_byte_by))
+    }
+
+    /// Cancellation covers connecting and sending, but not waiting for the
+    /// response to a fully sent PUT. The upload guard signals completion only
+    /// after a cancelled send has dropped its upstream connection.
+    async fn attempt<S>(
+        &self,
+        client: &mut Inbound<S>,
+        exchange: &Exchange<'_>,
+        body_started: &mut bool,
+        continue_sent: &mut bool,
+    ) -> Result<(Conn, ResponseHead, bool), AttemptError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let sent = if exchange.create_only {
+            let mut upload = self
+                .shared
+                .job_write_block
+                .admit()
+                .ok_or(AttemptError::Blocked)?;
+            tokio::select! {
+                biased;
+                _ = upload.cancelled() => Err(AttemptError::Blocked),
+                result = self.send_request(client, exchange, body_started, continue_sent) => result,
+            }
+        } else {
+            self.send_request(client, exchange, body_started, continue_sent)
+                .await
+        };
+        let (mut conn, early_head, body_complete, first_byte_by) = sent?;
+        if let Some(head) = early_head {
+            return Ok((conn, head, body_complete));
+        }
+        let deadline = exchange.deadline;
         let head_request = exchange.request.method == Method::Head;
         match conn.read_head(first_byte_by, deadline, head_request).await {
             // Bytes of the body already went to the store, so a reset is no
@@ -1466,6 +1518,22 @@ impl Gateway {
                 Err(AttemptError::Client) => {
                     ticket.report(Outcome::Neutral);
                     return Next::Close;
+                }
+                Err(AttemptError::Blocked) => {
+                    ticket.report(Outcome::Neutral);
+                    if let Some(job) = &mut put.job {
+                        job.outcome = JobPutOutcome::Refused;
+                    }
+                    self.refused(binding, endpoint, "emergency write block");
+                    return self
+                        .answer(
+                            client,
+                            503,
+                            request.content_length == 0,
+                            request.close_requested,
+                            deadline,
+                        )
+                        .await;
                 }
             }
         };
