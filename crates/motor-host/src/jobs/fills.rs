@@ -205,6 +205,7 @@ impl Scheduler {
                 let assignment = resources.acquire_fill(&fill)?;
                 control.prepare_fill(&fill.fill)?;
                 let reply = control.start_job(&motor_vm_helper::job::Start {
+                    cache_write_blocked: false,
                     kind: motor_vm_helper::job::VmKind::Fill,
                     job_id: fill.fill.fill_id.clone(),
                     account: fill.fill.account.clone(),

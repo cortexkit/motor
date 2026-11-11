@@ -260,6 +260,7 @@ pub(super) fn install_command_at(args: Vec<OsString>, store: &Path) -> Result<()
     store::install(store, &account, &set)
 }
 
+#[cfg(all(test, feature = "linux-root-tests"))]
 pub(super) fn stage(
     store: &Path,
     account: &str,
@@ -267,15 +268,24 @@ pub(super) fn stage(
     jail: &File,
     uid: u32,
 ) -> Result<Option<String>> {
+    stage_with_write(store, account, kind, jail, uid, false).map(|(nonce, _)| nonce)
+}
+
+pub(super) fn stage_with_write(
+    store: &Path,
+    account: &str,
+    kind: VmKind,
+    jail: &File,
+    uid: u32,
+    job_write: bool,
+) -> Result<(Option<String>, bool)> {
     if kind == VmKind::Recovery {
-        return Ok(None);
+        return Ok((None, false));
     }
-    let Some(mut set) = store::load(store, account)? else {
-        return Ok(None);
+    let Some(set) = store::load(store, account)? else {
+        return Ok((None, false));
     };
-    if kind == VmKind::Job {
-        set.write_key = None;
-    }
+    let (set, job_write) = credentials_for_boot(set, kind, job_write);
     let nonce = random_nonce()?;
     let payload = Zeroizing::new(serde_json::to_vec(&set).map_err(|_| invalid())?);
     let length = REMOTE_CACHE_DRIVE_MAGIC.len() + nonce.len() + 4 + payload.len();
@@ -297,7 +307,19 @@ pub(super) fn stage(
         return Err(std::io::Error::last_os_error().into());
     }
     jail.sync_all()?;
-    Ok(Some(hex(&nonce)))
+    Ok((Some(hex(&nonce)), job_write))
+}
+
+fn credentials_for_boot(
+    mut set: RemoteCacheRequest,
+    kind: VmKind,
+    job_write: bool,
+) -> (RemoteCacheRequest, bool) {
+    if kind == VmKind::Job && !job_write {
+        set.write_key = None;
+    }
+    let job_write = kind == VmKind::Job && job_write && set.write_key.is_some();
+    (set, job_write)
 }
 
 #[cfg(test)]

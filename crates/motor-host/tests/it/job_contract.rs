@@ -473,6 +473,7 @@ fn isolated_vm(fill: bool) {
         let short_root = PathBuf::from(format!("/proc/self/fd/{}", root_fd.as_raw_fd()));
         wait_for(|| short_root.join("api.sock").exists());
         let start = Start {
+            cache_write_blocked: false,
             kind: if fill {
                 motor_vm_helper::job::VmKind::Fill
             } else {
@@ -487,6 +488,7 @@ fn isolated_vm(fill: bool) {
             burst_mib: None,
         };
         let registry = motor_vm_helper::job::Workspace {
+            workspace_key_hash: None,
             account: start.account.clone(),
             workspace_disk_id: start.workspace_disk_id.clone(),
             role: if fill {

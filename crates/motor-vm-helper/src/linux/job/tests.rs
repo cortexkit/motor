@@ -230,6 +230,7 @@ fn isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse(
 
 fn start() -> Start {
     Start {
+        cache_write_blocked: false,
         kind: job::VmKind::Job,
         job_id: job::test_id(1),
         account: "account-1".into(),
@@ -409,6 +410,7 @@ fn fixed_path_settings(roots: serde_json::Value) -> JobVms {
 
 fn disk_registry(start: &Start) -> Workspace {
     Workspace {
+        workspace_key_hash: None,
         account: start.account.clone(),
         workspace_disk_id: start.workspace_disk_id.clone(),
         role: if start.kind == job::VmKind::Fill {
@@ -1282,4 +1284,175 @@ fn fill_boot_authority_comes_from_the_root_disk_role_not_the_requested_start_kin
     assert!(boot(&requested)
         .split_whitespace()
         .any(|word| word == "motor.fill=1"));
+}
+
+#[test]
+fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
+    let base = scratch();
+    let mut record = record();
+    let id = record.start.job_id.clone();
+    let account = record.start.account.clone();
+    crate::cache_write::tests::with_fresh_token(&id, &account, |config, token| {
+        for tombstone in [false, true] {
+            let mut first = machine(&base);
+            first.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::cache_write::Grants::new(config),
+            ));
+            first
+                .cache_write_grants
+                .lock()
+                .unwrap()
+                .admit(token)
+                .unwrap();
+            std::fs::create_dir_all(&first.records_path).unwrap();
+            record.released = tombstone;
+            record.exit_acknowledged = tombstone;
+            record.oom_kill = tombstone.then_some(0);
+            first.save(&record).unwrap();
+            first.records.insert(id.clone(), record.clone());
+            first.cache_write_grants.lock().unwrap().consume(&id);
+            assert!(first.status(&id).is_ok());
+            assert!(first.cache_write_grants.lock().unwrap().get(&id).is_none());
+            assert!(!first.boundary(&id).exists());
+            let path = first.records_path.join(format!("{id}.json"));
+            drop(first);
+            let mut restarted = machine(&base);
+            restarted.settings = Some(fixed_path_settings(json!({})));
+            let saved = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            restarted.adopt_record(saved).unwrap();
+            restarted.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::cache_write::Grants::new(config),
+            ));
+            restarted
+                .cache_write_grants
+                .lock()
+                .unwrap()
+                .admit(token)
+                .unwrap();
+            assert!(restarted
+                .cache_write_grants
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some());
+            let error = restarted
+                .start(record.start.clone(), Peer { uid: 0, gid: 0 })
+                .err()
+                .unwrap();
+            assert_eq!(error.0, "job id already booted; use adopt_job");
+            assert!(!restarted.boundary(&id).exists());
+        }
+    });
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn write_boot_flag_requires_job_role_and_staged_credentials_without_granting_fill() {
+    let start = start();
+    let nonce = "ab".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES);
+    let mut requests = boot_requests(&start, Some(1), Some(&nonce), 4096).unwrap();
+    authorize_job_write_boot(&mut requests, &start, Some(&nonce), true).unwrap();
+    let boot = requests
+        .iter()
+        .find(|(path, _)| *path == "/boot-source")
+        .unwrap()
+        .1["boot_args"]
+        .as_str()
+        .unwrap();
+    assert!(boot
+        .split_whitespace()
+        .any(|part| part == "motor.cache_write=1"));
+    assert!(!boot.contains("motor.fill=1"));
+    assert!(!boot.contains("motor.recovery=1"));
+    assert_eq!(
+        requests
+            .iter()
+            .find(|(path, _)| *path == "/drives/remote_cache")
+            .unwrap()
+            .1["is_read_only"],
+        true
+    );
+    assert_eq!(start.kind, job::VmKind::Job);
+    for case in ["missing-key", "no-disk", "block", "fill", "recovery"] {
+        let mut start = start.clone();
+        match case {
+            "block" => start.cache_write_blocked = true,
+            "fill" => start.kind = job::VmKind::Fill,
+            "recovery" => start.kind = job::VmKind::Recovery,
+            _ => {}
+        }
+        let nonce = (case != "no-disk").then_some(nonce.as_str());
+        let mut requests = boot_requests(&start, Some(1), nonce, 4096).unwrap();
+        let write = case != "missing-key";
+        let result = authorize_job_write_boot(&mut requests, &start, nonce, write);
+        if case == "missing-key" {
+            result.unwrap();
+        } else {
+            assert!(result.is_err(), "{case}");
+        }
+        let boot = requests
+            .iter()
+            .find(|(path, _)| *path == "/boot-source")
+            .unwrap()
+            .1["boot_args"]
+            .as_str()
+            .unwrap();
+        assert!(!boot.contains("motor.cache_write=1"), "{case}");
+    }
+}
+
+#[test]
+fn start_retry_before_durable_intent_reuses_grant_for_write_boot_configuration() {
+    let base = scratch();
+    let mut jobs = machine(&base);
+    let start = start();
+    crate::cache_write::tests::with_fresh_token(&start.job_id, &start.account, |config, token| {
+        jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::cache_write::Grants::new(config),
+        ));
+        jobs.cache_write_grants
+            .lock()
+            .unwrap()
+            .admit(token)
+            .unwrap();
+        for _ in 0..2 {
+            let error = jobs
+                .start(start.clone(), Peer { uid: 0, gid: 0 })
+                .err()
+                .unwrap();
+            assert_eq!(error.0, "job VM settings are required");
+            assert!(!jobs
+                .records_path
+                .join(format!("{}.json", start.job_id))
+                .exists());
+            let grant = jobs
+                .cache_write_grants
+                .lock()
+                .unwrap()
+                .get(&start.job_id)
+                .unwrap()
+                .clone();
+            let mut disk = disk_registry(&start);
+            disk.workspace_key_hash = Some(grant.workspace_key_hash.clone());
+            assert!(grant.permits(&start, &disk));
+            let nonce = "ab".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES);
+            let mut requests = boot_requests(&start, Some(1), Some(&nonce), 4096).unwrap();
+            authorize_job_write_boot(
+                &mut requests,
+                &start,
+                Some(&nonce),
+                grant.permits(&start, &disk),
+            )
+            .unwrap();
+            let boot = requests
+                .iter()
+                .find(|(path, _)| *path == "/boot-source")
+                .unwrap()
+                .1["boot_args"]
+                .as_str()
+                .unwrap();
+            assert!(boot.contains("motor.cache_write=1"));
+        }
+    });
+    std::fs::remove_dir_all(base).unwrap();
 }

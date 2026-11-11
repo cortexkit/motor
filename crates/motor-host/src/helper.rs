@@ -51,6 +51,15 @@ pub trait Control: Send + Sync {
     fn ensure_workspace(&self, _account: &str, _disk_id: &str, _size_bytes: u64) -> Result<()> {
         anyhow::bail!("workspace creation unavailable")
     }
+    fn ensure_workspace_for_job(
+        &self,
+        account: &str,
+        disk_id: &str,
+        size_bytes: u64,
+        _job: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_workspace(account, disk_id, size_bytes)
+    }
     /// Resident bytes of the VMM's guest-RAM mappings, measured by the helper.
     fn job_memory(&self, _job: &str) -> Result<u64> {
         Err(BalloonUnavailable.into())
@@ -425,6 +434,20 @@ impl Control for Helper {
     }
     fn ensure_workspace(&self, account: &str, disk_id: &str, size_bytes: u64) -> Result<()> {
         let (reply, _) = self.request(json!({"op":"ensure_workspace", "account":account, "disk_id":disk_id, "size_bytes":size_bytes}))?;
+        ensure!(reply["result"] == "ok", "workspace creation refused");
+        Ok(())
+    }
+    fn ensure_workspace_for_job(
+        &self,
+        account: &str,
+        disk_id: &str,
+        size_bytes: u64,
+        job: Option<&str>,
+    ) -> Result<()> {
+        let Some(job) = job else {
+            return self.ensure_workspace(account, disk_id, size_bytes);
+        };
+        let (reply, _) = self.request(json!({"op":"ensure_workspace", "account":account, "disk_id":disk_id, "size_bytes":size_bytes, "cache_write_job_id":job}))?;
         ensure!(reply["result"] == "ok", "workspace creation refused");
         Ok(())
     }

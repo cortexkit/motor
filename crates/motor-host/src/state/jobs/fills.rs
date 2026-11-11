@@ -259,6 +259,9 @@ impl Host {
         };
         Ok(Some(SeedPlan {
             request: motor_vm_helper::job::Seed {
+                cache_write_job_id: (execution.claims.cache_write == Some(true)
+                    && !self.snapshot.remote_cache_write_blocked)
+                    .then(|| job.into()),
                 account: disk.sub.clone(),
                 repository_key: repository_key.into(),
                 base_id: base_id.clone(),

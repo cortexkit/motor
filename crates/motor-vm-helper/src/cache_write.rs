@@ -2,7 +2,7 @@
 use crate::{config::Config, job::validate_start_window, Error, Result};
 use motor_lease::{verify_token, AuthError, Jwks, KeySet, Purpose, JWKS_URL};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -13,6 +13,20 @@ pub struct Grant {
     pub sub: String,
     pub jti: String,
     pub workspace_key_hash: String,
+}
+
+impl Grant {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn permits(&self, start: &crate::job::Start, disk: &crate::job::Workspace) -> bool {
+        start.kind == crate::job::VmKind::Job
+            && !start.cache_write_blocked
+            && disk.role == crate::job::WorkspaceRole::Job
+            && self.jti == start.job_id
+            && self.sub == disk.account
+            && start.account == disk.account
+            && start.workspace_disk_id == disk.workspace_disk_id
+            && disk.workspace_key_hash.as_ref() == Some(&self.workspace_key_hash)
+    }
 }
 
 /// Shared only inside the helper. Network work holds this lock, never the
@@ -27,6 +41,7 @@ pub struct Grants {
     keys: KeySet,
     keys_ready: bool,
     grants: BTreeMap<String, Grant>,
+    consumed: BTreeSet<String>,
 }
 
 impl Grants {
@@ -40,6 +55,7 @@ impl Grants {
             keys: KeySet::default(),
             keys_ready: false,
             grants: BTreeMap::new(),
+            consumed: BTreeSet::new(),
         }
     }
 
@@ -90,7 +106,17 @@ impl Grants {
 
     fn get_at(&self, jti: &str, now: SystemTime) -> Option<&Grant> {
         validate_start_window(jti, now).ok()?;
+        if self.consumed.contains(jti) {
+            return None;
+        }
         self.grants.get(jti)
+    }
+
+    /// Call only after the durable start intent excludes another VM for this id.
+    pub fn consume(&mut self, jti: &str) {
+        if self.grants.contains_key(jti) {
+            self.consumed.insert(jti.into());
+        }
     }
 
     pub fn maintain(&mut self) {
@@ -103,6 +129,7 @@ impl Grants {
     fn prune_at(&mut self, now: SystemTime) {
         self.grants
             .retain(|jti, _| validate_start_window(jti, now).is_ok());
+        self.consumed.retain(|jti| self.grants.contains_key(jti));
     }
 
     fn refresh(&mut self, token: &str, now: SystemTime) -> Result<()> {
@@ -146,4 +173,4 @@ fn seconds(now: SystemTime) -> Result<u64> {
 
 #[cfg(test)]
 #[path = "cache_write_tests.rs"]
-mod tests;
+pub(crate) mod tests;

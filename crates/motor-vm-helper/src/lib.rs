@@ -79,6 +79,8 @@ pub enum Request {
         vcpus: u32,
         memory_mib: u64,
         burst_mib: Option<u64>,
+        #[serde(default)]
+        cache_write_blocked: bool,
     },
     AdoptJob {
         job_id: String,
@@ -114,6 +116,8 @@ pub enum Request {
         account: String,
         disk_id: String,
         size_bytes: u64,
+        #[serde(default)]
+        cache_write_job_id: Option<String>,
     },
     AckJobExit {
         job_id: String,
@@ -510,6 +514,7 @@ impl<M: Machine> Helper<M> {
                 vcpus,
                 memory_mib,
                 burst_mib,
+                cache_write_blocked,
             } => self.job(
                 job::Operation::Start(job::Start {
                     kind,
@@ -520,6 +525,7 @@ impl<M: Machine> Helper<M> {
                     vcpus,
                     memory_mib,
                     burst_mib,
+                    cache_write_blocked,
                 }),
                 peer,
             ),
@@ -551,11 +557,13 @@ impl<M: Machine> Helper<M> {
                 account,
                 disk_id,
                 size_bytes,
+                cache_write_job_id,
             } => self.job(
                 job::Operation::EnsureWorkspace {
                     account,
                     disk_id,
                     size_bytes,
+                    cache_write_job_id,
                 },
                 peer,
             ),

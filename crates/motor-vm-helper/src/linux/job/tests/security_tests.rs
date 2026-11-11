@@ -154,6 +154,7 @@ mod root {
             super::super::super::workspace::create(
                 &jobs.workspaces,
                 job::CreateWorkspace {
+                    cache_write_job_id: None,
                     account: "account-1".into(),
                     workspace_disk_id: disk_id.clone(),
                     size_bytes: 4096,
@@ -215,6 +216,7 @@ mod root {
             super::super::super::workspace::create(
                 &jobs.workspaces,
                 job::CreateWorkspace {
+                    cache_write_job_id: None,
                     account: request.account.clone(),
                     workspace_disk_id: request.workspace_disk_id.clone(),
                     size_bytes: 4096,
@@ -257,6 +259,7 @@ mod root {
         let mut jobs = machine(&base);
         settings(&mut jobs);
         jobs.create_workspace(job::CreateWorkspace {
+            cache_write_job_id: None,
             account: "account-1".into(),
             workspace_disk_id: "disk-1".into(),
             size_bytes: 4096,

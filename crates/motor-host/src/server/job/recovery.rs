@@ -191,6 +191,7 @@ fn recovery_start(
     assignment: &Assignment,
 ) -> motor_vm_helper::job::Start {
     motor_vm_helper::job::Start {
+        cache_write_blocked: false,
         kind: motor_vm_helper::job::VmKind::Recovery,
         job_id: recovery.id.clone(),
         account: account.into(),

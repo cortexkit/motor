@@ -144,7 +144,16 @@ impl LinuxJobs {
     }
     pub fn create_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
         self.check_workspace_size(request.size_bytes)?;
-        workspace::create(&self.workspaces, request, job::WorkspaceRole::Job)
+        let grant = self.disk_grant(request.cache_write_job_id.as_deref());
+        workspace::create_bound(
+            &self.workspaces,
+            request,
+            job::WorkspaceRole::Job,
+            grant.as_ref(),
+        )
+    }
+    fn disk_grant(&self, id: Option<&str>) -> Option<crate::cache_write::Grant> {
+        self.cache_write_grants.lock().ok()?.get(id?).cloned()
     }
     fn check_workspace_size(&self, size: u64) -> Result<()> {
         let maximum = self
@@ -610,7 +619,8 @@ impl LinuxJobs {
             Operation::SeedWorkspace(seed) => {
                 self.disk_available_identity(&seed.disk_id)?;
                 self.disk_available_identity(&seed.base_id)?;
-                workspace::seed(&self.workspaces, &seed)?;
+                let grant = self.disk_grant(seed.cache_write_job_id.as_deref());
+                workspace::seed_bound(&self.workspaces, &seed, grant.as_ref())?;
                 Ok(Response::new(Reply::Ok))
             }
             Operation::WorkspaceUsage { account, disk_id } => {
@@ -640,16 +650,20 @@ impl LinuxJobs {
                 account,
                 disk_id,
                 size_bytes,
+                cache_write_job_id,
             } => {
                 self.check_workspace_size(size_bytes)?;
                 self.disk_available_identity(&disk_id)?;
-                workspace::ensure(
+                let grant = self.disk_grant(cache_write_job_id.as_deref());
+                workspace::ensure_bound(
                     &self.workspaces,
                     job::CreateWorkspace {
                         account,
                         workspace_disk_id: disk_id,
                         size_bytes,
+                        cache_write_job_id,
                     },
+                    grant.as_ref(),
                 )?;
                 Ok(Response::new(Reply::Ok))
             }
@@ -980,6 +994,15 @@ impl LinuxJobs {
         // crash in setup keeps it reserved until explicit stop has cleaned up.
         self.save(&record)?;
         self.records.insert(start.job_id.clone(), record);
+        let job_write = self
+            .disk_grant(Some(&start.job_id))
+            .is_some_and(|grant| grant.permits(&start, &registry));
+        // Durable intent already prevents another VM, including after restart.
+        // Failures before intent leave the admission grant reusable by a retry.
+        self.cache_write_grants
+            .lock()
+            .map_err(|_| Error("cache grant lock poisoned".into()))?
+            .consume(&start.job_id);
         let id = &start.job_id;
         let boundary = self.boundary(id);
         let root = self.root(id);
@@ -995,8 +1018,15 @@ impl LinuxJobs {
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&boundary)?;
-            let nonce = self.stage_start_cache(&start, &boundary_fd, uid)?;
-            let requests = recorded_boot_requests(
+            let (nonce, job_write) = cache::stage_with_write(
+                &self.cache_store,
+                &start.account,
+                start.kind,
+                &boundary_fd,
+                uid,
+                job_write,
+            )?;
+            let mut requests = recorded_boot_requests(
                 &start,
                 tap_index,
                 nonce.as_deref(),
@@ -1004,6 +1034,7 @@ impl LinuxJobs {
                 &registry,
                 &settings,
             )?;
+            authorize_job_write_boot(&mut requests, &start, nonce.as_deref(), job_write)?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             fs::chown(&File::open(&root)?, uid)?;
@@ -1072,6 +1103,7 @@ impl LinuxJobs {
         self.network.ensure(id, &tap)
     }
 
+    #[cfg(all(test, feature = "linux-root-tests"))]
     fn stage_start_cache(
         &self,
         start: &Start,
@@ -1337,6 +1369,8 @@ fn early_boot_command_line(
     let line = boot_command_line(start, Some(&nonce), workspace_bytes, fixed_paths)?;
     if start.kind == job::VmKind::Fill {
         checked_boot_command_line(format!("{line} motor.fill=1"))
+    } else if start.kind == job::VmKind::Job {
+        checked_boot_command_line(format!("{line} motor.cache_write=1"))
     } else {
         Ok(line)
     }
@@ -1382,6 +1416,31 @@ fn authorize_fill_boot(requests: &mut [(&str, Value)], role: job::WorkspaceRole)
             .as_str()
             .ok_or_else(|| Error("missing boot arguments".into()))?;
         boot["boot_args"] = checked_boot_command_line(format!("{args} motor.fill=1"))?.into();
+    }
+    Ok(())
+}
+
+fn authorize_job_write_boot(
+    requests: &mut [(&str, Value)],
+    start: &Start,
+    nonce: Option<&str>,
+    job_write: bool,
+) -> Result<()> {
+    if job_write {
+        if start.kind != job::VmKind::Job || start.cache_write_blocked || nonce.is_none() {
+            return Err(Error(
+                "job cache write boot lacks staged credentials".into(),
+            ));
+        }
+        let (_, boot) = requests
+            .iter_mut()
+            .find(|(path, _)| *path == "/boot-source")
+            .ok_or_else(|| Error("missing boot source".into()))?;
+        let args = boot["boot_args"]
+            .as_str()
+            .ok_or_else(|| Error("missing boot arguments".into()))?;
+        boot["boot_args"] =
+            checked_boot_command_line(format!("{args} motor.cache_write=1"))?.into();
     }
     Ok(())
 }

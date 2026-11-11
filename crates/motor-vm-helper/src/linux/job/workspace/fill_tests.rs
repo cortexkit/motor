@@ -51,6 +51,7 @@ fn isolated_fill_provisioning_owns_provenance_and_cannot_relabel_job_disks() {
     assert!(jobs
         .handle(
             Operation::EnsureWorkspace {
+                cache_write_job_id: None,
                 account: fill.account.clone(),
                 disk_id: fill.disk_id(),
                 size_bytes: 4096
@@ -61,6 +62,7 @@ fn isolated_fill_provisioning_owns_provenance_and_cannot_relabel_job_disks() {
     assert!(jobs
         .handle(
             Operation::Start(Start {
+                cache_write_blocked: false,
                 kind: job::VmKind::Job,
                 job_id: job::test_id(701),
                 account: fill.account.clone(),
@@ -143,6 +145,7 @@ fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_ba
     exited(&mut jobs, &fill, Some(true), Some(0));
     assert!(jobs.finish_fill(&fill, true).unwrap());
     let request = job::Seed {
+        cache_write_job_id: None,
         account: fill.account.clone(),
         repository_key: fill.repository_key.clone(),
         base_id: fill.disk_id(),
@@ -158,8 +161,36 @@ fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_ba
     let peer = Peer { uid: 0, gid: 0 };
     jobs.handle(Operation::SeedWorkspace(request.clone()), peer)
         .unwrap();
-    jobs.handle(Operation::SeedWorkspace(request), peer)
+    jobs.handle(Operation::SeedWorkspace(request.clone()), peer)
         .unwrap();
+    let id = job::test_id(704);
+    crate::cache_write::tests::with_fresh_token(&id, &fill.account, |config, token| {
+        jobs.cache_write_grants = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::cache_write::Grants::new(config),
+        ));
+        jobs.cache_write_grants
+            .lock()
+            .unwrap()
+            .admit(token)
+            .unwrap();
+        let mut bound = request.clone();
+        bound.cache_write_job_id = Some(id);
+        jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)
+            .unwrap();
+        assert!(open_disk(&jobs.workspaces, &fill.account, "new-job")
+            .unwrap()
+            .0
+            .workspace_key_hash
+            .is_none());
+        bound.disk_id = "new-bound-job".into();
+        jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)
+            .unwrap();
+        assert!(open_disk(&jobs.workspaces, &fill.account, &bound.disk_id)
+            .unwrap()
+            .0
+            .workspace_key_hash
+            .is_some());
+    });
     let (registry, clone) = open_disk(&jobs.workspaces, &fill.account, "new-job").unwrap();
     let original = File::open(&source).unwrap();
     assert_eq!(registry.role, job::WorkspaceRole::Job);
@@ -177,6 +208,7 @@ fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_ba
     let denied = jobs
         .handle(
             Operation::Start(Start {
+                cache_write_blocked: false,
                 kind: job::VmKind::BaseBuild,
                 job_id: job::test_id(702),
                 account: fill.account.clone(),

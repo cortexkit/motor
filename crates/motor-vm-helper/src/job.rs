@@ -35,6 +35,9 @@ pub struct Start {
     /// Guest RAM, already sized by the host for the job limit and boot overhead.
     pub memory_mib: u64,
     pub burst_mib: Option<u64>,
+    /// Deny-only emergency control; it never substitutes for a verified grant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_write_blocked: bool,
 }
 
 impl Start {
@@ -139,6 +142,8 @@ pub struct Workspace {
     pub workspace_disk_id: String,
     #[serde(default)]
     pub role: WorkspaceRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_key_hash: Option<String>,
 }
 
 /// Helper-owned provenance, stored separately from the guest-written image.
@@ -170,6 +175,8 @@ pub struct Seed {
     pub repository_key: String,
     pub base_id: String,
     pub disk_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_job_id: Option<String>,
 }
 
 /// Internal sparse-disk request. The provisioning operation chooses the role;
@@ -178,6 +185,7 @@ pub struct CreateWorkspace {
     pub account: String,
     pub workspace_disk_id: String,
     pub size_bytes: u64,
+    pub cache_write_job_id: Option<String>,
 }
 
 /// Fixed by root when provisioning the disk, never by a start request.
@@ -242,6 +250,7 @@ pub enum Operation {
         account: String,
         disk_id: String,
         size_bytes: u64,
+        cache_write_job_id: Option<String>,
     },
     Start(Start),
     Adopt(String),
@@ -330,6 +339,7 @@ mod tests {
                     disk_id: "ws-1".into(),
                 },
                 super::Operation::EnsureWorkspace {
+                    cache_write_job_id: None,
                     account: account.into(),
                     disk_id: "ws-1".into(),
                     size_bytes: 4096,
@@ -367,6 +377,7 @@ mod tests {
     fn start_uuidv7_freshness_edges_and_non_v7_refusal() {
         let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
         let mut start = Start {
+            cache_write_blocked: false,
             kind: VmKind::Job,
             job_id: test_id(1),
             account: "account-1".into(),

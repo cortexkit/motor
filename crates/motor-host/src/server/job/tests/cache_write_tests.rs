@@ -1,4 +1,39 @@
 use super::*;
+
+#[tokio::test]
+async fn boot_forwards_only_eligible_grant_selector_and_the_persisted_deny() {
+    for (claim_value, blocked) in [
+        (None, false),
+        (Some(false), false),
+        (Some(true), false),
+        (Some(true), true),
+    ] {
+        let (runtime, fake, _storage) = fixture();
+        hold_boot(&runtime, &fake, "unused");
+        let mut c = claims(JOB);
+        c.cache_write = claim_value;
+        let id = claim(&runtime, &c);
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .set_remote_cache_write_block(blocked)
+            .unwrap();
+        let (mut client, task) = start(runtime.clone(), c, id).await;
+        queued(&mut client, JOB).await;
+        next_type(&mut client, "output").await;
+        let expected = (claim_value == Some(true) && !blocked).then(|| JOB.to_owned());
+        assert_eq!(*fake.workspace_grant_selectors.lock().unwrap(), [expected]);
+        let starts = fake.job_starts.lock().unwrap().clone();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].job_id, JOB);
+        assert_eq!(starts[0].kind, motor_vm_helper::job::VmKind::Job);
+        assert_eq!(starts[0].cache_write_blocked, blocked);
+        drop(client);
+        task.await.unwrap().unwrap();
+        runtime.stop_job(JOB, true, false).unwrap();
+    }
+}
 use ed25519_dalek::{Signer, SigningKey};
 use motor_lease::{Jwks, JwksKey, RequesterJwk};
 
