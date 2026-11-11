@@ -272,6 +272,11 @@ subtree hash (`cache/xwin`, retaining `xwin/` in relative names). Generated
 Only the generated `xwin/DONE` marker is normalized: its LF-separated lines are
 sorted before hashing because cargo-xwin writes an unordered payload set. Line
 content and multiplicity still matter; every other file and symlink is exact.
+Microsoft republishes its live channel manifest, so `install-cross.sh` reuses a
+cache that is already built when both its tree hash and the stored manifest it
+was built from (`provenance/manifest.vsman`) match the pins; it fetches the live
+channel only to build a missing or mismatched cache, and still refuses a
+changed manifest then.
 The cross tool/cache install stays under the source checkout's
 `target/windows-cross`, with no host-global installation. xwin downloads Microsoft's MSVC CRT
 and Windows SDK headers/import libraries under Microsoft's Build Tools/SDK

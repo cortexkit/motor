@@ -22,6 +22,13 @@ export RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_NET_OFFLINE=false
 cargo install --locked --version "=${pins[0]}" --root "$tools" cargo-xwin
 export PATH="$tools/bin:$PATH"
 cargo xwin --version
+# Microsoft republishes its live channel manifest, so a pinned cache that is
+# already built must not depend on it. When the cache's tree hash and the stored
+# manifest it was built from both match the pins, reuse the cache as it is.
+if python3 script/windows-runner/cache-manifest.py "$XWIN_CACHE_DIR" .cortexkit/internal-docs/investigations/ally-windows-sdk-sha256.json script/runner/toolchain.json 2>/dev/null; then
+  echo 'SDK cache and its stored Microsoft manifest match the pins; the live channel is not fetched'
+  exit 0
+fi
 python3 script/windows-runner/fetch-manifest.py target/windows-cross/provenance
 cargo xwin cache xwin
 python3 script/windows-runner/cache-manifest.py "$XWIN_CACHE_DIR" .cortexkit/internal-docs/investigations/ally-windows-sdk-sha256.json script/runner/toolchain.json
