@@ -6,7 +6,11 @@ use std::path::Path;
 
 /// Read only bounded, no-follow output files. Missing or incomplete statistics
 /// (for example after a killed shell) must not change the job's outcome.
-pub(crate) fn read(state: &Path, id: Uuid) -> Option<RemoteCacheTotals> {
+pub(crate) fn read(
+    state: &Path,
+    id: Uuid,
+    puts: super::gateway::JobPutTotals,
+) -> Option<RemoteCacheTotals> {
     let sccache = crate::writer::fill::statistics(state, id)
         .ok()
         .and_then(|value| sccache(&value));
@@ -18,17 +22,24 @@ pub(crate) fn read(state: &Path, id: Uuid) -> Option<RemoteCacheTotals> {
                 misses: *stats.get("remote_storage_miss")?,
                 errors: stats[super::ccache::REMOTE_ERROR]
                     .saturating_add(stats[super::ccache::REMOTE_TIMEOUT]),
+                ..Default::default()
             })
         });
-    let totals = match (sccache, ccache) {
+    let mut totals = match (sccache, ccache) {
         (Some(a), Some(b)) => RemoteCacheTotals {
             hits: a.hits.saturating_add(b.hits),
             misses: a.misses.saturating_add(b.misses),
             errors: a.errors.saturating_add(b.errors),
+            ..Default::default()
         },
-        (a, b) => a.or(b)?,
+        (a, b) => a.or(b).unwrap_or_default(),
     };
-    (totals.hits != 0 || totals.misses != 0 || totals.errors != 0).then_some(totals)
+    totals.puts_accepted = puts.accepted;
+    totals.puts_duplicate = puts.duplicate;
+    totals.puts_failed = puts.failed;
+    totals.puts_refused = puts.refused;
+    totals.put_bytes_accepted = puts.accepted_bytes;
+    (totals != RemoteCacheTotals::default()).then_some(totals)
 }
 
 fn sccache(value: &Value) -> Option<RemoteCacheTotals> {
@@ -37,6 +48,7 @@ fn sccache(value: &Value) -> Option<RemoteCacheTotals> {
         hits: count(stats.get("cache_hits")?)?,
         misses: count(stats.get("cache_misses")?)?,
         errors: count(stats.get("cache_errors")?)?,
+        ..Default::default()
     })
 }
 
@@ -57,6 +69,78 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn put_only_totals_survive_missing_or_zero_compiler_statistics() {
+        use super::super::gateway::JobPutTotals;
+        let state = cortexkit_test_support::ScratchDir::new("put-totals");
+        let id = Uuid::now_v7();
+        let output = state.join("sandboxes").join(id.to_string()).join("output");
+        std::fs::create_dir_all(&output).unwrap();
+        for stats in [
+            None,
+            Some("invalid"),
+            Some(r#"{"cache_hits":0,"cache_misses":0,"cache_errors":0}"#),
+        ] {
+            if let Some(stats) = stats {
+                std::fs::write(output.join("cache-stats"), stats).unwrap();
+            }
+            for (puts, expected) in [
+                (
+                    JobPutTotals {
+                        accepted: 1,
+                        ..Default::default()
+                    },
+                    RemoteCacheTotals {
+                        puts_accepted: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    JobPutTotals {
+                        duplicate: 2,
+                        ..Default::default()
+                    },
+                    RemoteCacheTotals {
+                        puts_duplicate: 2,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    JobPutTotals {
+                        failed: 3,
+                        ..Default::default()
+                    },
+                    RemoteCacheTotals {
+                        puts_failed: 3,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    JobPutTotals {
+                        refused: 4,
+                        ..Default::default()
+                    },
+                    RemoteCacheTotals {
+                        puts_refused: 4,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    JobPutTotals {
+                        accepted_bytes: 5,
+                        ..Default::default()
+                    },
+                    RemoteCacheTotals {
+                        put_bytes_accepted: 5,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                assert_eq!(read(&state, id, puts), Some(expected));
+            }
+        }
+    }
+
+    #[test]
     fn sccache_counts_languages_once_and_accepts_numeric_counters() {
         assert_eq!(
             sccache(&json!({"stats": {
@@ -67,7 +151,8 @@ mod tests {
             Some(RemoteCacheTotals {
                 hits: 9,
                 misses: 3,
-                errors: 1
+                errors: 1,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -75,7 +160,8 @@ mod tests {
             Some(RemoteCacheTotals {
                 hits: 4,
                 misses: 2,
-                errors: 0
+                errors: 0,
+                ..Default::default()
             })
         );
     }
@@ -103,7 +189,7 @@ mod tests {
         let id = Uuid::now_v7();
         let output = state.join("sandboxes").join(id.to_string()).join("output");
         fs::create_dir_all(&output).unwrap();
-        assert_eq!(read(&state, id), None);
+        assert_eq!(read(&state, id, Default::default()), None);
         let sccache = output.join("cache-stats");
         fs::write(
             &sccache,
@@ -111,51 +197,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read(&state, id),
+            read(&state, id, Default::default()),
             Some(RemoteCacheTotals {
                 hits: 7,
                 misses: 3,
-                errors: 1
+                errors: 1,
+                ..Default::default()
             })
         );
-        assert_eq!(read(&state, Uuid::now_v7()), None);
+        assert_eq!(read(&state, Uuid::now_v7(), Default::default()), None);
         let ccache = output.join("ccache-stats");
         fs::write(&ccache, "remote_storage_hit\t2\nremote_storage_miss\t4\nremote_storage_error\t1\nremote_storage_timeout\t2\n").unwrap();
         assert_eq!(
-            read(&state, id),
+            read(&state, id, Default::default()),
             Some(RemoteCacheTotals {
                 hits: 9,
                 misses: 7,
-                errors: 4
+                errors: 4,
+                ..Default::default()
             })
         );
         fs::write(&sccache, b"not JSON").unwrap();
         assert_eq!(
-            read(&state, id),
+            read(&state, id, Default::default()),
             Some(RemoteCacheTotals {
                 hits: 2,
                 misses: 4,
-                errors: 3
+                errors: 3,
+                ..Default::default()
             })
         );
         fs::write(&ccache, "remote_storage_hit\t2\n").unwrap();
-        assert_eq!(read(&state, id), None);
+        assert_eq!(read(&state, id, Default::default()), None);
         let valid = br#"{"cache_hits":7,"cache_misses":3,"cache_errors":1}"#;
         let mut oversized = valid.to_vec();
         oversized.resize(64 * 1024 + 1, b' ');
         fs::write(&sccache, oversized).unwrap();
-        assert_eq!(read(&state, id), None);
+        assert_eq!(read(&state, id, Default::default()), None);
         fs::remove_file(&sccache).unwrap();
         fs::write(&ccache, valid).unwrap();
         std::os::unix::fs::symlink(&ccache, &sccache).unwrap();
-        assert_eq!(read(&state, id), None);
+        assert_eq!(read(&state, id, Default::default()), None);
         fs::remove_file(&sccache).unwrap();
         fs::write(
             &sccache,
             r#"{"cache_hits":0,"cache_misses":0,"cache_errors":0}"#,
         )
         .unwrap();
-        assert_eq!(read(&state, id), None);
+        assert_eq!(read(&state, id, Default::default()), None);
         fs::remove_dir_all(state).unwrap();
     }
 }

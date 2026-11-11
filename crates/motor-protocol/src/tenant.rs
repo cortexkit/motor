@@ -237,6 +237,16 @@ pub struct RemoteCacheTotals {
     pub hits: u64,
     pub misses: u64,
     pub errors: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub puts_accepted: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub puts_duplicate: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub puts_failed: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub puts_refused: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub put_bytes_accepted: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -24,6 +24,25 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
+    pub(crate) fn finish_job(&self, job: &str) -> super::gateway::JobPutTotals {
+        let gateway = self.gateway.clone();
+        let id = job.to_string();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        self.handle.spawn(async move {
+            let _ = send.send(gateway.finish_job(&id).await);
+        });
+        match receive.recv_timeout(std::time::Duration::from_secs(4)) {
+            Ok(totals) => totals,
+            Err(_) => {
+                tracing::warn!(
+                    job_id = job,
+                    "remote cache executor did not stop job sockets; late PUTs may be uncounted"
+                );
+                self.gateway.take_job_put_totals(job)
+            }
+        }
+    }
+
     pub(crate) fn start(config: &crate::Config) -> Result<Arc<Self>, String> {
         let layout = Layout::for_config(config);
         layout

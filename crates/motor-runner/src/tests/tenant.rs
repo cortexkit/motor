@@ -243,6 +243,7 @@ fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
             hits: 7,
             misses: 3,
             errors: 1,
+            ..Default::default()
         });
         job.execution_ended_ms = Some(now + 100);
         job.terminal_ended(Outcome::Exit { code: 0 }, now + 100);
@@ -266,6 +267,7 @@ fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
                 hits: 7,
                 misses: 3,
                 errors: 1,
+                ..Default::default()
             })
         );
         assert!(!disk.memory_accounting_pending);

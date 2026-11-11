@@ -373,6 +373,11 @@ fn guest_cache_totals_are_logged_as_integers_and_never_sent_to_broker() {
             hits: 7,
             misses: 3,
             errors: u64::MAX,
+            puts_accepted: 5,
+            puts_duplicate: 4,
+            puts_failed: 3,
+            puts_refused: 2,
+            put_bytes_accepted: u64::MAX,
         }),
     ] {
         buffer.0.lock().unwrap().clear();
@@ -398,6 +403,11 @@ fn guest_cache_totals_are_logged_as_integers_and_never_sent_to_broker() {
                 "hits=7".into(),
                 "misses=3".into(),
                 format!("errors={}", u64::MAX),
+                "puts_accepted=5".into(),
+                "puts_duplicate=4".into(),
+                "puts_failed=3".into(),
+                "puts_refused=2".into(),
+                format!("put_bytes_accepted={}", u64::MAX),
             ] {
                 assert!(line.contains(&field), "{line}");
             }

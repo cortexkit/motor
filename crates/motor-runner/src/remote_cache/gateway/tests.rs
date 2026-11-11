@@ -21,6 +21,8 @@ const MIB: usize = 1 << 20;
 
 #[path = "job_create_tests.rs"]
 mod job_create;
+#[path = "job_end_tests.rs"]
+mod job_end;
 #[path = "store_answers_tests.rs"]
 mod store_answers;
 #[path = "write_block_tests.rs"]
