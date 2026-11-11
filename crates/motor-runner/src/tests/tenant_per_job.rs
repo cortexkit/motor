@@ -1,11 +1,15 @@
 use super::*;
 
 fn job_runner(f: &Fixture) -> Runner {
+    Runner::open(job_config(f)).unwrap()
+}
+
+fn job_config(f: &Fixture) -> Config {
     let mut config = f.config();
     config.manual_tick = true;
     config.tenant_vm = true;
     config.per_job = true;
-    Runner::open(config).unwrap()
+    config
 }
 
 #[test]
@@ -212,7 +216,17 @@ async fn early_terminal_stored_ack_cannot_power_off_a_job_vm() {
 async fn mirror_drain_skips_legacy_hosts_and_bounds_an_opted_in_host_without_acks() {
     for opted_in in [false, true] {
         let f = Fixture::new();
-        let runner = job_runner(&f);
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let mut config = job_config(&f);
+        config.long_work = Some({
+            let finished = finished.clone();
+            Arc::new(move |label| {
+                if label == "job_finish_complete" {
+                    finished.notify_one();
+                }
+            })
+        });
+        let runner = Runner::open(config).unwrap();
         let (request, bytes) = f.run("true");
         runner
             .tenant_events()
@@ -226,6 +240,12 @@ async fn mirror_drain_skips_legacy_hosts_and_bounds_an_opted_in_host_without_ack
             Outcome::Exit { code: 0 }
         );
         assert!(runner.terminal_stored(request.job_id));
+        // A terminal is published before the finisher's last state-lock holds.
+        // Readiness conservatively returns false on contention, so wait for
+        // finalization rather than race it while checking the exact deadline.
+        tokio::time::timeout(Duration::from_secs(15), finished.notified())
+            .await
+            .expect("post-terminal finalization did not finish");
         assert_eq!(runner.job_poweroff_ready(), !opted_in);
         if opted_in {
             f.clock.fetch_add(9_999, Ordering::SeqCst);
