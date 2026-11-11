@@ -18,7 +18,15 @@ pub(crate) const INHERITED_PREFIXES: [&str; 3] = ["SCCACHE_", "AWS_", "CCACHE_"]
 pub(crate) const READ_ONLY_MODE: &str = "READ_ONLY";
 pub(crate) const READ_WRITE_MODE: &str = "READ_WRITE";
 
-/// The switch-on job environment of one host type, as that role's switch-off
+/// Settings for an admitted unit's cache sockets, not permission to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    JobRead,
+    JobWrite,
+    Fill,
+}
+
+/// The switch-on environment of one host type, as that role's switch-off
 /// environment plus exactly this delta. `forwarders` are the unit's cache
 /// forwarders, one per active tool.
 pub(crate) fn delta(
@@ -27,10 +35,33 @@ pub(crate) fn delta(
     bucket: &str,
     region: &str,
 ) -> BTreeMap<String, String> {
+    delta_for_mode(role, Mode::JobRead, forwarders, bucket, region)
+}
+
+/// Selects write settings for tenant jobs in job-write mode and for fills.
+/// Build-server and Boat jobs keep the read-only delta even if job-write is requested.
+pub(crate) fn delta_for_mode(
+    role: HostRole,
+    mode: Mode,
+    forwarders: &[Forwarder],
+    bucket: &str,
+    region: &str,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     // Each tool's forwarder exposes that tool's own socket as a URL.
     if let Some(forwarder) = forwarders.iter().find(|f| f.tool() == Tool::Sccache) {
         env.extend(small_values(role));
+        match mode {
+            Mode::JobWrite if role == HostRole::TenantVm => {
+                env.insert("SCCACHE_S3_RW_MODE".into(), READ_WRITE_MODE.into());
+            }
+            Mode::Fill => {
+                env.extend(fill_values());
+                env.insert("SCCACHE_RECACHE".into(), "1".into());
+                env.insert("SCCACHE_S3_RW_MODE".into(), READ_WRITE_MODE.into());
+            }
+            Mode::JobRead | Mode::JobWrite => {}
+        }
         env.insert("SCCACHE_BUCKET".into(), bucket.into());
         env.insert("SCCACHE_REGION".into(), region.into());
         env.insert("SCCACHE_ENDPOINT".into(), forwarder.url());

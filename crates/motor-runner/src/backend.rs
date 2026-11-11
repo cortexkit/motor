@@ -1817,7 +1817,11 @@ fn remote_cache_environment(
         crate::remote_cache::provisioning::HostRole::of(config),
         forwarders,
         generation,
-        setup.base,
+        if setup.base {
+            crate::remote_cache::environment::Mode::Fill
+        } else {
+            crate::remote_cache::environment::Mode::JobRead
+        },
         if setup.base {
             paths::run(&setup.request).caller_cwd.text()
         } else {
@@ -1836,35 +1840,26 @@ pub(crate) fn remote_cache_job_environment(
     role: crate::remote_cache::provisioning::HostRole,
     forwarders: &[crate::remote_cache::transport::Forwarder],
     generation: &crate::remote_cache::provisioning::ActiveGeneration,
-    fill: bool,
+    mode: crate::remote_cache::environment::Mode,
     workspace: &str,
     env: &mut BTreeMap<String, String>,
 ) {
-    let mut delta = crate::remote_cache::environment::delta(
+    let mut delta = crate::remote_cache::environment::delta_for_mode(
         role,
+        mode,
         forwarders,
         &generation.bucket,
         &generation.region,
     );
-    if fill
-        && forwarders
-            .iter()
-            .any(|f| f.tool() == crate::remote_cache::gateway::Tool::Sccache)
-    {
-        delta.extend(crate::remote_cache::environment::fill_values());
-        delta.insert("SCCACHE_RECACHE".into(), "1".into());
-        delta.insert(
-            "SCCACHE_S3_RW_MODE".into(),
-            crate::remote_cache::environment::READ_WRITE_MODE.into(),
-        );
-    }
     if let Some(forwarder) = forwarders
         .iter()
         .find(|f| f.tool() == crate::remote_cache::gateway::Tool::Ccache)
         .filter(|_| crate::remote_cache::ccache::installed(role))
     {
         delta.extend(crate::remote_cache::ccache::environment(
-            forwarder, fill, workspace,
+            forwarder,
+            mode == crate::remote_cache::environment::Mode::Fill,
+            workspace,
         ));
     }
     env.extend(delta);

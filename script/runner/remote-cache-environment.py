@@ -7,9 +7,9 @@ these names and values, so both read them from here. The parity check expands
 there, chosen by the runner's forwarder configuration.
 
 Only values that do not depend on the cache tenant's provisioning files live
-here. The store bucket, region, endpoint and credentials are written into unit
-environments by the runner from the active provisioning generation, and are
-never pinned in this repository.
+here. The runner supplies the store bucket and region from the active
+generation and the gateway endpoint from the unit's forwarder. Credentials
+in a unit's environment are fixed dummy values; signing keys stay in the runner.
 """
 
 # Names the runner removes from a job environment before it adds anything: on
@@ -19,7 +19,7 @@ never pinned in this repository.
 # side additionally clears these for its own unit environment.
 INHERITED_PREFIXES = ('SCCACHE_', 'AWS_')
 
-# Values the fill units use and jobs never see.
+# S3 access modes used by jobs and fills.
 READ_WRITE_MODE = 'READ_WRITE'
 READ_ONLY_MODE = 'READ_ONLY'
 # Under this policy every put waits for every read-write level and fails if
@@ -41,7 +41,7 @@ _S3_COMMON = {
     'AWS_EC2_METADATA_DISABLED': 'true',
 }
 
-# The bucket, region and signing endpoint of a job's read socket. The bucket
+# The bucket, region and signing endpoint of a job's gateway socket. The bucket
 # and region come from the active provisioning generation in a real unit.
 S3_FRONT_END = {
     'SCCACHE_BUCKET': '<remote-cache-bucket>',
@@ -104,6 +104,18 @@ def expand(value, ports=None):
     return out
 
 
-def environment(role, ports=None):
-    """One role's switch-on job environment delta, fully expanded."""
-    return {name: expand(value, ports) for name, value in JOB_ENVIRONMENT_BY_ROLE[role].items()}
+def environment(role, ports=None, mode='job-read'):
+    """One role's switch-on environment delta for a job or fill, fully expanded."""
+    values = dict(JOB_ENVIRONMENT_BY_ROLE[role])
+    if mode == 'job-write':
+        if role == 'tenant':
+            values['SCCACHE_S3_RW_MODE'] = READ_WRITE_MODE
+    elif mode == 'fill':
+        values.update({
+            'SCCACHE_S3_RW_MODE': READ_WRITE_MODE,
+            'SCCACHE_RECACHE': '1',
+            'SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY': WRITE_ERROR_POLICY,
+        })
+    elif mode != 'job-read':
+        raise ValueError(f'unknown remote cache environment mode: {mode}')
+    return {name: expand(value, ports) for name, value in values.items()}
