@@ -1332,11 +1332,19 @@ async fn queued_upload_over_cap_pauses_within_the_spool_and_disconnect_deletes_i
     let chunk = json!({"type":"bundle_chunk","index":0,"offset":0,"data":"a".repeat(700_000)});
     // 100 chunks (70 MB) exceed the 64 MiB spool. The host stops reading, so
     // the writes stall rather than fail. How fast the spool fills depends on
-    // the machine, so wait for it to fill rather than for a fixed time.
+    // the machine, so wait until it is near its cap and has stopped growing,
+    // rather than for a fixed time.
     let full = SPOOL_LIMIT - 2 * FRAME_LIMIT as u64;
-    let spool_filled = async {
-        while std::fs::metadata(storage.spool(JOB)).map_or(0, |m| m.len()) <= full {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    let spool_len = || std::fs::metadata(storage.spool(JOB)).map_or(0, |m| m.len());
+    let stalled = async {
+        let mut last = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = spool_len();
+            if now > full && now == last {
+                break now;
+            }
+            last = now;
         }
     };
     let writes = async {
@@ -1344,18 +1352,18 @@ async fn queued_upload_over_cap_pauses_within_the_spool_and_disconnect_deletes_i
             write_frame(&mut client, &chunk).await.unwrap();
         }
     };
-    tokio::select! {
+    let spooled = tokio::select! {
         _ = writes => panic!("an over-cap upload must pause"),
-        filled = tokio::time::timeout(Duration::from_secs(60), spool_filled) => {
-            filled.expect("the spool never filled to its cap");
+        spooled = tokio::time::timeout(Duration::from_secs(60), stalled) => {
+            spooled.expect("the spool never filled and stopped at its cap")
         }
-    }
-    // Once the spool is full the host reads nothing more, so a further write stays blocked.
-    let more = tokio::time::timeout(Duration::from_secs(1), write_frame(&mut client, &chunk)).await;
-    assert!(more.is_err(), "a full spool must keep the upload paused");
-    let spooled = std::fs::metadata(storage.spool(JOB)).unwrap().len();
-    assert!(spooled > full, "{spooled}");
+    };
     assert!(spooled <= SPOOL_LIMIT, "{spooled}");
+    assert_eq!(
+        spool_len(),
+        spooled,
+        "the spool grew after the upload paused"
+    );
     // The paused session stays alive and keeps the caller informed.
     next_type(&mut client, "heartbeat").await;
     assert!(!task.is_finished());
