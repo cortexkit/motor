@@ -166,7 +166,7 @@ impl Prepared {
                 c.iat = now() - 600;
                 c.exp = now() - 300;
             }
-            "expired-queued" => c.exp = now() + 2,
+            "expired-queued" => c.exp = now() + 30,
             _ => {}
         }
         let seed = if matches!(case, "forged" | "host-only-keys") {
@@ -197,7 +197,12 @@ impl Prepared {
         assert_eq!(admitted.is_ok(), valid, "{case}: {admitted:?}");
         create(Some(c.jti.clone()));
         if case == "expired-queued" {
+            let deadline = Instant::now() + Duration::from_secs(35);
             while now() <= c.exp {
+                assert!(
+                    Instant::now() < deadline,
+                    "test clock did not reach token expiry"
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
@@ -260,7 +265,7 @@ s = socket.socket(socket.AF_UNIX)
 s.settimeout(10)
 s.connect('/motor-gateway/sccache.sock')
 s.sendall(b'PUT /compile/probe HTTP/1.1\r\nHost: cache\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx')
-head = s.recv(4096).split(b'\r\n', 1)[0]
+head = s.makefile('rb').readline(4097)
 assert head.split()[1] == b'{status}', head
 s.close()
 assert set(os.listdir('/motor-gateway')) <= {{'sccache.sock', 'ccache.sock'}}
@@ -269,7 +274,7 @@ if os.path.exists('/motor-gateway/ccache.sock'):
     c.settimeout(10)
     c.connect('/motor-gateway/ccache.sock')
     c.sendall(b'PUT /probe HTTP/1.1\r\nHost: cache\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx')
-    assert c.recv(4096).split()[1] == b'403'
+    assert c.makefile('rb').readline(4097).split()[1] == b'403'
     c.close()
 assert not os.access('/run/motor/cache/write-key', os.R_OK)
 print('PASS job cache: {case} {mode} PUT {status}')
