@@ -26,22 +26,22 @@ impl Runtime {
         };
         // Even an ended job may still be awaiting teardown. Deletion must wait
         // for the helper to prove every possible disk holder has stopped.
-        for (job, execution) in executions {
+        for (job, execution) in &executions {
             if execution.boot_started {
-                self.control.stop_job(&job)?;
+                self.control.stop_job(job)?;
             }
         }
-        for (id, disk) in disks {
+        for (id, disk) in &disks {
             if disk.deleted {
                 continue;
             }
             if let Some(recovery) = &disk.recovery {
                 self.control.stop_job(&recovery.id)?;
             }
-            self.control.delete_workspace(&disk.sub, &id)?;
+            self.control.delete_workspace(&disk.sub, id)?;
             let mut host = self.host.lock().expect("host lock");
             let mut next = host.snapshot.clone();
-            let disk = next.per_job.disks.get_mut(&id).expect("rollback disk");
+            let disk = next.per_job.disks.get_mut(id).expect("rollback disk");
             disk.deleted = true;
             disk.have.clear();
             disk.queue.clear();

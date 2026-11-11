@@ -123,10 +123,19 @@ pub struct Metrics {
 /// No live end and no live start means the guest ran wholly outside observation.
 /// Guest-supplied clocks and durations are deliberately not inputs to settlement.
 pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
-    for (job, lease) in &next.leases {
-        if lease.state != LeaseState::Ended {
-            continue;
-        }
+    // A billing record with usage is final. Pick the rest by reading, so
+    // finished jobs' records are not copied out of the snapshot's tables.
+    let jobs: Vec<String> = next
+        .leases
+        .iter()
+        .filter(|(job, lease)| {
+            lease.state == LeaseState::Ended
+                && next.billing.get(job).is_none_or(|b| b.usage.is_none())
+        })
+        .map(|(job, _)| job.clone())
+        .collect();
+    for job in &jobs {
+        let lease = &next.leases[job];
         let b = next.billing.entry(job.clone()).or_default();
         if b.usage.is_some() {
             continue;
@@ -235,20 +244,32 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
     }
 }
 
-pub(crate) fn mark_overlap(next: &mut Snapshot) {
-    for (job, lease) in &next.leases {
-        if lease.state == LeaseState::Started
-            && next.leases.iter().any(|(other, l)| {
-                other != job
-                    && l.tenant == lease.tenant
-                    && matches!(
-                        l.state,
-                        LeaseState::Reserved | LeaseState::Admitted | LeaseState::Started
-                    )
-            })
-        {
-            next.billing.entry(job.clone()).or_default().overlapping = true;
-        }
+/// Marks every started lease that shares its tenant with another reserved,
+/// admitted or started lease. Only unended leases can be either, so this
+/// reads the `unended` jobs alone, never the finished history.
+pub(crate) fn mark_overlap(next: &mut Snapshot, unended: &std::collections::BTreeSet<String>) {
+    let active: Vec<(&String, &crate::state::Lease)> = unended
+        .iter()
+        .filter_map(|job| Some((job, next.leases.get(job)?)))
+        .collect();
+    let overlapping: Vec<String> = active
+        .iter()
+        .filter(|(job, lease)| {
+            lease.state == LeaseState::Started
+                && active.iter().any(|(other, l)| {
+                    other != job
+                        && l.tenant == lease.tenant
+                        && matches!(
+                            l.state,
+                            LeaseState::Reserved | LeaseState::Admitted | LeaseState::Started
+                        )
+                })
+                && next.billing.get(job).is_none_or(|b| !b.overlapping)
+        })
+        .map(|(job, _)| (*job).clone())
+        .collect();
+    for job in overlapping {
+        next.billing.entry(job).or_default().overlapping = true;
     }
 }
 
@@ -358,7 +379,18 @@ impl Host {
         let mut next = self.snapshot.clone();
         let mut lost = Vec::new();
         let mut new_checks = Vec::new();
-        for (job, lease) in &mut next.leases {
+        // Only a started lease changes here. Any other lease at most gains
+        // an empty billing record, so finished jobs are read, not copied.
+        let jobs: Vec<String> = next
+            .leases
+            .iter()
+            .filter(|(job, lease)| {
+                lease.state == LeaseState::Started || !next.billing.contains_key(job)
+            })
+            .map(|(job, _)| job.clone())
+            .collect();
+        for job in &jobs {
+            let lease = next.leases.get_mut(job).expect("listed lease");
             let b = next.billing.entry(job.clone()).or_default();
             if lease.state == LeaseState::Started {
                 let cap = lease
@@ -441,7 +473,8 @@ impl Host {
         }
         finalize_ready(&mut next, now_ms);
         enqueue_usage(&mut next, now_ms);
-        if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
+        // Comparing a copy with its original reads only the changed records.
+        if next != self.snapshot {
             if let Err(error) = self.save(next) {
                 for job in new_checks {
                     self.lost_checks.remove(&job);
@@ -510,13 +543,18 @@ impl Host {
     }
     pub fn lose_tenant(&mut self, tenant: &str, now_ms: u64) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
-        for (job, lease) in &mut next.leases {
-            if lease.tenant == tenant && lease.state != LeaseState::Ended {
-                let billing = next.billing.entry(job.clone()).or_default();
-                settle_lost(lease, billing, now_ms, now_ms);
-                // The VM is already gone, so this loss cannot require another stop.
-                billing.restart_pending = Some(false);
-            }
+        let jobs: Vec<String> = next
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.tenant == tenant && lease.state != LeaseState::Ended)
+            .map(|(job, _)| job.clone())
+            .collect();
+        for job in &jobs {
+            let lease = next.leases.get_mut(job).expect("listed lease");
+            let billing = next.billing.entry(job.clone()).or_default();
+            settle_lost(lease, billing, now_ms, now_ms);
+            // The VM is already gone, so this loss cannot require another stop.
+            billing.restart_pending = Some(false);
         }
         finalize_ready(&mut next, now_ms);
         self.save(next)?;
@@ -554,15 +592,23 @@ impl Host {
         vm.stop_pending = false;
         vm.initialized_generation = None;
         next.pending_cancels.retain(|_, t| t != tenant);
-        for (job, billing) in &mut next.billing {
-            if billing.host_settled
-                && next
-                    .leases
-                    .get(job)
-                    .is_some_and(|lease| lease.tenant == tenant)
-            {
-                billing.restart_pending = Some(false);
-            }
+        let settled: Vec<String> = next
+            .billing
+            .iter()
+            .filter(|(job, billing)| {
+                billing.host_settled
+                    && next
+                        .leases
+                        .get(job)
+                        .is_some_and(|lease| lease.tenant == tenant)
+            })
+            .map(|(job, _)| job.clone())
+            .collect();
+        for job in &settled {
+            next.billing
+                .get_mut(job)
+                .expect("listed billing")
+                .restart_pending = Some(false);
         }
         self.save(next)?;
         self.stopping.remove(tenant);
@@ -694,7 +740,7 @@ impl Host {
                         && self
                             .snapshot
                             .leases
-                            .get(*job)
+                            .get(job)
                             .is_none_or(|lease| lease.state == LeaseState::Ended)
                 })
                 .take(motor_lease::REVOKED_LIMIT)
@@ -1167,24 +1213,29 @@ pub(crate) fn settle_lost(
     );
 }
 fn enqueue_usage(next: &mut Snapshot, now_ms: u64) {
-    for (job, b) in &mut next.billing {
-        let Some(usage) = b.usage.as_ref() else {
-            continue;
-        };
-        if !b.enqueued
-            && (b.delivered
-                || b.ended_observed_ms
-                    .is_some_and(|e| now_ms >= e.saturating_add(DELIVERY_GRACE_MS)))
-        {
-            let host = &next.leases[job].claims.placement.host;
-            next.outbox.push(Request {
-                path: format!("/v1/hosts/{host}/usage"),
-                body: serde_json::to_vec(usage).expect("usage serialization"),
-                created_ms: now_ms,
-                job: Some(job.clone()),
-            });
-            b.enqueued = true;
-        }
+    let due: Vec<String> = next
+        .billing
+        .iter()
+        .filter(|(_, b)| {
+            b.usage.is_some()
+                && !b.enqueued
+                && (b.delivered
+                    || b.ended_observed_ms
+                        .is_some_and(|e| now_ms >= e.saturating_add(DELIVERY_GRACE_MS)))
+        })
+        .map(|(job, _)| job.clone())
+        .collect();
+    for job in &due {
+        let b = next.billing.get_mut(job).expect("listed billing");
+        let usage = b.usage.as_ref().expect("listed usage");
+        let host = &next.leases[job].claims.placement.host;
+        next.outbox.push(Request {
+            path: format!("/v1/hosts/{host}/usage"),
+            body: serde_json::to_vec(usage).expect("usage serialization"),
+            created_ms: now_ms,
+            job: Some(job.clone()),
+        });
+        b.enqueued = true;
     }
 }
 

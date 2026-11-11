@@ -50,7 +50,7 @@ pub fn directory(journal: &Path, generation: &str) -> PathBuf {
 
 pub(crate) fn remove_unreferenced(
     journal: &Path,
-    slots: &std::collections::BTreeMap<String, Slot>,
+    slots: &crate::state::Table<Slot>,
 ) -> std::io::Result<()> {
     let root = journal.join("fill-sources");
     let entries = match fs::read_dir(&root) {

@@ -11,6 +11,7 @@ mod cache_write_tests;
 mod deadline_tests;
 mod heartbeat_tests;
 mod recovery_tests;
+mod scale_tests;
 mod seed_tests;
 mod startup_tests;
 #[path = "upload_tests.rs"]
@@ -2221,6 +2222,64 @@ async fn queued_job_ended_before_boot_reaches_live_and_reattached_callers() {
     drop(client);
     task.await.unwrap().unwrap();
     runtime.host.lock().unwrap().close(id).unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+/// The same host-side end can come while the caller is still uploading its
+/// request, before the host has answered a Run with `accepted`. The caller
+/// must get the stored no-start terminal then too, not an end it cannot tell
+/// from a broken connection while it still counts itself as uploading.
+#[tokio::test]
+async fn queued_job_ended_while_its_caller_still_uploads_gets_the_stored_terminal() {
+    let (runtime, fake, storage) = fixture();
+    hold_boot(&runtime, &fake, "none");
+    claim(&runtime, &claims(JOB));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    let c = claims(JOB2);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    // Part of the Run frame is on the wire: the caller is mid-upload.
+    let run = serde_json::to_vec(&run(JOB2)).unwrap();
+    client
+        .write_all(&(run.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    client.write_all(&run[..run.len() / 2]).await.unwrap();
+    let r = runtime.clone();
+    tokio::task::spawn_blocking(move || r.stop_job(JOB2, true, true))
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = runtime.host.lock().unwrap().snapshot.billing[JOB2]
+        .terminal
+        .clone()
+        .expect("the ended queued job has a durable terminal");
+    let terminal =
+        tokio::time::timeout(Duration::from_secs(10), next_type(&mut client, "terminal"))
+            .await
+            .expect("the uploading caller gets the ended job's terminal");
+    assert_eq!(terminal, stored);
+    assert_eq!(terminal["ran"], "none");
+    assert_eq!(terminal["outcome"]["type"], "refused_before_start");
+    next_type(&mut client, "hosted_terminal").await;
+    task.await.unwrap().unwrap();
+    drop(client);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.per_job.executions[JOB2].ended);
+        assert!(!host.snapshot.leases[JOB2].delivered);
+        host.close(id).unwrap();
+    }
+    assert!(!storage.spool(JOB2).exists());
     runtime.stop_job(JOB, true, false).unwrap();
 }
 

@@ -189,6 +189,11 @@ pub struct Runtime {
     /// collection releases only VMs that ended by themselves. Lost on restart,
     /// which costs one more (idempotent) helper stop.
     helper_stopped_jobs: Mutex<std::collections::BTreeSet<String>>,
+    /// Finished jobs whose resources this process has released, so the tick
+    /// retries only failed releases instead of releasing every finished job
+    /// it still keeps records of. Lost on restart, which costs one more
+    /// (idempotent) release of each.
+    released_jobs: Mutex<std::collections::BTreeSet<String>>,
     job_exits: Mutex<Option<u64>>,
     job_launches: Mutex<BTreeMap<String, Arc<job::Launch>>>,
     job_recoveries: Mutex<BTreeMap<String, job::recovery::Worker>>,
@@ -461,6 +466,7 @@ impl Runtime {
             image_generations: None,
             job_stops: Mutex::new(BTreeMap::new()),
             helper_stopped_jobs: Mutex::new(Default::default()),
+            released_jobs: Mutex::new(Default::default()),
             job_exits: Mutex::new(None),
             job_launches: Mutex::new(BTreeMap::new()),
             job_recoveries: Mutex::new(BTreeMap::new()),
@@ -1401,11 +1407,11 @@ impl Runtime {
                 .iter()
                 .filter(|(job, l)| {
                     l.state == LeaseState::Ended
-                        && !host.snapshot.zero_usage.contains_key(*job)
+                        && !host.snapshot.zero_usage.contains_key(job)
                         && host
                             .snapshot
                             .billing
-                            .get(*job)
+                            .get(job)
                             .is_none_or(|b| b.terminal.is_none())
                 })
                 .map(|(job, l)| (job.clone(), l.clone()))

@@ -6,7 +6,6 @@ use crate::config::HostSettings;
 use motor_lease::{Claims, Purpose};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 pub mod fills;
 pub(crate) mod have;
@@ -18,29 +17,50 @@ pub(super) const WARM_WORKSPACE_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub fill_sources: BTreeMap<String, crate::jobs::fill_source::Slot>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub export_tips: BTreeMap<String, crate::jobs::fill_source::Request>,
+    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
+    pub fill_sources: super::Table<crate::jobs::fill_source::Slot>,
+    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
+    pub export_tips: super::Table<crate::jobs::fill_source::Request>,
     /// The helper's store may rotate while the kept tenant disk is unused.
     /// Tenant startup must install the current sets before clearing this fence.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tenant_rollback_pending: bool,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub fills: BTreeMap<String, fills::Reservation>,
+    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
+    pub fills: super::Table<fills::Reservation>,
     /// A DAX-less boot requires operator intervention, not an automatic retry.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dax_failed: bool,
     /// Disk ids are opaque VM names in placement hints, not account or workspace names.
-    pub disks: BTreeMap<String, WorkspaceDisk>,
-    pub executions: BTreeMap<String, Execution>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub bases: BTreeMap<String, storage::Base>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub images: BTreeMap<String, images::Generation>,
+    pub disks: super::Table<WorkspaceDisk>,
+    pub executions: super::Table<Execution>,
+    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
+    pub bases: super::Table<storage::Base>,
+    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
+    pub images: super::Table<images::Generation>,
 }
 
 impl Ledger {
+    /// Folds every table's changes into its base; see `Snapshot::commit`.
+    pub(super) fn commit(&mut self) {
+        let Self {
+            fill_sources,
+            export_tips,
+            tenant_rollback_pending: _,
+            fills,
+            dax_failed: _,
+            disks,
+            executions,
+            bases,
+            images,
+        } = self;
+        fill_sources.commit();
+        export_tips.commit();
+        fills.commit();
+        disks.commit();
+        executions.commit();
+        bases.commit();
+        images.commit();
+    }
     pub fn is_empty(&self) -> bool {
         !self.tenant_rollback_pending
             && self.fill_sources.is_empty()
