@@ -91,6 +91,16 @@ the current phase has lasted two seconds and are at least ten seconds apart.
 They keep carrying the job ID. Callers that do not opt in receive no progress,
 and attach does not replay progress records.
 
+After `Accepted` and until `Started`, an opted-in caller also receives
+display-only `queue_wait` progress each time what the queued job waits on
+changes, and never while it stays the same. `waiting_on` is `checkout` when
+another job holds this checkout, `sibling_checkout` for a sibling checkout,
+`capacity` for runner permits and other capacity waits, `memory`, or
+`checkout_disk`; it is absent for any other wait. `blocker_job_id` names the
+job holding the checkout, and only ever a job of the same account. A job that
+reports no queue status sends no `queue_wait` record. These fields are never
+an input to retry, cancellation or routing.
+
 For broker-leased jobs, `Accepted` includes display-only `placement` with a
 `provider` and optional `host`. Registered hosts use provider `first_party` and
 include the host name (the broker's grant names a provider only for overflow
