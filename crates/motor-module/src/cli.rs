@@ -1334,7 +1334,12 @@ async fn consume<C: ExecClient + ?Sized>(
     let mut cancel_wanted = false;
     let mut cancel_sent = false;
     let mut queue_display = QueueDisplay::default();
-    let mut status_tick = tokio::time::interval(Duration::from_secs(1));
+    // Most jobs start within seconds, so status is first read after 5 s and
+    // then every 2 s; a job that starts promptly costs no status reads.
+    let mut status_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(2),
+    );
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let next = tokio::select! {
@@ -1342,7 +1347,9 @@ async fn consume<C: ExecClient + ?Sized>(
             status = async {
                 status_tick.tick().await;
                 tokio::time::timeout(Duration::from_secs(2), client.status(job_id.unwrap(), session.secret.as_deref().unwrap())).await
-            }, if name == "run" && job_id.is_some() && session.secret.is_some() && !queue_display.started => {
+            // Poll only while the stream is attached: during recovery the
+            // reattach path owns the connection to ck-motor.
+            }, if name == "run" && job_id.is_some() && session.secret.is_some() && !queue_display.started && recovery_deadline.is_none() => {
                 if let Ok(Ok(status)) = status {
                     queue_display.observe(&status, err);
                 }
@@ -1672,13 +1679,19 @@ async fn consume<C: ExecClient + ?Sized>(
 struct QueueDisplay {
     last: Option<(String, Option<Uuid>)>,
     started: bool,
+    /// A `queued:` line was printed, so the start is worth a line too. A job
+    /// that never visibly waited keeps the run's stderr exactly as before;
+    /// callers and scripts read it.
+    announced: bool,
 }
 
 impl QueueDisplay {
     fn started(&mut self, err: &mut dyn Write) {
         if !self.started {
             self.started = true;
-            let _ = writeln!(err, "ck motor run: started");
+            if self.announced {
+                let _ = writeln!(err, "ck motor run: started");
+            }
         }
     }
 
@@ -1751,6 +1764,7 @@ impl QueueDisplay {
             }
             None => waiting.to_owned(),
         };
+        self.announced = true;
         let _ = writeln!(err, "ck motor run: queued: waiting for {detail}");
     }
 }
