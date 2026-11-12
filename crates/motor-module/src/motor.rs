@@ -398,15 +398,19 @@ impl Motor {
         let id = Uuid::now_v7();
         // repository_root is resolved by the caller from Git's common directory,
         // not the workspace key, which changes for each linked worktree.
-        let repository_routed = wsl_refusal.is_none()
+        let repository = (wsl_refusal.is_none()
             && !hosted_test
-            && matches!(request.platform, None | Some(Platform::Linux))
-            && std::fs::canonicalize(&request.repository_root).is_ok_and(|root| {
-                self.config
-                    .hosted_repositories
-                    .iter()
-                    .any(|listed| std::fs::canonicalize(listed).is_ok_and(|listed| listed == root))
-            });
+            && matches!(request.platform, None | Some(Platform::Linux)))
+        .then(|| {
+            std::fs::canonicalize(&request.repository_root)
+                .ok()
+                .and_then(|root| {
+                    self.config.hosted_repositories.iter().find(|listed| {
+                        std::fs::canonicalize(listed).is_ok_and(|listed| listed == root)
+                    })
+                })
+        })
+        .flatten();
         let wait = if gate_job {
             30 * 60
         } else {
@@ -446,12 +450,16 @@ impl Motor {
             route.hosted_test = true;
             route.hosted_no_fallback = true;
             self.storage.hosted_route(id, route)?;
-        } else if repository_routed {
+        } else if let Some(repository) = repository {
             let mut route = crate::HostedJobState::new(&self.config);
             route.repository_routed = true;
             route.hosted_no_fallback = true;
-            route.repository_placement_hint =
-                self.config.hosted_repositories_placement_hint.clone();
+            route.repository_placement_hint = self
+                .config
+                .hosted_repositories_placement_hints
+                .get(repository)
+                .or(self.config.hosted_repositories_placement_hint.as_ref())
+                .cloned();
             self.storage.hosted_route(id, route)?;
             tracing::info!(job_id = %id, repo = %request.repository_root,
                 "routed to hosted (hosted_repositories)");

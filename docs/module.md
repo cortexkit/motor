@@ -216,6 +216,7 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
 | `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose Linux leases use repository-specific placement policy. See [repository routing](#hosted-repository-routing). |
 | `hosted_repositories_placement_hint` | absent (omitted) | Optional `{ "host": "control-host", "vm": "t1" }` placement hint for repository-routed leases only. Both names must follow the broker grammar; `vm` cannot be null. Hinted jobs never fall back to the build server. |
+| `hosted_repositories_placement_hints` | `{}` (omitted) | Map from absolute repository roots listed in `hosted_repositories` to `{ "host": "control-host", "vm": "t1" }` placement hints. Each entry overrides `hosted_repositories_placement_hint` for that repository, with the same name requirements. |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
 | `memory_sizes` | `false` (omitted) | Accept Linux `memory_mib` requests and list `exec-remote-memory/v1`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
@@ -928,6 +929,12 @@ does not fit, the broker returns retryable `no_capacity` rather than choosing
 another host. Such a refusal waits and retries within the normal queue budget.
 A hinted repository job never corrects to the build server, even on
 `no_host_fits`, and still sends `allow_spill: false` so it cannot run on Boat.
+
+Use `hosted_repositories_placement_hints` to give individual repositories their
+own `{host, vm}` hints. Keys must be absolute roots listed in
+`hosted_repositories`. An entry overrides `hosted_repositories_placement_hint`
+for its repository; listed repositories without an entry keep the shared hint.
+The map is omitted from serialized Config when empty. Fleet routes ignore it.
 
 For a repository-routed job, broker `503 no_capacity` responses wait for
 `Retry-After` (seconds, clamped to 1–30 seconds; missing or invalid means one

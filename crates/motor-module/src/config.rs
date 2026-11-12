@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
 };
@@ -22,6 +23,10 @@ pub struct Config {
     /// fleet routes ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_repositories_placement_hint: Option<motor_lease::Placement>,
+    /// Per-repository overrides for the shared repository placement hint.
+    /// Keys must be roots listed in hosted_repositories.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosted_repositories_placement_hints: BTreeMap<String, motor_lease::Placement>,
     /// Ignored legacy keys: Linux jobs now require a hosted lease and never
     /// queue on a direct Linux runner before spilling to hosted capacity.
     #[serde(skip_serializing)]
@@ -298,6 +303,7 @@ impl Default for Config {
             hosted_fleet_routing: serde::de::IgnoredAny,
             hosted_repositories: Vec::new(),
             hosted_repositories_placement_hint: None,
+            hosted_repositories_placement_hints: BTreeMap::new(),
             spill_to_hosted: serde::de::IgnoredAny,
             shadow_to_hosted: serde::de::IgnoredAny,
             spill_after_s: serde::de::IgnoredAny,
@@ -477,6 +483,18 @@ impl Config {
             return Err(io::Error::other(
                 "hosted_repositories_placement_hint requires a valid host and non-null vm in the broker name grammar",
             ));
+        }
+        for (root, hint) in &self.hosted_repositories_placement_hints {
+            if !Path::new(root).is_absolute() || !self.hosted_repositories.contains(root) {
+                return Err(io::Error::other(
+                    "hosted_repositories_placement_hints keys must be absolute repository roots listed in hosted_repositories",
+                ));
+            }
+            if !crate::hosted::valid_hint(hint) {
+                return Err(io::Error::other(
+                    "hosted_repositories_placement_hints requires a valid host and non-null vm in the broker name grammar",
+                ));
+            }
         }
         Ok(())
     }
