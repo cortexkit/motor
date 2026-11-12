@@ -12,6 +12,75 @@ fn job_config(f: &Fixture) -> Config {
     config
 }
 
+#[tokio::test]
+async fn host_admitted_run_survives_expiry_while_waiting_for_boot() {
+    let f = Fixture::new();
+    let runner = job_runner(&f);
+    let (mut run, _) = f.run("true");
+    run.weight_hint = Some(2);
+    run.timeout = Some(30);
+    let mut token = lease(run.job_id, LeasePurpose::Run);
+    token.exp = token.exp.saturating_sub(24 * 60 + 60);
+    let (mut client, task) = connect(&runner, token).await;
+    write_frame_async(&mut client, &Frame::Run(run.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(frame(&mut client).await, Some(Frame::Accepted(_))));
+    assert!(runner.has_job_record(run.job_id));
+    drop(client);
+    task.await.unwrap().unwrap();
+    assert!(pending(&runner).iter().any(|event| {
+        event.jti == Some(run.job_id) && event.event == TenantEventKind::Admitted
+    }));
+}
+
+#[tokio::test]
+async fn host_admitted_expired_lease_still_requires_matching_run() {
+    for case in 0..4 {
+        let f = Fixture::new();
+        let runner = job_runner(&f);
+        let (mut run, _) = f.run("true");
+        run.weight_hint = Some(2);
+        run.timeout = Some(30);
+        let id = run.job_id;
+        let mut token = lease(id, LeasePurpose::Run);
+        token.exp = 1;
+        match case {
+            0 => run.weight_hint = Some(12),
+            1 => run.network = Some(Network::Outbound),
+            2 => run.timeout = Some(3600),
+            3 => run.job_id = Uuid::now_v7(),
+            _ => unreachable!(),
+        }
+        let (mut client, task) = connect(&runner, token).await;
+        write_frame_async(&mut client, &Frame::Run(run.clone()))
+            .await
+            .unwrap();
+        if case != 3 {
+            assert!(matches!(
+                frame(&mut client).await,
+                Some(Frame::Refusal(refusal)) if refusal.reason == RefusalReason::RequestRejected
+                    && refusal.job_id == Some(id)
+            ));
+        }
+        assert!(frame(&mut client).await.is_none());
+        task.await.unwrap().unwrap();
+        assert!(!runner.has_job_record(id));
+        assert!(!runner.has_job_record(run.job_id));
+        let events = pending(&runner);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, TenantEventKind::Refused);
+        assert_eq!(
+            events[0].cause,
+            Some(if case == 3 {
+                RefusedCause::Disconnect
+            } else {
+                RefusedCause::Mismatch
+            })
+        );
+    }
+}
+
 #[test]
 fn job_vm_accepts_one_execution_and_workspace_even_after_completion() {
     let f = Fixture::new();

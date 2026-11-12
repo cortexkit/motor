@@ -560,6 +560,13 @@ async fn tenant_rejection_disconnect_and_expiry_are_distinct() {
     motor_protocol::write_frame_async(&mut client, &Frame::VerifiedLease(expired))
         .await
         .unwrap();
+    assert!(matches!(
+        frame(&mut client).await,
+        Some(Frame::Refusal(refusal))
+            if refusal.job_id == Some(run.job_id)
+                && refusal.reason == RefusalReason::RequestRejected
+                && refusal.detail.as_deref() == Some("lease expired before runner admission")
+    ));
     assert!(frame(&mut client).await.is_none());
     task.await.unwrap().unwrap();
     assert_eq!(pending(&runner)[0].cause, Some(RefusedCause::Expired));
