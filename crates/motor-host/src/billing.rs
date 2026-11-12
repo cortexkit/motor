@@ -679,12 +679,20 @@ impl Host {
         Some(frames)
     }
     pub fn heartbeat(&self, now_ms: u64, free_mem_mib: u64, healthy: bool) -> Heartbeat {
+        let heartbeat = self.heartbeat_unlogged(now_ms, free_mem_mib, healthy);
+        self.log_job_memory(now_ms, heartbeat.free_mem_mib);
+        heartbeat
+    }
+
+    /// The heartbeat body without the memory log line. The broker loop builds
+    /// one with a placeholder free-memory figure on every tick only to compare
+    /// lifecycle state; logging that placeholder would record a false zero.
+    pub fn heartbeat_unlogged(&self, now_ms: u64, free_mem_mib: u64, healthy: bool) -> Heartbeat {
         let free_mem_mib = if self.snapshot.per_job.dax_failed {
             0
         } else {
             free_mem_mib
         };
-        self.log_job_memory(now_ms, free_mem_mib);
         Heartbeat {
             // While host storage is low, new leases are refused, so no free
             // vCPUs are advertised and the broker places no new work here.

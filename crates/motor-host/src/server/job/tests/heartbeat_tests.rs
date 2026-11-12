@@ -127,6 +127,28 @@ fn memory_advertisement_logs_initial_gib_changes_and_one_minute_refresh() {
 }
 
 #[test]
+fn lifecycle_comparison_heartbeats_do_not_log_their_placeholder_memory() {
+    // The broker loop builds a heartbeat with free memory 0 on every tick only
+    // to compare lifecycle state, then the real one. Only the real figure may
+    // reach the log, and the one-minute refresh must still suppress repeats.
+    let (runtime, _, _) = fixture();
+    let host = runtime.host.lock().unwrap();
+    let now = unix_ms();
+    let logs = crate::test_logs::capture(|| {
+        for offset in 0..8 {
+            host.heartbeat_unlogged(now + offset, 0, true);
+            host.heartbeat(now + offset, 4000, true);
+        }
+    });
+    let logs: Vec<_> = logs
+        .iter()
+        .filter(|s| s.contains("message=job_memory_advertised "))
+        .collect();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert!(logs[0].contains("free_mem_mib=4000 "), "{}", logs[0]);
+}
+
+#[test]
 fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_waiters() {
     let (runtime, _, _) = fixture();
     let now = unix_ms();

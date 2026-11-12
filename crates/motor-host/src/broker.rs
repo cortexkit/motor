@@ -459,7 +459,10 @@ impl Heartbeats {
         let changed = {
             let host = self.runtime.host.lock().expect("host lock");
             // Free memory is not lifecycle state, so any value compares equal.
-            self.last_state.as_ref() != Some(&lifecycle_state(host.heartbeat(now_ms, 0, healthy)))
+            self.last_state.as_ref()
+                != Some(&lifecycle_state(
+                    host.heartbeat_unlogged(now_ms, 0, healthy),
+                ))
         };
         if due || changed {
             let previous_health = healthy;
