@@ -133,6 +133,11 @@ impl Host {
             .storage
             .get_or_insert_with(|| Disk::new(default_cap, now_ms));
         storage.last_used_ms = storage.last_used_ms.max(now_ms);
+        // A disk made under a lower cap grows to the configured one when a job
+        // claims it; the helper extends the file before boot. Caps never
+        // shrink: the helper refuses a disk larger than the size it is asked
+        // for, and the guest filesystem cannot shrink.
+        storage.cap_bytes = storage.cap_bytes.max(default_cap);
         storage.growth_reservation_bytes = storage.cap_bytes;
         self.reserve_storage(next, disk_id, now_ms)
     }

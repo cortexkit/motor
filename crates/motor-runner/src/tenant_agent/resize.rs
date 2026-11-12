@@ -189,6 +189,33 @@ impl Geometry {
     }
 }
 
+/// Grows the XFS filesystem mounted at /tenant to fill /dev/vdb when the
+/// block device is larger than the filesystem, and does nothing otherwise.
+pub(super) fn grow_to_device() -> io::Result<()> {
+    let device = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/dev/vdb")?;
+    let mut bytes: u64 = 0;
+    // BLKGETSIZE64 reports the block device's current size.
+    if unsafe {
+        libc::ioctl(
+            device.as_raw_fd(),
+            0x80081272_u32 as libc::Ioctl,
+            &mut bytes,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let info = Command::new("xfs_info").arg("/tenant").output()?;
+    if !info.status.success() {
+        return Err(io::Error::other("xfs_info failed"));
+    }
+    let geometry = Geometry::parse(&String::from_utf8_lossy(&info.stdout))?;
+    grow_if_needed(&geometry, bytes, || command("xfs_growfs", &["/tenant"]))
+}
+
 fn grow_if_needed(
     geometry: &Geometry,
     bytes: u64,
@@ -222,30 +249,7 @@ impl Disk {
                 }
                 self.directory = Some(paths::Directory::absolute(Path::new("/tenant"), 0)?);
             }
-            Step::Grow => {
-                let device = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open("/dev/vdb")?;
-                let mut bytes: u64 = 0;
-                // BLKGETSIZE64 reports the patched block device's current size.
-                if unsafe {
-                    libc::ioctl(
-                        device.as_raw_fd(),
-                        0x80081272_u32 as libc::Ioctl,
-                        &mut bytes,
-                    )
-                } < 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                let info = Command::new("xfs_info").arg("/tenant").output()?;
-                if !info.status.success() {
-                    return Err(io::Error::other("xfs_info failed"));
-                }
-                let geometry = Geometry::parse(&String::from_utf8_lossy(&info.stdout))?;
-                grow_if_needed(&geometry, bytes, || command("xfs_growfs", &["/tenant"]))?;
-            }
+            Step::Grow => grow_to_device()?,
             Step::Write => {
                 // A fixed name is safe only with create_new: never follow a
                 // tenant-created symlink or truncate a hard-linked file.

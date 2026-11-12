@@ -362,6 +362,40 @@ fn only_proven_exclusive_extents_reduce_growth_and_probe_is_refreshed() {
     );
 }
 
+/// Raising the configured cap must reach checkout disks made under the old
+/// one, or a repository whose build outgrew the old cap keeps failing on the
+/// same small disk. Lowering it must not shrink them: the guest filesystem
+/// can't shrink, and the helper refuses a disk larger than the size asked for.
+#[test]
+fn a_raised_cap_grows_an_existing_disk_on_its_next_claim_and_never_shrinks_it() {
+    let mut h = memory_host(10_000);
+    h.claim(job(JOB), AT).unwrap();
+    let first = disk(&h, JOB);
+    h.job_stopped(JOB, false).unwrap();
+    h.job_replay_closed(JOB, ReplayCompletion::Terminal)
+        .unwrap();
+    let cap = |h: &Host| {
+        let storage = h.snapshot.per_job.disks[&first].storage.clone().unwrap();
+        (storage.cap_bytes, storage.growth_reservation_bytes)
+    };
+    assert_eq!(cap(&h).0, CAP);
+    let set_cap = |h: &mut Host, bytes| {
+        if let motor_host::config::HostSettings::PerJob(s) = &mut h.settings {
+            s.workspace_disk_cap_bytes = bytes;
+        }
+    };
+    set_cap(&mut h, 2 * CAP);
+    h.claim(job(JOB2), AT).unwrap();
+    assert_eq!(disk(&h, JOB2), first);
+    assert_eq!(cap(&h), (2 * CAP, 2 * CAP));
+    h.job_stopped(JOB2, false).unwrap();
+    h.job_replay_closed(JOB2, ReplayCompletion::Terminal)
+        .unwrap();
+    set_cap(&mut h, CAP);
+    h.claim(job(JOB3), AT).unwrap();
+    assert_eq!(cap(&h).0, 2 * CAP);
+}
+
 #[test]
 fn reservation_transaction_failure_and_restart_preserve_all_promises() {
     let root = scratch();

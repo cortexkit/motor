@@ -236,13 +236,21 @@ pub(super) fn install_args() -> io::Result<()> {
 fn workspace_steps(
     kind: Option<&str>,
     mut run: impl FnMut(&str, &[&str]) -> io::Result<()>,
+    grow: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     match kind {
         Some("xfs") => {}
         None => run("mkfs.xfs", &["/dev/vdb"])?,
         Some(_) => return Err(io::Error::other("workspace disk is not XFS")),
     }
-    run("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])
+    run("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
+    // The host grows a checkout's disk file when its size cap rises, so an
+    // existing filesystem can be smaller than its disk. A failed grow leaves
+    // the job its old space, which is no reason to refuse it.
+    if let Err(error) = grow() {
+        eprintln!("motor-tenant-agent: workspace filesystem not grown: {error}");
+    }
+    Ok(())
 }
 
 pub(super) fn mount_workspace() -> io::Result<()> {
@@ -263,7 +271,11 @@ pub(super) fn mount_workspace() -> io::Result<()> {
         }
         _ => return Err(io::Error::other("workspace filesystem probe failed")),
     };
-    workspace_steps(kind.as_deref().map(str::trim), command)
+    workspace_steps(
+        kind.as_deref().map(str::trim),
+        command,
+        super::resize::grow_to_device,
+    )
 }
 
 pub(super) fn mount_sources(image_cargo: &Path) -> io::Result<()> {
@@ -436,28 +448,49 @@ mod tests {
     #[test]
     fn empty_workspace_is_formatted_once_and_existing_xfs_is_kept() {
         for kind in [None, Some("xfs"), Some("ext4")] {
-            let mut calls = Vec::new();
-            let result = workspace_steps(kind, |program, args| {
-                calls.push((program.to_owned(), args.join(" ")));
-                Ok(())
-            });
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = workspace_steps(
+                kind,
+                |program, args| {
+                    calls
+                        .borrow_mut()
+                        .push((program.to_owned(), args.join(" ")));
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push(("grow".into(), String::new()));
+                    Ok(())
+                },
+            );
+            let calls = calls.into_inner();
+            let mount = ("mount".to_owned(), "-t xfs /dev/vdb /tenant".to_owned());
+            let grow = ("grow".to_owned(), String::new());
             match kind {
-                None => assert_eq!(
-                    calls,
-                    [
-                        ("mkfs.xfs".into(), "/dev/vdb".into()),
-                        ("mount".into(), "-t xfs /dev/vdb /tenant".into())
-                    ]
-                ),
-                Some("xfs") => {
-                    assert_eq!(calls, [("mount".into(), "-t xfs /dev/vdb /tenant".into())])
-                }
+                None => assert_eq!(calls, [("mkfs.xfs".into(), "/dev/vdb".into()), mount, grow]),
+                Some("xfs") => assert_eq!(calls, [mount, grow]),
                 _ => {
                     assert!(result.is_err());
                     assert!(calls.is_empty());
                 }
             }
         }
+    }
+
+    /// A disk the host grew keeps its warm build, so a failed grow must not
+    /// cost the job its workspace: the job runs with the space it had.
+    #[test]
+    fn failed_workspace_grow_still_mounts_the_workspace() {
+        let mut calls = Vec::new();
+        workspace_steps(
+            Some("xfs"),
+            |program, _| {
+                calls.push(program.to_owned());
+                Ok(())
+            },
+            || Err(io::Error::other("xfs_growfs failed")),
+        )
+        .unwrap();
+        assert_eq!(calls, ["mount"]);
     }
 
     #[test]

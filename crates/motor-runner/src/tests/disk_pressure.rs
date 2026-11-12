@@ -601,6 +601,48 @@ fn job_vm_admission_clears_its_own_build_outputs_before_refusing_for_disk() {
     assert_eq!(inner.jobs[&request.job_id].state, JobState::AwaitingBundles);
 }
 
+/// Above the floor but under the eviction goal, a job VM still clears its own
+/// build before admitting: a job admitted with only the floor left fails
+/// mid-build once it writes more than that. Incremental caches go first, and
+/// clearing stops at the goal; with the goal met nothing is touched.
+#[test]
+fn job_vm_admission_clears_its_own_incremental_caches_under_the_eviction_goal() {
+    for under_goal in [true, false] {
+        let f = Fixture::new();
+        let (request, _) = f.run("true");
+        let incoming = PathBuf::from(&request.workspace_key);
+        let outputs = incoming.join("target");
+        let incremental = outputs.join("debug/incremental");
+        let cache = incremental.clone();
+        // Floor 100, eviction goal 200 (twice the floor).
+        let mut c = config(&f, move |_| {
+            Ok(if under_goal && cache.exists() { 150 } else { 250 })
+        });
+        c.manual_tick = true;
+        c.tenant_vm = true;
+        c.per_job = true;
+        let runner = Runner::open(c).unwrap();
+        workspace(&runner, &incoming, runner.now() - 20 * 60 * 1000);
+        fs::create_dir_all(incremental.join("unit-1")).unwrap();
+        fs::write(incremental.join("unit-1/data"), [3; 4096]).unwrap();
+        fs::create_dir_all(outputs.join("debug/deps")).unwrap();
+        fs::write(outputs.join("debug/deps/libkept.rlib"), [1; 16]).unwrap();
+        assert!(matches!(
+            runner.accept(request.clone()).unwrap(),
+            Admission::Accepted(_)
+        ));
+        assert_eq!(
+            incremental.exists(),
+            !under_goal,
+            "incremental caches cleared only under the goal (under_goal={under_goal})"
+        );
+        assert!(
+            outputs.join("debug/deps/libkept.rlib").exists(),
+            "clearing must stop once the goal is met (under_goal={under_goal})"
+        );
+    }
+}
+
 #[test]
 fn disk_admission_evicts_then_admits_and_reprobes() {
     let f = Fixture::new();

@@ -49,17 +49,57 @@ pub(super) fn ensure_bound(
 ) -> Result<()> {
     if root.join(&request.workspace_disk_id).try_exists()? {
         let (registry, disk) = open_disk(root, &request.account, &request.workspace_disk_id)?;
+        let meta = disk.metadata()?;
+        // A larger request means the host raised its checkout disk cap; the
+        // guest grows its filesystem to the new size at its next boot. The
+        // host never lowers a disk's cap, so a smaller one is not a request
+        // this helper produced.
         if registry.role != job::WorkspaceRole::Job
-            || disk.metadata()?.uid() != 0
-            || disk.metadata()?.len() != request.size_bytes
+            || meta.uid() != 0
+            || meta.len() > request.size_bytes
         {
             return Err(Error(
                 "workspace role, owner or size mismatch; quarantine required".into(),
             ));
         }
+        if meta.len() < request.size_bytes {
+            grow_disk(
+                root,
+                &request.workspace_disk_id,
+                (meta.dev(), meta.ino()),
+                request.size_bytes,
+            )?;
+        }
         return Ok(());
     }
     create_bound(root, request, job::WorkspaceRole::Job, grant)
+}
+
+/// Extends an existing job disk file to `size` bytes. The caller has checked
+/// that no VM holds the disk, so no running guest sees its device change.
+/// The extension is sparse: nothing the guest wrote is read or moved.
+fn grow_disk(root: &Path, disk_id: &str, identity: (u64, u64), size: u64) -> Result<()> {
+    let root = File::open(root)?;
+    let directory = fs::beneath(
+        root.as_raw_fd(),
+        disk_id,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )?;
+    let disk = fs::beneath(
+        directory.as_raw_fd(),
+        "workspace.img",
+        libc::O_RDWR | libc::O_NONBLOCK,
+        0,
+    )?;
+    let meta = disk.metadata()?;
+    // The same file open_disk checked, not one swapped in since.
+    if !meta.is_file() || meta.uid() != 0 || (meta.dev(), meta.ino()) != identity {
+        return Err(Error("workspace disk changed while growing".into()));
+    }
+    disk.set_len(size)?;
+    disk.sync_all()?;
+    Ok(())
 }
 
 pub(super) fn base_lease(
@@ -484,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn isolated_workspace_ensure_enforces_helper_cap_exact_size_and_identity() {
+    fn isolated_workspace_ensure_enforces_helper_cap_grow_only_and_identity() {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         let base = super::super::tests::scratch();
         let mut jobs = super::super::tests::machine(&base);
@@ -514,6 +554,18 @@ mod tests {
         assert_eq!(std::fs::metadata(&disk).unwrap().ino(), before.ino());
         assert!(jobs.handle(op(4096), peer).is_err());
         assert_eq!(std::fs::metadata(&disk).unwrap().len(), 8192);
+        // A raised host cap grows the same file in place, sparsely, and
+        // never past the helper's maximum.
+        jobs.settings.as_mut().unwrap().workspace_disk_max_bytes = Some(16384);
+        assert!(jobs.handle(op(20480), peer).is_err());
+        jobs.handle(op(12288), peer).unwrap();
+        let grown = std::fs::metadata(&disk).unwrap();
+        assert_eq!(
+            (grown.ino(), grown.len(), grown.blocks()),
+            (before.ino(), 12288, 0)
+        );
+        assert!(jobs.handle(op(8192), peer).is_err());
+        assert_eq!(std::fs::metadata(&disk).unwrap().len(), 12288);
         assert!(jobs
             .handle(
                 Operation::EnsureWorkspace {

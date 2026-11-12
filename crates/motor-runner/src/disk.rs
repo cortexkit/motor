@@ -1590,21 +1590,25 @@ impl Runner {
             self.core.config.boat_profile,
             &mut PressurePass::default(),
         )?;
-        if full.is_none() || !self.core.config.per_job {
+        if !self.core.config.per_job {
             return Ok(full);
         }
         self.clear_admitting_build_outputs(request, full)
     }
 
     /// A job VM serves one job, on a disk that holds only its own account's
-    /// checkouts. When that disk is still under the floor after the ordinary
-    /// pass, what fills it is usually the request's own checkout: its previous
-    /// build, which admission protects. Refusing then does not save it: once
-    /// the refusal drops that protection, the pressure timer deletes the whole
-    /// workspace. So delete its build outputs instead, keep the checkout, and
-    /// admit if the floor is met. Incremental caches go first, then the whole
-    /// `target` folder. Nothing else can be using the workspace, because a job
-    /// VM admits no other job.
+    /// checkouts. What fills that disk is usually the request's own checkout:
+    /// its earlier builds, which admission protects, so the ordinary pass
+    /// never frees them. Waiting for the floor is too late: a job admitted just
+    /// above it fails mid-build as soon as it writes more than the space left
+    /// (a large link that runs out of space dies with SIGBUS). And refusing
+    /// does not save the build either: once the refusal drops that protection,
+    /// the pressure timer deletes the whole workspace. So whenever free space
+    /// is under the eviction goal, delete the checkout's build outputs until
+    /// the goal is met, keep the checkout, and refuse only if the floor still
+    /// isn't. Incremental caches go first, then the whole `target` folder.
+    /// Nothing else can be using the workspace, because a job VM admits no
+    /// other job.
     ///
     /// Shared tenant VMs keep refusing: there other queued or future jobs
     /// share the workspace, and other workspaces on the disk can still free
@@ -1615,7 +1619,19 @@ impl Runner {
         full: Option<RunnerDiskFull>,
     ) -> io::Result<Option<RunnerDiskFull>> {
         let floor = self.core.config.free_space_floor_bytes;
+        if floor == 0 {
+            return Ok(full);
+        }
+        let goal = self
+            .core
+            .config
+            .free_space_eviction_bytes
+            .unwrap_or_else(|| floor.saturating_mul(2))
+            .max(floor);
         let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
+        if probe()? >= goal {
+            return Ok(full);
+        }
         let key = crate::caller_path::request(request)
             .caller_workspace_key
             .text()
@@ -1662,7 +1678,7 @@ impl Runner {
         let before = allocated_bytes(&target, device)?;
         let mut free = probe()?;
         for stage in [crate::cargo_gc::incremental(&target)?, vec![target.clone()]] {
-            if free >= floor {
+            if free >= goal {
                 break;
             }
             for output in stage {
@@ -1687,7 +1703,7 @@ impl Runner {
             });
         }
         tracing::info!(path = %target.display(), bytes, free_bytes = free, floor_bytes = floor,
-            "runner admission cleared its own build outputs");
+            goal_bytes = goal, "runner admission cleared its own build outputs");
         Ok((free < floor).then_some(RunnerDiskFull {
             free_bytes: free,
             floor_bytes: floor,
