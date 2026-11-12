@@ -105,11 +105,10 @@ impl Runtime {
         Ok(json!({"ok":true,"blocked":blocked,"not_acknowledged":not_acknowledged}))
     }
 
-    /// Re-send the persisted deny before relaying an admission, even if the
-    /// runner restarted without the host noticing. Old runners may refuse the
-    /// control but still serve read-only jobs; the persisted host deny must
-    /// also be checked independently by write eligibility at admission.
-    pub(super) fn sync_remote_cache_write_block(&self, id: &str, job: bool) {
+    /// Read the persisted deny while serialized with block changes, before any
+    /// admission relay. A dedicated Job VM must acknowledge it or be stopped;
+    /// its boot may already have received a write key before the block was set.
+    pub(super) fn sync_remote_cache_write_block(&self, id: &str, job: bool) -> Result<()> {
         let _operation = self
             .write_block_operation
             .lock()
@@ -121,20 +120,29 @@ impl Runtime {
             .snapshot
             .remote_cache_write_blocked
         {
-            return;
+            return Ok(());
         }
         let request = json!({"op":"set_remote_cache_write_block","blocked":true});
-        let reply = if job {
-            self.control.job_admin(id, &request)
-        } else {
-            self.control.admin(id, &request)
-        };
-        if !reply.is_ok_and(|reply| reply["ok"] == true && reply["blocked"] == true) {
+        for _ in 0..if job { 3 } else { 1 } {
+            let reply = if job {
+                self.control.job_admin(id, &request)
+            } else {
+                self.control.admin(id, &request)
+            };
+            if reply.is_ok_and(|reply| reply["ok"] == true && reply["blocked"] == true) {
+                return Ok(());
+            }
             tracing::warn!(
                 runner = id,
                 blocked = true,
                 "remote_cache_write_block_not_acknowledged"
             );
         }
+        drop(_operation);
+        if job {
+            self.stop_job(id, true, true)?;
+            anyhow::bail!("job VM did not acknowledge the cache write block after 3 attempts");
+        }
+        Ok(())
     }
 }

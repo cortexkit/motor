@@ -35,6 +35,9 @@ mod conntrack;
 mod memory;
 mod namespace;
 pub(super) mod network;
+#[cfg(feature = "linux-root-tests")]
+#[doc(hidden)]
+pub mod qualification;
 mod workspace;
 
 pub(super) fn image_copy_exclusive_bytes(file: &File) -> Result<u64> {
@@ -152,8 +155,16 @@ impl LinuxJobs {
             grant.as_ref(),
         )
     }
+    /// The host's EnsureWorkspace: create the disk bound to the job's write
+    /// grant, or keep an existing disk and the binding it was created with.
+    pub(super) fn ensure_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
+        self.check_workspace_size(request.size_bytes)?;
+        self.disk_available_identity(&request.workspace_disk_id)?;
+        let grant = self.disk_grant(request.cache_write_job_id.as_deref());
+        workspace::ensure_bound(&self.workspaces, request, grant.as_ref())
+    }
     fn disk_grant(&self, id: Option<&str>) -> Option<crate::cache_write::Grant> {
-        self.cache_write_grants.lock().ok()?.get(id?).cloned()
+        crate::cache_write::disk_grant(&self.cache_write_grants, id)
     }
     fn check_workspace_size(&self, size: u64) -> Result<()> {
         let maximum = self
@@ -175,9 +186,7 @@ impl LinuxJobs {
     }
     pub fn new(config: &Config) -> Self {
         Self {
-            cache_write_grants: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::cache_write::Grants::new(config),
-            )),
+            cache_write_grants: std::sync::Arc::new(crate::cache_write::Grants::new(config)),
             settings: config.job_vms.clone(),
             groups: cgroup::JOB_SLICE.into(),
             records_path: job::RECORDS.into(),
@@ -652,19 +661,12 @@ impl LinuxJobs {
                 size_bytes,
                 cache_write_job_id,
             } => {
-                self.check_workspace_size(size_bytes)?;
-                self.disk_available_identity(&disk_id)?;
-                let grant = self.disk_grant(cache_write_job_id.as_deref());
-                workspace::ensure_bound(
-                    &self.workspaces,
-                    job::CreateWorkspace {
-                        account,
-                        workspace_disk_id: disk_id,
-                        size_bytes,
-                        cache_write_job_id,
-                    },
-                    grant.as_ref(),
-                )?;
+                self.ensure_workspace(job::CreateWorkspace {
+                    account,
+                    workspace_disk_id: disk_id,
+                    size_bytes,
+                    cache_write_job_id,
+                })?;
                 Ok(Response::new(Reply::Ok))
             }
             Operation::EvictBase { account, disk_id } => {
@@ -994,15 +996,9 @@ impl LinuxJobs {
         // crash in setup keeps it reserved until explicit stop has cleaned up.
         self.save(&record)?;
         self.records.insert(start.job_id.clone(), record);
-        let job_write = self
-            .disk_grant(Some(&start.job_id))
-            .is_some_and(|grant| grant.permits(&start, &registry));
         // Durable intent already prevents another VM, including after restart.
         // Failures before intent leave the admission grant reusable by a retry.
-        self.cache_write_grants
-            .lock()
-            .map_err(|_| Error("cache grant lock poisoned".into()))?
-            .consume(&start.job_id);
+        let job_write = take_job_write_grant(&self.cache_write_grants, &start, &registry);
         let id = &start.job_id;
         let boundary = self.boundary(id);
         let root = self.root(id);
@@ -1018,23 +1014,17 @@ impl LinuxJobs {
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&boundary)?;
-            let (nonce, job_write) = cache::stage_with_write(
+            let (nonce, requests) = stage_boot(
                 &self.cache_store,
-                &start.account,
-                start.kind,
-                &boundary_fd,
-                uid,
-                job_write,
-            )?;
-            let mut requests = recorded_boot_requests(
                 &start,
-                tap_index,
-                nonce.as_deref(),
-                meta.len(),
                 &registry,
                 &settings,
+                &boundary_fd,
+                uid,
+                tap_index,
+                meta.len(),
+                job_write.as_ref(),
             )?;
-            authorize_job_write_boot(&mut requests, &start, nonce.as_deref(), job_write)?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             fs::chown(&File::open(&root)?, uid)?;
@@ -1151,6 +1141,62 @@ const CONSOLE_LOG: &str = "console.log";
 /// The console's last bytes are what explain a halt or crash; a guest can write
 /// as much as it likes, so only this much is ever read back.
 const CONSOLE_TAIL_BYTES: u64 = 16 * 1024;
+
+#[doc(hidden)]
+pub type BootRequests = Vec<(&'static str, Value)>;
+
+pub(crate) fn take_job_write_grant(
+    authority: &crate::cache_write::Authority,
+    start: &Start,
+    registry: &Workspace,
+) -> Option<crate::cache_write::Grant> {
+    authority
+        .consume(&start.job_id)
+        .filter(|grant| grant.permits(start, registry))
+}
+
+pub(crate) fn job_write_for_stage(
+    grant: Option<&crate::cache_write::Grant>,
+    start: &Start,
+    registry: &Workspace,
+    now: SystemTime,
+) -> bool {
+    grant.is_some_and(|grant| grant.valid_at(now) && grant.permits(start, registry))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_boot(
+    store: &Path,
+    start: &Start,
+    registry: &Workspace,
+    settings: &JobVms,
+    boundary: &File,
+    uid: u32,
+    tap: Option<u8>,
+    workspace_bytes: u64,
+    grant: Option<&crate::cache_write::Grant>,
+) -> Result<(Option<String>, BootRequests)> {
+    let permitted = job_write_for_stage(grant, start, registry, SystemTime::now());
+    let (nonce, job_write) = cache::stage_with_write(
+        store,
+        &start.account,
+        start.kind,
+        registry.role,
+        boundary,
+        uid,
+        permitted,
+    )?;
+    let mut requests = recorded_boot_requests(
+        start,
+        tap,
+        nonce.as_deref(),
+        workspace_bytes,
+        registry,
+        settings,
+    )?;
+    authorize_job_write_boot(&mut requests, start, nonce.as_deref(), job_write)?;
+    Ok((nonce, requests))
+}
 
 /// Copies the tail of a job VM's serial console to the helper journal, one
 /// line per entry with control characters replaced, so guest-written bytes

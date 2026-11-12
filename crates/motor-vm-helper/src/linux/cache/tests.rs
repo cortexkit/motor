@@ -377,6 +377,7 @@ fn job_credential_staging_requires_matching_grant_and_keeps_read_key() {
         workspace_key_hash: Some("bound-hash".into()),
     };
     let grant = crate::cache_write::Grant {
+        exp: u64::MAX,
         sub: start.account.clone(),
         jti: start.job_id.clone(),
         workspace_key_hash: "bound-hash".into(),
@@ -406,7 +407,7 @@ fn job_credential_staging_requires_matching_grant_and_keeps_read_key() {
             _ => {}
         }
         let (staged, write_boot) =
-            credentials_for_boot(keys, start.kind, grant.permits(&start, &disk));
+            credentials_for_boot(keys, start.kind, disk.role, grant.permits(&start, &disk));
         let payload = serde_json::to_string(&staged).unwrap();
         assert!(payload.contains("READ-SECRET-new"), "{case}");
         assert_eq!(write_boot, case == "matching", "{case}");
@@ -417,12 +418,51 @@ fn job_credential_staging_requires_matching_grant_and_keeps_read_key() {
         );
         assert_eq!(staged.write_key.is_some(), case == "matching", "{case}");
     }
-    let (staged, write_boot) = credentials_for_boot(set("account-1", "new"), VmKind::Job, false);
+    let (staged, write_boot) = credentials_for_boot(
+        set("account-1", "new"),
+        VmKind::Job,
+        WorkspaceRole::Job,
+        false,
+    );
     assert!(staged.write_key.is_none());
     assert!(!write_boot);
     for kind in [VmKind::Fill, VmKind::BaseBuild] {
-        let (staged, write_boot) = credentials_for_boot(set("account-1", "new"), kind, false);
-        assert!(staged.write_key.is_some());
+        let role = if kind == VmKind::Fill {
+            WorkspaceRole::Fill
+        } else {
+            WorkspaceRole::Base
+        };
+        let (staged, write_boot) = credentials_for_boot(set("account-1", "new"), kind, role, false);
+        assert_eq!(staged.write_key.is_some(), kind == VmKind::Fill);
         assert!(!write_boot);
+    }
+}
+
+#[test]
+fn write_key_is_kept_only_for_fill_role_or_granted_job() {
+    use crate::job::WorkspaceRole;
+    for kind in [
+        VmKind::Job,
+        VmKind::Fill,
+        VmKind::BaseBuild,
+        VmKind::Recovery,
+    ] {
+        for role in [WorkspaceRole::Job, WorkspaceRole::Fill, WorkspaceRole::Base] {
+            for granted in [false, true] {
+                let (staged, write_boot) =
+                    credentials_for_boot(set("account-1", "new"), kind, role, granted);
+                let job = kind == VmKind::Job && role == WorkspaceRole::Job && granted;
+                let fill = kind == VmKind::Fill && role == WorkspaceRole::Fill;
+                assert_eq!(
+                    staged.write_key.is_some(),
+                    job || fill,
+                    "{kind:?}/{role:?}/{granted}"
+                );
+                assert_eq!(write_boot, job, "{kind:?}/{role:?}/{granted}");
+                assert!(serde_json::to_string(&staged)
+                    .unwrap()
+                    .contains("READ-SECRET-new"));
+            }
+        }
     }
 }

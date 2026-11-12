@@ -21,6 +21,16 @@ use std::{
 const PROBE: &str = include_str!("../../../../script/runner/job-sandbox-probe.py");
 const LIMIT: Duration = Duration::from_secs(180);
 
+#[cfg(feature = "job-cache-vm-tests")]
+mod cache_write;
+
+enum Probe {
+    Sandbox,
+    Fill,
+    #[cfg(feature = "job-cache-vm-tests")]
+    Cache(std::rc::Rc<cache_write::Prepared>),
+}
+
 fn artifact(name: &str) -> PathBuf {
     let path = PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("missing {name}")));
     assert!(
@@ -181,12 +191,16 @@ fn git(path: &Path, args: &[&str]) -> String {
     )
 }
 
-async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
+fn probe_checkout(scratch: &Path, files: &[(&str, &str)]) -> PathBuf {
     let repo = scratch.join("repo");
     fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "--quiet"]);
-    fs::write(repo.join("probe.py"), PROBE).unwrap();
-    git(&repo, &["add", "probe.py"]);
+    for (name, source) in files {
+        let path = repo.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+        git(&repo, &["add", "--", name]);
+    }
     git(
         &repo,
         &[
@@ -202,6 +216,17 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
             "contract probe",
         ],
     );
+    repo
+}
+
+async fn run_probe(
+    root: &Path,
+    scratch: &Path,
+    id: uuid::Uuid,
+    files: &[(&str, &str)],
+    verdict: &str,
+) {
+    let repo = probe_checkout(scratch, files);
     let commit = git(&repo, &["rev-parse", "HEAD"]);
     let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
     let reference = format!("refs/ck-motor/{id}/snapshot");
@@ -258,10 +283,7 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid) {
             Frame::Terminal(terminal) => {
                 assert!(started, "probe did not start: {terminal:?}; {output}");
                 assert_eq!(terminal.outcome, Outcome::Exit { code: 0 }, "{output}");
-                assert!(
-                    output.contains("PASS job sandbox:"),
-                    "missing full contract verdict: {output}"
-                );
+                assert!(output.contains(verdict), "missing probe verdict: {output}");
                 let fixed = format!(
                     "/w/acct-01ARZ3NDEKTSV4RRFFQ69G5FAV/{:x}/motor-contract",
                     Sha256::digest(workspace.as_bytes())
@@ -342,16 +364,17 @@ async fn next(socket: &mut tokio::net::UnixStream) -> Frame {
 #[test]
 #[ignore = "requires root, KVM, cgroup v2, iproute2, jailer/Firecracker 1.17.0 and job image artifacts"]
 fn isolated_job_vm_preserves_full_sandbox_contract() {
-    isolated_vm(false);
+    isolated_vm(Probe::Sandbox);
 }
 
 #[test]
 #[ignore = "requires root, KVM, cgroup v2, iproute2, jailer/Firecracker 1.17.0 and job image artifacts"]
 fn isolated_fill_vm_refuses_run_admission() {
-    isolated_vm(true);
+    isolated_vm(Probe::Fill);
 }
 
-fn isolated_vm(fill: bool) {
+fn isolated_vm(probe: Probe) {
+    let fill = matches!(probe, Probe::Fill);
     assert_eq!(unsafe { libc::geteuid() }, 0, "run as the root operator");
     let firecracker = artifact("MOTOR_VM_TEST_FIRECRACKER");
     let jailer = artifact("MOTOR_VM_TEST_JAILER");
@@ -377,7 +400,11 @@ fn isolated_vm(fill: bool) {
     // Unix sockets use descriptor aliases below, but mountinfo checks need an
     // unescaped absolute path to verify that all our mounts have disappeared.
     assert!(!base.to_str().unwrap().chars().any(char::is_whitespace));
-    let id = uuid::Uuid::now_v7();
+    let id = match &probe {
+        #[cfg(feature = "job-cache-vm-tests")]
+        Probe::Cache(prepared) => prepared.id,
+        _ => uuid::Uuid::now_v7(),
+    };
     let mut resources = Resources {
         scratch: Some(scratch),
         group: PathBuf::from(format!("/sys/fs/cgroup/motor-contract-{id}")),
@@ -507,7 +534,7 @@ fn isolated_vm(fill: bool) {
                 vec!["/home/motor-contract".into()],
             )]),
         };
-        for (path, mut body) in motor_vm_helper::linux::job::recorded_boot_requests(
+        let requests = motor_vm_helper::linux::job::recorded_boot_requests(
             &start,
             Some(tap),
             None,
@@ -515,8 +542,38 @@ fn isolated_vm(fill: bool) {
             &registry,
             &settings,
         )
-        .unwrap()
-        {
+        .unwrap();
+        #[cfg(feature = "job-cache-vm-tests")]
+        let requests = if let Probe::Cache(prepared) = &probe {
+            let (disk, requests) = prepared.boot(&start, &root, uid, tap);
+            if prepared
+                .stage_only
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // `boot` has already checked the staged boot arguments.
+                println!(
+                    "PASS job cache: {} second staging is read-only",
+                    prepared.case()
+                );
+                return;
+            }
+            resources.mounts.push(workspace.clone());
+            command(
+                Command::new("mount")
+                    .arg("--bind")
+                    .arg(format!(
+                        "/proc/{}/fd/{}",
+                        std::process::id(),
+                        disk.as_raw_fd()
+                    ))
+                    .arg(&workspace),
+            );
+            helper_fs::chown(&disk, uid).unwrap();
+            requests
+        } else {
+            requests
+        };
+        for (path, mut body) in requests {
             // Only the host-side device name is fixture-specific; the guest
             // interface and every boot/drive/vsock request stay production's.
             if path == "/network-interfaces/eth0" {
@@ -556,10 +613,30 @@ fn isolated_vm(fill: bool) {
             .unwrap()
             .block_on(async {
                 let probe = async {
-                    if fill {
-                        refuse_run_probe(&short_root, id).await;
-                    } else {
-                        run_probe(&short_root, &base, id).await;
+                    match &probe {
+                        Probe::Fill => refuse_run_probe(&short_root, id).await,
+                        #[cfg(feature = "job-cache-vm-tests")]
+                        Probe::Cache(prepared) => {
+                            let source = prepared.probe();
+                            run_probe(
+                                &short_root,
+                                &base,
+                                id,
+                                &cache_write::probe_files(&source),
+                                "PASS job cache:",
+                            )
+                            .await;
+                        }
+                        _ => {
+                            run_probe(
+                                &short_root,
+                                &base,
+                                id,
+                                &[("probe.py", PROBE)],
+                                "PASS job sandbox:",
+                            )
+                            .await
+                        }
                     }
                 };
                 tokio::time::timeout(Duration::from_secs(75), probe)

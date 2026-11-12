@@ -108,6 +108,7 @@ struct Fake {
     guest_identity: Mutex<Vec<Value>>,
     admin_requests: Mutex<Vec<(String, Value)>>,
     write_block_reply: Mutex<Option<Value>>,
+    write_block_errors: Mutex<usize>,
     recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
     /// A refusal the fake runner sends instead of `accepted` for a Run.
     refuse_run: Mutex<Option<Value>>,
@@ -310,6 +311,11 @@ impl Control for Fake {
                 .lock()
                 .unwrap()
                 .push((job.into(), request.clone()));
+            let mut errors = self.write_block_errors.lock().unwrap();
+            if *errors > 0 {
+                *errors -= 1;
+                anyhow::bail!("cache block exchange disconnected");
+            }
             return Ok(self
                 .write_block_reply
                 .lock()

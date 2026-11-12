@@ -1902,7 +1902,8 @@ impl Runtime {
             Err(std::sync::TryLockError::Poisoned(_)) => panic!("tenant operations lock poisoned"),
         };
         self.ensure_locked(&tenant, unix_ms())?;
-        self.sync_remote_cache_write_block(&tenant, false);
+        self.sync_remote_cache_write_block(&tenant, false)
+            .map_err(|_| Error::Refused(Refusal::InternalFailure))?;
         self.start_events(tenant.clone());
         let mut stream = self.control.relay(&tenant, 52).map_err(|error| {
             tracing::error!(tenant, port = 52, detail = %error, "tenant_job_relay_failed");
