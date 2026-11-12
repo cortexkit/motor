@@ -55,6 +55,7 @@ pub enum Behavior {
     CompleteRun,
     ConnectFailure,
     DropHave,
+    DropHaveThenRefuse(&'static str),
     Refuse(&'static str),
     RefuseAttach(&'static str),
     BrokerRefuseAttach,
@@ -63,6 +64,7 @@ pub enum Behavior {
     DropTerminal,
     WrongHost,
     DropRunAck,
+    DropRunAckRefuseAttach(&'static str),
     WrongHello,
     ReturnCapFailure,
     /// The run connection carries `Started` and the first output record; the
@@ -410,7 +412,10 @@ impl Harness {
                         };
                         if let Some(reason) = queued.or(match behavior {
                             Behavior::Refuse(reason) if purpose == Purpose::Run => Some(reason),
-                            Behavior::RefuseAttach(reason) if purpose == Purpose::Attach => {
+                            Behavior::RefuseAttach(reason)
+                            | Behavior::DropRunAckRefuseAttach(reason)
+                                if purpose == Purpose::Attach =>
+                            {
                                 Some(reason)
                             }
                             _ => None,
@@ -533,6 +538,10 @@ impl Harness {
                                     .unwrap();
                                 }
                                 Frame::Have { repositories, .. } => {
+                                    if let Behavior::DropHaveThenRefuse(reason) = behavior {
+                                        host_refusals.lock().unwrap().push_back(reason);
+                                        return;
+                                    }
                                     if matches!(behavior, Behavior::DropHave) {
                                         return;
                                     }
@@ -587,7 +596,10 @@ impl Harness {
                                             .await;
                                         return;
                                     }
-                                    if matches!(behavior, Behavior::DropRunAck) {
+                                    if matches!(
+                                        behavior,
+                                        Behavior::DropRunAck | Behavior::DropRunAckRefuseAttach(_)
+                                    ) {
                                         return;
                                     }
                                     if matches!(
