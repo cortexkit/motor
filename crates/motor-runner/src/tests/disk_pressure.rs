@@ -616,7 +616,11 @@ fn job_vm_admission_clears_its_own_incremental_caches_under_the_eviction_goal() 
         let cache = incremental.clone();
         // Floor 100, eviction goal 200 (twice the floor).
         let mut c = config(&f, move |_| {
-            Ok(if under_goal && cache.exists() { 150 } else { 250 })
+            Ok(if under_goal && cache.exists() {
+                150
+            } else {
+                250
+            })
         });
         c.manual_tick = true;
         c.tenant_vm = true;
