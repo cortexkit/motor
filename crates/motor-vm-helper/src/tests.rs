@@ -211,6 +211,70 @@ fn job_vm_settings_require_a_separate_uid_range_and_a_slice_ceiling() {
         assert!(config.validate_resources().is_err());
     }
 }
+#[cfg(target_os = "linux")]
+fn fixed_path_boot_config(roots: &[&str]) -> config::Config {
+    let mut config: config::Config =
+        serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();
+    config.job_vms = Some(config::JobVms {
+        workspace_disk_max_bytes: Some(u64::MAX - 511),
+        fixed_path_repositories: std::collections::BTreeMap::from([(
+            "acct:01KXJJHK4V6DB42W1YAN2XD9QN".into(),
+            roots.iter().map(|root| (*root).into()).collect(),
+        )]),
+        uid_base: 500000,
+        uid_count: 128,
+        memory_max_bytes: 1073741824,
+    });
+    config
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixed_path_boot_validation_refuses_three_long_roots_and_names_account() {
+    let config = fixed_path_boot_config(&[
+        "/Users/ufukaltinok/Work/Projects/CortexKit/motor",
+        "/Users/ufukaltinok/Work/Projects/CortexKit/aft",
+        "/Users/ufukaltinok/Work/Projects/CortexKit/broca",
+    ]);
+    for error in [
+        config.validate_resources().unwrap_err(),
+        config.validate().unwrap_err(),
+    ] {
+        assert!(error.0.contains("acct:01KXJJHK4V6DB42W1YAN2XD9QN"));
+        assert!(error.0.contains("1638 bytes"), "{error}");
+        assert!(error.0.contains("1536-byte command-line budget"), "{error}");
+        assert!(error.0.contains("'*' or fewer roots"), "{error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixed_path_boot_validation_measures_lists_larger_than_the_runner_argument_limit() {
+    let root = format!("/{}", "x".repeat(17 * 1024));
+    let error = fixed_path_boot_config(&[&root]).validate().unwrap_err();
+    assert!(error.0.contains("acct:01KXJJHK4V6DB42W1YAN2XD9QN"));
+    assert!(error.0.contains("job VM boot arguments are"), "{error}");
+    assert!(error.0.contains("1536-byte command-line budget"), "{error}");
+    assert!(error.0.contains("'*' or fewer roots"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixed_path_boot_validation_accepts_two_long_roots() {
+    fixed_path_boot_config(&[
+        "/Users/ufukaltinok/Work/Projects/CortexKit/motor",
+        "/Users/ufukaltinok/Work/Projects/CortexKit/aft",
+    ])
+    .validate()
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixed_path_boot_validation_accepts_whole_account_wildcard() {
+    fixed_path_boot_config(&["*"]).validate().unwrap();
+}
+
 fn fixture() -> (Helper<Fake>, u64, u64) {
     let mut h = Helper::new(Fake::default(), 1, vec![1000]).unwrap();
     let a = h

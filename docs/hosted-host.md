@@ -412,6 +412,9 @@ Before switching:
    source metadata. Job and Fill VMs receive the same policy for their own
    account; Recovery VMs receive none. Malformed maps are refused at helper
    startup and by `check-config`.
+   The list travels on a job VM's boot command line, so settings validation refuses
+   lists too long to fit. Use `"*"` to enable every repository of the account, or list
+   fewer roots.
 4. [Drain the host](#drain-the-host-for-an-update), wait for `draining: true`, then
    run from the installed checkout:
 

@@ -167,6 +167,8 @@ impl Config {
                     "workspace_disk_max_bytes must be positive and sector aligned".into(),
                 ));
             }
+            #[cfg(target_os = "linux")]
+            crate::linux::job::validate_fixed_path_boot_command_lines(jobs)?;
         }
         if count == 0
             || self.allowed_uids.is_empty()

@@ -582,6 +582,64 @@ fn configured_fixed_paths_are_included_in_the_early_boot_budget() {
 }
 
 #[test]
+fn fixed_path_validation_worst_case_bounds_real_job_and_fill_boot_lines() {
+    let account = "acct:01KXJJHK4V6DB42W1YAN2XD9QN";
+    let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
+    for ceiling in [Some(4 << 30), Some(1024 << 30), Some(u64::MAX - 511), None] {
+        let mut settings = fixed_path_settings(json!({
+            account: ["/Users/ufukaltinok/Work/Projects/CortexKit/motor"]
+        }));
+        settings.workspace_disk_max_bytes = ceiling;
+        let roots = &settings.fixed_path_repositories[account];
+        let worst = worst_case_fixed_path_boot_command_line(&settings, account, roots).unwrap();
+        let maximum_disk = ceiling.unwrap_or(u64::MAX - 511);
+        let mut reached_worst = false;
+        for bytes in [512, 4 << 30, maximum_disk] {
+            for vcpus in [1, 9, 10, 32] {
+                for kind in [job::VmKind::Job, job::VmKind::Fill] {
+                    for cache_nonce in [None, Some(nonce.as_str())] {
+                        let mut shape = start();
+                        shape.account = account.into();
+                        shape.vcpus = vcpus;
+                        shape.kind = kind;
+                        let registry = disk_registry(&shape);
+                        let mut requests = recorded_boot_requests(
+                            &shape,
+                            Some(17),
+                            cache_nonce,
+                            bytes,
+                            &registry,
+                            &settings,
+                        )
+                        .unwrap();
+                        authorize_job_write_boot(
+                            &mut requests,
+                            &shape,
+                            cache_nonce,
+                            kind == job::VmKind::Job && cache_nonce.is_some(),
+                        )
+                        .unwrap();
+                        let actual = requests[1].1["boot_args"].as_str().unwrap();
+                        assert!(
+                            worst.len() >= actual.len(),
+                            "validation reserved {} bytes, start needs {} (ceiling={ceiling:?}, disk={bytes}, vcpus={vcpus}, kind={kind:?}, remote_cache={})",
+                            worst.len(),
+                            actual.len(),
+                            cache_nonce.is_some(),
+                        );
+                        reached_worst |= worst.len() == actual.len();
+                    }
+                }
+            }
+        }
+        assert!(
+            reached_worst,
+            "maximum settings must reach the reserved length"
+        );
+    }
+}
+
+#[test]
 fn runner_policy_matches_provisioning_for_small_large_and_cache_enabled_disks() {
     let script =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../script/tenant-provision/provision.py");

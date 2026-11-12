@@ -25,6 +25,8 @@ use std::{
 
 const JOB_OOM_SCORE: i32 = 1000;
 const JOB_BOOT_CMDLINE_MAX_BYTES: usize = 1536;
+const JOB_CACHE_WRITE_BOOT_SUFFIX: &str = " motor.cache_write=1";
+const FILL_BOOT_SUFFIX: &str = " motor.fill=1";
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 // Without huge pages, the guest defaults to reporting only whole 4 MiB blocks.
@@ -1372,6 +1374,17 @@ fn runner_args(
     remote_cache: bool,
     fixed_paths: Option<(&str, &[String])>,
 ) -> Result<String> {
+    let text = build_runner_args(start, disk_bytes, remote_cache, fixed_paths)?;
+    crate::tenant::activation::validate_runner_args(&text)?;
+    Ok(text)
+}
+
+fn build_runner_args(
+    start: &Start,
+    disk_bytes: u64,
+    remote_cache: bool,
+    fixed_paths: Option<(&str, &[String])>,
+) -> Result<String> {
     start.validate()?;
     if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
         return Err(Error("invalid job workspace disk length".into()));
@@ -1400,8 +1413,53 @@ fn runner_args(
             text.push_str(&format!(" --fixed-path-repository {root}"));
         }
     }
-    crate::tenant::activation::validate_runner_args(&text)?;
     Ok(text)
+}
+
+pub(crate) fn validate_fixed_path_boot_command_lines(settings: &JobVms) -> Result<()> {
+    for (account, roots) in &settings.fixed_path_repositories {
+        let line = worst_case_fixed_path_boot_command_line(settings, account, roots)?;
+        if line.len() >= JOB_BOOT_CMDLINE_MAX_BYTES {
+            return Err(Error(format!(
+                "job_vms.fixed_path_repositories for {account}: worst-case job VM boot arguments are {} bytes, exceeding the {JOB_BOOT_CMDLINE_MAX_BYTES}-byte command-line budget (including NUL); use '*' or fewer roots",
+                line.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn worst_case_fixed_path_boot_command_line(
+    settings: &JobVms,
+    account: &str,
+    roots: &[String],
+) -> Result<String> {
+    let start = Start {
+        job_id: "00000000-0000-7000-8000-000000000000".into(),
+        account: account.into(),
+        workspace_disk_id: "disk".into(),
+        image_generation_id: "image".into(),
+        kind: job::VmKind::Job,
+        // Start::validate permits at most 32 vCPUs. Other shape fields do not
+        // appear on the boot line, but must form a valid start request.
+        vcpus: 32,
+        memory_mib: 1,
+        burst_mib: None,
+        cache_write_blocked: false,
+    };
+    // Without a provisioning ceiling, existing sector-aligned disks may still
+    // boot. Reserve the largest representable disk in that case.
+    let workspace_bytes = settings.workspace_disk_max_bytes.unwrap_or(u64::MAX - 511);
+    let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
+    // Measure before the runner's separate argument-size check, so even very
+    // long lists report the account and the actual boot-line budget overrun.
+    let text = build_runner_args(&start, workspace_bytes, true, Some((account, roots)))?;
+    let line = build_boot_command_line(&start, Some(&nonce), &text)?;
+    let suffix = [JOB_CACHE_WRITE_BOOT_SUFFIX, FILL_BOOT_SUFFIX]
+        .into_iter()
+        .max_by_key(|suffix| suffix.len())
+        .unwrap();
+    Ok(format!("{line}{suffix}"))
 }
 
 fn early_boot_command_line(
@@ -1414,9 +1472,9 @@ fn early_boot_command_line(
     let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
     let line = boot_command_line(start, Some(&nonce), workspace_bytes, fixed_paths)?;
     if start.kind == job::VmKind::Fill {
-        checked_boot_command_line(format!("{line} motor.fill=1"))
+        checked_boot_command_line(format!("{line}{FILL_BOOT_SUFFIX}"))
     } else if start.kind == job::VmKind::Job {
-        checked_boot_command_line(format!("{line} motor.cache_write=1"))?;
+        checked_boot_command_line(format!("{line}{JOB_CACHE_WRITE_BOOT_SUFFIX}"))?;
         Ok(line)
     } else {
         Ok(line)
@@ -1462,7 +1520,7 @@ fn authorize_fill_boot(requests: &mut [(&str, Value)], role: job::WorkspaceRole)
         let args = boot["boot_args"]
             .as_str()
             .ok_or_else(|| Error("missing boot arguments".into()))?;
-        boot["boot_args"] = checked_boot_command_line(format!("{args} motor.fill=1"))?.into();
+        boot["boot_args"] = checked_boot_command_line(format!("{args}{FILL_BOOT_SUFFIX}"))?.into();
     }
     Ok(())
 }
@@ -1487,7 +1545,7 @@ fn authorize_job_write_boot(
             .as_str()
             .ok_or_else(|| Error("missing boot arguments".into()))?;
         boot["boot_args"] =
-            checked_boot_command_line(format!("{args} motor.cache_write=1"))?.into();
+            checked_boot_command_line(format!("{args}{JOB_CACHE_WRITE_BOOT_SUFFIX}"))?.into();
     }
     Ok(())
 }
@@ -1527,6 +1585,19 @@ fn boot_command_line(
     workspace_bytes: u64,
     fixed_paths: Option<(&str, &[String])>,
 ) -> Result<String> {
+    let text = if start.kind == job::VmKind::Recovery {
+        String::new()
+    } else {
+        runner_args(start, workspace_bytes, nonce.is_some(), fixed_paths)?
+    };
+    checked_boot_command_line(build_boot_command_line(start, nonce, &text)?)
+}
+
+fn build_boot_command_line(
+    start: &Start,
+    nonce: Option<&str>,
+    runner_text: &str,
+) -> Result<String> {
     if nonce.is_some_and(|nonce| {
         nonce.len() != REMOTE_CACHE_DRIVE_NONCE_BYTES * 2
             || !nonce
@@ -1543,8 +1614,7 @@ fn boot_command_line(
     let args = if start.kind == job::VmKind::Recovery {
         format!("{JOB_BOOT_ARGS} motor.recovery=1")
     } else {
-        let text = runner_args(start, workspace_bytes, nonce.is_some(), fixed_paths)?;
-        let encoded: String = text
+        let encoded: String = runner_text
             .as_bytes()
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -1555,7 +1625,7 @@ fn boot_command_line(
         Some(nonce) => format!("{args} {REMOTE_CACHE_NONCE_CMDLINE_KEY}={nonce}"),
         None => args,
     };
-    checked_boot_command_line(boot_args)
+    Ok(boot_args)
 }
 
 /// Client Git bundles stream to the guest runner over vsock, never a drive.
