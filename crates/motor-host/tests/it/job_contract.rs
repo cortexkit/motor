@@ -191,12 +191,16 @@ fn git(path: &Path, args: &[&str]) -> String {
     )
 }
 
-async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid, source: &str, verdict: &str) {
+fn probe_checkout(scratch: &Path, files: &[(&str, &str)]) -> PathBuf {
     let repo = scratch.join("repo");
     fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "--quiet"]);
-    fs::write(repo.join("probe.py"), source).unwrap();
-    git(&repo, &["add", "probe.py"]);
+    for (name, source) in files {
+        let path = repo.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+        git(&repo, &["add", "--", name]);
+    }
     git(
         &repo,
         &[
@@ -212,6 +216,17 @@ async fn run_probe(root: &Path, scratch: &Path, id: uuid::Uuid, source: &str, ve
             "contract probe",
         ],
     );
+    repo
+}
+
+async fn run_probe(
+    root: &Path,
+    scratch: &Path,
+    id: uuid::Uuid,
+    files: &[(&str, &str)],
+    verdict: &str,
+) {
+    let repo = probe_checkout(scratch, files);
     let commit = git(&repo, &["rev-parse", "HEAD"]);
     let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
     let reference = format!("refs/ck-motor/{id}/snapshot");
@@ -591,10 +606,26 @@ fn isolated_vm(probe: Probe) {
                         Probe::Fill => refuse_run_probe(&short_root, id).await,
                         #[cfg(feature = "job-cache-vm-tests")]
                         Probe::Cache(prepared) => {
-                            run_probe(&short_root, &base, id, &prepared.probe(), "PASS job cache:")
-                                .await;
+                            let source = prepared.probe();
+                            run_probe(
+                                &short_root,
+                                &base,
+                                id,
+                                &cache_write::probe_files(&source),
+                                "PASS job cache:",
+                            )
+                            .await;
                         }
-                        _ => run_probe(&short_root, &base, id, PROBE, "PASS job sandbox:").await,
+                        _ => {
+                            run_probe(
+                                &short_root,
+                                &base,
+                                id,
+                                &[("probe.py", PROBE)],
+                                "PASS job sandbox:",
+                            )
+                            .await
+                        }
                     }
                 };
                 tokio::time::timeout(Duration::from_secs(75), probe)

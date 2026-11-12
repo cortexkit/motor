@@ -255,10 +255,30 @@ impl Prepared {
     }
 
     pub fn probe(&self) -> String {
-        let writable = self.writable.load(Ordering::SeqCst);
-        format!(
-            r#"import os, socket
-assert os.environ['SCCACHE_S3_RW_MODE'] == '{mode}', dict(os.environ)
+        probe_source(self.case, self.writable.load(Ordering::SeqCst))
+    }
+}
+
+// The production sandbox exposes sccache only for a Cargo checkout. A Python-
+// only socket probe would receive neither its socket nor its cache environment.
+pub(super) fn probe_files(source: &str) -> [(&'static str, &str); 3] {
+    [
+        ("probe.py", source),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"cache-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        ),
+        ("src/lib.rs", "pub fn cache_probe() {}\n"),
+    ]
+}
+
+fn probe_source(case: &str, writable: bool) -> String {
+    format!(
+        r#"import os, socket
+def redacted_environment():
+    sensitive = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL', 'COOKIE', 'AUTH', 'NONCE')
+    return {{name: '<redacted>' if any(part in name.upper() for part in sensitive) else value for name, value in os.environ.items()}}
+assert os.environ.get('SCCACHE_S3_RW_MODE') == '{mode}', {{'expected': '{mode}', 'actual': os.environ.get('SCCACHE_S3_RW_MODE'), 'cargo_manifest': os.path.isfile('Cargo.toml'), 'gateway_sockets': sorted(os.listdir('/motor-gateway')) if os.path.isdir('/motor-gateway') else [], 'environment': redacted_environment()}}
 assert 'SCCACHE_RECACHE' not in os.environ
 assert 'SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY' not in os.environ
 s = socket.socket(socket.AF_UNIX)
@@ -279,11 +299,10 @@ if os.path.exists('/motor-gateway/ccache.sock'):
 assert not os.access('/run/motor/cache/write-key', os.R_OK)
 print('PASS job cache: {case} {mode} PUT {status}')
 "#,
-            mode = if writable { "READ_WRITE" } else { "READ_ONLY" },
-            status = if writable { 503 } else { 403 },
-            case = self.case
-        )
-    }
+        mode = if writable { "READ_WRITE" } else { "READ_ONLY" },
+        status = if writable { 503 } else { 403 },
+        case = case
+    )
 }
 
 /// Boots real production guests, but uses the helper's root-only scratch seam
@@ -316,5 +335,63 @@ fn isolated_job_cache_write_authority_and_guest_binding() {
             prepared.writable.store(false, Ordering::SeqCst);
             isolated_vm(Probe::Cache(prepared));
         }
+    }
+}
+
+#[test]
+fn cache_probe_checkout_tracks_cargo_project_for_sccache() {
+    let scratch = tempfile::Builder::new()
+        .prefix("motor-cache-probe-checkout-")
+        .tempdir_in(cortexkit_test_support::scratch_root())
+        .unwrap();
+    let repo = probe_checkout(scratch.path(), &probe_files(&probe_source("valid", true)));
+    assert!(
+        repo.join("Cargo.toml").is_file(),
+        "sccache selection requires Cargo.toml in the job checkout"
+    );
+    assert!(git(&repo, &["show", "HEAD:Cargo.toml"]).contains("[package]"));
+    assert!(git(&repo, &["show", "HEAD:src/lib.rs"]).contains("pub fn cache_probe()"));
+    assert!(git(&repo, &["show", "HEAD:probe.py"]).contains("READ_WRITE"));
+}
+
+#[test]
+fn cache_probe_missing_or_wrong_mode_reports_redacted_environment() {
+    let scratch = tempfile::Builder::new()
+        .prefix("motor-cache-probe-diagnostics-")
+        .tempdir_in(cortexkit_test_support::scratch_root())
+        .unwrap();
+    let source = probe_source("valid", true);
+    let repo = probe_checkout(scratch.path(), &probe_files(&source));
+    let sensitive = [
+        ("AWS_SECRET_ACCESS_KEY", "secret-value-must-not-appear"),
+        ("SCCACHE_S3_KEY_PREFIX", "key-value-must-not-appear"),
+        ("session_token", "token-value-must-not-appear"),
+        ("AUTHORIZATION", "auth-value-must-not-appear"),
+    ];
+    for mode in [None, Some("READ_ONLY")] {
+        let mut probe = Command::new("python3");
+        probe
+            .args(["-c", &source])
+            .current_dir(&repo)
+            .env_clear()
+            .env("SAFE_PROBE_CONTEXT", "visible-diagnostic-context")
+            .envs(sensitive);
+        if let Some(mode) = mode {
+            probe.env("SCCACHE_S3_RW_MODE", mode);
+        }
+        let output = probe
+            .output()
+            .expect("python3 required for cache probe diagnostics");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("AssertionError:"), "{stderr}");
+        assert!(stderr.contains("visible-diagnostic-context"), "{stderr}");
+        assert!(stderr.contains("'cargo_manifest': True"), "{stderr}");
+        assert!(stderr.contains("<redacted>"), "{stderr}");
+        for (key, value) in sensitive {
+            assert!(stderr.contains(key), "{stderr}");
+            assert!(!stderr.contains(value), "{stderr}");
+        }
+        assert!(!stderr.contains("KeyError:"), "{stderr}");
     }
 }
