@@ -232,11 +232,13 @@ impl Host {
 
     pub fn record_host_resources(&mut self, resources: HostResources) {
         self.host_resources = Some(resources);
+        self.job_vm_file_mib = None;
         self.host_resources_failed.set(false);
     }
 
     pub(crate) fn host_resources_unavailable(&mut self, detail: &str) {
         self.host_resources = None;
+        self.job_vm_file_mib = None;
         if !self.host_resources_failed.replace(true) {
             tracing::warn!(detail, "host_resources_unavailable");
         }
@@ -272,6 +274,73 @@ impl Host {
             .values()
             .filter(|f| !f.runner_hello)
             .fold(free, |free, f| free.saturating_sub(f.memory_debit_mib))
+    }
+
+    pub(crate) fn log_job_memory(&self, now_ms: u64, free_mem_mib: u64) {
+        let HostSettings::PerJob(settings) = &self.settings else {
+            return;
+        };
+        if self.job_memory_logged.get().is_some_and(|(at_ms, free)| {
+            now_ms >= at_ms && now_ms - at_ms < 60_000 && free.abs_diff(free_mem_mib) < 1024
+        }) {
+            return;
+        }
+        self.job_memory_logged.set(Some((now_ms, free_mem_mib)));
+        let sample = self.fresh_host_resources(now_ms);
+        let mut booting_memory_debit_mib = 0u64;
+        let mut running_memory_debit_mib = 0u64;
+        let mut disk_waiters = 0u64;
+        for job in self
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .filter(|e| !e.ended)
+        {
+            if !job.boot_started {
+                if !self.job_boot_disk_ready(&job.claims.jti) {
+                    disk_waiters += 1;
+                }
+            } else if job.runner_hello {
+                // Running VMs are already charged in the host/cgroup samples;
+                // their admission debits are diagnostic, not subtracted again.
+                running_memory_debit_mib =
+                    running_memory_debit_mib.saturating_add(job.memory_debit_mib);
+            } else {
+                booting_memory_debit_mib =
+                    booting_memory_debit_mib.saturating_add(job.memory_debit_mib);
+            }
+        }
+        let recovery_memory_debit_mib = self
+            .snapshot
+            .per_job
+            .disks
+            .values()
+            .filter_map(|disk| disk.recovery.as_ref())
+            .fold(0u64, |sum, recovery| {
+                sum.saturating_add(recovery.memory_debit_mib)
+            });
+        let fill_memory_debit_mib = self
+            .snapshot
+            .per_job
+            .fills
+            .values()
+            .filter(|fill| !fill.runner_hello)
+            .fold(0u64, |sum, fill| sum.saturating_add(fill.memory_debit_mib));
+        tracing::info!(
+            free_mem_mib,
+            available_mem_mib = sample.map(|s| s.available_mem_mib),
+            job_vm_headroom_mib = sample.map(|s| s.job_vm_headroom_mib),
+            job_vm_file_mib = sample.and(self.job_vm_file_mib),
+            host_reserve_mib = settings.host_reserve_mib,
+            booting_memory_debit_mib,
+            running_memory_debit_mib,
+            running_subtracted_mib = 0u64,
+            recovery_memory_debit_mib,
+            fill_memory_debit_mib,
+            disk_waiters,
+            "job_memory_advertised"
+        );
     }
 
     pub(crate) fn fresh_host_resources(&self, now_ms: u64) -> Option<HostResources> {

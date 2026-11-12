@@ -138,6 +138,12 @@ pub trait Control: Send + Sync {
     fn job_vm_headroom_mib(&self) -> Result<u64> {
         anyhow::bail!("job-VM cgroup memory unavailable")
     }
+    fn job_vm_memory(&self) -> Result<JobVmMemory> {
+        Ok(JobVmMemory {
+            headroom_mib: self.job_vm_headroom_mib()?,
+            file_mib: None,
+        })
+    }
     fn online_cpus(&self) -> Result<u32>;
     /// Reads the host capacity file. Without one, the storage refusal stays
     /// latched and free memory is advertised as 0.
@@ -153,6 +159,12 @@ pub trait Control: Send + Sync {
         ensure!(reply["ok"] == true, "tenant runner status refused");
         Ok(RunnerSample::from_health(&reply["health"]))
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct JobVmMemory {
+    pub headroom_mib: u64,
+    pub file_mib: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -251,9 +263,22 @@ pub struct Helper {
 }
 impl Helper {
     fn request(&self, request: Value) -> Result<(Value, Vec<OwnedFd>)> {
+        self.request_logged(request, false)
+    }
+
+    fn request_logged(&self, request: Value, boot_retry: bool) -> Result<(Value, Vec<OwnedFd>)> {
         let started = std::time::Instant::now();
         let deadline = helper_reply_deadline(&request);
-        tracing::info!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], reply_timeout_ms = deadline.as_millis() as u64, "helper_request");
+        let routine = boot_retry
+            || matches!(
+                request["op"].as_str(),
+                Some("adopt_job" | "job_exits" | "workspace_usage")
+            );
+        if routine {
+            tracing::debug!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], reply_timeout_ms = deadline.as_millis() as u64, "helper_request");
+        } else {
+            tracing::info!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], reply_timeout_ms = deadline.as_millis() as u64, "helper_request");
+        }
         let result = UnixStream::connect(&self.socket)
             .with_context(|| format!("connect helper socket {}", self.socket.display()))
             .and_then(|stream| exchange_helper(stream, &request))
@@ -267,14 +292,32 @@ impl Helper {
                 )
             });
         match &result {
+            Ok((reply, _)) if routine => {
+                tracing::debug!(op = %request["op"], tenant = %request["tenant"], result = %reply["result"], running = %reply["running"], restored = %reply["restored"], generation = %reply["generation"], elapsed_ms = started.elapsed().as_millis() as u64, "helper_reply")
+            }
             Ok((reply, _)) => {
                 tracing::info!(op = %request["op"], tenant = %request["tenant"], result = %reply["result"], running = %reply["running"], restored = %reply["restored"], generation = %reply["generation"], elapsed_ms = started.elapsed().as_millis() as u64, "helper_reply")
+            }
+            Err(error) if boot_retry => {
+                tracing::debug!(op = %request["op"], tenant = %request["tenant"], detail = %format!("{error:#}"), "helper_boot_relay_retry")
             }
             Err(error) => {
                 tracing::warn!(op = %request["op"], tenant = %request["tenant"], detail = %format!("{error:#}"), "helper_request_failed")
             }
         }
         result
+    }
+
+    fn open_job_relay(&self, job: &str, port: u32, boot_retry: bool) -> Result<UnixStream> {
+        let (reply, mut fds) = self.request_logged(
+            json!({"op":"open_job_relay", "job_id":job, "port":port}),
+            boot_retry,
+        )?;
+        ensure!(
+            reply["result"] == "relay" && fds.len() == 1,
+            "job VM relay refused"
+        );
+        Ok(UnixStream::from(fds.remove(0)))
     }
 }
 
@@ -518,16 +561,14 @@ impl Control for Helper {
         Ok(())
     }
     fn job_relay(&self, job: &str, port: u32) -> Result<UnixStream> {
-        let (reply, mut fds) =
-            self.request(json!({"op":"open_job_relay", "job_id":job, "port":port}))?;
-        ensure!(
-            reply["result"] == "relay" && fds.len() == 1,
-            "job VM relay refused"
-        );
-        Ok(UnixStream::from(fds.remove(0)))
+        self.open_job_relay(job, port, false)
     }
     fn job_admin_after_start(&self, job: &str, request: &Value, wait: Duration) -> Result<Value> {
-        let stream = open_after_start(|| self.job_relay(job, 54), wait)?;
+        let stream =
+            open_after_start(|| self.open_job_relay(job, 54, true), wait).map_err(|error| {
+                tracing::warn!(job, %error, "helper_boot_relay_failed");
+                error
+            })?;
         exchange_control(stream, job, request, control_read_deadline(request))
     }
     fn pressure_cgroup(&self, tenant: &str) -> Option<&Path> {
@@ -752,9 +793,12 @@ impl Control for Helper {
         crate::server::host_available_mib(&std::fs::read_to_string("/proc/meminfo")?)
     }
     fn job_vm_headroom_mib(&self) -> Result<u64> {
+        Ok(self.job_vm_memory()?.headroom_mib)
+    }
+    fn job_vm_memory(&self) -> Result<JobVmMemory> {
         #[cfg(target_os = "linux")]
         {
-            crate::server::job_vm_headroom_mib(Path::new(motor_vm_helper::linux::cgroup::JOB_SLICE))
+            crate::server::job_vm_memory(Path::new(motor_vm_helper::linux::cgroup::JOB_SLICE))
         }
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("job-VM cgroup memory requires Linux")
@@ -1078,6 +1122,55 @@ mod helper_deadline_tests {
 
     const REPLY: &[u8] =
         b"{\"result\":\"tenant\",\"running\":false,\"restored\":false,\"generation\":7}\n";
+
+    #[test]
+    fn routine_helper_logs_are_debug_but_failures_and_state_changes_remain_visible() {
+        let scratch = cortexkit_test_support::scratch_root();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let root = tempfile::tempdir_in(scratch).unwrap();
+        let helper = Helper {
+            socket: root.path().join("helper.sock"),
+            storage: root.path().into(),
+            capacity: root.path().join("capacity.json"),
+            guest_init: BTreeMap::new(),
+            vcpu_ceiling: BTreeMap::new(),
+            pressure_cgroups: BTreeMap::new(),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&helper.socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                stream.write_all(REPLY).unwrap();
+            }
+        });
+        for (op, boot_retry, level) in [
+            ("adopt_job", false, "DEBUG"),
+            ("job_exits", false, "DEBUG"),
+            ("workspace_usage", false, "DEBUG"),
+            ("open_job_relay", true, "DEBUG"),
+            ("stop_job", false, "INFO"),
+        ] {
+            let logs = crate::test_logs::capture(|| {
+                helper.request_logged(json!({"op":op}), boot_retry).unwrap();
+            });
+            assert_eq!(logs.len(), 2, "{logs:?}");
+            assert!(logs.iter().all(|line| line.starts_with(level)), "{logs:?}");
+        }
+        worker.join().unwrap();
+        for (boot_retry, level) in [(false, "WARN"), (true, "DEBUG")] {
+            let logs = crate::test_logs::capture(|| {
+                assert!(helper
+                    .request_logged(json!({"op":"open_job_relay"}), boot_retry)
+                    .is_err());
+            });
+            assert_eq!(logs.len(), 2, "{logs:?}");
+            assert!(logs[1].starts_with(level), "{logs:?}");
+        }
+    }
 
     #[test]
     fn runner_samples_from_old_guests_have_no_warm_workspaces() {

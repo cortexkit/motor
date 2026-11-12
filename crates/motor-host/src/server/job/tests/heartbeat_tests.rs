@@ -1,6 +1,212 @@
 use super::*;
 
 #[test]
+fn adoption_polling_is_bounded_per_vm_and_exit_reports_do_not_wait_for_it() {
+    let (runtime, fake, _) = fixture();
+    let now = unix_ms();
+    for (job, key) in [(JOB, 5), (JOB2, 6)] {
+        let mut c = claims(job);
+        c.workspace_key_hash = Some(motor_lease::base64url(&[key; 32]));
+        claim(&runtime, &c);
+        let mut host = runtime.host.lock().unwrap();
+        host.begin_job_boot_at(job, now).unwrap().unwrap();
+        host.job_runner_hello(job).unwrap();
+    }
+    let count = |job: &str| {
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == format!("adopt:{job}"))
+            .count()
+    };
+    for offset in (0..2000).step_by(10) {
+        runtime.tick_jobs(now + offset).unwrap();
+    }
+    assert_eq!((count(JOB), count(JOB2)), (1, 1));
+    runtime.tick_jobs(now + 2000).unwrap();
+    assert_eq!((count(JOB), count(JOB2)), (2, 2));
+
+    fake.exits
+        .lock()
+        .unwrap()
+        .push(motor_vm_helper::job::ExitReport {
+            job_id: JOB.into(),
+            oom_kill: 0,
+            egress_bytes: None,
+        });
+    runtime.tick_jobs(now + 3000).unwrap();
+    assert!(runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended);
+    assert_eq!((count(JOB), count(JOB2)), (2, 2));
+    runtime.tick_jobs(now + 4000).unwrap();
+    assert_eq!((count(JOB), count(JOB2)), (2, 3));
+    assert!(!runtime.job_adoptions.lock().unwrap().contains_key(JOB));
+    // A backwards clock must not suppress probing indefinitely.
+    runtime.tick_jobs(now + 3500).unwrap();
+    assert_eq!(count(JOB2), 4);
+}
+
+#[test]
+fn adoption_failures_are_paced_without_delaying_stop_deadlines() {
+    let (runtime, fake, _) = fixture();
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let now = unix_ms();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.begin_job_boot_at(JOB, now).unwrap().unwrap();
+        host.job_runner_hello(JOB).unwrap();
+        host.delivered(id).unwrap();
+        host.job_started(JOB, now).unwrap();
+    }
+    fake.fail_adopt.store(true, Ordering::SeqCst);
+    assert!(runtime.tick_jobs(now).is_err());
+    for offset in (10..2000).step_by(10) {
+        runtime.tick_jobs(now + offset).unwrap();
+    }
+    assert_eq!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("adopt:"))
+            .count(),
+        1
+    );
+    fake.fail_adopt.store(false, Ordering::SeqCst);
+    // Poll just before the absolute execution deadline, then cross it within
+    // the cache interval. The stop must not wait for another liveness probe.
+    let deadline = now + c.max_s * 1000 + crate::billing::BACKSTOP_CANCEL_GRACE_MS;
+    runtime.tick_jobs(deadline - 1).unwrap();
+    runtime.tick_jobs(deadline).unwrap();
+    assert!(runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended);
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(calls.iter().filter(|c| c.starts_with("adopt:")).count(), 2);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| **c == format!("stop:{JOB}"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn memory_advertisement_logs_initial_gib_changes_and_one_minute_refresh() {
+    let (runtime, _, _) = fixture();
+    let mut host = runtime.host.lock().unwrap();
+    let now = unix_ms();
+    let sample = host.fresh_host_resources(now).unwrap();
+    let logs = crate::test_logs::capture(|| {
+        for (offset, free) in [
+            (0, 4000),
+            (1, 5023),
+            (2, 5024),
+            (3, 4000),
+            (60_002, 4000),
+            (60_003, 4000),
+        ] {
+            host.record_host_resources(HostResources {
+                at_ms: now + offset,
+                ..sample
+            });
+            host.heartbeat(now + offset, free, true);
+        }
+        host.snapshot.per_job.dax_failed = true;
+        host.heartbeat(now + 60_004, 4000, true);
+    });
+    let logs: Vec<_> = logs
+        .iter()
+        .filter(|s| s.contains("message=job_memory_advertised "))
+        .collect();
+    assert_eq!(logs.len(), 5, "{logs:?}");
+    for (line, free) in logs.iter().zip([4000, 5024, 4000, 4000, 0]) {
+        assert!(line.starts_with("INFO "), "{line}");
+        assert!(line.contains(&format!("free_mem_mib={free} ")), "{line}");
+    }
+}
+
+#[test]
+fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_waiters() {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.record_host_resources(HostResources {
+            at_ms: now,
+            available_mem_mib: 100_000,
+            job_vm_headroom_mib: 80_000,
+            vcpu_ceiling: 2,
+            permit_budget: 100,
+        });
+        host.reserve_fill(&claims(JOB).sub, &"a".repeat(64), 1000, now)
+            .unwrap()
+            .unwrap();
+    }
+    for (job, key, boot, hello) in [
+        (JOB, 5, true, true),
+        (JOB2, 6, true, false),
+        ("00000000-0000-7000-8000-000000000003", 5, false, false),
+    ] {
+        let mut c = claims(job);
+        c.workspace_key_hash = Some(motor_lease::base64url(&[key; 32]));
+        claim(&runtime, &c);
+        if boot {
+            let mut host = runtime.host.lock().unwrap();
+            host.begin_job_boot_at(job, now).unwrap().unwrap();
+            if hello {
+                host.job_runner_hello(job).unwrap();
+            }
+        }
+    }
+    let mut host = runtime.host.lock().unwrap();
+    let disk = host.snapshot.per_job.executions[JOB2].disk_id.clone();
+    host.snapshot.per_job.disks.get_mut(&disk).unwrap().recovery =
+        Some(crate::state::jobs::recovery::Recovery {
+            id: "00000000-0000-7000-8000-000000000004".into(),
+            memory_debit_mib: 600,
+            guest_ram_mib: 700,
+            started_at_ms: None,
+            phase: crate::state::jobs::recovery::Phase::Reserved,
+        });
+    host.job_vm_file_mib = Some(512);
+    let fill_debit = host
+        .snapshot
+        .per_job
+        .fills
+        .values()
+        .next()
+        .unwrap()
+        .memory_debit_mib;
+    let logs = crate::test_logs::capture(|| {
+        let free = host.job_free_mem_mib(now);
+        assert_eq!(free, 80_000 - 50 - 120 - 600 - fill_debit);
+        host.heartbeat(now, free, true);
+    });
+    let line = logs
+        .iter()
+        .find(|s| s.contains("message=job_memory_advertised "))
+        .unwrap();
+    for field in [
+        "available_mem_mib=100000 ",
+        "job_vm_headroom_mib=80000 ",
+        "job_vm_file_mib=512 ",
+        "host_reserve_mib=50 ",
+        "booting_memory_debit_mib=120 ",
+        "running_memory_debit_mib=120 ",
+        "running_subtracted_mib=0 ",
+        "recovery_memory_debit_mib=600 ",
+        "disk_waiters=1 ",
+    ] {
+        assert!(line.contains(field), "missing {field}: {line}");
+    }
+    assert!(
+        line.contains(&format!("fill_memory_debit_mib={fill_debit} ")),
+        "{line}"
+    );
+}
+
+#[test]
 fn periodic_exit_polling_is_bounded_but_explicit_collection_remains_immediate() {
     let (runtime, fake, _) = fixture();
     let now = unix_ms();
@@ -133,6 +339,7 @@ fn slice_file_pages_are_reclaimable_but_anon_and_kernel_are_not() {
     // 1000 MiB limit - (990 MiB charged - 200 MiB file) = 210 MiB.
     let headroom = job_vm_headroom_mib(&slice).unwrap();
     assert_eq!(headroom, 210);
+    assert_eq!(job_vm_memory(&slice).unwrap().file_mib, Some(200));
     *fake.slice_headroom_mib.lock().unwrap() = Some(headroom);
     fake.capacity_available.store(true, Ordering::SeqCst);
     runtime.host.lock().unwrap().enforce_storage();

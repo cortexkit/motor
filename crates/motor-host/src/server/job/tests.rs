@@ -95,6 +95,7 @@ struct Fake {
     gone: Mutex<BTreeSet<String>>,
     fail_ack: AtomicBool,
     fail_poll: AtomicBool,
+    fail_adopt: AtomicBool,
     exit_polls: std::sync::atomic::AtomicU64,
     disconnect_on_run: AtomicBool,
     acknowledgements: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
@@ -350,6 +351,10 @@ impl Control for Fake {
     }
     fn adopt_job(&self, job: &str) -> Result<bool> {
         self.calls.lock().unwrap().push(format!("adopt:{job}"));
+        ensure!(
+            !self.fail_adopt.load(Ordering::SeqCst),
+            "adoption unavailable"
+        );
         Ok(!self.gone.lock().unwrap().contains(job))
     }
     fn delete_workspace(&self, _: &str, disk_id: &str) -> Result<()> {
