@@ -6556,7 +6556,8 @@ impl Runner {
                         ) || holder.request.as_ref().is_some_and(|held| {
                             request.siblings.iter().any(|sibling| {
                                 held.siblings.iter().any(|other| {
-                                    sibling.canonical_path == other.canonical_path
+                                    crate::caller_path::sibling(sibling).caller
+                                        == crate::caller_path::sibling(other).caller
                                         && sibling.commit != other.commit
                                 })
                             })
