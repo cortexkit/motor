@@ -244,11 +244,17 @@ impl Prepared {
         for (path, body) in &mut requests {
             if *path == "/boot-source" {
                 let args = body["boot_args"].as_str().unwrap();
+                // Test VMs only: copy the guest journal to the serial console,
+                // which this fixture prints on failure. The guest's own
+                // diagnostics redact runner messages, so without this a guest
+                // that refuses to start shows no reason.
+                let mut args = format!("{args} systemd.journald.forward_to_console=1");
                 if self.case == "flag-without-key" {
-                    body["boot_args"] = format!("{args} motor.cache_write=1").into();
+                    args = format!("{args} motor.cache_write=1");
                 } else if self.case == "key-without-flag" {
-                    body["boot_args"] = args.replace(" motor.cache_write=1", "").into();
+                    args = args.replace(" motor.cache_write=1", "");
                 }
+                body["boot_args"] = args.into();
             }
         }
         (disk, requests)
