@@ -305,7 +305,7 @@ out of memory.
 | `per_vm_overhead_mib` | MiB | Added to stated memory when computing a VM's positive resident-RAM overage. |
 | `reclaim_timeout_ms` | milliseconds | Wait after balloon inflation before rechecking pressure and possibly stopping that VM. |
 | `hysteresis_mib` | MiB | Available memory above the reserve at both limits needed to deflate balloons. |
-| `workspace_disk_cap_bytes` | bytes | Sparse workspace-disk size cap; admission reserves remaining possible physical growth. |
+| `workspace_disk_cap_bytes` | bytes | Sparse workspace-disk size cap; admission reserves remaining possible physical growth. Raising it grows each existing checkout disk to the new cap the next time a job claims it (the helper extends the file, the guest grows its filesystem at boot); lowering it never shrinks a disk. A helper older than this rule refuses a grown disk, so roll the helper back only with the cap unchanged. |
 | `boot_deadline_ms` | milliseconds | Bound from boot start to runner hello, excluding disk recovery. |
 | `recovery_timeout_ms` | milliseconds | Bound from recovery VM start; expiry stops recovery and deletes its workspace disk. |
 | `exit_evidence_bound_ms` | milliseconds | Maximum wait from discovering a gone VMM for durable exit/OOM evidence. |

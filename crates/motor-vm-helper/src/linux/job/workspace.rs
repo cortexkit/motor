@@ -52,8 +52,8 @@ pub(super) fn ensure_bound(
         let meta = disk.metadata()?;
         // A larger request means the host raised its checkout disk cap; the
         // guest grows its filesystem to the new size at its next boot. The
-        // host never lowers a disk's cap, so a smaller one is not a request
-        // this helper produced.
+        // host never lowers a disk's cap, so a request smaller than the
+        // existing disk is invalid.
         if registry.role != job::WorkspaceRole::Job
             || meta.uid() != 0
             || meta.len() > request.size_bytes

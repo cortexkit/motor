@@ -278,7 +278,7 @@ The host JSON's required `per_job` settings have no compiled-in defaults:
 | `per_vm_overhead_mib` | MiB above stated memory before resident RAM counts as overage. |
 | `reclaim_timeout_ms` | Balloon-reclaim wait before rechecking pressure. |
 | `hysteresis_mib` | MiB above the reserve required before balloon deflation. |
-| `workspace_disk_cap_bytes` | Sparse disk cap and growth reservation bound. |
+| `workspace_disk_cap_bytes` | Sparse disk cap and growth reservation bound; a raised cap grows existing disks at their next claim, a lowered one never shrinks them ([hosted-host.md](hosted-host.md#per-job-mode-settings)). |
 | `boot_deadline_ms` | Boot-to-runner-hello deadline. |
 | `recovery_timeout_ms` | Recovery-start deadline, followed by disk deletion on timeout. |
 | `exit_evidence_bound_ms` | Bound from observing a gone VMM to missing-evidence settlement. |

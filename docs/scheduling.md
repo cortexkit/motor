@@ -364,6 +364,15 @@ workspace's incremental directories, not its base. Test:
   `fourth_pass_evicts_oldest_base_after_workspaces_and_staging_before_refusal`,
   `seed_pin_racing_eviction_keeps_current_and_allows_cold_fallback_after_release`
   (`crates/motor-runner/src/tests.rs`).
+- In a job VM the disk holds only the incoming job's own checkout, which the
+  passes above protect. So whenever free space is still under the soft goal,
+  admission deletes that checkout's incremental state and then, if needed,
+  its whole `target`, stopping at the goal; the checkout itself stays. This
+  keeps a job from starting with only the floor left and failing mid-build.
+  Shared tenant VMs don't do this. Tests:
+  `job_vm_admission_clears_its_own_build_outputs_before_refusing_for_disk`,
+  `job_vm_admission_clears_its_own_incremental_caches_under_the_eviction_goal`
+  (`crates/motor-runner/src/tests/disk_pressure.rs`).
 - If space is still under the floor, the job is refused before upload with
   `runner_disk_full`, with `free_bytes` and `floor_bytes` in the refusal. Tests:
   `disk_admission_refuses_typed_when_reflinks_reclaim_too_little`,
