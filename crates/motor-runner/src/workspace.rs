@@ -874,6 +874,12 @@ fn valid_loose_ref(content: &[u8]) -> bool {
 /// deleted: checkouts borrow them through alternates. The check reads only
 /// the ref files, one `for-each-ref` and one `cat-file --batch-check`, so it
 /// does not walk history. Callers hold the runner's ref mutation lock.
+/// A bare repository always has its HEAD file; a folder without one is a
+/// mirror whose creation, or the disk writes behind it, never finished.
+pub(crate) fn mirror_has_repository(mirror: &Path) -> bool {
+    mirror.join("HEAD").is_file()
+}
+
 pub(crate) fn repair_mirror(mirror: &Path, commits: &[String]) -> io::Result<Vec<String>> {
     let mut removed = Vec::new();
     let mut pending = vec![mirror.join("refs")];
@@ -1164,9 +1170,17 @@ impl Trees {
     }
     pub fn ensure_mirror(&self, repository: &str) -> io::Result<PathBuf> {
         let path = self.mirror(repository);
-        if !path.exists() {
+        if !mirror_has_repository(&path) {
+            // A crash between creating the folder and `git init` finishing,
+            // or a VM stopped before its writes reached the disk, can leave
+            // the folder without a repository; `git init` adds what is
+            // missing and keeps whatever objects survived.
             fs::create_dir_all(&path)?;
             git(&path, &["init", "--bare"])?;
+            write_mirror_identity(&path, "motor.repository", repository)?;
+        } else if mirror_identity(&path).0.is_none() {
+            // Startup re-initialises such a folder without knowing its
+            // repository; the first job for it records the identity.
             write_mirror_identity(&path, "motor.repository", repository)?;
         }
         Ok(path)

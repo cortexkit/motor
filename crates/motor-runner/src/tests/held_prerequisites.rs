@@ -348,3 +348,34 @@ async fn startup_removes_unusable_mirror_refs() {
     assert_eq!(remaining, format!("refs/snapshots/{snapshot}"));
     drop(runner);
 }
+
+/// A VM stopped before its writes reached the disk can leave a mirror folder
+/// with no repository in it. Startup must still serve, and the next job must
+/// refill the mirror and record its identity, instead of every git step
+/// failing on the folder (maintenance's ref pruning first, which used to stop
+/// the runner at startup).
+#[tokio::test]
+async fn startup_serves_after_a_mirror_folder_lost_its_repository() {
+    let f = Fixture::new();
+    let config = f.config();
+    let runner = Runner::open(config.clone()).unwrap();
+    let first = job_after_have(&f, &runner, "first").await;
+    assert_eq!(first.outcome, Outcome::Exit { code: 0 });
+    let mirror = runner.core.trees.mirror(&f.root);
+    drop(runner);
+
+    fs::remove_dir_all(&mirror).unwrap();
+    fs::create_dir_all(&mirror).unwrap();
+    fs::write(mirror.join("stray"), "half-written\n").unwrap();
+    assert!(!workspace::mirror_has_repository(&mirror));
+
+    let runner = reopen(config);
+    assert!(workspace::mirror_has_repository(&mirror));
+    let second = job_after_have(&f, &runner, "second").await;
+    assert_eq!(second.outcome, Outcome::Exit { code: 0 });
+    assert_eq!(
+        workspace::mirror_identity(&mirror).0.as_deref(),
+        Some(f.root.as_str())
+    );
+    drop(runner);
+}

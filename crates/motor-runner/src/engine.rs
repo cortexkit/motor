@@ -7889,6 +7889,22 @@ impl Runner {
             if !mirror.is_dir() {
                 continue;
             }
+            if !workspace::mirror_has_repository(&mirror) {
+                // Left by a crash or a VM stopped before its writes reached
+                // the disk. Every later git step (maintenance's ref pruning
+                // first) fails on it and would stop the runner from serving,
+                // so give it a repository again; the next job's bundles
+                // refill it and record its identity.
+                match workspace::git(&mirror, &["init", "--bare"]) {
+                    Ok(_) => {
+                        tracing::warn!(mirror = %mirror.display(), "startup re-initialised a mirror folder with no repository")
+                    }
+                    Err(error) => {
+                        tracing::error!(mirror = %mirror.display(), %error, "cannot re-initialise mirror folder");
+                        continue;
+                    }
+                }
+            }
             match workspace::repair_mirror(&mirror, &[]) {
                 Ok(removed) if removed.is_empty() => {}
                 Ok(removed) => {
