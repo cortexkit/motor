@@ -6,6 +6,8 @@ use crate::jobs::{Assignment, SPOOL_LIMIT};
 use crate::state::jobs::Execution;
 use tokio::io::AsyncSeekExt;
 
+mod runner_diagnostics;
+
 #[derive(Default)]
 pub(super) struct Launch {
     started: AtomicBool,

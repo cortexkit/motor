@@ -55,6 +55,7 @@ struct TenantState {
     closed: bool,
     created_record: bool,
     cause: RefusedCause,
+    refusal_detail: Option<&'static str>,
     terminal_written: bool,
     terminal_stored: bool,
 }
@@ -78,6 +79,14 @@ fn frame_type(frame: &Frame) -> String {
 }
 
 impl TenantConnection {
+    fn checks_expiry(&self) -> bool {
+        // Per-job mode comes from the helper's boot arguments, not the peer.
+        // The host checked expiry at admission and allows disk/memory waits
+        // past it, while bounding never-started work from VM boot. This guest
+        // admits only one execution per boot; Run claims must still match the
+        // host's VerifiedLease.
+        !self.runner.config().per_job
+    }
     async fn admitted(&self) -> bool {
         self.state.lock().await.admitted
     }
@@ -91,6 +100,7 @@ impl TenantConnection {
         }
         state.closed = true;
         state.cause = RefusedCause::Expired;
+        state.refusal_detail = Some("lease expired before runner admission");
         self.changed.notify_one();
         true
     }
@@ -157,6 +167,7 @@ pub(crate) async fn tenant_channel<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             closed: false,
             created_record: false,
             cause: RefusedCause::Disconnect,
+            refusal_detail: None,
             terminal_written: false,
             terminal_stored: false,
         }),
@@ -279,7 +290,7 @@ async fn reader<R: AsyncRead + Unpin>(
                         break;
                     }
                 },
-                _ = tokio::time::sleep_until(ctx.deadline()), if ctx.lease.purpose == LeasePurpose::Run && !ctx.admitted().await => {
+                _ = tokio::time::sleep_until(ctx.deadline()), if ctx.checks_expiry() && ctx.lease.purpose == LeasePurpose::Run && !ctx.admitted().await => {
                     if ctx.expire().await { trace.reason = "lease_expired"; break; }
                     continue;
                 }
@@ -359,63 +370,72 @@ async fn writer<W: AsyncWrite + Unpin>(
                 break;
             }
         }
-        let result = if let (Some(ctx), Frame::Accepted(_)) = (&tenant, &frame) {
-            let mut state = ctx.state.lock().await;
-            if state.closed || unix_s() >= ctx.lease.exp {
-                state.cause = RefusedCause::Expired;
-                state.closed = true;
-                ctx.changed.notify_one();
-                trace.reason = "lease_expired";
-                break;
-            }
-            let result = match tokio::time::timeout_at(
-                ctx.deadline(),
-                write_frame_async(&mut write, &frame),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
+        let result =
+            if let (Some(ctx), Frame::Accepted(_)) = (&tenant, &frame) {
+                let mut state = ctx.state.lock().await;
+                if state.closed || (ctx.checks_expiry() && unix_s() >= ctx.lease.exp) {
                     state.cause = RefusedCause::Expired;
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "tenant admission expired during accepted write",
-                    ))
-                }
-            };
-            if result.is_ok() {
-                // Upload and execution wait for this write and the durable event,
-                // so detached work cannot outrun its admission record.
-                state.admitted = true;
-                if let Err(error) = ctx.runner.tenant_admitted(ctx.lease.jti) {
-                    tracing::error!(%error, "cannot persist tenant admission");
+                    state.refusal_detail = Some("lease expired before runner admission");
                     state.closed = true;
                     ctx.changed.notify_one();
+                    trace.reason = "lease_expired";
                     break;
                 }
+                let deadline = if ctx.checks_expiry() {
+                    ctx.deadline()
+                } else {
+                    // Transport backpressure is still bounded independently of
+                    // the host's already-checked token expiry.
+                    tokio::time::Instant::now() + Duration::from_secs(60)
+                };
+                let result =
+                    match tokio::time::timeout_at(deadline, write_frame_async(&mut write, &frame))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            if ctx.checks_expiry() {
+                                state.cause = RefusedCause::Expired;
+                            }
+                            Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "tenant admission timed out during accepted write",
+                            ))
+                        }
+                    };
+                if result.is_ok() {
+                    // Upload and execution wait for this write and the durable event,
+                    // so detached work cannot outrun its admission record.
+                    state.admitted = true;
+                    if let Err(error) = ctx.runner.tenant_admitted(ctx.lease.jti) {
+                        tracing::error!(%error, "cannot persist tenant admission");
+                        state.closed = true;
+                        ctx.changed.notify_one();
+                        break;
+                    }
+                } else {
+                    state.closed = true;
+                }
+                ctx.changed.notify_one();
+                result
+            } else if let (Some(ctx), Frame::Terminal(_)) = (&tenant, &frame) {
+                // Hold the same lock as the reader through the flush so an ack
+                // arriving immediately cannot race terminal_written publication.
+                let mut state = ctx.state.lock().await;
+                let result = write_frame_async(&mut write, &frame).await;
+                if result.is_ok() {
+                    state.terminal_written = true;
+                }
+                ctx.changed.notify_one();
+                result
+            } else if let Some(ctx) = &tenant {
+                tokio::select! {
+                    result = write_frame_async(&mut write, &frame) => result,
+                    _ = ctx.stop_write.notified() => { trace.reason = "reader_closed"; break; },
+                }
             } else {
-                state.closed = true;
-            }
-            ctx.changed.notify_one();
-            result
-        } else if let (Some(ctx), Frame::Terminal(_)) = (&tenant, &frame) {
-            // Hold the same lock as the reader through the flush so an ack
-            // arriving immediately cannot race terminal_written publication.
-            let mut state = ctx.state.lock().await;
-            let result = write_frame_async(&mut write, &frame).await;
-            if result.is_ok() {
-                state.terminal_written = true;
-            }
-            ctx.changed.notify_one();
-            result
-        } else if let Some(ctx) = &tenant {
-            tokio::select! {
-                result = write_frame_async(&mut write, &frame) => result,
-                _ = ctx.stop_write.notified() => { trace.reason = "reader_closed"; break; },
-            }
-        } else {
-            write_frame_async(&mut write, &frame).await
-        };
+                write_frame_async(&mut write, &frame).await
+            };
         if let Err(error) = result {
             let frame_type = match &frame {
                 Frame::Hello { .. } => "hello",
@@ -445,6 +465,26 @@ async fn writer<W: AsyncWrite + Unpin>(
                 tracing::info!(job_id = %reply.job_id, "runner cancel reply written to client")
             }
             _ => {}
+        }
+    }
+    if let Some(ctx) = &tenant {
+        let state = ctx.state.lock().await;
+        if let Some(detail) = state.refusal_detail.filter(|_| !state.admitted) {
+            let refusal = Frame::Refusal(Refusal {
+                job_id: Some(ctx.lease.jti),
+                transfer_id: None,
+                reason: RefusalReason::RequestRejected,
+                disk_full: None,
+                retry_after_ms: None,
+                detail: Some(detail.into()),
+            });
+            drop(state);
+            // A peer that stopped reading must not hold channel cleanup open.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                write_frame_async(&mut write, &refusal),
+            )
+            .await;
         }
     }
 }

@@ -65,21 +65,45 @@ impl JournalQuery {
 }
 
 pub(super) async fn collect(https: bool, query: JournalQuery) -> io::Result<Value> {
-    let pid = runner_socket::main_pid()?
-        .ok_or_else(|| io::Error::other("tenant runner has no current MainPID"))?;
-    let mut result = tokio::task::spawn_blocking(move || {
-        snapshot(Path::new("/proc"), Path::new("/tenant/state"), pid)
-    })
-    .await
-    .map_err(io::Error::other)??;
-    result["journal"] = journal(query)
+    collect_with_pid(runner_socket::main_pid()?, https, journal(query)).await
+}
+
+async fn collect_with_pid(
+    pid: Option<u32>,
+    https: bool,
+    read_journal: impl std::future::Future<Output = io::Result<Value>>,
+) -> io::Result<Value> {
+    let mut result = if let Some(pid) = pid {
+        tokio::task::spawn_blocking(move || {
+            snapshot(Path::new("/proc"), Path::new("/tenant/state"), pid)
+        })
+        .await
+        .map_err(io::Error::other)??
+    } else {
+        // The runner service's journal survives runner exit. Do not make missing live
+        // process evidence look like a healthy runner with no descendants.
+        json!({"runner_pid":{"unavailable":true},"processes":{"unavailable":true},
+            "flocks":{"unavailable":true}})
+    };
+    result["journal"] = read_journal
         .await
         .unwrap_or_else(|error| json!({"unavailable":true,"error":{
             "type":"journal_read_failed", "detail":error.to_string().chars().take(300).collect::<String>()
         }}));
-    result["network"] = super::network::collect(pid, https)
-        .await
-        .unwrap_or_else(|_| json!({"unavailable":true}));
+    if pid.is_none()
+        && (result["journal"]["unavailable"] == true
+            || !result["journal"]["entries"].is_array()
+            || result["journal"]["unrecognized_messages_redacted"] != true)
+    {
+        return Err(io::Error::other("runner exited and journal is unavailable"));
+    }
+    result["network"] = if let Some(pid) = pid {
+        super::network::collect(pid, https)
+            .await
+            .unwrap_or_else(|_| json!({"unavailable":true}))
+    } else {
+        json!({"unavailable":true})
+    };
     result["ok"] = json!(true);
     Ok(result)
 }
@@ -811,6 +835,48 @@ mod tests {
         assert_eq!(source["directories"][0]["exists"], false);
         assert_eq!(source["directories"][1]["machine_ids"], json!([boot_id]));
         assert!(!source.to_string().contains("TOP_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn exited_runner_diagnostics_returns_journal_not_fake_live_evidence() {
+        let raw = json!({"__REALTIME_TIMESTAMP":"1800000000000000", "MESSAGE":
+            "motor_runner::server: runner_channel_closed direction=read reason=lease_expired error=SECRET"})
+            .to_string();
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf '%s\\n' \"$1\"", "journal-fixture", &raw]);
+        let reply = collect_with_pid(
+            None,
+            false,
+            journal_command(command, JournalQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["ok"], true);
+        for field in ["runner_pid", "processes", "flocks", "network"] {
+            assert_eq!(reply[field], json!({"unavailable":true}), "{field}");
+        }
+        assert_eq!(reply["journal"]["unrecognized_messages_redacted"], true);
+        assert_eq!(
+            reply["journal"]["entries"][0]["message"],
+            "runner_channel_closed direction=read reason=lease_expired"
+        );
+        assert!(!reply.to_string().contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn exited_runner_diagnostics_does_not_claim_success_without_a_journal() {
+        for read in [
+            Err(io::Error::other("SECRET")),
+            Ok(json!({"unavailable":true,"error":{"stderr_tail":"SECRET"}})),
+        ] {
+            let error = collect_with_pid(None, false, async { read })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "runner exited and journal is unavailable"
+            );
+        }
     }
 
     #[tokio::test]

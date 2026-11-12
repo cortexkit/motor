@@ -1979,6 +1979,12 @@ async fn delivered_run_without_guest_acceptance_replays_unknown_after_disconnect
     next_type(&mut client, "hosted_terminal").await;
     task.await.unwrap().unwrap();
     drop(client);
+    assert!(fake
+        .admin_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(job, request)| { job == JOB && request == &json!({"op":"diagnostics"}) }));
     {
         let mut host = runtime.host.lock().unwrap();
         assert!(host.snapshot.leases[JOB].delivered);

@@ -235,7 +235,10 @@ impl Runtime {
                     crate::config::HostSettings::PerJob(s) => s.teardown_timeout_ms,
                     _ => unreachable!(),
                 };
-                std::thread::sleep(Duration::from_millis(timeout));
+                let grace = Duration::from_millis(timeout);
+                let began = std::time::Instant::now();
+                super::runner_diagnostics::collect(runtime.control.clone(), &claims.jti, grace);
+                std::thread::sleep(grace.saturating_sub(began.elapsed()));
                 if let Err(error) = runtime.stop_job(&claims.jti, true, true) {
                     tracing::error!(jti = claims.jti, %error, "job_teardown_failed");
                 }
