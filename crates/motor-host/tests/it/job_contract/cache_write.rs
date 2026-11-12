@@ -115,6 +115,8 @@ pub(super) struct Prepared {
     fixture: Fixture,
     case: &'static str,
     writable: AtomicBool,
+    /// Stage the boot and check it, without starting a guest.
+    pub stage_only: AtomicBool,
     _scratch: tempfile::TempDir,
 }
 
@@ -224,6 +226,7 @@ impl Prepared {
             fixture,
             case,
             writable: AtomicBool::new(writable),
+            stage_only: AtomicBool::new(false),
             _scratch: scratch,
         }
     }
@@ -254,10 +257,21 @@ impl Prepared {
                 } else if self.case == "key-without-flag" {
                     args = args.replace(" motor.cache_write=1", "");
                 }
+                if self.stage_only.load(Ordering::SeqCst) {
+                    assert!(
+                        !args.contains(" motor.cache_write=1"),
+                        "{}: a spent grant staged a writable boot: {args}",
+                        self.case
+                    );
+                }
                 body["boot_args"] = args.into();
             }
         }
         (disk, requests)
+    }
+
+    pub fn case(&self) -> &'static str {
+        self.case
     }
 
     pub fn probe(&self) -> String {
@@ -345,7 +359,16 @@ fn isolated_job_cache_write_authority_and_guest_binding() {
         let prepared = std::rc::Rc::new(Prepared::new(&broker, case));
         isolated_vm(Probe::Cache(prepared.clone()));
         if case == "replay" {
+            // The grant is spent by the first boot, so staging the same job
+            // again must produce a read-only boot. That is checked at staging,
+            // not by booting a second guest: production never starts a second
+            // VM for one job (the durable start intent refuses it), and this
+            // fixture kills each VM without a guest shutdown, so a second guest
+            // on the same disk would meet an unclean disk that production sends
+            // through recovery first. A guest given no write flag is proven
+            // read-only by the key-without-flag case.
             prepared.writable.store(false, Ordering::SeqCst);
+            prepared.stage_only.store(true, Ordering::SeqCst);
             isolated_vm(Probe::Cache(prepared));
         }
     }

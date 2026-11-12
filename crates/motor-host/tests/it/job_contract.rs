@@ -546,6 +546,17 @@ fn isolated_vm(probe: Probe) {
         #[cfg(feature = "job-cache-vm-tests")]
         let requests = if let Probe::Cache(prepared) = &probe {
             let (disk, requests) = prepared.boot(&start, &root, uid, tap);
+            if prepared
+                .stage_only
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // `boot` has already checked the staged boot arguments.
+                println!(
+                    "PASS job cache: {} second staging is read-only",
+                    prepared.case()
+                );
+                return;
+            }
             resources.mounts.push(workspace.clone());
             command(
                 Command::new("mount")
