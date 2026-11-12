@@ -106,6 +106,103 @@ async fn capacity_refusal_replaces_without_returning_to_the_refusing_host() {
 }
 
 #[tokio::test]
+async fn lost_pre_run_upload_capacity_refusal_keeps_host_cause_when_replace_is_finished() {
+    for (reason, code) in [
+        ("capacity", "hosted_capacity"),
+        ("host_full", "hosted_host_full"),
+    ] {
+        let logs = crate::logging::Captured::default();
+        let _logs = crate::logging::scoped(logs.clone());
+        let h = Harness::new(Behavior::DropHaveThenRefuse(reason)).await;
+        h.replace_replies.lock().unwrap().push_back((
+            409,
+            serde_json::json!({"error":"job_finished"}),
+            "",
+        ));
+        let (scratch, repo) = committed_repo();
+        let motor = Motor::with_connector(
+            h.config(),
+            &scratch.0.join("state"),
+            Arc::new(NoSsh(AtomicUsize::new(0))),
+        )
+        .unwrap();
+        let mut request = Harness::request(&repo);
+        request.queue_wait_limit_s = Some(20);
+        let stream = motor.run(request).unwrap();
+        let id = stream.job_id;
+        let (_, terminal) = records(stream).await;
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerFull
+            },
+            "{reason}"
+        );
+        assert_eq!(terminal.ran, Some(Ran::None));
+        let detail = terminal.refusal_detail.unwrap();
+        assert!(detail.starts_with(code), "{detail}");
+        assert!(
+            detail.contains("server refused admission while restarting or full"),
+            "{detail}"
+        );
+        let state = motor.hosted_state(id).unwrap();
+        assert!(!state.run_sent);
+        assert_eq!(state.hosted_code.as_deref(), Some(code));
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+        // Relay upload bytes can be pre-Run Have traffic, not command delivery.
+        assert!(h
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| matches!(f, Frame::Have { .. })));
+        assert_eq!(h.tokens.load(Ordering::SeqCst), 2);
+        assert_eq!(replace_count(&h), 1);
+        // No lease re-request or host-full sleep after the settled replacement reply.
+        assert_eq!(h.lease_bodies.lock().unwrap().len(), 2);
+        assert!(h.replace_replies.lock().unwrap().is_empty());
+        assert!(!logs
+            .text()
+            .contains("hosted host full; waiting to ask again"));
+    }
+}
+
+#[tokio::test]
+async fn lost_run_ack_capacity_refusal_stays_unknown_and_never_replaces() {
+    let h = Harness::new(Behavior::DropRunAckRefuseAttach("capacity")).await;
+    let (scratch, repo) = committed_repo();
+    let motor = Motor::with_connector(
+        h.config(),
+        &scratch.0.join("state"),
+        Arc::new(NoSsh(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    let stream = motor.run(Harness::request(&repo)).unwrap();
+    let id = stream.job_id;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while h.tokens.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    h.finished.store(true, Ordering::SeqCst);
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_eq!(terminal.ran, Some(Ran::Unknown("maybe".into())));
+    assert!(motor.hosted_state(id).unwrap().run_sent);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
+    assert_eq!(replace_count(&h), 0);
+    assert!(h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.ends_with("/reattach")));
+}
+
+#[tokio::test]
 async fn capacity_replace_pending_queue_expiry_is_runner_full_and_never_ran() {
     let h = Harness::new(Behavior::Refuse("host_full")).await;
     h.replace_replies.lock().unwrap().push_back((
@@ -387,10 +484,19 @@ async fn replace_refusals_wait_on_the_same_job_and_try_each_host_only_once() {
         };
         let storage = stored(&scratch, id, route.clone());
         let start = tokio::time::Instant::now();
-        let (_, lease) = Client::new(route)
+        let result = Client::new(route)
             .run(id, &Harness::request(&scratch.0), &storage)
-            .await
-            .unwrap();
+            .await;
+        if code == "job_finished" {
+            assert_eq!(result.err(), Some(Error::HostFull));
+            assert_eq!(replace_count(&h), 1);
+            assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
+            assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+            assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+            assert!(!storage.job(id).unwrap().hosted.unwrap().run_sent);
+            continue;
+        }
+        let (_, lease) = result.unwrap();
         assert_eq!(lease.job_id, id.to_string());
         assert!(start.elapsed() >= Duration::from_millis(HOST_FULL_RETRY_MS * 2));
         assert_eq!(replace_count(&h), 1, "{code}");

@@ -1013,7 +1013,14 @@ impl Client {
         self.broker_code.lock().unwrap().clone()
     }
     pub(crate) fn refusal_detail(&self, error: Error, detail: String) -> String {
-        self.wait_answers.lock().unwrap().detail(error, detail)
+        let mut detail = self.wait_answers.lock().unwrap().detail(error, detail);
+        if !self.route.run_sent
+            && matches!(error, Error::HostFull | Error::Capacity)
+            && self.broker_code().as_deref() == Some("job_finished")
+        {
+            detail.push_str(": server refused admission while restarting or full");
+        }
+        detail
     }
     fn wait_expired(&self, pending: Error) -> Error {
         self.wait_answers.lock().unwrap().expire(pending)
@@ -1690,6 +1697,12 @@ impl Client {
                                     .map_err(|_| Error::Broker)?;
                                 lease = next;
                                 continue;
+                            }
+                            Err(Error::Finished) => {
+                                // No Run was sent, and the settled lease cannot be
+                                // replaced or admitted later. Report the host's
+                                // refusal instead of waiting on the closed booking.
+                                return Err(connected.err().unwrap().error);
                             }
                             Err(error) if self.wait_answers.lock().unwrap().expired => {
                                 return Err(error);
