@@ -3000,6 +3000,9 @@ impl Motor {
                     queue_wait_ms,
                     queue_status,
                 })) => {
+                    if let Some(status) = &queue_status {
+                        self.report_queue_status(id, status);
+                    }
                     if let Some(owner) = &owner {
                         owner.heartbeat(id, queue_wait_ms, queue_status);
                     }
@@ -3018,6 +3021,7 @@ impl Motor {
                 })) if job_id == build_server_id => {
                     placement_queue = None;
                     self.submission_ready(id);
+                    self.report_queue_started(id);
                     if hosted {
                         self.storage.hosted_update(id, |state| {
                             state.started_at_ms.get_or_insert(started_at_ms);

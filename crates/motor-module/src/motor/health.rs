@@ -92,6 +92,23 @@ impl Motor {
         }
     }
 
+    /// Passes a heartbeat's queue status to the live submission's progress
+    /// reporter, which turns changes into `queue_wait` progress for callers
+    /// that opted in. A job read without a live submission, such as one being
+    /// reattached, reports nothing.
+    pub(super) fn report_queue_status(&self, id: Uuid, status: &motor_protocol::QueueStatus) {
+        if let Some((_, reporter)) = self.health_progress.lock().unwrap().get(&id) {
+            reporter.queue_status(status);
+        }
+    }
+
+    /// Ends queue-wait reporting for the live submission once the job starts.
+    pub(super) fn report_queue_started(&self, id: Uuid) {
+        if let Some((_, reporter)) = self.health_progress.lock().unwrap().get(&id) {
+            reporter.queue_started();
+        }
+    }
+
     pub(crate) async fn macos_health(&self) -> Option<Value> {
         self.config.macos_runner.as_ref()?;
         let status = tokio::time::timeout(

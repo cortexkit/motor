@@ -171,6 +171,12 @@ pub struct Harness {
     /// While false, a `CompleteRun` host holds each admitted job after
     /// `Accepted`, so it keeps its claim on the tenant, until set true.
     pub run_gate: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Frames a `CompleteRun` host sends right after `Accepted`, such as queue
+    /// heartbeats; taken by the first run.
+    pub after_accepted: Arc<Mutex<Vec<Frame>>>,
+    /// Frames a `CompleteRun` host sends once `run_gate` opens, before the
+    /// terminal record; taken by the first run.
+    pub after_run_gate: Arc<Mutex<Vec<Frame>>>,
     /// QuietAttach counts: admitted connections, closed connections (including
     /// idle closes), and protocol Attach frames received, in that order.
     pub attach_lifecycle: Arc<tokio::sync::watch::Sender<(usize, usize, usize)>>,
@@ -270,6 +276,8 @@ impl Harness {
         let host_refusals = Arc::new(Mutex::new(VecDeque::<&'static str>::new()));
         let capacity = Arc::new(Mutex::new(None::<TenantCapacity>));
         let run_gate = Arc::new(tokio::sync::watch::Sender::new(true));
+        let after_accepted = Arc::new(Mutex::new(Vec::<Frame>::new()));
+        let after_run_gate = Arc::new(Mutex::new(Vec::<Frame>::new()));
         let attach_lifecycle = Arc::new(tokio::sync::watch::Sender::new((0, 0, 0)));
         let attach_auth_refusals = Arc::new(AtomicUsize::new(0));
         let attach_history_expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -280,6 +288,8 @@ impl Harness {
             let host_refusals = host_refusals.clone();
             let capacity = capacity.clone();
             let run_gate = run_gate.clone();
+            let after_accepted = after_accepted.clone();
+            let after_run_gate = after_run_gate.clone();
             let attach_lifecycle = attach_lifecycle.clone();
             let attach_auth_refusals = attach_auth_refusals.clone();
             let attach_history_expired = attach_history_expired.clone();
@@ -303,6 +313,8 @@ impl Harness {
                     let host_refusals = host_refusals.clone();
                     let capacity = capacity.clone();
                     let run_gate = run_gate.clone();
+                    let after_accepted = after_accepted.clone();
+                    let after_run_gate = after_run_gate.clone();
                     let attach_lifecycle = attach_lifecycle.clone();
                     let attach_auth_refusals = attach_auth_refusals.clone();
                     let attach_history_expired = attach_history_expired.clone();
@@ -641,8 +653,12 @@ impl Harness {
                                         .enumerate()
                                         {
                                             if index == 1 {
+                                                write_test_frames(&mut tls, &after_accepted, id)
+                                                    .await;
                                                 let mut gate = run_gate.subscribe();
                                                 let _ = gate.wait_for(|open| *open).await;
+                                                write_test_frames(&mut tls, &after_run_gate, id)
+                                                    .await;
                                             }
                                             motor_protocol::write_frame_async(&mut tls, &frame)
                                                 .await
@@ -1044,6 +1060,8 @@ impl Harness {
             host_refusals,
             capacity,
             run_gate,
+            after_accepted,
+            after_run_gate,
             attach_lifecycle,
             attach_auth_refusals,
             attach_history_expired,
@@ -1169,6 +1187,24 @@ fn settled_records(id: Uuid) -> Vec<(u64, Frame)> {
         ));
     }
     records
+}
+
+/// Writes the frames a test queued for a run. `Started` is given the run's
+/// ID, which the test cannot know when it queues the frame.
+async fn write_test_frames<W: tokio::io::AsyncWrite + Unpin>(
+    socket: &mut W,
+    frames: &Mutex<Vec<Frame>>,
+    id: Uuid,
+) {
+    let frames = std::mem::take(&mut *frames.lock().unwrap());
+    for mut frame in frames {
+        if let Frame::Started { job_id, .. } = &mut frame {
+            *job_id = id;
+        }
+        motor_protocol::write_frame_async(socket, &frame)
+            .await
+            .unwrap();
+    }
 }
 
 /// The run connection of `Behavior::SettleThenDrop`: ck-motor receives the
