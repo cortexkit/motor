@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 TEST_FILES = [
+    "script/test_remote_cache_measure.py",
     "script/boat-probe/test_probe.py",
     "script/boat-probe/test_cache_bench.py",
     "script/boat-probe/test_cache_live.py",
