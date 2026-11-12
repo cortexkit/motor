@@ -4,18 +4,26 @@ use motor_lease::{verify_token, AuthError, Jwks, KeySet, Purpose, JWKS_URL};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+// Bound trust in a revoked signing key when the broker cannot be refreshed.
+const MAX_JWKS_AGE_S: u64 = 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub sub: String,
     pub jti: String,
     pub workspace_key_hash: String,
+    pub exp: u64,
 }
 
 impl Grant {
+    pub(crate) fn valid_at(&self, now: SystemTime) -> bool {
+        seconds(now).is_ok_and(|now| now < self.exp)
+    }
+
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn permits(&self, start: &crate::job::Start, disk: &crate::job::Workspace) -> bool {
         start.kind == crate::job::VmKind::Job
@@ -29,17 +37,46 @@ impl Grant {
     }
 }
 
-/// Shared only inside the helper. Network work holds this lock, never the
-/// global lifecycle lock, so a slow broker cannot delay VM stop or memory controls.
-pub type Authority = Arc<Mutex<Grants>>;
+/// Network refresh and grant lookup use separate state. Lifecycle callers only
+/// try the grant lock, so a slow broker cannot delay VM stop or memory controls.
+pub type Authority = Arc<Grants>;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn disk_grant(authority: &Authority, id: Option<&str>) -> Option<Grant> {
+    authority.get(id?)
+}
 
 /// Memory belongs to the root helper, not the host ledger. Restart loses grants
 /// and therefore falls back to read-only rather than trusting restored host state.
 pub struct Grants {
     host_id: Option<String>,
     jwks_url: String,
+    keys: Mutex<Keys>,
+    refreshed: Condvar,
+    records: Mutex<Records>,
+}
+
+#[derive(Default)]
+struct Keys {
     keys: KeySet,
     keys_ready: bool,
+    fetching: bool,
+    retry_at: Option<u64>,
+    retry_delay_s: u64,
+    last_success_s: Option<u64>,
+}
+
+impl Keys {
+    fn usable_at(&self, now_s: u64) -> bool {
+        self.keys_ready
+            && self
+                .last_success_s
+                .is_some_and(|last| now_s.saturating_sub(last) <= MAX_JWKS_AGE_S)
+    }
+}
+
+#[derive(Default)]
+struct Records {
     grants: BTreeMap<String, Grant>,
     consumed: BTreeSet<String>,
 }
@@ -52,18 +89,17 @@ impl Grants {
         Self {
             host_id: config.host_id.clone(),
             jwks_url: config.jwks_url.clone().unwrap_or_else(|| JWKS_URL.into()),
-            keys: KeySet::default(),
-            keys_ready: false,
-            grants: BTreeMap::new(),
-            consumed: BTreeSet::new(),
+            keys: Mutex::default(),
+            refreshed: Condvar::new(),
+            records: Mutex::default(),
         }
     }
 
-    pub fn admit(&mut self, token: &str) -> Result<()> {
+    pub fn admit(&self, token: &str) -> Result<()> {
         self.admit_with_clock(token, SystemTime::now)
     }
 
-    fn admit_with_clock(&mut self, token: &str, clock: impl Fn() -> SystemTime) -> Result<()> {
+    fn admit_with_clock(&self, token: &str, clock: impl Fn() -> SystemTime) -> Result<()> {
         self.prune_at(clock());
         let host = self
             .host_id
@@ -73,20 +109,33 @@ impl Grants {
         // Fetching can take long enough for a short-lived token to expire.
         // Check against root's clock after the fetch, not the caller's timestamp.
         let now = clock();
-        let claims = verify_token(token, &self.keys, &host, None, Purpose::Run, seconds(now)?)
+        let keys = self
+            .keys
+            .lock()
+            .map_err(|_| Error("cache key lock poisoned".into()))?;
+        if !keys.usable_at(seconds(now)?) {
+            return Err(Error("helper JWKS unavailable or stale".into()));
+        }
+        let claims = verify_token(token, &keys.keys, &host, None, Purpose::Run, seconds(now)?)
             .map_err(|_| Error("cache-write token verification refused".into()))?;
+        drop(keys);
         if claims.cache_write != Some(true) {
             return Err(Error("cache-write token does not grant writes".into()));
         }
         validate_start_window(&claims.jti, now)?;
         let grant = Grant {
+            exp: claims.exp,
             sub: claims.sub,
             jti: claims.jti,
             workspace_key_hash: claims
                 .workspace_key_hash
                 .ok_or_else(|| Error("cache-write token has no workspace hash".into()))?,
         };
-        if let Some(existing) = self.grants.get(&grant.jti) {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| Error("cache grant lock poisoned".into()))?;
+        if let Some(existing) = records.grants.get(&grant.jti) {
             if existing != &grant {
                 return Err(Error(
                     "cache-write grant already recorded with another binding".into(),
@@ -94,46 +143,79 @@ impl Grants {
             }
             return Ok(());
         }
-        self.grants.insert(grant.jti.clone(), grant);
+        records.grants.insert(grant.jti.clone(), grant);
         Ok(())
     }
 
-    /// A queued boot uses admission's decision, not the token's later expiry.
-    /// This only exposes a grant; the boot path must still bind disk and account.
-    pub fn get(&self, jti: &str) -> Option<&Grant> {
+    /// This only exposes an unexpired grant; the boot path must still bind disk
+    /// and account, consume it once, and recheck expiry when staging credentials.
+    pub fn get(&self, jti: &str) -> Option<Grant> {
         self.get_at(jti, SystemTime::now())
     }
 
-    fn get_at(&self, jti: &str, now: SystemTime) -> Option<&Grant> {
+    fn get_at(&self, jti: &str, now: SystemTime) -> Option<Grant> {
         validate_start_window(jti, now).ok()?;
-        if self.consumed.contains(jti) {
+        let records = self.records.try_lock().ok()?;
+        if records.consumed.contains(jti) {
             return None;
         }
-        self.grants.get(jti)
+        records
+            .grants
+            .get(jti)
+            .filter(|grant| grant.valid_at(now))
+            .cloned()
     }
 
     /// Call only after the durable start intent excludes another VM for this id.
-    pub fn consume(&mut self, jti: &str) {
-        if self.grants.contains_key(jti) {
-            self.consumed.insert(jti.into());
-        }
+    pub fn consume(&self, jti: &str) -> Option<Grant> {
+        self.consume_at(jti, SystemTime::now())
     }
 
-    pub fn maintain(&mut self) {
+    fn consume_at(&self, jti: &str, now: SystemTime) -> Option<Grant> {
+        let mut records = self.records.try_lock().ok()?;
+        if records.consumed.contains(jti) {
+            return None;
+        }
+        let grant = records.grants.get(jti)?.clone();
+        records.consumed.insert(jti.into());
+        (validate_start_window(jti, now).is_ok() && grant.valid_at(now)).then_some(grant)
+    }
+
+    pub fn maintain(&self) {
         self.prune_at(SystemTime::now());
         if self.host_id.is_some() {
             let _ = self.refresh("", SystemTime::now());
         }
     }
 
-    fn prune_at(&mut self, now: SystemTime) {
-        self.grants
-            .retain(|jti, _| validate_start_window(jti, now).is_ok());
-        self.consumed.retain(|jti| self.grants.contains_key(jti));
+    fn prune_at(&self, now: SystemTime) {
+        let Ok(mut records) = self.records.try_lock() else {
+            return;
+        };
+        let Records { grants, consumed } = &mut *records;
+        grants.retain(|jti, _| validate_start_window(jti, now).is_ok());
+        consumed.retain(|jti| grants.contains_key(jti));
     }
 
-    fn refresh(&mut self, token: &str, now: SystemTime) -> Result<()> {
-        if self.keys.should_refetch(token, seconds(now)?) {
+    fn refresh(&self, token: &str, now: SystemTime) -> Result<()> {
+        let mut keys = self
+            .keys
+            .lock()
+            .map_err(|_| Error("cache key lock poisoned".into()))?;
+        while keys.fetching && !keys.keys_ready {
+            keys = self
+                .refreshed
+                .wait(keys)
+                .map_err(|_| Error("cache key lock poisoned".into()))?;
+        }
+        let now_s = seconds(now)?;
+        let due = keys.retry_at.map_or_else(
+            || keys.keys.should_refetch(token, now_s),
+            |retry| now_s >= retry,
+        );
+        if !keys.fetching && due {
+            keys.fetching = true;
+            drop(keys);
             let fetched = (|| -> Result<Jwks> {
                 let response = reqwest::blocking::Client::builder()
                     .connect_timeout(Duration::from_secs(5))
@@ -153,12 +235,31 @@ impl Grants {
                 }
                 serde_json::from_slice(&bytes).map_err(|_| Error("helper JWKS is invalid".into()))
             })();
-            self.keys_ready = self
+            keys = self
                 .keys
+                .lock()
+                .map_err(|_| Error("cache key lock poisoned".into()))?;
+            let mut replacement = KeySet::default();
+            if replacement
                 .refresh(fetched.map_err(|_| AuthError::Auth))
-                .is_ok();
+                .is_ok()
+            {
+                replacement.should_refetch("", now_s);
+                keys.keys = replacement;
+                keys.keys_ready = true;
+                keys.last_success_s = Some(now_s);
+                keys.retry_at = None;
+                keys.retry_delay_s = 0;
+            } else {
+                // A failed refresh cannot revoke previously verified keys.
+                // Token expiry is still checked for every admission.
+                keys.retry_delay_s = (keys.retry_delay_s * 2).clamp(5, 60);
+                keys.retry_at = Some(now_s.saturating_add(keys.retry_delay_s));
+            }
+            keys.fetching = false;
+            self.refreshed.notify_all();
         }
-        if !self.keys_ready {
+        if !keys.usable_at(now_s) {
             return Err(Error("helper JWKS unavailable".into()));
         }
         Ok(())

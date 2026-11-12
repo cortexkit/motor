@@ -273,13 +273,20 @@ pub(super) fn stage(
     jail: &File,
     uid: u32,
 ) -> Result<Option<String>> {
-    stage_with_write(store, account, kind, jail, uid, false).map(|(nonce, _)| nonce)
+    let role = if kind == VmKind::Fill {
+        crate::job::WorkspaceRole::Fill
+    } else {
+        crate::job::WorkspaceRole::Job
+    };
+    stage_with_write(store, account, kind, role, jail, uid, false).map(|(nonce, _)| nonce)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_with_write(
     store: &Path,
     account: &str,
     kind: VmKind,
+    role: crate::job::WorkspaceRole,
     jail: &File,
     uid: u32,
     job_write: bool,
@@ -290,7 +297,7 @@ pub(super) fn stage_with_write(
     let Some(set) = store::load(store, account)? else {
         return Ok((None, false));
     };
-    let (set, job_write) = credentials_for_boot(set, kind, job_write);
+    let (set, job_write) = credentials_for_boot(set, kind, role, job_write);
     let nonce = random_nonce()?;
     let payload = Zeroizing::new(serde_json::to_vec(&set).map_err(|_| invalid())?);
     let length = REMOTE_CACHE_DRIVE_MAGIC.len() + nonce.len() + 4 + payload.len();
@@ -318,12 +325,15 @@ pub(super) fn stage_with_write(
 fn credentials_for_boot(
     mut set: RemoteCacheRequest,
     kind: VmKind,
+    role: crate::job::WorkspaceRole,
     job_write: bool,
 ) -> (RemoteCacheRequest, bool) {
-    if kind == VmKind::Job && !job_write {
+    let granted_job = kind == VmKind::Job && role == crate::job::WorkspaceRole::Job && job_write;
+    let fill = kind == VmKind::Fill && role == crate::job::WorkspaceRole::Fill;
+    if !granted_job && !fill {
         set.write_key = None;
     }
-    let job_write = kind == VmKind::Job && job_write && set.write_key.is_some();
+    let job_write = granted_job && set.write_key.is_some();
     (set, job_write)
 }
 

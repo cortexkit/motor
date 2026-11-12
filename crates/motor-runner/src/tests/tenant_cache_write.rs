@@ -325,3 +325,51 @@ fn job_vm_socket_grant_requires_both_trusted_boot_flag_and_credential_write_key(
         }
     }
 }
+
+#[test]
+fn dedicated_job_gateway_refuses_fill_binding_without_root_fill_boot() {
+    use crate::remote_cache::gateway::tests::{FakeConnector, FakeStore};
+    use crate::remote_cache::{
+        gateway::{Gateway, Limits, Tool},
+        runtime::Runtime,
+        transport::Role,
+    };
+    for (index, boot) in [
+        "motor.per_job=1 motor.cache_write=1",
+        "motor.per_job=1 motor.fill=0",
+        "motor.per_job=1 motor.fill=1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (f, runner, cache, _) = provisioned(true);
+        let mut config = runner.config().clone();
+        config.per_job = true;
+        let gateway = Gateway::with_connector(
+            Limits::for_config_and_boot(&config, boot),
+            Arc::new(cache.watch.clone()),
+            Arc::new(FakeConnector(Arc::new(FakeStore::default()))),
+        );
+        let cache =
+            Runtime::with_gateway(cache.watch.clone(), gateway, vec![(Tool::Sccache, 3893)])
+                .unwrap();
+        let directory = f.scratch.join(format!("fill-{index}"));
+        let result = cache
+            .transport(TENANT, &[Tool::Sccache])
+            .unwrap()
+            .open(&directory, Role::Fill);
+        if index == 2 {
+            let sockets = result.unwrap();
+            assert_eq!(
+                sockets.listeners()[0].binding().endpoint(),
+                crate::remote_cache::gateway::Endpoint::Write
+            );
+        } else {
+            assert_eq!(
+                result.err().expect("Job VM bound a Fill writer").kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert!(!directory.join("sccache.sock").exists());
+        }
+    }
+}

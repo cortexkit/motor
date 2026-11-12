@@ -156,7 +156,7 @@ impl LinuxJobs {
         )
     }
     fn disk_grant(&self, id: Option<&str>) -> Option<crate::cache_write::Grant> {
-        self.cache_write_grants.lock().ok()?.get(id?).cloned()
+        crate::cache_write::disk_grant(&self.cache_write_grants, id)
     }
     fn check_workspace_size(&self, size: u64) -> Result<()> {
         let maximum = self
@@ -178,9 +178,7 @@ impl LinuxJobs {
     }
     pub fn new(config: &Config) -> Self {
         Self {
-            cache_write_grants: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::cache_write::Grants::new(config),
-            )),
+            cache_write_grants: std::sync::Arc::new(crate::cache_write::Grants::new(config)),
             settings: config.job_vms.clone(),
             groups: cgroup::JOB_SLICE.into(),
             records_path: job::RECORDS.into(),
@@ -999,7 +997,7 @@ impl LinuxJobs {
         self.records.insert(start.job_id.clone(), record);
         // Durable intent already prevents another VM, including after restart.
         // Failures before intent leave the admission grant reusable by a retry.
-        let job_write = take_job_write_grant(&self.cache_write_grants, &start, &registry)?;
+        let job_write = take_job_write_grant(&self.cache_write_grants, &start, &registry);
         let id = &start.job_id;
         let boundary = self.boundary(id);
         let root = self.root(id);
@@ -1024,7 +1022,7 @@ impl LinuxJobs {
                 uid,
                 tap_index,
                 meta.len(),
-                job_write,
+                job_write.as_ref(),
             )?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
@@ -1146,19 +1144,23 @@ const CONSOLE_TAIL_BYTES: u64 = 16 * 1024;
 #[doc(hidden)]
 pub type BootRequests = Vec<(&'static str, Value)>;
 
-fn take_job_write_grant(
+pub(crate) fn take_job_write_grant(
     authority: &crate::cache_write::Authority,
     start: &Start,
     registry: &Workspace,
-) -> Result<bool> {
-    let mut grants = authority
-        .lock()
-        .map_err(|_| Error("cache grant lock poisoned".into()))?;
-    let permitted = grants
-        .get(&start.job_id)
-        .is_some_and(|grant| grant.permits(start, registry));
-    grants.consume(&start.job_id);
-    Ok(permitted)
+) -> Option<crate::cache_write::Grant> {
+    authority
+        .consume(&start.job_id)
+        .filter(|grant| grant.permits(start, registry))
+}
+
+pub(crate) fn job_write_for_stage(
+    grant: Option<&crate::cache_write::Grant>,
+    start: &Start,
+    registry: &Workspace,
+    now: SystemTime,
+) -> bool {
+    grant.is_some_and(|grant| grant.valid_at(now) && grant.permits(start, registry))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1171,10 +1173,18 @@ fn stage_boot(
     uid: u32,
     tap: Option<u8>,
     workspace_bytes: u64,
-    permitted: bool,
+    grant: Option<&crate::cache_write::Grant>,
 ) -> Result<(Option<String>, BootRequests)> {
-    let (nonce, job_write) =
-        cache::stage_with_write(store, &start.account, start.kind, boundary, uid, permitted)?;
+    let permitted = job_write_for_stage(grant, start, registry, SystemTime::now());
+    let (nonce, job_write) = cache::stage_with_write(
+        store,
+        &start.account,
+        start.kind,
+        registry.role,
+        boundary,
+        uid,
+        permitted,
+    )?;
     let mut requests = recorded_boot_requests(
         start,
         tap,

@@ -178,11 +178,7 @@ fn isolated_base_seed_is_same_account_repository_reflink_and_never_a_writable_ba
                 .unwrap();
             jobs.handle(Operation::SeedWorkspace(request.clone()), peer)
                 .unwrap();
-            jobs.cache_write_grants
-                .lock()
-                .unwrap()
-                .admit(token)
-                .unwrap();
+            jobs.cache_write_grants.admit(token).unwrap();
             let mut bound = request.clone();
             bound.cache_write_job_id = Some(id.clone());
             jobs.handle(Operation::SeedWorkspace(bound.clone()), peer)

@@ -54,7 +54,6 @@ async fn boot_while_blocked_resends_deny_before_job_lease() {
     runtime
         .host_admin(&json!({"op":"set_remote_cache_write_block","blocked":true}))
         .unwrap();
-    *fake.write_block_reply.lock().unwrap() = Some(json!({"ok":false,"error":"unsupported"}));
     let c = claims(JOB);
     let id = claim(&runtime, &c);
     existing_workspace(&runtime, JOB);
@@ -78,4 +77,68 @@ async fn boot_while_blocked_resends_deny_before_job_lease() {
     task.await.unwrap().unwrap();
     runtime.stop_job(JOB, true, false).unwrap();
     drop(storage);
+}
+
+#[tokio::test]
+async fn block_set_during_boot_retries_failed_resync_and_stops_unacknowledged_vm() {
+    for failures in [2, 4] {
+        let (runtime, fake, _storage) = fixture();
+        hold_boot(&runtime, &fake, "runner");
+        struct ReleaseGate(Arc<Fake>);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                *self.0.gate.0.lock().unwrap() = true;
+                self.0.gate.1.notify_all();
+            }
+        }
+        let _release = ReleaseGate(fake.clone());
+        let c = claims(JOB);
+        let id = claim(&runtime, &c);
+        let (mut client, task) = start(runtime.clone(), c, id).await;
+        queued(&mut client, JOB).await;
+        tokio::time::timeout(Duration::from_secs(2), fake.entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            !fake.job_starts.lock().unwrap()[0].cache_write_blocked,
+            "block must arrive after Start"
+        );
+        *fake.write_block_errors.lock().unwrap() = failures;
+        let blocked = runtime
+            .host_admin(&json!({"op":"set_remote_cache_write_block","blocked":true}))
+            .unwrap();
+        assert_eq!(blocked["not_acknowledged"], json!([JOB]));
+        *fake.gate.0.lock().unwrap() = true;
+        fake.gate.1.notify_all();
+        if failures == 2 {
+            next_type(&mut client, "output").await;
+            assert_eq!(
+                fake.admin_requests.lock().unwrap().len(),
+                3,
+                "broadcast plus two resync attempts"
+            );
+            assert!(!fake.inputs.lock().unwrap().is_empty());
+        } else {
+            next_type(&mut client, "lease_refused").await;
+            assert_eq!(
+                fake.admin_requests.lock().unwrap().len(),
+                4,
+                "broadcast plus three bounded resync attempts"
+            );
+            assert!(
+                fake.inputs.lock().unwrap().is_empty(),
+                "unacknowledged VM received a lease"
+            );
+            assert!(fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == &format!("stop:{JOB}")));
+            assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+        }
+        drop(client);
+        task.await.unwrap().unwrap();
+        runtime.stop_job(JOB, true, false).unwrap();
+    }
 }

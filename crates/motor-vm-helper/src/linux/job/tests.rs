@@ -319,9 +319,7 @@ pub(super) fn machine(base: &Path) -> LinuxJobs {
 
 pub(super) fn machine_with_config(base: &Path, config: &Config) -> LinuxJobs {
     LinuxJobs {
-        cache_write_grants: std::sync::Arc::new(std::sync::Mutex::new(
-            crate::cache_write::Grants::new(config),
-        )),
+        cache_write_grants: std::sync::Arc::new(crate::cache_write::Grants::new(config)),
         settings: None,
         groups: base.join("groups"),
         records_path: base.join("records"),
@@ -1301,21 +1299,16 @@ fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
     crate::cache_write::tests::with_fresh_token(&id, &account, |config, token| {
         for tombstone in [false, true] {
             let mut first = machine_with_config(&base, config);
-            first
-                .cache_write_grants
-                .lock()
-                .unwrap()
-                .admit(token)
-                .unwrap();
+            first.cache_write_grants.admit(token).unwrap();
             std::fs::create_dir_all(&first.records_path).unwrap();
             record.released = tombstone;
             record.exit_acknowledged = tombstone;
             record.oom_kill = tombstone.then_some(0);
             first.save(&record).unwrap();
             first.records.insert(id.clone(), record.clone());
-            first.cache_write_grants.lock().unwrap().consume(&id);
+            first.cache_write_grants.consume(&id);
             assert!(first.status(&id).is_ok());
-            assert!(first.cache_write_grants.lock().unwrap().get(&id).is_none());
+            assert!(first.cache_write_grants.get(&id).is_none());
             assert!(!first.boundary(&id).exists());
             let path = first.records_path.join(format!("{id}.json"));
             drop(first);
@@ -1323,18 +1316,8 @@ fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
             restarted.settings = Some(fixed_path_settings(json!({})));
             let saved = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             restarted.adopt_record(saved).unwrap();
-            restarted
-                .cache_write_grants
-                .lock()
-                .unwrap()
-                .admit(token)
-                .unwrap();
-            assert!(restarted
-                .cache_write_grants
-                .lock()
-                .unwrap()
-                .get(&id)
-                .is_some());
+            restarted.cache_write_grants.admit(token).unwrap();
+            assert!(restarted.cache_write_grants.get(&id).is_some());
             let error = restarted
                 .start(record.start.clone(), Peer { uid: 0, gid: 0 })
                 .err()
@@ -1408,11 +1391,7 @@ fn start_retry_before_durable_intent_reuses_grant_for_write_boot_configuration()
     start.account = crate::cache_write::tests::ACCOUNT.into();
     crate::cache_write::tests::with_fresh_token(&start.job_id, &start.account, |config, token| {
         let mut jobs = machine_with_config(&base, config);
-        jobs.cache_write_grants
-            .lock()
-            .unwrap()
-            .admit(token)
-            .unwrap();
+        jobs.cache_write_grants.admit(token).unwrap();
         for _ in 0..2 {
             let error = jobs
                 .start(start.clone(), Peer { uid: 0, gid: 0 })
@@ -1423,13 +1402,7 @@ fn start_retry_before_durable_intent_reuses_grant_for_write_boot_configuration()
                 .records_path
                 .join(format!("{}.json", start.job_id))
                 .exists());
-            let grant = jobs
-                .cache_write_grants
-                .lock()
-                .unwrap()
-                .get(&start.job_id)
-                .unwrap()
-                .clone();
+            let grant = jobs.cache_write_grants.get(&start.job_id).unwrap().clone();
             let mut disk = disk_registry(&start);
             disk.workspace_key_hash = Some(grant.workspace_key_hash.clone());
             assert!(grant.permits(&start, &disk));

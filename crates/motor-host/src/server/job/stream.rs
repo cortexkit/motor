@@ -259,11 +259,11 @@ async fn collect(
     mut commands: mpsc::Receiver<Input>,
 ) -> Result<()> {
     let resume = guest.is_none();
-    if resume && runtime.remote_cache_write_blocked() {
+    if resume {
         let runtime = runtime.clone();
         let job = claims.jti.clone();
         tokio::task::spawn_blocking(move || runtime.sync_remote_cache_write_block(&job, true))
-            .await?;
+            .await??;
     }
     let guest = match guest {
         Some(guest) => guest,

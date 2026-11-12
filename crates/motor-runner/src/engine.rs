@@ -874,8 +874,12 @@ impl Config {
                     .is_some_and(|generation| generation.write_key.is_some())
             })
     }
-    /// Whether a tenant VM may queue fills now: only with a write key.
+    /// A Job VM's create-only key never authorizes maintenance fills. Dedicated
+    /// fill runners and shared tenants still require an installed write key.
     pub(crate) fn tenant_fills(&self) -> bool {
+        if self.per_job && !self.fill_vm {
+            return false;
+        }
         #[cfg(unix)]
         return self.tenant_write_key_held();
         #[cfg(not(unix))]

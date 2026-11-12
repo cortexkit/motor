@@ -16,11 +16,7 @@ fn isolated_workspace_binding_is_created_from_verified_grant_and_never_backfille
     crate::cache_write::tests::with_fresh_token(&id, account, |config, token| {
         let mut jobs = super::super::tests::machine_with_config(&base, config);
         jobs.settings = settings;
-        jobs.cache_write_grants
-            .lock()
-            .unwrap()
-            .admit(token)
-            .unwrap();
+        jobs.cache_write_grants.admit(token).unwrap();
         let request = |disk: &str, selector: Option<String>| job::CreateWorkspace {
             account: account.into(),
             workspace_disk_id: disk.into(),
@@ -34,8 +30,6 @@ fn isolated_workspace_binding_is_created_from_verified_grant_and_never_backfille
             bound.workspace_key_hash.as_deref(),
             Some(
                 jobs.cache_write_grants
-                    .lock()
-                    .unwrap()
                     .get(&id)
                     .unwrap()
                     .workspace_key_hash
@@ -74,7 +68,7 @@ fn isolated_workspace_binding_is_created_from_verified_grant_and_never_backfille
             .0
             .workspace_key_hash
             .is_none());
-        jobs.cache_write_grants.lock().unwrap().consume(&id);
+        jobs.cache_write_grants.consume(&id);
         jobs.create_workspace(request("consumed", Some(id.clone())))
             .unwrap();
         assert!(open_disk(&jobs.workspaces, account, "consumed")
@@ -110,11 +104,7 @@ fn isolated_pre_intent_retry_stages_write_key_and_read_only_credential_drive() {
     };
     crate::cache_write::tests::with_fresh_token(&start.job_id, &start.account, |config, token| {
         let mut jobs = super::super::tests::machine_with_config(&base, config);
-        jobs.cache_write_grants
-            .lock()
-            .unwrap()
-            .admit(token)
-            .unwrap();
+        jobs.cache_write_grants.admit(token).unwrap();
         assert!(jobs.start(start.clone(), Peer { uid: 0, gid: 0 }).is_err());
         let grant = jobs.disk_grant(Some(&start.job_id)).unwrap();
         jobs.settings = Some(
@@ -140,6 +130,7 @@ fn isolated_pre_intent_retry_stages_write_key_and_read_only_credential_drive() {
             &jobs.cache_store,
             &start.account,
             start.kind,
+            registry.role,
             &File::open(&boundary).unwrap(),
             600001,
             grant.permits(&start, &registry),

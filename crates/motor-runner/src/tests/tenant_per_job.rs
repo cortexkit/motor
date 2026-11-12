@@ -58,7 +58,7 @@ fn fill_vm_may_fill_only_with_a_write_key_and_tip() {
     let f = Fixture::new();
     for (per_job, key, tip, refusal) in [
         (false, Some(true), "tip", None),
-        (true, Some(true), "tip", None),
+        (true, Some(true), "tip", Some("remote cache is off")),
         // Which write-key reason applies depends on the fixture's cache setup.
         (false, Some(false), "tip", Some("")),
         (false, Some(true), "", Some("no default-branch tip")),
@@ -67,6 +67,7 @@ fn fill_vm_may_fill_only_with_a_write_key_and_tip() {
         config.manual_tick = true;
         config.tenant_vm = true;
         config.per_job = per_job;
+        config.fill_vm = !per_job;
         config.tenant_write_key = key;
         let runner = Runner::open(config).unwrap();
         let got = runner.fill_vm_writer_refusal(tip);

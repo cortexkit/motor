@@ -78,7 +78,7 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
     if let Some(authority) = authority {
         std::thread::spawn(move || loop {
             std::thread::park_timeout(Duration::from_millis(100));
-            authority.lock().unwrap().maintain();
+            authority.maintain();
         });
     }
     let maintenance = helper.clone();
@@ -167,7 +167,7 @@ pub(crate) fn connection_loop<M: crate::Machine>(
                 let op = match request {
                     Request::AdmitCacheWrite { token } => {
                         let authority = helper.lock().unwrap().admission_work(id)?;
-                        authority.lock().unwrap().admit(&token)?;
+                        authority.admit(&token)?;
                         return Ok(Response::new(Reply::Ok));
                     }
                     Request::PerJobReadiness {} => helper.lock().unwrap().readiness_work(id)?,

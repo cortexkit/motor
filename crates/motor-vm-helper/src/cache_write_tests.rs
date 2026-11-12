@@ -181,7 +181,7 @@ pub(crate) fn with_fresh_token(jti: &str, account: &str, run: impl FnOnce(&Confi
 #[test]
 fn invalid_credentials_never_record_a_grant() {
     let server = Server::new();
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     let original = claims();
     let mut cases =
         vec![sign_token(&original, "current", &SigningKey::from_bytes(&[2; 32])).unwrap()];
@@ -207,48 +207,49 @@ fn invalid_credentials_never_record_a_grant() {
     }
     for token in cases {
         assert!(grants.admit_with_clock(&token, now).is_err());
-        assert!(grants.grants.is_empty());
+        assert!(grants.records.lock().unwrap().grants.is_empty());
     }
     server.arrived.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn valid_admission_is_immutable_and_survives_token_expiry_until_start_window_ends() {
+fn valid_admission_is_immutable_but_expires_before_start_window_ends() {
     let server = Server::new();
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     let c = claims();
     grants.admit_with_clock(&token(&c), now).unwrap();
     let expected = Grant {
+        exp: c.exp,
         sub: c.sub.clone(),
         jti: c.jti.clone(),
         workspace_key_hash: c.workspace_key_hash.clone().unwrap(),
     };
-    assert_eq!(grants.get_at(&c.jti, now()), Some(&expected));
+    assert_eq!(grants.get_at(&c.jti, now()), Some(expected.clone()));
     grants.admit_with_clock(&token(&c), now).unwrap();
     let mut changed = c.clone();
     changed.sub = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
     changed.workspace_key_hash = Some(base64url(&[8; 32]));
     assert!(grants.admit_with_clock(&token(&changed), now).is_err());
-    assert_eq!(grants.grants.len(), 1);
+    assert_eq!(grants.records.lock().unwrap().grants.len(), 1);
     assert_eq!(
         grants.get_at(&c.jti, now() + Duration::from_secs(301)),
-        Some(&expected)
+        None
     );
     assert_eq!(
         grants.get_at(&c.jti, now() + Duration::from_secs(24 * 60 * 60)),
-        Some(&expected)
+        None
     );
     let stale = now() + Duration::from_secs(24 * 60 * 60 + 1);
     assert!(grants.get_at(&c.jti, stale).is_none());
     grants.prune_at(stale);
-    assert!(grants.grants.is_empty());
+    assert!(grants.records.lock().unwrap().grants.is_empty());
 }
 
 #[test]
 fn keys_supplied_by_host_cannot_authorize_and_requests_accept_only_raw_token() {
     let server = Server::new();
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     let forged = sign_token(&claims(), "host-only", &SigningKey::from_bytes(&[9; 32])).unwrap();
     let request = json!({"op":"admit_cache_write","token":forged});
     assert!(serde_json::from_value::<crate::Request>(request.clone()).is_ok());
@@ -269,7 +270,7 @@ fn keys_supplied_by_host_cannot_authorize_and_requests_accept_only_raw_token() {
         assert!(serde_json::from_value::<crate::Request>(extra).is_err());
     }
     assert!(grants.admit_with_clock(&forged, now).is_err());
-    assert!(grants.grants.is_empty());
+    assert!(grants.records.lock().unwrap().grants.is_empty());
 }
 
 #[test]
@@ -277,14 +278,14 @@ fn missing_host_identity_and_failed_key_fetch_fail_closed() {
     let server = Server::new();
     let mut config = server.config();
     config.host_id = None;
-    let mut grants = Grants::new(&config);
+    let grants = Grants::new(&config);
     assert!(grants.admit_with_clock(&token(&claims()), now).is_err());
-    assert!(grants.grants.is_empty());
+    assert!(grants.records.lock().unwrap().grants.is_empty());
     assert_eq!(server.requests.load(Ordering::SeqCst), 0);
     server.fail.store(true, Ordering::SeqCst);
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     assert!(grants.admit_with_clock(&token(&claims()), now).is_err());
-    assert!(grants.grants.is_empty());
+    assert!(grants.records.lock().unwrap().grants.is_empty());
     // A known kid cannot bypass a failed refresh by retrying before the throttle.
     assert!(grants.admit_with_clock(&token(&claims()), now).is_err());
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
@@ -293,7 +294,7 @@ fn missing_host_identity_and_failed_key_fetch_fail_closed() {
 #[test]
 fn admission_rechecks_expiry_after_fetch_and_rejects_stale_start_identity() {
     let server = Server::new();
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     let c = claims();
     let calls = AtomicUsize::new(0);
     assert!(grants
@@ -305,7 +306,7 @@ fn admission_rechecks_expiry_after_fetch_and_rejects_stale_start_identity() {
             }
         })
         .is_err());
-    assert!(grants.grants.is_empty());
+    assert!(grants.records.lock().unwrap().grants.is_empty());
     let mut stale = c.clone();
     stale.jti = uuid::Uuid::from_u128(
         (u128::from((NOW - 24 * 60 * 60 - 1) * 1000) << 80)
@@ -314,13 +315,13 @@ fn admission_rechecks_expiry_after_fetch_and_rejects_stale_start_identity() {
     )
     .to_string();
     assert!(grants.admit_with_clock(&token(&stale), now).is_err());
-    assert!(grants.grants.is_empty());
+    assert!(grants.records.lock().unwrap().grants.is_empty());
 }
 
 #[test]
 fn key_refresh_uses_ten_minute_cadence_and_throttled_unknown_kid_refetch() {
     let server = Server::new();
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     let c = claims();
     grants.admit_with_clock(&token(&c), now).unwrap();
     *server.broker.lock().unwrap() = broker(2, "next");
@@ -344,29 +345,37 @@ fn key_refresh_uses_ten_minute_cadence_and_throttled_unknown_kid_refetch() {
         .unwrap();
     assert_eq!(server.requests.load(Ordering::SeqCst), 3);
     server.fail.store(true, Ordering::SeqCst);
-    assert!(grants
+    grants
         .refresh("", now() + Duration::from_secs(1260))
-        .is_err());
+        .unwrap();
     let mut c = claims();
     c.jti.replace_range(35..36, "3");
     c.iat = NOW + 1260;
     c.exp = c.iat + 300;
     let token = sign_token(&c, "next", &SigningKey::from_bytes(&[2; 32])).unwrap();
-    assert!(grants
+    grants
         .admit_with_clock(&token, || now() + Duration::from_secs(1260))
-        .is_err());
-    assert!(!grants.grants.contains_key(&c.jti));
+        .unwrap();
+    assert!(grants.records.lock().unwrap().grants.contains_key(&c.jti));
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn held_jwks_fetch_does_not_block_stop_and_concurrent_admissions_share_one_grant() {
-    use crate::{Helper, Kind, Lease, Machine, Reply};
+fn held_jwks_fetch_keeps_ensure_start_and_stop_job_responsive() {
+    use crate::{
+        job::{Operation, Workspace, WorkspaceRole},
+        Helper, Kind, Lease, Machine, Peer, Reply, Response,
+    };
     use std::os::{fd::OwnedFd, unix::net::UnixStream};
 
+    // Exercise the exact grant lookups used by LinuxJobs under the real Helper
+    // mutex. VM/disk IO is irrelevant to this lock-order test; the real-VM matrix
+    // separately qualifies authorization and the sandbox boundary.
     struct LifecycleMachine {
         authority: Authority,
+        entered: std::sync::mpsc::Sender<()>,
         stopped: Arc<AtomicBool>,
+        running: BTreeSet<String>,
     }
     impl Machine for LifecycleMachine {
         fn cache_write_authority(&self) -> Option<Authority> {
@@ -376,11 +385,10 @@ fn held_jwks_fetch_does_not_block_stop_and_concurrent_admissions_share_one_grant
             Ok(())
         }
         fn start(&mut self, _: usize, _: &Lease, _: Kind) -> Result<Vec<OwnedFd>> {
-            Ok(vec![])
+            unreachable!()
         }
         fn stop(&mut self, _: usize, _: &Lease, _: bool) -> Result<()> {
-            self.stopped.store(true, Ordering::SeqCst);
-            Ok(())
+            unreachable!()
         }
         fn cleanup(&mut self, _: usize) -> Result<()> {
             Ok(())
@@ -388,13 +396,41 @@ fn held_jwks_fetch_does_not_block_stop_and_concurrent_admissions_share_one_grant
         fn alive(&mut self, _: usize) -> bool {
             true
         }
+        fn job(&mut self, op: Operation, _: Peer) -> Result<Response> {
+            match op {
+                Operation::EnsureWorkspace {
+                    cache_write_job_id, ..
+                } => {
+                    self.entered.send(()).unwrap();
+                    let _grant = disk_grant(&self.authority, cache_write_job_id.as_deref());
+                }
+                Operation::Start(start) => {
+                    self.entered.send(()).unwrap();
+                    let disk = Workspace {
+                        account: start.account.clone(),
+                        workspace_disk_id: start.workspace_disk_id.clone(),
+                        role: WorkspaceRole::Job,
+                        workspace_key_hash: Some(base64url(&[5; 32])),
+                    };
+                    let _grant =
+                        crate::linux::job::take_job_write_grant(&self.authority, &start, &disk);
+                    self.running.insert(start.job_id);
+                }
+                Operation::Stop(id) => {
+                    assert!(self.running.remove(&id), "StopJob must target a running VM");
+                    self.stopped.store(true, Ordering::SeqCst);
+                }
+                _ => unreachable!(),
+            }
+            Ok(Response::new(Reply::Ok))
+        }
     }
     fn connection(
         helper: &Arc<Mutex<Helper<LifecycleMachine>>>,
     ) -> (BufReader<UnixStream>, JoinHandle<()>) {
         let (client, stream) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let peer = crate::linux::server::peer(&stream).unwrap();
         let id = helper.lock().unwrap().connect(peer).unwrap();
@@ -408,90 +444,101 @@ fn held_jwks_fetch_does_not_block_stop_and_concurrent_admissions_share_one_grant
     fn send(client: &mut BufReader<UnixStream>, request: serde_json::Value) {
         writeln!(client.get_mut(), "{request}").unwrap();
     }
-    fn receive(client: &mut BufReader<UnixStream>) -> serde_json::Value {
+    fn receive(client: &mut BufReader<UnixStream>) -> std::io::Result<serde_json::Value> {
         let mut line = String::new();
-        client.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
+        client.read_line(&mut line)?;
+        Ok(serde_json::from_str(&line).unwrap())
     }
-
     let server = Server::new();
-    let authority = Arc::new(Mutex::new(Grants::new(&server.config())));
+    let authority = Arc::new(Grants::new(&server.config()));
     let stopped = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered) = std::sync::mpsc::channel();
     let helper = Arc::new(Mutex::new(
         Helper::new(
             LifecycleMachine {
                 authority: authority.clone(),
+                entered: entered_tx,
                 stopped: stopped.clone(),
+                running: BTreeSet::new(),
             },
             1,
             vec![unsafe { libc::geteuid() }],
         )
         .unwrap(),
     ));
-    let (mut lifecycle, lifecycle_thread) = connection(&helper);
-    let job = crate::job::test_id(100);
+    // Connect before holding the fetch; connect itself takes the Helper mutex.
+    let (mut admission, admission_thread) = connection(&helper);
+    let (mut ensure, ensure_thread) = connection(&helper);
+    let (mut start, start_thread) = connection(&helper);
+    let (mut stop, stop_thread) = connection(&helper);
+    let other = crate::job::test_id(102);
     send(
-        &mut lifecycle,
-        json!({"op":"acquire","instance":"test","job_id":job}),
+        &mut stop,
+        json!({"op":"start_job","kind":"job","job_id":other,"account":ACCOUNT,"workspace_disk_id":"other-disk","image_generation_id":"gen-1","vcpus":2,"memory_mib":16384}),
     );
-    assert_eq!(
-        receive(&mut lifecycle),
-        json!({"result":"acquired","slot":0})
-    );
-    send(
-        &mut lifecycle,
-        json!({"op":"start","slot":0,"instance":"test","job_id":job,"kind":"job"}),
-    );
-    assert_eq!(
-        receive(&mut lifecycle),
-        serde_json::to_value(Reply::Started { fd_count: 0 }).unwrap()
-    );
-
-    *server.gate.0.lock().unwrap() = true;
-    let (mut first, first_thread) = connection(&helper);
-    let (mut second, second_thread) = connection(&helper);
+    assert_eq!(receive(&mut stop).unwrap(), json!({"result":"ok"}));
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
     let mut c = claims();
     c.jti = crate::job::test_id(101);
     c.iat = seconds(SystemTime::now()).unwrap();
     c.exp = c.iat + 300;
-    let request = json!({"op":"admit_cache_write","token":token(&c)});
-    send(&mut first, request.clone());
-    server.arrived.recv_timeout(Duration::from_secs(5)).unwrap();
-    send(&mut second, request);
-    // Both admissions use the authority lock. Lifecycle requests use only the
-    // global Helper lock and must complete while the broker is still held.
+    *server.gate.0.lock().unwrap() = true;
     send(
-        &mut lifecycle,
-        json!({"op":"stop","slot":0,"instance":"test","job_id":job,"export":false}),
+        &mut admission,
+        json!({"op":"admit_cache_write","token":token(&c)}),
     );
-    let stop_reply = receive(&mut lifecycle);
-    assert!(stopped.load(Ordering::SeqCst));
-    assert_eq!(stop_reply, json!({"result":"ok"}));
+    server.arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+    send(
+        &mut ensure,
+        json!({"op":"ensure_workspace","account":ACCOUNT,"disk_id":"disk-1","size_bytes":4096,"cache_write_job_id":c.jti}),
+    );
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    send(
+        &mut start,
+        json!({"op":"start_job","kind":"job","job_id":c.jti,"account":ACCOUNT,"workspace_disk_id":"disk-1","image_generation_id":"gen-1","vcpus":2,"memory_mib":16384}),
+    );
+    let start_entered = entered.recv_timeout(Duration::from_secs(2));
+    send(&mut stop, json!({"op":"stop_job","job_id":other}));
+    let stop_reply = receive(&mut stop);
+    let stopped_while_fetch_held = stopped.load(Ordering::SeqCst);
     *server.gate.0.lock().unwrap() = false;
     server.gate.1.notify_all();
-    assert_eq!(receive(&mut first), json!({"result":"ok"}));
-    assert_eq!(receive(&mut second), json!({"result":"ok"}));
-    assert_eq!(authority.lock().unwrap().grants.len(), 1);
-    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
-    assert_eq!(authority.lock().unwrap().get(&c.jti).unwrap().sub, c.sub);
+    assert_eq!(receive(&mut admission).unwrap(), json!({"result":"ok"}));
+    assert_eq!(receive(&mut ensure).unwrap(), json!({"result":"ok"}));
+    assert_eq!(receive(&mut start).unwrap(), json!({"result":"ok"}));
+    if stop_reply.is_err() {
+        // Drain the late reply before disconnecting, so a deadline failure is
+        // reported as a lifecycle stall rather than a connection-reset panic.
+        assert_eq!(receive(&mut stop).unwrap(), json!({"result":"ok"}));
+    }
     assert!(helper.lock().unwrap().admission_work(u64::MAX).is_err());
     helper.lock().unwrap().shutdown().unwrap();
     assert!(helper.lock().unwrap().admission_work(1).is_err());
-    drop((first, second, lifecycle));
-    first_thread.join().unwrap();
-    second_thread.join().unwrap();
-    lifecycle_thread.join().unwrap();
+    drop((admission, ensure, start, stop));
+    for worker in [admission_thread, ensure_thread, start_thread, stop_thread] {
+        worker.join().unwrap();
+    }
+    assert!(
+        start_entered.is_ok(),
+        "Start blocked behind held JWKS fetch"
+    );
+    assert_eq!(
+        stop_reply.unwrap(),
+        json!({"result":"ok"}),
+        "StopJob exceeded its two-second deadline"
+    );
+    assert!(stopped_while_fetch_held, "StopJob waited for broker");
 }
 
 #[test]
 fn verified_grant_retries_before_boot_but_cannot_be_rearmed_after_consumption() {
     let server = Server::new();
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     let c = claims();
     grants.admit_with_clock(&token(&c), now).unwrap();
     let first = grants.get_at(&c.jti, now()).unwrap().clone();
-    assert_eq!(grants.get_at(&c.jti, now()), Some(&first));
-    grants.consume(&c.jti);
+    assert_eq!(grants.get_at(&c.jti, now()), Some(first.clone()));
+    assert!(grants.consume_at(&c.jti, now()).is_some());
     assert!(grants.get_at(&c.jti, now()).is_none());
     grants.admit_with_clock(&token(&c), now).unwrap();
     assert!(grants.get_at(&c.jti, now()).is_none());
@@ -500,7 +547,7 @@ fn verified_grant_retries_before_boot_but_cannot_be_rearmed_after_consumption() 
 #[test]
 fn verified_grant_binds_exact_job_subject_workspace_and_deny_flag() {
     let server = Server::new();
-    let mut grants = Grants::new(&server.config());
+    let grants = Grants::new(&server.config());
     let c = claims();
     grants.admit_with_clock(&token(&c), now).unwrap();
     let grant = grants.get_at(&c.jti, now()).unwrap();
@@ -551,4 +598,164 @@ fn verified_grant_binds_exact_job_subject_workspace_and_deny_flag() {
         }
         assert!(!grant.permits(&start, &disk), "{case}");
     }
+}
+
+#[test]
+fn failed_refresh_keeps_verified_keys_and_retries_with_bounded_backoff() {
+    let server = Server::new();
+    let grants = Grants::new(&server.config());
+    grants.admit_with_clock(&token(&claims()), now).unwrap();
+    server.fail.store(true, Ordering::SeqCst);
+    let mut cached = claims();
+    cached.jti.replace_range(35..36, "4");
+    cached.iat = NOW + 600;
+    cached.exp = cached.iat + 300;
+    grants
+        .admit_with_clock(&token(&cached), || now() + Duration::from_secs(600))
+        .unwrap();
+    assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    for (elapsed, requests) in [
+        (604, 2),
+        (605, 3),
+        (614, 3),
+        (615, 4),
+        (634, 4),
+        (635, 5),
+        (674, 5),
+        (675, 6),
+        (734, 6),
+        (735, 7),
+    ] {
+        grants
+            .refresh("", now() + Duration::from_secs(elapsed))
+            .unwrap();
+        assert_eq!(
+            server.requests.load(Ordering::SeqCst),
+            requests,
+            "at {elapsed}s"
+        );
+    }
+    server.fail.store(false, Ordering::SeqCst);
+    *server.broker.lock().unwrap() = broker(2, "next");
+    let mut rotated = cached.clone();
+    rotated.jti.replace_range(35..36, "5");
+    rotated.iat = NOW + 795;
+    rotated.exp = rotated.iat + 300;
+    let rotated_token = sign_token(&rotated, "next", &SigningKey::from_bytes(&[2; 32])).unwrap();
+    grants
+        .admit_with_clock(&rotated_token, || now() + Duration::from_secs(795))
+        .unwrap();
+    assert_eq!(server.requests.load(Ordering::SeqCst), 8);
+    assert!(grants
+        .admit_with_clock(&rotated_token, || now() + Duration::from_secs(1095))
+        .is_err());
+    server.fail.store(true, Ordering::SeqCst);
+    let mut boundary = rotated.clone();
+    boundary.jti.replace_range(35..36, "6");
+    boundary.iat = NOW + 795 + 3600;
+    boundary.exp = boundary.iat + 300;
+    let sign = |c: &Claims| sign_token(c, "next", &SigningKey::from_bytes(&[2; 32])).unwrap();
+    let hour = now() + Duration::from_secs(795 + 3600);
+    grants.admit_with_clock(&sign(&boundary), || hour).unwrap();
+    let admitted_id = boundary.jti.clone();
+    boundary.jti.replace_range(35..36, "7");
+    let stale = hour + Duration::from_secs(1);
+    assert!(grants.admit_with_clock(&sign(&boundary), || stale).is_err());
+    assert!(!grants
+        .records
+        .lock()
+        .unwrap()
+        .grants
+        .contains_key(&boundary.jti));
+    assert!(
+        grants.get_at(&admitted_id, stale).is_some(),
+        "keyset age cannot revoke an unexpired admitted grant"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn expired_grant_consumption_and_staging_fall_back_to_read_only() {
+    let server = Server::new();
+    let grants = Grants::new(&server.config());
+    let c = claims();
+    grants.admit_with_clock(&token(&c), now).unwrap();
+    let grant = grants.get_at(&c.jti, now()).unwrap();
+    let expired = now() + Duration::from_secs(300);
+    assert!(grants.consume_at(&c.jti, expired).is_none());
+    let start = crate::job::Start {
+        kind: crate::job::VmKind::Job,
+        job_id: c.jti.clone(),
+        account: c.sub.clone(),
+        workspace_disk_id: "disk-1".into(),
+        image_generation_id: "gen-1".into(),
+        vcpus: 2,
+        memory_mib: 16384,
+        burst_mib: None,
+        cache_write_blocked: false,
+    };
+    let disk = crate::job::Workspace {
+        account: c.sub,
+        workspace_disk_id: start.workspace_disk_id.clone(),
+        role: crate::job::WorkspaceRole::Job,
+        workspace_key_hash: c.workspace_key_hash,
+    };
+    assert!(crate::linux::job::job_write_for_stage(
+        Some(&grant),
+        &start,
+        &disk,
+        now()
+    ));
+    assert!(!crate::linux::job::job_write_for_stage(
+        Some(&grant),
+        &start,
+        &disk,
+        expired
+    ));
+    assert!(
+        grants.get_at(&c.jti, now()).is_none(),
+        "expired consumption is still one-use"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn contended_or_poisoned_grant_lookup_never_blocks_or_refuses_compute() {
+    let authority = Arc::new(Grants::new(&Server::new().config()));
+    let lock = authority.records.lock().unwrap();
+    assert!(disk_grant(&authority, None).is_none());
+    assert!(disk_grant(&authority, Some(&crate::job::test_id(1))).is_none());
+    assert!(authority.consume(&crate::job::test_id(1)).is_none());
+    drop(lock);
+    let poison = authority.clone();
+    assert!(std::thread::spawn(move || {
+        let _guard = poison.records.lock().unwrap();
+        panic!("poison records");
+    })
+    .join()
+    .is_err());
+    assert!(disk_grant(&authority, Some(&crate::job::test_id(1))).is_none());
+    assert!(authority.consume(&crate::job::test_id(1)).is_none());
+}
+
+#[test]
+fn concurrent_admissions_share_one_fetch_and_one_immutable_grant() {
+    let server = Server::new();
+    let authority = Arc::new(Grants::new(&server.config()));
+    *server.gate.0.lock().unwrap() = true;
+    let first = authority.clone();
+    let first = std::thread::spawn(move || first.admit_with_clock(&token(&claims()), now));
+    server.arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+    let second = authority.clone();
+    let second = std::thread::spawn(move || second.admit_with_clock(&token(&claims()), now));
+    *server.gate.0.lock().unwrap() = false;
+    server.gate.1.notify_all();
+    first.join().unwrap().unwrap();
+    second.join().unwrap().unwrap();
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.records.lock().unwrap().grants.len(), 1);
+    assert_eq!(
+        authority.get_at(&claims().jti, now()).unwrap().sub,
+        claims().sub
+    );
 }

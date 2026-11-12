@@ -150,6 +150,9 @@ impl Endpoint {
 /// Gateway limits; the defaults are the configured defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Limits {
+    /// Dedicated Job/Fill VMs may bind fill writers only when the host supplied
+    /// the privileged `motor.fill=1` kernel boot argument.
+    pub(crate) fill_write_allowed: bool,
     /// Largest object a PUT may send or a response may carry.
     pub(crate) max_object_bytes: u64,
     /// Longest full upstream key, prefix included.
@@ -190,6 +193,7 @@ pub(crate) struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            fill_write_allowed: true,
             max_object_bytes: 1 << 30,
             max_key_bytes: 1024,
             stream_buffer_bytes: 1 << 20,
@@ -212,7 +216,19 @@ impl Default for Limits {
 
 impl Limits {
     pub(crate) fn for_config(config: &crate::Config) -> Self {
+        #[cfg(target_os = "linux")]
+        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let cmdline = String::new();
+        Self::for_config_and_boot(config, &cmdline)
+    }
+
+    pub(crate) fn for_config_and_boot(config: &crate::Config, cmdline: &str) -> Self {
         Self {
+            fill_write_allowed: !(config.per_job || config.fill_vm)
+                || cmdline
+                    .split_whitespace()
+                    .any(|word| word == "motor.fill=1"),
             max_job_put_objects: config.remote_cache_max_job_put_objects,
             max_job_put_bytes: config.remote_cache_max_job_put_bytes,
             max_job_puts: config.remote_cache_max_job_puts,
@@ -997,6 +1013,12 @@ impl Gateway {
     /// runner binds it into. Dropping the returned listener also ends every
     /// connection accepted on it.
     pub(crate) fn listen(&self, path: &Path, binding: Arc<Binding>) -> io::Result<Listener> {
+        if binding.endpoint == Endpoint::Write && !self.shared.limits.fill_write_allowed {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fill cache binding requires a Fill VM boot",
+            ));
+        }
         let mut stopped = binding.owner.stopped.subscribe();
         if *stopped.borrow() {
             return Err(io::Error::other("job cache sockets are stopped"));

@@ -19,7 +19,7 @@ impl Fixture {
     }
 
     pub fn admit(&self, token: &str) -> Result<()> {
-        self.jobs.cache_write_grants.lock().unwrap().admit(token)
+        self.jobs.cache_write_grants.admit(token)
     }
 
     pub fn create(&self, request: job::CreateWorkspace) -> Result<()> {
@@ -46,7 +46,7 @@ impl Fixture {
             &start.account,
             &start.workspace_disk_id,
         )?;
-        let granted = take_job_write_grant(&self.jobs.cache_write_grants, start, &registry)?;
+        let granted = take_job_write_grant(&self.jobs.cache_write_grants, start, &registry);
         let (_, requests) = stage_boot(
             &self.jobs.cache_store,
             start,
@@ -59,7 +59,7 @@ impl Fixture {
             uid,
             Some(tap),
             disk.metadata()?.len(),
-            granted,
+            granted.as_ref(),
         )?;
         Ok((disk, requests))
     }

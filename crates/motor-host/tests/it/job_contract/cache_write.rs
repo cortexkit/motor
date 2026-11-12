@@ -206,7 +206,7 @@ impl Prepared {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        let writable = matches!(case, "valid" | "expired-queued" | "replay");
+        let writable = matches!(case, "valid" | "replay");
         let set: motor_protocol::RemoteCacheRequest = serde_json::from_value(json!({
             "op":"set_remote_cache",
             "config":json!({"generation":"test","tenant":ACCOUNT,"endpoint":"https://127.0.0.1:9","region":"test","bucket":"compile","prefix":"tenant/acct-01ARZ3NDEKTSV4RRFFQ69G5FAV/","storage_class":"STANDARD","enabled":true}).to_string(),
