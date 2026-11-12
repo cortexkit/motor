@@ -934,7 +934,9 @@ Use `hosted_repositories_placement_hints` to give individual repositories their
 own `{host, vm}` hints. Keys must be absolute roots listed in
 `hosted_repositories`. An entry overrides `hosted_repositories_placement_hint`
 for its repository; listed repositories without an entry keep the shared hint.
-The map is omitted from serialized Config when empty. Fleet routes ignore it.
+The map is omitted from serialized Config when empty. Jobs from repositories
+not listed in `hosted_repositories` ignore it; the broker places those as
+usual.
 
 For a repository-routed job, broker `503 no_capacity` responses wait for
 `Retry-After` (seconds, clamped to 1–30 seconds; missing or invalid means one
