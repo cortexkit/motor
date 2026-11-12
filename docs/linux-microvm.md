@@ -266,6 +266,9 @@ guest source metadata can add roots. A new workspace disk may be seeded from a
 matching base; an existing disk is never replaced. The host selects a base using
 the lease's account and Run's exact repository root before boot. Missing bases
 and failed seed attempts fall back to normal workspace creation.
+The list travels on a job VM's boot command line, so settings validation refuses
+lists too long to fit. Use `"*"` to enable every repository of the account, or list
+fewer roots.
 
 The host JSON's required `per_job` settings have no compiled-in defaults:
 
