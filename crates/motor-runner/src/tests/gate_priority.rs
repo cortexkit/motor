@@ -1086,6 +1086,69 @@ fn job_status_names_a_gate_job_ahead_as_the_reason() {
     assert_eq!(detail.split(';').next(), Some("waiting_on=gate job ahead"));
 }
 
+#[test]
+fn verified_bundles_report_queued_with_workspace_blocker() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, bytes) = f.run("true");
+    let now = runner.now();
+    let mut owner = job(&request, &f.key, 12, 0, false, now);
+    owner.state = JobState::Running;
+    owner.started_ms = Some(now);
+    owner.request.as_mut().unwrap().timeout = Some(7200);
+    let owner_id = owner.id;
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .insert(owner_id, owner);
+    assert_run_accepted(&runner, &request);
+    assert_eq!(
+        runner
+            .queue_progress(request.job_id)
+            .status()
+            .unwrap()
+            .state,
+        "uploading"
+    );
+    let spool = f.spool(&runner, &request, &bytes);
+    runner.fetch_run(&request, &spool.directory, true).unwrap();
+    let status = runner.job_status(request.job_id).unwrap();
+    assert_eq!(status.state, "queued");
+    assert_eq!(status.waiting_on.as_deref(), Some("workspace owner"));
+    let blocker = status.blocker.unwrap();
+    assert_eq!(blocker.job_id, owner_id);
+    assert_eq!(blocker.started_ms, Some(now));
+    assert_eq!(blocker.timeout_s, Some(7200));
+    let live = runner.queue_progress(request.job_id).status().unwrap();
+    assert_eq!(live.state, "queued");
+    assert_eq!(live.waiting_on, status.waiting_on);
+    assert_eq!(live.blocker, Some(blocker));
+}
+
+#[test]
+fn status_names_the_sibling_user_holding_the_checkout() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut user = sibling_user(&f, &request, "running", 1, now);
+    user.state = JobState::Running;
+    user.started_ms = Some(now);
+    let worker = workspace_job(&f, &request, 2, false, now);
+    let (user_id, worker_id) = (user.id, worker.id);
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner.jobs.insert(user.id, user);
+        inner.jobs.insert(worker.id, worker);
+    }
+    let status = runner.job_status(worker_id).unwrap();
+    assert_eq!(status.waiting_on.as_deref(), Some(SIBLING_USER_WAIT));
+    assert_eq!(status.blocker.unwrap().job_id, user_id);
+}
+
 /// The capacity-wait classification marks which waits count as capacity: a
 /// job behind a gate job or an older job waiting for permits is in a capacity
 /// queue, while a job held behind its own workspace, a sibling user of its

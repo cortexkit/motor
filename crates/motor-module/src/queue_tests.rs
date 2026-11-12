@@ -204,6 +204,7 @@ impl Connector for ClockPeer {
                             let ms = queue.load(Ordering::SeqCst);
                             if write_frame_async(&mut peer, &Frame::Heartbeat {
                                 queue_wait_ms: (ms != u64::MAX).then_some(ms),
+                                queue_status: None,
                             }).await.is_err() { return; }
                             continue;
                         }
@@ -214,6 +215,7 @@ impl Connector for ClockPeer {
                             let _ = write_frame_async(
                                 &mut peer,
                                 &Frame::JobStatusReply(JobStatusReply {
+                                    blocker: None,
                                     job_id,
                                     state: "queued".into(),
                                     waiting_on: None,
@@ -610,6 +612,7 @@ impl Connector for ResubmitPeer {
                             write_frame_async(&mut peer, &accepted).await.unwrap();
                             let waiting = Frame::Heartbeat {
                                 queue_wait_ms: Some(0),
+                                queue_status: None,
                             };
                             write_frame_async(&mut peer, &waiting).await.unwrap();
                             if run.queue_wait_limit_s == 0 {
@@ -1180,7 +1183,7 @@ impl Connector for QueuedPeer {
                             if clock_runs {
                                 waited_ms += 1_000;
                             }
-                            let beat = Frame::Heartbeat { queue_wait_ms: Some(waited_ms) };
+                            let beat = Frame::Heartbeat { queue_wait_ms: Some(waited_ms), queue_status: None };
                             if write_frame_async(&mut peer, &beat).await.is_err() {
                                 return;
                             }

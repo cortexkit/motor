@@ -551,6 +551,7 @@ mod tests {
     }
     fn reply(id: Uuid, state: &str, waiting: Option<&str>) -> JobStatusReply {
         JobStatusReply {
+            blocker: None,
             job_id: id,
             state: state.into(),
             waiting_on: waiting.map(str::to_owned),

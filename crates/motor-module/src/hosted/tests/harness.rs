@@ -504,6 +504,7 @@ impl Harness {
                                     motor_protocol::write_frame_async(
                                         &mut tls,
                                         &Frame::JobStatusReply(motor_protocol::JobStatusReply {
+                                            blocker: None,
                                             job_id,
                                             state: if behavior.status_terminal() {
                                                 "ended"

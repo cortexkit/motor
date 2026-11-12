@@ -885,6 +885,7 @@ impl Connector for FutureRecords {
                     write_frame_async(
                         &mut b,
                         &Frame::JobStatusReply(JobStatusReply {
+                            blocker: None,
                             job_id,
                             state: "running".into(),
                             waiting_on: None,
@@ -1005,6 +1006,7 @@ impl Connector for UnknownCursorRecovery {
                     write_frame_async(
                         &mut b,
                         &Frame::JobStatusReply(JobStatusReply {
+                            blocker: None,
                             job_id,
                             state: "running".into(),
                             waiting_on: None,

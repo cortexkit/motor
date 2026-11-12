@@ -735,7 +735,11 @@ async fn no_boot_before_first_frame_and_busy_disk_has_queue_frames() {
         next_type(&mut client, "accepted").await["queue_position"],
         1
     );
-    assert!(next_type(&mut client, "heartbeat").await["queue_wait_ms"].is_number());
+    let waiting = next_type(&mut client, "heartbeat").await;
+    assert!(waiting["queue_wait_ms"].is_number());
+    assert_eq!(waiting["queue_status"]["state"], "queued");
+    assert_eq!(waiting["queue_status"]["waiting_on"], "checkout disk");
+    assert_eq!(waiting["queue_status"]["blocker"]["job_id"], JOB);
     assert!(fake.calls.lock().unwrap().is_empty());
     runtime
         .host
@@ -749,10 +753,18 @@ async fn no_boot_before_first_frame_and_busy_disk_has_queue_frames() {
             permit_budget: 4,
         });
     runtime.stop_job(JOB, false, false).unwrap();
-    assert_eq!(
-        next_type(&mut client, "heartbeat").await["queue_wait_ms"],
-        0
-    );
+    let waiting = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = next_type(&mut client, "heartbeat").await;
+            if frame["queue_status"]["waiting_on"] == "memory" {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(waiting["queue_wait_ms"], 0);
+    assert!(waiting["queue_status"].get("blocker").is_none());
     assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB2].boot_started);
     assert_eq!(
         fake.calls.lock().unwrap().as_slice(),

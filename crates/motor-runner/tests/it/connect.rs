@@ -187,6 +187,7 @@ fn connect_exits_quietly_when_stdout_pipe_closes() {
         &mut socket,
         &Frame::Heartbeat {
             queue_wait_ms: None,
+            queue_status: None,
         },
     )
     .unwrap();

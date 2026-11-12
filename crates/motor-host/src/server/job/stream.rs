@@ -766,6 +766,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // Subscribing starts after the latest heartbeat: only a new runner frame
     // can describe the queue state of this caller's live attachment.
     let mut heartbeats = stream.runner_heartbeat.subscribe();
+    let status_started = tokio::time::Instant::now();
+    let mut queue_updates = motor_protocol::QueueStatusUpdates::default();
     stream.expire_chunks(unix_ms())?;
     let _owner = (!hello).then(|| UploadOwner(stream.clone()));
     let _ = publish_settlement(runtime, &claims.jti, &stream);
@@ -877,6 +879,15 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         if let Some(terminal) = ended {
                             let reply = stored_reply(kind, &claims.jti, terminal)?;
                             write_frame(&mut write, &reply).await?;
+                        } else if kind == "job_status" && stream.input.lock().expect("job input").is_none() {
+                            if let Some(status) = queue_status(runtime, claims) {
+                                let reply = motor_protocol::JobStatusReply {
+                                    job_id: claims.jti.parse()?, state: status.state,
+                                    waiting_on: status.waiting_on, blocker: status.blocker,
+                                    queue_wait_ms: Some(0), terminal: None, unit: None, unit_alive: None,
+                                };
+                                write_frame(&mut write, &serde_json::to_value(motor_protocol::Frame::JobStatusReply(reply))?).await?;
+                            }
                         } else {
                             let tx = stream.input.lock().expect("job input").clone().context("runner disconnected")?;
                             let (reply, response) = oneshot::channel();
@@ -901,7 +912,16 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 let bytes = heartbeats.borrow_and_update().clone();
                 if let Some(bytes) = bytes {
                     write.write_all(&bytes).await.map_err(anyhow::Error::from).map_err(client_io)?;
-                    last_runner_heartbeat = Some(bytes);
+                    // Repeated keepalives must not replay a change notification.
+                    let mut sample: Value = serde_json::from_slice(&bytes[4..])?;
+                    let removed = sample.as_object_mut().context("runner heartbeat object")?.remove("queue_status").is_some();
+                    last_runner_heartbeat = Some(if removed {
+                        let payload = serde_json::to_vec(&sample)?;
+                        let mut clean = Vec::with_capacity(payload.len() + 4);
+                        clean.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
+                        clean.extend_from_slice(&payload);
+                        clean
+                    } else { bytes });
                     last_write = tokio::time::Instant::now();
                 }
             }
@@ -915,7 +935,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         // No live runner queue sample has reached this attachment.
                         // Keep the caller's capacity-queue budget paused rather
                         // than clearing its deadline with a bare heartbeat.
-                        write_frame(&mut write, &json!({"type":"heartbeat","queue_wait_ms":0})).await.map_err(client_io)?;
+                        let mut frame = json!({"type":"heartbeat","queue_wait_ms":0});
+                        if let Some(status) = queue_updates.update(queue_status(runtime, claims), u64::try_from(status_started.elapsed().as_millis()).unwrap_or(u64::MAX)) {
+                            frame["queue_status"] = serde_json::to_value(status)?;
+                        }
+                        write_frame(&mut write, &frame).await.map_err(client_io)?;
                     }
                     last_write = tokio::time::Instant::now();
                 }

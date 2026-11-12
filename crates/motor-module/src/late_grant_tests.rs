@@ -260,6 +260,7 @@ impl Connector for Runner {
                                 &mut server,
                                 &Frame::Heartbeat {
                                     queue_wait_ms: None,
+                                    queue_status: None,
                                 },
                             )
                             .await

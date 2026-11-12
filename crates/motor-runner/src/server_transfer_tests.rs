@@ -25,6 +25,7 @@ async fn runner_reader_reports_eof_with_the_last_frame_instead_of_silent_detach(
         &mut client,
         &Frame::Heartbeat {
             queue_wait_ms: None,
+            queue_status: None,
         },
     )
     .await
@@ -109,6 +110,7 @@ async fn upload_stall_bound_ignores_heartbeats_and_empty_chunks() {
             if tx
                 .send(Frame::Heartbeat {
                     queue_wait_ms: None,
+                    queue_status: None,
                 })
                 .await
                 .is_err()

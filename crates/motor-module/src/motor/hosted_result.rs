@@ -57,6 +57,24 @@ fn sequence(record: &StreamRecord) -> Option<u64> {
 }
 
 impl Owner {
+    pub(super) fn heartbeat(
+        &self,
+        id: Uuid,
+        elapsed: Option<u64>,
+        status: Option<motor_protocol::QueueStatus>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(status) = status {
+            let reply = state.reply.get_or_insert_with(|| empty_status(id));
+            reply.state = status.state;
+            reply.waiting_on = status.waiting_on;
+            reply.blocker = status.blocker;
+        }
+        if let Some(reply) = &mut state.reply {
+            reply.queue_wait_ms = elapsed;
+        }
+        self.changed.send_replace(());
+    }
     pub(super) fn has_rewind(&self) -> bool {
         self.state.lock().unwrap().rewind.is_some()
     }
@@ -855,9 +873,14 @@ impl Motor {
                     }
                     if state.started {
                         reply.state = "running".into();
+                        reply.waiting_on = None;
+                        reply.blocker = None;
+                        reply.queue_wait_ms = None;
                     }
                     if let Some(terminal) = terminal {
                         reply.state = "terminal".into();
+                        reply.waiting_on = None;
+                        reply.blocker = None;
                         reply.queue_wait_ms = Some(terminal.queue_wait_ms);
                         reply.terminal = Some(terminal);
                     }
@@ -901,6 +924,7 @@ impl Motor {
 
 fn empty_status(id: Uuid) -> JobStatusReply {
     JobStatusReply {
+        blocker: None,
         job_id: id,
         state: "unknown".into(),
         waiting_on: None,
@@ -1153,6 +1177,57 @@ mod audit_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn verified_bundle_heartbeat_changes_hosted_status_from_uploading_to_queued() {
+        let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-queue-status");
+        let motor = Motor::with_connector(
+            crate::Config::default(),
+            &scratch,
+            Arc::new(crate::hosted::tests::harness::NoSsh(
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        let mut route = crate::HostedJobState::new(&motor.config);
+        route.run_sent = true;
+        motor.storage.hosted_route(id, route).unwrap();
+        let owner = motor.reserve_hosted_result(id, 0);
+        owner.publish(Ok(StreamRecord::Accepted(motor_protocol::Accepted::new(
+            id, 0,
+        ))));
+        assert_eq!(motor.job_status(id).await.unwrap().state, "uploading");
+        let blocker = motor_protocol::QueueBlocker {
+            job_id: Uuid::now_v7(),
+            started_ms: Some(1000),
+            timeout_s: Some(7200),
+        };
+        owner.heartbeat(
+            id,
+            Some(0),
+            Some(motor_protocol::QueueStatus {
+                state: "queued".into(),
+                waiting_on: Some("workspace owner".into()),
+                blocker: Some(blocker.clone()),
+            }),
+        );
+        owner.heartbeat(id, Some(0), None);
+        let status = motor.job_status(id).await.unwrap();
+        assert_eq!(status.state, "queued");
+        assert_eq!(status.waiting_on.as_deref(), Some("workspace owner"));
+        assert_eq!(status.blocker, Some(blocker));
+        owner.publish(Ok(StreamRecord::Started(motor_protocol::Started::new(
+            0, 0, 2000,
+        ))));
+        let status = motor.job_status(id).await.unwrap();
+        assert_eq!(status.state, "running");
+        assert!(status.waiting_on.is_none());
+        assert!(status.blocker.is_none());
+        motor.hosted_results.lock().unwrap().remove(&id);
+        motor.close().await;
+    }
 
     #[tokio::test]
     async fn retirement_and_new_transport_claim_are_mutually_exclusive() {

@@ -999,6 +999,55 @@ struct QueueClock {
     at: tokio::time::Instant,
     elapsed_ms: u64,
 }
+
+fn queue_status(runtime: &Runtime, claims: &Claims) -> Option<motor_protocol::QueueStatus> {
+    let host = runtime.host.lock().expect("host lock");
+    let execution = host.snapshot.per_job.executions.get(&claims.jti)?;
+    let disk = host.snapshot.per_job.disks.get(&execution.disk_id)?;
+    if execution.ended
+        || execution.claims.sub != claims.sub
+        || disk.sub != claims.sub
+        || execution.claims.workspace_key_hash != claims.workspace_key_hash
+        || Some(&disk.workspace_key_hash) != claims.workspace_key_hash.as_ref()
+    {
+        return None;
+    }
+    let (waiting_on, holder) = if execution.boot_started {
+        ("workspace setup", None)
+    } else if !host.job_boot_disk_ready(&claims.jti) {
+        (
+            "checkout disk",
+            disk.attached_job
+                .as_ref()
+                .or_else(|| disk.queue.first().filter(|id| **id != claims.jti)),
+        )
+    } else if host.job_free_mem_mib(unix_ms()) < execution.memory_debit_mib {
+        ("memory", None)
+    } else {
+        ("workspace setup", None)
+    };
+    let blocker = holder
+        .and_then(|id| host.snapshot.per_job.executions.get(id))
+        .filter(|holder| {
+            // Placement hints cannot select a disk. Name a holder only from the
+            // authenticated account's recorded workspace disk, never a foreign job.
+            holder.disk_id == execution.disk_id
+                && holder.claims.sub == claims.sub
+                && holder.claims.workspace_key_hash == claims.workspace_key_hash
+        })
+        .and_then(|holder| {
+            Some(motor_protocol::QueueBlocker {
+                job_id: holder.claims.jti.parse().ok()?,
+                started_ms: None,
+                timeout_s: Some(holder.claims.max_s),
+            })
+        });
+    Some(motor_protocol::QueueStatus {
+        state: "queued".into(),
+        waiting_on: Some(waiting_on.into()),
+        blocker,
+    })
+}
 impl QueueClock {
     fn new() -> Self {
         Self {
@@ -1474,6 +1523,8 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut queue_clock = QueueClock::new();
     let mut queue_limit_ms = None;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    let status_started = tokio::time::Instant::now();
+    let mut queue_updates = motor_protocol::QueueStatusUpdates::default();
     type Starting =
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<tokio::net::UnixStream>> + Send>>;
     let mut starting: Option<Starting> = None;
@@ -1631,7 +1682,11 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 // Admitted workspace queues, including a memory recheck before
                 // boot, keep the same paused caller queue clock as VM setup.
                 let wait = accepted.then(|| queue_clock.observe(false));
-                write_frame(client, &json!({"type":"heartbeat","queue_wait_ms":wait})).await.map_err(client_io)?;
+                let mut frame = json!({"type":"heartbeat","queue_wait_ms":wait});
+                if let Some(status) = queue_updates.update(accepted.then(|| queue_status(runtime, claims)).flatten(), u64::try_from(status_started.elapsed().as_millis()).unwrap_or(u64::MAX)) {
+                    frame["queue_status"] = serde_json::to_value(status)?;
+                }
+                write_frame(client, &frame).await.map_err(client_io)?;
             },
         }
     }

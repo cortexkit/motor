@@ -2996,7 +2996,13 @@ impl Motor {
                 continue;
             };
             match incoming {
-                Ok(Incoming::Frame(Frame::Heartbeat { queue_wait_ms })) => {
+                Ok(Incoming::Frame(Frame::Heartbeat {
+                    queue_wait_ms,
+                    queue_status,
+                })) => {
+                    if let Some(owner) = &owner {
+                        owner.heartbeat(id, queue_wait_ms, queue_status);
+                    }
                     queue_deadline = queue_wait_ms.and_then(|elapsed| {
                         tokio::time::Instant::now().checked_add(Duration::from_millis(
                             wait.saturating_mul(1000).saturating_sub(elapsed),
@@ -3582,6 +3588,7 @@ impl Motor {
                 .and_then(|job| job.hosted_route()?.terminal)
             {
                 return Ok(JobStatusReply {
+                    blocker: None,
                     job_id: id,
                     state: "terminal".into(),
                     waiting_on: None,
@@ -3614,6 +3621,7 @@ impl Motor {
             .and_then(|job| job.remote_terminal.or(job.local_terminal))
         {
             return Ok(JobStatusReply {
+                blocker: None,
                 job_id: id,
                 state: "terminal".into(),
                 waiting_on: None,
@@ -3631,6 +3639,7 @@ impl Motor {
                 let _ = rx.try_recv();
             }
             return Ok(JobStatusReply {
+                blocker: None,
                 job_id: id,
                 state: "terminal".into(),
                 waiting_on: None,
@@ -3650,6 +3659,7 @@ impl Motor {
                 let (tx, _rx) = mpsc::channel(1);
                 self.finish_hosted(id, true, &tx).await?;
                 return Ok(JobStatusReply {
+                    blocker: None,
                     job_id: id,
                     state: "terminal".into(),
                     waiting_on: None,
