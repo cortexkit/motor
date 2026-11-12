@@ -580,7 +580,10 @@ The helper atomically replaces `/var/lib/motor-vm/remote-cache`'s account set
 needs no drain or restart and applies at the next VM start; running VMs keep
 their original set. Jobs receive config and the read key, trusted fill/base-build
 VMs also receive the write key, and recovery receives neither keys nor a virtual
-network interface (TAP).
+network interface (TAP). The one exception for jobs: when the helper itself has
+verified that a job may write to the cache, that job VM's runner also receives
+the write key, while the job's own processes still see only a socket; see
+[Job writes to the remote cache](#job-writes-to-the-remote-cache).
 The helper delivers a read-only, nonce-bound credential drive; the guest consumes
 it into tmpfs. `motor-host` never reads or relays key bytes, and no key is stored
 on a workspace disk, base, published image, replay store or log. See the
@@ -629,6 +632,183 @@ The comparator exits 0 within tolerance, 1 above tolerance, and 2 for invalid or
 incomplete evidence. `scripts/test_per_job_rates.py` covers the fixture and
 coverage refusal; these rates are evidence for operator review, not an automatic
 authorization to switch modes.
+
+## Job writes to the remote cache
+
+An account can let its jobs on this host save compiler results into its remote
+compile cache. [Job writes to the remote cache](compile-cache.md#job-writes-to-the-remote-cache)
+describes what jobs can then do: create-only uploads, the per-job write
+budgets and the counters. This section covers the operator's part.
+
+The broker keeps a per-account job write setting, off by default, and turns it
+on by adding the signed `cache_write` claim to the account's run tokens.
+`motor-host` decides once, when an execution is first admitted: the job may
+write only if the claim is true, the account's remote-cache set holds a write
+key, and the emergency write block is not set. Boat hosts never write. A later
+reconnect or attach token never changes the decision, in either direction.
+ccache stays read-only on every host.
+
+### Before enabling an account
+
+1. Install `motor-host`, the helper and the runner images that read the claim,
+   while the broker does not yet send it to the account. Once a token carrying
+   the claim has been admitted, rolling `motor-host` back to a version that
+   cannot read it is unsupported until those job records have aged out.
+2. Give the account's remote-cache set a write key: in tenant mode with
+   `provision.py set-remote-cache` (see the
+   [provisioning guide](../script/tenant-provision/README.md)), in per-job mode
+   with the [root credential command](#root-remote-cache-credential-command) and
+   `--write-key`.
+3. In per-job mode, configure the helper's own token check; see
+   [Per-job mode: the helper's check](#per-job-mode-the-helpers-check).
+4. Run the [create-only probe](#run-the-create-only-probe) against the
+   account's live store. It must pass.
+5. Only then ask the broker operator to turn on the account's job write
+   setting.
+
+The probe pass is the operator's precondition, a rollout step and not a CI
+check: nothing records it or checks it automatically. If the store fails the
+probe, leave job writes off. There is no fallback to overwriting.
+
+To turn writes off again, ask the broker operator to turn the setting off, so
+new admissions are read-only. Jobs already admitted keep their decision, so
+also set the [emergency write block](#set-or-clear-the-emergency-write-block)
+or stop those jobs.
+
+### Run the create-only probe
+
+The probe checks that the account's store creates an object only when no
+object of that name exists, and never overwrites one; the four cases are listed
+in [the probe's description](compile-cache.md#create-only-probe). It is a tenant
+operation on `motor-host`'s admin socket and runs through that tenant's runner
+with the account's provisioned keys. It runs on a serving host: no drain is
+needed, but it waits for any provisioning of that tenant to finish and keeps
+provisioning out while it runs. `account` must be the tenant's bound account
+subject, as in `tenants.json`.
+
+```sh
+sudo python3 - tenant-1 '<account subject>' <<'EOF'
+import json, sys
+sys.path.insert(0, "/srv/build/src/motor/script/hosted-host")
+import hosted_host
+reply = hosted_host.admin_exchange(
+    {"tenant": sys.argv[1], "op": "remote_cache_create_only_probe",
+     "account": sys.argv[2]}, timeout=180)
+print(json.dumps(reply, indent=2))
+sys.exit(reply.get("exit_code", 1))
+EOF
+```
+
+The reply is `{"ok": ..., "exit_code": ..., "cases": [...]}`, with one entry per
+case giving its `name`, `ok` and `detail`. `exit_code` is 0 only when every
+case passed. A failed case's `detail` is one of `unexpected_status_or_bytes`,
+`timed_out`, `remote_cache_unavailable`, `remote_cache_account_mismatch`,
+`remote_cache_write_key_missing` or `remote_cache_write_blocked`; the store's
+own error text is never shown. The probe is refused while the emergency write
+block is set. `motor-host` does not record the result.
+
+The probe objects use fresh names that sccache never asks for. Nothing can
+delete them through the gateway, so they expire under the bucket's lifecycle
+rule. The older `remote_cache_probe` operation, which only reports that a tenant
+supports provisioning, is unchanged.
+
+A per-job host does not forward the probe to job VMs. Run it from a tenant-mode
+host whose tenant is provisioned with the same account's store and keys.
+
+Tests: `probe_runs_with_an_active_lease_and_bound_account_without_recording_reports`,
+`emergency_block_refuses_probe_by_name_before_waking_or_forwarding`,
+`arbitrary_agent_details_and_inconsistent_reports_are_never_echoed`
+(`crates/motor-host/tests/it/transport/create_only_probe.rs`).
+
+### Set or clear the emergency write block
+
+The block is a host-wide switch that only takes job writes away; it never
+grants them. Set it with the host admin operation
+`{"op": "set_remote_cache_write_block", "blocked": true}` and clear it with
+`"blocked": false`:
+
+```sh
+sudo python3 - true <<'EOF'
+import json, sys
+sys.path.insert(0, "/srv/build/src/motor/script/hosted-host")
+import hosted_host
+reply = hosted_host.admin_exchange(
+    {"op": "set_remote_cache_write_block", "blocked": sys.argv[1] == "true"},
+    timeout=180)
+print(json.dumps(reply, indent=2))
+EOF
+```
+
+`motor-host` records the block in its journal, so it survives a restart. While
+it is set, no new admission may write, in either mode, and the create-only probe
+is refused. `motor-host` also sends the block to every running tenant runner
+and job VM. From the moment a runner acknowledges, its job uploads are refused;
+an upload still sending its body is aborted with no partial object left, and
+one already fully sent completes. Reads and fills carry on.
+
+The reply is `{"ok": true, "blocked": ..., "not_acknowledged": [...]}`.
+`not_acknowledged` names every runner that did not confirm, because it could
+not be reached or is too old to know the operation. A runner too old to know
+the block also ignores the claim, so its jobs are read-only anyway. For any
+other runner listed, stop its write-enabled jobs. A tenant runner that wakes
+while the block is set gets it before any lease. A job VM that boots while it
+is set gets it before its job starts, and is stopped if it has not
+acknowledged after three attempts.
+
+Tests: `admin_block_persists_and_names_all_unacknowledged_runners`,
+`runner_waking_after_block_gets_deny_before_read_only_lease_delivery`,
+`older_runner_refusal_does_not_prevent_read_only_admission`
+(`crates/motor-host/tests/it/transport/write_block.rs`),
+`block_reaches_each_running_job_vm_and_reports_unknown_runner_controls`,
+`block_set_during_boot_retries_failed_resync_and_stops_unacknowledged_vm`
+(`crates/motor-host/src/server/job/tests/write_block_tests.rs`).
+
+### Per-job mode: the helper's check
+
+In per-job mode the root helper does not take `motor-host`'s word that a job
+may write. When an execution is first admitted with a true claim and no block,
+`motor-host` passes the raw run token to the helper before answering the
+client. The helper verifies the token's signature, issuer, audience, run
+purpose and expiry itself, against its own clock and with the broker's signing
+keys, which it fetches itself. It accepts no key, host id or time from
+`motor-host`. If the helper refuses, the job still runs, read-only.
+
+Two optional fields in `/etc/motor-vm-helper.json` configure the check:
+
+| Field | Meaning |
+| --- | --- |
+| `host_id` | This host's registered id, the same value as `host_id` in `/etc/motor-host/host.json`. Tokens for any other host are refused. |
+| `jwks_url` | Overrides the address the helper fetches the broker's signing keys from. Tests point it at a fake broker; unset, the helper uses the broker's own address. |
+
+The helper reads them at startup. The installer writes neither field, and a
+helper without `host_id` grants no writes and logs
+`helper cache writes disabled: host_id is not configured` when it starts. Set
+`host_id` only on a per-job host that should admit job writes.
+
+A verified token gives a grant for one boot of that job, for the account and
+workspace the token names. A Start retried before the VM has booted reuses the
+grant; any later Start for the same job is read-only. A grant that no Start
+uses within the helper's start window (24 hours from the job id's creation
+time) is discarded, and a helper restart drops
+all grants, so those jobs boot read-only. The job VM's runner then gets the
+write key on its read-only credential drive, and the job's processes see only
+the socket.
+
+The helper records which workspace a disk belongs to only when it creates the
+disk for a verified grant. A disk created before that, including one first
+created for a read-only job, stays read-only for every later job until it is
+recreated. A write-enabled job VM is still a Job VM: it refuses fill
+operations and never gets the fill socket.
+
+Tests (`crates/motor-vm-helper/src/cache_write_tests.rs`):
+`invalid_credentials_never_record_a_grant`,
+`keys_supplied_by_host_cannot_authorize_and_requests_accept_only_raw_token`,
+`missing_host_identity_and_failed_key_fetch_fail_closed`,
+`verified_grant_retries_before_boot_but_cannot_be_rearmed_after_consumption`,
+`verified_grant_binds_exact_job_subject_workspace_and_deny_flag`; and
+`first_true_claim_sends_raw_token_before_lease_ok_even_if_helper_refuses`,
+`reconnect_and_attach_never_send_a_grant_even_with_a_later_true_claim`
+(`crates/motor-host/src/server/job/tests/cache_write_tests.rs`).
 
 ## Firewall
 

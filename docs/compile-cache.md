@@ -2,10 +2,13 @@
 
 Linux jobs share one compiler cache per runner instance, so a job does not
 recompile dependencies that another job, or a background build, already
-compiled. Jobs only read the cache. A separate trusted account fills it from the
-repository's default-branch tip, never from a submitted branch. This document
-covers who reads and writes the cache, what goes into a fill, and the local
-build bases that can seed private build folders.
+compiled. Jobs only read the cache, with one exception: an account can let its
+jobs on registered hosts add new entries to that account's remote compile
+cache, as described in [Job writes to the remote cache](#job-writes-to-the-remote-cache).
+Boat jobs and ccache stay read-only in every case. A separate trusted account
+fills the cache from the repository's default-branch tip, never from a
+submitted branch. This document covers who reads and writes the cache, what
+goes into a fill, and the local build bases that can seed private build folders.
 The repository's default branch and its locked dependencies are trusted; code
 on other branches is untrusted. A malicious default branch can poison both the
 shared compile cache and its build bases. A default-branch fill's output may
@@ -23,7 +26,8 @@ Boat profiles never queue background cache fills or warm builds, and a tenant
 VM queues none unless its provisioning holds a remote cache write key. An
 idle-started fill can outlive the idle period, compete for leased CPU time, or
 hold a setup lock when the next job arrives. Boat avoids that because it only
-reads the cache. A tenant VM given a write key accepts the delay: it fills its
+reads the cache; Boat jobs also stay read-only when their account allows job
+writes. A tenant VM given a write key accepts the delay: it fills its
 own cache with its own capacity, one fill at a time
 and only on unallocated permits. Its runner reports the running fill's permits
 as `fill_permits` in health, and motor-host subtracts them from that tenant's
@@ -92,9 +96,12 @@ builds the patched binary; see [runner-install.md](runner-install.md).
 ## Reading
 
 A job that compiles Rust gets the read-only cache and a wrapper that sends
-`rustc` through sccache. The job cannot write entries, including through build
-scripts or procedural macros, because the cache belongs to another account and
-the mount is read-only.
+`rustc` through sccache. The job cannot write entries in the runner's local
+cache, including through build scripts or procedural macros, because that cache
+belongs to another account and the mount is read-only. The only way a job adds
+entries is the remote cache's create-only socket, which a job gets only when
+its account allows job writes; see
+[Job writes to the remote cache](#job-writes-to-the-remote-cache).
 
 - A missing or evicted cache does not stop a job: the wrapper falls back to the
   plain compiler. Test: `isolated_public_reader_missing_cache_eviction_and_server_fallback`
@@ -167,6 +174,200 @@ Incremental compilation: the writer builds local crates incrementally, and the
 wrapper strips `CARGO_INCREMENTAL` and `CARGO_BUILD_INCREMENTAL` before
 sccache sees them, because sccache refuses to cache when either is `1`. Test:
 `incremental_variables_are_stripped_for_cached_compiles_only`.
+
+## Job writes to the remote cache
+
+On a registered host, whether a tenant VM or a VM per job, the runner reaches
+the account's remote compile cache, an S3-compatible object store, through a
+gateway that holds the account's keys. A job never sees a key: it gets a Unix
+socket and dummy credentials. By default every job's socket is read-only and
+only trusted fills write. An account can also let its jobs save their own
+compiler results, so a cache miss in one job becomes a hit for the next.
+
+### Setting and eligibility
+
+The broker keeps a per-account job write setting, off by default. It is never
+supplied by the client. When the setting is on, the broker adds the optional
+signed `cache_write` claim to the job's run token; an absent or false claim
+means read-only.
+
+A job writes only when all of these hold:
+
+- its execution's `cache_write` claim was true when the execution was first
+  admitted;
+- it runs on a registered host, not on Boat;
+- the account's provisioned remote-cache keys include a write key;
+- the [emergency write block](#emergency-write-block) is not set.
+
+The decision is taken once, when the execution is first admitted, and never
+from a later reconnect or attach token or from the client's Run frame. A later
+token carrying the claim does not upgrade a read-only job, and a later token
+without it does not downgrade a write-enabled one: to stop a running job's
+writes, stop the job or set the block. A missing write key leaves the job
+read-only; the gateway never borrows another account's key.
+
+Only sccache writes. ccache keeps its read-only socket, Boat jobs never receive
+the claim and refuse a token that carries it, and a runner too old to know the
+claim ignores it and stays read-only. Writes are sccache's own uploads of
+finished compiler outputs; nothing copies a build folder into the cache after
+a job.
+
+Every job of a write-enabled account can store any bytes under any sccache key
+in that account's part of the store, including a key another repository of
+the same account will ask for later. Create-only writes stop a job from
+replacing an existing entry, not from planting a bad new one. An account that
+needs a cache only trusted builds can fill leaves the setting off.
+
+Tests: `eligibility_requires_host_permission_isolation_tenant_role_and_account_key`,
+`first_job_record_fixes_access_despite_later_run_or_attach_tokens`,
+`keyless_blocked_or_wrong_account_admission_cannot_be_upgraded_later`
+(`crates/motor-runner/src/tests/tenant_cache_write.rs`),
+`first_claim_ceiling_requires_explicit_permission_registered_host_and_no_block`,
+`later_run_attach_or_block_change_never_replaces_the_first_claim_ceiling`
+(`crates/motor-host/src/state/cache_write_tests.rs`), and the operator-only
+`isolated_tenant_cache_writes_use_admitted_claims` and
+`isolated_tenant_cache_denials_survive_later_credentials_and_attach`
+(`crates/motor-runner/src/tests/tenant_cache_write_isolated.rs`).
+
+### Create-only writes
+
+A write-enabled job's sccache socket is a create-only socket instead of the
+read socket, never in addition to it. Reads on it behave exactly as on a
+read-only socket: they use the read key and the same read limits, and any
+failure is a miss. The job's environment differs from a read-only job's only
+in `SCCACHE_S3_RW_MODE=READ_WRITE`. That variable is not what grants writing;
+the socket is.
+
+Every upload a job sends is signed with the write key, and the gateway adds
+`If-None-Match: *` to it, so the store creates the object only if no object of
+that name exists. Conditional headers sent by the job are dropped, never
+forwarded. Fills keep unconditional uploads, because they repair entries. The
+socket refuses listing, deleting, and any other tool's or account's part of the
+store, as every cache socket does.
+
+The store's answer to a job upload decides what the job sees:
+
+- Success: the object was created, and the answer is passed on.
+- 412, the entry already exists: the job gets 200 with an empty body, and the
+  upload counts as a duplicate. When the store answers before the job has sent
+  its whole body, the gateway reads and discards the rest within the time
+  limit, or else closes the connection; it never reuses a connection with
+  unread bytes.
+- 409 or any other failure: the job gets 503, and the upload counts as failed.
+  The gateway never resends a body; a retry by sccache is a new upload and gets
+  the condition again.
+
+No job upload ever reaches the store without the condition, and there is no
+fallback to overwriting. A store that cannot honour the condition must keep
+job writes off; the [create-only probe](#create-only-probe) checks this.
+Cancelling a job during an upload leaves no partial object, while entries from
+the job's earlier compiles remain.
+
+Tests (`crates/motor-runner/src/remote_cache/gateway/`):
+`puts_sign_the_gateways_create_condition_and_ignore_the_jobs_conditions`,
+`job_create_refuses_delete_list_and_prefix_escapes_without_contacting_the_store`,
+`reads_share_job_and_gateway_caps_with_read_only_sockets`
+(`job_create_tests.rs`), `fake_store_conditionally_creates_without_overwriting`,
+`full_body_duplicate_is_empty_and_preserves_bytes_and_client_reuse`,
+`early_answers_close_instead_of_reusing_unread_body_bytes`,
+`non_success_answers_fail_once_without_replaying_the_body`
+(`store_answers_tests.rs`).
+
+### Per-job write budgets
+
+The runner limits each write-enabled job's uploads. Each limit is a runner
+`serve` option:
+
+| Option | Default | Limits |
+| --- | --- | --- |
+| `--remote-cache-max-job-put-objects` | 5000 | Objects a job may upload |
+| `--remote-cache-max-job-put-bytes` | 8589934592 (8 GiB) | Bytes a job may upload |
+| `--remote-cache-max-job-puts` | 16 | Uploads a job may have in flight at once |
+
+The defaults never refuse an ordinary build but stop a runaway job. Tenant
+provisioning does not set these options, so tenant runners use the defaults.
+
+Before any byte goes to the store, an upload reserves one object and its
+stated length. An upload that would pass either total, or the in-flight limit,
+gets 503 without contacting the store and counts as refused. Duplicates and
+failures keep their reservation, so repeated duplicates stay bounded; an
+in-flight slot frees when its upload ends. The budget belongs to the job id
+and holds across all of the job's sockets, connections and key rotations.
+sccache's `.sccache_check` test object does not use up the object or byte
+budget, but is still create-only and still subject to the block. Fills have no
+job budget. After a refusal the job keeps reading the cache and compiles the
+entry itself, uncached. These are per-job limits; there is no per-account write
+budget.
+
+Tests (`crates/motor-runner/src/remote_cache/gateway/write_budget_tests.rs`):
+`runner_settings_supply_gateway_write_limits`,
+`object_budget_survives_connections_socket_replacement_and_key_rotation`,
+`byte_budget_checks_content_length_and_rejected_puts_reserve_nothing`,
+`duplicates_and_failures_keep_object_and_byte_reservations`,
+`simultaneous_puts_never_overshoot_object_or_byte_budgets`,
+`concurrent_put_cap_spans_sockets_and_rotation_and_releases_on_completion`,
+`sccache_check_is_create_only_but_exempt_from_object_and_byte_budgets`,
+`fill_puts_ignore_all_job_write_limits`.
+
+### Emergency write block
+
+The block is a host-wide switch that only takes writing away; it can never
+grant it. The operator sets and clears it through `motor-host`, which records
+it so that it survives a restart; see
+[the operator steps](hosted-host.md#job-writes-to-the-remote-cache). While it is
+set, new admissions are read-only, and every running runner, tenant or job VM,
+is told to refuse job uploads. From the moment a runner acknowledges, its job
+uploads get 503 without contacting the store and count as refused. An upload
+still sending its body is aborted before the last byte, so no partial object
+becomes visible; an upload already fully sent completes. Reads and fills carry
+on. Clearing the block restores writes for jobs that were admitted with them.
+
+Tests: `block_between_keepalive_puts_denies_checks_and_clearing_restores_writes`,
+`acknowledgement_closes_partial_upload_before_last_byte_and_never_publishes`,
+`fully_sent_put_waiting_for_store_response_completes_while_blocked`
+(`crates/motor-runner/src/remote_cache/gateway/write_block_tests.rs`).
+
+### Create-only probe
+
+The create-only probe checks that the account's store really honours
+`If-None-Match: *`. The runner runs it through its own gateway with the
+account's provisioned keys, using fresh object names in the account's sccache
+area that sccache never asks for. The gateway cannot delete, so probe objects
+expire under the bucket's lifecycle rule. It passes only if all four cases
+pass:
+
+| Case | Passes when |
+| --- | --- |
+| `concurrent_creates` | Simultaneous conditional creates of one name give exactly one success, the others 412 or 409, and the stored bytes are the winner's. |
+| `existing_object` | A conditional upload of different bytes to an existing name gets 412 and leaves the bytes unchanged. |
+| `interrupted_body` | An upload cut off mid-body leaves no object, and a later create succeeds. |
+| `fill_race` | A job create racing an unconditional fill upload leaves exactly one of the two bodies, never a mix. |
+
+The probe reports each case and returns a non-zero result when any case fails.
+It is separate from `remote_cache_probe`, which only reports that a tenant
+supports provisioning and is unchanged.
+
+A passing probe against the account's live store is the operator's
+precondition before job writes are enabled for that account. It is a rollout
+step, not a CI check: nothing records the result or checks it automatically.
+If the probe fails, writes stay off; there is no fallback to overwriting.
+
+Tests: `all_four_store_criteria_pass_through_the_gateway_with_provisioned_keys`,
+`a_store_ignoring_conditions_has_a_nonzero_probe_result`,
+`every_criterion_detects_its_store_fault_without_hiding_other_case_reports`
+(`crates/motor-runner/src/remote_cache/gateway/probe_tests.rs`).
+
+### Counters
+
+The gateway counts each job's accepted, duplicate, failed and refused uploads,
+and the bytes of accepted uploads. At job end they join the job's remote cache
+totals as `puts_accepted`, `puts_duplicate`, `puts_failed`, `puts_refused` and
+`put_bytes_accepted`, and `motor-host` logs them by job id with the existing
+hit and miss counts. Fields that are zero are omitted, so a read-only job's
+totals look exactly as before. Like the hit counts, these are best-effort
+figures reported by the runner, not usage or billing data. Test:
+`job_totals_include_refusals_and_survive_new_bindings_and_key_rotation`
+(`crates/motor-runner/src/remote_cache/gateway/store_answers_tests.rs`).
 
 ## Filling
 
