@@ -116,6 +116,141 @@ fn repository_placement_hint_rejects_invalid_names_and_null_vm() {
     }
 }
 
+#[test]
+fn repository_placement_hints_config_roundtrips_and_empty_is_omitted() {
+    for input in ["{}", r#"{"hosted_repositories_placement_hints":{}}"#] {
+        let config: Config = serde_json::from_str(input).unwrap();
+        config.validate().unwrap();
+        assert!(config.hosted_repositories_placement_hints.is_empty());
+        let wire = serde_json::to_value(config).unwrap();
+        assert!(wire.get("hosted_repositories_placement_hints").is_none());
+        let restored: Config = serde_json::from_value(wire).unwrap();
+        assert!(restored.hosted_repositories_placement_hints.is_empty());
+    }
+    let hints = serde_json::json!({
+        "/home/operator/first": {"host":"first-host","vm":"t1"},
+        "/home/operator/second": {"host":"second-host","vm":"t2"}
+    });
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "hosted_repositories": ["/home/operator/first", "/home/operator/second"],
+        "hosted_repositories_placement_hints": hints
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    let wire = serde_json::to_value(&config).unwrap();
+    assert_eq!(wire["hosted_repositories_placement_hints"], hints);
+    let restored: Config = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        restored.hosted_repositories_placement_hints,
+        config.hosted_repositories_placement_hints
+    );
+}
+
+#[test]
+fn repository_placement_hints_rejects_unlisted_relative_keys_and_invalid_placements() {
+    for (root, hint) in [
+        (
+            "/home/operator/unlisted",
+            serde_json::json!({"host":"control-host","vm":"t1"}),
+        ),
+        (
+            "relative/repo",
+            serde_json::json!({"host":"control-host","vm":"t1"}),
+        ),
+        (
+            "/home/operator/project",
+            serde_json::json!({"host":"","vm":"t1"}),
+        ),
+        (
+            "/home/operator/project",
+            serde_json::json!({"host":"control host","vm":"t1"}),
+        ),
+        (
+            "/home/operator/project",
+            serde_json::json!({"host":"control-host","vm":null}),
+        ),
+        (
+            "/home/operator/project",
+            serde_json::json!({"host":"control-host","vm":""}),
+        ),
+        (
+            "/home/operator/project",
+            serde_json::json!({"host":"control-host","vm":"a/b"}),
+        ),
+    ] {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "hosted_repositories": ["/home/operator/project"],
+            "hosted_repositories_placement_hints": {root: hint}
+        }))
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("hosted_repositories_placement_hints"),
+            "{root}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repository_placement_hints_override_per_repository_and_fall_back_to_the_shared_hint() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let (scratch, first) = committed_repo();
+    let (_second_scratch, second) = committed_repo();
+    let (_fallback_scratch, fallback) = committed_repo();
+    let (_unlisted_scratch, unlisted) = committed_repo();
+    let first_listed = first.join(".");
+    let first_hint = motor_lease::Placement {
+        host: "first-host".into(),
+        vm: Some("t1".into()),
+    };
+    let second_hint = motor_lease::Placement {
+        host: "second-host".into(),
+        vm: Some("t2".into()),
+    };
+    let mut config = config(&h, &first);
+    config.hosted_repositories = [&first_listed, &second, &fallback]
+        .map(|repo| repo.to_str().unwrap().to_owned())
+        .into();
+    config.hosted_repositories_placement_hint = Some(control_placement());
+    config.hosted_repositories_placement_hints = [
+        (first_listed.to_str().unwrap().into(), first_hint.clone()),
+        (second.to_str().unwrap().into(), second_hint.clone()),
+    ]
+    .into();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    for (index, (repo, expected_hint)) in [
+        (&first, Some(first_hint)),
+        (&second, Some(second_hint)),
+        (&fallback, Some(control_placement())),
+        (&unlisted, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stream = motor.run(request(repo)).unwrap();
+        let id = stream.job_id;
+        let (_, terminal) = records(stream).await;
+        assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+        let state = motor.hosted_state(id).unwrap();
+        assert_eq!(state.repository_routed, index < 3);
+        assert_eq!(state.fleet_routed, index == 3);
+        assert_eq!(state.repository_placement_hint, expected_hint);
+        let bodies = lease_bodies(&h);
+        assert_eq!(bodies.len(), index + 1);
+        assert_eq!(
+            bodies[index]["placement_hint"],
+            serde_json::to_value(&expected_hint).unwrap()
+        );
+        if state.repository_routed {
+            assert_eq!(bodies[index]["allow_spill"], false);
+            assert_eq!(bodies[index]["avoid_host"], serde_json::Value::Null);
+        }
+    }
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    motor.close().await;
+}
+
 #[tokio::test]
 async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_for_other_routes() {
     let h = Harness::new(Behavior::CompleteRun).await;
