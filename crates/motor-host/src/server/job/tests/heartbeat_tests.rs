@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn pre_vm_queue_diagnostics_do_not_name_a_foreign_account_holder() {
+    let (runtime, _, _) = fixture();
+    let first = claims(JOB);
+    claim(&runtime, &first);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    let mut other = claims(JOB2);
+    other.sub.push_str("-other");
+    claim(&runtime, &other);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let disk = host.snapshot.per_job.executions[JOB2].disk_id.clone();
+        // Even a stale or inconsistent attachment must not disclose another account.
+        host.snapshot
+            .per_job
+            .disks
+            .get_mut(&disk)
+            .unwrap()
+            .attached_job = Some(JOB.into());
+    }
+    let status = queue_status(&runtime, &other).unwrap();
+    assert_eq!(status.waiting_on.as_deref(), Some("checkout disk"));
+    assert!(status.blocker.is_none());
+    other.sub = first.sub;
+    assert!(queue_status(&runtime, &other).is_none());
+}
+
+#[test]
 fn adoption_polling_is_bounded_per_vm_and_exit_reports_do_not_wait_for_it() {
     let (runtime, fake, _) = fixture();
     let now = unix_ms();

@@ -169,9 +169,11 @@ async fn new_ck_motor_old_runner_does_not_guess_started_from_heartbeats() {
             vec![
                 Frame::Heartbeat {
                     queue_wait_ms: Some(125),
+                    queue_status: None,
                 },
                 Frame::Heartbeat {
                     queue_wait_ms: None,
+                    queue_status: None,
                 },
                 output(0),
                 terminal(id),

@@ -516,6 +516,9 @@ define_frames! {
         /// timing upload, setup or a runner that cannot report queue timing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queue_wait_ms: Option<u64>,
+        /// Live lifecycle diagnostics, sent on change and occasionally refreshed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_status: Option<QueueStatus>,
     },
     Withdraw {
         job_id: Uuid,
@@ -686,6 +689,45 @@ pub struct HostedTerminal {
     pub max_runtime_s: u64,
 }
 
+/// A job holding a checkout in the waiting caller's account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueBlocker {
+    pub job_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+}
+
+/// Ephemeral diagnostics; absence on a heartbeat leaves the last observation intact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueStatus {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<QueueBlocker>,
+}
+
+/// Suppresses unchanged diagnostic payloads without suppressing liveness beats.
+#[derive(Default)]
+pub struct QueueStatusUpdates {
+    last: Option<QueueStatus>,
+    sent_ms: u64,
+}
+
+impl QueueStatusUpdates {
+    pub fn update(&mut self, status: Option<QueueStatus>, now_ms: u64) -> Option<QueueStatus> {
+        let status = status?;
+        if self.last.as_ref() == Some(&status) && now_ms.saturating_sub(self.sent_ms) < 60_000 {
+            return None;
+        }
+        self.last = Some(status.clone());
+        self.sent_ms = now_ms;
+        Some(status)
+    }
+}
+
 /// Per-job lifecycle inspection. Aggregate status retains its v1 shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobStatusReply {
@@ -694,6 +736,8 @@ pub struct JobStatusReply {
     /// Current scheduler phase or blocker while the job has not started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<QueueBlocker>,
     pub terminal: Option<TerminalRecord>,
     pub unit: Option<String>,
     pub unit_alive: Option<bool>,

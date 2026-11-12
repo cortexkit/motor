@@ -356,11 +356,18 @@ async fn writer<W: AsyncWrite + Unpin>(
 ) {
     let mut trace = ChannelTrace::new(tenant.as_deref(), "write");
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    let mut queue_updates = motor_protocol::QueueStatusUpdates::default();
+    let status_started = tokio::time::Instant::now();
     loop {
         let frame = tokio::select! {
             frame = rx.recv() => match frame { Some(f) => f, None => { trace.reason = "session_output_closed"; break; } },
-            _ = heartbeat.tick() => Frame::Heartbeat {
-                queue_wait_ms: job.borrow().as_ref().and_then(QueueProgress::elapsed_ms),
+            _ = heartbeat.tick() => {
+                let queue_status = job.borrow().as_ref().and_then(QueueProgress::status);
+                let queue_status = queue_updates.update(queue_status, u64::try_from(status_started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                Frame::Heartbeat {
+                    queue_wait_ms: job.borrow().as_ref().and_then(QueueProgress::elapsed_ms),
+                    queue_status,
+                }
             },
         };
         trace.frame(&frame);

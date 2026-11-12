@@ -380,6 +380,7 @@ impl Connector for RoutingPeer {
                                     &mut peer,
                                     &Frame::Heartbeat {
                                         queue_wait_ms: Some(1_000),
+                                        queue_status: None,
                                     },
                                 )
                                 .await;
@@ -468,6 +469,7 @@ impl Connector for RoutingPeer {
                             let _ = write_frame_async(
                                 &mut peer,
                                 &Frame::JobStatusReply(JobStatusReply {
+                                    blocker: None,
                                     job_id: id,
                                     state: instance.clone(),
                                     waiting_on: None,

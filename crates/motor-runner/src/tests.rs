@@ -2034,6 +2034,7 @@ async fn chunks(stream: &mut UnixStream, bytes: &[Vec<u8>]) {
                 stream,
                 &Frame::Heartbeat {
                     queue_wait_ms: None,
+                    queue_status: None,
                 },
             )
             .await
@@ -2273,7 +2274,8 @@ async fn truncated_upload_tombstones_without_fetch_and_replayed_run_is_ignored()
     while matches!(
         read_frame_async(&mut stream).await.unwrap(),
         Some(Frame::Heartbeat {
-            queue_wait_ms: None
+            queue_wait_ms: None,
+            ..
         })
     ) {}
     assert_eq!(before, fs::read(runner.record_path(r.job_id)).unwrap());
@@ -5331,6 +5333,7 @@ async fn queued_heartbeat_does_not_wait_for_the_global_state_lock() {
         loop {
             if let Some(Frame::Heartbeat {
                 queue_wait_ms: Some(ms),
+                ..
             }) = read_frame_async(stream).await.unwrap()
             {
                 return ms;

@@ -118,6 +118,7 @@ async fn javascript_frame_reader_skips_heartbeats_without_swallowing_other_frame
             &mut writer,
             &Frame::Heartbeat {
                 queue_wait_ms: None,
+                queue_status: None,
             },
         )
         .await
@@ -126,6 +127,7 @@ async fn javascript_frame_reader_skips_heartbeats_without_swallowing_other_frame
             &mut writer,
             &Frame::Heartbeat {
                 queue_wait_ms: None,
+                queue_status: None,
             },
         )
         .await
@@ -136,6 +138,7 @@ async fn javascript_frame_reader_skips_heartbeats_without_swallowing_other_frame
         &mut writer,
         &Frame::Heartbeat {
             queue_wait_ms: None,
+            queue_status: None,
         },
     )
     .await

@@ -1114,11 +1114,22 @@ fn boat_memory_override_requires_explicit_profile_and_budget() {
 
 #[derive(Clone)]
 pub(crate) struct QueueProgress {
+    runner: std::sync::Weak<Core>,
+    id: Uuid,
     entry: Arc<std::sync::atomic::AtomicU64>,
     elapsed: Arc<std::sync::atomic::AtomicU64>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 impl QueueProgress {
+    pub(crate) fn status(&self) -> Option<motor_protocol::QueueStatus> {
+        let runner = Runner {
+            core: self.runner.upgrade()?,
+        };
+        // Diagnostics must not stall transport liveness behind scheduler work.
+        let inner = runner.core.inner.try_lock().ok()?;
+        let index = DispatchIndex::build(&inner);
+        runner.queue_status_with_index(&inner, &index, self.id)
+    }
     pub(crate) fn elapsed_ms(&self) -> Option<u64> {
         let (entry, elapsed) = queue_clock_at(&self.entry, &self.elapsed, (self.clock)());
         (entry != NO_QUEUE).then_some(elapsed)
@@ -6448,6 +6459,8 @@ impl Runner {
     pub(crate) fn queue_progress(&self, id: Uuid) -> QueueProgress {
         let inner = self.core.inner.lock().unwrap();
         QueueProgress {
+            runner: Arc::downgrade(&self.core),
+            id,
             entry: inner
                 .jobs
                 .get(&id)
@@ -6467,11 +6480,13 @@ impl Runner {
         let now = self.now();
         self.update_queue_wait_clocks(&inner, now, &index);
         let job = inner.jobs.get(&id);
+        let queue_status = self.queue_status_with_index(&inner, &index, id);
         let quarantine = self.core.quarantined.get(&id);
         let process = job
             .and_then(|j| j.process)
             .or_else(|| quarantine.and_then(|j| j.process));
         Ok(JobStatusReply {
+            blocker: queue_status.and_then(|status| status.blocker),
             job_id: id,
             queue_wait_ms: Self::queue_wait_ms_at(&inner, id, now),
             state: job
@@ -6500,6 +6515,71 @@ impl Runner {
                 .and_then(|p| p.unit)
                 .map(|u| self.core.backend.unit_name(&self.core.config, u)),
             unit_alive: self.unit_alive(process)?,
+        })
+    }
+
+    fn queue_status_with_index(
+        &self,
+        inner: &Inner,
+        index: &DispatchIndex,
+        id: Uuid,
+    ) -> Option<motor_protocol::QueueStatus> {
+        let job = inner.jobs.get(&id)?;
+        let waiting_on = self.queue_wait_phase(inner, index, id).map(|_| {
+            let now = self.now();
+            self.queue_wait_label(inner, &index.heads(inner, now), index, id, now)
+                .0
+        });
+        let key = crate::caller_path::job_key(job);
+        let blocker = inner
+            .jobs
+            .values()
+            .filter(|holder| {
+                if holder.id == id
+                    || !(holder.state == JobState::Running || inner.starting.contains(&holder.id))
+                {
+                    return false;
+                }
+                match waiting_on.as_deref() {
+                    Some("workspace owner") => crate::caller_path::job_key(holder) == key,
+                    Some(SIBLING_USER_WAIT) => {
+                        index.checkout_sibling_users(key).contains_key(&holder.id)
+                    }
+                    Some("sibling checkout owner") => job.request.as_ref().is_some_and(|request| {
+                        Self::workspace_uses_sibling(
+                            crate::caller_path::job_key(holder),
+                            &request.siblings,
+                        ) || holder.request.as_ref().is_some_and(|held| {
+                            request.siblings.iter().any(|sibling| {
+                                held.siblings.iter().any(|other| {
+                                    sibling.canonical_path == other.canonical_path
+                                        && sibling.commit != other.commit
+                                })
+                            })
+                        })
+                    }),
+                    _ => false,
+                }
+            })
+            .min_by_key(|holder| (holder.order, holder.id))
+            .map(|holder| {
+                // A runner's checkout namespace belongs to one tenant VM, one
+                // account's workspace disk, or the local operator. No foreign
+                // account's job can hold a checkout in this namespace.
+                motor_protocol::QueueBlocker {
+                    job_id: holder.id,
+                    started_ms: holder.started_ms,
+                    timeout_s: holder.request.as_ref().and_then(|request| request.timeout),
+                }
+            });
+        Some(motor_protocol::QueueStatus {
+            state: if job.state == JobState::AwaitingBundles {
+                "uploading".into()
+            } else {
+                format!("{:?}", job.state).to_lowercase()
+            },
+            waiting_on,
+            blocker,
         })
     }
     pub fn cancel(&self, id: Uuid) -> io::Result<()> {

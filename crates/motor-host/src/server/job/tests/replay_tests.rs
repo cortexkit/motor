@@ -342,7 +342,11 @@ async fn reattach_waits_for_a_new_runner_heartbeat_instead_of_replaying_the_old_
     .await
     .expect("quiet attachment did not receive a keepalive")
     .unwrap();
-    assert_eq!(beat, json!({"type":"heartbeat","queue_wait_ms":0}));
+    assert_eq!(
+        beat,
+        json!({"type":"heartbeat","queue_wait_ms":0,
+        "queue_status":{"state":"queued","waiting_on":"workspace setup"}})
+    );
     write_frame(
         &mut guest,
         &json!({"type":"heartbeat","queue_wait_ms":54321}),
@@ -377,6 +381,42 @@ async fn quiet_prestart_attachment_repeats_only_its_live_runner_queue_sample() {
 }
 
 #[tokio::test]
+async fn quiet_keepalive_does_not_repeat_a_queue_change_notification() {
+    let (runtime, fake, _) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    let status = json!({"state":"queued","waiting_on":"workspace owner",
+        "blocker":{"job_id":JOB2}});
+    write_frame(
+        &mut guest,
+        &json!({"type":"heartbeat","queue_wait_ms":0,"queue_status":status}),
+    )
+    .await
+    .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = next_type(&mut client, "heartbeat").await;
+            if frame["queue_status"]["blocker"]["job_id"] == JOB2 {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first["queue_status"], status);
+    let repeated = tokio::time::timeout(
+        super::super::stream::CLIENT_HEARTBEAT + Duration::from_secs(3),
+        read_frame(&mut client),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(repeated, json!({"type":"heartbeat","queue_wait_ms":0}));
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
 async fn busy_disk_observer_keepalive_pauses_instead_of_clearing_the_queue_budget() {
     let (runtime, _, _) = fixture();
     claim(&runtime, &claims(JOB));
@@ -398,8 +438,19 @@ async fn busy_disk_observer_keepalive_pauses_instead_of_clearing_the_queue_budge
     .await
     .expect("busy-disk observer did not receive a keepalive")
     .unwrap();
-    assert_eq!(beat, json!({"type":"heartbeat","queue_wait_ms":0}));
+    assert_eq!(
+        beat,
+        json!({"type":"heartbeat","queue_wait_ms":0,
+        "queue_status":{"state":"queued","waiting_on":"checkout disk"}})
+    );
     assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].boot_started);
+    write_frame(&mut client, &json!({"type":"job_status","job_id":JOB}))
+        .await
+        .unwrap();
+    let status = next_type(&mut client, "job_status_reply").await;
+    assert_eq!(status["state"], "queued");
+    assert_eq!(status["waiting_on"], "checkout disk");
+    assert_eq!(status["queue_wait_ms"], 0);
     drop(client);
     task.await.unwrap().unwrap();
     runtime.host.lock().unwrap().close(id).unwrap();

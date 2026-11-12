@@ -269,6 +269,7 @@ impl Boat {
                                 write_frame_async(
                                     &mut socket,
                                     &Frame::JobStatusReply(JobStatusReply {
+                                        blocker: None,
                                         job_id: id,
                                         state: "running".into(),
                                         waiting_on: None,

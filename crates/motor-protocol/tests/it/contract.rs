@@ -580,6 +580,7 @@ fn bundle_transcript(prepare: bool, seed: u64) -> (Vec<Frame>, Vec<Vec<u8>>) {
             });
             transcript.push(Frame::Heartbeat {
                 queue_wait_ms: None,
+                queue_status: None,
             });
             offset = end;
         }
@@ -648,6 +649,7 @@ fn codec_pins_big_endian_prefix_and_detects_truncation() {
         &mut wire,
         &Frame::Heartbeat {
             queue_wait_ms: None,
+            queue_status: None,
         },
     )
     .unwrap();
@@ -655,7 +657,8 @@ fn codec_pins_big_endian_prefix_and_detects_truncation() {
     assert_eq!(
         read_frame(&mut &wire[..]).unwrap(),
         Some(Frame::Heartbeat {
-            queue_wait_ms: None
+            queue_wait_ms: None,
+            queue_status: None,
         })
     );
     assert_eq!(read_frame(&mut &[][..]).unwrap(), None);
@@ -1042,7 +1045,8 @@ fn queue_heartbeats_are_additive_in_both_upgrade_orders() {
         assert!(matches!(
             serde_json::from_value::<Frame>(value).unwrap(),
             Frame::Heartbeat {
-                queue_wait_ms: Some(_)
+                queue_wait_ms: Some(_),
+                ..
             }
         ));
     }
@@ -1050,10 +1054,109 @@ fn queue_heartbeats_are_additive_in_both_upgrade_orders() {
     assert!(matches!(
         serde_json::from_value::<Frame>(value.clone()).unwrap(),
         Frame::Heartbeat {
-            queue_wait_ms: None
+            queue_wait_ms: None,
+            ..
         }
     ));
     round_trip::<Frame>(&value);
+}
+
+#[test]
+fn queue_diagnostics_are_optional_and_old_decoders_ignore_them() {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OldFrame {
+        Heartbeat { queue_wait_ms: Option<u64> },
+    }
+    let blocker = QueueBlocker {
+        job_id: Uuid::nil(),
+        started_ms: Some(1_729_468_800_000),
+        timeout_s: Some(7200),
+    };
+    let frame = Frame::Heartbeat {
+        queue_wait_ms: Some(0),
+        queue_status: Some(QueueStatus {
+            state: "queued".into(),
+            waiting_on: Some("workspace owner".into()),
+            blocker: Some(blocker.clone()),
+        }),
+    };
+    let value = serde_json::to_value(&frame).unwrap();
+    let OldFrame::Heartbeat { queue_wait_ms } = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(queue_wait_ms, Some(0));
+    assert_eq!(serde_json::from_value::<Frame>(value).unwrap(), frame);
+    let old = serde_json::json!({"type":"heartbeat","queue_wait_ms":0});
+    assert!(matches!(
+        serde_json::from_value::<Frame>(old).unwrap(),
+        Frame::Heartbeat {
+            queue_status: None,
+            ..
+        }
+    ));
+    let plain = serde_json::to_value(Frame::Heartbeat {
+        queue_wait_ms: None,
+        queue_status: None,
+    })
+    .unwrap();
+    assert_eq!(plain, serde_json::json!({"type":"heartbeat"}));
+    let mut status = vector("frames", "job-status-queued");
+    status["waiting_on"] = serde_json::json!("workspace owner");
+    status["blocker"] = serde_json::to_value(blocker).unwrap();
+    #[derive(serde::Deserialize)]
+    struct OldStatus {
+        state: String,
+        waiting_on: Option<String>,
+    }
+    let old: OldStatus = serde_json::from_value(status.clone()).unwrap();
+    assert_eq!(old.state, "queued");
+    assert!(old.waiting_on.is_some());
+    assert!(matches!(
+        serde_json::from_value::<Frame>(status).unwrap(),
+        Frame::JobStatusReply(JobStatusReply {
+            blocker: Some(_),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn queue_status_updates_send_changes_and_at_most_one_refresh_per_minute() {
+    let mut updates = QueueStatusUpdates::default();
+    let mut status = QueueStatus {
+        state: "queued".into(),
+        waiting_on: Some("workspace owner".into()),
+        blocker: None,
+    };
+    assert_eq!(
+        updates.update(Some(status.clone()), 0),
+        Some(status.clone())
+    );
+    for now in 1..60_000 {
+        assert!(updates.update(Some(status.clone()), now).is_none());
+    }
+    assert!(updates.update(None, 60_000).is_none());
+    assert_eq!(
+        updates.update(Some(status.clone()), 60_000),
+        Some(status.clone())
+    );
+    status.blocker = Some(QueueBlocker {
+        job_id: Uuid::now_v7(),
+        started_ms: None,
+        timeout_s: None,
+    });
+    assert_eq!(
+        updates.update(Some(status.clone()), 60_001),
+        Some(status.clone())
+    );
+    status.blocker.as_mut().unwrap().job_id = Uuid::now_v7();
+    assert_eq!(
+        updates.update(Some(status.clone()), 60_002),
+        Some(status.clone())
+    );
+    status.state = "running".into();
+    status.waiting_on = None;
+    status.blocker = None;
+    assert_eq!(updates.update(Some(status.clone()), 60_003), Some(status));
 }
 
 #[test]

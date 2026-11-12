@@ -1625,7 +1625,7 @@ impl Channel {
             loop {
                 let (frame, ack) = tokio::select! {
                     request = writes.recv() => match request { Some((f, a)) => (f, Some(a)), None => break },
-                    _ = heartbeat.tick(), if *heartbeat_state.borrow() => (Frame::Heartbeat { queue_wait_ms: None }, None),
+                    _ = heartbeat.tick(), if *heartbeat_state.borrow() => (Frame::Heartbeat { queue_wait_ms: None, queue_status: None }, None),
                     changed = heartbeat_state.changed() => {
                         if changed.is_err() {
                             break;
@@ -2069,6 +2069,7 @@ mod transfer_io_tests {
             &mut expected,
             &Frame::Heartbeat {
                 queue_wait_ms: None,
+                queue_status: None,
             },
         )
         .unwrap();
@@ -2085,6 +2086,7 @@ mod transfer_io_tests {
             &mut write,
             &Frame::Heartbeat {
                 queue_wait_ms: None,
+                queue_status: None,
             },
         )
         .await

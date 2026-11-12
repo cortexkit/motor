@@ -32,6 +32,8 @@ use tokio::{
     time::Instant,
 };
 
+#[cfg(test)]
+mod queue_tests;
 mod records;
 #[cfg(test)]
 mod return_tests;
@@ -1331,9 +1333,21 @@ async fn consume<C: ExecClient + ?Sized>(
     let mut recovery_announced = false;
     let mut cancel_wanted = false;
     let mut cancel_sent = false;
+    let mut queue_display = QueueDisplay::default();
+    let mut status_tick = tokio::time::interval(Duration::from_secs(1));
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let next = tokio::select! {
             next = stream.next() => next,
+            status = async {
+                status_tick.tick().await;
+                tokio::time::timeout(Duration::from_secs(2), client.status(job_id.unwrap(), session.secret.as_deref().unwrap())).await
+            }, if name == "run" && job_id.is_some() && session.secret.is_some() && !queue_display.started => {
+                if let Ok(Ok(status)) = status {
+                    queue_display.observe(&status, err);
+                }
+                continue;
+            }
             Some(()) = interrupts.recv() => {
                 if cancel_wanted {
                     let _ = writeln!(err, "ck motor {name}: stopped waiting; a cancel was requested. {}", job_hint(job_id));
@@ -1599,6 +1613,9 @@ async fn consume<C: ExecClient + ?Sized>(
                 }
             }
             StreamRecord::Output(output) => {
+                if name == "run" {
+                    queue_display.started(err);
+                }
                 // Attach replays from the beginning; a sequence is shared by
                 // stdout and stderr, so one high-water mark covers both.
                 if last_output_seq.is_some_and(|seq| output.seq <= seq) {
@@ -1633,6 +1650,11 @@ async fn consume<C: ExecClient + ?Sized>(
                 }
                 return settle_named(&terminal, name, err);
             }
+            StreamRecord::Started(_) => {
+                if name == "run" {
+                    queue_display.started(err);
+                }
+            }
             StreamRecord::ReturnResult(result) => session.returns.legacy(&result),
             StreamRecord::ReturnChunk(chunk) => session.returns.chunk(&chunk),
             StreamRecord::ReturnManifest(manifest) => {
@@ -1643,6 +1665,93 @@ async fn consume<C: ExecClient + ?Sized>(
             }
             _ => {}
         }
+    }
+}
+
+#[derive(Default)]
+struct QueueDisplay {
+    last: Option<(String, Option<Uuid>)>,
+    started: bool,
+}
+
+impl QueueDisplay {
+    fn started(&mut self, err: &mut dyn Write) {
+        if !self.started {
+            self.started = true;
+            let _ = writeln!(err, "ck motor run: started");
+        }
+    }
+
+    fn observe(&mut self, status: &JobStatusReply, err: &mut dyn Write) {
+        if status.state == "running" {
+            self.started(err);
+        }
+        if self.started || status.state != "queued" {
+            return;
+        }
+        let Some(waiting) = status.waiting_on.as_deref() else {
+            return;
+        };
+        let key = (
+            waiting.to_owned(),
+            status.blocker.as_ref().map(|blocker| blocker.job_id),
+        );
+        if self.last.as_ref() == Some(&key) {
+            return;
+        }
+        self.last = Some(key);
+        if matches!(
+            waiting,
+            "permits"
+                | "gate job ahead"
+                | "cache fill ahead needs more free permits"
+                | "older job ahead needs more free permits"
+                | "demand exceeds capacity"
+        ) {
+            return;
+        }
+        let detail = match &status.blocker {
+            Some(blocker) => {
+                let activity = match waiting {
+                    "workspace owner" if blocker.started_ms.is_some() => {
+                        "which is running in this checkout"
+                    }
+                    "workspace owner" => "which is holding this checkout",
+                    "sibling user of this checkout" => "which is using this checkout as a sibling",
+                    "sibling checkout owner" => "which is holding a sibling checkout",
+                    "checkout disk" => "which is holding this checkout disk",
+                    _ => "which is holding the checkout",
+                };
+                let mut facts = Vec::new();
+                if let Some(ms) = blocker.started_ms {
+                    let seconds = ms / 1000 % 86400;
+                    facts.push(format!(
+                        "started {:02}:{:02}:{:02}Z",
+                        seconds / 3600,
+                        seconds / 60 % 60,
+                        seconds % 60
+                    ));
+                }
+                if let Some(seconds) = blocker.timeout_s {
+                    let limit = if seconds.is_multiple_of(3600) {
+                        format!("{} h", seconds / 3600)
+                    } else if seconds.is_multiple_of(60) {
+                        format!("{} min", seconds / 60)
+                    } else {
+                        format!("{seconds} s")
+                    };
+                    facts.push(format!("limit {limit}"));
+                }
+                let facts = if facts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", facts.join(", "))
+                };
+                format!("job {} {activity}{facts}", blocker.job_id)
+            }
+            None => waiting.to_owned(),
+        };
+        let _ = writeln!(err, "ck motor run: queued: waiting for {detail}");
     }
 }
 
@@ -3182,6 +3291,7 @@ mod hosted_cli_tests {
                 .with_ran(motor_protocol::Ran::Remote);
             terminal.queue_wait_ms = 17;
             Ok(JobStatusReply {
+                blocker: None,
                 job_id,
                 state: "terminal".into(),
                 waiting_on: None,

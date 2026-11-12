@@ -381,6 +381,7 @@ async fn service_stop_exits_after_hold_drain_with_a_live_heartbeat_client() {
                 &mut write,
                 &Frame::Heartbeat {
                     queue_wait_ms: None,
+                    queue_status: None,
                 },
             )
             .await
