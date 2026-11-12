@@ -22,8 +22,10 @@ impl Fixture {
         self.jobs.cache_write_grants.admit(token)
     }
 
+    /// Production's EnsureWorkspace, so a case that meets an existing disk keeps
+    /// it and its original binding exactly as a real host's later job would.
     pub fn create(&self, request: job::CreateWorkspace) -> Result<()> {
-        self.jobs.create_workspace(request)
+        self.jobs.ensure_workspace(request)
     }
 
     pub fn install(&self, account: &str, set: &motor_protocol::RemoteCacheRequest) -> Result<()> {

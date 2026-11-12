@@ -155,6 +155,14 @@ impl LinuxJobs {
             grant.as_ref(),
         )
     }
+    /// The host's EnsureWorkspace: create the disk bound to the job's write
+    /// grant, or keep an existing disk and the binding it was created with.
+    pub(super) fn ensure_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
+        self.check_workspace_size(request.size_bytes)?;
+        self.disk_available_identity(&request.workspace_disk_id)?;
+        let grant = self.disk_grant(request.cache_write_job_id.as_deref());
+        workspace::ensure_bound(&self.workspaces, request, grant.as_ref())
+    }
     fn disk_grant(&self, id: Option<&str>) -> Option<crate::cache_write::Grant> {
         crate::cache_write::disk_grant(&self.cache_write_grants, id)
     }
@@ -653,19 +661,12 @@ impl LinuxJobs {
                 size_bytes,
                 cache_write_job_id,
             } => {
-                self.check_workspace_size(size_bytes)?;
-                self.disk_available_identity(&disk_id)?;
-                let grant = self.disk_grant(cache_write_job_id.as_deref());
-                workspace::ensure_bound(
-                    &self.workspaces,
-                    job::CreateWorkspace {
-                        account,
-                        workspace_disk_id: disk_id,
-                        size_bytes,
-                        cache_write_job_id,
-                    },
-                    grant.as_ref(),
-                )?;
+                self.ensure_workspace(job::CreateWorkspace {
+                    account,
+                    workspace_disk_id: disk_id,
+                    size_bytes,
+                    cache_write_job_id,
+                })?;
                 Ok(Response::new(Reply::Ok))
             }
             Operation::EvictBase { account, disk_id } => {
