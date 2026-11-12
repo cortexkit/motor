@@ -24,5 +24,7 @@ pub mod wire;
 #[cfg(test)]
 extern crate self as motor_host;
 #[cfg(test)]
+mod test_logs;
+#[cfg(test)]
 #[path = "../tests/it/mod.rs"]
 mod tests;

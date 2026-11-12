@@ -195,6 +195,7 @@ pub struct Runtime {
     /// (idempotent) release of each.
     released_jobs: Mutex<std::collections::BTreeSet<String>>,
     job_exits: Mutex<Option<u64>>,
+    job_adoptions: Mutex<BTreeMap<String, job::Adoption>>,
     job_launches: Mutex<BTreeMap<String, Arc<job::Launch>>>,
     job_recoveries: Mutex<BTreeMap<String, job::recovery::Worker>>,
     job_fills: Mutex<crate::jobs::fills::Scheduler>,
@@ -468,6 +469,7 @@ impl Runtime {
             helper_stopped_jobs: Mutex::new(Default::default()),
             released_jobs: Mutex::new(Default::default()),
             job_exits: Mutex::new(None),
+            job_adoptions: Mutex::new(BTreeMap::new()),
             job_launches: Mutex::new(BTreeMap::new()),
             job_recoveries: Mutex::new(BTreeMap::new()),
             job_fills: Mutex::new(crate::jobs::fills::Scheduler::new(Arc::new(
@@ -723,21 +725,27 @@ impl Runtime {
                 capacity.as_ref().map_err(|e| anyhow::anyhow!(e.clone()))?;
                 settings.validate_cpus(self.control.online_cpus()?)?;
                 let available_mem_mib = self.control.host_available_mib()?;
-                let job_vm_headroom_mib = self.control.job_vm_headroom_mib()?;
-                Ok(crate::state::jobs::HostResources {
-                    // Use the caller's observation clock so the probe's I/O
-                    // time does not consume the allowance for concurrent
-                    // callers whose clocks were captured slightly earlier.
-                    at_ms: now_ms,
-                    available_mem_mib,
-                    job_vm_headroom_mib,
-                    vcpu_ceiling: settings.vcpu_ceiling,
-                    permit_budget: settings.permit_budget,
-                })
+                let job_vm_memory = self.control.job_vm_memory()?;
+                Ok((
+                    crate::state::jobs::HostResources {
+                        // Use the caller's observation clock so probe I/O does
+                        // not make the sample appear too new to concurrent
+                        // callers whose clocks were captured slightly earlier.
+                        at_ms: now_ms,
+                        available_mem_mib,
+                        job_vm_headroom_mib: job_vm_memory.headroom_mib,
+                        vcpu_ceiling: settings.vcpu_ceiling,
+                        permit_budget: settings.permit_budget,
+                    },
+                    job_vm_memory.file_mib,
+                ))
             })();
             let mut host = self.host.lock().expect("host lock");
             match sample {
-                Ok(sample) => host.record_host_resources(sample),
+                Ok((sample, file_mib)) => {
+                    host.record_host_resources(sample);
+                    host.job_vm_file_mib = file_mib;
+                }
                 Err(error) => host.host_resources_unavailable(&format!("{error:#}")),
             }
         }
@@ -1925,7 +1933,7 @@ mod rollback;
 mod write_block;
 pub(crate) use job::host_available_mib;
 #[cfg(target_os = "linux")]
-pub(crate) use job::job_vm_headroom_mib;
+pub(crate) use job::job_vm_memory;
 
 fn verified_lease(claims: &Claims, burst_enabled: bool) -> Value {
     let mut lease = json!({"type":"verified_lease", "jti":claims.jti, "purpose":claims.purpose, "sub":claims.sub, "vcpus":claims.vcpus, "mem_mib":claims.mem_mib, "platform":claims.platform, "net":claims.net, "max_s":claims.max_s, "exp":claims.exp});

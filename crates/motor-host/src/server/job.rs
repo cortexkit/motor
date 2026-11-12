@@ -358,6 +358,29 @@ impl Runtime {
         }))
     }
 
+    fn poll_job_adoption(&self, job: &str, now_ms: u64) -> Result<bool> {
+        let mut polls = self.job_adoptions.lock().expect("job adoptions");
+        if let Some(last) = polls.get(job) {
+            if now_ms >= last.at_ms && now_ms - last.at_ms < 2000 {
+                return Ok(last.running);
+            }
+        }
+        // Failed requests consume the interval too, without claiming the VM
+        // disappeared. Deadlines and stop retries still run on every tick.
+        let running = self.control.adopt_job(job);
+        if matches!(running, Ok(false)) {
+            tracing::info!(jti = job, "job_vmm_gone");
+        }
+        polls.insert(
+            job.to_owned(),
+            Adoption {
+                at_ms: now_ms,
+                running: running.as_ref().copied().unwrap_or(true),
+            },
+        );
+        running
+    }
+
     pub(super) fn tick_jobs(&self, now_ms: u64) -> Result<()> {
         if !self.per_job() {
             return Ok(());
@@ -369,6 +392,17 @@ impl Runtime {
             "exits",
             self.collect_job_exits_at(now_ms, false),
         );
+        {
+            let host = self.host.lock().expect("host lock");
+            self.job_adoptions
+                .lock()
+                .expect("job adoptions")
+                .retain(|job, _| {
+                    host.snapshot.per_job.executions.get(job).is_some_and(|e| {
+                        !e.ended && e.evidence.as_ref().is_none_or(|e| e.exit.is_none())
+                    })
+                });
+        }
         tick_step(
             &mut failure,
             "fill_sources",
@@ -433,7 +467,17 @@ impl Runtime {
             // If a VM disappeared while the host was down, still allow time
             // for a delayed helper exit report. The execution deadline alone
             // cannot prove how the VM ended.
-            if hello && matches!(self.control.adopt_job(&job), Ok(false)) {
+            let known_gone = self
+                .host
+                .lock()
+                .expect("host lock")
+                .snapshot
+                .per_job
+                .executions[&job]
+                .evidence
+                .as_ref()
+                .is_some_and(|e| e.gone_at_ms.is_some());
+            if hello && (known_gone || matches!(self.poll_job_adoption(&job, now_ms), Ok(false))) {
                 tick_step(
                     &mut failure,
                     "expired_vmm_gone",
@@ -487,7 +531,7 @@ impl Runtime {
             {
                 true
             } else {
-                match self.control.adopt_job(job) {
+                match self.poll_job_adoption(job, now_ms) {
                     Ok(running) => !running,
                     Err(error) => {
                         tick_step(&mut failure, "adopt", Err::<(), _>(error));
@@ -504,6 +548,8 @@ impl Runtime {
                 tick_step(&mut failure, "stop", self.stop_job(job, false, true));
             }
             if gone {
+                // Only absence detection is paced. Once observed, the evidence
+                // window is checked every tick, not once per adoption interval.
                 let result = self
                     .host
                     .lock()
@@ -691,6 +737,7 @@ impl Runtime {
                     .expect("host lock")
                     .job_exit_received(&report, now_ms)?;
                 if accepted {
+                    tracing::info!(jti = %report.job_id, oom_kill = report.oom_kill, "job_exit_received");
                     self.finish_job_exit(&report)?;
                 }
                 Ok(())
@@ -809,6 +856,11 @@ fn remove_spool(path: &std::path::Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+pub(super) struct Adoption {
+    at_ms: u64,
+    running: bool,
 }
 
 struct Spool {
@@ -1052,8 +1104,13 @@ pub(crate) fn host_available_mib(meminfo: &str) -> Result<u64> {
     Ok(kib / 1024)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) fn job_vm_headroom_mib(slice: &std::path::Path) -> Result<u64> {
+    Ok(job_vm_memory(slice)?.headroom_mib)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn job_vm_memory(slice: &std::path::Path) -> Result<crate::helper::JobVmMemory> {
     let limit: u64 = std::fs::read_to_string(slice.join("memory.max"))?
         .trim()
         .parse()
@@ -1080,7 +1137,10 @@ pub(crate) fn job_vm_headroom_mib(slice: &std::path::Path) -> Result<u64> {
         .context("invalid job-VM memory.current")?;
     // Like MemAvailable, treat file pages as reclaimable, but not anonymous,
     // kernel or other charged memory. Saturation bounds cross-file sample drift.
-    Ok(limit.saturating_sub(current.saturating_sub(file)) / (1024 * 1024))
+    Ok(crate::helper::JobVmMemory {
+        headroom_mib: limit.saturating_sub(current.saturating_sub(file)) / (1024 * 1024),
+        file_mib: Some(file.min(current) / (1024 * 1024)),
+    })
 }
 
 async fn boot(

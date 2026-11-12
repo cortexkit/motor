@@ -679,6 +679,12 @@ impl Host {
         Some(frames)
     }
     pub fn heartbeat(&self, now_ms: u64, free_mem_mib: u64, healthy: bool) -> Heartbeat {
+        let free_mem_mib = if self.snapshot.per_job.dax_failed {
+            0
+        } else {
+            free_mem_mib
+        };
+        self.log_job_memory(now_ms, free_mem_mib);
         Heartbeat {
             // While host storage is low, new leases are refused, so no free
             // vCPUs are advertised and the broker places no new work here.
@@ -693,11 +699,7 @@ impl Host {
                     .max()
                     .unwrap_or(0)
             },
-            free_mem_mib: if self.snapshot.per_job.dax_failed {
-                0
-            } else {
-                free_mem_mib
-            },
+            free_mem_mib,
             queued: self
                 .snapshot
                 .leases
