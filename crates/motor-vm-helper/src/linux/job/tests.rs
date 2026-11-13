@@ -7,6 +7,7 @@ mod plane_tests;
 mod security_tests;
 #[cfg(feature = "linux-service-tests")]
 mod service_cleanup;
+mod watcher_tests;
 #[cfg(feature = "linux-service-tests")]
 use service_cleanup::ServiceResources;
 
@@ -322,6 +323,14 @@ pub(super) fn machine(base: &Path) -> LinuxJobs {
         base,
         &serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap(),
     )
+}
+
+pub(in crate::linux) fn empty_exit_fixture(base: &Path) -> LinuxJobs {
+    let jobs = exit_tests::fixture(base);
+    jobs.save(&record()).unwrap();
+    jobs.insert_record(record());
+    exit_tests::empty_group(&jobs, 3);
+    jobs
 }
 
 pub(super) fn machine_with_config(base: &Path, config: &Config) -> LinuxJobs {

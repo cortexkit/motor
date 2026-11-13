@@ -172,13 +172,14 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
         std::thread::park_timeout(Duration::from_millis(100));
         helper_lock(&maintenance).maintain();
     });
-    // Job collection must not wait for tenants or dirty legacy-slot cleanup.
-    // Each held job writer is skipped, so launch or stop cannot stall the scan.
+    // Reconcile is complete. Detection takes only published views, and each
+    // collector waits on its own writer so slow teardown cannot stall a scan.
+    jobs.start_exit_watcher();
     let maintenance = jobs.clone();
     std::thread::spawn(move || loop {
-        std::thread::park_timeout(Duration::from_millis(100));
+        std::thread::park_timeout(Duration::from_secs(60));
         if let Err(error) = maintenance.maintain() {
-            eprintln!("job exit evidence collection failed: {error}");
+            eprintln!("job tombstone pruning failed: {error}");
         }
     });
     // Removed tenants' quarantined data is deleted here once it is old

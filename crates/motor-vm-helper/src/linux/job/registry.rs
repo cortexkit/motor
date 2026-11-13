@@ -1,6 +1,7 @@
 use super::*;
 use crate::lock_order::{Lock, Mutex};
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,11 +36,38 @@ impl JobState {
 
 // Whole-record rewrites, child reaping, stop and launch share one writer lock.
 // Holding it never requires another job's lock or a later admission decision.
-pub(super) struct JobCell(pub Mutex<JobState>);
+pub(super) struct JobCell(pub Mutex<JobState>, AtomicBool, AtomicBool);
 
 impl JobCell {
     pub fn new(state: JobState) -> Self {
-        Self(Mutex::new(Lock::J, state))
+        Self(
+            Mutex::new(Lock::J, state),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        )
+    }
+
+    pub fn begin_collection(&self) -> bool {
+        self.1
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn end_collection(&self) {
+        self.1.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn is_collecting(&self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
+
+    pub fn log_spawn_failure(&self, error: &std::io::Error) {
+        // Error deduplication cannot take J: even spawn failure must not make
+        // the watcher wait behind a boot, stop or another collector.
+        if !self.2.swap(true, Ordering::Relaxed) {
+            eprintln!("job exit collector spawn failed: {error}");
+        }
     }
 }
 
@@ -51,8 +79,7 @@ pub(super) struct JobView {
     pub record: Record,
     pub state: State,
     pub cleanup_pending: bool,
-    // Retain the owned process identity even when no reader needs to poll it.
-    pub _pidfd: Option<Arc<OwnedFd>>,
+    pub pidfd: Option<Arc<OwnedFd>>,
 }
 
 impl From<&JobState> for JobView {
@@ -61,7 +88,7 @@ impl From<&JobState> for JobView {
             record: state.record.clone(),
             state: state.state,
             cleanup_pending: state.cleanup_pending,
-            _pidfd: state.pidfd.clone(),
+            pidfd: state.pidfd.clone(),
         }
     }
 }
@@ -88,7 +115,7 @@ impl LinuxJobs {
         let result = launch(&mut state);
         if let Err(error) = result {
             if let Err(cleanup) = self.stop_locked(&mut state) {
-                // Launch is over even when cleanup must be retried. Maintenance
+                // Launch is over even when cleanup must be retried. The watcher
                 // may now collect it, but only explicit stop can release its disk.
                 state.state = State::Running;
                 self.publish(&state);
