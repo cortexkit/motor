@@ -3751,7 +3751,7 @@ impl Runner {
         id: Uuid,
         directory: &Path,
         cap: u64,
-    ) -> io::Result<motor_protocol::FillSource> {
+    ) -> io::Result<crate::fill_source::Export> {
         let request = {
             let inner = self.core.inner.lock().unwrap();
             let job = inner
