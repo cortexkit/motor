@@ -958,6 +958,112 @@ async fn execution_exit_preserves_an_already_stored_runner_terminal() {
 }
 
 #[tokio::test]
+async fn evidence_gap_publishes_live_terminal_before_failed_stop_releases_disk() {
+    let (runtime, fake, storage) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    guest.write_all(&records()[0]).await.unwrap();
+    assert_eq!(next_record(&mut client).await.value["type"], "started");
+    let disk = runtime.host.lock().unwrap().snapshot.per_job.executions[JOB]
+        .disk_id
+        .clone();
+    fake.disk_holders
+        .lock()
+        .unwrap()
+        .insert(disk.clone(), JOB.into());
+    storage.recovery_available.store(true, Ordering::Release);
+    fake.gone.lock().unwrap().insert(JOB.into());
+    fake.fail_stop.store(true, Ordering::Release);
+    let now = unix_ms();
+    runtime.tick_jobs(now).unwrap();
+    assert!(runtime.tick_jobs(now + 1000).is_err());
+
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = next_record(&mut client).await;
+            if frame.value["type"] == "terminal" {
+                break frame.value;
+            }
+        }
+    })
+    .await
+    .expect("the gap tick must deliver the terminal without waiting for helper stop");
+    assert_eq!(terminal["outcome"]["type"], "outcome_unknown");
+    task.await.unwrap().unwrap();
+    let stream = runtime.job_stream(JOB).unwrap();
+    let published = stream
+        .with_store(|s| {
+            assert!(s.ended());
+            (0..s.len())
+                .map(|position| s.frame(position))
+                .collect::<Result<Vec<_>>>()
+        })
+        .unwrap();
+    assert_eq!(
+        published
+            .iter()
+            .filter(
+                |frame| crate::replay::decode(frame.as_ref().unwrap()).unwrap()["type"]
+                    == "terminal"
+            )
+            .count(),
+        1
+    );
+    {
+        let host = runtime.host.lock().unwrap();
+        let execution = &host.snapshot.per_job.executions[JOB];
+        assert!(!execution.ended);
+        assert_eq!(
+            execution.replay_completion,
+            Some(crate::state::jobs::storage::ReplayCompletion::Terminal)
+        );
+        assert_eq!(
+            host.snapshot.per_job.disks[&disk].attached_job.as_deref(),
+            Some(JOB)
+        );
+        assert!(host.snapshot.per_job.disks[&disk].recovery.is_none());
+    }
+    assert!(fake.recovery_starts.lock().unwrap().is_empty());
+    assert_eq!(
+        fake.disk_holders
+            .lock()
+            .unwrap()
+            .get(&disk)
+            .map(String::as_str),
+        Some(JOB)
+    );
+
+    // Publication, not helper cleanup, makes the selected outcome immutable.
+    let late = crate::replay::decode(records().last().unwrap()).unwrap();
+    let winner = runtime.observe_job_frame(JOB, &late).unwrap().unwrap();
+    assert_eq!(winner["outcome"]["type"], "outcome_unknown");
+    assert!(runtime.tick_jobs(now + 6000).is_err());
+    assert!(fake.recovery_starts.lock().unwrap().is_empty());
+    // Keep this test focused on release, not the later recovery VM lifecycle.
+    storage.recovery_available.store(false, Ordering::Release);
+    fake.fail_stop.store(false, Ordering::Release);
+    runtime.tick_jobs(now + 11000).unwrap();
+    {
+        let host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.per_job.executions[JOB].ended);
+        assert!(host.snapshot.per_job.disks[&disk].attached_job.is_none());
+    }
+    assert!(!fake.disk_holders.lock().unwrap().contains_key(&disk));
+    assert!(!storage.held.lock().unwrap().contains(JOB));
+    let after_release = stream
+        .with_store(|s| {
+            (0..s.len())
+                .map(|position| s.frame(position))
+                .collect::<Result<Vec<_>>>()
+        })
+        .unwrap();
+    assert_eq!(
+        after_release, published,
+        "cleanup must not publish a second terminal"
+    );
+    drop((client, guest));
+}
+
+#[tokio::test]
 async fn restart_recovers_a_missing_terminal_after_receipt_or_evidence_expiry() {
     use crate::state::jobs::storage::ReplayCompletion;
     for receipt in [false, true] {

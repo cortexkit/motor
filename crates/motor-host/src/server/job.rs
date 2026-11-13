@@ -579,6 +579,10 @@ impl Runtime {
                         })
                 };
                 if expired {
+                    // The durable lost outcome is deliverable even while the
+                    // helper still holds the disk. Publishing commits that
+                    // outcome; only successful stop permits disk detachment.
+                    tick_step(&mut failure, "gap_replay", self.publish_job_settlement(job));
                     if self
                         .job_adoptions
                         .lock()

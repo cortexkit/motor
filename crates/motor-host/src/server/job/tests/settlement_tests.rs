@@ -475,7 +475,10 @@ fn evidence_gap_stops_helper_before_detaching_disk_and_late_exit_retries_release
         let host = runtime.host.lock().unwrap();
         let e = &host.snapshot.per_job.executions[JOB];
         assert!(!e.ended);
-        assert_eq!(e.replay_completion, None);
+        assert_eq!(
+            e.replay_completion,
+            Some(crate::state::jobs::storage::ReplayCompletion::Terminal)
+        );
         assert_eq!(
             host.snapshot.billing[JOB].terminal.as_ref().unwrap()["outcome"]["type"],
             "outcome_unknown"

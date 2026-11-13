@@ -329,6 +329,10 @@ jobs recorded by this host before starting, including records left by an older
 host. It never stops an unrelated holder to force a disk available.
 Failed helper stops on the evidence-gap path retry and warn at most once every
 five seconds per job; this retry timer is process-local and resets on restart.
+The evidence-bound terminal is published to replay and an attached caller in
+the gap's tick even if helper cleanup fails. The execution remains unended and
+the disk stays attached until the helper stop succeeds; result delivery does
+not authorize workspace recovery or disk reuse.
 
 A refused recovery start moves to disk deletion. Failed cleanup retries at most
 once every five seconds per disk, with one warning per attempt; the retry time
@@ -341,8 +345,9 @@ are released. Receipts contain OOM and egress measurements, not the command's
 result. A late guest terminal can replace an evidence-gap outcome only before
 any terminal has been committed to replay or delivered to the caller and before
 usage has been queued or accepted. Otherwise the first published outcome stands.
-The host normally publishes the unknown terminal in the same tick as the gap;
-there is no additional late-result grace period.
+Publishing the gap's unknown terminal commits that outcome even while helper
+cleanup is pending, so a later guest terminal cannot replace it. There is no
+additional late-result grace period.
 
 Job relay opens do not retry a missing or refused VMM socket while holding the
 helper lock; their handshake has a two-second total budget. This keeps a normal
