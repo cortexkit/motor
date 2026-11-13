@@ -28,7 +28,9 @@ pub(crate) fn validate_dependencies(dependencies: &[GitDependency]) -> io::Resul
             return Err(invalid("invalid git dependency URL or commit"));
         }
         if let Some(bundle) = &d.bundle {
-            if d.commits.len() != 1 || bundle.repository != d.url || !bundled.insert(&d.commits[0])
+            if d.commits.len() != 1
+                || bundle.repository != d.url
+                || !bundled.insert((&d.url, &d.commits[0]))
             {
                 return Err(invalid(
                     "git dependency bundle must declare one unique commit",
@@ -715,5 +717,41 @@ mod cache_gc_tests {
             .find(|(key, _)| *key == std::ffi::OsStr::new("CARGO_CACHE_AUTO_CLEAN_FREQUENCY"))
             .and_then(|(_, value)| value);
         assert_eq!(setting, Some(std::ffi::OsStr::new("never")));
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_commit_uniqueness_is_scoped_to_the_dependency_url() {
+        let dependency = GitDependency {
+            url: "https://example.invalid/dependency".into(),
+            commits: vec!["a".repeat(40)],
+            bundle: Some(motor_protocol::BundleManifest {
+                index: 1,
+                repository: "https://example.invalid/dependency".into(),
+                length: 1,
+                sha256: "b".repeat(64),
+            }),
+        };
+        let mut alias = dependency.clone();
+        alias.url.push_str(".git");
+        alias.bundle.as_mut().unwrap().repository = alias.url.clone();
+        alias.bundle.as_mut().unwrap().index = 2;
+        validate_dependencies(&[dependency.clone(), alias]).unwrap();
+        assert!(validate_dependencies(&[dependency.clone(), dependency.clone()]).is_err());
+        let mut multiple = dependency.clone();
+        multiple.commits.push("c".repeat(40));
+        assert!(validate_dependencies(&[multiple]).is_err());
+        let mut wrong_url = dependency;
+        wrong_url
+            .bundle
+            .as_mut()
+            .unwrap()
+            .repository
+            .push_str(".git");
+        assert!(validate_dependencies(&[wrong_url]).is_err());
     }
 }

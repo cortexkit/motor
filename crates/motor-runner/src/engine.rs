@@ -1793,6 +1793,9 @@ struct Core {
     /// after a restart every connection that received a reply is gone, so the
     /// first prune removes all held refs.
     held_offers: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>>,
+    /// Connection-scoped mirror refs, retained through the fill control reply.
+    #[cfg(target_os = "linux")]
+    fill_source_holds: Mutex<BTreeMap<Uuid, BTreeMap<PathBuf, BTreeSet<String>>>>,
     /// Immutable until restart after operator reconciliation. Even readable
     /// workspace metadata cannot establish a damaged job's full CPU/cache use.
     quarantined: BTreeMap<Uuid, QuarantinedJob>,
@@ -2052,6 +2055,24 @@ enum DrainResult {
 #[derive(Clone)]
 pub struct Runner {
     core: Arc<Core>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct FillSourceHold {
+    runner: Runner,
+    token: Uuid,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FillSourceHold {
+    fn drop(&mut self) {
+        self.runner
+            .core
+            .fill_source_holds
+            .lock()
+            .unwrap()
+            .remove(&self.token);
+    }
 }
 
 struct WorkspaceDrop {
@@ -3023,6 +3044,8 @@ impl Runner {
                 job_logs: Mutex::new(BTreeMap::new()),
                 ref_mutation: Mutex::new(()),
                 held_offers: Mutex::new(BTreeMap::new()),
+                #[cfg(target_os = "linux")]
+                fill_source_holds: Mutex::new(BTreeMap::new()),
                 quarantine_admission: Mutex::new(
                     (!quarantined.is_empty())
                         .then(|| "live unit ownership has not been inspected".into()),
@@ -3756,17 +3779,50 @@ impl Runner {
         &self,
         source: &motor_protocol::FillSource,
         directory: &Path,
-    ) -> io::Result<Option<Uuid>> {
+    ) -> io::Result<(Option<Uuid>, FillSourceHold)> {
         crate::fill_source::require_fill_boot()?;
+        self.import_fill_source_contents(source, directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn import_fill_source_contents(
+        &self,
+        source: &motor_protocol::FillSource,
+        directory: &Path,
+    ) -> io::Result<(Option<Uuid>, FillSourceHold)> {
         self.validate_writer_paths(paths::fill_source(source).host, None, &[])?;
+        // Import, hold registration and queuing are one ref-mutation turn:
+        // maintenance must not observe the imported refs without their owner.
+        let _refs = self.core.ref_mutation.lock().unwrap();
         crate::fill_source::import(&self.core.trees, source, directory)?;
+        let mut mirrors = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+        for pin in crate::fill_source::pins(&self.core.trees, source)? {
+            let mirror = if let Some(repository) = pin.repository {
+                self.core.trees.mirror(&repository)
+            } else {
+                self.core
+                    .trees
+                    .dependency_mirror(pin.dependency.as_ref().unwrap())
+            };
+            mirrors.entry(mirror).or_default().insert(pin.reference);
+        }
+        let token = Uuid::now_v7();
+        self.core
+            .fill_source_holds
+            .lock()
+            .unwrap()
+            .insert(token, mirrors);
+        let hold = FillSourceHold {
+            runner: self.clone(),
+            token,
+        };
         tracing::info!(
             tip = source.integration_tip,
             repository_key = workspace::name(paths::fill_source(source).caller.text()),
             dependencies = source.git_dependencies.len(),
             "fill_source_imported"
         );
-        self.queue_imported_fill(source)
+        Ok((self.queue_imported_fill(source)?, hold))
     }
 
     #[cfg(target_os = "linux")]
@@ -8074,6 +8130,15 @@ impl Runner {
             );
         }
         drop(offers);
+        #[cfg(target_os = "linux")]
+        for hold in self.core.fill_source_holds.lock().unwrap().values() {
+            for (mirror, references) in hold {
+                mirrors
+                    .entry(mirror.clone())
+                    .or_default()
+                    .extend(references.iter().cloned());
+            }
+        }
         // Expired records may be the last mention of a repository. Enumerate
         // mirrors too, so their unheld refs are pruned after that record expires.
         for entry in fs::read_dir(&self.core.trees.mirrors)? {

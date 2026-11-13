@@ -176,17 +176,28 @@ fn unlocked_dependency_urls_and_commits_are_refused_before_any_dependency_import
 }
 
 fn source_fixture() -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSource) {
+    source_fixture_with_aliases(false)
+}
+
+fn source_fixture_with_aliases(
+    aliases: bool,
+) -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSource) {
     let f = Fixture::new();
     let dependency = f.scratch.join("dependency");
     fs::create_dir(&dependency).unwrap();
     git(&dependency, &["init"]);
     let (dep, _) = commit(&dependency, "dependency");
+    let mut locked = format!("version = 3\n[[package]]\nname='dep'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency#{dep}'\n");
+    if aliases {
+        let (second, _) = commit(&dependency, "second revision");
+        locked.push_str(&format!("[[package]]\nname='dep'\nversion='0.2.0'\nsource='git+https://example.invalid/dependency?rev={second}#{second}'\n[[package]]\nname='alias'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency.git#{dep}'\n"));
+    }
     fs::write(
         f.main.join("Cargo.toml"),
         "[package]\nname='source'\nversion='0.1.0'\n",
     )
     .unwrap();
-    fs::write(f.main.join("Cargo.lock"), format!("version = 3\n[[package]]\nname='dep'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency#{dep}'\n")).unwrap();
+    fs::write(f.main.join("Cargo.lock"), locked).unwrap();
     commit(&f.main, "second");
     let mut config = f.config();
     config.manual_tick = true;
@@ -218,6 +229,16 @@ fn source_fixture() -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSourc
         &mirror,
         &["update-ref", &format!("refs/ck-motor/dep/{dep}"), &dep],
     );
+    if aliases {
+        let alias = runner
+            .core
+            .trees
+            .dependency_mirror("https://example.invalid/dependency.git");
+        git(
+            &dependency,
+            &["clone", "--bare", text(&dependency), text(&alias)],
+        );
+    }
     let directory = f.scratch.join("export");
     let source = crate::fill_source::export(
         &runner.core.trees,
@@ -228,6 +249,84 @@ fn source_fixture() -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSourc
     )
     .unwrap();
     (f, runner, request, directory, source)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn imported_fill_accepts_lockfile_url_aliases_and_multiple_revisions() {
+    let (f, _, _, directory, source) = source_fixture_with_aliases(true);
+    let mut config = f.config();
+    config.state_root = f.scratch.join("alias-fill-state");
+    config.manual_tick = true;
+    config.tenant_vm = true;
+    config.fill_vm = true;
+    config.tenant_write_key = Some(true);
+    let runner = Runner::open(config).unwrap();
+    let (id, _hold) = runner
+        .import_fill_source_contents(&source, &directory)
+        .unwrap();
+    let id = id.unwrap();
+    let inner = runner.core.inner.lock().unwrap();
+    let imported = &inner.jobs[&id].request.as_ref().unwrap().git_dependencies;
+    let expected: BTreeSet<_> = source
+        .git_dependencies
+        .iter()
+        .flat_map(|d| {
+            d.commits
+                .iter()
+                .map(|commit| (d.url.clone(), commit.clone()))
+        })
+        .collect();
+    assert_eq!(expected.len(), 3);
+    assert_eq!(
+        imported
+            .iter()
+            .flat_map(|d| {
+                d.commits
+                    .iter()
+                    .map(|commit| (d.url.clone(), commit.clone()))
+            })
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    for (url, commit) in expected {
+        let mirror = runner.core.trees.dependency_mirror(&url);
+        assert_eq!(
+            git(
+                &mirror,
+                &["rev-parse", &format!("refs/ck-motor/dep/{commit}")]
+            ),
+            commit
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refused_imported_fill_releases_its_source_hold() {
+    let (f, _, _, directory, source) = source_fixture();
+    let mut config = f.config();
+    config.state_root = f.scratch.join("refused-writer-state");
+    config.manual_tick = true;
+    config.tenant_vm = true;
+    config.fill_vm = true;
+    config.tenant_write_key = Some(false);
+    let runner = Runner::open(config).unwrap();
+    let result = runner.import_fill_source_contents(&source, &directory);
+    let error = result
+        .err()
+        .expect("a fill without writer authority must be refused");
+    assert!(
+        error.to_string().contains("fill writer unavailable"),
+        "{error}"
+    );
+    assert!(runner.core.fill_source_holds.lock().unwrap().is_empty());
+    runner.maintenance().unwrap();
+    let refs = git(
+        &runner.core.trees.mirror(&source.repository_root),
+        &["for-each-ref", "--format=%(refname)"],
+    );
+    assert!(!refs.contains("refs/snapshots/"));
 }
 
 #[test]
@@ -331,7 +430,8 @@ fn helper_fill_boot_refuses_run_and_job_boot_refuses_fill_before_import() {
         );
         let error = runner
             .import_fill_source(&source, &f.scratch.join("absent"))
-            .unwrap_err();
+            .err()
+            .expect("a job boot must refuse fill import");
         assert!(error.to_string().contains("boot kind"), "{error}");
     }
 }
@@ -391,6 +491,17 @@ fn failed_writer_publication_is_not_reported_as_fill_success() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn imported_fill_settles_ok_and_root_policy_publishes_a_fixed_path_base() {
+    published_imported_fill(false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn imported_fill_completion_keeps_snapshot_pins_through_maintenance() {
+    published_imported_fill(true).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn published_imported_fill(maintain: bool) {
     use crate::build_base::{self, CompatibleInputs, FillLaunch, Timestamp, ToolchainIdentity};
     let (f, _tenant, _, directory, source) = source_fixture();
     let saved = f.scratch.join("filled-bd");
@@ -405,8 +516,18 @@ async fn imported_fill_settles_ok_and_root_policy_publishes_a_fixed_path_base() 
         saved.display()
     )];
     let runner = Runner::open(config.clone()).unwrap();
-    crate::fill_source::import(&runner.core.trees, &source, &directory).unwrap();
-    let id = runner.queue_imported_fill(&source).unwrap().unwrap();
+    let (id, hold) = runner
+        .import_fill_source_contents(&source, &directory)
+        .unwrap();
+    let id = id.unwrap();
+    if maintain {
+        let parent = git(&f.main, &["rev-parse", "HEAD^"]);
+        let stale = format!("refs/snapshots/{parent}");
+        let mirror = runner.core.trees.mirror(&source.repository_root);
+        git(&mirror, &["update-ref", &stale, &parent]);
+        runner.maintenance().unwrap();
+        assert!(!git(&mirror, &["for-each-ref", "--format=%(refname)"]).contains(&stale));
+    }
     runner.tick().unwrap();
     assert_eq!(
         terminal(&runner, id).await.outcome,
@@ -464,4 +585,66 @@ async fn imported_fill_settles_ok_and_root_policy_publishes_a_fixed_path_base() 
         b"compiled"
     );
     assert!(runner.fill_settled(id, &source.repository_root).unwrap());
+    if maintain {
+        runner.maintenance().unwrap();
+    }
+    let reply = crate::fill_source::completion(&runner, id, &source)
+        .await
+        .unwrap();
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["base_published"], true);
+    let pins: Vec<motor_protocol::MirrorRef> =
+        serde_json::from_value(reply["have"].clone()).unwrap();
+    assert!(pins.iter().any(|pin| pin.reference
+        == format!("refs/snapshots/{}", source.integration_tip)
+        && pin.commit == source.integration_tip));
+    drop(hold);
+    if maintain {
+        runner.maintenance().unwrap();
+        let refs = git(
+            &runner.core.trees.mirror(&source.repository_root),
+            &["for-each-ref", "--format=%(refname)"],
+        );
+        assert!(!refs.contains(&format!("refs/snapshots/{}", source.integration_tip)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_fill_completion_retains_errors_before_the_progress_tail() {
+    let (f, _, _, directory, source) = source_fixture();
+    let mut config = f.config();
+    config.state_root = f.scratch.join("failed-fill-state");
+    config.manual_tick = true;
+    config.tenant_vm = true;
+    config.fill_vm = true;
+    config.tenant_write_key = Some(true);
+    config.base_commands = vec!["printf 'error[E0001]: missing fixture symbol\\nwarning: build failed, waiting for other jobs to finish...\\n'; i=0; while [ $i -lt 300 ]; do printf '   Compiling fixture-%s\\n' \"$i\"; i=$((i+1)); done; printf 'final output\\n'; exit 101".into()];
+    let runner = Runner::open(config).unwrap();
+    let (id, hold) = runner
+        .import_fill_source_contents(&source, &directory)
+        .unwrap();
+    let id = id.unwrap();
+    runner.tick().unwrap();
+    assert_eq!(
+        terminal(&runner, id).await.outcome,
+        Outcome::Exit { code: 101 }
+    );
+    let error = crate::fill_source::completion(&runner, id, &source)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("fill command failed (Exit { code: 101 })"),
+        "{error}"
+    );
+    assert!(
+        error.contains("error[E0001]: missing fixture symbol"),
+        "{error}"
+    );
+    assert!(error.contains("warning: build failed"), "{error}");
+    assert!(error.ends_with("final output"), "{error}");
+    assert!(error.len() <= 2048 + 64, "{} bytes", error.len());
+    drop(hold);
+    assert!(runner.core.fill_source_holds.lock().unwrap().is_empty());
 }
