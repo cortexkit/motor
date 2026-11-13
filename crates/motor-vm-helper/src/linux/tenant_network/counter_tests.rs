@@ -17,11 +17,7 @@ impl StalledCounter {
     pub fn new(root: &Path) -> Self {
         let command = root.join("stalled-counter");
         let pid_file = root.join("stalled-counter.pid");
-        std::fs::write(
-            &command,
-            "#!/bin/sh\necho $$ > \"$0.pid\"\nwhile :; do :; done\n",
-        )
-        .unwrap();
+        std::fs::write(&command, "#!/bin/sh\necho $$ > \"$0.pid\"\nexec sleep 60\n").unwrap();
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (cancel, cancelled) = mpsc::channel();
         let path = pid_file.clone();
