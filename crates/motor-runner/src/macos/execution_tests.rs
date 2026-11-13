@@ -95,6 +95,68 @@ fn missing_exit_or_signal_names_output_incomplete() {
     let error = run_output(&mut transport, &tx, &tx).unwrap_err();
     assert!(error.to_string().contains("output_incomplete"));
 }
+#[derive(Clone, Default)]
+struct LogBytes(Arc<Mutex<Vec<u8>>>);
+impl Write for LogBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+#[test]
+fn agent_reason_for_a_missing_exit_is_logged_with_the_job_id() {
+    let scratch = ScratchDir::new("macos-agent-reason");
+    let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+    let job_id = transport.entry.owned.lock().unwrap().record.id;
+    for bytes in [
+        b"warning: from the job\n".to_vec(),
+        b"motor: the build disk could not be released: Resource busy\n".to_vec(),
+    ] {
+        motor_winagent::write_frame(
+            &mut peer,
+            &Frame::Output {
+                stream: Stream::Stderr,
+                bytes,
+            },
+        )
+        .unwrap();
+    }
+    drop(peer);
+    let logs = LogBytes::default();
+    let (tx, rx) = mpsc::sync_channel(4);
+    let error = tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || run_output(&mut transport, &tx, &tx).unwrap_err(),
+    );
+    drop(tx);
+    assert!(error.to_string().contains("output_incomplete"));
+    // The caller still gets the line as the job's own stderr.
+    assert!(String::from_utf8(rx.into_iter().flatten().collect())
+        .unwrap()
+        .ends_with("motor: the build disk could not be released: Resource busy\n"));
+    let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let line = log
+        .lines()
+        .find(|line| line.contains("without Exit or Signal"))
+        .unwrap_or_else(|| panic!("no agent failure line: {log}"));
+    assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+    assert!(
+        line.contains("the build disk could not be released: Resource busy"),
+        "{line}"
+    );
+}
+#[test]
+fn only_a_last_motor_line_counts_as_the_agent_reason() {
+    assert_eq!(
+        agent_reason(b"job output\nmotor: the build disk could not be mounted: x\n\n").as_deref(),
+        Some("motor: the build disk could not be mounted: x")
+    );
+    assert_eq!(agent_reason(b"motor: earlier\njob output\n"), None);
+    assert_eq!(agent_reason(b""), None);
+}
 #[test]
 fn wrong_agent_version_refuses_with_image_name_before_command() {
     let scratch = ScratchDir::new("macos-agent-version");

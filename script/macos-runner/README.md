@@ -235,6 +235,22 @@ notice. With a state root, the script also checks that the kept
 remains. It prints each check, keeps both jobs' records beside the checkout, and
 exits non-zero at the first failure.
 
+### Build disk probe
+
+`script/macos-runner/build-disk-probe.sh <motor-macvm> <sealed-image> <new work directory>`
+needs no installed runner and runs as the image-building account. It uses the
+signed VM helper's `build-disk-probe` command to boot job VMs from APFS clones
+of the sealed image, through the same job helper the runner starts, and drives
+the image's own guest agent. For each attachment of the build disk, virtio
+block (the old one) and USB mass storage (the current one), a first VM formats
+the blank disk, mounts it at `target/` and writes a marker; a second VM gets
+the same disk and reads the marker. Each VM prints the volume's mount line and
+what `diskutil` says about its device, and the agent's notice if it had to
+reformat. Everything is created in the new work directory, never in a runner
+state root, and deleted afterwards unless `MOTOR_PROBE_KEEP=1`; the log is kept
+as `<work directory>.log`. The script exits 0 only when the second VM mounted
+the first VM's volume over USB.
+
 Earlier sealing code set a non-login shell and `*` password marker for
 `motorbuild` but kept its password hash, enabled authority and admin
 membership. Older sealed images may retain that account in this weaker state.

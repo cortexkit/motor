@@ -730,20 +730,59 @@ fn run_output(
     stdout: &SyncSender<Vec<u8>>,
     stderr: &SyncSender<Vec<u8>>,
 ) -> io::Result<ExecutionOutcome> {
+    let mut tail = Vec::new();
+    let result = forward_output(transport, stdout, stderr, &mut tail);
+    // A cancelled job's session ends on purpose; any other failure is logged
+    // with the agent's own reason when it sent one.
+    if let (Err(error), Ok(())) = (&result, transport.entry.check()) {
+        let job_id = transport.entry.owned.lock().unwrap().record.id;
+        let reason = agent_reason(&tail).unwrap_or_else(|| "none".into());
+        tracing::warn!(
+            %job_id,
+            %error,
+            agent_reason = %reason,
+            "macOS agent ended the session without Exit or Signal"
+        );
+    }
+    result
+}
+/// Bytes of the job's standard error kept to find the agent's last line.
+const STDERR_TAIL_BYTES: usize = 4096;
+/// The agent's reason for closing without Exit or Signal: its last stderr
+/// line, which starts with `motor: `. A session that ended for another reason
+/// has none.
+fn agent_reason(tail: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(tail);
+    let last = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    last.starts_with("motor: ").then(|| last.to_owned())
+}
+fn forward_output(
+    transport: &mut Transport,
+    stdout: &SyncSender<Vec<u8>>,
+    stderr: &SyncSender<Vec<u8>>,
+    tail: &mut Vec<u8>,
+) -> io::Result<ExecutionOutcome> {
     loop {
         match transport
             .receive()
             .map_err(|e| invalid(format!("output_incomplete: {e}")))?
         {
-            Frame::Output { stream, bytes } => forward(
-                if stream == Stream::Stdout {
-                    stdout
-                } else {
-                    stderr
-                },
-                bytes,
-                &transport.entry,
-            )?,
+            Frame::Output { stream, bytes } => {
+                if stream == Stream::Stderr {
+                    tail.extend_from_slice(&bytes);
+                    let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                    tail.drain(..excess);
+                }
+                forward(
+                    if stream == Stream::Stdout {
+                        stdout
+                    } else {
+                        stderr
+                    },
+                    bytes,
+                    &transport.entry,
+                )?
+            }
             Frame::Exit { code } => return Ok(ExecutionOutcome::Unix(exit_status(code)?)),
             Frame::Signal { signal } => return Ok(ExecutionOutcome::Signal { signal }),
             _ => return Err(invalid("unexpected macOS agent frame")),

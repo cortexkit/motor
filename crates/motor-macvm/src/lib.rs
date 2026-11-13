@@ -20,6 +20,8 @@ pub mod apfs;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod disk_release;
 mod nonce;
+#[cfg(unix)]
+pub mod probe;
 pub use nonce::{
     BUILD_EXTENSION_HEADER, BUILD_EXTENSION_SIZE, BootConfig, BuildConfig, MAX_BUILD_RETURN_BYTES,
     MAX_BUILD_RETURNS, Mount, NONCE_DISK_SIZE, NONCE_HEADER, NONCE_IMAGE_SIZE,
@@ -63,7 +65,42 @@ pub struct Share {
 pub struct Disk {
     pub path: PathBuf,
     pub read_only: bool,
+    pub bus: DiskBus,
 }
+
+/// How the VM presents a disk to the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskBus {
+    /// A virtio block device, which macOS treats as internal storage.
+    Virtio,
+    /// A USB mass storage device, which macOS treats as removable storage.
+    Usb,
+}
+
+impl DiskBus {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Virtio => "virtio",
+            Self::Usb => "usb",
+        }
+    }
+    pub fn parse(name: &str) -> io::Result<Self> {
+        match name {
+            "virtio" => Ok(Self::Virtio),
+            "usb" => Ok(Self::Usb),
+            _ => Err(invalid("disk bus must be virtio or usb")),
+        }
+    }
+}
+
+/// How job VMs attach the build disk. On Apple silicon, macOS encrypts every
+/// APFS volume on internal storage with a key the Secure Enclave protects, and
+/// a job VM's Secure Enclave state lives in its clone of the image, which is
+/// discarded after the job. A volume formatted on a virtio disk therefore
+/// cannot be unlocked by the next job VM: mount_apfs fails with EILSEQ.
+/// Removable storage is not tied to the Secure Enclave, so the build disk is
+/// a USB mass storage device.
+pub const BUILD_DISK_BUS: DiskBus = DiskBus::Usb;
 
 #[derive(Clone, Debug)]
 pub struct JobVmConfig {
@@ -149,19 +186,32 @@ impl JobVmConfig {
                 Disk {
                     path: request.clone.join(BOOT_DISK),
                     read_only: false,
+                    bus: DiskBus::Virtio,
                 },
                 Disk {
                     path: request.nonce_disk.clone(),
                     read_only: true,
+                    bus: DiskBus::Virtio,
                 },
                 Disk {
                     path: request.clone.join(BUILD_DISK),
                     read_only: false,
+                    bus: BUILD_DISK_BUS,
                 },
             ],
             request,
             shares,
         })
+    }
+
+    /// Attaches the build disk on `bus` instead of `BUILD_DISK_BUS`. Only the
+    /// operator's build disk probe uses this, to compare the two.
+    pub fn with_build_disk_bus(mut self, bus: DiskBus) -> Self {
+        self.disks[2].bus = bus;
+        self
+    }
+    pub fn build_disk_bus(&self) -> DiskBus {
+        self.disks[2].bus
     }
 
     pub fn disks(&self) -> &[Disk; 3] {
@@ -531,8 +581,14 @@ pub fn spawn_job_helper(
     let guest_fd = duplicate(child_session.as_raw_fd())?;
     let slot_fd = duplicate(slot.as_raw_fd())?;
     let mut command = Command::new(executable);
+    // The request does not carry the build disk's bus, so a plan that differs
+    // from the production attachment starts the probe form of the helper.
+    if config.build_disk_bus() == BUILD_DISK_BUS {
+        command.arg("job");
+    } else {
+        command.arg("probe-job").arg(config.build_disk_bus().name());
+    }
     command
-        .arg("job")
         .arg(serde_json::to_string(config.request())?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -591,17 +647,24 @@ mod tests {
             &[
                 Disk {
                     path: "/state/clones/job/disk.img".into(),
-                    read_only: false
+                    read_only: false,
+                    bus: DiskBus::Virtio,
                 },
                 Disk {
                     path: "/state/nonces/job.raw".into(),
-                    read_only: true
+                    read_only: true,
+                    bus: DiskBus::Virtio,
                 },
                 Disk {
                     path: "/state/clones/job/build-disk.img".into(),
-                    read_only: false
+                    read_only: false,
+                    bus: DiskBus::Usb,
                 }
             ]
+        );
+        assert_eq!(
+            plan.clone().with_build_disk_bus(DiskBus::Virtio).disks()[2].bus,
+            DiskBus::Virtio
         );
         assert_eq!(
             plan.auxiliary_storage(),
@@ -906,6 +969,35 @@ mod tests {
         assert!(helper.child.wait().unwrap().success());
         assert_eq!(helper.session.read(&mut byte).unwrap(), 0);
         drop(helper);
+        drop(slot);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_non_production_build_disk_bus_starts_the_probe_helper() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = cortexkit_test_support::scratch_root()
+            .join(format!("macvm-spawn-bus-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("helper");
+        std::fs::write(&executable, "#!/bin/bash\nprintf '%s\\n' \"$1\" \"$2\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let slot = std::fs::File::create(root.join("slot")).unwrap();
+        let request_json = serde_json::to_string(&request()).unwrap();
+        for (bus, expected) in [
+            (DiskBus::Usb, format!("job\n{request_json}\n")),
+            (DiskBus::Virtio, "probe-job\nvirtio\n".to_owned()),
+        ] {
+            let plan = JobVmConfig::new(request())
+                .unwrap()
+                .with_build_disk_bus(bus);
+            let mut helper = spawn_job_helper(&executable, &plan, &slot).unwrap();
+            let mut printed = String::new();
+            helper.reports.read_to_string(&mut printed).unwrap();
+            assert!(helper.child.wait().unwrap().success());
+            assert_eq!(printed, expected, "{bus:?}");
+        }
         drop(slot);
         std::fs::remove_dir_all(root).unwrap();
     }
