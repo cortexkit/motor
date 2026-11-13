@@ -285,7 +285,11 @@ An overlapping pressure pass skips the timer turn. Passes that evict nothing
 stay quiet; otherwise one summary records bytes freed, eviction count and free
 space before and after. Boat retains its separate reserve-file upkeep; macOS
 VM runners retain their fixed thresholds and admission-time cleanup instead
-of the timer.
+of the timer. Below 40 GiB free, that cleanup deletes idle canonical checkouts,
+then kept build disks, then the preparation caches, stopping once 40 GiB is
+free. Build folders kept from before build disks go first, then build disks
+least recently used first, with the one taking more host disk first among disks
+last used at the same moment. A checkout with a job in progress keeps its disk.
 Tests: `periodic_disk_pressure_evicts_idle_workspaces_while_a_job_runs_without_admission`,
 `periodic_disk_pressure_keeps_reclaiming_during_drain`,
 `periodic_disk_pressure_does_nothing_at_or_above_goal`,
