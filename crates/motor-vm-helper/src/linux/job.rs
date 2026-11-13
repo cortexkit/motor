@@ -127,6 +127,12 @@ pub(super) enum ExitStep {
     Launch,
     #[cfg(test)]
     Api,
+    #[cfg(test)]
+    RelayConnect,
+    #[cfg(test)]
+    RelayConnected,
+    #[cfg(test)]
+    MemoryRead,
     Stop,
     Adopt,
     Ack,
@@ -855,20 +861,25 @@ impl LinuxJobs {
                 self.status(&id)
             }
             Operation::Relay(id, port) => {
-                let cell = self.cell(&id)?;
-                self.running_view(&id)?;
-                let state = cell.0.lock();
-                let record = &state.record;
-                if self.pid(record)?.is_none() {
+                let view = self.running_view(&id)?;
+                // Socket I/O must not hold the job writer lock: exit collection
+                // needs to publish evidence even when a guest never answers.
+                if self.pid(&view.record)?.is_none() {
                     return Err(Error("job VM is not running".into()));
                 }
+                #[cfg(test)]
+                self.exit_checkpoint(ExitStep::RelayConnect)?;
+                let stream = tenant::connect_job_relay(&self.root(&id), view.record.uid, port)?;
+                #[cfg(test)]
+                self.exit_checkpoint(ExitStep::RelayConnected)?;
+                // A successful handshake is not proof the job is still running.
+                // Recheck the published view before handing the pinned fd out;
+                // an intervening exit drops the stream on the error path.
+                self.running_view(&id)
+                    .map_err(|_| Error("job VM is not running".into()))?;
                 Ok(Response {
                     reply: Reply::Relay { fd_count: 1 },
-                    fds: vec![tenant::connect_job_relay(
-                        &self.root(&id),
-                        record.uid,
-                        port,
-                    )?],
+                    fds: vec![stream],
                 })
             }
             Operation::Exits => {

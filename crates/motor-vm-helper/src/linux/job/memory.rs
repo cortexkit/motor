@@ -71,21 +71,23 @@ impl LinuxJobs {
     }
 
     pub(super) fn memory(&self, id: &str) -> Result<Response> {
-        self.running_view(id)?;
-        let cell = self.cell(id)?;
-        let state = cell.0.lock();
-        let record = &state.record;
+        let view = self.running_view(id)?;
+        // The published snapshot needs no writer lock during procfs I/O.
+        // The pinned process's alive checks reject an exit during the read.
+        let record = &view.record;
         let process = self.memory_process(record)?;
+        #[cfg(test)]
+        self.exit_checkpoint(ExitStep::MemoryRead)?;
         let resident_bytes = guest_resident_bytes(&process.smaps()?, record.start.memory_mib)?;
         process.alive()?;
         Ok(Response::new(Reply::JobMemory { resident_bytes }))
     }
 
     pub(super) fn balloon(&self, id: &str, amount_mib: u64) -> Result<Response> {
-        self.running_view(id)?;
-        let cell = self.cell(id)?;
-        let state = cell.0.lock();
-        let record = &state.record;
+        let view = self.running_view(id)?;
+        // A silent API peer must not prevent stop or collection from taking
+        // the job lock. The pidfd stays pinned through the final alive check.
+        let record = &view.record;
         if amount_mib > record.start.memory_mib {
             return Err(Error("balloon target exceeds guest RAM".into()));
         }
