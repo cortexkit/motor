@@ -1800,7 +1800,11 @@ async fn stored_stated_memory_survives_restart_and_request_changes() {
         let h = Harness::new(Behavior::Normal).await;
         // Refuse at placement so this test exercises only the persisted lease
         // identity, without starting a job.
-        h.broker.lock().unwrap().knobs.max_vcpus = Some(1);
+        {
+            let mut broker = h.broker.lock().unwrap();
+            broker.knobs.max_vcpus = Some(1);
+            broker.knobs.max_mem_mib = Some(100_352);
+        }
         let scratch = Scratch::new();
         let id = Uuid::now_v7();
         let mut request = Harness::request(&scratch.0);
@@ -1828,7 +1832,7 @@ async fn stored_stated_memory_survives_restart_and_request_changes() {
         let route = storage.job(id).unwrap().hosted.unwrap();
         assert_eq!(
             Client::new(route).run(id, &request, &storage).await.err(),
-            Some(Error::NoHostFits(Some(1)))
+            Some(Error::NoHostFits(Some(1), Some(100_352)))
         );
         let bodies = h.lease_bodies.lock().unwrap();
         assert_eq!(bodies.len(), 1);
