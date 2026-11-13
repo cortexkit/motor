@@ -118,6 +118,15 @@ the checkout copies its own final binaries back into the target folder. The
 opt-in fixed path in 3.9 gives a repository's worktrees the same Cargo path
 without sharing a writable checkout or build folder.
 
+Build-folder cleanup understands Cargo v1 (including 1.99) and v2 (1.100).
+On v1 it reads dep-info in `<profile>/deps/`; on v2 it reads
+`<profile>/build/<package>/<hash>/out/`. A folder is removed as foreign only
+when dep-info proves it belongs to neither the checkout nor its siblings;
+unknown or unreadable evidence keeps it. The legacy one-time migration leaves
+v2 and mixed-layout profiles intact. The stale-unit sweep keeps each v2 hash
+directory indivisible, including fingerprints and build-script state. See
+[compile-cache.md](compile-cache.md#fixed-paths-and-local-build-bases) for tests.
+
 A build script that runs a nested Cargo in the same workspace inherits this
 variable. `--target-dir` does not move a build folder that
 `CARGO_BUILD_BUILD_DIR` sets, so the nested Cargo uses the outer build's
@@ -486,6 +495,11 @@ changed ones get the time step's start time. A kept folder is never time-set.
 Jobs with siblings are not seeded. Publication, the six-hour refresh bound,
 compatibility checks and recovery are described with their tests in
 [compile-cache.md](compile-cache.md#fixed-paths-and-local-build-bases).
+The content-based time step leaves Cargo outputs untouched on both v1 and v2.
+Compatibility uses the runner compiler when no toolchain selector exists, or
+the exact release from one snapshot selector. Floating, partial, path-based or
+ambiguous selectors disable reuse and publication rather than risk seeding
+across toolchains or layouts.
 Tests: `isolated_seed_base_is_warm_and_copy_on_write`,
 `isolated_seed_old_dated_change_rebuilds_changed_crate_and_dependents_once`,
 `isolated_seed_kept_folder_edit_and_revert_each_rebuild`

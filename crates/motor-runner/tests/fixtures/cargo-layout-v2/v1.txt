@@ -1,0 +1,28 @@
+debug/.cargo-build-lock
+debug/.fingerprint/layout-app-3a6bf1534f17adfe/lib-layout_app
+debug/.fingerprint/layout-app-b276795ee767e5c0/invoked.timestamp
+debug/.fingerprint/layout-app-b276795ee767e5c0/test-lib-layout_app
+debug/.fingerprint/layout-dep-040436316614ca23/build-script-build-script-build
+debug/.fingerprint/layout-dep-fa38dfb7043165d3/run-build-script-build-script-build
+debug/.fingerprint/layout-mac-1cda89f657f0a4b6/lib-layout_mac
+debug/build/layout-dep-040436316614ca23/build-script-build
+debug/build/layout-dep-040436316614ca23/build_script_build-040436316614ca23.d
+  dep-info: <ROOT>/target/bd/ab/0123456789abcd/debug/build/layout-dep-040436316614ca23/build_script_build-040436316614ca23.d: dep/build.rs
+debug/build/layout-dep-fa38dfb7043165d3/out/
+debug/build/layout-dep-fa38dfb7043165d3/invoked.timestamp
+debug/build/layout-dep-fa38dfb7043165d3/output
+debug/build/layout-dep-fa38dfb7043165d3/root-output
+debug/build/layout-dep-fa38dfb7043165d3/stderr
+debug/deps/layout_app-3a6bf1534f17adfe.d
+  dep-info: <ROOT>/target/bd/ab/0123456789abcd/debug/deps/layout_app-3a6bf1534f17adfe.d: app/src/lib.rs
+debug/deps/layout_app-b276795ee767e5c0
+debug/deps/layout_app-b276795ee767e5c0.d
+  dep-info: <ROOT>/target/bd/ab/0123456789abcd/debug/deps/layout_app-b276795ee767e5c0.d: app/src/lib.rs
+debug/deps/layout_dep-bfba641ef5327106.d
+  dep-info: <ROOT>/target/bd/ab/0123456789abcd/debug/deps/layout_dep-bfba641ef5327106.d: dep/src/lib.rs
+debug/deps/liblayout_app-3a6bf1534f17adfe.rlib
+debug/deps/liblayout_app-3a6bf1534f17adfe.rmeta
+debug/deps/liblayout_dep-bfba641ef5327106.rlib
+debug/deps/liblayout_mac-1cda89f657f0a4b6.so
+debug/deps/layout_mac-1cda89f657f0a4b6.d
+  dep-info: <ROOT>/target/bd/ab/0123456789abcd/debug/deps/layout_mac-1cda89f657f0a4b6.d: mac/src/lib.rs

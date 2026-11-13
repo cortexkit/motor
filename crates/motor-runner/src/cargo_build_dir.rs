@@ -118,8 +118,40 @@ fn profiles(root: &File) -> io::Result<Vec<(PathBuf, File)>> {
 }
 
 fn is_profile(directory: &File) -> io::Result<bool> {
+    Ok(is_legacy_profile(directory)? || self::directory(directory, OsStr::new("build"))?.is_some())
+}
+
+fn is_legacy_profile(directory: &File) -> io::Result<bool> {
     Ok(self::directory(directory, OsStr::new("deps"))?.is_some()
         || self::directory(directory, OsStr::new(".fingerprint"))?.is_some())
+}
+
+/// Cargo v2 puts each build step under build/<package>/<hash>. Do not walk
+/// arbitrary depths or follow links in this job-controlled tree. An unreadable
+/// entry prevents maintenance from proving the containing folder foreign.
+fn v2_units(profile: &File) -> io::Result<Vec<File>> {
+    let mut units = Vec::new();
+    let Some(build) = directory(profile, OsStr::new("build"))? else {
+        return Ok(units);
+    };
+    for package in names(&build)? {
+        let Some(package_dir) = directory(&build, &package)? else {
+            if file(&build, &package, libc::O_RDONLY)?.is_some() {
+                continue;
+            }
+            return Err(io::Error::other("unknown Cargo build package"));
+        };
+        for hash in names(&package_dir)?
+            .into_iter()
+            .filter(|name| hex(name, 16))
+        {
+            units.push(
+                directory(&package_dir, &hash)?
+                    .ok_or_else(|| io::Error::other("unknown Cargo build unit"))?,
+            );
+        }
+    }
+    Ok(units)
 }
 
 fn remove(
@@ -151,6 +183,12 @@ fn maintain(
         // Cargo stops using these intermediates after the layout switch.
         // Leaving them behind would roughly double each warm target's disk use.
         for (profile, dir) in profiles(&root)? {
+            // This migration predates Cargo's v2 layout. A v2-only profile, or
+            // one with both layouts after a toolchain change, is live data, not
+            // the old shared intermediates the marker authorizes removing.
+            if !is_legacy_profile(&dir)? || !v2_units(&dir)?.is_empty() {
+                continue;
+            }
             // Leave a profile sentinel until last so partial deletions remain
             // discoverable when the migration retries after an error.
             for name in ["build", "incremental", "deps", ".fingerprint"] {
@@ -228,33 +266,43 @@ fn dependency(folder: &File, roots: &[&Path]) -> io::Result<Dependency> {
     let mut dependency = Dependency::Unidentified;
     let mut unknown = false;
     for (_, profile) in profiles(folder)? {
-        let Some(deps) = directory(&profile, OsStr::new("deps"))? else {
-            continue;
-        };
-        for name in names(&deps)?
-            .into_iter()
-            .filter(|name| Path::new(name).extension() == Some(OsStr::new("d")))
-        {
-            let Ok(Some(file)) = file(&deps, &name, libc::O_RDONLY) else {
-                unknown = true;
-                continue;
-            };
-            let mut bytes = Vec::new();
-            if file.take(64 * 1024).read_to_end(&mut bytes).is_err() {
-                unknown = true;
-                continue;
-            }
-            if bytes.len() == 64 * 1024 {
-                unknown = true;
-                continue;
-            }
-            if let Some(path) = dependency_path(&bytes) {
-                if path.is_relative() || roots.iter().any(|root| path.starts_with(root)) {
-                    return Ok(Dependency::Checkout);
-                }
-                dependency = Dependency::Foreign;
+        let mut dep_dirs = Vec::new();
+        if let Some(deps) = directory(&profile, OsStr::new("deps"))? {
+            dep_dirs.push(deps);
+        }
+        for unit in v2_units(&profile)? {
+            if let Some(out) = directory(&unit, OsStr::new("out"))? {
+                dep_dirs.push(out);
             } else {
                 unknown = true;
+            }
+        }
+        for deps in dep_dirs {
+            for name in names(&deps)?
+                .into_iter()
+                .filter(|name| Path::new(name).extension() == Some(OsStr::new("d")))
+            {
+                let Ok(Some(file)) = file(&deps, &name, libc::O_RDONLY) else {
+                    unknown = true;
+                    continue;
+                };
+                let mut bytes = Vec::new();
+                if file.take(64 * 1024).read_to_end(&mut bytes).is_err() {
+                    unknown = true;
+                    continue;
+                }
+                if bytes.len() == 64 * 1024 {
+                    unknown = true;
+                    continue;
+                }
+                if let Some(path) = dependency_path(&bytes) {
+                    if path.is_relative() || roots.iter().any(|root| path.starts_with(root)) {
+                        return Ok(Dependency::Checkout);
+                    }
+                    dependency = Dependency::Foreign;
+                } else {
+                    unknown = true;
+                }
             }
         }
     }

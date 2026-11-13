@@ -35,10 +35,8 @@ fn real_cargo_relative_dep_info_keeps_own_warm_build_directory() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    let deps = build.join("debug/deps");
-    let dep_info = fs::read_dir(&deps)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let dep_info = crate::cargo_gc::fixture::files(&build)
+        .into_iter()
         .find(|path| path.extension() == Some(OsStr::new("d")))
         .unwrap();
     let bytes = fs::read(&dep_info).unwrap();
@@ -349,4 +347,120 @@ fn unreadable_or_unknown_dep_info_prevents_foreign_classification() {
     assert!(malformed.is_dir());
     assert!(oversized.is_dir());
     assert!(outside.is_file());
+}
+
+#[test]
+fn captured_layouts_keep_live_checkouts_and_remove_only_proven_foreign() {
+    use crate::cargo_gc::fixture::{files, materialize, V1, V2};
+    let scratch = ScratchDir::new("cargo-captured-ownership");
+    let target = scratch.join("target");
+    let checkout = scratch.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    for (index, tree) in [V1, V2].into_iter().enumerate() {
+        for (case, source) in [
+            ("relative", None),
+            ("live", Some(checkout.join("app/src/lib.rs"))),
+            ("foreign", Some(scratch.join("removed-checkout/src/lib.rs"))),
+            ("mixed", Some(scratch.join("registry/src/lib.rs"))),
+            ("unknown", Some(scratch.join("removed-checkout/src/lib.rs"))),
+            ("linked", Some(scratch.join("removed-checkout/src/lib.rs"))),
+        ] {
+            let build = target.join(format!(
+                "bd/ab/{:014x}",
+                index * 16
+                    + match case {
+                        "relative" => 1,
+                        "live" => 2,
+                        "foreign" => 3,
+                        "mixed" => 4,
+                        "unknown" => 5,
+                        _ => 6,
+                    }
+            ));
+            materialize(&build, tree);
+            let deps: Vec<_> = files(&build)
+                .into_iter()
+                .filter(|p| {
+                    p.extension() == Some(OsStr::new("d"))
+                        && (index != 0 || p.components().any(|c| c.as_os_str() == "deps"))
+                })
+                .collect();
+            if let Some(source) = source {
+                for dep in &deps {
+                    fs::write(dep, format!("out: {}\n", source.display())).unwrap();
+                }
+            }
+            if case == "mixed" {
+                fs::write(deps.last().unwrap(), "out: app/src/lib.rs\n").unwrap();
+            } else if case == "unknown" {
+                fs::write(&deps[0], "not dep-info").unwrap();
+            } else if case == "linked" {
+                fs::remove_file(&deps[0]).unwrap();
+                symlink(checkout.join("missing.d"), &deps[0]).unwrap();
+            }
+            run(&target, &[&checkout]);
+            assert_eq!(build.exists(), case != "foreign", "layout {index}, {case}");
+        }
+    }
+}
+
+#[test]
+fn migration_keeps_v2_live_data_even_with_legacy_profile_sentinels() {
+    let scratch = ScratchDir::new("cargo-v2-migration");
+    let target = scratch.join("target");
+    for profile in ["debug", "custom", "x86_64-unknown-linux-gnu/release"] {
+        let unit = target
+            .join(profile)
+            .join("build/layout-app/210fc4115dcd38ca/out");
+        fs::create_dir_all(&unit).unwrap();
+        fs::write(unit.join("live.d"), "out: /checkout/src/lib.rs\n").unwrap();
+        if profile != "debug" {
+            fs::create_dir_all(target.join(profile).join("deps")).unwrap();
+        }
+    }
+    run(&target, &[Path::new("/checkout")]);
+    for profile in ["debug", "custom", "x86_64-unknown-linux-gnu/release"] {
+        assert!(
+            target
+                .join(profile)
+                .join("build/layout-app/210fc4115dcd38ca/out/live.d")
+                .is_file(),
+            "{profile}"
+        );
+    }
+    assert!(target.join(MARKER).is_file());
+}
+
+#[test]
+fn v2_unknown_dep_info_and_linked_units_cannot_prove_live_folder_foreign() {
+    let scratch = ScratchDir::new("cargo-v2-unknown-ownership");
+    let outside = scratch.join("checkout");
+    fs::create_dir_all(outside.join("out")).unwrap();
+    fs::write(outside.join("out/own.d"), "out: /checkout/src/lib.rs\n").unwrap();
+    for case in ["oversized", "linked-unit", "linked-out", "missing-out"] {
+        let target = scratch.join(case);
+        let build = target.join("bd/ab/00000000000001");
+        let unit = build.join("debug/build/local/0123456789abcdef");
+        fs::create_dir_all(&unit).unwrap();
+        let foreign = build.join("debug/build/registry/fedcba9876543210/out");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("registry.d"), "out: /registry/src/lib.rs\n").unwrap();
+        match case {
+            "oversized" => {
+                fs::create_dir_all(unit.join("out")).unwrap();
+                fs::write(unit.join("out/own.d"), vec![b'x'; 64 * 1024]).unwrap();
+            }
+            "linked-unit" => {
+                fs::remove_dir(&unit).unwrap();
+                symlink(&outside, &unit).unwrap();
+            }
+            "linked-out" => symlink(outside.join("out"), unit.join("out")).unwrap(),
+            _ => {}
+        }
+        // A malformed layout may abort maintenance altogether; neither that
+        // nor unknown dep-info is permission to remove the containing folder.
+        let _ = maintain(&target, &[Path::new("/checkout")], |_| Ok(()));
+        assert!(build.exists(), "{case}");
+        assert!(outside.join("out/own.d").is_file());
+    }
 }

@@ -592,6 +592,26 @@ legacy caller roots. Tests:
 remain byte-identical: `job_unit_commands_match_the_pinned_argv`
 (`crates/motor-runner/src/isolation/command_golden_tests.rs`).
 
+Build-folder upkeep handles Cargo's v1 layout (including 1.99) and v2 layout
+(1.100): rustc dep-info lives in `<profile>/deps/*.d` on v1 and
+`<profile>/build/<package>/<hash>/out/*.d` on v2. A checkout-relative source or
+a source under a live checkout/sibling root keeps the folder; only positively
+foreign dep-info permits removal. Unknown, unreadable or oversized dep-info
+does not prove a folder foreign. The one-time legacy migration skips v2 and
+mixed-layout profiles. The 48-hour stale-unit sweep also visits the runner's
+`bd/<2 hex>/<14 hex>/` roots. On v2 it treats each hash directory's outputs,
+fingerprints and build-script state as one unit; a recent member retains the
+whole unit, while unknown names and symlinks are not candidates. Empty
+directories use modification time rather than access time, so maintenance's
+own directory reads cannot keep an otherwise-stale unit warm. Tests:
+`captured_layouts_keep_live_checkouts_and_remove_only_proven_foreign`,
+`migration_keeps_v2_live_data_even_with_legacy_profile_sentinels`
+(`crates/motor-runner/src/cargo_build_dir_tests.rs`),
+`captured_v2_units_are_indivisible_and_recent_members_keep_live_outputs`,
+`captured_layouts_are_swept_inside_only_physical_workspace_hash_roots`,
+`v2_empty_out_stays_stale_across_both_deletion_scans`
+(`crates/motor-runner/src/cargo_gc.rs`).
+
 ### Store and publication
 
 The store is `<state_dir>/build-bases/<repo-key>/`, independent of which
@@ -668,9 +688,22 @@ incompatible base leaves the job to build normally. Tests:
 `isolated_seed_ignored_watched_file_and_clean_keep_next_job_unseeded`
 (`crates/motor-runner/src/tests/isolated_seed.rs`).
 
-Toolchain identity covers the runner's `rustc -vV`, the snapshot's root
-`rust-toolchain` and `rust-toolchain.toml` blob ids (including absence), and
-runner-provided wrapper inputs. The environment fingerprint covers effective
+Toolchain identity covers the snapshot's root `rust-toolchain` and
+`rust-toolchain.toml` blob ids (including absence) and runner-provided wrapper
+inputs. With neither selector, the compiler identity is the runner's
+`rustc -vV`. With one selector, it must name an exact `MAJOR.MINOR.PATCH`
+release: `[toolchain] channel = "1.100.0"` in TOML or only `1.100.0` in the
+legacy plain file. The exact selected release is recorded instead of the
+runner-default compiler, so toolchain/layout changes cannot reuse the same
+base identity. Floating channels, partial versions, dated/custom toolchains,
+`path` selectors, both files present, and unparseable or oversized selectors
+disable both seeding and publication, not jobs. Selectors are read from the
+verified snapshot, never by executing a compiler in an untrusted checkout.
+Tests: `exact_selector_release_identifies_compiler_independently_of_runner_default`,
+`floating_ambiguous_and_unreadable_selectors_disable_reuse_and_publication`
+(`crates/motor-runner/src/build_base.rs`).
+
+The environment fingerprint covers effective
 `CARGO_*`, `RUSTFLAGS`, `RUSTDOCFLAGS` and `RUSTC_WRAPPER`, excluding
 `CARGO_BUILD_JOBS` and `CARGO_INCREMENTAL`. Absent and empty variables differ;
 the encoding preserves variable names and values. Concurrency changes alone
@@ -710,6 +743,11 @@ deletion even when no remaining file is newer. Tests:
 `isolated_seed_deleted_file_rebuilds_changed_crate_and_dependents_once`,
 `isolated_seed_deleted_watched_file_in_reused_workspace_reruns_script_once`
 (`crates/motor-runner/src/tests/isolated_seed.rs`).
+
+This step is independent of Cargo's v1/v2 output layout: it stamps Git-tracked
+sources, not Cargo fingerprints or dep-info. The cloned `target/` tree is never
+time-set. Test: `seed_time_step_stamps_sources_and_leaves_both_cargo_layouts_untouched`
+(`crates/motor-runner/src/build_base.rs`).
 
 The Cargo reuse guarantee is limited to the units the fill warmed. At the base
 tree, the tested warm command compiles no local crate on the first seeded
