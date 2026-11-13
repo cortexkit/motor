@@ -76,11 +76,11 @@ fn api_socket_refuses_symlinks_and_wrong_owner_and_patches_only_the_pinned_socke
     let root = scratch.path();
     let listener = UnixListener::bind(root.join("real.sock")).unwrap();
     symlink("real.sock", root.join("api.sock")).unwrap();
-    assert!(api_socket(root, unsafe { libc::geteuid() }).is_err());
+    assert!(api_socket(root, unsafe { libc::geteuid() }, deadline()).is_err());
     std::fs::remove_file(root.join("api.sock")).unwrap();
     std::fs::rename(root.join("real.sock"), root.join("api.sock")).unwrap();
-    assert!(api_socket(root, unsafe { libc::geteuid() } + 1).is_err());
-    let mut stream = api_socket(root, unsafe { libc::geteuid() }).unwrap();
+    assert!(api_socket(root, unsafe { libc::geteuid() } + 1, deadline()).is_err());
+    let mut stream = api_socket(root, unsafe { libc::geteuid() }, deadline()).unwrap();
     std::fs::rename(root.join("api.sock"), root.join("old.sock")).unwrap();
     let replacement = UnixListener::bind(root.join("api.sock")).unwrap();
     replacement.set_nonblocking(true).unwrap();
@@ -111,7 +111,11 @@ fn api_socket_refuses_symlinks_and_wrong_owner_and_patches_only_the_pinned_socke
             .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
             .unwrap();
     });
-    patch_balloon(&mut stream, 37).unwrap();
+    patch_balloon(&mut stream, 37, deadline()).unwrap();
     server.join().unwrap();
     assert!(replacement.accept().is_err());
+}
+
+fn deadline() -> std::time::Instant {
+    std::time::Instant::now() + API_DEADLINE
 }

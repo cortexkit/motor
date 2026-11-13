@@ -357,6 +357,38 @@ fn paused_memory_and_silent_balloon_allow_same_job_stop_to_publish_exit() {
 }
 
 #[test]
+fn balloon_connect_to_a_full_api_backlog_fails_within_its_deadline() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::{mpsc, Arc};
+    let vmm = Vmm::new();
+    let jobs = Arc::new(running_fixture(&vmm));
+    let root = jobs.root(&start().job_id);
+    std::fs::create_dir_all(&root).unwrap();
+    let listener = bind_socket(&root, "api.sock");
+    // A VMM that stopped accepting: its one-slot backlog is already full.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let directory = File::open(&root).unwrap();
+    let queued = UnixStream::connect(format!(
+        "/proc/self/fd/{}/api.sock",
+        directory.as_raw_fd()
+    ))
+    .unwrap();
+    let ballooning = jobs.clone();
+    let (sent, reply) = mpsc::channel();
+    let balloon = std::thread::spawn(move || {
+        sent.send(ballooning.handle(Operation::Balloon(start().job_id, 0), peer()))
+            .unwrap();
+    });
+    let result = reply.recv_timeout(Duration::from_secs(5));
+    // Closing the listener also ends a connect that has no deadline.
+    drop((listener, queued));
+    balloon.join().unwrap();
+    assert!(result
+        .expect("balloon connect waited without a deadline")
+        .is_err());
+}
+
+#[test]
 fn relay_memory_and_balloon_refuse_exited_and_released_views_before_io() {
     use super::super::registry::State;
     for state in [State::Exited, State::Released] {
