@@ -1252,14 +1252,15 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
         tracing::info!(jti = %job, reason = "disk_exists", "workspace_seed_not_needed; checkout disk already exists and keeps its own warm build");
         return;
     }
-    let seeded = (|| -> Result<bool> {
+    let started = std::time::Instant::now();
+    let seeded = (|| -> Result<Option<String>> {
         let plan = runtime
             .host
             .lock()
             .expect("host lock")
             .job_seed_plan(job, &crate::jobs::fill_source::repository_key(root))?;
         let Some(plan) = plan else {
-            return Ok(false);
+            return Ok(None);
         };
         runtime.control.seed_workspace(&plan.request)?;
         runtime
@@ -1267,11 +1268,18 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
             .lock()
             .expect("host lock")
             .job_seeded(job, &plan, unix_ms())?;
-        Ok(true)
+        Ok(Some(plan.request.base_id.clone()))
     })();
     match seeded {
-        Ok(true) => {}
-        Ok(false) => tracing::info!(jti = %job, "workspace_base_missing; using empty workspace"),
+        // The one host-side record that a new checkout started from a
+        // trusted base rather than empty.
+        Ok(Some(base_id)) => tracing::info!(
+            jti = %job,
+            base_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "workspace_seeded_from_base"
+        ),
+        Ok(None) => tracing::info!(jti = %job, "workspace_base_missing; using empty workspace"),
         Err(error) => {
             tracing::warn!(jti = %job, %error, "workspace_base_seed_failed; ensuring workspace without seed")
         }
