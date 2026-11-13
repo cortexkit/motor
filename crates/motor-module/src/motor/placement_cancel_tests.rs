@@ -139,14 +139,14 @@ async fn cancel_after_grant(replacement_retry: bool) {
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
     until("replacement retry with a booked lease", || {
-        logs.text().contains(if replacement_retry {
-            "hosted broker retry wait"
-        } else {
-            "hosted host full; waiting to ask again"
-        })
+        logs.text().contains("hosted broker retry wait")
     })
     .await;
     assert!(motor.hosted_state(id).unwrap().placement.is_some());
+    assert_eq!(
+        h.requests.lock().unwrap().as_slice(),
+        ["/v1/leases", &format!("/v1/leases/{id}/replace")]
+    );
     motor.cancel(CancelRequest::new(id)).await.unwrap();
     assert_cancelled(&motor, &h, id, stream).await;
     motor.close().await;

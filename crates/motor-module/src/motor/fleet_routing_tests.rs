@@ -633,12 +633,21 @@ async fn fleet_unknown_boat_booking_is_finished_without_run_or_reattach() {
 #[tokio::test]
 async fn fleet_capacity_waits_do_not_exhaust_three_placements() {
     let h = Harness::new(Behavior::CompleteRun).await;
-    h.host_refusals.lock().unwrap().extend(["host_full"; 4]);
+    let next = Harness::with_host(Behavior::CompleteRun, "replacement-host").await;
+    h.host_refusals.lock().unwrap().push_back("host_full");
     h.lease_replies.lock().unwrap().push_back((
         503,
         serde_json::json!({"error":"no_capacity"}),
         "0",
     ));
+    h.replace_replies
+        .lock()
+        .unwrap()
+        .extend((0..4).map(|_| (503, serde_json::json!({"error":"no_capacity"}), "0")));
+    h.replacement_hosts
+        .lock()
+        .unwrap()
+        .push_back(next.broker.clone());
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
@@ -647,13 +656,33 @@ async fn fleet_capacity_waits_do_not_exhaust_three_placements() {
     let (_, terminal) = records(stream).await;
     assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
     let bodies = lease_bodies(&h);
-    assert_eq!(bodies.len(), 6);
+    assert_eq!(
+        bodies.len(),
+        2,
+        "no lease re-request after replacement begins"
+    );
     assert!(bodies
         .iter()
         .all(|body| body["job_id"] == id.to_string() && body["allow_spill"] == true));
-    assert_eq!(motor.hosted_state(id).unwrap().placement_attempts, 1);
-    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
-    assert_eq!(h.tokens.load(Ordering::SeqCst), 5);
+    assert_eq!(bodies[0], bodies[1]);
+    let replace_answers = h.replace_answers.lock().unwrap();
+    assert_eq!(
+        replace_answers
+            .iter()
+            .map(|(_, status, _)| *status)
+            .collect::<Vec<_>>(),
+        [503, 503, 503, 503, 201]
+    );
+    assert!(replace_answers
+        .iter()
+        .all(|(job, _, _)| job == &id.to_string()));
+    let state = motor.hosted_state(id).unwrap();
+    assert_eq!(state.placement_attempts, 1);
+    assert_eq!(state.placement.unwrap().host, "replacement-host");
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(next.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(next.tokens.load(Ordering::SeqCst), 1);
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }
 
