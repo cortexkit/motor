@@ -13,12 +13,25 @@ pub(in crate::linux::job) struct State {
     fail_install: bool,
     namespaces: BTreeSet<String>,
     fail_namespace_remove: bool,
+    egress_command: Option<PathBuf>,
 }
 
-#[derive(Clone, Default)]
-pub(in crate::linux::job) struct Fake(Arc<Mutex<State>>);
+#[derive(Clone)]
+pub(in crate::linux::job) struct Fake(Arc<Mutex<State>>, Arc<cortexkit_test_support::ScratchDir>);
+
+impl Default for Fake {
+    fn default() -> Self {
+        Self(
+            Arc::default(),
+            Arc::new(cortexkit_test_support::ScratchDir::new("job-network-lock")),
+        )
+    }
+}
 
 impl Access for Fake {
+    fn lock(&self) -> Result<tenant_network::lock::Guard> {
+        tenant_network::lock::acquire_at(&self.1.join("network"), unsafe { libc::geteuid() })
+    }
     fn tenants(&self) -> Result<Vec<Tap>> {
         Ok(self.0.lock().unwrap().tenants.clone())
     }
@@ -61,9 +74,15 @@ impl Access for Fake {
     fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>> {
         let mut state = self.0.lock().unwrap();
         state.events.push(format!("read:{}", tap.tap_index));
+        if let Some(command) = &state.egress_command {
+            return tenant_network::optional_egress_bytes_with_command(
+                tap,
+                &mut Command::new(command),
+            );
+        }
         Ok(state.bytes.get(&tap.tap_index).copied())
     }
-    fn remove(&mut self, _id: &str, tap: &Tap) -> Result<()> {
+    fn remove(&mut self, _id: &str, tap: &Tap, _lock: &tenant_network::lock::Guard) -> Result<()> {
         let mut state = self.0.lock().unwrap();
         if let Some(path) = &state.record_path {
             let record: Record = serde_json::from_slice(&std::fs::read(path)?).unwrap();
@@ -281,6 +300,85 @@ fn missing_counter_records_absent_egress_once_and_releases_network_without_retry
     ));
     jobs.collect_exits().unwrap();
     assert_eq!(fake.0.lock().unwrap().events, ["read:17", "remove:17"]);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn timed_out_egress_publishes_unmeasured_report_once_and_replays_after_restart() {
+    let (base, mut jobs, fake) = fixture();
+    let stalled = tenant_network::counter_tests::StalledCounter::new(&base);
+    fake.0.lock().unwrap().egress_command = Some(stalled.command.clone());
+    let started = std::time::Instant::now();
+    jobs.maintain().unwrap();
+    assert!(started.elapsed() < Duration::from_millis(2500));
+    let saved = persisted(&jobs);
+    let report = saved.pending_exit().unwrap();
+    assert_eq!(report.oom_kill, 3);
+    assert_eq!(report.egress_bytes, None);
+    assert_eq!(saved.egress_bytes, None);
+    assert_eq!(saved.tap_index, None);
+    assert!(serde_json::to_value(&report)
+        .unwrap()
+        .get("egress_bytes")
+        .is_none());
+    let poll = |jobs: &mut LinuxJobs| match jobs
+        .handle(
+            Operation::Exits,
+            Peer {
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+            },
+        )
+        .unwrap()
+        .reply
+    {
+        Reply::JobExits { exits } => exits,
+        other => panic!("unexpected reply: {other:?}"),
+    };
+    assert_eq!(poll(&mut jobs), std::slice::from_ref(&report));
+    assert_eq!(poll(&mut jobs), std::slice::from_ref(&report));
+    assert_eq!(
+        jobs.collection_logs,
+        [format!(
+            "job {} exit evidence MissingEgress: counter missing; egress unmeasured",
+            start().job_id
+        )]
+    );
+    drop(jobs);
+    let mut restarted = machine(&base);
+    restarted.network = Box::new(fake.clone());
+    restarted.adopt_record(persisted(&restarted)).unwrap();
+    assert_eq!(poll(&mut restarted), [report]);
+    assert_eq!(persisted(&restarted).egress_bytes, None);
+    assert!(restarted.collection_logs.is_empty());
+    assert_eq!(fake.0.lock().unwrap().events, ["read:17", "remove:17"]);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn network_release_holds_lock_until_tap_clear_is_durable() {
+    use std::os::fd::AsRawFd;
+    let (base, mut jobs, fake) = fixture();
+    let path = jobs.records_path.join(format!("{}.json", start().job_id));
+    let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let check_flag = checked.clone();
+    jobs.tap_release_check = Some(Box::new(move || {
+        let saved: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.tap_index, None);
+        let other = File::open(fake.1.join("network/lock")).unwrap();
+        assert_ne!(
+            unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "network lock dropped before the durable TAP release"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        check_flag.store(true, Ordering::SeqCst);
+    }));
+    jobs.collect_exits().unwrap();
+    assert!(checked.load(Ordering::SeqCst));
     std::fs::remove_dir_all(base).unwrap();
 }
 

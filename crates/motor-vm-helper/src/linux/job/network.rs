@@ -2,6 +2,7 @@ use super::*;
 use crate::linux::tenant_network::{self, Tap};
 
 pub(super) trait Access: Send {
+    fn lock(&self) -> Result<tenant_network::lock::Guard>;
     fn tenants(&self) -> Result<Vec<Tap>>;
     fn install(&mut self, taps: &[Tap]) -> Result<()>;
     fn create_namespace(&mut self, id: &str) -> Result<PathBuf>;
@@ -9,17 +10,19 @@ pub(super) trait Access: Send {
     fn remove_namespace(&mut self, id: &str) -> Result<()>;
     fn ensure(&mut self, id: &str, tap: &Tap) -> Result<()>;
     fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>>;
-    fn remove(&mut self, id: &str, tap: &Tap) -> Result<()>;
+    fn remove(&mut self, id: &str, tap: &Tap, lock: &tenant_network::lock::Guard) -> Result<()>;
 }
 
 pub(super) struct System(pub Config);
 
 impl Access for System {
+    fn lock(&self) -> Result<tenant_network::lock::Guard> {
+        tenant_network::lock::acquire()
+    }
     fn tenants(&self) -> Result<Vec<Tap>> {
         tenant_taps(Path::new(crate::tenant::REGISTRY))
     }
     fn install(&mut self, taps: &[Tap]) -> Result<()> {
-        tenant_network::validate_taps(taps)?;
         tenant_network::install_taps(taps, &self.0)?.require_ready()
     }
     fn create_namespace(&mut self, id: &str) -> Result<PathBuf> {
@@ -37,9 +40,9 @@ impl Access for System {
     fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>> {
         tenant_network::optional_egress_bytes(tap)
     }
-    fn remove(&mut self, id: &str, tap: &Tap) -> Result<()> {
+    fn remove(&mut self, id: &str, tap: &Tap, lock: &tenant_network::lock::Guard) -> Result<()> {
         namespace::disconnect(id, tap)?;
-        tenant_network::remove_allocated(tap)?;
+        tenant_network::remove_allocated_locked(tap, lock)?;
         // The host owns the NAT mapping; the job namespace tracks forwarding
         // too. Retire both before the durable allocation can be reused.
         super::conntrack::flush(tap.tap_index)

@@ -4,8 +4,14 @@ use std::{
     process::{Command, Stdio},
 };
 
-mod lock;
+mod counter;
+pub(super) mod lock;
 mod ufw;
+
+#[cfg(test)]
+pub(super) mod counter_tests;
+#[cfg(test)]
+mod locking_tests;
 
 /// Network identity shared by tenant registrations and durable job allocations.
 #[derive(Debug, Clone, Copy)]
@@ -537,12 +543,32 @@ pub fn install(
 }
 
 pub(super) fn fence(registries: &[crate::tenant::Registry]) -> Result<()> {
-    let allocations = super::job::network_allocations();
+    with_job_taps(
+        lock::acquire,
+        super::job::network_allocations,
+        |allocations| fence_allocations(registries, allocations),
+    )
+}
+
+// Read durable allocations only while holding the render lock. Otherwise a
+// render waiting behind a TAP release could restore the released TAP's rules.
+fn with_job_taps<T>(
+    acquire: impl FnOnce() -> Result<lock::Guard>,
+    list: impl FnOnce() -> Result<Vec<Tap>>,
+    render: impl FnOnce(Result<Vec<Tap>>) -> Result<T>,
+) -> Result<T> {
+    let _lock = acquire()?;
+    render(list())
+}
+
+fn fence_allocations(
+    registries: &[crate::tenant::Registry],
+    allocations: Result<Vec<Tap>>,
+) -> Result<()> {
     let mut registries: Vec<_> = registries.iter().map(Tap::from).collect();
     if let Ok(taps) = &allocations {
         registries.extend(taps);
     }
-    let _lock = lock::acquire()?;
     let tables = nft_json(&["-j", "list", "tables"])?;
     let existing = nft_table(&tables, "motor_tenant")?;
     fence_tenant_gates(&registries, existing.as_ref(), apply)?;
@@ -618,14 +644,8 @@ pub(crate) fn install_startup(
     registries: &[crate::tenant::Registry],
     config: &crate::config::Config,
 ) -> Result<NetworkReadiness> {
-    install_taps(&combined_taps(registries)?, config)
-}
-
-fn combined_taps(registries: &[crate::tenant::Registry]) -> Result<Vec<Tap>> {
-    let mut taps: Vec<_> = registries.iter().map(Tap::from).collect();
-    taps.extend(super::job::network_allocations()?);
-    validate_taps(&taps)?;
-    Ok(taps)
+    let tenants: Vec<_> = registries.iter().map(Tap::from).collect();
+    install_taps(&tenants, config)
 }
 
 pub(super) fn validate_taps(taps: &[Tap]) -> Result<()> {
@@ -642,10 +662,21 @@ pub(super) fn validate_taps(taps: &[Tap]) -> Result<()> {
 }
 
 pub(super) fn install_taps(
+    tenants: &[Tap],
+    config: &crate::config::Config,
+) -> Result<NetworkReadiness> {
+    with_job_taps(lock::acquire, super::job::network_allocations, |jobs| {
+        let mut taps = tenants.to_vec();
+        taps.extend(jobs?);
+        validate_taps(&taps)?;
+        install_taps_locked(&taps, config)
+    })
+}
+
+fn install_taps_locked(
     registries: &[Tap],
     config: &crate::config::Config,
 ) -> Result<NetworkReadiness> {
-    let _lock = lock::acquire()?;
     let mut commands = NetworkCommands {
         config: Some(config),
     };
@@ -718,7 +749,11 @@ pub fn remove(registry: &crate::tenant::Registry) -> Result<()> {
 }
 
 pub(super) fn remove_allocated(registry: &Tap) -> Result<()> {
-    let _lock = lock::acquire()?;
+    let lock = lock::acquire()?;
+    remove_allocated_locked(registry, &lock)
+}
+
+pub(super) fn remove_allocated_locked(registry: &Tap, _lock: &lock::Guard) -> Result<()> {
     remove_with(&mut NetworkCommands { config: None }, registry)
 }
 
@@ -1053,8 +1088,24 @@ pub fn egress_bytes(registry: &Tap) -> Result<u64> {
 
 pub(super) fn optional_egress_bytes(registry: &Tap) -> Result<Option<u64>> {
     // Listing counters succeeds even when a policy reload removed our table.
-    // Query/parse errors remain errors; only an absent counter is unmeasured.
-    optional_forward_bytes(&nft_json(&["-j", "list", "counters"])?, &registry.tap())
+    // A missing counter or a timed-out read is unmeasured, never zero.
+    optional_egress_bytes_with_command(
+        registry,
+        Command::new("/usr/sbin/nft").args(["-j", "list", "counters"]),
+    )
+}
+
+pub(super) fn optional_egress_bytes_with_command(
+    registry: &Tap,
+    command: &mut Command,
+) -> Result<Option<u64>> {
+    counter::output(command)?
+        .map(|output| {
+            nft_json_output(output)
+                .and_then(|value| optional_forward_bytes(&value, &registry.tap()))
+        })
+        .transpose()
+        .map(Option::flatten)
 }
 
 fn optional_forward_bytes(value: &serde_json::Value, tap: &str) -> Result<Option<u64>> {
@@ -1088,6 +1139,10 @@ fn nft_table(tables: &serde_json::Value, name: &str) -> Result<Option<serde_json
 
 fn nft_json(args: &[&str]) -> Result<serde_json::Value> {
     let output = Command::new("/usr/sbin/nft").args(args).output()?;
+    nft_json_output(output)
+}
+
+fn nft_json_output(output: std::process::Output) -> Result<serde_json::Value> {
     if !output.status.success() {
         return Err(Error(format!(
             "tenant nft query: {}",
