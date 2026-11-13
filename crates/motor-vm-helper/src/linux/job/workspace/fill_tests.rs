@@ -34,6 +34,12 @@ fn exited(jobs: &mut LinuxJobs, fill: &job::Fill, success: Option<bool>, oom: Op
     record.start.job_id = fill.fill_id.clone();
     record.start.account = fill.account.clone();
     record.start.workspace_disk_id = fill.disk_id();
+    // A real execution record names the disk inode its VM ran on, and
+    // promotion refuses any other inode at that path.
+    let disk =
+        std::fs::metadata(jobs.workspaces.join(fill.disk_id()).join("workspace.img")).unwrap();
+    record.disk_device = disk.dev();
+    record.disk_inode = disk.ino();
     record.released = true;
     record.fill_exit_success = success;
     record.oom_kill = oom;
