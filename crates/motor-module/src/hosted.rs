@@ -330,11 +330,8 @@ pub(crate) enum Error {
     BoatHostFull,
     Capacity,
     NoCapacity(u64),
-    /// The broker answered a lease request with `no_host_fits`: no host it
-    /// could ever place the job on has that many vCPUs, so asking again cannot
-    /// succeed. Carries the broker's `max_vcpus`, the largest count it could
-    /// place, when the reply included a valid one.
-    NoHostFits(Option<u64>),
+    /// No registered host can fit the job; valid broker limits are retained.
+    NoHostFits(Option<u64>, Option<u64>),
     /// The broker refused a new lease with 403 `account_closed`: the hosted
     /// account was closed for good, so no job of it may run anywhere. Final:
     /// never retried, never sent back to the build server, never run locally.
@@ -430,7 +427,7 @@ impl Error {
             Self::BrokerRefused => "hosted_broker_refused",
             Self::HostFull | Self::BoatHostFull => "hosted_host_full",
             Self::Capacity | Self::NoCapacity(_) => "hosted_capacity",
-            Self::NoHostFits(_) => "hosted_no_host_fits",
+            Self::NoHostFits(_, _) => "hosted_no_host_fits",
             Self::AccountClosed => "hosted_account_closed",
             Self::InternalFailure => "hosted_internal_failure",
             Self::StorageFull => "hosted_storage_full",
@@ -490,6 +487,19 @@ impl Error {
             format!("{}: hosted account closed", self.code())
         } else if self == Self::BoatHostFull {
             format!("{}; spill_attempted={}", self.code(), self.code())
+        } else if let Self::NoHostFits(vcpus, memory_mib) = self {
+            let capacity = match (vcpus, memory_mib) {
+                (Some(vcpus), Some(memory)) => {
+                    format!("{vcpus} vCPUs and {} GiB memory", memory / 1024)
+                }
+                (Some(vcpus), None) => format!("{vcpus} vCPUs"),
+                (None, Some(memory)) => format!("{} GiB memory", memory / 1024),
+                (None, None) => return self.code().into(),
+            };
+            format!(
+                "{}: the largest job a server can hold now is {capacity}",
+                self.code()
+            )
         } else if let Some(field) = self.request_field() {
             format!("{}: {field}", self.code())
         } else {
@@ -1224,11 +1234,14 @@ impl Client {
                     Some("capacity" | "no_capacity") => Error::Capacity,
                     // Keyed on the error code alone: the broker sends it with
                     // HTTP 422, but no status makes it worth retrying. The
-                    // `max_vcpus` count is informational; a missing or
-                    // malformed one is recorded as unknown.
+                    // limits are informational; missing or malformed
+                    // values are recorded independently as unknown.
                     Some("no_host_fits") if path == "/v1/leases" => Error::NoHostFits(
                         code.as_ref()
                             .and_then(|v| v.get("max_vcpus"))
+                            .and_then(serde_json::Value::as_u64),
+                        code.as_ref()
+                            .and_then(|v| v.get("max_mem_mib"))
                             .and_then(serde_json::Value::as_u64),
                     ),
                     Some("host_full") => Error::HostFull,
@@ -1524,10 +1537,10 @@ impl Client {
                         Error::NoCapacity(_) | Error::Provisioning(_) if boat_host_full => {
                             return Err(Error::BoatHostFull);
                         }
-                        // No host can ever hold this many vCPUs, so the same
+                        // No host can fit this job's shape, so the same
                         // request would be refused again. The caller decides
                         // where the job goes instead.
-                        Error::NoHostFits(_) => return Err(error),
+                        Error::NoHostFits(_, _) => return Err(error),
                         // The account is closed for good; asking again is
                         // refused the same way.
                         Error::AccountClosed => return Err(error),

@@ -965,9 +965,12 @@ After that marker the existing hosted reattach/finish path governs an ambiguous
 submission.
 
 A broker answer of `no_host_fits` (HTTP 422, `{"error":"no_host_fits",
-"max_vcpus":N}`) means no eligible host can hold the job's vCPUs, so retrying
-cannot succeed. It is a typed `request_rejected` refusal with
-`hosted_no_host_fits` detail, never a correction to a direct Linux runner.
+"max_vcpus":N,"max_mem_mib":M}`) means no eligible host can hold the job's
+shape, so retrying cannot succeed. The refusal reason is `request_rejected`;
+the job is not rerouted to a direct Linux runner. Its detail begins with
+`hosted_no_host_fits` and describes whichever limits are valid, with memory
+rounded down to whole GiB. The vCPU limit is for hosts that fit the job's memory;
+the memory limit is the largest memory a host can hold.
 Each repository-selected job logs `routed to hosted (hosted_repositories)` with
 `job_id` and `repo` fields.
 

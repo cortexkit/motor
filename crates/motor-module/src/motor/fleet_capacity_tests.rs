@@ -373,19 +373,23 @@ async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_plac
 /// Requests that cannot fit are refused by the broker, never tried on another Linux endpoint.
 #[tokio::test]
 async fn invalid_fleet_timeouts_and_no_host_fits_are_typed_without_a_direct_probe() {
-    for (claim, timeout, stub_without_max, leases) in [
-        (22, 600, false, 1),
-        (22, 600, true, 1),
-        (17, 21601, false, 0),
+    for (claim, timeout, reply, expected, leases) in [
+        (22, 600, None, "hosted_no_host_fits: the largest job a server can hold now is 21 vCPUs and 98 GiB memory", 1),
+        (22, 600, Some(serde_json::json!({"error":"no_host_fits", "max_vcpus":21})), "hosted_no_host_fits: the largest job a server can hold now is 21 vCPUs", 1),
+        (22, 600, Some(serde_json::json!({"error":"no_host_fits", "max_mem_mib":100353})), "hosted_no_host_fits: the largest job a server can hold now is 98 GiB memory", 1),
+        (22, 600, Some(serde_json::json!({"error":"no_host_fits", "max_vcpus":"secret", "max_mem_mib":100353})), "hosted_no_host_fits: the largest job a server can hold now is 98 GiB memory", 1),
+        (22, 600, Some(serde_json::json!({"error":"no_host_fits", "max_vcpus":21, "max_mem_mib":-1})), "hosted_no_host_fits: the largest job a server can hold now is 21 vCPUs", 1),
+        (22, 600, Some(serde_json::json!({"error":"no_host_fits"})), "hosted_no_host_fits", 1),
+        (17, 21601, None, "", 0),
     ] {
         let h = Harness::new(Behavior::CompleteRun).await;
-        h.broker.lock().unwrap().knobs.max_vcpus = Some(21);
-        if stub_without_max {
-            h.lease_replies.lock().unwrap().push_back((
-                422,
-                serde_json::json!({"error":"no_host_fits"}),
-                "",
-            ));
+        {
+            let mut broker = h.broker.lock().unwrap();
+            broker.knobs.max_vcpus = Some(21);
+            broker.knobs.max_mem_mib = Some(100_352);
+        }
+        if let Some(reply) = reply {
+            h.lease_replies.lock().unwrap().push_back((422, reply, ""));
         }
         let (scratch, repo) = committed_repo();
         let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
@@ -406,7 +410,7 @@ async fn invalid_fleet_timeouts_and_no_host_fits_are_typed_without_a_direct_prob
         assert_eq!(terminal.ran, Some(Ran::None));
         let detail = terminal.refusal_detail.unwrap();
         if leases == 1 {
-            assert_eq!(detail, "hosted_no_host_fits");
+            assert_eq!(detail, expected);
         } else {
             assert!(detail.contains("timeout_s"), "{detail}");
             assert!(detail.contains("10..=21600"), "{detail}");
