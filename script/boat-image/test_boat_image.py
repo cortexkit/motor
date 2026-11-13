@@ -1352,6 +1352,8 @@ class AptInstallTests(unittest.TestCase):
         self.assertNotIn('openssh-server', command)
         self.assertIn('musl-tools', command)
         self.assertIn('cmake', command)
+        self.assertIn('gdb', command)
+        self.assertIn('elfutils', command)
         self.assertIn('python3-venv', command)
         for package in manifest['apt_packages']['required'] + manifest['apt_packages']['by_role']['boat']:
             if package != 'openssh-server':
