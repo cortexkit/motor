@@ -15,6 +15,7 @@ import zipfile
 
 import parity
 import pinlock
+import guest_services
 
 PREFIX = Path("/opt/motor")
 HERE = Path(__file__).resolve().parent
@@ -215,6 +216,7 @@ def provision(manifest, scratch, measure):
     shutil.copytree(PREFIX / "share/git-core", tools / "share/git-core", symlinks=True)
     tool_sha = {name: parity.digest(tools / spec["path"]) for name, spec in manifest["prep_tools"].items()}
     (PREFIX / "toolchain.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    guest_services.apply(PREFIX)
     make_readonly()
     actual = parity.capture(manifest)
     result = pinlock.candidate(manifest, actual, sources, agent_sha, tool_sha)
@@ -266,6 +268,7 @@ def seal(manifest, build_user, scratch):
     errors = parity.differences(manifest, parity.capture(manifest))
     if errors or parity.digest(PREFIX / "bin/motor-macagent") != manifest["agent"]["sha256"]:
         raise ValueError("guest tools differ from reviewed pins: " + "; ".join(errors))
+    services = guest_services.verify(PREFIX)
     home = Path(pwd.getpwnam(build_user).pw_dir)
     if build_user in ("root", "motorjob") or not home.is_relative_to(Path("/Users")):
         raise ValueError("invalid build-only account")
@@ -273,8 +276,10 @@ def seal(manifest, build_user, scratch):
     # Build sources and the privileged bootstrap key are not part of a job image.
     shutil.rmtree(scratch)
     (PREFIX / "sealed.json").write_text(json.dumps({"manifest_sha256": manifest_sha,
-                                                   "agent_sha256": manifest["agent"]["sha256"],
-                                                   "remote_login": "Off"}) + "\n")
+                                                    "agent_sha256": manifest["agent"]["sha256"],
+                                                    "guest_services": services,
+                                                    "remote_login": "Off"}) + "\n")
+    print("MOTOR_GUEST_SERVICES " + json.dumps(services, sort_keys=True), flush=True)
     print("MOTOR_SEALED " + manifest_sha, flush=True)
     run("/sbin/shutdown", "-h", "now")
 

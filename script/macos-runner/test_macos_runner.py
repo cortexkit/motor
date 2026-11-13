@@ -25,6 +25,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import download
 import guest
+import guest_services
 import image
 import install
 import parity
@@ -32,6 +33,16 @@ import pinlock
 
 SERVER = json.loads((HERE.parent / "runner/toolchain.json").read_text())
 DATA_UUID = "12345678-1234-1234-1234-123456789ABC"
+NEXT_BOOT = "23456789-1234-1234-1234-123456789ABC"
+
+
+def service_receipt():
+    text = guest_services.POLICY.read_text()
+    return {"policy_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "provision_boot_session": DATA_UUID, "verified_boot_session": NEXT_BOOT,
+            "results": {label: {"outcome": "kept-sip" if expected == "kept-sip" else "off",
+                                "disabled": expected != "kept-sip", "pid": 0}
+                        for label, expected in guest_services.parse(text).items()}}
 
 
 def pending():
@@ -1499,7 +1510,8 @@ class OfflineImageTests(unittest.TestCase):
         manifest = ready()
         path = self.root / "toolchain.json"
         path.write_text(json.dumps(manifest))
-        (self.root / "guest-sealed.json").write_text(json.dumps({"manifest_sha256": parity.digest(path), "remote_login": "Off"}))
+        (self.root / "guest-sealed.json").write_text(json.dumps({"manifest_sha256": parity.digest(path),
+                                                               "remote_login": "Off", "guest_services": service_receipt()}))
         args = SimpleNamespace(work=self.root, image=self.bundle, manifest=path)
         with patch.object(image, "require_committed"), patch("sys.stdout", io.StringIO()):
             image.finalize(args, manifest)
@@ -1509,7 +1521,8 @@ class OfflineImageTests(unittest.TestCase):
         pin = json.loads((self.bundle / "image.json").read_text())
         self.assertEqual(pin["files"]["disk.img"], hashlib.sha256(b"granted disk").hexdigest())
         self.assertEqual(pin["tcc"], {"services": ["kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolicyAllFiles"],
-                                     "requirement": self.requirement})
+                                      "requirement": self.requirement})
+        self.assertEqual(pin["guest_services"], service_receipt())
         self.assertEqual([Path(args[0]).name for args in self.commands[-5:]], ["hdiutil", "lsof", "lsof", "lsof", "lsof"])
         self.assertEqual((self.bundle / "disk.img").stat().st_mode & 0o222, 0)
 
@@ -1590,6 +1603,24 @@ class OfflineImageTests(unittest.TestCase):
         with patch.object(image, "require_committed"), patch.object(image.os, "chown") as chown, patch("sys.stdout", io.StringIO()):
             image.agent_swap(self.swap_args, manifest)
         return chown
+
+    def test_agent_swap_preserves_measured_service_policy_metadata(self):
+        manifest = self.swap_inputs()
+        receipt = service_receipt()
+        metadata = self.bundle / "image.json"
+        pin = json.loads(metadata.read_text())
+        pin["guest_services"] = receipt
+        metadata.chmod(0o644)
+        metadata.write_text(json.dumps(pin))
+        metadata.chmod(0o444)
+        assert self.guest_data is not None
+        guest_seal = self.guest_data / "opt/motor/sealed.json"
+        sealed = json.loads(guest_seal.read_text())
+        sealed["guest_services"] = receipt
+        guest_seal.write_text(json.dumps(sealed))
+        self.swap(manifest)
+        self.assertEqual(json.loads((self.swap_args.destination / "image.json").read_text())["guest_services"], receipt)
+        self.assertEqual(json.loads(guest_seal.read_text())["guest_services"], receipt)
 
     def test_agent_swap_clones_replaces_atomically_and_reseals_without_touching_source(self):
         manifest = self.swap_inputs()
@@ -1789,6 +1820,269 @@ class OfflineImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the sealed source"):
             self.swap(manifest)
         self.assertEqual(sorted(path.name for path in self.bundle.iterdir()), before)
+
+
+class GuestServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(prefix="motor-job-")
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        self.policy = self.root / "policy.txt"
+        self.policy.write_text("unverified com.apple.analyticsd # No analytics upload in job VMs.\n")
+        self.daemons = self.root / "LaunchDaemons"
+        self.daemons.mkdir()
+        (self.daemons / "analytics.plist").write_bytes(plistlib.dumps({"Label": "com.apple.analyticsd"}))
+
+    def apply(self, result=None):
+        result = result or subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(guest_services.subprocess, "run", return_value=result) as run, \
+                patch.object(guest_services.subprocess, "check_output", return_value=DATA_UUID):
+            receipt = guest_services.apply(self.root, self.policy, self.daemons)
+        return receipt, run
+
+    def verify(self, disabled='disabled services = {\n "com.apple.analyticsd" => true\n}',
+               spotlight="/:\n\tIndexing disabled.\n", pid=0, boot=NEXT_BOOT):
+        system = f"system = {{\n services = {{\n {pid} - com.apple.analyticsd\n }}\n}}"
+        with patch.object(guest_services.subprocess, "check_output", side_effect=[boot, disabled, system, spotlight]) as output:
+            receipt = guest_services.verify(self.root, self.policy)
+        return receipt, output
+
+    def test_policy_parsing_requires_status_label_and_reason(self):
+        self.assertEqual(guest_services.parse("# heading\n\noff com.apple.analyticsd # No uploads\n"
+                                             "kept-sip com.apple.locationd # Protected\n"),
+                         {"com.apple.analyticsd": "off", "com.apple.locationd": "kept-sip"})
+        for text in ("", "# comments only", "com.apple.analyticsd # Missing outcome",
+                     "off system/com.apple.analyticsd # Wrong domain", "off com.apple.analyticsd",
+                     "maybe com.apple.analyticsd # Unknown status", "off com.apple.* # No wildcards",
+                     "off com.apple.analyticsd # first\nunverified com.apple.analyticsd # duplicate"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                guest_services.parse(text)
+
+    def test_pinned_policy_keeps_essential_services(self):
+        services = guest_services.parse(guest_services.POLICY.read_text())
+        self.assertTrue({"com.apple.metadata.mds", "com.apple.metadata.mds.index", "com.apple.analyticsd",
+                         "com.apple.mobileassetd", "com.apple.airportd"}.issubset(services))
+        for label in ("io.cortexkit.motor.macagent", "com.apple.logd", "com.apple.opendirectoryd",
+                      "com.apple.trustd", "com.apple.syspolicyd", "com.apple.tccd", "com.apple.mDNSResponder",
+                      "com.apple.nehelper", "com.apple.configd", "com.apple.diskarbitrationd", "com.apple.fskitd",
+                      "com.apple.kernelmanagerd", "com.apple.runningboardd", "com.apple.lsd", "com.apple.UserEventAgent-System",
+                      "com.apple.notifyd", "com.apple.securityd", "com.apple.ReportCrash", "com.apple.spindump"):
+            self.assertNotIn(label, services)
+
+    def test_provisioning_uses_system_domain_and_all_mounted_spotlight_volumes_idempotently(self):
+        first, run = self.apply()
+        self.assertEqual([call.args for call in run.call_args_list], [
+            (["/bin/launchctl", "disable", "system/com.apple.analyticsd"],),
+            (["/usr/bin/mdutil", "-a", "-i", "off"],),
+        ])
+        self.assertEqual(run.call_args_list[0].kwargs, {"check": True})
+        self.assertEqual(run.call_args_list[1].kwargs, {"check": True})
+        before = (self.root / guest_services.POLICY.name).read_text()
+        second, _ = self.apply()
+        self.assertEqual(first, second)
+        self.assertEqual(before, (self.root / guest_services.POLICY.name).read_text())
+        self.assertEqual(first["results"], {})
+        self.assertEqual(first["provision_boot_session"], DATA_UUID)
+
+    def test_nonexistent_label_fails_instead_of_creating_a_meaningless_override(self):
+        self.policy.write_text("unverified com.apple.misspelled # Not a real service\n")
+        with patch.object(guest_services.subprocess, "run") as run, self.assertRaisesRegex(ValueError, "absent"):
+            guest_services.apply(self.root, self.policy, self.daemons)
+        run.assert_not_called()
+
+    def test_still_running_after_reboot_is_recorded_as_kept_sip(self):
+        self.apply()
+        for disabled in ('"com.apple.analyticsd" => true', '"com.apple.analyticsd" => false'):
+            with self.subTest(disabled=disabled):
+                actual, _ = self.verify(disabled=disabled, pid=123)
+                self.assertEqual(actual["results"]["com.apple.analyticsd"], {
+                    "outcome": "kept-sip", "disabled": disabled.endswith("true"), "pid": 123})
+                self.assertIn('"outcome": "kept-sip"', (self.root / guest_services.POLICY.name).read_text())
+
+    def test_disable_command_errors_fail_instead_of_becoming_kept_sip(self):
+        with patch.object(guest_services.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["launchctl"])), \
+                self.assertRaises(subprocess.CalledProcessError):
+            guest_services.apply(self.root, self.policy, self.daemons)
+        self.assertFalse((self.root / guest_services.POLICY.name).exists())
+
+    def test_pinned_off_service_running_after_reboot_is_a_regression(self):
+        self.policy.write_text("off com.apple.analyticsd # No uploads\n")
+        self.apply()
+        with self.assertRaisesRegex(ValueError, "still running"):
+            self.verify(pid=123)
+
+    def test_seal_requires_a_new_boot(self):
+        self.apply()
+        with self.assertRaisesRegex(ValueError, "must reboot"):
+            self.verify(boot=DATA_UUID)
+
+    def test_pinned_sip_services_are_not_touched(self):
+        self.policy.write_text("kept-sip com.apple.analyticsd # Protected\n")
+        receipt, run = self.apply()
+        self.assertEqual([call.args for call in run.call_args_list], [(["/usr/bin/mdutil", "-a", "-i", "off"],)])
+        self.assertEqual(receipt["results"], {})
+        actual, _ = self.verify(disabled="{}", pid=123)
+        self.assertEqual(actual["results"]["com.apple.analyticsd"], {"outcome": "kept-sip", "disabled": False, "pid": 123})
+
+    def test_mdutil_failure_does_not_write_success_receipt(self):
+        with patch.object(guest_services.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], 0, "", ""), subprocess.CalledProcessError(1, ["mdutil"])]), \
+                self.assertRaises(subprocess.CalledProcessError):
+            guest_services.apply(self.root, self.policy, self.daemons)
+        self.assertFalse((self.root / guest_services.POLICY.name).exists())
+
+    def test_seal_checks_actual_disabled_overrides_and_root_spotlight(self):
+        receipt, _ = self.apply()
+        actual, output = self.verify()
+        self.assertEqual(actual["policy_sha256"], receipt["policy_sha256"])
+        self.assertEqual(actual["results"], {"com.apple.analyticsd": {"outcome": "off", "disabled": True, "pid": 0}})
+        self.assertEqual([call.args for call in output.call_args_list], [
+            (["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],),
+            (["/bin/launchctl", "print-disabled", "system"],), (["/bin/launchctl", "print", "system"],),
+            (["/usr/bin/mdutil", "-s", "/"],),
+        ])
+        for disabled in ('"com.apple.analyticsd" => false', '"com.apple.analyticsd.extra" => true',
+                         '"comXappleXanalyticsd" => true', "disabled services = {}"):
+            with self.subTest(disabled=disabled), self.assertRaisesRegex(ValueError, "not disabled"):
+                self.verify(disabled=disabled)
+        for status in ("/:\n Indexing enabled.\n", "", "/Volumes/Other:\n Indexing disabled.\n", "Spotlight server is disabled."):
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "Spotlight"):
+                self.verify(spotlight=status)
+
+    def test_seal_rejects_missing_changed_and_unresolved_results(self):
+        with self.assertRaises(FileNotFoundError):
+            self.verify()
+        self.apply()
+        receipt, _ = self.verify()
+        path = self.root / guest_services.POLICY.name
+        original = path.read_text()
+        for installed in (self.policy.read_text(), original.replace("No analytics upload", "Changed policy")):
+            path.write_text(installed)
+            with self.assertRaisesRegex(ValueError, "missing or changed"):
+                self.verify()
+        for change in (lambda value: value.update(policy_sha256="0" * 64),
+                       lambda value: value["results"].clear(),
+                       lambda value: value["results"].update({"com.apple.analyticsd": {"outcome": "unverified"}}),
+                       lambda value: value["results"].update({"com.apple.analyticsd": {"outcome": "kept-sip", "evidence": "any error"}})):
+            bad = copy.deepcopy(receipt)
+            change(bad)
+            path.write_text(self.policy.read_text() + guest_services.RESULTS + json.dumps(bad) + "\n")
+            with self.subTest(receipt=bad), self.assertRaises(ValueError):
+                guest_services.validate_receipt(bad, self.policy.read_text())
+
+    def test_missing_service_table_or_command_failure_never_counts_as_stopped(self):
+        self.apply()
+        for table in ("", "system = {}", "system = {\n services = {\n malformed row\n }\n}"):
+            with self.subTest(table=table), patch.object(guest_services.subprocess, "check_output",
+                    side_effect=[NEXT_BOOT, '"com.apple.analyticsd" => true', table]), self.assertRaises(ValueError):
+                guest_services.verify(self.root, self.policy)
+        with patch.object(guest_services.subprocess, "check_output", side_effect=subprocess.CalledProcessError(1, ["launchctl"])), \
+                self.assertRaises(subprocess.CalledProcessError):
+            guest_services.verify(self.root, self.policy)
+
+    def test_running_services_reads_pids_not_last_exit_status_from_system_table(self):
+        table = """system = {
+	services = {
+		     170      - 	com.apple.runningboardd
+		       0      - 	com.apple.diagnosticextensions.osx.spotlight.helper
+		       0      0 	com.apple.AmbientDisplayAgent
+	}
+}"""
+        self.assertEqual(guest_services.running_services(table), {
+            "com.apple.runningboardd": 170, "com.apple.diagnosticextensions.osx.spotlight.helper": 0,
+            "com.apple.AmbientDisplayAgent": 0})
+
+    def test_failed_service_seal_keeps_build_access_and_never_shuts_down(self):
+        manifest = ready()
+        with patch.object(guest.pinlock, "require_ready"), patch.object(guest.parity, "digest", return_value="a" * 64), \
+                patch.object(guest, "clt_verify"), patch.object(guest, "PREFIX", self.root), \
+                patch.object(guest.parity, "capture"), patch.object(guest.parity, "differences", return_value=[]), \
+                patch.object(guest_services, "verify", side_effect=ValueError("service is not disabled")), \
+                patch.object(guest, "drop_build_access") as drop, patch.object(guest, "run") as run:
+            with self.assertRaisesRegex(ValueError, "not disabled"):
+                guest.seal(manifest, "motorbuild", self.root / "scratch")
+        drop.assert_not_called()
+        run.assert_not_called()
+
+    def test_successful_guest_seal_persists_and_reports_service_outcomes(self):
+        manifest = ready()
+        receipt = service_receipt()
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        with patch.object(guest.pinlock, "require_ready"), patch.object(guest.parity, "digest", return_value="a" * 64), \
+                patch.object(guest, "clt_verify"), patch.object(guest, "PREFIX", self.root), \
+                patch.object(guest.parity, "capture"), patch.object(guest.parity, "differences", return_value=[]), \
+                patch.object(guest_services, "verify", return_value=receipt), \
+                patch("pwd.getpwnam", return_value=SimpleNamespace(pw_dir="/Users/motorbuild")), \
+                patch.object(guest, "drop_build_access"), patch.object(guest, "run") as run, \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            guest.seal(manifest, "motorbuild", scratch)
+        self.assertEqual(json.loads((self.root / "sealed.json").read_text())["guest_services"], receipt)
+        self.assertIn("MOTOR_GUEST_SERVICES " + json.dumps(receipt, sort_keys=True), output.getvalue())
+        self.assertFalse(scratch.exists())
+        run.assert_called_once_with("/sbin/shutdown", "-h", "now")
+
+    def test_provision_uploads_policy_and_reboots_after_collecting_outputs(self):
+        args = SimpleNamespace(work=self.root, guest="motorbuild@guest", known_hosts=self.root / "known_hosts",
+                               measure=True, clt_label=None)
+        calls = []
+
+        def reboot(*unused):
+            self.assertIn("sudo -n tar -cf", calls[-1][-1])
+
+        with patch.object(image, "prepare_inputs", return_value=self.root / "inputs"), \
+                patch.object(image, "run", side_effect=lambda *args, **kwargs: calls.append(args)), \
+                patch.object(image, "reboot_for_service_policy", side_effect=reboot) as restart:
+            image.provision(args, ready())
+        restart.assert_called_once()
+        for name in ("guest_services.py", "guest-services-off.txt"):
+            self.assertEqual((self.root / "recipe" / name).read_bytes(), (HERE / name).read_bytes())
+
+    def test_reboot_waits_for_a_new_guest_boot_not_just_working_ssh(self):
+        args = SimpleNamespace(guest="motorbuild@guest")
+        results = [subprocess.CompletedProcess([], 255, "", "connection closed"),
+                   subprocess.CompletedProcess([], 0, DATA_UUID + "\n", ""),
+                   subprocess.CompletedProcess([], 255, "", "not ready"),
+                   subprocess.CompletedProcess([], 0, NEXT_BOOT + "\n", "")]
+        with patch.object(image.subprocess, "check_output", return_value=DATA_UUID), \
+                patch.object(image.subprocess, "run", side_effect=results) as run, patch.object(image.time, "sleep") as sleep:
+            image.reboot_for_service_policy(args, [])
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0][-1], "sudo -n /sbin/shutdown -r now")
+
+    def test_reboot_timeout_fails_instead_of_sealing_the_old_boot(self):
+        with patch.object(image.subprocess, "check_output", return_value=DATA_UUID), \
+                patch.object(image.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                patch.object(image.time, "monotonic", side_effect=[0, 301]), \
+                self.assertRaisesRegex(ValueError, "did not return on a new boot"):
+            image.reboot_for_service_policy(SimpleNamespace(guest="motorbuild@guest"), [])
+
+    def test_host_seal_uploads_policy_and_requires_service_outcomes_before_deleting_keys(self):
+        manifest = ready()
+        path = self.root / "toolchain.json"
+        path.write_text(json.dumps(manifest))
+        (self.root / "candidate.json").write_text(json.dumps(dict(manifest, release_status="pending review")))
+        args = SimpleNamespace(work=self.root, manifest=path, guest="motorbuild@guest", known_hosts=self.root / "known_hosts")
+        marker = "MOTOR_SEALED " + parity.digest(path) + "\n"
+        receipt = service_receipt()
+        for outcomes in ("", "MOTOR_GUEST_SERVICES {}\n", "MOTOR_GUEST_SERVICES " + json.dumps(receipt) + "\n"):
+            for name in ("build_key", "build_key.pub"):
+                (self.root / name).write_text("test-only key fixture")
+            response = subprocess.CompletedProcess([], 0, outcomes + marker, "")
+            with self.subTest(outcomes=outcomes), patch.object(image, "require_committed"), \
+                    patch.object(image, "run") as run, patch.object(image.subprocess, "run", return_value=response):
+                if outcomes in ("", "MOTOR_GUEST_SERVICES {}\n"):
+                    with self.assertRaises(ValueError):
+                        image.seal(args, manifest)
+                    self.assertTrue((self.root / "build_key").exists())
+                else:
+                    image.seal(args, manifest)
+                    self.assertFalse((self.root / "build_key").exists())
+                    self.assertEqual(json.loads((self.root / "guest-sealed.json").read_text())["guest_services"], receipt)
+                uploaded = run.call_args_list[-1].args
+                self.assertIn(HERE / "guest_services.py", uploaded)
+                self.assertIn(HERE / "guest-services-off.txt", uploaded)
 
 
 class ImageTests(unittest.TestCase):
