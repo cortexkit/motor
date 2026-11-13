@@ -38,11 +38,14 @@ impl Access for Fake {
     fn lock(&self) -> Result<tenant_network::lock::Guard> {
         tenant_network::lock::acquire_at(&self.1.join("network"), unsafe { libc::geteuid() })
     }
+    fn try_lock(&self) -> Result<Option<tenant_network::lock::Guard>> {
+        tenant_network::lock::try_acquire_at(&self.1.join("network"), unsafe { libc::geteuid() })
+    }
     fn tenants(&self) -> Result<Vec<Tap>> {
         Ok(self.0.lock().unwrap().tenants.clone())
     }
-    fn install(&self, taps: &[Tap]) -> Result<()> {
-        tenant_network::validate_taps(taps)?;
+    fn install(&self) -> Result<()> {
+        tenant_network::validate_taps(&self.0.lock().unwrap().tenants)?;
         self.0.lock().unwrap().events.push("install".into());
         if self.0.lock().unwrap().fail_install {
             return Err(Error("network policy failed".into()));
@@ -147,11 +150,11 @@ fn network_policy_failure_prevents_tap_activation() {
     let tap = jobs.records()[&start().job_id].tap().unwrap();
     fake.0.lock().unwrap().fail_install = true;
     assert!(jobs
-        .prepare_network(&start().job_id, Vec::new(), tap)
+        .prepare_network(&start().job_id, tap)
         .is_err());
     assert_eq!(fake.0.lock().unwrap().events, ["install"]);
     fake.0.lock().unwrap().fail_install = false;
-    jobs.prepare_network(&start().job_id, Vec::new(), tap)
+    jobs.prepare_network(&start().job_id, tap)
         .unwrap();
     assert_eq!(
         fake.0.lock().unwrap().events,
@@ -530,5 +533,107 @@ fn acknowledgement_and_tap_clear_serialize_whole_record_writes() {
     assert!(jobs.records()[&start().job_id].exit_acknowledged);
     assert_eq!(jobs.records()[&start().job_id].tap_index, None);
     drop(jobs);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn collector_never_waits_for_the_network_lock_while_holding_the_job_writer() {
+    use std::sync::mpsc;
+    let (base, jobs, fake) = fixture();
+    let id = start().job_id;
+    let jobs = Arc::new(jobs);
+    // Another job's teardown or a tenant render holds the machine-wide flock.
+    let held = jobs.network.lock().unwrap();
+    let collecting = jobs.clone();
+    let (collected, collection) = mpsc::channel();
+    let collector = std::thread::spawn(move || {
+        collecting.collect_exits().unwrap();
+        collected.send(()).unwrap();
+    });
+    let finished = collection.recv_timeout(Duration::from_secs(2));
+    // The host acknowledges the published report while the flock is busy.
+    let acknowledging = jobs.clone();
+    let (acked, acknowledgement) = mpsc::channel();
+    let ack = std::thread::spawn(move || {
+        acked
+            .send(acknowledging.acknowledge_exit(ExitReport {
+                job_id: start().job_id,
+                oom_kill: 3,
+                egress_bytes: Some(1234),
+            }))
+            .unwrap();
+    });
+    let ack_result = acknowledgement.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    collector.join().unwrap();
+    ack.join().unwrap();
+    assert!(
+        finished.is_ok(),
+        "collector waited for the network flock holding J"
+    );
+    ack_result.expect("ack waited behind network teardown").unwrap();
+    let saved = persisted(&jobs);
+    assert!(saved.exit_acknowledged);
+    assert_eq!(saved.tap_index, Some(17), "TAP released without the flock");
+    let view = jobs.view(&id).unwrap();
+    assert_eq!(view.state, super::super::registry::State::Exited);
+    assert!(view.cleanup_pending);
+    assert!(jobs.group(&id).exists());
+    assert_eq!(fake.0.lock().unwrap().events, ["read:17"]);
+    // The next tick finishes the cleanup without losing the acknowledgement.
+    jobs.collect_exits().unwrap();
+    let saved = persisted(&jobs);
+    assert_eq!(saved.tap_index, None);
+    assert!(saved.exit_acknowledged);
+    assert!(!jobs.view(&id).unwrap().cleanup_pending);
+    assert!(!jobs.group(&id).exists());
+    assert_eq!(fake.0.lock().unwrap().events, ["read:17", "remove:17"]);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn prune_never_unlinks_a_record_while_a_render_scans_the_directory() {
+    use std::sync::mpsc;
+    let (base, jobs, _) = fixture();
+    let mut tombstone = record();
+    tombstone.start.job_id = job::test_id(2);
+    tombstone.released = true;
+    tombstone.oom_kill = Some(3);
+    tombstone.exit_acknowledged = true;
+    jobs.save(&tombstone).unwrap();
+    let path = jobs
+        .records_path
+        .join(format!("{}.json", tombstone.start.job_id));
+    File::open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+    jobs.adopt_record(tombstone.clone()).unwrap();
+    let jobs = Arc::new(jobs);
+    // A render holds the flock and has listed the directory; it opens each
+    // listed record next, as network::read_records does.
+    let held = jobs.network.lock().unwrap();
+    let listed: Vec<_> = std::fs::read_dir(&jobs.records_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(listed.len(), 2);
+    let pruning = jobs.clone();
+    let (pruned, prune) = mpsc::channel();
+    let pruner = std::thread::spawn(move || {
+        pruned
+            .send(pruning.prune_records(SystemTime::now()))
+            .unwrap();
+    });
+    let early = prune.recv_timeout(Duration::from_millis(500));
+    let opened: Vec<_> = listed.iter().map(std::fs::read).collect();
+    drop(held);
+    pruner.join().unwrap();
+    assert!(early.is_err(), "prune unlinked a record during the scan");
+    assert!(opened.iter().all(|read| read.is_ok()), "{opened:?}");
+    prune.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+    assert!(!path.exists());
+    assert!(jobs.view(&tombstone.start.job_id).is_none());
     std::fs::remove_dir_all(base).unwrap();
 }

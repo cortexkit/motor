@@ -14,10 +14,26 @@ pub(in crate::linux) struct Guard {
 }
 
 pub(in crate::linux) fn acquire() -> Result<Guard> {
-    acquire_at(Path::new("/run/motor-network"), 0)
+    acquire_at(Path::new(DIRECTORY), 0)
 }
 
+/// Takes the flock only if nobody holds it; None means it is busy.
+pub(in crate::linux) fn try_acquire() -> Result<Option<Guard>> {
+    try_acquire_at(Path::new(DIRECTORY), 0)
+}
+
+const DIRECTORY: &str = "/run/motor-network";
+
 pub(in crate::linux) fn acquire_at(directory: &Path, owner: u32) -> Result<Guard> {
+    lock_at(directory, owner, true)?
+        .ok_or_else(|| Error("blocking network lock returned busy".into()))
+}
+
+pub(in crate::linux) fn try_acquire_at(directory: &Path, owner: u32) -> Result<Option<Guard>> {
+    lock_at(directory, owner, false)
+}
+
+fn lock_at(directory: &Path, owner: u32, wait: bool) -> Result<Option<Guard>> {
     // Track acquisition as well as ownership: waiting for the flock while a
     // later lock is held is already an inversion, even before flock succeeds.
     let held = crate::lock_order::enter(crate::lock_order::Lock::N);
@@ -46,13 +62,22 @@ pub(in crate::linux) fn acquire_at(directory: &Path, owner: u32) -> Result<Guard
     {
         return Err(Error("unsafe motor network lock file".into()));
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    let operation = if wait {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if !wait && error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error.into());
     }
-    Ok(Guard {
+    Ok(Some(Guard {
         _file: file,
         _held: held,
-    })
+    }))
 }
 
 #[cfg(test)]

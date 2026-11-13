@@ -3,8 +3,10 @@ use crate::linux::tenant_network::{self, Tap};
 
 pub(super) trait Access: Send + Sync {
     fn lock(&self) -> Result<tenant_network::lock::Guard>;
+    fn try_lock(&self) -> Result<Option<tenant_network::lock::Guard>>;
     fn tenants(&self) -> Result<Vec<Tap>>;
-    fn install(&self, taps: &[Tap]) -> Result<()>;
+    /// Renders the whole policy from tenants and jobs read under the lock.
+    fn install(&self) -> Result<()>;
     fn create_namespace(&self, id: &str) -> Result<PathBuf>;
     fn reconcile_namespaces(&self, retained: &BTreeSet<String>) -> Result<()>;
     fn remove_namespace(&self, id: &str) -> Result<()>;
@@ -19,11 +21,21 @@ impl Access for System {
     fn lock(&self) -> Result<tenant_network::lock::Guard> {
         tenant_network::lock::acquire()
     }
+    fn try_lock(&self) -> Result<Option<tenant_network::lock::Guard>> {
+        tenant_network::lock::try_acquire()
+    }
     fn tenants(&self) -> Result<Vec<Tap>> {
         tenant_taps(Path::new(crate::tenant::REGISTRY))
     }
-    fn install(&self, taps: &[Tap]) -> Result<()> {
-        tenant_network::install_taps(taps, &self.0)?.require_ready()
+    fn install(&self) -> Result<()> {
+        // Tenant operations no longer exclude job starts, so a tenant list
+        // read before the flock could restore a removed tenant's rules or
+        // drop a new tenant's. Read it inside the same hold as the jobs.
+        tenant_network::install_registered_taps(
+            || tenant_taps(Path::new(crate::tenant::REGISTRY)),
+            &self.0,
+        )?
+        .require_ready()
     }
     fn create_namespace(&self, id: &str) -> Result<PathBuf> {
         namespace::create(id)

@@ -11,10 +11,13 @@ impl Access for PrivateNetwork {
     fn lock(&self) -> Result<tenant_network::lock::Guard> {
         tenant_network::lock::acquire_at(&self.base.join("network-lock"), 0)
     }
+    fn try_lock(&self) -> Result<Option<tenant_network::lock::Guard>> {
+        tenant_network::lock::try_acquire_at(&self.base.join("network-lock"), 0)
+    }
     fn tenants(&self) -> Result<Vec<Tap>> {
         Ok(Vec::new())
     }
-    fn install(&self, _: &[Tap]) -> Result<()> {
+    fn install(&self) -> Result<()> {
         let _lock = self.lock()?;
         let taps: Vec<_> = network::read_records(&self.base.join("records"))?
             .iter()

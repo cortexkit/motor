@@ -79,7 +79,7 @@ pub(super) fn boot(jobs: &LinuxJobs, artifacts: &Artifacts, mut start: Start) ->
             uid,
         };
         let netns = jobs.network.create_namespace(id)?;
-        jobs.prepare_network(id, Vec::new(), tap)?;
+        jobs.prepare_network(id, tap)?;
         let boundary = jobs.boundary(id);
         let root = jobs.root(id);
         let group = jobs.group(id);

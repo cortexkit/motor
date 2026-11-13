@@ -99,6 +99,6 @@ impl LinuxJobs {
         if let Err(error) = self.reap_job(&mut state, Duration::ZERO) {
             self.log_collection_failure(&mut state, CollectionFailure::Reap, &error);
         }
-        let _ = self.collect_exit_locked(&mut state);
+        let _ = self.collect_exit_locked(&mut state, NetworkLock::Try);
     }
 }

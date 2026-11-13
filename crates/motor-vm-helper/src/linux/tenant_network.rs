@@ -677,11 +677,34 @@ pub(super) fn install_taps(
     tenants: &[Tap],
     config: &crate::config::Config,
 ) -> Result<NetworkReadiness> {
-    with_job_taps(lock::acquire, super::job::network_allocations, |jobs| {
-        let mut taps = tenants.to_vec();
+    install_registered_taps(|| Ok(tenants.to_vec()), config)
+}
+
+/// Installs policy for the tenants `tenants` lists and every job allocation,
+/// both read after taking the network lock.
+pub(super) fn install_registered_taps(
+    tenants: impl FnOnce() -> Result<Vec<Tap>>,
+    config: &crate::config::Config,
+) -> Result<NetworkReadiness> {
+    with_registered_taps(
+        lock::acquire,
+        tenants,
+        super::job::network_allocations,
+        |taps| install_taps_locked(&taps, config),
+    )
+}
+
+fn with_registered_taps<T>(
+    acquire: impl FnOnce() -> Result<lock::Guard>,
+    tenants: impl FnOnce() -> Result<Vec<Tap>>,
+    jobs: impl FnOnce() -> Result<Vec<Tap>>,
+    render: impl FnOnce(Vec<Tap>) -> Result<T>,
+) -> Result<T> {
+    with_job_taps(acquire, jobs, |jobs| {
+        let mut taps = tenants()?;
         taps.extend(jobs?);
         validate_taps(&taps)?;
-        install_taps_locked(&taps, config)
+        render(taps)
     })
 }
 

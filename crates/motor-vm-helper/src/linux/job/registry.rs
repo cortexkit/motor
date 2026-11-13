@@ -104,6 +104,13 @@ impl LinuxJobs {
         if self.view(&start.job_id).is_some() {
             return Err(Error("job id already booted; use adopt_job".into()));
         }
+        // Stop or Adopt already answered that this id has no VM. Booting it
+        // now would leave a VM that its host has given up on.
+        if self.proven_absent(&start.job_id)? {
+            return Err(Error(
+                "job id was already reported absent; start it under a new id".into(),
+            ));
+        }
         self.disk_available(start, device, inode)
     }
 
