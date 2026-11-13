@@ -243,18 +243,21 @@ fn start() -> Start {
 }
 
 pub(super) fn record() -> Record {
-    Record {
-        start: start(),
-        uid: unsafe { libc::geteuid() },
-        disk_device: 8,
-        disk_inode: 99,
-        released: false,
-        oom_kill: None,
-        exit_acknowledged: false,
-        tap_index: None,
-        egress_bytes: None,
-        fill_exit_success: None,
-    }
+    Record::new(start(), unsafe { libc::geteuid() }, 8, 99, None)
+}
+
+fn start_record(jobs: &LinuxJobs, start: Start, uid: u32, tap_index: Option<u8>) -> Record {
+    let workspace = jobs.workspaces.join(&start.workspace_disk_id);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let disk = File::create(workspace.join("workspace.img")).unwrap();
+    let meta = disk.metadata().unwrap();
+    Record::new(start, uid, meta.dev(), meta.ino(), tap_index)
+}
+
+fn restart_start(base: &Path) -> Start {
+    // UUIDv7 fixtures use a process-local timestamp. Every helper incarnation
+    // must use the original start rather than generate another job identity.
+    serde_json::from_reader(File::open(base.join("start.json")).unwrap()).unwrap()
 }
 
 #[test]
@@ -877,6 +880,82 @@ fn helper_restart_re_adopts_a_live_vmm_without_killing_it() {
 }
 
 #[test]
+fn saved_start_record_reconciles_a_live_vmm_across_processes() {
+    const TEST: &str =
+        "linux::job::tests::saved_start_record_reconciles_a_live_vmm_across_processes";
+    if let Some(base) = std::env::var_os("MOTOR_VM_JOB_RECORD_TEST_ROOT") {
+        let base = PathBuf::from(base);
+        let start = restart_start(&base);
+        let mut restarted = machine(&base);
+        let paths: Vec<_> = std::fs::read_dir(&restarted.records_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        let saved: Record = serde_json::from_reader(File::open(&paths[0]).unwrap()).unwrap();
+        saved.start.validate().unwrap();
+        assert_eq!(
+            paths[0].file_stem().unwrap().to_str().unwrap(),
+            saved.start.job_id
+        );
+        restarted.settings = Some(JobVms {
+            workspace_disk_max_bytes: Some(1073741824),
+            fixed_path_repositories: Default::default(),
+            uid_base: saved.uid,
+            uid_count: 1,
+            memory_max_bytes: 268435456,
+        });
+        // The root service test covers trusted-file loading. This portable test
+        // feeds the saved JSON into the same reconciliation used after loading.
+        restarted.reconcile_records(vec![saved]).unwrap();
+        let expected: u32 = std::fs::read_to_string(base.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let reply = restarted.status(&start.job_id).unwrap().reply;
+        assert!(
+            matches!(reply,
+                Reply::Job { known: true, running: true, vmm_pid: Some(pid), exit_report: None, tap_index: Some(17) } if pid == expected),
+            "expected the saved job's live VMM {expected}, got {reply:?}"
+        );
+        return;
+    }
+
+    let mut vmm = Vmm::new();
+    let jobs = machine(&vmm.base);
+    let mut start = start();
+    // A distinct suffix makes regenerating the default start fail even if both
+    // test processes happen to initialize their UUID timestamp in the same ms.
+    start.job_id = job::test_id(42);
+    tenant::durable_write(
+        &vmm.base.join("start.json"),
+        &serde_json::to_vec(&start).unwrap(),
+    )
+    .unwrap();
+    let record = start_record(&jobs, start.clone(), unsafe { libc::geteuid() }, Some(17));
+    std::fs::create_dir_all(&jobs.records_path).unwrap();
+    jobs.save(&record).unwrap();
+    let group = jobs.group(&start.job_id);
+    std::fs::create_dir_all(&group).unwrap();
+    std::fs::write(group.join("cgroup.procs"), vmm.child.id().to_string()).unwrap();
+    std::fs::write(vmm.base.join("pid"), vmm.child.id().to_string()).unwrap();
+    drop(jobs);
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env("MOTOR_VM_JOB_RECORD_TEST_ROOT", &vmm.base)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fresh helper process failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(vmm.child.try_wait().unwrap().is_none());
+}
+
+#[test]
 fn adoption_refuses_a_cgroup_with_the_wrong_uid() {
     let vmm = Vmm::new();
     let mut jobs = machine(&vmm.base);
@@ -1007,6 +1086,8 @@ fn wait_for_file(path: &Path) {
 
 /// Runs outside remote jobs as root: it creates a disposable systemd service
 /// with the shipped helper's kill/delegation settings and a separate test slice.
+/// Both service incarnations read one serialized Start and the durable record
+/// uses the production start-record constructor; no KVM or guest image is needed.
 /// The shared scratch root and its ancestors must be root-owned, non-writable
 /// by other users, and traversable by the VM uid in 600000..600254; do not use
 /// a directory below /root. On a Linux build server with systemd 254+ as PID 1,
@@ -1026,8 +1107,20 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     const TEST: &str = "linux::job::tests::isolated_job_vmm_survives_helper_service_restart";
     const SLICE: &str = "/sys/fs/cgroup/motorvmtest.slice";
-    if let Ok(phase) = std::env::var("MOTOR_VM_JOB_TEST_PHASE") {
-        let base = PathBuf::from(std::env::var_os("MOTOR_VM_JOB_TEST_ROOT").unwrap());
+    let phase = std::env::var("MOTOR_VM_JOB_TEST_PHASE");
+    let base = if phase.is_ok() {
+        PathBuf::from(std::env::var_os("MOTOR_VM_JOB_TEST_ROOT").unwrap())
+    } else {
+        let base = scratch();
+        tenant::durable_write(
+            &base.join("start.json"),
+            &serde_json::to_vec(&start()).unwrap(),
+        )
+        .unwrap();
+        base
+    };
+    let start = || restart_start(&base);
+    if let Ok(phase) = phase {
         let mut jobs = machine(&base);
         jobs.remove_test_group = None;
         jobs.groups = SLICE.into();
@@ -1041,8 +1134,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         if phase == "start" {
             trusted_directory(&jobs.records_path).unwrap();
             let uid = jobs.allocate_uid(jobs.settings.as_ref().unwrap()).unwrap();
-            let mut record = record();
-            record.uid = uid;
+            let record = start_record(&jobs, start(), uid, None);
             let group = jobs.group(&record.start.job_id);
             cgroup::create_job(&group, 1).unwrap();
             let procs = OpenOptions::new()
@@ -1131,7 +1223,6 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         }
         return;
     }
-    let base = scratch();
     // Ancestors of helper-owned records must already be root-controlled. The
     // operator must set a root-controlled, uid-traversable shared scratch root
     // such as TMPDIR=/var/lib/motor-root-tests for this service restart test.
