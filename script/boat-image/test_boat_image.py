@@ -54,7 +54,19 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("python3", manifest["apt_packages"]["required"])
         self.assertEqual(set(manifest["rust_toolchains"]), {
             name + "-x86_64-unknown-linux-gnu"
-            for name in ("1.91.0", "1.92.0", "1.96.0", "1.99.0", "stable")})
+            for name in ("1.91.0", "1.92.0", "1.96.0", "1.99.0", "1.100.0", "stable")})
+
+    def test_rust_1_100_is_preinstalled_without_changing_default(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        self.assertEqual(manifest['rust_default'], '1.99.0-x86_64-unknown-linux-gnu')
+        previous = manifest['rust_toolchains']['1.99.0-x86_64-unknown-linux-gnu']
+        added = manifest['rust_toolchains']['1.100.0-x86_64-unknown-linux-gnu']
+        self.assertEqual(added['components'], previous['components'])
+        self.assertEqual(added['targets'], previous['targets'])
+        self.assertEqual(added['rustc'], 'rustc 1.100.0 (0ef1bc386 2026-11-09)')
+        with patch.object(install, 'run', return_value='') as run:
+            install.install_rust(manifest, '/rustup-init')
+        self.assertEqual(run.call_args.args, ('rustup', 'default', manifest['rust_default']))
 
     def test_accounts_use_boats_system_assigned_rule(self):
         with patch.object(install.job_account, 'ensure') as ensure, \
@@ -142,7 +154,8 @@ class RecipeTests(unittest.TestCase):
         manifest = json.loads(install.PARITY_PATH.read_text())
         with patch.object(install, 'run', return_value='') as run:
             install.install_rust(manifest, '/rustup-init')
-        names = ('1.99.0-x86_64-unknown-linux-gnu', 'stable-x86_64-unknown-linux-gnu')
+        names = ('1.99.0-x86_64-unknown-linux-gnu', '1.100.0-x86_64-unknown-linux-gnu',
+                 'stable-x86_64-unknown-linux-gnu')
         actual = {call.args[3]: call.args for call in run.call_args_list
                   if call.args[:3] == ('rustup', 'toolchain', 'install') and call.args[3] in names}
         targets = ('--target', 'aarch64-apple-ios', '--target', 'aarch64-apple-ios-sim',
@@ -151,12 +164,13 @@ class RecipeTests(unittest.TestCase):
                    '--target', 'x86_64-pc-windows-msvc', '--target', 'x86_64-unknown-linux-gnu',
                    '--target', 'x86_64-unknown-linux-musl')
         self.assertEqual(actual, {
-            names[0]: ('rustup', 'toolchain', 'install', names[0], '--profile', 'minimal',
+            name: ('rustup', 'toolchain', 'install', name, '--profile', 'minimal',
                        '--component', 'clippy', '--component', 'llvm-tools',
-                       '--component', 'rust-analyzer', '--component', 'rustfmt', *targets),
+                       '--component', 'rust-analyzer', '--component', 'rustfmt', *targets)
+            for name in names[:2]
         })
         root = manifest['rustup_home'] + '/toolchains/'
-        run.assert_any_call('cp', '-a', '--reflink=auto', root + names[0] + '/.', root + names[1])
+        run.assert_any_call('cp', '-a', '--reflink=auto', root + names[0] + '/.', root + names[2])
 
     def test_recipe_normalizes_preview_names_and_removes_extra_parts(self):
         host = 'x86_64-unknown-linux-gnu'

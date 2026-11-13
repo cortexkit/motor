@@ -214,6 +214,10 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(pins["pnpm"], "11.1.2")
         self.assertIn("python3", pins["packages"])
         self.assertIn("systemd-sysv", pins["packages"])
+        self.assertEqual(pins["rust_default"], "1.99.0")
+        manifest = json.loads((image.REPO / "script/runner/toolchain.json").read_text())
+        self.assertEqual(pins["rust_toolchains"]["1.100.0"],
+                         manifest["rust_toolchains"]["1.100.0-x86_64-unknown-linux-gnu"]["targets"])
 
     def test_debootstrap_includes_the_pinned_git_build_dependencies(self):
         pins = image.load_versions(self.versions)

@@ -625,6 +625,37 @@
   "rust_default": "1.99.0-x86_64-unknown-linux-gnu",
   "rust_profile": "minimal",
   "rust_toolchains": {
+    "1.100.0-x86_64-unknown-linux-gnu": {
+      "components": [
+        "cargo-x86_64-unknown-linux-gnu",
+        "clippy-x86_64-unknown-linux-gnu",
+        "llvm-tools-x86_64-unknown-linux-gnu",
+        "rust-analyzer-x86_64-unknown-linux-gnu",
+        "rust-std-aarch64-apple-ios",
+        "rust-std-aarch64-apple-ios-sim",
+        "rust-std-aarch64-pc-windows-msvc",
+        "rust-std-wasm32-unknown-unknown",
+        "rust-std-wasm32-wasip1",
+        "rust-std-x86_64-pc-windows-gnu",
+        "rust-std-x86_64-pc-windows-msvc",
+        "rust-std-x86_64-unknown-linux-gnu",
+        "rust-std-x86_64-unknown-linux-musl",
+        "rustc-x86_64-unknown-linux-gnu",
+        "rustfmt-x86_64-unknown-linux-gnu"
+      ],
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "targets": [
+        "aarch64-apple-ios",
+        "aarch64-apple-ios-sim",
+        "aarch64-pc-windows-msvc",
+        "wasm32-unknown-unknown",
+        "wasm32-wasip1",
+        "x86_64-pc-windows-gnu",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl"
+      ]
+    },
     "1.91.0-x86_64-unknown-linux-gnu": {
       "components": [
         "cargo-x86_64-unknown-linux-gnu",

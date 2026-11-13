@@ -99,6 +99,16 @@ class ParityTests(unittest.TestCase):
         manifest = json.loads((HERE / "toolchain.json").read_text())
         parity.validate(manifest, SERVER)
 
+    def test_linux_rust_1_100_waits_for_the_next_macos_image(self):
+        manifest = json.loads((HERE / "toolchain.json").read_text())
+        self.assertIn("1.100.0-x86_64-unknown-linux-gnu", SERVER["rust_toolchains"])
+        self.assertNotIn("1.100.0-" + parity.HOST, manifest["rust_toolchains"])
+        self.assertIn("1.100.0", parity.PENDING_MACOS_TOOLCHAINS)
+        parity.validate(manifest, SERVER)
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", parity.PENDING_MACOS_TOOLCHAINS - {"1.100.0"}):
+            with self.assertRaisesRegex(ValueError, "differ from build-server"):
+                parity.validate(manifest, SERVER)
+
     def test_bun_version_outside_server_and_pending_versions_is_rejected(self):
         self.manifest["tools"]["bun"]["version"] = "1.4.3"
         with self.assertRaisesRegex(ValueError, "macOS tool version differs from build-server: bun"):
@@ -128,7 +138,7 @@ class ParityTests(unittest.TestCase):
         chains = server["rust_toolchains"]
         base = chains["1.99.0-x86_64-unknown-linux-gnu"]
         chains["1.93.0-x86_64-unknown-linux-gnu"] = dict(base, rustc="rustc 1.93.0 (aaaaaaaaa 2026-01-22)")
-        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.93.0"}):
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", parity.PENDING_MACOS_TOOLCHAINS | {"1.93.0"}):
             parity.validate(self.manifest, server)
         with self.assertRaisesRegex(ValueError, "differ from build-server"):
             parity.validate(self.manifest, server)
