@@ -74,6 +74,27 @@ struct Record {
 }
 
 impl Record {
+    fn new(
+        start: Start,
+        uid: u32,
+        disk_device: u64,
+        disk_inode: u64,
+        tap_index: Option<u8>,
+    ) -> Self {
+        Self {
+            start,
+            uid,
+            disk_device,
+            disk_inode,
+            released: false,
+            oom_kill: None,
+            exit_acknowledged: false,
+            tap_index,
+            egress_bytes: None,
+            fill_exit_success: None,
+        }
+    }
+
     fn is_tombstone(&self) -> bool {
         self.released && self.exit_acknowledged && self.tap_index.is_none()
     }
@@ -992,18 +1013,7 @@ impl LinuxJobs {
         for path in [&self.records_path, &self.jail] {
             trusted_directory(path)?;
         }
-        let record = Record {
-            start: start.clone(),
-            uid,
-            disk_device: meta.dev(),
-            disk_inode: meta.ino(),
-            released: false,
-            oom_kill: None,
-            exit_acknowledged: false,
-            tap_index,
-            egress_bytes: None,
-            fill_exit_success: None,
-        };
+        let record = Record::new(start.clone(), uid, meta.dev(), meta.ino(), tap_index);
         // The intent is durable before any jail or VMM can open the disk. A
         // crash in setup keeps it reserved until explicit stop has cleaned up.
         self.save(&record)?;
