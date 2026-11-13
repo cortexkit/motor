@@ -108,6 +108,7 @@ pub const SETTLED_OUTPUT: [&[u8]; 2] = [b"before the drop\n", b"after the drop\n
 
 type LeaseReplies = Arc<Mutex<VecDeque<(u16, serde_json::Value, &'static str)>>>;
 type ReplacementHosts = Arc<Mutex<VecDeque<Arc<Mutex<FakeBroker>>>>>;
+type ReplaceAnswers = Arc<Mutex<Vec<(String, u16, tokio::time::Instant)>>>;
 
 pub struct Timeline {
     start: std::time::Instant,
@@ -153,6 +154,8 @@ pub struct Harness {
     pub lease_rerequest_pending: Arc<std::sync::atomic::AtomicBool>,
     pub replacement_hosts: ReplacementHosts,
     pub replace_replies: LeaseReplies,
+    /// Replacement job, response status and answer time, including default replies.
+    pub replace_answers: ReplaceAnswers,
     pub tokens: Arc<AtomicUsize>,
     pub iats: Arc<Mutex<Vec<u64>>>,
     pub runs: Arc<AtomicUsize>,
@@ -832,6 +835,7 @@ impl Harness {
         let replacement_hosts = ReplacementHosts::default();
         let lease_rerequest_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let replace_replies = LeaseReplies::default();
+        let replace_answers = ReplaceAnswers::default();
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -847,6 +851,7 @@ impl Harness {
             let lease_rerequest_pending = lease_rerequest_pending.clone();
             let replacement_hosts = replacement_hosts.clone();
             let replace_replies = replace_replies.clone();
+            let replace_answers = replace_answers.clone();
             let finished = finished.clone();
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
@@ -1033,6 +1038,13 @@ impl Harness {
                         revoking.remove(job);
                         reply.body["lease_id"] = reservations[job].clone();
                     }
+                    if path.ends_with("/replace") {
+                        replace_answers.lock().unwrap().push((
+                            path.split('/').nth(3).unwrap().to_owned(),
+                            reply.status,
+                            tokio::time::Instant::now(),
+                        ));
+                    }
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
                         continue;
                     }
@@ -1065,6 +1077,7 @@ impl Harness {
             lease_rerequest_pending,
             replacement_hosts,
             replace_replies,
+            replace_answers,
             tokens,
             iats,
             runs,

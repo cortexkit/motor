@@ -14,6 +14,16 @@ fn config(h: &Harness, repo: &Path) -> Config {
     }
 }
 
+fn pinned_config(h: &Harness, repo: &Path) -> Config {
+    Config {
+        hosted_repositories_placement_hint: Some(motor_lease::Placement {
+            host: "test-host".into(),
+            vm: Some("test-vm".into()),
+        }),
+        ..config(h, repo)
+    }
+}
+
 pub(super) fn control_placement() -> motor_lease::Placement {
     motor_lease::Placement {
         host: "control-host".into(),
@@ -1154,9 +1164,10 @@ pub(super) async fn terminal_without_more_time(
     job.await.unwrap().1
 }
 
-/// The broker grants a routed job's lease from a stale view of the host, and
-/// the host refuses it as full (or out of capacity) twice before admitting
-/// it. The job waits and asks again with the same job ID and lease body,
+/// A placement hint pins the repository job to its host, so a full-host
+/// refusal must wait without starting revocation. The broker grants from a
+/// stale view and the host refuses it as full (or out of capacity) twice
+/// before admitting it. The job asks again with the same job ID and lease body,
 /// then runs once on the host; nothing is released and nothing reaches the
 /// build server. The clock is held, so each wait ends only when the test
 /// moves time on by two seconds.
@@ -1168,8 +1179,8 @@ async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
         h.host_refusals.lock().unwrap().extend(refusals);
         let (scratch, repo) = committed_repo();
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone())
-            .unwrap();
+        let config = pinned_config(&h, &repo);
+        let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let started = tokio::time::Instant::now();
         let stream = motor.run(request(&repo)).unwrap();
         let id = stream.job_id;
@@ -1204,6 +1215,7 @@ async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
             );
         }
         assert!(lease_settlement_requests(&h).is_empty());
+        assert!(h.replace_answers.lock().unwrap().is_empty());
         let state = motor.hosted_state(id).unwrap();
         assert!(state.repository_routed && state.run_sent);
         assert_eq!(state.placement_attempts, 1);
@@ -1211,8 +1223,9 @@ async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
     }
 }
 
-/// A host that stays full uses up the routed job's queue-wait budget and no
-/// more, then gives the same typed, retryable refusal as broker no_capacity.
+/// A placement hint keeps a full repository host from being replaced. Waiting
+/// for that host consumes the queue budget and no more, then gives the same
+/// typed, retryable refusal as broker no_capacity.
 /// The unused reservation is released; nothing reaches the build server.
 /// With a three-second budget and the clock held, the job asks exactly
 /// twice: at the start and after one two-second wait. A second wait would
@@ -1222,7 +1235,7 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
     let _clock = HeldClock::new();
     let h = Harness::new(Behavior::Refuse("host_full")).await;
     let (scratch, repo) = committed_repo();
-    let config = config(&h, &repo);
+    let config = pinned_config(&h, &repo);
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let started = tokio::time::Instant::now();
@@ -1275,6 +1288,7 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
     );
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert!(!motor.hosted_state(id).unwrap().run_sent);
+    assert!(h.replace_answers.lock().unwrap().is_empty());
     assert_eq!(
         lease_settlement_requests(&h),
         vec![format!("/v1/leases/{id}/release")]
@@ -1283,7 +1297,7 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
 }
 
 /// The queue-wait budget can end while a lease request is in flight. Once
-/// the host has refused the job as full, the job is waiting for that host,
+/// the pinned host has refused the job as full, the job is waiting for it,
 /// so cutting off the request that asks again still gives the host-full
 /// refusal (runner full, retry after 2 s), not the transport failure the
 /// cut-off causes, and the unused reservation is released. A broker that
@@ -1297,7 +1311,7 @@ async fn stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_
         let leases = if after_host_full { 2 } else { 1 };
         h.unanswered_lease.store(leases, Ordering::SeqCst);
         let (scratch, repo) = committed_repo();
-        let config = config(&h, &repo);
+        let config = pinned_config(&h, &repo);
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
         let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let started = tokio::time::Instant::now();
@@ -1338,6 +1352,7 @@ async fn stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_
         assert_eq!(h.tokens.load(Ordering::SeqCst), leases - 1);
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
         assert!(!motor.hosted_state(id).unwrap().run_sent);
+        assert!(h.replace_answers.lock().unwrap().is_empty());
         if after_host_full {
             assert_eq!(
                 lease_settlement_requests(&h),
