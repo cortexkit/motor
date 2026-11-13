@@ -92,14 +92,15 @@ fn missing_oom_evidence_names_path_and_retries_without_inventing_zero() {
 
 #[test]
 fn job_relay_failure_does_not_block_concurrent_exit_collection() {
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{mpsc, Arc};
     for socket_state in ["absent", "refused", "silent", "backlog"] {
-        let base = scratch();
-        let root = base.join("relay");
+        let mut vmm = Vmm::new();
+        let jobs = Arc::new(running_fixture(&vmm));
+        let root = jobs.root(&start().job_id);
         std::fs::create_dir_all(&root).unwrap();
-        let listener = (socket_state != "absent")
-            .then(|| UnixListener::bind(root.join("vsock.sock")).unwrap());
+        let listener = (socket_state != "absent").then(|| bind_socket(&root, "vsock.sock"));
         let listener = if socket_state == "refused" {
             drop(listener);
             None
@@ -110,33 +111,276 @@ fn job_relay_failure_does_not_block_concurrent_exit_collection() {
         if socket_state == "backlog" {
             let listener = listener.as_ref().unwrap();
             assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
-            queued.push(UnixStream::connect(root.join("vsock.sock")).unwrap());
+            let directory = File::open(&root).unwrap();
+            queued.push(
+                UnixStream::connect(format!(
+                    "/proc/self/fd/{}/vsock.sock",
+                    directory.as_raw_fd()
+                ))
+                .unwrap(),
+            );
         }
-        let jobs = Arc::new(Mutex::new(fixture(&base)));
-        let (entered, rx) = mpsc::channel();
+        let (waiting, release) = pause_io(&jobs, ExitStep::RelayConnect);
         let worker = jobs.clone();
-        let relay = std::thread::spawn(move || {
-            // This fixture deliberately holds an outer mutex for the whole open.
-            let _guard = worker.lock().unwrap();
-            entered.send(()).unwrap();
-            assert!(tenant::connect_job_relay(&root, peer().uid, 53).is_err());
-        });
-        rx.recv().unwrap();
-        let started = std::time::Instant::now();
-        assert!(reports(&mut jobs.lock().unwrap()).is_empty());
-        let bound = if socket_state == "silent" {
-            Duration::from_secs(3)
+        let relay =
+            std::thread::spawn(move || worker.handle(Operation::Relay(start().job_id, 53), peer()));
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let silent_peer = if socket_state == "silent" {
+            release.send(()).unwrap();
+            let listener = listener.as_ref().unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 11];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"CONNECT 53\n");
+            Some(stream)
         } else {
-            Duration::from_secs(1)
+            None
         };
+        vmm.child.kill().unwrap();
+        vmm.child.wait().unwrap();
+        empty_group(&jobs, 3);
+        let collecting = jobs.clone();
+        let (sent, collected) = mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            collecting.collect_exits().unwrap();
+            sent.send(()).unwrap();
+        });
+        let collection = collected.recv_timeout(Duration::from_millis(500));
+        let exits = bounded_poll(&jobs);
+        if socket_state != "silent" {
+            release.send(()).unwrap();
+        }
+        assert!(relay.join().unwrap().is_err());
+        collector.join().unwrap();
         assert!(
-            started.elapsed() < bound,
-            "{socket_state} relay delayed job_exits: {:?}",
-            started.elapsed()
+            collection.is_ok(),
+            "{socket_state} relay blocked collection"
         );
-        relay.join().unwrap();
-        drop((listener, queued, jobs));
-        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(exits, [expected(3)], "{socket_state}");
+        drop((listener, queued, silent_peer, jobs));
+    }
+}
+
+fn running_fixture(vmm: &Vmm) -> LinuxJobs {
+    let jobs = fixture(&vmm.base);
+    let record = start_record(&jobs, start(), peer().uid, None);
+    jobs.save(&record).unwrap();
+    empty_group(&jobs, 0);
+    std::fs::write(
+        jobs.group(&start().job_id).join("cgroup.procs"),
+        vmm.child.id().to_string(),
+    )
+    .unwrap();
+    jobs.adopt_record(record).unwrap();
+    jobs
+}
+
+fn bind_socket(root: &Path, name: &str) -> std::os::unix::net::UnixListener {
+    // The shared scratch prefix plus the jail's UUID can exceed sun_path.
+    // A directory fd keeps the fixture under scratch without that name limit.
+    let directory = File::open(root).unwrap();
+    std::os::unix::net::UnixListener::bind(format!(
+        "/proc/self/fd/{}/{name}",
+        directory.as_raw_fd()
+    ))
+    .unwrap()
+}
+
+fn pause_io(
+    jobs: &LinuxJobs,
+    step: ExitStep,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    jobs.pause_exit_at(step, move || {
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    (waiting, release)
+}
+
+fn bounded_poll(jobs: &std::sync::Arc<LinuxJobs>) -> Vec<ExitReport> {
+    let polling = jobs.clone();
+    let (sent, received) = std::sync::mpsc::channel();
+    let poll = std::thread::spawn(move || {
+        sent.send(polling.handle(Operation::Exits, peer())).unwrap();
+    });
+    let response = received
+        .recv_timeout(Duration::from_millis(200))
+        .expect("job_exits waited for job I/O")
+        .unwrap();
+    poll.join().unwrap();
+    match response.reply {
+        Reply::JobExits { exits } => exits,
+        reply => panic!("unexpected exit poll: {reply:?}"),
+    }
+}
+
+#[test]
+fn relay_drops_connected_fd_if_exit_is_published_before_post_check() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    let mut vmm = Vmm::new();
+    let jobs = Arc::new(running_fixture(&vmm));
+    let root = jobs.root(&start().job_id);
+    std::fs::create_dir_all(&root).unwrap();
+    let listener = bind_socket(&root, "vsock.sock");
+    let (waiting, release) = pause_io(&jobs, ExitStep::RelayConnected);
+    let worker = jobs.clone();
+    let relay =
+        std::thread::spawn(move || worker.handle(Operation::Relay(start().job_id, 53), peer()));
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut request = [0; 11];
+    stream.read_exact(&mut request).unwrap();
+    assert_eq!(&request, b"CONNECT 53\n");
+    stream.write_all(b"OK 53\n").unwrap();
+    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+    vmm.child.kill().unwrap();
+    vmm.child.wait().unwrap();
+    empty_group(&jobs, 5);
+    jobs.collect_exits().unwrap();
+    assert_eq!(bounded_poll(&jobs), [expected(5)]);
+    release.send(()).unwrap();
+    let result = relay.join().unwrap();
+    // Read before dropping the returned result: a mistakenly accepted relay
+    // would still own its descriptor and leave the peer open here.
+    let closed = stream.read(&mut [0]);
+    assert_eq!(result.err().unwrap().0, "job VM is not running");
+    assert_eq!(closed.unwrap(), 0, "refused relay leaked its connected fd");
+}
+
+#[test]
+fn paused_memory_and_silent_balloon_allow_same_job_stop_to_publish_exit() {
+    use std::io::{Read, Write};
+    use std::sync::{mpsc, Arc};
+
+    for memory in [true, false] {
+        let mut vmm = Vmm::new();
+        let jobs = Arc::new(running_fixture(&vmm));
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let api = if memory {
+            jobs.pause_exit_at(ExitStep::MemoryRead, move || {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            None
+        } else {
+            let root = jobs.root(&start().job_id);
+            std::fs::create_dir_all(&root).unwrap();
+            let listener = bind_socket(&root, "api.sock");
+            Some(std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 1024);
+                }
+                assert!(request.starts_with(b"PATCH /balloon HTTP/1.1\r\n"));
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .unwrap();
+            }))
+        };
+        let worker = jobs.clone();
+        let (sent, finished) = mpsc::channel();
+        let io = std::thread::spawn(move || {
+            let op = if memory {
+                Operation::Memory(start().job_id)
+            } else {
+                Operation::Balloon(start().job_id, 0)
+            };
+            sent.send(worker.handle(op, peer())).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(bounded_poll(&jobs).is_empty());
+        vmm.child.kill().unwrap();
+        vmm.child.wait().unwrap();
+        empty_group(&jobs, 6);
+        let stopping = jobs.clone();
+        let (sent, stopped) = mpsc::channel();
+        let stop = std::thread::spawn(move || {
+            sent.send(stopping.handle(Operation::Stop(start().job_id), peer()))
+                .unwrap();
+        });
+        let completion = stopped.recv_timeout(Duration::from_millis(500));
+        let exits = bounded_poll(&jobs);
+        let still_waiting = matches!(finished.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release.send(()).unwrap();
+        io.join().unwrap();
+        if let Some(api) = api {
+            api.join().unwrap();
+        }
+        stop.join().unwrap();
+        assert!(still_waiting, "memory={memory}: I/O ended before stop");
+        assert_eq!(
+            exits,
+            [expected(6)],
+            "memory={memory}: stop could not publish"
+        );
+        let result = completion.expect("stop waited for memory or balloon I/O");
+        if peer().uid == 0 {
+            assert!(matches!(
+                result.unwrap().reply,
+                Reply::Job { running: false, .. }
+            ));
+            assert!(read_record(&jobs).released);
+        } else {
+            assert!(result.err().unwrap().0.contains("must be root-owned"));
+            assert!(!read_record(&jobs).released);
+        }
+        assert_eq!(
+            finished
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap()
+                .0,
+            "job VMM exited during memory operation",
+            "memory={memory}: lost pidfd post-check"
+        );
+    }
+}
+
+#[test]
+fn relay_memory_and_balloon_refuse_exited_and_released_views_before_io() {
+    use super::super::registry::State;
+    for state in [State::Exited, State::Released] {
+        for evidence in [false, true] {
+            let vmm = Vmm::new();
+            let jobs = running_fixture(&vmm);
+            let cell = jobs.cell(&start().job_id).unwrap();
+            let mut writer = cell.0.lock();
+            writer.state = state;
+            let mut record = writer.record.clone();
+            record.released = state == State::Released;
+            record.oom_kill = evidence.then_some(7);
+            jobs.persist(&mut writer, record).unwrap();
+            for op in [
+                Operation::Relay(start().job_id, 53),
+                Operation::Memory(start().job_id),
+                Operation::Balloon(start().job_id, 0),
+            ] {
+                assert_eq!(
+                    jobs.handle(op, peer()).err().unwrap().0,
+                    "job VM is not running"
+                );
+            }
+        }
     }
 }
 
