@@ -215,7 +215,8 @@ There is no full-copy fallback.
 Agents speaking macOS protocol version 2 format and mount each job's build disk
 at `target/` (see `docs/macos-runner.md`). The runner refuses an image whose agent
 reports version 1, so install the runner and an image carrying a version 2 agent
-together; an `agent-swap` is enough, as the seal steps are unchanged. The agent
+together. The offline agent update above is enough: nothing else in the
+sealed image changes, so the image need not be rebuilt and resealed. The agent
 uses only tools every macOS guest has: `/usr/sbin/diskutil`, `/usr/bin/plutil` and
 `/sbin/mount_apfs`. After installing, run
 `script/macos-runner/build-disk-e2e.sh` (below) once on the VM host.
