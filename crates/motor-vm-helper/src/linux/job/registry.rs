@@ -190,11 +190,27 @@ impl LinuxJobs {
     }
 
     pub(super) fn publish(&self, state: &JobState) {
+        let id = &state.record.start.job_id;
+        let published = self
+            .registry
+            .lock()
+            .get_mut(id)
+            .map(|entry| entry.view = JobView::from(state))
+            .is_some();
+        // Pruning may retire a cell that a late request still holds. Its view
+        // is gone for good; never recreate it, and never panic while holding R.
+        if !published {
+            eprintln!("job {id} view was already retired; not publishing");
+        }
+    }
+
+    /// Whether `cell` is still the registered cell for `id`. A writer that
+    /// looked a cell up before taking its J must check this before any change.
+    pub(super) fn is_registered(&self, id: &str, cell: &Arc<JobCell>) -> bool {
         self.registry
             .lock()
-            .get_mut(&state.record.start.job_id)
-            .unwrap()
-            .view = JobView::from(state);
+            .get(id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.cell, cell))
     }
 
     pub(super) fn persist(&self, state: &mut JobState, record: Record) -> Result<()> {

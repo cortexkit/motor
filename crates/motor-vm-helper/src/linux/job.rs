@@ -31,6 +31,11 @@ const JOB_CACHE_WRITE_BOOT_SUFFIX: &str = " motor.cache_write=1";
 const FILL_BOOT_SUFFIX: &str = " motor.fill=1";
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+// The kernel takes an exiting task out of cgroup.procs a moment before the task
+// becomes a zombie its parent can reap, so collection may briefly wait for it.
+const REAP_WAIT: Duration = Duration::from_secs(5);
+// After cgroup.kill a VMM still has to release guest RAM before it exits.
+const STOP_WAIT: Duration = Duration::from_secs(10);
 // Without huge pages, the guest defaults to reporting only whole 4 MiB blocks.
 // Report 128 KiB blocks so fragmented pages freed from file cache reach the host.
 const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1 page_reporting.page_reporting_order=5";
@@ -133,6 +138,10 @@ pub(super) enum ExitStep {
     RelayConnected,
     #[cfg(test)]
     MemoryRead,
+    #[cfg(test)]
+    Reap,
+    #[cfg(test)]
+    FillAdmission,
     Stop,
     Adopt,
     Ack,
@@ -183,6 +192,7 @@ struct TestHooks {
     exit_fault: Option<ExitStep>,
     exit_pause: Option<(ExitStep, Box<dyn FnMut() + Send>)>,
     collector_spawns: usize,
+    child_wait: Option<Duration>,
 }
 
 impl LinuxJobs {
@@ -445,37 +455,67 @@ impl LinuxJobs {
         Ok(Some(pid))
     }
 
-    fn reap_job(&self, state: &mut JobState) {
+    /// Reaps this helper's own VMM child once it has exited, waiting at most
+    /// `wait`, and returns false while the child still runs. The child's pidfd
+    /// is dropped with it, so a finished job never keeps a descriptor open
+    /// until its record is pruned.
+    fn reap_job(&self, state: &mut JobState, wait: Duration) -> Result<bool> {
         let Some(child) = state.child.as_mut() else {
-            return;
+            if state.pidfd.take().is_some() {
+                self.publish(state);
+            }
+            return Ok(true);
+        };
+        let Some(status) = process::wait_child(child, wait)? else {
+            return Ok(false);
         };
         let id = state.record.start.job_id.clone();
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                eprintln!("job {id} VMM exited: {status}");
-                log_console_tail(&id, &self.boundary(&id));
-                if state.record.start.kind == job::VmKind::Fill {
-                    let mut record = state.record.clone();
-                    record.fill_exit_success = Some(status.success());
-                    if let Err(error) = self.persist(state, record) {
-                        self.log_collection_failure(state, CollectionFailure::Evidence, &error);
-                        return;
-                    }
-                }
-                state.child = None;
-            }
-            Ok(None) => (),
-            Err(error) => {
-                self.log_collection_failure(state, CollectionFailure::Reap, &error);
-            }
+        eprintln!("job {id} VMM exited: {status}");
+        log_console_tail(&id, &self.boundary(&id));
+        if state.record.start.kind == job::VmKind::Fill {
+            // std keeps the reaped status in the Child, so a failed write is
+            // retried with the same status while the child stays recorded.
+            let mut record = state.record.clone();
+            record.fill_exit_success = Some(status.success());
+            self.persist(state, record)?;
         }
+        state.child = None;
+        state.pidfd = None;
+        self.publish(state);
+        Ok(true)
+    }
+
+    /// An empty cgroup.procs proves the VMM has stopped running, not that it
+    /// has been reaped. Until it is, its zombie keeps the job's uid busy and a
+    /// fill's exit status is unknown, so evidence waits for the reap.
+    fn reap_exited(&self, state: &mut JobState) -> Result<()> {
+        #[cfg(test)]
+        if state.child.is_some() {
+            self.exit_checkpoint(ExitStep::Reap)?;
+        }
+        let wait = self.child_wait(REAP_WAIT);
+        if self.reap_job(state, wait)? {
+            Ok(())
+        } else {
+            Err(Error(format!(
+                "job VMM left its cgroup but was not reaped within {wait:?}; retrying"
+            )))
+        }
+    }
+
+    fn child_wait(&self, wait: Duration) -> Duration {
+        #[cfg(test)]
+        if let Some(wait) = self.hooks.lock().unwrap().child_wait {
+            return wait;
+        }
+        wait
     }
 
     #[cfg(test)]
     fn reap(&self) {
         for (_, cell, _) in self.snapshot() {
             if let Some(mut state) = cell.0.try_lock() {
-                self.reap_job(&mut state);
+                let _ = self.reap_job(&mut state, Duration::ZERO);
             }
         }
     }
@@ -584,6 +624,9 @@ impl LinuxJobs {
         let group = self.group(&id);
         if !group.try_exists()? {
             // A reboot can erase cgroups. No count is better than an invented 0.
+            // A removed group says nothing about our own child: reap it first.
+            *kind = CollectionFailure::Reap;
+            self.reap_exited(state)?;
             *kind = CollectionFailure::Credentials;
             self.remove_credentials(&id)?;
             *kind = CollectionFailure::Network;
@@ -601,6 +644,8 @@ impl LinuxJobs {
         {
             return Ok(());
         }
+        *kind = CollectionFailure::Reap;
+        self.reap_exited(state)?;
         *kind = CollectionFailure::Credentials;
         self.remove_credentials(&id)?;
         let mut record = state.record.clone();
@@ -905,6 +950,33 @@ impl LinuxJobs {
         }
     }
 
+    /// Opens the disk a finished fill's VM wrote, as named by its execution
+    /// record. None means the disk is gone and there is nothing to promote.
+    /// The open descriptor keeps the inode allocated, so no later disk at
+    /// the same path can share its device and inode numbers.
+    fn open_executed_disk(&self, record: &Record) -> Result<Option<(u64, u64, File)>> {
+        let path = self
+            .workspaces
+            .join(&record.start.workspace_disk_id)
+            .join("workspace.img");
+        let disk = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(disk) => disk,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let meta = disk.metadata()?;
+        if (meta.dev(), meta.ino()) != (record.disk_device, record.disk_inode) {
+            return Err(Error(
+                "fill disk is not the disk its VM ran on; refusing promotion".into(),
+            ));
+        }
+        Ok(Some((meta.dev(), meta.ino(), disk)))
+    }
+
     fn disk_available_identity(&self, disk_id: &str) -> Result<()> {
         if self
             .records()
@@ -930,38 +1002,66 @@ impl LinuxJobs {
     fn finish_fill(&self, fill: &job::Fill, mut published: bool) -> Result<bool> {
         let requested_publication = published;
         let id = fill.disk_id();
+        // The disk this fill's VM wrote: its identity from the execution record,
+        // and an open descriptor so the inode number cannot be reused by a
+        // replacement disk before promotion compares it under admission.
+        let mut executed = None;
+        let mut registered = false;
         // Only this fill's writer is needed while waiting for its VM to stop.
         // Holding admission here would delay every unrelated start/workspace.
         if let Ok(cell) = self.cell(&fill.fill_id) {
             let mut state = cell.0.lock();
-            let record = &state.record;
-            if record.start.kind != job::VmKind::Fill
-                || record.start.account != fill.account
-                || record.start.workspace_disk_id != id
-            {
-                return Err(Error("fill execution identity mismatch".into()));
+            // Pruning can retire an expired tombstone between the lookup and
+            // J. A retired cell is finished: never change or publish it again.
+            registered = self.is_registered(&fill.fill_id, &cell);
+            if registered {
+                let record = &state.record;
+                if record.start.kind != job::VmKind::Fill
+                    || record.start.account != fill.account
+                    || record.start.workspace_disk_id != id
+                {
+                    return Err(Error("fill execution identity mismatch".into()));
+                }
+                // Finishing must observe this fill's final child status and
+                // evidence even when maintenance has not run since the exit.
+                self.reap_job(&mut state, Duration::ZERO)?;
+                self.collect_exit_locked(&mut state)?;
+                let record = &state.record;
+                if published {
+                    published = self.pid(record)?.is_none()
+                        && record.oom_kill == Some(0)
+                        && record.fill_exit_success == Some(true);
+                }
+                self.stop_locked(&mut state)?;
+                if published {
+                    executed = self.open_executed_disk(&state.record)?;
+                    published = executed.is_some();
+                }
             }
-            // Finishing must observe this fill's final child status and evidence
-            // even when maintenance has not run since the guest exited.
-            self.reap_job(&mut state);
-            self.collect_exit_locked(&mut state)?;
-            let record = &state.record;
-            if published {
-                published = self.pid(record)?.is_none()
-                    && record.oom_kill == Some(0)
-                    && record.fill_exit_success == Some(true);
-            }
-            self.stop_locked(&mut state)?;
-        } else {
+        }
+        if !registered {
             published = false;
         }
+        #[cfg(test)]
+        self.exit_checkpoint(ExitStep::FillAdmission)?;
         // The job guard is gone before admission: disk identity and promotion
         // must serialize with new reservations, never with a running VM's I/O.
         let _admission = self.admission.lock();
         if self.workspaces.join(&id).try_exists()? {
-            let (registry, _) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
+            let (registry, disk) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
             if workspace::read_fill(&self.workspaces, &id)? != *fill {
                 return Err(Error("fill provenance mismatch".into()));
+            }
+            // Between J and admission, a discard of this fill and a new
+            // PrepareFill can put an unbuilt disk with identical provenance at
+            // this path. Only the disk the VM wrote may become a base.
+            if let Some((device, inode, _)) = &executed {
+                let meta = disk.metadata()?;
+                if (meta.dev(), meta.ino()) != (*device, *inode) {
+                    return Err(Error(
+                        "fill disk was replaced after its VM ran; refusing promotion".into(),
+                    ));
+                }
             }
             if registry.role == job::WorkspaceRole::Base {
                 return if requested_publication {
@@ -1322,10 +1422,16 @@ impl LinuxJobs {
         let group = self.group(id);
         if group.try_exists()? {
             std::fs::write(group.join("cgroup.kill"), "1")?;
-            if let Some(mut child) = state.child.take() {
-                let status = child.wait()?;
-                eprintln!("job {id} VMM stopped by the helper: {status}");
-                log_console_tail(id, &self.boundary(id));
+            if state.child.is_some() {
+                let wait = self.child_wait(STOP_WAIT);
+                if !self.reap_job(state, wait)? {
+                    // Without proof that the VMM is gone nothing may be
+                    // reported or released; the child stays ours to reap.
+                    return Err(Error(format!(
+                        "job {id} VMM did not exit within {wait:?} of cgroup.kill; its disk, uid and TAP stay reserved"
+                    )));
+                }
+                eprintln!("job {id} VMM stopped by the helper");
             }
             tenant::wait_empty(&group)?;
         }
@@ -1342,6 +1448,7 @@ impl LinuxJobs {
         record.released = true;
         self.persist(state, record)?;
         state.state = State::Released;
+        state.pidfd = None;
         self.publish(state);
         Ok(())
     }
