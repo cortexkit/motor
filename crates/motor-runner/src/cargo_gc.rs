@@ -55,6 +55,12 @@ fn hex_component(path: &Path, length: usize) -> Option<String> {
 }
 
 fn stale_profiles(target: &Path) -> io::Result<Vec<PathBuf>> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    }
     let mut found = profiles(target)?;
     // The runner's per-checkout build roots are not ordinary Cargo profiles.
     // Descend only the two exact hash components, never arbitrary job trees.
@@ -72,7 +78,7 @@ fn stale_profiles(target: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn incremental(target: &Path) -> io::Result<Vec<PathBuf>> {
-    Ok(profiles(target)?
+    Ok(stale_profiles(target)?
         .into_iter()
         .map(|profile| profile.join("incremental"))
         .filter(|path| fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()))
@@ -510,5 +516,57 @@ mod tests {
             .iter()
             .flatten()
             .any(|path| path == &script));
+    }
+
+    #[test]
+    fn incremental_visits_both_layouts_only_inside_physical_workspace_hash_roots() {
+        let scratch = ScratchDir::new("cargo-incremental-build-roots");
+        let target = scratch.join("target");
+        let now = SystemTime::now();
+        let mut expected = Vec::new();
+        for (hash, tree, prefix) in [
+            ("00000000000001", fixture::V1, ""),
+            ("00000000000002", fixture::V2, "x86_64-unknown-linux-gnu"),
+        ] {
+            let build = target.join("bd/ab").join(hash).join(prefix);
+            fixture::materialize(&build, tree);
+            output(&build, "debug/incremental/local-session/state.bin", now);
+            expected.push(build.join("debug/incremental"));
+        }
+        output(&target, "release/incremental/legacy-session/state.bin", now);
+        expected.push(target.join("release/incremental"));
+        for root in [
+            "bd/a/00000000000001",
+            "bd/abc/00000000000001",
+            "bd/gh/00000000000001",
+            "bd/ab/0000000000001",
+            "bd/ab/000000000000001",
+            "bd/ab/not-a-workspace",
+        ] {
+            output(&target.join(root), "debug/incremental/keep/state.bin", now);
+        }
+        let outside = scratch.join("outside");
+        output(&outside, "debug/incremental/keep/state.bin", now);
+        std::os::unix::fs::symlink(&outside, target.join("bd/ab/00000000000003")).unwrap();
+        std::os::unix::fs::symlink(target.join("bd/ab"), target.join("bd/cd")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("debug"),
+            target.join("bd/ab/00000000000001/custom"),
+        )
+        .unwrap();
+        fs::create_dir_all(target.join("bd/ab/00000000000004/debug")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("debug/incremental"),
+            target.join("bd/ab/00000000000004/debug/incremental"),
+        )
+        .unwrap();
+        let mut actual = incremental(&target).unwrap();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        let linked_target = scratch.join("linked-target");
+        std::os::unix::fs::symlink(&target, &linked_target).unwrap();
+        assert!(incremental(&linked_target).unwrap().is_empty());
+        assert!(outside.join("debug/incremental/keep/state.bin").is_file());
     }
 }
