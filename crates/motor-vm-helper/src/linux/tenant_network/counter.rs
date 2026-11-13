@@ -28,8 +28,9 @@ pub(super) fn output(command: &mut Command) -> Result<Option<Output>> {
 
 /// Runs `command` for at most DEADLINE plus KILL_GRACE. A query that `settle`
 /// has not reaped within KILL_GRACE of its kill goes to `reap` on a background
-/// thread, and the result is unmeasured: the caller is holding a job's exit
-/// evidence open meanwhile.
+/// thread and the result is unmeasured (None). Exit collection calls this
+/// while it holds a finished job's lock and before it has recorded the job's
+/// exit, so waiting longer here would delay that job's exit report.
 pub(super) fn output_with(
     command: &mut Command,
     reapers: &'static AtomicUsize,

@@ -49,7 +49,8 @@ fn late_finish_fill_after_tombstone_pruning_neither_panics_nor_publishes() {
         .unwrap();
     jobs.adopt_record(tombstone).unwrap();
     let cell = jobs.cell(&id).unwrap();
-    // The pruner pauses holding the tombstone's J, before removing anything.
+    // The pruner pauses holding the tombstone's writer lock (J), before it
+    // removes anything.
     let (waiting, release) = pause(&jobs, ExitStep::Prune);
     let pruning = jobs.clone();
     let pruner = std::thread::spawn(move || pruning.prune_records(SystemTime::now()));
@@ -97,7 +98,8 @@ fn isolated_fill_promotion_refuses_a_disk_recreated_after_execution() {
     let record = finished_fill(executed.0, executed.1);
     jobs.save(&record).unwrap();
     jobs.adopt_record(record).unwrap();
-    // F1 publishes the executed disk but pauses after J, before admission.
+    // The publishing FinishFill pauses after releasing the cell's writer lock
+    // (J) and before taking admission.
     let (waiting, release) = pause(&jobs, ExitStep::FillAdmission);
     let publishing = jobs.clone();
     let publish = std::thread::spawn(move || {
@@ -110,7 +112,7 @@ fn isolated_fill_promotion_refuses_a_disk_recreated_after_execution() {
         )
     });
     waiting.recv_timeout(Duration::from_secs(2)).unwrap();
-    // F2 discards the same fill and a new PrepareFill recreates its disk with
+    // A second FinishFill discards the same fill and a new PrepareFill recreates its disk with
     // identical fill.json.
     let discarded = jobs
         .handle(
