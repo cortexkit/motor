@@ -124,16 +124,57 @@ pub(super) struct Entry {
     pub active: AtomicBool,
     pub failed: AtomicBool,
     cleanup: Mutex<()>,
+    /// True once the job's build disk is published. Held from publication's
+    /// last cancellation check through its rename, and by every cancel.
+    publication: Mutex<bool>,
     #[cfg(test)]
     pub output_blocked: AtomicBool,
 }
 impl Entry {
+    fn new(record: Record, slot: Option<File>, active: bool) -> Self {
+        Self {
+            owned: Mutex::new(Owned {
+                record,
+                slot,
+                workspace_lock: None,
+                helper: None,
+            }),
+            cancel: Cancellation::default(),
+            active: AtomicBool::new(active),
+            failed: AtomicBool::new(false),
+            cleanup: Mutex::new(()),
+            publication: Mutex::new(false),
+            #[cfg(test)]
+            output_blocked: AtomicBool::new(false),
+        }
+    }
     pub fn check(&self) -> io::Result<()> {
         if self.cancel.0.load(Ordering::Acquire) {
             Err(invalid("macOS job cancelled"))
         } else {
             Ok(())
         }
+    }
+    /// Cancels the job. A cancel either lands before the build disk's
+    /// publication commits, which then publishes nothing, or waits for it to
+    /// finish; returns whether the disk was already published.
+    pub fn cancel_job(&self) -> bool {
+        let published = self.publication.lock().unwrap();
+        self.cancel.cancel();
+        *published
+    }
+    /// Runs `commit`, the build disk's rename, unless the job is cancelled,
+    /// with cancellation held off until it returns, and records success.
+    pub fn publish(&self, commit: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let mut published = self.publication.lock().unwrap();
+        self.check()?;
+        commit()?;
+        *published = true;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub fn published(&self) -> bool {
+        *self.publication.lock().unwrap()
     }
 }
 
@@ -372,20 +413,7 @@ impl Runtime {
         };
         // This durable inventory precedes staging, including the first job directory.
         Self::save(root, &record)?;
-        let entry = Arc::new(Entry {
-            owned: Mutex::new(Owned {
-                record,
-                slot: None,
-                workspace_lock: None,
-                helper: None,
-            }),
-            cancel: Cancellation::default(),
-            active: AtomicBool::new(true),
-            failed: AtomicBool::new(false),
-            cleanup: Mutex::new(()),
-            #[cfg(test)]
-            output_blocked: AtomicBool::new(false),
-        });
+        let entry = Arc::new(Entry::new(record, None, true));
         if self.cancelled.lock().unwrap().contains(&id) {
             entry.cancel.cancel();
         }
@@ -398,13 +426,15 @@ impl Runtime {
     pub fn cancel(&self, id: Uuid) {
         self.cancelled.lock().unwrap().insert(id);
         if let Some(entry) = self.entry(id) {
-            entry.cancel.cancel();
+            if entry.cancel_job() {
+                tracing::info!(job_id = %id, "cancel arrived after the build disk was published");
+            }
         }
     }
     pub fn interrupt(&self, id: Uuid) {
         if let Some(entry) = self.entry(id) {
             self.cancelled.lock().unwrap().insert(id);
-            entry.cancel.cancel();
+            entry.cancel_job();
         }
     }
     pub fn cancelled(&self, id: Uuid) -> bool {
@@ -800,23 +830,10 @@ impl Runtime {
                 let _ = fs2::FileExt::try_lock_exclusive(file);
             }
             let id = record.id;
-            self.jobs.lock().unwrap().insert(
-                id,
-                Arc::new(Entry {
-                    owned: Mutex::new(Owned {
-                        record,
-                        slot,
-                        workspace_lock: None,
-                        helper: None,
-                    }),
-                    cancel: Cancellation::default(),
-                    active: AtomicBool::new(false),
-                    failed: AtomicBool::new(false),
-                    cleanup: Mutex::new(()),
-                    #[cfg(test)]
-                    output_blocked: AtomicBool::new(false),
-                }),
-            );
+            self.jobs
+                .lock()
+                .unwrap()
+                .insert(id, Arc::new(Entry::new(record, slot, false)));
         }
         let entries: Vec<_> = self.jobs.lock().unwrap().values().cloned().collect();
         for entry in entries {

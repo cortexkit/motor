@@ -111,6 +111,120 @@ fn open_directory_at(directory: &File, name: &str) -> io::Result<File> {
     open_at(directory, name, libc::O_RDONLY | libc::O_DIRECTORY)
 }
 
+/// The normal components of an absolute path, refusing `.`, `..` and empty ones.
+pub fn components(path: &Path) -> io::Result<Vec<&str>> {
+    let text = path
+        .to_str()
+        .and_then(|text| text.strip_prefix('/'))
+        .ok_or_else(|| invalid(format!("not an absolute path: {}", path.display())))?;
+    let parts: Vec<&str> = text.split('/').collect();
+    if parts.iter().any(|part| matches!(*part, "" | "." | "..")) {
+        return Err(invalid(format!("not a normal path: {}", path.display())));
+    }
+    Ok(parts)
+}
+
+/// Whether the job account could rename or replace entries in a directory:
+/// it owns it, or the directory is writable by its group or by everyone.
+fn job_writable(metadata: &std::fs::Metadata, uid: libc::uid_t, gid: libc::gid_t) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == uid
+        || metadata.mode() & 0o002 != 0
+        || (metadata.gid() == gid && metadata.mode() & 0o020 != 0)
+}
+
+/// Opens a directory by walking from `root` one component at a time, never
+/// following a link. With `job`, every directory above the last one, `root`
+/// included, must be out of the job account's reach (see `job_writable`).
+fn walk(root: &File, parts: &[&str], job: Option<(libc::uid_t, libc::gid_t)>) -> io::Result<File> {
+    let mut current = root.try_clone()?;
+    for part in parts {
+        if let Some((uid, gid)) = job
+            && job_writable(&current.metadata()?, uid, gid)
+        {
+            return Err(invalid(format!(
+                "a directory above the workspace is writable by the job account, at {part}"
+            )));
+        }
+        current = open_directory_at(&current, part)
+            .map_err(|e| invalid(format!("{part}: not a plain directory: {e}")))?;
+    }
+    Ok(current)
+}
+
+/// Opens the workspace share's directory before any job code runs. Refuses a
+/// workspace below a directory the job account could change: during its run
+/// the job could rename such a directory and leave a link in its place, so
+/// that the path the agent unmounts afterwards names another mount.
+pub fn open_workspace(
+    root: &File,
+    workspace: &Path,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> io::Result<File> {
+    walk(root, &components(workspace)?, Some((uid, gid)))
+}
+
+/// Reopens a directory by its absolute path from `root` without following
+/// any link, so a renamed ancestor cannot redirect the agent.
+pub fn reopen(root: &File, path: &Path) -> io::Result<File> {
+    walk(root, &components(path)?, None)
+}
+
+/// Gives the volume's root to the job account. An earlier job of the
+/// checkout owned that root and may have set user flags such as `uchg` on it,
+/// which would make even root's chmod fail; root clears them first.
+pub fn take_ownership(root: &File, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        let flags = root.metadata()?.st_flags();
+        if flags & libc::UF_SETTABLE != 0 {
+            check(unsafe { libc::fchflags(root.as_raw_fd(), flags & !libc::UF_SETTABLE) })?;
+        }
+    }
+    check(unsafe { libc::fchown(root.as_raw_fd(), uid, gid) })?;
+    check(unsafe { libc::fchmod(root.as_raw_fd(), 0o755) })?;
+    Ok(())
+}
+
+/// The disk operations `attach` chooses between, so tests can check its
+/// decisions without a disk.
+pub trait DiskSteps {
+    /// Whether the build disk is all zero, as the host creates it.
+    fn blank(&mut self) -> io::Result<bool>;
+    /// Finds the disk's existing volume and mounts it at `target/`.
+    fn mount_existing(&mut self) -> io::Result<()>;
+    /// Unmounts anything from the disk, formats it and mounts the new volume.
+    fn format_and_mount(&mut self) -> io::Result<()>;
+    /// Gives the mounted volume's root to the job account.
+    fn take_ownership(&mut self) -> io::Result<()>;
+}
+
+/// A blank disk is formatted. An existing volume that cannot be found,
+/// mounted or handed to the job account is reformatted, and the returned
+/// notice tells the job its build starts cold. A freshly formatted volume
+/// that still fails refuses the job: the command never runs with the shared
+/// folder in the volume's place.
+pub fn attach_with(steps: &mut impl DiskSteps) -> io::Result<Option<String>> {
+    if steps.blank()? {
+        steps.format_and_mount()?;
+        steps.take_ownership()?;
+        return Ok(None);
+    }
+    match steps.mount_existing().and_then(|()| steps.take_ownership()) {
+        Ok(()) => Ok(None),
+        Err(error) => {
+            eprintln!("motor-macagent: reformatting the build disk: {error}");
+            steps.format_and_mount()?;
+            steps.take_ownership()?;
+            Ok(Some(format!(
+                "motor: the build disk could not be used ({error}); it was reformatted, so this build starts cold\n"
+            )))
+        }
+    }
+}
+
 /// Opens the empty directory the volume is mounted over, creating it if the
 /// checkout has none. Anything else at `target` (a file, a link, a directory
 /// with entries) refuses the job: mounting over it would hide or follow it.
@@ -167,16 +281,23 @@ fn entries(directory: &File) -> io::Result<usize> {
 pub enum Staged {
     /// Copied to the staging folder under this index.
     Copied { path: String, index: usize },
-    /// Larger than what was left of the cap. Only its size is kept: the host
-    /// measures the placeholder, refuses it as over the cap and never reads it,
-    /// as it would have done with the original.
+    /// Larger than what was left of the cap; none of its bytes are copied.
+    /// The host's placeholder is a sparse file of `size` bytes, which is
+    /// always more than the whole cap. The host budgets every returned path
+    /// while the agent budgets only those under `target/`, so a placeholder of
+    /// the file's real size could still fit the host's remaining budget and be
+    /// returned as zeros. One larger than the cap never fits, so the host
+    /// always refuses it as over the cap and never reads it.
     OverCap { path: String, size: u64 },
 }
 
 /// Opens a regular file by a relative path below `root` without following
-/// any link, so the walk cannot leave the volume. `None` if any component is
-/// missing, a link, or not a directory, or if the file is not regular.
-fn open_below(root: &File, path: &str) -> Option<File> {
+/// any link, and only while every opened component is on `device`, the build
+/// volume's: a link cannot lead off the volume, and neither can another file
+/// system mounted below it. `None` if any component is missing, a link, not a
+/// directory or on another device, or if the file is not regular.
+fn open_below(root: &File, device: u64, path: &str) -> Option<File> {
+    use std::os::unix::fs::MetadataExt;
     let mut components = path.split('/').peekable();
     let mut directory: Option<File> = None;
     while let Some(component) = components.next() {
@@ -186,9 +307,14 @@ fn open_below(root: &File, path: &str) -> Option<File> {
         let parent = directory.as_ref().unwrap_or(root);
         if components.peek().is_none() {
             let file = open_at(parent, component, libc::O_RDONLY | libc::O_NONBLOCK).ok()?;
-            return file.metadata().ok()?.is_file().then_some(file);
+            let metadata = file.metadata().ok()?;
+            return (metadata.is_file() && metadata.dev() == device).then_some(file);
         }
-        directory = Some(open_directory_at(parent, component).ok()?);
+        let next = open_directory_at(parent, component).ok()?;
+        if next.metadata().ok()?.dev() != device {
+            return None;
+        }
+        directory = Some(next);
     }
     None
 }
@@ -204,11 +330,13 @@ pub fn stage_returns(
     build: &BuildConfig,
     staging: &Path,
 ) -> io::Result<Vec<Staged>> {
+    use std::os::unix::fs::MetadataExt;
+    let device = volume.metadata()?.dev();
     let mut staged = Vec::new();
     let mut seen = BTreeSet::new();
     let mut total = 0u64;
     for path in &build.returns {
-        let Some(mut file) = open_below(volume, path) else {
+        let Some(mut file) = open_below(volume, device, path) else {
             continue;
         };
         let size = file.metadata()?.len();
@@ -216,7 +344,7 @@ pub fn stage_returns(
             if seen.insert(path.clone()) {
                 staged.push(Staged::OverCap {
                     path: path.clone(),
-                    size,
+                    size: size.max(build.return_max_bytes.saturating_add(1)),
                 });
             }
             continue;
@@ -336,8 +464,29 @@ mod native {
         gid: libc::gid_t,
         /// The workspace share's directory, opened before the job ran.
         workspace: Option<File>,
-        /// The mounted volume's identifier, such as `disk5s1`.
-        volume: Option<String>,
+        /// The mounted volume's file system ID and its root's inode, recorded
+        /// before the job ran.
+        root: Option<Identity>,
+    }
+
+    /// What names the mounted build volume's root: the file system ID and the
+    /// root directory's inode number.
+    type Identity = ([i32; 2], u64);
+
+    fn identity(directory: &File) -> io::Result<Identity> {
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        check(unsafe { libc::fstatfs(directory.as_raw_fd(), &mut stat) })?;
+        Ok((fsid(stat.f_fsid), directory.metadata()?.ino()))
+    }
+    fn fsid(fsid: libc::fsid_t) -> [i32; 2] {
+        // libc keeps fsid_t's two words private; it is exactly that array.
+        unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(fsid) }
+    }
+    fn open_root() -> io::Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open("/")
     }
 
     impl Native {
@@ -360,16 +509,29 @@ mod native {
                 uid,
                 gid,
                 workspace: None,
-                volume: None,
+                root: None,
             })
         }
+    }
 
-        fn mount(&self, volume: &str) -> io::Result<()> {
+    /// The real disk operations behind `attach_with`, before any job code runs.
+    struct Steps<'a> {
+        native: &'a Native,
+        workspace: &'a File,
+        disk: String,
+        raw: Option<File>,
+        /// The volume currently mounted at `target/`, such as `disk5s1`.
+        volume: Option<String>,
+    }
+
+    impl Steps<'_> {
+        fn mount(&mut self, volume: String) -> io::Result<()> {
             let device = format!("/dev/{volume}");
+            let target = &self.native.target;
             // The system may already have mounted the volume, under /Volumes.
             for mount in mounted()? {
                 if mount.from == device {
-                    unmount(&mount.on)?;
+                    unmount(&mount.on, mount.fsid)?;
                 }
             }
             run(
@@ -378,13 +540,14 @@ mod native {
                     "-o".as_ref(),
                     "nosuid,nodev".as_ref(),
                     device.as_ref(),
-                    self.target.as_os_str(),
+                    target.as_os_str(),
                 ],
                 None,
             )?;
+            self.volume = Some(volume);
             let at_target: Vec<_> = mounted()?
                 .into_iter()
-                .filter(|mount| mount.on == self.target)
+                .filter(|mount| mount.on == *target)
                 .collect();
             match &at_target[..] {
                 [mount]
@@ -402,10 +565,14 @@ mod native {
             Ok(())
         }
 
-        /// Opens the volume's root through the workspace share and checks that
-        /// it is the root of the mounted build volume.
-        fn volume_root(&self, workspace: &File, volume: &str) -> io::Result<File> {
-            let root = open_directory_at(workspace, "target")?;
+        /// The mounted volume's root, reached through the workspace share and
+        /// checked to be the root of the volume mounted at `target/`.
+        fn root(&self) -> io::Result<File> {
+            let volume = self
+                .volume
+                .as_deref()
+                .ok_or_else(|| invalid("no build volume is mounted"))?;
+            let root = open_directory_at(self.workspace, "target")?;
             let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
             check(unsafe { libc::fstatfs(root.as_raw_fd(), &mut stat) })?;
             let text = |bytes: &[libc::c_char]| {
@@ -414,96 +581,113 @@ mod native {
                     .into_owned()
             };
             if text(&stat.f_mntfromname) != format!("/dev/{volume}")
-                || Path::new(&text(&stat.f_mntonname)) != self.target
+                || Path::new(&text(&stat.f_mntonname)) != self.native.target
             {
                 return Err(invalid("target is not the build volume's root"));
             }
             Ok(root)
         }
+    }
 
-        fn try_existing(&self, disk: &str) -> io::Result<String> {
-            let volume = wait_volume(disk, ATTACH_WAIT)?
+    impl DiskSteps for Steps<'_> {
+        fn blank(&mut self) -> io::Result<bool> {
+            let raw = self
+                .raw
+                .take()
+                .ok_or_else(|| invalid("build disk already read"))?;
+            Ok(is_blank(&read_start(raw)?))
+        }
+        fn mount_existing(&mut self) -> io::Result<()> {
+            let volume = wait_volume(&self.disk, ATTACH_WAIT)?
                 .ok_or_else(|| invalid("the disk holds no APFS volume"))?;
-            self.mount(&volume)?;
-            Ok(volume)
+            self.mount(volume)
+        }
+        fn format_and_mount(&mut self) -> io::Result<()> {
+            if let Some(volume) = self.volume.take() {
+                let device = format!("/dev/{volume}");
+                for mount in mounted()? {
+                    if mount.from == device {
+                        unmount(&mount.on, mount.fsid)?;
+                    }
+                }
+            }
+            run(
+                DISKUTIL,
+                &[
+                    "eraseDisk".as_ref(),
+                    "APFS".as_ref(),
+                    VOLUME_NAME.as_ref(),
+                    "GPT".as_ref(),
+                    format!("/dev/{}", self.disk).as_ref(),
+                ],
+                None,
+            )?;
+            let volume = wait_volume(&self.disk, ATTACH_WAIT)?
+                .ok_or_else(|| invalid("formatted build disk shows no APFS volume"))?;
+            self.mount(volume)
+        }
+        fn take_ownership(&mut self) -> io::Result<()> {
+            super::take_ownership(&self.root()?, self.native.uid, self.native.gid)
         }
     }
 
     impl BuildVolume for Native {
         fn attach(&mut self) -> io::Result<Option<String>> {
-            let workspace = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(
-                    self.target
-                        .parent()
-                        .ok_or_else(|| invalid("target parent"))?,
-                )?;
+            let workspace = open_workspace(
+                &open_root()?,
+                self.target
+                    .parent()
+                    .ok_or_else(|| invalid("target parent"))?,
+                self.uid,
+                self.gid,
+            )?;
             drop(mount_point(&workspace)?);
             let (disk, raw) = find_disk(self.gid)?;
-            let mut notice = None;
-            let reused = if is_blank(&read_start(raw)?) {
-                None
-            } else {
-                Some(self.try_existing(&disk))
+            let mut steps = Steps {
+                native: self,
+                workspace: &workspace,
+                disk,
+                raw: Some(raw),
+                volume: None,
             };
-            let volume = match reused {
-                Some(Ok(volume)) => volume,
-                other => {
-                    if let Some(Err(error)) = other {
-                        eprintln!("motor-macagent: reformatting build disk {disk}: {error}");
-                        notice = Some(format!(
-                            "motor: the build disk could not be used ({error}); it was reformatted, so this build starts cold\n"
-                        ));
-                    }
-                    run(
-                        DISKUTIL,
-                        &[
-                            "eraseDisk".as_ref(),
-                            "APFS".as_ref(),
-                            VOLUME_NAME.as_ref(),
-                            "GPT".as_ref(),
-                            format!("/dev/{disk}").as_ref(),
-                        ],
-                        None,
-                    )?;
-                    let volume = wait_volume(&disk, ATTACH_WAIT)?
-                        .ok_or_else(|| invalid("formatted build disk shows no APFS volume"))?;
-                    self.mount(&volume)?;
-                    volume
-                }
-            };
-            let root = self.volume_root(&workspace, &volume)?;
-            check(unsafe { libc::fchown(root.as_raw_fd(), self.uid, self.gid) })?;
-            check(unsafe { libc::fchmod(root.as_raw_fd(), 0o755) })?;
+            let notice = attach_with(&mut steps)?;
+            let root = identity(&steps.root()?)?;
+            self.root = Some(root);
             self.workspace = Some(workspace);
-            self.volume = Some(volume);
             Ok(notice)
         }
 
         fn detach(&mut self) -> io::Result<()> {
-            let (Some(workspace), Some(volume)) = (self.workspace.take(), self.volume.take())
+            let (Some(workspace), Some(recorded)) = (self.workspace.take(), self.root.take())
             else {
                 return Err(invalid("build volume is not attached"));
             };
+            // Job code has run: reach target/ again from / without following
+            // links, and require the volume root recorded before the job.
+            let root = reopen(&open_root()?, &self.target)?;
+            if identity(&root)? != recorded {
+                return Err(invalid("target no longer names the build volume's root"));
+            }
             let staging = tempfile::Builder::new()
                 .prefix("motor-returns-")
                 .tempdir_in("/var/tmp")?;
             let staged = if self.build.returns.is_empty() {
                 Vec::new()
             } else {
-                // The root's descriptor closes before the unmount below.
-                let root = self.volume_root(&workspace, &volume)?;
                 stage_returns(&root, &self.build, staging.path())?
             };
-            let device = format!("/dev/{volume}");
-            if !mounted()?
-                .iter()
-                .any(|mount| mount.on == self.target && mount.from == device)
-            {
-                return Err(invalid("build volume is no longer mounted at target"));
+            // The root's descriptor must close before the unmount.
+            drop(root);
+            let entries: Vec<_> = mounted()?
+                .into_iter()
+                .filter(|mount| mount.fsid == recorded.0)
+                .collect();
+            if !matches!(&entries[..], [mount] if mount.on == self.target) {
+                return Err(invalid(format!(
+                    "build volume is not mounted exactly once at target: {entries:?}"
+                )));
             }
-            unmount(&self.target)?;
+            unmount(&self.target, recorded.0)?;
             let shared = open_directory_at(&workspace, "target")?;
             if shared.metadata()?.dev() != workspace.metadata()?.dev() {
                 return Err(invalid("target is still a mount point after unmounting"));
@@ -518,6 +702,7 @@ mod native {
         on: PathBuf,
         filesystem: String,
         flags: u32,
+        fsid: [i32; 2],
     }
 
     fn mounted() -> io::Result<Vec<Mounted>> {
@@ -539,14 +724,17 @@ mod native {
                     on: text(&mount.f_mntonname).into(),
                     filesystem: text(&mount.f_fstypename),
                     flags: mount.f_flags,
+                    fsid: fsid(mount.f_fsid),
                 })
                 .collect(),
         )
     }
 
-    /// A process killed with the job can briefly keep the volume busy, and
-    /// the job's processes are all gone, so a busy unmount is forced.
-    fn unmount(path: &Path) -> io::Result<()> {
+    /// Unmounts the file system `fsid` mounted at `path`. Call only once the
+    /// path has been checked to reach it. A process killed with the job can
+    /// briefly keep the volume busy, and the job's processes are all gone, so
+    /// a busy unmount is forced.
+    fn unmount(path: &Path, fsid: [i32; 2]) -> io::Result<()> {
         let path_c = CString::new(path.as_os_str().as_bytes()).map_err(invalid)?;
         if unsafe { libc::unmount(path_c.as_ptr(), 0) } != 0 {
             let error = io::Error::last_os_error();
@@ -556,7 +744,7 @@ mod native {
             eprintln!("motor-macagent: forcing busy unmount of {}", path.display());
             check(unsafe { libc::unmount(path_c.as_ptr(), libc::MNT_FORCE) })?;
         }
-        if mounted()?.iter().any(|mount| mount.on == path) {
+        if mounted()?.iter().any(|mount| mount.fsid == fsid) {
             return Err(invalid(format!("{} is still mounted", path.display())));
         }
         Ok(())
@@ -830,7 +1018,7 @@ mod tests {
                 },
                 Staged::OverCap {
                     path: "debug/deps/lib.rlib".into(),
-                    size: 20
+                    size: 27
                 },
                 Staged::Copied {
                     path: "small".into(),
@@ -843,11 +1031,12 @@ mod tests {
             vec![1; 10]
         );
         assert_eq!(std::fs::read(v.target.join("small")).unwrap(), vec![3; 5]);
-        // The over-cap file keeps its size, so the host refuses it as over the
-        // cap, but none of its bytes left the volume.
+        // The over-cap placeholder is larger than the whole cap, so the host
+        // refuses it whatever else it admitted, and none of the file's bytes
+        // left the volume.
         let placeholder = v.target.join("debug/deps/lib.rlib");
-        assert_eq!(std::fs::metadata(&placeholder).unwrap().len(), 20);
-        assert_eq!(std::fs::read(&placeholder).unwrap(), vec![0; 20]);
+        assert_eq!(std::fs::metadata(&placeholder).unwrap().len(), 27);
+        assert_eq!(std::fs::read(&placeholder).unwrap(), vec![0; 27]);
     }
     #[test]
     fn links_and_non_regular_files_on_the_volume_are_never_followed_or_copied() {
@@ -884,5 +1073,193 @@ mod tests {
         copy(&v, &["app", "debug/app"], 1 << 20);
         assert!(!v.outside.join("written").exists());
         assert!(!v.outside.join("app").exists());
+    }
+
+    #[test]
+    fn workspace_below_a_directory_the_job_can_change_is_refused() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let scratch = cortexkit_test_support::ScratchDir::new("build-workspace-walk");
+        let root = scratch.join("root");
+        let workspace = root.join("Users/p/repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        for path in [&root, &root.join("Users"), &root.join("Users/p")] {
+            mode(path, 0o755);
+        }
+        // The workspace itself is the share; the job writes in it.
+        mode(&workspace, 0o777);
+        let open = |uid, gid| {
+            open_workspace(
+                &File::open(&root).unwrap(),
+                Path::new("/Users/p/repo"),
+                uid,
+                gid,
+            )
+        };
+        let me = std::fs::metadata(&root).unwrap();
+        let (other_uid, other_gid) = (me.uid() + 1, me.gid() + 1);
+        let opened = open(other_uid, other_gid).unwrap();
+        assert_eq!(
+            opened.metadata().unwrap().ino(),
+            std::fs::metadata(&workspace).unwrap().ino()
+        );
+        // Owned by the job account, as a home directory would be.
+        assert!(open(me.uid(), other_gid).is_err());
+        mode(&root.join("Users/p"), 0o775);
+        assert!(open(other_uid, me.gid()).is_err());
+        assert!(open(other_uid, other_gid).is_ok());
+        mode(&root.join("Users/p"), 0o757);
+        assert!(open(other_uid, other_gid).is_err());
+        mode(&root.join("Users/p"), 0o755);
+        mode(&root, 0o777);
+        assert!(open(other_uid, other_gid).is_err());
+        mode(&root, 0o755);
+        // A link in place of an ancestor is never followed.
+        std::fs::rename(root.join("Users/p"), root.join("Users/moved")).unwrap();
+        std::os::unix::fs::symlink(root.join("Users/moved"), root.join("Users/p")).unwrap();
+        assert!(open(other_uid, other_gid).is_err());
+        assert!(
+            open_workspace(
+                &File::open(&root).unwrap(),
+                Path::new("/Users/../p"),
+                other_uid,
+                other_gid
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn target_is_reopened_without_following_a_renamed_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+        let scratch = cortexkit_test_support::ScratchDir::new("build-target-reopen");
+        let root = scratch.join("root");
+        std::fs::create_dir_all(root.join("Users/p/repo/target")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/repo/target")).unwrap();
+        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+        let target = Path::new("/Users/p/repo/target");
+        let reopened = reopen(&File::open(&root).unwrap(), target).unwrap();
+        assert_eq!(
+            reopened.metadata().unwrap().ino(),
+            inode(&root.join("Users/p/repo/target"))
+        );
+        std::fs::rename(root.join("Users/p"), root.join("Users/moved")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("Users/p")).unwrap();
+        assert!(reopen(&File::open(&root).unwrap(), target).is_err());
+    }
+
+    #[derive(Default)]
+    struct FakeSteps {
+        blank: bool,
+        mount_fails: bool,
+        /// Ownership fails while this many volumes are left to format.
+        own_fails_until_formats: usize,
+        own_always_fails: bool,
+        log: Vec<&'static str>,
+    }
+    impl DiskSteps for FakeSteps {
+        fn blank(&mut self) -> io::Result<bool> {
+            Ok(self.blank)
+        }
+        fn mount_existing(&mut self) -> io::Result<()> {
+            self.log.push("mount");
+            if self.mount_fails {
+                return Err(invalid("will not mount"));
+            }
+            Ok(())
+        }
+        fn format_and_mount(&mut self) -> io::Result<()> {
+            self.log.push("format");
+            self.own_fails_until_formats = self.own_fails_until_formats.saturating_sub(1);
+            Ok(())
+        }
+        fn take_ownership(&mut self) -> io::Result<()> {
+            self.log.push("own");
+            if self.own_always_fails || self.own_fails_until_formats > 0 {
+                return Err(invalid("operation not permitted"));
+            }
+            Ok(())
+        }
+    }
+    #[test]
+    fn attach_formats_blank_disks_and_reformats_any_volume_it_cannot_use() {
+        let mut blank = FakeSteps {
+            blank: true,
+            ..FakeSteps::default()
+        };
+        assert_eq!(attach_with(&mut blank).unwrap(), None);
+        assert_eq!(blank.log, ["format", "own"]);
+        let mut warm = FakeSteps::default();
+        assert_eq!(attach_with(&mut warm).unwrap(), None);
+        assert_eq!(warm.log, ["mount", "own"]);
+        let mut unmountable = FakeSteps {
+            mount_fails: true,
+            ..FakeSteps::default()
+        };
+        assert!(
+            attach_with(&mut unmountable)
+                .unwrap()
+                .unwrap()
+                .contains("starts cold")
+        );
+        assert_eq!(unmountable.log, ["mount", "format", "own"]);
+        // An earlier job made the volume's root impossible to hand over: the
+        // checkout heals by reformatting instead of failing every later job.
+        let mut locked = FakeSteps {
+            own_fails_until_formats: 1,
+            ..FakeSteps::default()
+        };
+        let notice = attach_with(&mut locked).unwrap().unwrap();
+        assert!(notice.contains("operation not permitted") && notice.contains("starts cold"));
+        assert_eq!(locked.log, ["mount", "own", "format", "own"]);
+        // A fresh volume that still fails refuses the job.
+        let mut broken = FakeSteps {
+            own_always_fails: true,
+            ..FakeSteps::default()
+        };
+        assert!(attach_with(&mut broken).is_err());
+        let mut broken_blank = FakeSteps {
+            blank: true,
+            own_always_fails: true,
+            ..FakeSteps::default()
+        };
+        assert!(attach_with(&mut broken_blank).is_err());
+    }
+
+    #[test]
+    fn returned_files_are_read_only_from_the_build_volumes_device() {
+        use std::os::unix::fs::MetadataExt;
+        let v = volume();
+        std::fs::create_dir(v.volume.join("debug")).unwrap();
+        std::fs::write(v.volume.join("debug/app"), "built").unwrap();
+        let root = File::open(&v.volume).unwrap();
+        let device = root.metadata().unwrap().dev();
+        assert!(open_below(&root, device, "debug/app").is_some());
+        // Anything on another device, such as a file system mounted below
+        // target/, is not the build volume's.
+        assert!(open_below(&root, device.wrapping_add(1), "debug/app").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ownership_is_taken_even_from_a_root_the_job_made_immutable() {
+        use std::os::macos::fs::MetadataExt as _;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let scratch = cortexkit_test_support::ScratchDir::new("build-root-uchg");
+        let root = scratch.join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = File::open(&root).unwrap();
+        check(unsafe { libc::fchflags(file.as_raw_fd(), libc::UF_IMMUTABLE) }).unwrap();
+        let me = file.metadata().unwrap();
+        let result = take_ownership(&file, me.uid(), me.gid());
+        // Leave the scratch directory removable whatever happened.
+        unsafe { libc::fchflags(file.as_raw_fd(), 0) };
+        result.unwrap();
+        let after = std::fs::metadata(&root).unwrap();
+        assert_eq!(after.mode() & 0o777, 0o755);
+        assert_eq!(after.st_flags() & libc::UF_SETTABLE, 0);
     }
 }

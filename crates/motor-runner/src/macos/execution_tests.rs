@@ -472,21 +472,11 @@ fn staged_target_becomes_an_empty_directory_without_following_a_link() {
     target_in(&staged).unwrap();
     assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
 }
-#[test]
-fn only_return_paths_inside_target_reach_the_guest_relative_to_target() {
-    let mut request = motor_protocol::Run {
-        return_paths: [
-            "/Users/test/repo/target/debug/app",
-            "/Users/test/repo/Target/doc/index.html",
-            "/Users/test/repo/src/main.rs",
-            "/Users/test/repo/target",
-            "/Users/test/repo/target/../src/lib.rs",
-            "/Users/test/repo/target/./release/app",
-            "/Users/test/repo/targets/x",
-        ]
-        .map(String::from)
-        .to_vec(),
-        return_max_bytes: 1234,
+/// A chunked-return request in `/Users/test/repo` for these paths and cap.
+fn request(paths: &[&str], cap: u64) -> motor_protocol::Run {
+    motor_protocol::Run {
+        return_paths: paths.iter().map(|path| path.to_string()).collect(),
+        return_max_bytes: cap,
         return_chunked: true,
         gate_job: false,
         network: None,
@@ -508,7 +498,22 @@ fn only_return_paths_inside_target_reach_the_guest_relative_to_target() {
         bundles: vec![],
         git_dependencies: vec![],
         base_commit: None,
-    };
+    }
+}
+#[test]
+fn only_return_paths_inside_target_reach_the_guest_relative_to_target() {
+    let mut request = request(
+        &[
+            "/Users/test/repo/target/debug/app",
+            "/Users/test/repo/Target/doc/index.html",
+            "/Users/test/repo/src/main.rs",
+            "/Users/test/repo/target",
+            "/Users/test/repo/target/../src/lib.rs",
+            "/Users/test/repo/target/./release/app",
+            "/Users/test/repo/targets/x",
+        ],
+        1234,
+    );
     assert_eq!(
         build_config(&request).unwrap(),
         motor_macvm::BuildConfig {
@@ -522,4 +527,120 @@ fn only_return_paths_inside_target_reach_the_guest_relative_to_target() {
     );
     request.return_paths.clear();
     assert!(build_config(&request).unwrap().returns.is_empty());
+}
+
+/// The host admits returned files in request order across every path, while
+/// the guest budgets only those under `target/`. With a cap of 100, a 50-byte
+/// file outside `target/`, then target files of 60 and 45 bytes: the guest
+/// copies the 60 and leaves a placeholder for the 45, while the host refuses
+/// the 60 and has 50 left. The placeholder must still be refused, never
+/// returned as 45 zero bytes.
+#[test]
+fn guest_placeholder_is_never_returned_as_content() {
+    use motor_macagent::build_volume::{place_returns, stage_returns};
+    use motor_protocol::{ReturnManifestOutcome, ReturnPathsFailureCause};
+    let scratch = ScratchDir::new("macos-placeholder");
+    let staged = staged(&scratch.join("state"), Uuid::now_v7());
+    let volume = scratch.join("volume");
+    std::fs::create_dir_all(volume.join("debug")).unwrap();
+    std::fs::write(volume.join("debug/large"), vec![6; 60]).unwrap();
+    std::fs::write(volume.join("debug/small"), vec![4; 45]).unwrap();
+    std::fs::create_dir_all(staged.workspace.join("src")).unwrap();
+    std::fs::write(staged.workspace.join("src/outside"), vec![5; 50]).unwrap();
+    target_in(&staged).unwrap();
+    let request = request(
+        &[
+            "/Users/test/repo/src/outside",
+            "/Users/test/repo/target/debug/large",
+            "/Users/test/repo/target/debug/small",
+        ],
+        100,
+    );
+    let copies = scratch.join("copies");
+    std::fs::create_dir(&copies).unwrap();
+    let placed = stage_returns(
+        &std::fs::File::open(&volume).unwrap(),
+        &build_config(&request).unwrap(),
+        &copies,
+    )
+    .unwrap();
+    place_returns(
+        &std::fs::File::open(staged.workspace.join("target")).unwrap(),
+        &placed,
+        &copies,
+    )
+    .unwrap();
+    let job = scratch.join("job");
+    std::fs::create_dir(&job).unwrap();
+    let crate::return_paths::Collection::Chunked(collection) =
+        crate::return_paths::collect_staged(&request, &staged.workspace, &job)
+    else {
+        panic!("chunked request collected without chunks");
+    };
+    assert!(matches!(
+        collection.files[0].outcome(),
+        ReturnManifestOutcome::Returned { size: 50, .. }
+    ));
+    for file in &collection.files[1..] {
+        assert!(
+            matches!(
+                file.outcome(),
+                ReturnManifestOutcome::Failed {
+                    cause: ReturnPathsFailureCause::OverCap,
+                    ..
+                }
+            ),
+            "{:?}",
+            file.outcome()
+        );
+    }
+    assert_eq!(collection.total_bytes, 50);
+}
+
+/// A cancel that arrives while the build disk is being renamed into place
+/// waits for the rename, and the job is then recorded as published; one that
+/// arrives before it publishes nothing (see the cancel test above).
+#[test]
+fn a_cancel_during_publication_waits_for_it_and_finds_the_job_published() {
+    let scratch = ScratchDir::new("macos-publish-cancel");
+    let root = scratch.join("state");
+    let runtime = Arc::new(Runtime::default());
+    let entry = job(&root, &runtime);
+    let id = entry.owned.lock().unwrap().record.id;
+    runtime.stop(&root, &entry).unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_during_commit = Arc::new(AtomicBool::new(false));
+    let canceller = Arc::new(Mutex::new(None));
+    let mut config = Config::new(&root, "macos");
+    {
+        let (runtime, cancelled, during, canceller) = (
+            runtime.clone(),
+            cancelled.clone(),
+            cancelled_during_commit.clone(),
+            canceller.clone(),
+        );
+        config.long_work = Some(Arc::new(move |phase| {
+            if phase != "macos-target-publishing" {
+                return;
+            }
+            let (runtime, flag) = (runtime.clone(), cancelled.clone());
+            *canceller.lock().unwrap() = Some(std::thread::spawn(move || {
+                runtime.cancel(id);
+                flag.store(true, Ordering::Release);
+            }));
+            std::thread::sleep(Duration::from_millis(300));
+            during.store(cancelled.load(Ordering::Acquire), Ordering::Release);
+        }));
+    }
+    target_out(&config, &entry).unwrap();
+    canceller.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(
+        !cancelled_during_commit.load(Ordering::Acquire),
+        "a cancel must not complete inside the publication commit"
+    );
+    assert!(cancelled.load(Ordering::Acquire));
+    assert!(entry.published());
+    assert!(runtime.cancelled(id));
+    assert!(kept(&root).exists());
+    finish(&runtime, &root, &entry);
 }

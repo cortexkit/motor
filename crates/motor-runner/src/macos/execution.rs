@@ -452,13 +452,21 @@ pub(super) fn target_out(config: &Config, entry: &Entry) -> io::Result<()> {
     if let Some(hook) = &config.long_work {
         hook("macos-target-before-publish");
     }
-    entry.check()?;
     let targets = Dir::open(&config.state_root.join("targets"), false)?;
-    clone.replace_into(
-        motor_macvm::BUILD_DISK.as_ref(),
-        &targets,
-        lifecycle::image(&record.workspace).as_ref(),
-    )?;
+    // The commit point: a cancel either lands before it and nothing is
+    // published, or waits until the rename is done and the job is recorded
+    // as published.
+    entry.publish(|| {
+        #[cfg(test)]
+        if let Some(hook) = &config.long_work {
+            hook("macos-target-publishing");
+        }
+        clone.replace_into(
+            motor_macvm::BUILD_DISK.as_ref(),
+            &targets,
+            lifecycle::image(&record.workspace).as_ref(),
+        )
+    })?;
     if let Err(error) = targets.remove(lifecycle::key(&record.workspace).as_ref()) {
         tracing::warn!(job_id = %record.id, %error, "old macOS build folder removal failed; eviction will retry");
     }
@@ -474,7 +482,7 @@ struct VmExecution {
 }
 impl Drop for VmExecution {
     fn drop(&mut self) {
-        self.entry.cancel.cancel();
+        self.entry.cancel_job();
     }
 }
 impl Execution for VmExecution {
@@ -491,7 +499,7 @@ impl Execution for VmExecution {
             .ok_or_else(|| invalid("macOS output already taken"))
     }
     fn abort(&self) -> io::Result<()> {
-        self.entry.cancel.cancel();
+        self.entry.cancel_job();
         Ok(())
     }
     fn wait(&mut self) -> io::Result<ExecutionOutcome> {
@@ -500,7 +508,7 @@ impl Execution for VmExecution {
             .unwrap_or_else(|_| Err(invalid("macOS I/O worker stopped: output_incomplete")))
     }
     fn reap(&self) {
-        self.entry.cancel.cancel();
+        self.entry.cancel_job();
         if let Some(thread) = self.thread.lock().unwrap().take() {
             let _ = thread.join();
         }
