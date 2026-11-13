@@ -1013,6 +1013,57 @@ class ParityTests(unittest.TestCase):
                 self.assertIn('missing apt package: musl-tools',
                               parity.differences(manifest, actual, role=role))
 
+    def test_debugging_packages_are_required_on_every_linux_role(self):
+        for package in ('gdb', 'elfutils'):
+            self.assertIn(package, self.manifest['apt_packages']['required'])
+            for role in ('build-server', 'boat', 'tenant'):
+                with self.subTest(package=package, role=role):
+                    actual = self.observed_host(role)
+                    self.assertEqual([], parity.differences(self.manifest, actual, role=role))
+                    del actual['apt_packages'][package]
+                    self.assertIn(f'missing apt package: {package}',
+                                  parity.differences(self.manifest, actual, role=role))
+
+    def test_debugging_tools_are_required_on_every_linux_host_and_job_path(self):
+        for tool in ('gdb', 'eu-stack'):
+            self.assertIn(tool, self.manifest['tools'])
+            self.assertEqual(f'/usr/bin/{tool}', self.manifest['tools'][tool]['path'])
+            for role in ('build-server', 'boat', 'tenant'):
+                for job in (False, True):
+                    for drift in ('missing', 'path', 'exit_code', 'version'):
+                        with self.subTest(tool=tool, role=role, job=job, drift=drift):
+                            actual = self.observed(role, job=True) if job else self.observed_host(role)
+                            actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                            self.assertEqual([], parity.differences(self.manifest, actual, role, job,
+                                                                   gnu_test_sha256='package-qualified-test'))
+                            if drift == 'missing':
+                                actual['tools'][tool] = None
+                            else:
+                                actual['tools'][tool][drift] = {
+                                    'path': f'/usr/local/bin/{tool}',
+                                    'exit_code': 1,
+                                    'version': f'not {tool}',
+                                }[drift]
+                            errors = parity.differences(self.manifest, actual, role, job,
+                                                       gnu_test_sha256='package-qualified-test')
+                            self.assertTrue(any(tool in error for error in errors), errors)
+
+    def test_debugging_tools_accept_distribution_versions(self):
+        versions = {
+            'gdb': ('GNU gdb (Ubuntu 17.1-2ubuntu1) 17.1', 'GNU gdb (Debian 13.1-3) 13.1'),
+            'eu-stack': ('eu-stack (elfutils) 0.194', 'eu-stack (elfutils) 0.190'),
+        }
+        for tool, outputs in versions.items():
+            for role in ('build-server', 'boat', 'tenant'):
+                for job in (False, True):
+                    for version in outputs:
+                        with self.subTest(tool=tool, role=role, job=job, version=version):
+                            actual = self.observed(role, job=True) if job else self.observed_host(role)
+                            actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                            actual['tools'][tool]['version'] = version
+                            self.assertEqual([], parity.differences(self.manifest, actual, role, job,
+                                                                   gnu_test_sha256='package-qualified-test'))
+
     def test_cmake_is_required_on_every_linux_role(self):
         self.assertIn('cmake', self.manifest['apt_packages']['required'])
         for role in ('build-server', 'boat', 'tenant'):

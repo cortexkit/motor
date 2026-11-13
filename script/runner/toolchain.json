@@ -44,12 +44,14 @@
       "cpio": "2.15+dfsg-2.1ubuntu0.1",
       "curl": "8.18.0-1ubuntu2.8",
       "ed": "1.22.4-1",
+      "elfutils": "0.194-4",
       "fakeroot": "1.37.2-1",
       "file": "1:5.46-5build2",
       "fontconfig": "2.17.1-3ubuntu1",
       "g++-mingw-w64-x86-64": "13.2.0-6ubuntu1+26.1",
       "gawk": "1:5.3.2-1ubuntu1.1",
       "gcc-mingw-w64-x86-64": "13.2.0-6ubuntu1+26.1",
+      "gdb": "17.1-2ubuntu1",
       "git": "1:2.53.0-1ubuntu1.1",
       "gnu-coreutils": "9.7-3ubuntu2.1",
       "iproute2": "6.19.0-1ubuntu1.1",
@@ -134,6 +136,8 @@
       "build-essential",
       "clang",
       "cmake",
+      "gdb",
+      "elfutils",
       "lld",
       "pkg-config",
       "libssl-dev",
@@ -834,6 +838,16 @@
       "path": "/usr/local/bin/corepack",
       "realpath_suffix": "/lib/node_modules/corepack/dist/corepack.js",
       "version": "0.36.0"
+    },
+    "eu-stack": {
+      "observed_build_server_version": "eu-stack (elfutils) 0.194",
+      "path": "/usr/bin/eu-stack",
+      "version_pattern": "eu-stack \\(elfutils\\) [0-9]+(?:\\.[0-9]+)+"
+    },
+    "gdb": {
+      "observed_build_server_version": "GNU gdb (Ubuntu 17.1-2ubuntu1) 17.1",
+      "path": "/usr/bin/gdb",
+      "version_pattern": "GNU gdb .* [0-9]+(?:\\.[0-9]+)+"
     },
     "git": {
       "path": "/usr/bin/git",
