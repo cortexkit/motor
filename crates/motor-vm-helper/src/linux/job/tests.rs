@@ -332,6 +332,8 @@ pub(super) fn machine_with_config(base: &Path, config: &Config) -> LinuxJobs {
         records: BTreeMap::new(),
         children: BTreeMap::new(),
         collection_failures: BTreeMap::new(),
+        collection_logs: Vec::new(),
+        tap_release_check: None,
         next_prune: None,
         network: Box::<network_tests::Fake>::default(),
         exit_fault: None,

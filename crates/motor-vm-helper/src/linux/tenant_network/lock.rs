@@ -8,11 +8,15 @@ use std::{
     path::Path,
 };
 
-pub(super) fn acquire() -> Result<File> {
+pub(in crate::linux) struct Guard {
+    _file: File,
+}
+
+pub(in crate::linux) fn acquire() -> Result<Guard> {
     acquire_at(Path::new("/run/motor-network"), 0)
 }
 
-fn acquire_at(directory: &Path, owner: u32) -> Result<File> {
+pub(in crate::linux) fn acquire_at(directory: &Path, owner: u32) -> Result<Guard> {
     match fs::DirBuilder::new().mode(0o700).create(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -41,7 +45,7 @@ fn acquire_at(directory: &Path, owner: u32) -> Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(file)
+    Ok(Guard { _file: file })
 }
 
 #[cfg(test)]

@@ -146,6 +146,10 @@ pub struct LinuxJobs {
     records: BTreeMap<String, Record>,
     children: BTreeMap<String, Child>,
     collection_failures: BTreeMap<String, BTreeSet<CollectionFailure>>,
+    #[cfg(test)]
+    collection_logs: Vec<String>,
+    #[cfg(test)]
+    tap_release_check: Option<Box<dyn FnMut() + Send>>,
     next_prune: Option<SystemTime>,
     network: Box<dyn network::Access>,
     #[cfg(test)]
@@ -219,6 +223,10 @@ impl LinuxJobs {
             records: BTreeMap::new(),
             children: BTreeMap::new(),
             collection_failures: BTreeMap::new(),
+            #[cfg(test)]
+            collection_logs: Vec::new(),
+            #[cfg(test)]
+            tap_release_check: None,
             next_prune: None,
             network: Box::new(network::System(config.clone())),
             #[cfg(test)]
@@ -428,7 +436,10 @@ impl LinuxJobs {
             .or_default()
             .insert(kind)
         {
-            eprintln!("job {id} exit evidence {kind:?}: {error}");
+            let line = format!("job {id} exit evidence {kind:?}: {error}");
+            #[cfg(test)]
+            self.collection_logs.push(line.clone());
+            eprintln!("{line}");
             true
         } else {
             false
@@ -559,12 +570,19 @@ impl LinuxJobs {
     fn remove_network(&mut self, id: &str) -> Result<()> {
         let mut record = self.records.get(id).unwrap().clone();
         if let Some(tap) = record.tap() {
-            self.network.remove(id, &tap)?;
+            // Keep one non-reentrant network lock through the durable release:
+            // a network policy render must not restore this TAP before the write.
+            let lock = self.network.lock()?;
+            self.network.remove(id, &tap, &lock)?;
             self.network.remove_namespace(id)?;
             // A crash before this write retries idempotent removal, never the
             // measurement. Until it succeeds the allocation cannot be reused.
             record.tap_index = None;
             self.save(&record)?;
+            #[cfg(test)]
+            if let Some(check) = self.tap_release_check.as_mut() {
+                check();
+            }
             self.records.insert(id.into(), record);
         } else {
             self.network.remove_namespace(id)?;
@@ -1109,8 +1127,9 @@ impl LinuxJobs {
         self.status(id)
     }
 
-    fn prepare_network(&mut self, id: &str, mut tenants: Vec<Tap>, tap: Tap) -> Result<()> {
-        tenants.extend(self.records.values().filter_map(Record::tap));
+    fn prepare_network(&mut self, id: &str, tenants: Vec<Tap>, tap: Tap) -> Result<()> {
+        // The installer reads durable job allocations after taking the network
+        // lock; a snapshot of self.records taken before that lock could be stale.
         self.network.install(&tenants)?;
         self.network.ensure(id, &tap)
     }
