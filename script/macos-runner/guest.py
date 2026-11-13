@@ -24,7 +24,7 @@ def run(*args, env=None, cwd=None):
     subprocess.run([str(value) for value in args], check=True, env=env, cwd=cwd)
 
 
-def unpack(archive, destination):
+def unpack(archive, destination, include=None):
     destination.mkdir(parents=True, exist_ok=False)
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as source:
@@ -34,15 +34,37 @@ def unpack(archive, destination):
             source.extractall(destination)
     else:
         with tarfile.open(archive) as source:
+            members = [member for member in source.getmembers()
+                       if include is None or any(member.name == name or member.name.startswith(name + "/")
+                                                 for name in include)]
             # Even a hash-checked archive must never write outside scratch.
-            for member in source.getmembers():
+            for member in members:
                 if Path(member.name).is_absolute() or ".." in Path(member.name).parts or member.isdev() or member.isfifo():
                     raise ValueError("unsafe source archive entry")
                 if member.issym() or member.islnk():
                     if Path(member.linkname).is_absolute() or ".." in Path(member.linkname).parts:
                         raise ValueError("unsafe source archive link")
-            source.extractall(destination)
+            source.extractall(destination, members=members)
     return destination
+
+
+def install_cmake(archive, scratch):
+    # Keep the CLI binaries beside their module tree. The GUI app and its Qt
+    # frameworks are not job tools and need not be extracted or installed.
+    contents = "cmake-" + parity.CMAKE_SOURCE["version"] + "-macos-universal/CMake.app/Contents"
+    names = ("cmake", "ctest", "cpack")
+    root = unpack(archive, scratch / "cmake-source",
+                  include=[contents + "/bin/" + name for name in names] + [contents + "/share"]) / contents
+    shutil.copytree(root, PREFIX / "cmake")
+    for name in names:
+        (PREFIX / "bin" / name).symlink_to("../cmake/bin/" + name)
+
+
+def make_readonly():
+    for path in [PREFIX, *PREFIX.rglob("*")]:
+        if not path.is_symlink():
+            os.chown(path, 0, 0)
+            path.chmod(0o555 if path.is_dir() or os.access(path, os.X_OK) else 0o444)
 
 
 def account():
@@ -130,6 +152,8 @@ def provision(manifest, scratch, measure):
     (PREFIX / "bun/bin").mkdir(parents=True, exist_ok=True)
     shutil.copyfile(bun_root / "bun-darwin-aarch64/bun", PREFIX / "bun/bin/bun")
     (PREFIX / "bun/bin/bun").chmod(0o755)
+    if "cmake" in manifest["tools"]:
+        install_cmake(archives / "cmake", scratch)
     cargo = PREFIX / "cargo/bin/cargo"
     for index, tool in enumerate(manifest["cargo_installs"]):
         root = scratch / ("cargo-install-" + str(index))
@@ -191,10 +215,7 @@ def provision(manifest, scratch, measure):
     shutil.copytree(PREFIX / "share/git-core", tools / "share/git-core", symlinks=True)
     tool_sha = {name: parity.digest(tools / spec["path"]) for name, spec in manifest["prep_tools"].items()}
     (PREFIX / "toolchain.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    for path in [PREFIX, *PREFIX.rglob("*")]:
-        if not path.is_symlink():
-            os.chown(path, 0, 0)
-            path.chmod(0o555 if path.is_dir() or os.access(path, os.X_OK) else 0o444)
+    make_readonly()
     actual = parity.capture(manifest)
     result = pinlock.candidate(manifest, actual, sources, agent_sha, tool_sha)
     (scratch / "candidate.json").write_text(json.dumps(result, indent=2) + "\n")

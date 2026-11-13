@@ -130,6 +130,15 @@ allow-list, then pins `HOME=/Users/motorjob`, a fresh writable job `TMPDIR`,
 `PATH=/opt/motor/cargo/bin:/opt/motor/bun/bin:/opt/motor/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 `CARGO_TARGET_DIR` is unset.
 
+The image recipe installs Rust 1.91.0, 1.92.0, 1.96.0, 1.99.0 and 1.100.0, plus
+an independent stable copy of 1.99.0. The default remains 1.99.0. Rust 1.100.0
+has the same components and `aarch64-apple-darwin` target as 1.99.0, including
+`llvm-tools` and `rust-analyzer`. Bun is 1.4.4. CMake 4.2.3 uses Kitware's
+SHA-256-pinned official macOS universal archive; its CLI binaries and module tree
+are read-only under `/opt/motor/cmake`, with `cmake`, `ctest` and `cpack` links in
+`/opt/motor/bin` on the job PATH. The image measurement records exact tool
+versions, Rust component/target sets and native executable/toolchain hashes.
+
 After bash exits, its real exit or signal status is saved, and every process of
 the job uid is SIGKILLed. Both output pipes must reach EOF within two seconds of
 that kill. Root-owned disk spools separate pipe draining from host flow control:

@@ -11,6 +11,15 @@ import subprocess
 
 HOST = "aarch64-apple-darwin"
 PREFIX = "/opt/motor"
+REBUILD_RUST = "1.100.0-" + HOST
+REBUILD_RUSTC = "rustc 1.100.0 (0ef1bc386 2026-11-09)"
+REBUILD_CARGO = "cargo 1.100.0 (3acc79c0c 2026-11-05)"
+CMAKE_VERSION = "cmake version 4.2.3"
+CMAKE_SOURCE = {
+    "version": "4.2.3",
+    "url": "https://github.com/Kitware/CMake/releases/download/v4.2.3/cmake-4.2.3-macos-universal.tar.gz",
+    "sha256": "c2302d3e9c48daabee5ea7c4db4b2b93b989bcc89dae8b760880e00120641b5b",
+}
 ENVIRONMENT = {
     "HOME": "/Users/motorjob",
     "TMPDIR": {"per_job_directory": True},
@@ -94,15 +103,36 @@ PENDING_MACOS_TOOLCHAINS = set()
 PENDING_MACOS_TOOL_VERSIONS = set()
 
 
-def macos_components(server_components):
+def macos_components(server_components, rebuild=False):
     """The macOS image's components for one build-server toolchain: the host's
     own rust-std but no cross-target ones, and no pending components."""
     return sorted(component.replace("x86_64-unknown-linux-gnu", HOST)
                   for component in server_components
                   if (not component.startswith("rust-std-")
                       or component == "rust-std-x86_64-unknown-linux-gnu")
-                  and component.removesuffix("-x86_64-unknown-linux-gnu")
-                  not in PENDING_MACOS_COMPONENTS)
+                  and (rebuild or component.removesuffix("-x86_64-unknown-linux-gnu")
+                       not in PENDING_MACOS_COMPONENTS))
+
+
+def rust_toolchains(server, rebuild=False):
+    """Project Linux pins, retaining live-image exceptions only outside a rebuild."""
+    chains = {}
+    for name, spec in server["rust_toolchains"].items():
+        version = name.removesuffix("-x86_64-unknown-linux-gnu")
+        if not rebuild and version in PENDING_MACOS_TOOLCHAINS:
+            continue
+        chains[version + "-" + HOST] = {
+            "rustc": spec["rustc"], "targets": [HOST],
+            "components": macos_components(spec["components"], rebuild=rebuild),
+        }
+    if rebuild:
+        # The next numbered toolchain is installed beside the unchanged default.
+        base = chains["1.99.0-" + HOST]
+        expected = dict(base, rustc=REBUILD_RUSTC)
+        if REBUILD_RUST in chains and chains[REBUILD_RUST] != expected:
+            raise ValueError("Rust 1.100.0 differs from the rebuild pins")
+        chains[REBUILD_RUST] = dict(expected, cargo=REBUILD_CARGO)
+    return chains
 
 
 def validate(manifest, server):
@@ -114,16 +144,10 @@ def validate(manifest, server):
         raise ValueError("macOS rustup differs from build-server")
     if manifest.get("rust_profile") != server["rust_profile"]:
         raise ValueError("macOS Rust profile differs from build-server")
-    expected = {}
-    for name, spec in server["rust_toolchains"].items():
-        version = name.removesuffix("-x86_64-unknown-linux-gnu")
-        if version in PENDING_MACOS_TOOLCHAINS:
-            continue
-        components = macos_components(spec["components"])
-        expected[version + "-" + HOST] = {
-            "rustc": spec["rustc"], "targets": [HOST], "components": components}
     chains = manifest.get("rust_toolchains", {})
-    projected = {name: {key: row.get(key) for key in ("rustc", "targets", "components")}
+    rebuild = REBUILD_RUST in chains
+    expected = rust_toolchains(server, rebuild=rebuild)
+    projected = {name: {key: row.get(key) for key in ("rustc", "targets", "components", *(["cargo"] if name == REBUILD_RUST else []))}
                  for name, row in chains.items()}
     if projected != expected:
         raise ValueError("macOS Rust toolchains/components differ from build-server")
@@ -159,9 +183,17 @@ def validate(manifest, server):
                 raise ValueError("macOS cargo-bin version differs from build-server: " + name)
             if spec.get("matches") != server["cargo_binaries"][name].get("matches"):
                 raise ValueError("macOS cargo-bin variant differs from build-server: " + name)
-    if set(manifest["tools"]) != {"bun", "git", "bash"}:
+    tool_names = {"bun", "git", "bash"} | ({"cmake"} if rebuild else set())
+    if set(manifest["tools"]) != tool_names:
         raise ValueError("invalid macOS tool set")
-    for name in ("bun", "git", "bash"):
+    if rebuild:
+        cmake = manifest["tools"]["cmake"]
+        if (cmake.get("version") != CMAKE_VERSION or cmake.get("path") != PREFIX + "/bin/cmake"
+                or manifest.get("sources", {}).get("cmake") != CMAKE_SOURCE):
+            raise ValueError("invalid pinned CMake release")
+        if server["tools"]["cmake"]["observed_build_server_version"] != CMAKE_VERSION:
+            raise ValueError("macOS CMake version differs from build-server")
+    for name in tool_names:
         spec = manifest["tools"][name]
         if not sha256(spec.get("sha256")) or not spec.get("version"):
             raise ValueError("missing macOS tool pin: " + name)
@@ -193,6 +225,8 @@ def capture(manifest, job=False):
             "rustc_verbose": output(str(rustup_home / "toolchains" / name / "bin/rustc"), "-vV", env=env),
             "sha256": tree_digest(rustup_home / "toolchains" / name),
         }
+        if "cargo" in manifest["rust_toolchains"].get(name, {}):
+            toolchains[name]["cargo"] = output(str(rustup_home / "toolchains" / name / "bin/cargo"), "--version", env=env)
         payloads[name] = all(any(path.stat().st_size > 0 for path in
                                 (rustup_home / "toolchains" / name / "lib/rustlib" / target / "lib").glob("libstd-*.rlib"))
                              for target in toolchains[name]["targets"])
