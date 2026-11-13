@@ -370,16 +370,18 @@ impl Runtime {
             }
         }
         // Failed requests consume the interval too, without claiming the VM
-        // disappeared. Deadlines and stop retries still run on every tick.
+        // disappeared. Deadlines and the evidence window are checked every tick.
         let running = self.control.adopt_job(job);
         if matches!(running, Ok(false)) {
             tracing::info!(jti = job, "job_vmm_gone");
         }
+        let stop_retry_after_ms = polls.get(job).and_then(|last| last.stop_retry_after_ms);
         polls.insert(
             job.to_owned(),
             Adoption {
                 at_ms: now_ms,
                 running: running.as_ref().copied().unwrap_or(true),
+                stop_retry_after_ms,
             },
         );
         running
@@ -577,9 +579,29 @@ impl Runtime {
                         })
                 };
                 if expired {
+                    if self
+                        .job_adoptions
+                        .lock()
+                        .expect("job adoptions")
+                        .get(job)
+                        .and_then(|last| last.stop_retry_after_ms)
+                        .is_some_and(|at| now_ms < at)
+                    {
+                        continue;
+                    }
                     // Keep the disk attached until the helper has released it.
                     // Absence and even a durable receipt prove no such release.
                     if let Err(error) = self.release_job_vm(job) {
+                        self.job_adoptions
+                            .lock()
+                            .expect("job adoptions")
+                            .entry(job.clone())
+                            .or_insert(Adoption {
+                                at_ms: now_ms,
+                                running: false,
+                                stop_retry_after_ms: None,
+                            })
+                            .stop_retry_after_ms = Some(now_ms.saturating_add(5000));
                         tick_step(&mut failure, "release_gone_vm", Err::<(), _>(error));
                         continue;
                     }
@@ -882,6 +904,8 @@ fn remove_spool(path: &std::path::Path) -> Result<()> {
 pub(super) struct Adoption {
     at_ms: u64,
     running: bool,
+    // Failed gap cleanup must not hammer the helper or log on every idle tick.
+    stop_retry_after_ms: Option<u64>,
 }
 
 struct Spool {

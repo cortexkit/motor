@@ -917,7 +917,7 @@ pub(super) fn connect_relay(root: &Path, uid: u32, port: u32) -> Result<OwnedFd>
 /// A job VMM already owns its socket. Retrying a refused connect after it
 /// reboots only stalls the helper mutex and every other VM's exit collection.
 pub(super) fn connect_job_relay(root: &Path, uid: u32, port: u32) -> Result<OwnedFd> {
-    connect_relay_with_budget(root, uid, port, false, Duration::from_millis(100))
+    connect_relay_with_budget(root, uid, port, false, Duration::from_secs(2))
 }
 
 fn connect_relay_with_budget(

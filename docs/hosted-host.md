@@ -327,6 +327,8 @@ detaching that disk: an exited VMM and an acknowledged exit receipt do not by
 themselves release the helper's disk ownership. Recovery also releases finished
 jobs recorded by this host before starting, including records left by an older
 host. It never stops an unrelated holder to force a disk available.
+Failed helper stops on the evidence-gap path retry and warn at most once every
+five seconds per job; this retry timer is process-local and resets on restart.
 
 A refused recovery start moves to disk deletion. Failed cleanup retries at most
 once every five seconds per disk, with one warning per attempt; the retry time
@@ -343,7 +345,7 @@ The host normally publishes the unknown terminal in the same tick as the gap;
 there is no additional late-result grace period.
 
 Job relay opens do not retry a missing or refused VMM socket while holding the
-helper lock; their handshake has a 100 ms total budget. This keeps a normal
+helper lock; their handshake has a two-second total budget. This keeps a normal
 guest reboot from imposing the legacy tenant relay's ten-second connect wait
 on exit collection. Missing final OOM evidence remains unknown, never zero;
 helper errors identify whether OOM-file reading, egress measurement, or exit

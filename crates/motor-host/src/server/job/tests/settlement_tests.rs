@@ -447,11 +447,39 @@ fn evidence_gap_stops_helper_before_detaching_disk_and_late_exit_retries_release
     fake.gone.lock().unwrap().insert(JOB.into());
     runtime.tick_jobs(now).unwrap();
     fake.fail_stop.store(true, Ordering::Release);
-    assert!(runtime.tick_jobs(now + 1000).is_err());
+    let logs = crate::test_logs::capture(|| {
+        assert!(runtime.tick_jobs(now + 1000).is_err());
+        for at in (now + 1001..now + 6000).step_by(100) {
+            runtime.tick_jobs(at).unwrap();
+        }
+        runtime.tick_jobs(now + 5999).unwrap();
+        assert_eq!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| *c == &format!("stop:{JOB}"))
+                .count(),
+            1
+        );
+        assert!(runtime.tick_jobs(now + 6000).is_err());
+    });
+    assert_eq!(
+        logs.iter()
+            .filter(|line| line.contains("job_tick_step_failed")
+                && line.contains("release_gone_vm"))
+            .count(),
+        2
+    );
     let disk = {
         let host = runtime.host.lock().unwrap();
         let e = &host.snapshot.per_job.executions[JOB];
         assert!(!e.ended);
+        assert_eq!(e.replay_completion, None);
+        assert_eq!(
+            host.snapshot.billing[JOB].terminal.as_ref().unwrap()["outcome"]["type"],
+            "outcome_unknown"
+        );
         assert_eq!(
             host.snapshot.per_job.disks[&e.disk_id]
                 .attached_job
@@ -461,7 +489,9 @@ fn evidence_gap_stops_helper_before_detaching_disk_and_late_exit_retries_release
         e.disk_id.clone()
     };
     fake.fail_stop.store(false, Ordering::Release);
-    runtime.tick_jobs(now + 1001).unwrap();
+    runtime.tick_jobs(now + 6001).unwrap();
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended);
+    runtime.tick_jobs(now + 11000).unwrap();
     assert!(runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended);
     assert!(runtime.host.lock().unwrap().snapshot.per_job.disks[&disk]
         .attached_job
@@ -472,10 +502,10 @@ fn evidence_gap_stops_helper_before_detaching_disk_and_late_exit_retries_release
     fake.exits.lock().unwrap().clear();
     fake.fail_stop.store(true, Ordering::Release);
     fake.exits.lock().unwrap().push(exit(JOB, 0));
-    assert!(runtime.collect_job_exits(now + 3000).is_err());
+    assert!(runtime.collect_job_exits(now + 13000).is_err());
     assert!(fake.exits.lock().unwrap().is_empty());
     fake.fail_stop.store(false, Ordering::Release);
-    runtime.collect_job_exits(now + 3001).unwrap();
+    runtime.collect_job_exits(now + 13001).unwrap();
     assert!(runtime.helper_stopped_jobs.lock().unwrap().contains(JOB));
 }
 
