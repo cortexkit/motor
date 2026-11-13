@@ -508,6 +508,18 @@ pub(super) fn test_job_policy(uplink: &str, index: u8) -> String {
     .unwrap()
 }
 
+#[cfg(all(test, feature = "linux-service-tests"))]
+pub(super) fn test_install_job_policy(uplink: &str, taps: &[Tap]) -> Result<()> {
+    let tables = nft_json(&["-j", "list", "tables"])?;
+    let existing = nft_table(&tables, "motor_tenant")?;
+    apply(&policy_rules(
+        uplink,
+        taps,
+        existing.as_ref(),
+        &Default::default(),
+    )?)
+}
+
 fn managed_tap(name: &str, suffix: &str) -> Option<String> {
     let digits = name.strip_prefix("tenant_mtap")?.strip_suffix(suffix)?;
     let index: u8 = digits.parse().ok()?;
