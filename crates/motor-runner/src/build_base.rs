@@ -936,6 +936,8 @@ fn publish_record_synced(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ToolchainIdentity {
+    // The runner's verbose compiler output when no selector exists; otherwise
+    // the snapshot's exact release. Floating selectors cannot identify a base.
     pub rustc_verbose: String,
     pub rust_toolchain: Option<String>,
     pub rust_toolchain_toml: Option<String>,
@@ -1019,6 +1021,69 @@ impl RunnerToolchain {
     }
 }
 
+fn selected_release(repository: &Path, blob: &str, is_toml: bool) -> io::Result<String> {
+    let invalid = || io::Error::other("build-base toolchain selector must name an exact release");
+    let size = workspace::git(repository, &["cat-file", "-s", blob])?
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| invalid())?;
+    if size > 16 * 1024 {
+        return Err(invalid());
+    }
+    let bytes = workspace::git_bytes(repository, &["cat-file", "blob", blob])?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+    let release = if is_toml {
+        let value: toml::Value = toml::from_str(text).map_err(|_| invalid())?;
+        let root = value.as_table().ok_or_else(invalid)?;
+        let toolchain = root
+            .get("toolchain")
+            .and_then(toml::Value::as_table)
+            .ok_or_else(invalid)?;
+        if root.len() != 1
+            || toolchain.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "channel" | "components" | "targets" | "profile"
+                )
+            })
+        {
+            return Err(invalid());
+        }
+        for key in ["components", "targets"] {
+            if toolchain.get(key).is_some_and(|value| {
+                !value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(toml::Value::is_str))
+            }) {
+                return Err(invalid());
+            }
+        }
+        if toolchain.get("profile").is_some_and(|value| {
+            !matches!(value.as_str(), Some("minimal" | "default" | "complete"))
+        }) {
+            return Err(invalid());
+        }
+        toolchain
+            .get("channel")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(invalid)?
+            .to_owned()
+    } else {
+        text.trim().to_owned()
+    };
+    let parts: Vec<_> = release.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(release)
+}
+
 /// All inputs exist before wrapper compilation. `env` must come from
 /// backend::job_environment with the unit's selected wrapper and transport.
 /// `sccache_backend` is the shared Cargo home's bin/sccache, not the generated
@@ -1033,11 +1098,6 @@ pub(crate) fn compatibility(
     let collect = || -> io::Result<CompatibleInputs> {
         snapshot_file(repository, tree, "Cargo.toml")?;
         snapshot_file(repository, tree, "crates/prefrontal-build-slot/src/main.rs")?;
-        let rustc_verbose = runner
-            .0
-            .as_ref()
-            .map_err(|e| io::Error::other(e.clone()))?
-            .clone();
         let entries = workspace::git(
             repository,
             &[
@@ -1056,13 +1116,26 @@ pub(crate) fn compatibility(
                 .split_once('\t')
                 .ok_or_else(|| io::Error::other("invalid toolchain tree entry"))?;
             let fields: Vec<_> = metadata.split_whitespace().collect();
-            if fields.len() != 3 || fields[1] != "blob" {
+            if fields.len() != 3 || fields[1] != "blob" || !matches!(fields[0], "100644" | "100755")
+            {
                 return Err(io::Error::other(format!(
                     "toolchain input is not a blob: {name}"
                 )));
             }
             blobs.insert(name, fields[2].to_owned());
         }
+        let rustc_verbose = match blobs.len() {
+            0 => runner
+                .0
+                .as_ref()
+                .map_err(|e| io::Error::other(e.clone()))?
+                .clone(),
+            1 => {
+                let (name, blob) = blobs.first_key_value().unwrap();
+                selected_release(repository, blob, *name == "rust-toolchain.toml")?
+            }
+            _ => return Err(io::Error::other("multiple build-base toolchain selectors")),
+        };
         let wrapper = match env.get("RUSTC_WRAPPER").map(String::as_str) {
             Some("/motor-tools/prefrontal-build-slot") => Some(WrapperIdentity::Supervisor {
                 source_sha256: supervisor_digest(),
@@ -1237,29 +1310,177 @@ mod tests {
             original.toolchain.rustc_verbose,
             f.runner.0.as_ref().unwrap().as_str()
         );
-        // Invalid toolchain text is only data: it must never be invoked.
-        f.stage("rust-toolchain", "not-an-installed-toolchain\n");
-        f.stage("rust-toolchain.toml", "also not a toolchain\n");
+        f.stage(
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.100.0\"\n",
+        );
         let identity = f.identity(None).for_seed().unwrap().clone();
-        for (name, actual) in [
-            ("rust-toolchain", &identity.toolchain.rust_toolchain),
-            (
-                "rust-toolchain.toml",
-                &identity.toolchain.rust_toolchain_toml,
-            ),
-        ] {
-            let expected = workspace::git(
-                &f.scratch,
-                &["rev-parse", &format!("{}:{name}", f.tree.trim())],
-            )
-            .unwrap();
-            assert_eq!(actual.as_deref(), Some(expected.trim()));
-        }
+        let expected = workspace::git(
+            &f.scratch,
+            &[
+                "rev-parse",
+                &format!("{}:rust-toolchain.toml", f.tree.trim()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(identity.toolchain.rust_toolchain, None);
+        assert_eq!(
+            identity.toolchain.rust_toolchain_toml.as_deref(),
+            Some(expected.trim())
+        );
+        assert_eq!(identity.toolchain.rustc_verbose, "1.100.0");
         assert_ne!(identity, original);
-        fs::write(f.scratch.join("rust-toolchain"), "unstaged edit").unwrap();
+        fs::write(f.scratch.join("rust-toolchain.toml"), "unstaged edit").unwrap();
         assert_eq!(f.identity(None).for_seed().unwrap(), &identity);
         f.runner = RunnerToolchain(Ok("rustc same release\nhost: other-host\n".into()));
-        assert!(f.identity(None).differs_for_due(&identity));
+        assert_eq!(f.identity(None).for_seed().unwrap(), &identity);
+    }
+
+    #[test]
+    fn exact_selector_release_identifies_compiler_independently_of_runner_default() {
+        for (name, text) in [
+            ("rust-toolchain", "1.100.0\n"),
+            ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.100.0\"\ncomponents = [\"clippy\"]\nprofile = \"minimal\"\n"),
+        ] {
+            let mut f = Fixture::new();
+            let default = f.identity(None).for_seed().unwrap().clone();
+            f.stage(name, text);
+            let pinned = f.identity(None).for_seed().unwrap().clone();
+            assert_eq!(pinned.toolchain.rustc_verbose, "1.100.0");
+            assert_ne!(pinned, default);
+            assert_eq!(f.identity(None).for_publication().unwrap(), &pinned);
+            f.stage(name, if name.ends_with("toml") { "[toolchain]\nchannel = \"1.99.1\"\n" } else { "1.99.1\n" });
+            assert_eq!(f.identity(None).for_seed().unwrap().toolchain.rustc_verbose, "1.99.1");
+            assert!(f.identity(None).differs_for_due(&pinned));
+        }
+    }
+
+    #[test]
+    fn floating_ambiguous_and_unreadable_selectors_disable_reuse_and_publication() {
+        for (name, text, both) in [
+            ("rust-toolchain", "stable\n", false),
+            ("rust-toolchain", "1.100\n", false),
+            ("rust-toolchain", "nightly-2026-11-01\n", false),
+            ("rust-toolchain", "custom\n", false),
+            ("rust-toolchain", "1.100.0\nextra\n", false),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"stable\"\n",
+                false,
+            ),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"1.100\"\n",
+                false,
+            ),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"beta\"\n",
+                false,
+            ),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"nightly-2026-11-01\"\n",
+                false,
+            ),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"1.100.0\"\npath = \"/custom\"\n",
+                false,
+            ),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\npath = \"/custom\"\n",
+                false,
+            ),
+            ("rust-toolchain.toml", "not toml", false),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"1.100.0\"\n",
+                true,
+            ),
+        ] {
+            let mut f = Fixture::new();
+            let published = f.identity(None).for_seed().unwrap().clone();
+            f.stage(name, text);
+            if both {
+                f.stage("rust-toolchain", "1.100.0\n");
+            }
+            let identity = f.identity(None);
+            assert!(identity.for_seed().is_err(), "{text}");
+            assert!(identity.for_publication().is_err(), "{text}");
+            assert!(!identity.differs_for_due(&published));
+        }
+        let mut f = Fixture::new();
+        f.stage(
+            "rust-toolchain.toml",
+            &format!(
+                "[toolchain]\nchannel = \"1.100.0\"\n#{}",
+                "x".repeat(16 * 1024)
+            ),
+        );
+        assert!(f.identity(None).for_seed().is_err());
+        assert!(f.identity(None).for_publication().is_err());
+    }
+
+    #[test]
+    fn seed_time_step_stamps_sources_and_leaves_both_cargo_layouts_untouched() {
+        use crate::cargo_gc::fixture::{files, materialize, V1, V2};
+        use std::time::{Duration, UNIX_EPOCH};
+        for layout in [V1, V2] {
+            let mut f = Fixture::new();
+            f.stage("stable.rs", "unchanged");
+            f.stage("changed.rs", "before");
+            let base = Record {
+                format: 1,
+                commit: "unused".into(),
+                tree: f.tree.trim().into(),
+                inputs: f.identity(None).for_seed().unwrap().clone(),
+                fixed_path: f.scratch.to_path_buf(),
+                fill_start: Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                },
+                newest_mtime: Timestamp {
+                    seconds: 2,
+                    nanos: 0,
+                },
+            };
+            f.stage("changed.rs", "after");
+            let target = f.scratch.join("target/bd/ab/0123456789abcd");
+            materialize(&target, layout);
+            let outputs = files(&target);
+            let output_time = UNIX_EPOCH + Duration::from_secs(2);
+            for output in &outputs {
+                fs::File::open(output)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(output_time))
+                    .unwrap();
+            }
+            let new =
+                crate::seed_times::apply(&f.scratch, &f.scratch, f.tree.trim(), &base).unwrap();
+            assert_eq!(
+                fs::metadata(f.scratch.join("stable.rs"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                UNIX_EPOCH + Duration::from_secs(1)
+            );
+            assert_eq!(
+                fs::metadata(f.scratch.join("changed.rs"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                UNIX_EPOCH + Duration::new(new.seconds as u64, new.nanos as u32)
+            );
+            for output in outputs {
+                assert_eq!(
+                    fs::metadata(&output).unwrap().modified().unwrap(),
+                    output_time,
+                    "{output:?}"
+                );
+            }
+        }
     }
 
     #[test]
