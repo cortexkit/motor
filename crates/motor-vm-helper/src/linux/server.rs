@@ -11,11 +11,86 @@ use std::{
         },
     },
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError, RwLock, RwLockWriteGuard},
     time::Duration,
 };
 
 const MAX_REQUEST: usize = 4096;
+
+mod requests;
+use requests::job_request;
+
+pub(crate) struct Service {
+    pub(crate) connections: Arc<crate::connections::ConnectionGate>,
+    // The service gate drains lifecycle work before tenant shutdown. Take it
+    // before the Helper or job lock; queued readers recheck stopping on entry.
+    lifecycle: RwLock<()>,
+    authority: Option<crate::cache_write::Authority>,
+    job_vms_configured: bool,
+    workspace_disk_max_bytes: Option<u64>,
+}
+
+impl Service {
+    pub(crate) fn new<M: Machine>(helper: &Helper<M>) -> Self {
+        Self {
+            connections: helper.connections.clone(),
+            lifecycle: RwLock::new(()),
+            authority: helper.machine.cache_write_authority(),
+            job_vms_configured: helper.machine.job_vms_configured(),
+            workspace_disk_max_bytes: helper.machine.workspace_disk_max_bytes(),
+        }
+    }
+
+    fn job(
+        &self,
+        op: crate::job::Operation,
+        peer: Peer,
+        jobs: &impl Fn(crate::job::Operation, Peer) -> Result<Response>,
+    ) -> Result<Response> {
+        op.validate()?;
+        let _lifecycle = if matches!(
+            op,
+            crate::job::Operation::Start(_)
+                | crate::job::Operation::Stop(_)
+                | crate::job::Operation::EnsureWorkspace { .. }
+                | crate::job::Operation::DeleteWorkspace { .. }
+                | crate::job::Operation::SeedWorkspace(_)
+                | crate::job::Operation::EvictBase { .. }
+                | crate::job::Operation::WorkspaceUsage { .. }
+                | crate::job::Operation::PrepareFill(_)
+                | crate::job::Operation::FinishFill { .. }
+        ) {
+            let guard = self
+                .lifecycle
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.connections.check_running()?;
+            Some(guard)
+        } else {
+            None
+        };
+        jobs(op, peer)
+    }
+
+    fn shutdown<'a, M: Machine>(
+        &'a self,
+        helper: &Mutex<Helper<M>>,
+    ) -> (RwLockWriteGuard<'a, ()>, Result<()>) {
+        self.connections.stop();
+        let guard = self
+            .lifecycle
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let result = helper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .machine
+            .shutdown();
+        // Return the guard even on failure: no lifecycle work may resume while
+        // the service is exiting, including after an unclean tenant stop.
+        (guard, result)
+    }
+}
 pub fn peer(stream: &UnixStream) -> Result<Peer> {
     let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -65,16 +140,18 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
     let allowed = config.allowed_uids.clone();
     let socket_gid = config.socket_gid;
     let machine = LinuxMachine::new(config)?;
+    let jobs = machine.jobs.clone();
     // Before any thread exists, so every thread inherits the blocked mask.
     let signals = crate::signals::StopSignals::block()?;
     let (helper, listener) = initialize_helper(machine, count, allowed, Path::new(SOCKET))?;
     let helper = Arc::new(helper);
+    let service = Arc::new(Service::new(&helper.lock().unwrap()));
     let path = c"/run/motor-vm-helper.sock";
     if unsafe { libc::chown(path.as_ptr(), 0, socket_gid) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o660))?;
-    let authority = helper.lock().unwrap().machine.cache_write_authority();
+    let authority = service.authority.clone();
     if let Some(authority) = authority {
         std::thread::spawn(move || loop {
             std::thread::park_timeout(Duration::from_millis(100));
@@ -85,6 +162,15 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
     std::thread::spawn(move || loop {
         std::thread::park_timeout(Duration::from_millis(100));
         maintenance.lock().unwrap().maintain();
+    });
+    // Job collection must not wait for tenants or dirty legacy-slot cleanup.
+    // The job lock serializes records and pre-collection without the Helper lock.
+    let maintenance = jobs.clone();
+    std::thread::spawn(move || loop {
+        std::thread::park_timeout(Duration::from_millis(100));
+        if let Err(error) = maintenance.lock().unwrap().maintain() {
+            eprintln!("job exit evidence collection failed: {error}");
+        }
     });
     // Removed tenants' quarantined data is deleted here once it is old
     // enough. Only removal writes that folder, so this needs no helper lock
@@ -100,29 +186,50 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
         std::thread::sleep(Duration::from_secs(3600));
     });
     let stopping = helper.clone();
+    let stop_service = service.clone();
     std::thread::spawn(move || {
         // A tenant that did not stop cleanly is already recorded as unclean,
         // so its next start runs the guest's recovery check. Exit 0 either
         // way: the stop was requested, and a failed unit would make
         // `provision.py switch-image`, which needs both services inactive,
         // refuse until the failure is reset by hand.
-        match crate::signals::stop_on_signal(&stopping, &signals) {
-            Ok(signal) => eprintln!("motor-vm-helper: stopped after signal {signal}"),
-            Err(e) => eprintln!("motor-vm-helper: {e}"),
+        let signal = match signals.wait() {
+            Ok(signal) => signal,
+            Err(e) => {
+                eprintln!("motor-vm-helper: {e}");
+                std::process::exit(0);
+            }
+        };
+        let (_guard, result) = stop_service.shutdown(&stopping);
+        match result {
+            Ok(()) => eprintln!("motor-vm-helper: stopped after signal {signal}"),
+            Err(e) => eprintln!("motor-vm-helper: clean stop after signal {signal}: {e}"),
         }
         std::process::exit(0);
     });
     for connection in listener.incoming() {
         let stream = connection?;
         let peer = peer(&stream)?;
-        let id = match helper.lock().unwrap().connect(peer) {
+        let id = match service.connections.connect(peer) {
             Ok(id) => id,
             Err(_) => continue,
         };
         let helper = helper.clone();
+        let service = service.clone();
+        let jobs = jobs.clone();
         std::thread::spawn(move || {
-            let result = connection_loop(&helper, id, stream);
-            helper.lock().unwrap().disconnect(id);
+            let result = connection_loop(
+                &helper,
+                &service,
+                &|op, peer| jobs.lock().unwrap().handle(op, peer),
+                id,
+                stream,
+            );
+            // Remove authorization under the connection gate alone before
+            // waiting for the Helper lock to dirty legacy leases. A slow tenant
+            // must not retain a disconnected peer.
+            service.connections.disconnect(id);
+            helper.lock().unwrap().dirty_leases(id);
             if let Err(e) = result {
                 eprintln!("helper connection: {e}");
             }
@@ -132,6 +239,8 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
 }
 pub(crate) fn connection_loop<M: crate::Machine>(
     helper: &Mutex<Helper<M>>,
+    service: &Service,
+    jobs: &impl Fn(crate::job::Operation, Peer) -> Result<Response>,
     id: u64,
     mut stream: UnixStream,
 ) -> Result<()> {
@@ -162,18 +271,29 @@ pub(crate) fn connection_loop<M: crate::Machine>(
         let result = serde_json::from_slice::<Request>(&line)
             .map_err(|e| Error(e.to_string()))
             .and_then(|request| {
+                let peer = service.connections.authorize(id)?;
+                let request = match job_request(request) {
+                    Ok(op) => return service.job(op, peer, jobs),
+                    Err(request) => request,
+                };
                 // Image copies must not hold the helper mutex: admission probes
                 // and stops must remain responsive during a publication.
                 let op = match request {
                     Request::AdmitCacheWrite { token } => {
-                        let authority = helper.lock().unwrap().admission_work(id)?;
+                        let authority = service.authority.as_ref().ok_or_else(|| {
+                            Error("cache-write admission is not configured".into())
+                        })?;
                         authority.admit(&token)?;
                         return Ok(Response::new(Reply::Ok));
                     }
-                    Request::PerJobReadiness {} => helper.lock().unwrap().readiness_work(id)?,
+                    Request::PerJobReadiness {} => crate::images::Operation::Readiness {
+                        job_vms_configured: service.job_vms_configured,
+                        workspace_disk_max_bytes: service.workspace_disk_max_bytes,
+                    },
                     Request::RemoveJobImages { generation } => {
-                        let response = helper.lock().unwrap().handle(
+                        let response = helper.lock().unwrap().handle_authorized(
                             id,
+                            peer,
                             Request::RemoveJobImages {
                                 generation: generation.clone(),
                             },
@@ -193,9 +313,9 @@ pub(crate) fn connection_loop<M: crate::Machine>(
                         generation,
                         account,
                     },
-                    request => return helper.lock().unwrap().handle(id, request),
+                    request => return helper.lock().unwrap().handle_authorized(id, peer, request),
                 };
-                helper.lock().unwrap().authorize_image_work(id, &op)?;
+                op.validate()?;
                 super::images::handle(op)
             });
         let response = match result {

@@ -1,11 +1,12 @@
 //! The helper owns machine-wide leases, not the runner. A connection retains a
 //! slot across fetch, job and scan VMs; only explicit release makes it available.
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt, os::fd::OwnedFd};
+use std::{fmt, os::fd::OwnedFd, sync::Arc};
 use uuid::Uuid;
 
 pub mod cache_write;
 pub mod config;
+mod connections;
 pub mod images;
 pub mod job;
 #[cfg(target_os = "linux")]
@@ -386,10 +387,7 @@ pub trait Machine {
 pub struct Helper<M: Machine> {
     pub machine: M,
     slots: Vec<Slot>,
-    allowed_uids: Vec<u32>,
-    connections: BTreeMap<u64, Peer>,
-    next_connection: u64,
-    stopping: bool,
+    pub(crate) connections: Arc<connections::ConnectionGate>,
 }
 impl<M: Machine> Helper<M> {
     /// Reconciliation is a barrier: a server may bind its socket only after this
@@ -402,28 +400,17 @@ impl<M: Machine> Helper<M> {
         Ok(Self {
             machine,
             slots: vec![Slot::Free; count],
-            allowed_uids,
-            connections: BTreeMap::new(),
-            next_connection: 0,
-            stopping: false,
+            connections: Arc::new(connections::ConnectionGate::new(allowed_uids)),
         })
     }
     /// Stops tenant VMs cleanly for a service stop. Afterwards every request
     /// is refused, so nothing can start a VM between this and the exit.
     pub fn shutdown(&mut self) -> Result<()> {
-        self.stopping = true;
+        self.connections.stop();
         self.machine.shutdown()
     }
     pub fn connect(&mut self, peer: Peer) -> Result<u64> {
-        if !self.allowed_uids.contains(&peer.uid) {
-            return Err(Error("unauthorised peer uid".into()));
-        }
-        self.next_connection = self
-            .next_connection
-            .checked_add(1)
-            .ok_or_else(|| Error("connection IDs exhausted".into()))?;
-        self.connections.insert(self.next_connection, peer);
-        Ok(self.next_connection)
+        self.connections.connect(peer)
     }
     fn matching(&self, connection: u64, slot: usize, identity: &Identity) -> Result<Lease> {
         match self.slots.get(slot) {
@@ -436,9 +423,9 @@ impl<M: Machine> Helper<M> {
             _ => Err(Error("lease identity or connection does not match".into())),
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn admission_work(&self, connection: u64) -> Result<cache_write::Authority> {
-        if self.stopping || !self.connections.contains_key(&connection) {
+        if self.connections.authorize(connection).is_err() {
             return Err(Error(
                 "connection is not authorised for cache-write admission".into(),
             ));
@@ -447,37 +434,22 @@ impl<M: Machine> Helper<M> {
             .cache_write_authority()
             .ok_or_else(|| Error("cache-write admission is not configured".into()))
     }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn readiness_work(&self, connection: u64) -> Result<images::Operation> {
-        let op = images::Operation::Readiness {
-            job_vms_configured: self.machine.job_vms_configured(),
-            workspace_disk_max_bytes: self.machine.workspace_disk_max_bytes(),
-        };
-        self.authorize_image_work(connection, &op)?;
-        Ok(op)
-    }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn authorize_image_work(
-        &self,
-        connection: u64,
-        op: &images::Operation,
-    ) -> Result<()> {
-        if self.stopping || !self.connections.contains_key(&connection) {
-            return Err(Error("connection is not authorised for image work".into()));
-        }
-        op.validate()
-    }
     pub fn handle(&mut self, connection: u64, request: Request) -> Result<Response> {
-        let peer = *self
-            .connections
-            .get(&connection)
-            .ok_or_else(|| Error("connection is not authorised".into()))?;
-        if self.stopping {
-            return Err(Error("helper is stopping".into()));
-        }
+        let peer = self.connections.authorize(connection)?;
+        self.handle_authorized(connection, peer, request)
+    }
+    // The server authorizes under the connection gate before taking the Helper
+    // lock, so registration never waits for tenant or legacy-slot work.
+    pub(crate) fn handle_authorized(
+        &mut self,
+        connection: u64,
+        peer: Peer,
+        request: Request,
+    ) -> Result<Response> {
+        self.connections.check_running()?;
         match request {
-            // The socket server uses admission_work to check authorization, then
-            // releases the global Helper lock before fetching signing keys.
+            // The socket server authorizes under its connection gate and fetches
+            // signing keys without holding the tenant and legacy-slot lock.
             Request::AdmitCacheWrite { .. } => {
                 Err(Error("cache-write admission requires detached work".into()))
             }
@@ -727,7 +699,10 @@ impl<M: Machine> Helper<M> {
         self.machine.job(op, peer)
     }
     pub fn disconnect(&mut self, connection: u64) {
-        self.connections.remove(&connection);
+        self.connections.disconnect(connection);
+        self.dirty_leases(connection);
+    }
+    pub(crate) fn dirty_leases(&mut self, connection: u64) {
         for state in &mut self.slots {
             if let Slot::Leased(l) = state {
                 if l.connection == connection {

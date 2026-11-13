@@ -433,11 +433,20 @@ fn held_jwks_fetch_keeps_ensure_start_and_stop_job_responsive() {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let peer = crate::linux::server::peer(&stream).unwrap();
-        let id = helper.lock().unwrap().connect(peer).unwrap();
+        let service = crate::linux::server::Service::new(&helper.lock().unwrap());
+        let id = service.connections.connect(peer).unwrap();
         let helper = helper.clone();
         let worker = std::thread::spawn(move || {
-            crate::linux::server::connection_loop(&helper, id, stream).unwrap();
-            helper.lock().unwrap().disconnect(id);
+            crate::linux::server::connection_loop(
+                &helper,
+                &service,
+                &|op, peer| helper.lock().unwrap().machine.job(op, peer),
+                id,
+                stream,
+            )
+            .unwrap();
+            service.connections.disconnect(id);
+            helper.lock().unwrap().dirty_leases(id);
         });
         (BufReader::new(client), worker)
     }
