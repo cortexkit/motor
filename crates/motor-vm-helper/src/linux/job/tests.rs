@@ -5,6 +5,10 @@ mod exit_tests;
 mod network_tests;
 mod plane_tests;
 mod security_tests;
+#[cfg(feature = "linux-service-tests")]
+mod service_cleanup;
+#[cfg(feature = "linux-service-tests")]
+use service_cleanup::ServiceResources;
 
 #[test]
 fn absent_job_stop_and_adopt_are_idempotent_without_exit_evidence() {
@@ -1025,27 +1029,6 @@ fn final_oom_evidence_is_not_invented() {
 }
 
 #[cfg(feature = "linux-service-tests")]
-struct ServiceResources {
-    base: PathBuf,
-    group: PathBuf,
-}
-
-#[cfg(feature = "linux-service-tests")]
-impl Drop for ServiceResources {
-    fn drop(&mut self) {
-        if self.group.exists() {
-            let _ = std::fs::write(self.group.join("cgroup.kill"), "1");
-            let _ = tenant::wait_empty(&self.group);
-            let _ = std::fs::remove_dir(&self.group);
-        }
-        let _ = Command::new("systemctl")
-            .args(["stop", "motorvmtest.slice"])
-            .status();
-        let _ = std::fs::remove_dir_all(&self.base);
-    }
-}
-
-#[cfg(feature = "linux-service-tests")]
 fn slice_state(point: &str) {
     let output = Command::new("systemctl")
         .args([
@@ -1258,10 +1241,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     cgroup::enable(Path::new(SLICE)).unwrap();
     let group = Path::new(SLICE).join(format!("job-{}", start().job_id));
     assert!(!group.exists(), "leftover job service-test cgroup");
-    let _resources = ServiceResources {
-        base: base.clone(),
-        group,
-    };
+    let _resources = ServiceResources::new(base.clone(), group);
     let unit = include_str!("../../../systemd/motor-vm-helper.service");
     let properties: Vec<_> = ["Delegate=", "DelegateSubgroup=", "KillMode="]
         .iter()
@@ -1411,8 +1391,6 @@ fn isolated_job_vmm_survives_helper_service_restart() {
         Reply::JobExits { exits } if exits.is_empty())
     );
     restarted.acknowledge_exit(report).unwrap();
-    run(&["stop", "motorvmtest.slice"]);
-    std::fs::remove_dir_all(base).unwrap();
 }
 #[test]
 fn fill_boot_authority_comes_from_the_root_disk_role_not_the_requested_start_kind() {
