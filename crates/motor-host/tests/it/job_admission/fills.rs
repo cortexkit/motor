@@ -418,16 +418,28 @@ fn scheduler_uses_recent_repository_and_success_have_but_discards_failures_and_n
         assert_eq!(starts[0].memory_mib, 32_768);
         assert_eq!(starts[0].burst_mib, None);
         assert_eq!(*helper.finishes.lock().unwrap(), [success]);
-        let h = host.lock().unwrap();
+        let mut h = host.lock().unwrap();
         assert!(h.snapshot.outbox.is_empty());
         assert!(h.snapshot.billing.is_empty());
         assert!(h.snapshot.zero_usage.is_empty());
         assert!(h.snapshot.leases.is_empty());
         assert!(h.snapshot.per_job.executions.is_empty());
         if success {
-            let base = h.snapshot.per_job.bases.values().next().unwrap();
+            let (base_id, base) = h.snapshot.per_job.bases.iter().next().unwrap();
+            let base_id = base_id.clone();
             assert_eq!(base.repository_key.as_deref(), Some("recent"));
             assert_eq!(base.have, pins());
+            h.set_job_storage(helper.clone());
+            h.claim(job(JOB), AT).unwrap();
+            let disk = h.snapshot.per_job.executions[JOB].disk_id.clone();
+            assert!(h.snapshot.per_job.disks[&disk].have.is_empty());
+            assert!(h.seed_job_from_base(JOB, "recent", AT).unwrap());
+            let seeds = helper.seeds.lock().unwrap();
+            assert_eq!(seeds.len(), 1);
+            assert_eq!(seeds[0].base_id, base_id);
+            assert_eq!(seeds[0].disk_id, disk);
+            assert_eq!(seeds[0].account, job(JOB).sub);
+            assert_eq!(h.snapshot.per_job.disks[&disk].have, pins());
         } else {
             assert!(h.snapshot.per_job.bases.is_empty());
         }

@@ -738,20 +738,27 @@ pub(crate) fn publication_eligible(
 /// failed publication leaves `current` unchanged; remove its staging generation
 /// only with remove-staging.
 pub(crate) fn publish(
-    state: &Path,
+    config: &crate::Config,
     trees: &workspace::Trees,
     checkout: &Path,
     job: &crate::storage::Job,
     success: bool,
 ) -> io::Result<()> {
-    publish_after_link_check(state, trees, checkout, job, success, |repository| {
-        crate::permissions::staging_operation(
-            "check-staging-links",
-            state,
-            &workspace::name(repository),
-            job.id,
-        )
-    })
+    publish_after_link_check(
+        &config.state_dir(),
+        trees,
+        checkout,
+        job,
+        success,
+        |repository| {
+            crate::permissions::staging_operation(
+                "check-staging-links",
+                config,
+                &workspace::name(repository),
+                job.id,
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -782,6 +789,26 @@ fn publish_after_link_check(
     success: bool,
     check_links: impl FnOnce(&str) -> io::Result<()>,
 ) -> io::Result<()> {
+    publish_with_operations(
+        state,
+        trees,
+        checkout,
+        job,
+        success,
+        check_links,
+        crate::isolation::reclaim_build_base,
+    )
+}
+
+fn publish_with_operations(
+    state: &Path,
+    trees: &workspace::Trees,
+    checkout: &Path,
+    job: &crate::storage::Job,
+    success: bool,
+    check_links: impl FnOnce(&str) -> io::Result<()>,
+    reclaim: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let started = std::time::Instant::now();
     let launch = publication_eligible(job, success)?;
     let request = job
@@ -795,7 +822,7 @@ fn publish_after_link_check(
     // No metadata repair, including an ACL restore, may precede this check.
     check_links(repository)?;
     verify_unchanged(trees, request, checkout, launch.reference)?;
-    crate::isolation::reclaim_build_base(&generation)?;
+    reclaim(&generation)?;
     let root = crate::permissions::physical_root(&generation)?;
     let target = open_directory(&root, std::ffi::OsStr::new("target"))?;
     let bd = open_directory(&target, std::ffi::OsStr::new("bd")).map_err(|error| {
@@ -821,6 +848,41 @@ fn publish_after_link_check(
     publish_record(&generation, &record)?;
     tracing::info!(job_id = %job.id, elapsed_ms = started.elapsed().as_millis() as u64, tip = %record.commit, repository = %repository, "build base published");
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn publish_with_fixture_ownership(
+    config: &crate::Config,
+    trees: &workspace::Trees,
+    checkout: &Path,
+    job: &crate::storage::Job,
+) -> io::Result<()> {
+    // Model the root runner's authority selection without requiring root in
+    // portable jobs. The ownership seam below uses real inode checks with the
+    // fixture UID in both roles, not a bypass of the publication predicates.
+    let authority = crate::source_seal::authority::Authority::staging_for_uid(config, 0, || {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no installed source-seal policy",
+        ))
+    })?;
+    publish_with_operations(
+        &config.state_dir(),
+        trees,
+        checkout,
+        job,
+        true,
+        |repository| {
+            crate::permissions::fixture_staging_operation(
+                &authority,
+                "check-staging-links",
+                &config.state_dir(),
+                &workspace::name(repository),
+                job.id,
+            )
+        },
+        crate::permissions::fixture_reclaim_staging,
+    )
 }
 
 /// Called only after the link, checkout, ownership and build-output checks.

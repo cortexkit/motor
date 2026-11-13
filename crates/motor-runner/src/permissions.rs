@@ -405,17 +405,19 @@ impl StagingOwners {
 /// inside the store's protected build-bases and repository directories.
 pub(crate) fn staging_operation(
     action: &str,
-    state: &Path,
+    config: &crate::Config,
     repository: &str,
     fill: motor_protocol::Uuid,
 ) -> io::Result<()> {
-    validate_staging_form(action, state, repository)?;
-    let authority = crate::source_seal::authority::Authority::load()?;
-    staging_authorized(&authority, action, state, repository, fill)
+    let state = config.state_dir();
+    validate_staging_form(action, &state, repository)?;
+    let authority = crate::source_seal::authority::Authority::for_staging(config)?;
+    staging_authorized(&authority, action, &state, repository, fill)
 }
 
 /// Use an already trusted policy, still enforcing its state allowlist on every
-/// operation. Production callers obtain that policy only from Authority::load.
+/// operation. Root runners derive it from their launch configuration; delegated
+/// helpers and non-root runners require the installed root-owned policy.
 pub(crate) fn staging_authorized(
     authority: &crate::source_seal::authority::Authority,
     action: &str,
@@ -440,6 +442,37 @@ fn staging_authorized_as(
     staging_execute(action, state, repository, fill, owners)
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_staging_operation(
+    authority: &crate::source_seal::authority::Authority,
+    action: &str,
+    state: &Path,
+    repository: &str,
+    fill: motor_protocol::Uuid,
+) -> io::Result<()> {
+    validate_staging_form(action, state, repository)?;
+    authority.roots(state)?;
+    // Portable fixtures use one real UID for both roles. Keep the physical
+    // tree, ownership, mode, mount and link checks; distinct system accounts
+    // and the privileged ownership transfer are covered by the root tests.
+    let uid = unsafe { libc::geteuid() };
+    staging_apply(
+        action,
+        state,
+        repository,
+        fill,
+        StagingOwners {
+            runner: uid,
+            writer: uid,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_reclaim_staging(path: &Path) -> io::Result<()> {
+    apply(Policy::OwnerWrite, &[path])
+}
+
 fn staging_execute(
     action: &str,
     state: &Path,
@@ -462,6 +495,14 @@ fn staging_execute(
 }
 
 pub(crate) fn staging_helper(action: &str, args: &[String]) -> io::Result<()> {
+    staging_helper_with_authority(action, args, crate::source_seal::authority::Authority::load)
+}
+
+fn staging_helper_with_authority(
+    action: &str,
+    args: &[String],
+    load: impl FnOnce() -> io::Result<crate::source_seal::authority::Authority>,
+) -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 || args.len() != 3 {
         return Err(io::Error::other(
             "staging helper requires root, repository key, fill UUID and state root",
@@ -479,7 +520,7 @@ pub(crate) fn staging_helper(action: &str, args: &[String]) -> io::Result<()> {
     fs::write("/proc/self/oom_score_adj", "900")?;
     // Only this explicit sudo-helper entry point delegates ownership. A root
     // daemon's in-process path must not interpret inherited SUDO_UID as identity.
-    let authority = crate::source_seal::authority::Authority::load()?;
+    let authority = load()?;
     staging_authorized_as(&authority, action, state, repository, fill, Some(runner))
 }
 

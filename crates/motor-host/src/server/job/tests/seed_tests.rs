@@ -87,6 +87,21 @@ async fn existing_workspace_is_untouched_when_a_new_base_is_available() {
     );
     let id = claim(&runtime, &c);
     existing_workspace(&runtime, JOB);
+    let execution = runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].clone();
+    let logs = crate::test_logs::capture(|| {
+        seed_workspace(
+            &runtime,
+            &execution,
+            run(JOB)["repository_root"].as_str().unwrap(),
+        );
+    });
+    assert!(
+        logs.iter().any(|line| line.contains("INFO")
+            && line.contains("workspace_seed_not_needed")
+            && line.contains("disk_exists")),
+        "{logs:?}"
+    );
+    assert!(!logs.iter().any(|line| line.contains("WARN")), "{logs:?}");
     let disk = runtime.host.lock().unwrap().snapshot.per_job.executions[JOB]
         .disk_id
         .clone();

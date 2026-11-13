@@ -848,11 +848,13 @@ fn isolated_staging_removal_accepts_partial_runner_chown_but_link_check_does_not
 
 #[test]
 #[ignore = "requires root and provisioned motor-cache/motor-job accounts; checks in-process authority"]
-fn isolated_staging_security_requires_authority_for_in_process_root() {
+fn isolated_staging_security_uses_config_authority_for_in_process_root() {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let scratch = ScratchDir::new("staging-root-authority");
     let fill = motor_protocol::Uuid::nil();
-    let generation = staging_fixture(&scratch, fill);
+    let config = crate::Config::new(scratch.path(), "state");
+    let state = config.state_dir();
+    let generation = staging_fixture(&state, fill);
     fs::write(generation.join("keep"), b"keep").unwrap();
     let owners = StagingOwners::current().unwrap();
     for path in [
@@ -865,14 +867,52 @@ fn isolated_staging_security_requires_authority_for_in_process_root() {
         set_fixture_owner(path, owners.writer);
     }
     for action in ["check-staging-links", "remove-staging"] {
-        let error = staging_operation(action, &scratch, REPOSITORY, fill).unwrap_err();
-        assert!(
-            error.to_string().contains("source seal authority")
-                || error.kind() == io::ErrorKind::NotFound,
-            "{error}"
-        );
-        assert_eq!(fs::read(generation.join("keep")).unwrap(), b"keep");
+        staging_operation(action, &config, REPOSITORY, fill).unwrap();
     }
+    assert!(!generation.exists());
+}
+
+#[test]
+#[ignore = "requires root and provisioned motor-cache/motor-job accounts"]
+fn isolated_staging_security_delegated_helper_requires_installed_policy() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    const CHILD: &str = "MOTOR_STAGING_MISSING_POLICY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let scratch = ScratchDir::new("staging-delegated-policy");
+        let fill = motor_protocol::Uuid::nil();
+        let generation = staging_fixture(&scratch, fill);
+        fs::write(generation.join("keep"), b"keep").unwrap();
+        let missing = scratch.join("missing-source-seal.json");
+        for action in ["check-staging-links", "remove-staging"] {
+            let error = staging_helper_with_authority(
+                action,
+                &[
+                    REPOSITORY.into(),
+                    fill.to_string(),
+                    scratch.display().to_string(),
+                ],
+                || {
+                    fs::File::open(&missing)?;
+                    unreachable!("missing policy opened")
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert_eq!(fs::read(generation.join("keep")).unwrap(), b"keep");
+        }
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "permissions::tests::isolated_staging_security_delegated_helper_requires_installed_policy", "--ignored", "--nocapture"])
+        .env(CHILD, "1")
+        .env("SUDO_UID", crate::isolation::job_identity().unwrap().uid.to_string())
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
