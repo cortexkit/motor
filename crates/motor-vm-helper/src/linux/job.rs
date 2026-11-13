@@ -508,7 +508,8 @@ impl LinuxJobs {
             record.egress_bytes = record
                 .tap()
                 .map(|tap| self.network.egress_bytes(&tap))
-                .transpose()?
+                .transpose()
+                .map_err(|e| Error(format!("capture final job egress: {e}")))?
                 .flatten();
             if record.tap_index.is_some() && record.egress_bytes.is_none() {
                 self.log_collection_failure(
@@ -518,7 +519,12 @@ impl LinuxJobs {
                 );
             }
             self.exit_checkpoint(ExitStep::Captured)?;
-            self.save(&record)?;
+            self.save(&record).map_err(|e| {
+                Error(format!(
+                    "persist final job exit {}: {e}",
+                    self.records_path.join(format!("{id}.json")).display()
+                ))
+            })?;
             self.records.insert(id.into(), record);
             self.exit_checkpoint(ExitStep::Recorded)?;
         }
@@ -709,7 +715,11 @@ impl LinuxJobs {
                 }
                 Ok(Response {
                     reply: Reply::Relay { fd_count: 1 },
-                    fds: vec![tenant::connect_relay(&self.root(&id), record.uid, port)?],
+                    fds: vec![tenant::connect_job_relay(
+                        &self.root(&id),
+                        record.uid,
+                        port,
+                    )?],
                 })
             }
             Operation::Exits => {
@@ -1294,7 +1304,14 @@ fn open_owned_disk(path: &Path, record: &Record) -> Result<File> {
 }
 
 fn read_oom_kill(group: &Path) -> Result<u64> {
-    std::fs::read_to_string(group.join("memory.events"))?
+    let path = group.join("memory.events");
+    std::fs::read_to_string(&path)
+        .map_err(|e| {
+            Error(format!(
+                "read final job oom evidence {}: {e}",
+                path.display()
+            ))
+        })?
         .lines()
         .find_map(|line| line.strip_prefix("oom_kill "))
         .and_then(|n| n.parse().ok())

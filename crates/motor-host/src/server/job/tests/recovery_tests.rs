@@ -243,3 +243,162 @@ async fn every_durable_recovery_phase_resumes_after_host_restart() {
         );
     }
 }
+
+#[tokio::test]
+async fn evidence_gap_held_disk_refusal_does_not_pin_debit_or_loop_delete() {
+    let (runtime, fake, storage) = fixture();
+    let id = claim(&runtime, &claims(JOB));
+    let now = unix_ms();
+    let disk = {
+        let mut host = runtime.host.lock().unwrap();
+        let execution = host.begin_job_boot(JOB).unwrap().unwrap();
+        host.delivered(id).unwrap();
+        host.job_started(JOB, now).unwrap();
+        host.job_vmm_gone(JOB, now - 1000).unwrap();
+        host.job_vmm_gone(JOB, now).unwrap();
+        // Reopen the state left by an older host's evidence-gap path.
+        host.job_stopped_at(JOB, true, now).unwrap();
+        execution.disk_id
+    };
+    fake.disk_holders
+        .lock()
+        .unwrap()
+        .insert(disk.clone(), JOB.into());
+    storage.recovery_available.store(true, Ordering::Release);
+    runtime.tick_recoveries(now).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let _ = runtime.tick_recoveries(now);
+            if runtime.host.lock().unwrap().snapshot.per_job.disks[&disk]
+                .recovery
+                .as_ref()
+                .is_none_or(|r| r.phase == Phase::Deleting)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..10 {
+        let _ = runtime.tick_recoveries(now);
+    }
+    let host = runtime.host.lock().unwrap();
+    assert_eq!(
+        host.job_free_mem_mib(now),
+        950,
+        "finished recovery must not pin its VM debit"
+    );
+    assert!(
+        !fake.disk_holders.lock().unwrap().contains_key(&disk),
+        "finished holder must be stopped before recovery"
+    );
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .filter(|call| *call == &format!("delete:{disk}"))
+            .count()
+            <= 1,
+        "held-disk deletion must not run every tick"
+    );
+}
+
+#[tokio::test]
+async fn foreign_holder_backs_off_deletion_without_vm_capacity_across_restart() {
+    let (runtime, fake, storage) = fixture();
+    let disk = unclean(&runtime);
+    let now = unix_ms();
+    fake.disk_holders
+        .lock()
+        .unwrap()
+        .insert(disk.clone(), "foreign-vm".into());
+    storage.recovery_available.store(true, Ordering::Release);
+    runtime.tick_recoveries(now).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            runtime.tick_recoveries(now).unwrap();
+            if runtime.host.lock().unwrap().snapshot.per_job.disks[&disk]
+                .recovery
+                .as_ref()
+                .unwrap()
+                .retry_after_ms
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fake.recovery_starts.lock().unwrap().len(), 1);
+    let runtime = restart(runtime, fake.clone(), storage);
+    for at in now..now + 5000 {
+        runtime.tick_recoveries(at).unwrap();
+    }
+    let host = runtime.host.lock().unwrap();
+    assert_eq!(host.job_free_mem_mib(now), 950);
+    assert_eq!(host.recovery_permits(), 0);
+    assert_eq!(
+        host.snapshot.per_job.disks[&disk]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .phase,
+        Phase::Deleting
+    );
+    drop(host);
+    assert_eq!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == &format!("delete:{disk}"))
+            .count(),
+        1
+    );
+    runtime.tick_recoveries(now + 5000).unwrap();
+    assert_eq!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == &format!("delete:{disk}"))
+            .count(),
+        2
+    );
+    assert!(!fake
+        .calls
+        .lock()
+        .unwrap()
+        .contains(&"stop:foreign-vm".into()));
+    fake.disk_holders.lock().unwrap().clear();
+    runtime.tick_recoveries(now + 10000).unwrap();
+    assert!(runtime.host.lock().unwrap().snapshot.per_job.disks[&disk].deleted);
+}
+
+#[test]
+fn recovery_waiting_for_images_does_not_debit_a_nonexistent_vm() {
+    let (runtime, _, _) = fixture();
+    let disk = unclean(&runtime);
+    let now = unix_ms();
+    runtime.tick_recoveries(now).unwrap();
+    let host = runtime.host.lock().unwrap();
+    let recovery = host.snapshot.per_job.disks[&disk]
+        .recovery
+        .as_ref()
+        .unwrap();
+    assert_eq!(recovery.phase, Phase::Reserved);
+    assert_eq!(host.job_free_mem_mib(now), 950);
+    assert_eq!(host.recovery_permits(), 0);
+    let mut old = serde_json::to_value(recovery).unwrap();
+    old.as_object_mut().unwrap().remove("retry_after_ms");
+    let old: crate::state::jobs::recovery::Recovery = serde_json::from_value(old).unwrap();
+    assert_eq!(old.retry_after_ms, None);
+    assert!(serde_json::to_value(old)
+        .unwrap()
+        .get("retry_after_ms")
+        .is_none());
+}

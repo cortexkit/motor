@@ -317,6 +317,45 @@ Per-job startup verifies the published image hashes before binding the admin
 socket. The scan can take tens of seconds for large images; a missing admin
 socket during that interval does not by itself mean startup is hung.
 
+### Per-job exit evidence and workspace recovery
+
+The exit-evidence clock starts when the host first observes that a VMM is gone,
+not when the guest requests its normal reboot. A missing receipt at
+`exit_evidence_bound_ms` settles an otherwise unknown result as lost and
+quarantines the workspace. The host calls the helper's `stop_job` before
+detaching that disk: an exited VMM and an acknowledged exit receipt do not by
+themselves release the helper's disk ownership. Recovery also releases finished
+jobs recorded by this host before starting, including records left by an older
+host. It never stops an unrelated holder to force a disk available.
+Failed helper stops on the evidence-gap path retry and warn at most once every
+five seconds per job; this retry timer is process-local and resets on restart.
+The evidence-bound terminal is published to replay and an attached caller in
+the gap's tick even if helper cleanup fails. The execution remains unended and
+the disk stays attached until the helper stop succeeds; result delivery does
+not authorize workspace recovery or disk reuse.
+
+A refused recovery start moves to disk deletion. Failed cleanup retries at most
+once every five seconds per disk, with one warning per attempt; the retry time
+survives host restarts. Memory and a CPU permit are debited only after recovery
+starts and until its VM is stopped or proven absent. Waiting for images or for
+a different VM to release a disk does not reserve recovery VM capacity.
+
+A late helper exit receipt is still acknowledged and its job's helper resources
+are released. Receipts contain OOM and egress measurements, not the command's
+result. A late guest terminal can replace an evidence-gap outcome only before
+any terminal has been committed to replay or delivered to the caller and before
+usage has been queued or accepted. Otherwise the first published outcome stands.
+Publishing the gap's unknown terminal commits that outcome even while helper
+cleanup is pending, so a later guest terminal cannot replace it. There is no
+additional late-result grace period.
+
+Job relay opens do not retry a missing or refused VMM socket while holding the
+helper lock; their handshake has a two-second total budget. This keeps a normal
+guest reboot from imposing the legacy tenant relay's ten-second connect wait
+on exit collection. Missing final OOM evidence remains unknown, never zero;
+helper errors identify whether OOM-file reading, egress measurement, or exit
+record persistence failed.
+
 `per_job_mode_refuses_each_unset_setting_without_defaults`,
 `complete_per_job_config_selects_image_managed_runtime`
 (`crates/motor-host/src/main.rs`) and the configuration tests in
