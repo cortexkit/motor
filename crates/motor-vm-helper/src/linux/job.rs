@@ -38,6 +38,7 @@ const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vd
 mod conntrack;
 mod memory;
 mod registry;
+mod watcher;
 use registry::{Entry, JobCell, JobState, State};
 mod namespace;
 pub(super) mod network;
@@ -131,6 +132,7 @@ pub(super) enum ExitStep {
     Recorded,
     Removed,
     Delivery,
+    Prune,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -172,6 +174,7 @@ struct TestHooks {
     tap_release_check: Option<Box<dyn FnMut() + Send>>,
     exit_fault: Option<ExitStep>,
     exit_pause: Option<(ExitStep, Box<dyn FnMut() + Send>)>,
+    collector_spawns: usize,
 }
 
 impl LinuxJobs {
@@ -348,6 +351,9 @@ impl LinuxJobs {
         let mut taps = tenants;
         taps.extend(self.records().values().filter_map(Record::tap));
         super::tenant_network::validate_taps(&taps)?;
+        // Reconcile finishes collection before serving requests or starting the
+        // watcher, so adopted records have the same durable exit decisions.
+        self.collect_exits()?;
         self.maintain()?;
         let retained = self
             .records()
@@ -479,24 +485,19 @@ impl LinuxJobs {
     }
 
     pub fn collect_exits(&self) -> Result<()> {
-        for (_, cell, view) in self.snapshot() {
-            if view.state == State::Booting
-                || (view.state == State::Released
-                    && !view.cleanup_pending
-                    && view.record.is_tombstone())
-            {
-                continue;
+        #[cfg(test)]
+        std::thread::scope(|scope| {
+            for cell in self.exiting_jobs() {
+                if cell.begin_collection() {
+                    scope.spawn(move || self.collect_job(&cell));
+                }
             }
-            let Some(mut state) = cell.0.try_lock() else {
-                continue;
-            };
-            if state.state == State::Booting {
-                continue;
+        });
+        #[cfg(not(test))]
+        for cell in self.exiting_jobs() {
+            if cell.begin_collection() {
+                self.collect_job(&cell);
             }
-            // A failed record stays reserved and retries independently. It must
-            // never disable another VM's stop, relay, start or exit delivery.
-            self.reap_job(&mut state);
-            let _ = self.collect_exit_locked(&mut state);
         }
         Ok(())
     }
@@ -506,18 +507,16 @@ impl LinuxJobs {
     }
 
     fn maintain_at(&self, now: SystemTime) -> Result<()> {
-        let collection = self.collect_exits();
-        // Maintenance runs every 100 ms. Retention needs only a minute's
-        // cadence, not a metadata lookup per tombstone on every tick.
+        // Retention is independent of detection: neither a tombstone's writer
+        // lock nor its filesystem work may delay a live job's exit report.
         let mut next_prune = self.next_prune.lock().unwrap();
-        let pruning = if next_prune.is_none_or(|deadline| now >= deadline) {
+        if next_prune.is_none_or(|deadline| now >= deadline) {
             self.prune_records(now).map(|()| {
                 *next_prune = now.checked_add(TOMBSTONE_PRUNE_INTERVAL);
             })
         } else {
             Ok(())
-        };
-        collection.and(pruning)
+        }
     }
 
     fn prune_records(&self, now: SystemTime) -> Result<()> {
@@ -525,9 +524,7 @@ impl LinuxJobs {
             if !view.record.is_tombstone() {
                 continue;
             }
-            let Some(state) = cell.0.try_lock() else {
-                continue;
-            };
+            let state = cell.0.lock();
             if !state.record.is_tombstone() {
                 continue;
             }
@@ -539,6 +536,7 @@ impl LinuxJobs {
                 .duration_since(modified)
                 .is_ok_and(|age| age >= TOMBSTONE_RETENTION)
             {
+                self.exit_checkpoint(ExitStep::Prune)?;
                 std::fs::remove_file(&path)?;
                 File::open(&self.records_path)?.sync_all()?;
                 self.registry.lock().remove(&id);
@@ -614,15 +612,19 @@ impl LinuxJobs {
                 ))
             })?;
             state.record = record;
-            state.state = if state.record.released {
-                State::Released
-            } else {
-                State::Exited
-            };
-            state.cleanup_pending = true;
-            self.publish(state);
-            self.exit_checkpoint(ExitStep::Recorded)?;
         }
+        // Phase 1 publishes only durable evidence, before network teardown can
+        // wait on the machine-wide flock. Polls use R, not this job's J.
+        state.state = if state.record.released {
+            State::Released
+        } else {
+            State::Exited
+        };
+        state.cleanup_pending = true;
+        self.publish(state);
+        self.exit_checkpoint(ExitStep::Recorded)?;
+        // Phase 2 keeps J because freeing the TAP rewrites the whole record;
+        // an acknowledgement must not be lost against that write.
         *kind = CollectionFailure::Network;
         self.remove_network(state)?;
         *kind = CollectionFailure::Cgroup;
@@ -1864,4 +1866,4 @@ fn boot_requests_with_fixed_paths(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

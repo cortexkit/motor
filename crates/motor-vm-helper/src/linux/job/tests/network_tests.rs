@@ -266,7 +266,7 @@ fn failed_removal_replays_frozen_egress_and_ack_matches_the_entire_report() {
     let mut restarted = machine(&base);
     restarted.network = Box::new(fake.clone());
     restarted.adopt_record(saved).unwrap();
-    restarted.maintain().unwrap();
+    restarted.collect_exits().unwrap();
     assert_eq!(persisted(&restarted).pending_exit(), Some(report.clone()));
     assert_eq!(
         fake.0.lock().unwrap().events,
@@ -317,7 +317,7 @@ fn timed_out_egress_publishes_unmeasured_report_once_and_replays_after_restart()
     let stalled = tenant_network::counter_tests::StalledCounter::new(&base);
     fake.0.lock().unwrap().egress_command = Some(stalled.command.clone());
     let started = std::time::Instant::now();
-    jobs.maintain().unwrap();
+    jobs.collect_exits().unwrap();
     assert!(started.elapsed() < Duration::from_millis(2500));
     let saved = persisted(&jobs);
     let report = saved.pending_exit().unwrap();

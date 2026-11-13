@@ -15,7 +15,7 @@ impl Maintenance {
             while stopped.recv_timeout(Duration::from_millis(100))
                 == Err(mpsc::RecvTimeoutError::Timeout)
             {
-                jobs.maintain().unwrap();
+                jobs.watch_exits();
             }
         });
         Self {
@@ -141,6 +141,7 @@ fn booting_job_keeps_network_and_adoption_waits_for_launch() {
         assert_eq!(read_record(&jobs).tap_index, Some(17));
         assert!(fake.has_namespace(&start().job_id));
         assert!(poll(&jobs).is_empty());
+        assert_eq!(jobs.hooks.lock().unwrap().collector_spawns, 0);
         let (begun, begins) = mpsc::channel();
         jobs.pause_exit_at(ExitStep::Adopt, move || begun.send(()).unwrap());
         let (adopted, adoption) = mpsc::channel();

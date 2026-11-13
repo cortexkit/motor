@@ -90,6 +90,7 @@ impl<T> Mutex<T> {
         Guard { guard, _held: held }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_lock(&self) -> Option<Guard<'_, T>> {
         let held = enter(self.order);
         match self.inner.try_lock() {

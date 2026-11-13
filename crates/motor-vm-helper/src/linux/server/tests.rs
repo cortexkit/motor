@@ -461,3 +461,47 @@ fn shutdown_waits_for_paused_start_and_refuses_previously_authorized_lifecycle()
         "helper is stopping"
     );
 }
+
+#[test]
+fn shutdown_does_not_wait_for_a_paused_exit_collector() {
+    let (entered, _entering) = mpsc::channel();
+    let (_release, releasing) = mpsc::channel();
+    let (stopped, stopping) = mpsc::channel();
+    let helper = Arc::new(Mutex::new(
+        Helper::new(
+            BlockingMachine {
+                entered,
+                release: releasing,
+                stopped,
+            },
+            1,
+            vec![1000],
+        )
+        .unwrap(),
+    ));
+    let service = Arc::new(Service::new(&helper.lock().unwrap()));
+    let base = cortexkit_test_support::ScratchDir::new("paused-exit-shutdown");
+    let jobs = Arc::new(super::super::job::tests::empty_exit_fixture(&base));
+    let (paused, pausing) = mpsc::channel();
+    let (resume, resuming) = mpsc::channel();
+    jobs.pause_exit_at(super::super::job::ExitStep::Captured, move || {
+        paused.send(()).unwrap();
+        resuming.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let watcher = jobs.start_exit_watcher();
+    pausing.recv_timeout(Duration::from_secs(2)).unwrap();
+    let shutdown = {
+        let helper = helper.clone();
+        let service = service.clone();
+        std::thread::spawn(move || {
+            let (_guard, result) = service.shutdown(&helper);
+            result.unwrap();
+        })
+    };
+    let result = stopping.recv_timeout(Duration::from_millis(200));
+    resume.send(()).unwrap();
+    shutdown.join().unwrap();
+    drop(jobs);
+    watcher.join().unwrap();
+    result.expect("shutdown waited for an exit collector");
+}

@@ -50,7 +50,7 @@ fn restart(base: &Path) -> LinuxJobs {
 }
 
 fn reports(jobs: &mut LinuxJobs) -> Vec<ExitReport> {
-    // Drive the independent maintenance step explicitly in single-threaded
+    // Drive one watcher scan and wait for its collectors in these replay
     // fixtures. Polling itself must never collect or touch a cgroup.
     jobs.collect_exits().unwrap();
     match jobs.handle(Operation::Exits, peer()).unwrap().reply {
@@ -455,6 +455,9 @@ fn absent_or_nonempty_cgroup_never_invents_an_exit_count() {
     // Even a process that cannot be found in /proc is not proof of an empty
     // cgroup: the cgroup's own membership must confirm that it has exited.
     std::fs::write(group.join("cgroup.procs"), "4294967295").unwrap();
+    // A missing cgroup is a terminal decision for this helper incarnation.
+    // Rebuild the view to exercise a distinct, nonempty adopted cgroup.
+    jobs.insert_record(record());
     assert!(reports(&mut jobs).is_empty());
     assert_eq!(read_record(&jobs).oom_kill, None);
     assert!(group.exists());
