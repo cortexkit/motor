@@ -187,6 +187,14 @@ struct TestHooks {
 
 impl LinuxJobs {
     pub fn images(&self, op: crate::images::Operation) -> Result<Response> {
+        self.with_image_admission(op, super::images::handle)
+    }
+
+    fn with_image_admission<T>(
+        &self,
+        op: crate::images::Operation,
+        operation: impl FnOnce(crate::images::Operation) -> Result<T>,
+    ) -> Result<T> {
         op.validate()?;
         let _admission = self.admission.lock();
         if let crate::images::Operation::Remove(id) = &op {
@@ -198,7 +206,9 @@ impl LinuxJobs {
                 return Err(Error("image generation is held by a VM".into()));
             }
         }
-        super::images::handle(op)
+        // Keep the generation check and fencing rename in one admission hold;
+        // a start must see either the reservation or the renamed generation.
+        operation(op)
     }
     pub fn create_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
         let _admission = self.admission.lock();
@@ -771,7 +781,6 @@ impl LinuxJobs {
                 | Operation::SeedWorkspace(_)
                 | Operation::WorkspaceUsage { .. }
                 | Operation::EvictBase { .. }
-                | Operation::DeleteWorkspace { .. }
         ) {
             Some(self.admission.lock())
         } else {
@@ -848,8 +857,9 @@ impl LinuxJobs {
                 Ok(Response::new(Reply::Ok))
             }
             Operation::DeleteWorkspace { account, disk_id } => {
-                self.disk_available_identity(&disk_id)?;
-                workspace::delete(&self.workspaces, &account, &disk_id)?;
+                self.with_disk_admission(&disk_id, || {
+                    workspace::delete(&self.workspaces, &account, &disk_id)
+                })?;
                 Ok(Response::new(Reply::Ok))
             }
             Operation::Start(start) => self.start(start, peer),
@@ -906,24 +916,22 @@ impl LinuxJobs {
         Ok(())
     }
 
-    fn finish_fill(&self, fill: &job::Fill, mut published: bool) -> Result<bool> {
+    fn with_disk_admission<T>(
+        &self,
+        disk_id: &str,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        // The held-disk check and deletion must exclude a new durable intent.
         let _admission = self.admission.lock();
+        self.disk_available_identity(disk_id)?;
+        operation()
+    }
+
+    fn finish_fill(&self, fill: &job::Fill, mut published: bool) -> Result<bool> {
+        let requested_publication = published;
         let id = fill.disk_id();
-        if self.workspaces.join(&id).try_exists()? {
-            let (registry, _) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
-            if workspace::read_fill(&self.workspaces, &id)? != *fill {
-                return Err(Error("fill provenance mismatch".into()));
-            }
-            if registry.role == job::WorkspaceRole::Base {
-                return if published {
-                    Ok(true)
-                } else {
-                    Err(Error("published base cannot be discarded as a fill".into()))
-                };
-            }
-        } else {
-            published = false;
-        }
+        // Only this fill's writer is needed while waiting for its VM to stop.
+        // Holding admission here would delay every unrelated start/workspace.
         if let Ok(cell) = self.cell(&fill.fill_id) {
             let mut state = cell.0.lock();
             let record = &state.record;
@@ -944,6 +952,24 @@ impl LinuxJobs {
                     && record.fill_exit_success == Some(true);
             }
             self.stop_locked(&mut state)?;
+        } else {
+            published = false;
+        }
+        // The job guard is gone before admission: disk identity and promotion
+        // must serialize with new reservations, never with a running VM's I/O.
+        let _admission = self.admission.lock();
+        if self.workspaces.join(&id).try_exists()? {
+            let (registry, _) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
+            if workspace::read_fill(&self.workspaces, &id)? != *fill {
+                return Err(Error("fill provenance mismatch".into()));
+            }
+            if registry.role == job::WorkspaceRole::Base {
+                return if requested_publication {
+                    Ok(true)
+                } else {
+                    Err(Error("published base cannot be discarded as a fill".into()))
+                };
+            }
         } else {
             published = false;
         }
@@ -1050,18 +1076,15 @@ impl LinuxJobs {
     }
 
     fn start(&self, start: Start, peer: Peer) -> Result<Response> {
-        let _admission = self.admission.lock();
+        let admission = self.admission.lock();
         start.validate_fresh_at(SystemTime::now())?;
         let settings = self
             .settings
             .clone()
             .ok_or_else(|| Error("job VM settings are required".into()))?;
-        if self.view(&start.job_id).is_some() {
-            return Err(Error("job id already booted; use adopt_job".into()));
-        }
         // Keep a start for an already attached identity out of all filesystem
         // preparation, including opening a disk owned by its running VMM.
-        self.disk_available(&start, 0, 0)?;
+        self.start_available(&start, 0, 0)?;
         if self.group(&start.job_id).try_exists()? || self.boundary(&start.job_id).try_exists()? {
             return Err(Error(
                 "stale job cgroup or jail requires reconciliation".into(),
@@ -1166,7 +1189,7 @@ impl LinuxJobs {
             trusted_directory(path)?;
         }
         let record = Record::new(start.clone(), uid, meta.dev(), meta.ino(), tap_index);
-        self.launch_record(record, |state| {
+        self.launch_record(admission, record, |state| {
             // Consume the cache-write grant only after the disk reservation is
             // durable. Earlier failures leave that grant available for a retry.
             let job_write = take_job_write_grant(&self.cache_write_grants, &start, &registry);

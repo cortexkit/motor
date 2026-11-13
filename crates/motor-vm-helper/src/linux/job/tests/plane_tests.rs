@@ -123,8 +123,8 @@ fn booting_job_keeps_network_and_adoption_waits_for_launch() {
         let starting = jobs.clone();
         let pid = vmm.child.id();
         let launch_thread = std::thread::spawn(move || {
-            let _admission = starting.admission.lock();
-            starting.launch_record(intent, |_| {
+            let admission = starting.admission.lock();
+            starting.launch_record(admission, intent, |_| {
                 starting.network.create_namespace(&id)?;
                 starting.exit_checkpoint(ExitStep::Launch)?;
                 let group = starting.group(&id);

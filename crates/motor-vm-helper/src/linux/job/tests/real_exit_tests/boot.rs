@@ -72,7 +72,7 @@ pub(super) fn boot(jobs: &LinuxJobs, artifacts: &Artifacts, mut start: Start) ->
     let meta = disk.metadata()?;
     let index = network::allocate(&[], &jobs.records())?;
     let record = Record::new(start.clone(), uid, meta.dev(), meta.ino(), Some(index));
-    jobs.launch_record(record, |state| {
+    jobs.launch_record(_admission, record, |state| {
         let id = &start.job_id;
         let tap = Tap {
             tap_index: index,
