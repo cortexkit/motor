@@ -62,12 +62,17 @@ fn late_finish_fill_after_tombstone_pruning_neither_panics_nor_publishes() {
     // then waits for J, which the pruner still holds.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while Arc::strong_count(&cell) == holders {
-        assert!(std::time::Instant::now() < deadline, "FinishFill never looked up the cell");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "FinishFill never looked up the cell"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     release.send(()).unwrap();
     pruner.join().unwrap().unwrap();
-    let finished = finish.join().expect("FinishFill panicked on a retired cell");
+    let finished = finish
+        .join()
+        .expect("FinishFill panicked on a retired cell");
     assert!(!finished.unwrap(), "a pruned fill was published");
     // The registry lock is still usable and the pruned id stays retired.
     assert!(jobs.view(&id).is_none());

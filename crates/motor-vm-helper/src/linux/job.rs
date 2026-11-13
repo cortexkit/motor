@@ -655,7 +655,10 @@ impl LinuxJobs {
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
-            if !name.to_str().is_some_and(|name| name.starts_with("absent-")) {
+            if !name
+                .to_str()
+                .is_some_and(|name| name.starts_with("absent-"))
+            {
                 continue;
             }
             let modified = entry.metadata()?.modified()?;

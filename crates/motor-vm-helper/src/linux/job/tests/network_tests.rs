@@ -149,13 +149,10 @@ fn network_policy_failure_prevents_tap_activation() {
     let (base, jobs, fake) = fixture();
     let tap = jobs.records()[&start().job_id].tap().unwrap();
     fake.0.lock().unwrap().fail_install = true;
-    assert!(jobs
-        .prepare_network(&start().job_id, tap)
-        .is_err());
+    assert!(jobs.prepare_network(&start().job_id, tap).is_err());
     assert_eq!(fake.0.lock().unwrap().events, ["install"]);
     fake.0.lock().unwrap().fail_install = false;
-    jobs.prepare_network(&start().job_id, tap)
-        .unwrap();
+    jobs.prepare_network(&start().job_id, tap).unwrap();
     assert_eq!(
         fake.0.lock().unwrap().events,
         ["install", "install", "ensure:17"]
@@ -571,7 +568,9 @@ fn collector_never_waits_for_the_network_lock_while_holding_the_job_writer() {
         finished.is_ok(),
         "collector waited for the network flock holding J"
     );
-    ack_result.expect("ack waited behind network teardown").unwrap();
+    ack_result
+        .expect("ack waited behind network teardown")
+        .unwrap();
     let saved = persisted(&jobs);
     assert!(saved.exit_acknowledged);
     assert_eq!(saved.tap_index, Some(17), "TAP released without the flock");

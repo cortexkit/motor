@@ -16,9 +16,14 @@ pub(super) const MAX_REAPERS: usize = 4;
 static REAPERS: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn output(command: &mut Command) -> Result<Option<Output>> {
-    output_with(command, &REAPERS, crate::linux::process::wait_child, |mut child| {
-        let _ = child.wait();
-    })
+    output_with(
+        command,
+        &REAPERS,
+        crate::linux::process::wait_child,
+        |mut child| {
+            let _ = child.wait();
+        },
+    )
 }
 
 /// Runs `command` for at most DEADLINE plus KILL_GRACE. A query that `settle`

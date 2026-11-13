@@ -368,11 +368,8 @@ fn balloon_connect_to_a_full_api_backlog_fails_within_its_deadline() {
     // A VMM that stopped accepting: its one-slot backlog is already full.
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
     let directory = File::open(&root).unwrap();
-    let queued = UnixStream::connect(format!(
-        "/proc/self/fd/{}/api.sock",
-        directory.as_raw_fd()
-    ))
-    .unwrap();
+    let queued =
+        UnixStream::connect(format!("/proc/self/fd/{}/api.sock", directory.as_raw_fd())).unwrap();
     let ballooning = jobs.clone();
     let (sent, reply) = mpsc::channel();
     let balloon = std::thread::spawn(move || {
