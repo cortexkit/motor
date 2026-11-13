@@ -255,3 +255,74 @@ async fn staged_renames_preserve_destination_paths_and_finish_ownership() {
     assert!(!inner.finalizing.contains(&request.job_id));
     assert!(!Runner::occupied(&inner, &request.workspace_key));
 }
+
+async fn job_created_git_metadata_is_reset(directory: &str, create_git: &str) {
+    let f = Fixture::new();
+    fs::write(
+        f.main.join(".gitignore"),
+        "target/\n.cache/\nred-scratch/cache/\n",
+    )
+    .unwrap();
+    commit(&f.main, "first\n");
+    fs::create_dir_all(f.main.join(directory)).unwrap();
+    fs::write(f.main.join(directory).join("source"), "snapshot input\n").unwrap();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    let (first, bytes) = f.run_worktree(&format!(
+        "mkdir -p target .cache red-scratch/cache && \
+         printf warm > target/reuse && printf warm > .cache/reuse && \
+         printf warm > red-scratch/cache/reuse && {create_git}"
+    ));
+    f.submit(&runner, &first, &bytes);
+    let result = terminal(&runner, first.job_id).await;
+    assert_eq!(result.outcome, Outcome::Exit { code: 0 }, "{result:?}");
+    let workspace = Path::new(&f.key);
+    assert!(fs::symlink_metadata(workspace.join(directory).join(".git")).is_ok());
+    assert!(!f.main.join(directory).join(".git").exists());
+
+    // Reuse the exact snapshot: only the previous job's workspace has changed.
+    let mut next = first.clone();
+    next.job_id = Uuid::now_v7();
+    next.command = format!("cat {directory}/source > ran-second");
+    f.submit(&runner, &next, &bytes);
+    let result = terminal(&runner, next.job_id).await;
+    assert_eq!(result.outcome, Outcome::Exit { code: 0 }, "{result:?}");
+    assert_eq!(
+        fs::read_to_string(workspace.join("ran-second")).unwrap(),
+        "snapshot input\n"
+    );
+    assert!(fs::symlink_metadata(workspace.join(directory).join(".git")).is_err());
+    for cache in ["target/reuse", ".cache/reuse", "red-scratch/cache/reuse"] {
+        assert_eq!(fs::read_to_string(workspace.join(cache)).unwrap(), "warm");
+    }
+}
+
+#[tokio::test]
+async fn job_created_nested_repository_does_not_poison_next_snapshot() {
+    job_created_git_metadata_is_reset("red-scratch", "git init -q red-scratch").await;
+}
+
+#[tokio::test]
+async fn job_created_git_file_does_not_poison_next_snapshot() {
+    job_created_git_metadata_is_reset(
+        "red-scratch",
+        "git init -q --separate-git-dir=\"$PWD/target/nested-git\" red-scratch",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn job_created_git_symlink_does_not_poison_next_snapshot() {
+    job_created_git_metadata_is_reset(
+        "red-scratch",
+        "git init -q target/nested-git && ln -s ../target/nested-git/.git red-scratch/.git",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn job_created_deep_repository_does_not_poison_next_snapshot() {
+    job_created_git_metadata_is_reset("red-scratch/two/deep", "git init -q red-scratch/two/deep")
+        .await;
+}

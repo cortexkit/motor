@@ -20,6 +20,7 @@ pub(crate) mod dependencies;
 mod fetch_tests;
 #[cfg(unix)]
 mod guest_scan;
+mod reset;
 mod transfer;
 pub(crate) use dependencies::validate_dependencies;
 pub(crate) use transfer::bounded_fetch_detail;
@@ -1548,14 +1549,27 @@ impl Trees {
             fs::write(&alternates, format!("{}\n", objects.trim()))?;
         }
 
-        let current_tree = self.tree_hash(path)?;
-        if current_tree != tree_hash
+        let current_tree = self.tree_hash(path);
+        let needs_repair = !current_tree.as_ref().is_ok_and(|tree| tree == tree_hash);
+        let expected_available = needs_repair
             && git(
                 &mirror,
                 &["cat-file", "-e", &format!("{tree_hash}^{{tree}}")],
             )
-            .is_ok()
+            .is_ok();
+        // A job can turn untracked snapshot source into a repository. Checking
+        // out its files and cleaning with the snapshot in the index leaves its
+        // .git behind, so restoring caller HEAD hides those files again. Repair
+        // that metadata and retry once before diffing or discarding warm outputs.
+        let current_tree = if expected_available
+            && reset::remove_nested_git_metadata(&mirror, path, tree_hash)?
         {
+            tracing::info!(workspace = %path.display(), "removed job-created nested Git metadata; retrying workspace tree computation");
+            self.tree_hash(path)?
+        } else {
+            current_tree?
+        };
+        if current_tree != tree_hash && expected_available {
             let diff = git(
                 path,
                 &[
