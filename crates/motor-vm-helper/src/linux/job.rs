@@ -125,6 +125,8 @@ impl Record {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExitStep {
     Launch,
+    #[cfg(test)]
+    Api,
     Stop,
     Adopt,
     Ack,
@@ -1233,11 +1235,22 @@ impl LinuxJobs {
                 Duration::from_secs(10),
             )?);
             set_job_oom_score(pid, host_score, helper_score)?;
-            for (path, body) in requests {
-                tenant::api(&short_root, "PUT", path, &body)?;
-            }
+            self.boot_api_requests(&short_root, requests)?;
             Ok(())
         })
+    }
+
+    fn boot_api_requests(&self, root: &Path, requests: Vec<(&str, Value)>) -> Result<()> {
+        for (path, body) in requests {
+            tenant::api(root, "PUT", path, &body)?;
+            // Tests can delay completion of InstanceStart after the real API
+            // call, while launch still owns the job's Booting state.
+            #[cfg(test)]
+            if path == "/actions" {
+                self.exit_checkpoint(ExitStep::Api)?;
+            }
+        }
+        Ok(())
     }
 
     fn prepare_network(&self, id: &str, tenants: Vec<Tap>, tap: Tap) -> Result<()> {
