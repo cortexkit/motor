@@ -39,11 +39,23 @@ fn failed_record_does_not_block_other_exit_delivery_stop_start_or_relay() {
     );
     std::fs::remove_file(first_group.join("cgroup.procs")).unwrap();
     std::fs::create_dir(first_group.join("cgroup.procs")).unwrap();
-    assert!(!jobs.log_collection_failure(
-        &mut jobs.cell(&first.start.job_id).unwrap().0.lock(),
-        CollectionFailure::Cgroup,
-        &"same failure"
-    ));
+    // The exit watcher never selects a running job whose existing group has an
+    // unreadable control file (that proves nothing about its processes), so
+    // nothing has logged this record yet. A repeated failure still logs once.
+    {
+        let cell = jobs.cell(&first.start.job_id).unwrap();
+        let mut state = cell.0.lock();
+        assert!(jobs.log_collection_failure(
+            &mut state,
+            CollectionFailure::Cgroup,
+            &"same failure"
+        ));
+        assert!(!jobs.log_collection_failure(
+            &mut state,
+            CollectionFailure::Cgroup,
+            &"same failure"
+        ));
+    }
     // Reaching the new start's own configuration check proves that another
     // record's collection failure did not short-circuit start dispatch.
     let mut next = start();
