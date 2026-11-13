@@ -14,17 +14,9 @@ AGENT_COMMIT = "9e6dab5c99b3c5e8715dc731d4146a95878570a5"
 
 
 def seed(server):
-    chains = {}
-    for name, spec in server["rust_toolchains"].items():
-        if name.removesuffix("-x86_64-unknown-linux-gnu") in parity.PENDING_MACOS_TOOLCHAINS:
-            continue
-        name = name.replace("x86_64-unknown-linux-gnu", parity.HOST)
-        chains[name] = {
-            "rustc": spec["rustc"],
-            "targets": [parity.HOST],
-            "components": parity.macos_components(spec["components"]),
-            "rustc_verbose": PENDING, "sha256": PENDING,
-        }
+    chains = parity.rust_toolchains(server, rebuild=True)
+    for spec in chains.values():
+        spec.update(rustc_verbose=PENDING, sha256=PENDING)
     bins = {name: copy.deepcopy(spec) for name, spec in server["cargo_binaries"].items()
             if not name.startswith("sccache")}
     for spec in bins.values():
@@ -54,11 +46,13 @@ def seed(server):
             "git": {"url": server["tools"]["git"]["source"]["url"], "sha256": server["tools"]["git"]["source"]["sha256"]},
             "bash": {"version": "5.2.37", "url": "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz",
                      "sha256": "9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff"},
+            "cmake": copy.deepcopy(parity.CMAKE_SOURCE),
         },
         "tools": {
             "bun": {"path": "/opt/motor/bun/bin/bun", "version": server["tools"]["bun"]["version"], "sha256": PENDING},
             "git": {"path": "/opt/motor/bin/git", "version": server["tools"]["git"]["version"], "sha256": PENDING},
             "bash": {"path": "/opt/motor/bin/bash", "version": PENDING, "sha256": PENDING},
+            "cmake": {"path": "/opt/motor/bin/cmake", "version": parity.CMAKE_VERSION, "sha256": PENDING},
         },
         "agent": {"commit": AGENT_COMMIT, "sha256": PENDING},
         "prep_tools": {name: {"path": "bin/" + name, "sha256": PENDING} for name in ("cargo", "rustc", "bun", "git")},
@@ -94,6 +88,18 @@ def require_ready(manifest):
 
 
 def candidate(manifest, actual, sources, agent_sha256, prep_tools):
+    # Measurement supplies hashes, not permission to replace a requested version
+    # or to silently omit an installed toolchain, component or target.
+    if set(actual["rust_toolchains"]) != set(manifest["rust_toolchains"]):
+        raise ValueError("measured Rust toolchain names differ")
+    for name, spec in manifest["rust_toolchains"].items():
+        for key in ("rustc", "targets", "components", *(["cargo"] if "cargo" in spec else [])):
+            if actual["rust_toolchains"][name].get(key) != spec[key]:
+                raise ValueError("measured Rust " + key + " differs: " + name)
+    for name, spec in manifest["tools"].items():
+        for key in ("path", "version"):
+            if spec[key] != PENDING and actual["tools"].get(name, {}).get(key) != spec[key]:
+                raise ValueError("measured tool " + key + " differs: " + name)
     result = copy.deepcopy(manifest)
     result["release_status"] = "pending review"
     result["rust_toolchains"] = actual["rust_toolchains"]

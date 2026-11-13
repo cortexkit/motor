@@ -14,11 +14,12 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -37,8 +38,17 @@ def pending():
     return pinlock.seed(SERVER)
 
 
-def ready():
+def ready(rebuild=None):
+    if rebuild is None:
+        rebuild = ("1.100.0-x86_64-unknown-linux-gnu" in SERVER["rust_toolchains"]
+                   and "1.100.0" not in parity.PENDING_MACOS_TOOLCHAINS)
     manifest = pending()
+    if not rebuild:
+        # Keep the existing parity tests exercising the measured live-image shape.
+        manifest["rust_toolchains"] = {name: manifest["rust_toolchains"][name]
+                                       for name in parity.rust_toolchains(SERVER) if name != parity.REBUILD_RUST}
+        del manifest["sources"]["cmake"]
+        del manifest["tools"]["cmake"]
 
     def fill(value) -> Any:
         if isinstance(value, dict):
@@ -126,22 +136,26 @@ class ParityTests(unittest.TestCase):
 
     def test_pending_component_is_skipped_but_any_other_new_component_is_not(self):
         server = copy.deepcopy(SERVER)
+        server["rust_toolchains"].pop("1.100.0-x86_64-unknown-linux-gnu", None)
+        manifest = ready(rebuild=False)
         components = server["rust_toolchains"]["1.99.0-x86_64-unknown-linux-gnu"]["components"]
         components.append("miri-x86_64-unknown-linux-gnu")
         with patch.object(parity, "PENDING_MACOS_COMPONENTS", {"miri"}):
-            parity.validate(self.manifest, server)
+            parity.validate(manifest, server)
         with self.assertRaisesRegex(ValueError, "differ from build-server"):
-            parity.validate(self.manifest, server)
+            parity.validate(manifest, server)
 
     def test_pending_toolchain_is_skipped_but_any_other_new_toolchain_is_not(self):
         server = copy.deepcopy(SERVER)
+        server["rust_toolchains"].pop("1.100.0-x86_64-unknown-linux-gnu", None)
+        manifest = ready(rebuild=False)
         chains = server["rust_toolchains"]
         base = chains["1.99.0-x86_64-unknown-linux-gnu"]
         chains["1.93.0-x86_64-unknown-linux-gnu"] = dict(base, rustc="rustc 1.93.0 (aaaaaaaaa 2026-01-22)")
         with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", parity.PENDING_MACOS_TOOLCHAINS | {"1.93.0"}):
-            parity.validate(self.manifest, server)
+            parity.validate(manifest, server)
         with self.assertRaisesRegex(ValueError, "differ from build-server"):
-            parity.validate(self.manifest, server)
+            parity.validate(manifest, server)
 
     def test_macos_pin_drift_compares_with_sealed_manifest(self):
         self.manifest["sources"]["bash"]["sha256"] = "b" * 64
@@ -240,6 +254,193 @@ class ParityTests(unittest.TestCase):
         self.assertNotIn("mountinfo", actual)
         self.assertNotIn("apt_packages", actual)
         self.assertFalse(any("dpkg" in str(command) or "/srv/build" in str(command) for command in commands))
+
+
+class RebuildRecipeTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(prefix="macos-rebuild-")
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+
+    def test_seed_includes_rust_1_100_with_exact_versions_and_unchanged_default(self):
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.92.0", "1.100.0"}), \
+                patch.object(parity, "PENDING_MACOS_COMPONENTS", {"llvm-tools", "rust-analyzer"}):
+            manifest = pending()
+        chains = manifest["rust_toolchains"]
+        new = chains["1.100.0-aarch64-apple-darwin"]
+        old = chains["1.99.0-aarch64-apple-darwin"]
+        self.assertEqual(manifest["rust_default"], "1.99.0-aarch64-apple-darwin")
+        self.assertEqual(manifest["stable_copy_from"], "1.99.0-aarch64-apple-darwin")
+        self.assertEqual(new["rustc"], "rustc 1.100.0 (0ef1bc386 2026-11-09)")
+        self.assertEqual(new["cargo"], "cargo 1.100.0 (3acc79c0c 2026-11-05)")
+        self.assertEqual(new["targets"], ["aarch64-apple-darwin"])
+        self.assertEqual(new["components"], old["components"])
+        self.assertIn("llvm-tools-aarch64-apple-darwin", new["components"])
+        self.assertIn("rust-analyzer-aarch64-apple-darwin", new["components"])
+        self.assertIn("1.92.0-aarch64-apple-darwin", chains)
+        self.assertEqual(new["sha256"], pinlock.PENDING)
+
+    def test_seed_pins_official_universal_cmake_at_linux_version(self):
+        manifest = pending()
+        self.assertEqual(manifest["sources"]["cmake"], {
+            "version": "4.2.3",
+            "url": "https://github.com/Kitware/CMake/releases/download/v4.2.3/cmake-4.2.3-macos-universal.tar.gz",
+            "sha256": "c2302d3e9c48daabee5ea7c4db4b2b93b989bcc89dae8b760880e00120641b5b",
+        })
+        self.assertEqual(manifest["tools"]["cmake"]["version"], "cmake version 4.2.3")
+        self.assertEqual(manifest["tools"]["cmake"]["version"], SERVER["tools"]["cmake"]["observed_build_server_version"])
+        self.assertEqual(manifest["tools"]["cmake"]["path"], "/opt/motor/bin/cmake")
+
+    def test_rebuilt_manifest_validates_before_and_after_linux_catches_up(self):
+        manifest = ready(rebuild=True)
+        pinlock.require_ready(manifest)
+        parity.validate(manifest, SERVER)
+        server = copy.deepcopy(SERVER)
+        server["rust_toolchains"]["1.100.0-x86_64-unknown-linux-gnu"] = dict(
+            server["rust_toolchains"]["1.99.0-x86_64-unknown-linux-gnu"],
+            rustc="rustc 1.100.0 (0ef1bc386 2026-11-09)")
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.100.0"}):
+            parity.validate(manifest, server)
+            legacy = ready(rebuild=False)
+            parity.validate(legacy, server)
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", set()):
+            parity.validate(manifest, server)
+            with self.assertRaisesRegex(ValueError, "toolchains/components"):
+                parity.validate(legacy, server)
+
+    def test_rebuilt_manifest_rejects_cmake_pin_and_rust_identity_drift(self):
+        for path, value in ((["tools", "cmake", "version"], "cmake version 4.2.4"),
+                            (["tools", "cmake", "path"], "/usr/bin/cmake"),
+                            (["sources", "cmake", "sha256"], "b" * 64),
+                            (["rust_toolchains", parity.REBUILD_RUST, "cargo"], "cargo 1.99.0"),
+                            (["rust_toolchains", parity.REBUILD_RUST, "rustc"], "rustc 1.100.0 (wrong 2026-11-09)")):
+            with self.subTest(path=path):
+                manifest = ready(rebuild=True)
+                parent = manifest
+                for key in path[:-1]:
+                    parent = parent[key]
+                parent[path[-1]] = value
+                with self.assertRaises(ValueError):
+                    parity.validate(manifest, SERVER)
+        manifest = ready(rebuild=True)
+        del manifest["tools"]["cmake"]
+        with self.assertRaisesRegex(ValueError, "tool set"):
+            parity.validate(manifest, SERVER)
+
+    def test_measurement_keeps_exact_requested_identities_and_records_hashes(self):
+        manifest = ready(rebuild=True)
+        actual = observed(manifest, self.root)
+        actual["tools"]["cmake"]["sha256"] = "b" * 64
+        actual["rust_toolchains"][parity.REBUILD_RUST]["sha256"] = "c" * 64
+        candidate = pinlock.candidate(manifest, actual, {}, "d" * 64, {})
+        self.assertEqual(candidate["tools"]["cmake"]["sha256"], "b" * 64)
+        self.assertEqual(candidate["rust_toolchains"][parity.REBUILD_RUST]["sha256"], "c" * 64)
+        self.assertEqual(candidate["rust_toolchains"][parity.REBUILD_RUST]["cargo"], "cargo 1.100.0 (3acc79c0c 2026-11-05)")
+        for key, value in (("cargo", "cargo 1.99.0"), ("rustc", "rustc 1.99.0"),
+                           ("components", []), ("targets", [])):
+            with self.subTest(key=key):
+                wrong = copy.deepcopy(actual)
+                wrong["rust_toolchains"][parity.REBUILD_RUST][key] = value
+                with self.assertRaisesRegex(ValueError, "measured Rust " + key):
+                    pinlock.candidate(manifest, wrong, {}, "d" * 64, {})
+        wrong = copy.deepcopy(actual)
+        wrong["tools"]["cmake"]["version"] = "cmake version 4.2.4"
+        with self.assertRaisesRegex(ValueError, "measured tool version differs: cmake"):
+            pinlock.candidate(manifest, wrong, {}, "d" * 64, {})
+        wrong = copy.deepcopy(actual)
+        del wrong["rust_toolchains"][parity.REBUILD_RUST]
+        with self.assertRaisesRegex(ValueError, "toolchain names"):
+            pinlock.candidate(manifest, wrong, {}, "d" * 64, {})
+        self.assertTrue(parity.differences(manifest, actual))
+
+    def test_capture_measures_numbered_cargo_and_cmake_version_and_hash(self):
+        manifest = ready(rebuild=True)
+        cargo, rustup = self.root / "cargo", self.root / "rustup"
+        (cargo / "bin").mkdir(parents=True)
+        (cargo / "bin/rustup").write_bytes(b"rustup")
+        (cargo / "bin/rustup").chmod(0o755)
+        for name in manifest["rust_toolchains"]:
+            chain = rustup / "toolchains" / name
+            (chain / "bin").mkdir(parents=True)
+            for binary in ("cargo", "rustc"):
+                (chain / "bin" / binary).write_bytes(binary.encode())
+            lib = chain / "lib/rustlib/aarch64-apple-darwin/lib"
+            lib.mkdir(parents=True)
+            (lib / "libstd-test.rlib").write_bytes(b"std")
+        cmake = self.root / "cmake"
+        cmake.write_bytes(b"official cmake executable")
+        manifest.update(cargo_home=str(cargo), rustup_home=str(rustup))
+        (self.root / "toolchain.json").write_text(json.dumps(manifest))
+
+        def output(*args, **kwargs):
+            if args[0] == "/usr/sbin/pkgutil":
+                return plistlib.dumps({"pkg-version": "27.0"}).decode()
+            if args[1:] == ("toolchain", "list"):
+                return "\n".join(manifest["rust_toolchains"])
+            if args[1:3] == ("target", "list"):
+                return "aarch64-apple-darwin"
+            if args[1:3] == ("component", "list"):
+                return "rustc-aarch64-apple-darwin"
+            if args[1:] == ("default",):
+                return "1.99.0-aarch64-apple-darwin (default)"
+            if args[1:] == ("show", "profile"):
+                return "minimal"
+            if args[0] == str(cmake):
+                return "cmake version 4.2.3\n\nCMake suite maintained and supported by Kitware"
+            if args[0] == str(rustup / "toolchains/1.100.0-aarch64-apple-darwin/bin/cargo"):
+                return "cargo 1.100.0 (3acc79c0c 2026-11-05)"
+            return "rustup 1.29.1" if args[0].endswith("rustup") else "rustc 1.99.0"
+
+        with patch.object(parity, "PREFIX", str(self.root)), patch.object(parity, "output", side_effect=output) as command, \
+                patch.object(parity.shutil, "which", side_effect=lambda name, **kw: str(cmake) if name == "cmake" else None):
+            actual = parity.capture(manifest)
+        command.assert_any_call(str(rustup / "toolchains/1.100.0-aarch64-apple-darwin/bin/cargo"), "--version", env=ANY)
+        self.assertEqual(actual["rust_toolchains"][parity.REBUILD_RUST]["cargo"], "cargo 1.100.0 (3acc79c0c 2026-11-05)")
+        self.assertEqual(actual["tools"]["cmake"]["version"], "cmake version 4.2.3")
+        self.assertEqual(actual["tools"]["cmake"]["sha256"], hashlib.sha256(b"official cmake executable").hexdigest())
+
+    def test_cmake_install_preserves_modules_and_exposes_only_cli_on_job_path(self):
+        archive = self.root / "cmake.tar.gz"
+        contents = "cmake-4.2.3-macos-universal/CMake.app/Contents/"
+        files = {"bin/cmake": b"cmake", "bin/ctest": b"ctest", "bin/cpack": b"cpack",
+                 "share/cmake-4.2/Modules/CMake.cmake": b"module", "MacOS/CMake": b"gui"}
+        with tarfile.open(archive, "w:gz") as output:
+            for name, data in files.items():
+                info = tarfile.TarInfo(contents + name)
+                info.mode, info.size = (0o755 if name.startswith("bin/") else 0o644), len(data)
+                output.addfile(info, io.BytesIO(data))
+            info = tarfile.TarInfo(contents + "bin/cmake-gui")
+            info.type, info.linkname = tarfile.SYMTYPE, "../MacOS/CMake"
+            output.addfile(info)
+        prefix = self.root / "opt/motor"
+        (prefix / "bin").mkdir(parents=True)
+        with patch.object(guest, "PREFIX", prefix):
+            guest.install_cmake(archive, self.root)
+        for name in ("cmake", "ctest", "cpack"):
+            path = prefix / "bin" / name
+            self.assertEqual(os.readlink(path), "../cmake/bin/" + name)
+            self.assertEqual(path.read_bytes(), name.encode())
+            self.assertTrue(os.access(path, os.X_OK))
+        self.assertEqual((prefix / "cmake/share/cmake-4.2/Modules/CMake.cmake").read_bytes(), b"module")
+        self.assertFalse((prefix / "cmake/bin/cmake-gui").exists())
+        self.assertFalse((prefix / "cmake/MacOS").exists())
+        with patch.object(guest, "PREFIX", prefix), patch.object(guest.os, "chown") as chown:
+            guest.make_readonly()
+        chown.assert_any_call(prefix / "cmake/bin/cmake", 0, 0)
+        self.assertEqual((prefix / "bin/cmake").stat().st_mode & 0o777, 0o555)
+        self.assertEqual((prefix / "cmake/share/cmake-4.2/Modules/CMake.cmake").stat().st_mode & 0o777, 0o444)
+        for path in [prefix, *prefix.rglob("*")]:
+            if not path.is_symlink():
+                path.chmod(0o755 if path.is_dir() else 0o644)
+
+    def test_selected_cmake_archive_members_cannot_escape_scratch(self):
+        archive = self.root / "unsafe.tar.gz"
+        with tarfile.open(archive, "w:gz") as output:
+            info = tarfile.TarInfo("contents/share/escape")
+            info.type, info.linkname = tarfile.SYMTYPE, "../../outside"
+            output.addfile(info)
+        with self.assertRaisesRegex(ValueError, "unsafe source archive link"):
+            guest.unpack(archive, self.root / "unpack", include=["contents/share"])
 
 
 class InstallerTests(unittest.TestCase):

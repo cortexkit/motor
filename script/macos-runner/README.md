@@ -16,8 +16,17 @@ download, and the SHA-256 above was measured from that verified file. `observed_
 host, not a required guest image version. Obtain the exact named IPSW from Apple
 or the operator's retained copy; `restore` checks its size and hash before use.
 
-Rust versions, components and default are derived from the read-only build-server
-manifest. GNU bash 5.2.37 is built from its pinned GNU archive (the source hash is
+Rust versions and components are derived from the read-only build-server
+manifest. The rebuild recipe also installs Rust **1.100.0** beside **1.99.0**, with
+the same components and native target; **1.99.0 remains the default** and the source
+of the independent stable copy. Rust 1.92.0, `llvm-tools`, `rust-analyzer` and Bun
+1.4.4 are included. CMake **4.2.3**, matching the Linux manifest, comes from
+Kitware's official `cmake-4.2.3-macos-universal.tar.gz`, pinned by SHA-256
+`c2302d3e9c48daabee5ea7c4db4b2b93b989bcc89dae8b760880e00120641b5b`
+from the release's `cmake-4.2.3-SHA-256.txt`. Its CLI binaries (`cmake`, `ctest`,
+`cpack`) and module tree are installed read-only under `/opt/motor/cmake`, with
+links in `/opt/motor/bin` on the job PATH; the GUI and Qt frameworks are excluded.
+GNU bash 5.2.37 is built from its pinned GNU archive (the source hash is
 also published in Buildroot's `package/bash/bash.hash`). Git uses the server's
 pinned kernel.org source release. The agent source is pinned to the full merged
 Motor commit in the `agent.commit` value in `toolchain.json`; `git archive` exports that commit, not the current
@@ -71,10 +80,16 @@ inside the checkout, for example `target/scratch/macos-image`.
    except `--ipsw`) to resume the **same** builder image in another terminal.
 
 3. In the guest console inspect `softwareupdate --list` for the exact CLT label.
-   Provision over SSH with strict host-key checking:
+   Seed a separate rebuild manifest; the committed `toolchain.json` continues to
+   describe the sealed image until its replacement has been measured and reviewed.
+   The seed includes all build-server toolchains/components even when parity has
+   pending exceptions for the live image. Provision over SSH with strict host-key
+   checking:
 
    ```sh
+   python3 script/macos-runner/pinlock.py --seed > target/scratch/macos-image/rebuild.json
    python3 script/macos-runner/image.py provision --measure \
+     --manifest target/scratch/macos-image/rebuild.json \
      --work target/scratch/macos-image --guest motorbuild@GUEST_IP \
      --known-hosts "$GUEST_KNOWN_HOSTS" --clt-label "$CLT_LABEL"
    ```
@@ -84,13 +99,16 @@ inside the checkout, for example `target/scratch/macos-image`.
    verifies the installed clang's Apple code signature. There is no invented CLT
    package-file hash: softwareupdate does not retain a package here.
 
-   GitHub payloads (Bun and pinned Cargo source archives) use six parallel HTTP
-   ranges, verify response ranges/lengths, then verify the complete SHA-256.
-   A server that ignores ranges is refused, not silently downloaded serially.
-   Use a hash-identical mirror URL in a reviewed source pin if range service is
-   unavailable. Rustup verifies the Rust distributions' checksums. Each toolchain
+   GitHub payloads (Bun, CMake and pinned Cargo source archives) try six parallel
+   HTTP ranges, verify response ranges/lengths, then verify the complete SHA-256.
+   If range service is unavailable, the downloader uses a serial transfer with
+   the same digest check. Rustup verifies the Rust distributions' checksums. Each toolchain
    records `rustc -vV` and a content-tree SHA-256; native cargo-bin hashes are
-   measured independently. Linux's sccache and cross-targets are not installed.
+   measured independently. Measurement requires exactly
+   `rustc 1.100.0 (0ef1bc386 2026-11-09)` and
+   `cargo 1.100.0 (3acc79c0c 2026-11-05)` for the new toolchain, its requested
+   targets/components, and `cmake version 4.2.3`; it cannot replace requested
+   versions with whatever was installed. Linux's sccache and cross-targets are not installed.
    Stable is an independent copy of the numbered release, with exactly its pinned
    subset of components, never an installation from the moving stable channel.
 
@@ -102,7 +120,11 @@ inside the checkout, for example `target/scratch/macos-image`.
 4. Review `<work>/candidate.json` (`<work>` is the path passed to `--work`), including source digests first acquired during
    bootstrap, all versions, component sets, `rustc -vV`, tree hashes, agent hash
    and prep-tool hashes. Replace `script/macos-runner/toolchain.json` with the
-   reviewed candidate, change only `release_status` to `reviewed`, and commit it.
+    reviewed candidate, change only `release_status` to `reviewed`, and commit it.
+   After measurement, remove `1.100.0` from `PENDING_MACOS_TOOLCHAINS` in
+   `parity.py` when committing the replacement lock. Keep that exception until
+   the rebuilt image is measured; it lets the live image pass parity while the
+   Linux images already carry 1.100.0. No component or Bun exceptions need removal.
    Do **not** re-provision the measured VM just to seal it: native rebuilds can
    produce different bytes. If provisioning failed midway, discard that builder
    and start measurement from a fresh restore instead of reusing partial scratch.
