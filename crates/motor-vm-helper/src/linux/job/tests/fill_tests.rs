@@ -1,4 +1,6 @@
-use super::exit_tests::{fixture, peer};
+use super::exit_tests::fixture;
+#[cfg(feature = "linux-root-tests")]
+use super::exit_tests::peer;
 use super::*;
 use std::sync::{mpsc, Arc};
 
