@@ -63,13 +63,25 @@ pub(crate) fn s3_path(key: &str) -> String {
     format!("/{BUCKET}/{key}")
 }
 
-/// A loopback port nothing listens on right now.
+/// Ports `free_port` chooses from. They sit below the kernel's ephemeral
+/// range (32768 and up on Linux, 49152 and up on macOS).
+const TEST_PORTS: std::ops::Range<u16> = 20000..32000;
+
+/// A loopback port nothing listens on right now, for a forwarder that binds it
+/// later. Binding port 0 would take a port from the ephemeral range, and the
+/// kernel can hand that same port to any outgoing connection, from this test or
+/// one running beside it, before the forwarder binds it (a CI run failed with
+/// "Address already in use" that way). Outgoing connections never get a port
+/// below that range, so only another test's `free_port` could collide, and the
+/// random start makes that unlikely.
 pub(crate) fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use rand::Rng;
+    let span = TEST_PORTS.end - TEST_PORTS.start;
+    let start = rand::thread_rng().gen_range(0..span);
+    (0..span)
+        .map(|offset| TEST_PORTS.start + (start + offset) % span)
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .expect("a free loopback port below the ephemeral range")
 }
 
 /// Kills a process group when dropped. A started forwarder serves from the
