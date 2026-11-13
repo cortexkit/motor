@@ -487,7 +487,10 @@ fn record_precedes_first_resource_and_recovery_removes_only_derived_paths() {
         }
         if window == "copy-back" {
             record.stop_proven = true;
-            write_build_disk(&record.paths.clone.join(motor_macvm::BUILD_DISK), b"new store");
+            write_build_disk(
+                &record.paths.clone.join(motor_macvm::BUILD_DISK),
+                b"new store",
+            );
             write_build_disk(
                 &root.join("targets").join(image(&record.workspace)),
                 b"old store",
@@ -1294,7 +1297,11 @@ fn build_stores_are_evicted_legacy_first_then_least_recently_used_then_largest()
     std::fs::write(legacy.join("app"), "old build").unwrap();
     stamp(&legacy, 3_000);
     // None of these is a build store.
-    std::fs::write(targets.join(format!("{}.source-mtimes.json", key('a'))), "{}").unwrap();
+    std::fs::write(
+        targets.join(format!("{}.source-mtimes.json", key('a'))),
+        "{}",
+    )
+    .unwrap();
     std::fs::write(targets.join("not-a-key.img"), "x").unwrap();
     std::fs::create_dir(targets.join(format!("{}.img", key('e')))).unwrap();
     std::os::unix::fs::symlink(

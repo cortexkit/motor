@@ -127,7 +127,10 @@ mod tests {
         // disk4 is not a prefix match for disk40's partitions.
         let other = report(serde_json::json!([container(&["disk40s2"], &["disk41s1"])]));
         assert_eq!(volume_on_disk(&other, "disk4").unwrap(), None);
-        assert_eq!(volume_on_disk(&report(serde_json::json!([])), "disk4").unwrap(), None);
+        assert_eq!(
+            volume_on_disk(&report(serde_json::json!([])), "disk4").unwrap(),
+            None
+        );
     }
     #[test]
     fn ambiguous_or_malformed_reports_are_errors_not_guesses() {

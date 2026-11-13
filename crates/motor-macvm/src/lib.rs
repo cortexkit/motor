@@ -22,8 +22,9 @@ mod disk_release;
 mod nonce;
 pub use nonce::{
     BUILD_EXTENSION_HEADER, BUILD_EXTENSION_SIZE, BootConfig, BuildConfig, MAX_BUILD_RETURN_BYTES,
-    MAX_BUILD_RETURNS, Mount, NONCE_DISK_SIZE, NONCE_HEADER, NONCE_IMAGE_SIZE, create_job_nonce_disk,
-    create_nonce_disk, decode_boot_config, nonce_bytes, read_boot_candidate, read_boot_config,
+    MAX_BUILD_RETURNS, Mount, NONCE_DISK_SIZE, NONCE_HEADER, NONCE_IMAGE_SIZE,
+    create_job_nonce_disk, create_nonce_disk, decode_boot_config, nonce_bytes, read_boot_candidate,
+    read_boot_config,
 };
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
 /// The job's writable build disk, in its clone directory beside the boot disk.

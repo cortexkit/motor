@@ -306,7 +306,8 @@ fn job(root: &Path, runtime: &Runtime) -> Arc<Entry> {
     entry
 }
 fn kept(root: &Path) -> std::path::PathBuf {
-    root.join("targets").join(lifecycle::image("/Users/test/repo"))
+    root.join("targets")
+        .join(lifecycle::image("/Users/test/repo"))
 }
 fn job_disk(entry: &Entry) -> std::path::PathBuf {
     entry

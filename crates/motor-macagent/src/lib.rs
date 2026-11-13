@@ -1145,7 +1145,8 @@ mod execution {
                     notice: notice.map(str::to_owned),
                     fail_attach,
                     fail_detach,
-                }) as Box<dyn crate::build_volume::BuildVolume>)
+                })
+                    as Box<dyn crate::build_volume::BuildVolume>)
             })
             .await;
             (fixture, events)
@@ -1153,9 +1154,13 @@ mod execution {
 
         #[tokio::test]
         async fn build_volume_is_attached_before_the_command_and_detached_before_its_exit() {
-            let (mut fixture, events) =
-                launch_with_volume("test -f mounted && echo ran", Some("motor: cold\n"), false, false)
-                    .await;
+            let (mut fixture, events) = launch_with_volume(
+                "test -f mounted && echo ran",
+                Some("motor: cold\n"),
+                false,
+                false,
+            )
+            .await;
             assert_eq!(
                 host_receive(&mut fixture.host).await.unwrap(),
                 Some(Frame::Started {})
@@ -1164,8 +1169,14 @@ mod execution {
             let mut stderr = Vec::new();
             let terminal = loop {
                 match host_receive(&mut fixture.host).await.unwrap().unwrap() {
-                    Frame::Output { stream: Stream::Stdout, bytes } => stdout.extend(bytes),
-                    Frame::Output { stream: Stream::Stderr, bytes } => stderr.extend(bytes),
+                    Frame::Output {
+                        stream: Stream::Stdout,
+                        bytes,
+                    } => stdout.extend(bytes),
+                    Frame::Output {
+                        stream: Stream::Stderr,
+                        bytes,
+                    } => stderr.extend(bytes),
                     terminal => break terminal,
                 }
             };
@@ -1179,8 +1190,7 @@ mod execution {
 
         #[tokio::test]
         async fn failed_build_volume_attach_runs_no_command() {
-            let (mut fixture, events) =
-                launch_with_volume("touch ran", None, true, false).await;
+            let (mut fixture, events) = launch_with_volume("touch ran", None, true, false).await;
             assert!(host_receive(&mut fixture.host).await.unwrap().is_none());
             assert!((&mut fixture.agent.0).await.unwrap().is_err());
             assert_eq!(*events.lock().unwrap(), ["attach"]);
@@ -1189,8 +1199,7 @@ mod execution {
 
         #[tokio::test]
         async fn failed_build_volume_detach_reports_no_exit() {
-            let (mut fixture, events) =
-                launch_with_volume("echo ran", None, false, true).await;
+            let (mut fixture, events) = launch_with_volume("echo ran", None, false, true).await;
             loop {
                 match host_receive(&mut fixture.host).await.unwrap() {
                     Some(Frame::Started {} | Frame::Output { .. }) => {}

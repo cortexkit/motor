@@ -519,7 +519,9 @@ impl Dir {
                     flags: u32,
                 ) -> libc::c_int;
             }
-            cv(unsafe { fclonefileat(source.as_raw_fd(), self.0.as_raw_fd(), c(name)?.as_ptr(), 0) })?;
+            cv(unsafe {
+                fclonefileat(source.as_raw_fd(), self.0.as_raw_fd(), c(name)?.as_ptr(), 0)
+            })?;
         }
         #[cfg(not(target_os = "macos"))]
         {

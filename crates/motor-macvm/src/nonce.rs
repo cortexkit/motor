@@ -362,7 +362,10 @@ mod tests {
             bad[at] = b'!';
             assert!(read_boot_config(&bad[..]).is_err(), "byte {at}");
         }
-        for length in [0, (BUILD_EXTENSION_SIZE - BUILD_EXTENSION_HEADER.len() - 3) as u32] {
+        for length in [
+            0,
+            (BUILD_EXTENSION_SIZE - BUILD_EXTENSION_HEADER.len() - 3) as u32,
+        ] {
             let mut bad = valid.clone();
             bad[start..start + 4].copy_from_slice(&length.to_be_bytes());
             assert!(read_boot_config(&bad[..]).is_err(), "length {length}");
@@ -384,9 +387,7 @@ mod tests {
     }
     #[test]
     fn build_return_paths_must_be_relative_and_normal() {
-        for path in [
-            "", "/abs", "a//b", "a/", "./a", "a/../b", "..", "a\0b",
-        ] {
+        for path in ["", "/abs", "a//b", "a/", "./a", "a/../b", "..", "a\0b"] {
             let config = BuildConfig {
                 returns: vec![path.into()],
                 return_max_bytes: 1,

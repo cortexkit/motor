@@ -272,11 +272,7 @@ pub fn place_returns(target: &File, staged: &[Staged], staging: &Path) -> io::Re
                 directory = Some(opened);
             }
             let parent = directory.as_ref().unwrap_or(target);
-            let mut output = open_at(
-                parent,
-                name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            )?;
+            let mut output = open_at(parent, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
             match entry {
                 Staged::Copied { index, .. } => {
                     io::copy(
@@ -438,7 +434,11 @@ mod native {
             let workspace = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(self.target.parent().ok_or_else(|| invalid("target parent"))?)?;
+                .open(
+                    self.target
+                        .parent()
+                        .ok_or_else(|| invalid("target parent"))?,
+                )?;
             drop(mount_point(&workspace)?);
             let (disk, raw) = find_disk(self.gid)?;
             let mut notice = None;
@@ -594,7 +594,11 @@ mod native {
     fn wait_volume(disk: &str, wait: Duration) -> io::Result<Option<String>> {
         let deadline = Instant::now() + wait;
         loop {
-            let plist = run(DISKUTIL, &["apfs".as_ref(), "list".as_ref(), "-plist".as_ref()], None)?;
+            let plist = run(
+                DISKUTIL,
+                &["apfs".as_ref(), "list".as_ref(), "-plist".as_ref()],
+                None,
+            )?;
             let json = run(
                 PLUTIL,
                 &[
@@ -812,7 +816,11 @@ mod tests {
         std::fs::write(v.volume.join("debug/app"), vec![1; 10]).unwrap();
         std::fs::write(v.volume.join("debug/deps/lib.rlib"), vec![2; 20]).unwrap();
         std::fs::write(v.volume.join("small"), vec![3; 5]).unwrap();
-        let staged = copy(&v, &["debug/app", "debug/deps/lib.rlib", "small", "debug/app"], 26);
+        let staged = copy(
+            &v,
+            &["debug/app", "debug/deps/lib.rlib", "small", "debug/app"],
+            26,
+        );
         assert_eq!(
             staged,
             vec![
@@ -830,7 +838,10 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(std::fs::read(v.target.join("debug/app")).unwrap(), vec![1; 10]);
+        assert_eq!(
+            std::fs::read(v.target.join("debug/app")).unwrap(),
+            vec![1; 10]
+        );
         assert_eq!(std::fs::read(v.target.join("small")).unwrap(), vec![3; 5]);
         // The over-cap file keeps its size, so the host refuses it as over the
         // cap, but none of its bytes left the volume.
@@ -848,7 +859,14 @@ mod tests {
         symlink("../outside/secret", v.volume.join("relative")).unwrap();
         let staged = copy(
             &v,
-            &["leaf", "parent/secret", "relative", "dir", "missing", "dir/missing"],
+            &[
+                "leaf",
+                "parent/secret",
+                "relative",
+                "dir",
+                "missing",
+                "dir/missing",
+            ],
             1 << 20,
         );
         assert!(staged.is_empty());
