@@ -52,10 +52,13 @@ set, so setuid binaries and file capabilities give it nothing. Test:
 ### Read-only source
 
 On Linux, regular files in the source snapshot are immutable while the command
-runs. Writing them in place, removing them, renaming another file over them,
-and changing their times or permissions all fail immediately. Build outputs,
-temporary files, new untracked files, and `node_modules` directories prepared by
-the runner stay writable. A tracked file explicitly named in `return_paths`
+runs. The snapshot holds the caller's tracked files and also its untracked files
+that no ignore rule excludes ([snapshot-contents.md](snapshot-contents.md), rule
+2.2), so a scratch copy of the source left untracked in the checkout is
+immutable too; copy it under `$TMPDIR` to edit it. Writing them in place,
+removing them, renaming another file over them, and changing their times or
+permissions all fail immediately. Build outputs, temporary files, files the job
+creates, and `node_modules` directories prepared by the runner stay writable. A tracked file explicitly named in `return_paths`
 stays writable so it can be regenerated and returned. Tracked symlinks are not
 sealed. Renaming a parent folder is still possible: a command can move it aside
 and create replacement files under the old path; `workspace_changes` reports
