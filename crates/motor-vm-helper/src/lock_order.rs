@@ -7,6 +7,9 @@ use std::marker::PhantomData;
 // The separate connection gate C protects peer authorization, not VM work;
 // drop it before entering an ordered lock. Check before waiting, because an
 // inverted acquisition can deadlock before it wins.
+// Only the connection gate exists outside Linux; the other locks guard the
+// Linux job and tenant planes but stay in one table so the order is stated once.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Lock {
     G,
@@ -49,6 +52,7 @@ pub(crate) fn enter(lock: Lock) -> Held {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn assert_held(lock: Lock) {
     #[cfg(debug_assertions)]
     HELD.with(|held| {
@@ -71,11 +75,13 @@ impl Drop for Held {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct Mutex<T> {
     inner: std::sync::Mutex<T>,
     order: Lock,
 }
 
+#[cfg(target_os = "linux")]
 impl<T> Mutex<T> {
     pub(crate) fn new(order: Lock, value: T) -> Self {
         Self {
@@ -100,17 +106,20 @@ impl<T> Mutex<T> {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct Guard<'a, T> {
     guard: std::sync::MutexGuard<'a, T>,
     _held: Held,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn mutex<T>(mutex: &std::sync::Mutex<T>, order: Lock) -> Guard<'_, T> {
     let held = enter(order);
     let guard = mutex.lock().unwrap();
     Guard { guard, _held: held }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn mutex_recover<T>(mutex: &std::sync::Mutex<T>, order: Lock) -> Guard<'_, T> {
     let held = enter(order);
     let guard = mutex
@@ -119,12 +128,14 @@ pub(crate) fn mutex_recover<T>(mutex: &std::sync::Mutex<T>, order: Lock) -> Guar
     Guard { guard, _held: held }
 }
 
+#[cfg(target_os = "linux")]
 impl<T> std::ops::Deref for Guard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.guard
     }
 }
+#[cfg(target_os = "linux")]
 impl<T> std::ops::DerefMut for Guard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.guard
