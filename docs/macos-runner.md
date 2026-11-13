@@ -86,7 +86,10 @@ sequence is `Hello` → host `TreeEnd { command }` → agent `Started` → zero 
 `Output` → `Exit { code }` or `Signal { signal }`. There is no `TreeReceived` or
 host `Start`. The host may send `Cancel` after `TreeEnd` until terminal status.
 The agent mounts the build disk between `TreeEnd` and `Started`, and unmounts it
-before `Exit` or `Signal`; the host allows two minutes for `Started`.
+before `Exit` or `Signal`; the host allows two minutes for `Started`. When the
+build disk cannot be mounted, no command runs: the agent sends `Started`, one
+standard-error `Output` line giving the reason, and closes without terminal
+status.
 
 ### Shares and command execution
 
@@ -165,10 +168,21 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
 - **On the host**, the runner keeps one file per checkout, `targets/<key>.img`
   under its state root: a sparse raw disk of exactly **128 GiB**, of which only
   written blocks use host disk. For each job it makes an APFS clone of that
-  file, a constant-time copy, in the job's clone directory, and attaches it as
-  the VM's third disk, writable, with the boot disk's caching and
-  synchronization settings. A checkout's first job gets a new, empty disk.
+  file, a constant-time copy, in the job's clone directory, and attaches it to
+  the VM as a writable USB mass storage device, with the boot disk's caching
+  and synchronization settings. A checkout's first job gets a new, empty disk.
   The staged checkout's `target/` is an empty directory.
+- **Why USB.** On Apple silicon, macOS protects the key of every APFS volume
+  on internal storage with the Secure Enclave. The guest treats a virtio block
+  disk as internal storage, and a job VM's Secure Enclave state belongs to its
+  clone of the image, which is discarded after the job. A volume formatted on
+  a virtio disk is mounted with the `protect` flag and does not mount in the
+  next job VM: `mount_apfs` fails with "Illegal byte sequence", so every build
+  started cold. Removable storage does not use the Secure Enclave, and the
+  guest treats a USB mass storage device as removable.
+  `script/macos-runner/build-disk-probe.sh` checks this on a host without a
+  runner: for each attachment it boots two job VMs from clones of a sealed
+  image and reports whether the second mounts the volume the first formatted.
 - **In the VM**, before the command starts, the root agent finds the disk by
   its fixed size, the one property the guest cannot change and no other disk
   shares. It formats the disk as APFS only while it is still blank (all zero,
@@ -190,7 +204,10 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
   same file system ID and inode). It copies the returned files out (below),
   then unmounts the volume, which must have exactly one mount, forcing the
   unmount if a killed process left it busy. Only then does it send `Exit` or
-  `Signal`. If any of this fails, it closes the session without either.
+  `Signal`. If any of this fails, the command's output is still delivered,
+  followed by one last standard-error line,
+  `motor: the build disk could not be released: <reason>`, and the session
+  closes without either. The runner logs that line with the job ID.
 - **Publication.** After the VM has provably stopped, the runner renames the
   job's disk over `targets/<key>.img` whenever the agent reported `Exit` or
   `Signal`, because only then was the volume cleanly unmounted. **A failed job

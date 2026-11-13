@@ -558,6 +558,18 @@ mod execution {
         }
     }
 
+    /// The one stderr line that tells the caller why the build disk could not
+    /// be `action` (mounted or released). Tool output in the error may span
+    /// lines; it is folded onto one.
+    fn build_disk_failure(action: &str, error: &io::Error) -> String {
+        let reason = error
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("motor: the build disk could not be {action}: {reason}\n")
+    }
+
     async fn serve<S>(stream: S, nonce: String, mut settings: Settings) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -577,9 +589,26 @@ mod execution {
             return Err(io::Error::other("expected command"));
         };
         // No job code runs until the build volume covers target/. A failure
-        // closes the session before Started.
-        let notice = match settings.build.as_mut() {
-            Some(volume) => volume.attach()?,
+        // runs no command: the caller gets the reason as one stderr line, which
+        // the protocol only carries after Started, and the session then closes
+        // without Exit, so the host publishes nothing.
+        let notice = match settings.build.as_mut().map(|volume| volume.attach()) {
+            Some(Ok(notice)) => notice,
+            Some(Err(error)) => {
+                eprintln!("motor-macagent: the build disk could not be mounted: {error}");
+                send(&mut writer, &protocol, Frame::Started {}).await?;
+                send(
+                    &mut writer,
+                    &protocol,
+                    Frame::Output {
+                        stream: Stream::Stderr,
+                        bytes: build_disk_failure("mounted", &error).into_bytes(),
+                    },
+                )
+                .await?;
+                writer.shutdown().await?;
+                return Err(error);
+            }
             None => None,
         };
         let tmpdir = tempfile::Builder::new()
@@ -594,6 +623,13 @@ mod execution {
         let mut stderr_write = tokio::fs::File::from_std(stderr.reopen()?);
         let stdout_read = tokio::fs::File::from_std(stdout.reopen()?);
         let stderr_read = tokio::fs::File::from_std(stderr.reopen()?);
+        // Appends after everything the pipe readers wrote, for a line the agent
+        // adds once the command's own output has ended.
+        let mut stderr_append = tokio::fs::File::from_std(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(stderr.path())?,
+        );
         let mut process = tokio::process::Command::new(&settings.shell);
         process
             .arg("-c")
@@ -698,9 +734,26 @@ mod execution {
         }
         let terminal = termination(status.unwrap())?;
         // Every job process is gone. The exit is reported only once the build
-        // volume is unmounted; without it the host publishes nothing.
-        if let Some(volume) = settings.build.as_mut() {
-            volume.detach()?;
+        // volume is unmounted; without it the host publishes nothing. A failed
+        // unmount still sends its reason as the last stderr line, then closes
+        // the session without Exit.
+        if let Some(Err(error)) = settings.build.as_mut().map(|volume| volume.detach()) {
+            eprintln!("motor-macagent: the build disk could not be released: {error}");
+            let line = build_disk_failure("released", &error);
+            stderr_append.write_all(line.as_bytes()).await?;
+            stderr_append.flush().await?;
+            output_tx
+                .send(Output::Chunk(Stream::Stderr, line.len()))
+                .map_err(|_| io::Error::other("output closed"))?;
+            // With the channel closed, forwarding sends what is queued and
+            // ends without a terminal status.
+            drop(output_tx);
+            loop {
+                tokio::select! {
+                    _ = &mut forwarding.0 => return Err(error),
+                    message = control_rx.recv() => { handle_control(message, &settings.scope)?; }
+                }
+            }
         }
         output_tx
             .send(Output::Terminal(terminal))
@@ -1189,8 +1242,21 @@ mod execution {
         }
 
         #[tokio::test]
-        async fn failed_build_volume_attach_runs_no_command() {
+        async fn failed_build_volume_attach_runs_no_command_and_says_why() {
             let (mut fixture, events) = launch_with_volume("touch ran", None, true, false).await;
+            // The reason travels as the one stderr line the protocol allows
+            // after Started; no Exit follows.
+            assert_eq!(
+                host_receive(&mut fixture.host).await.unwrap(),
+                Some(Frame::Started {})
+            );
+            assert_eq!(
+                host_receive(&mut fixture.host).await.unwrap(),
+                Some(Frame::Output {
+                    stream: Stream::Stderr,
+                    bytes: b"motor: the build disk could not be mounted: no build disk\n".to_vec(),
+                })
+            );
             assert!(host_receive(&mut fixture.host).await.unwrap().is_none());
             assert!((&mut fixture.agent.0).await.unwrap().is_err());
             assert_eq!(*events.lock().unwrap(), ["attach"]);
@@ -1198,17 +1264,43 @@ mod execution {
         }
 
         #[tokio::test]
-        async fn failed_build_volume_detach_reports_no_exit() {
-            let (mut fixture, events) = launch_with_volume("echo ran", None, false, true).await;
+        async fn failed_build_volume_detach_says_why_and_reports_no_exit() {
+            let (mut fixture, events) =
+                launch_with_volume("echo ran; echo job-err >&2", None, false, true).await;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             loop {
                 match host_receive(&mut fixture.host).await.unwrap() {
-                    Some(Frame::Started {} | Frame::Output { .. }) => {}
+                    Some(Frame::Started {}) => {}
+                    Some(Frame::Output {
+                        stream: Stream::Stdout,
+                        bytes,
+                    }) => stdout.extend(bytes),
+                    Some(Frame::Output {
+                        stream: Stream::Stderr,
+                        bytes,
+                    }) => stderr.extend(bytes),
                     None => break,
                     Some(frame) => panic!("unexpected frame {frame:?}"),
                 }
             }
             assert!((&mut fixture.agent.0).await.unwrap().is_err());
             assert_eq!(*events.lock().unwrap(), ["attach", "detach"]);
+            assert_eq!(stdout, b"ran\n");
+            // The reason is the last line, after all of the command's output.
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                "job-err\nmotor: the build disk could not be released: volume busy\n"
+            );
+        }
+
+        #[test]
+        fn build_disk_failure_is_one_line() {
+            let error = io::Error::other("diskutil failed:\n  Error: busy\n");
+            assert_eq!(
+                build_disk_failure("released", &error),
+                "motor: the build disk could not be released: diskutil failed: Error: busy\n"
+            );
         }
     }
 }

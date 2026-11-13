@@ -81,14 +81,15 @@ mod native {
         }
     }
 
-    /// Every disk, the build disk included, uses the framework's default
-    /// attachment: automatic caching and full synchronization, the setup the
-    /// boot disk has always used. Full synchronization means the guest's flushes
-    /// reach the host file, so the build disk is complete on the host once the
-    /// VM has stopped and before the runner publishes it.
+    /// Every disk uses the framework's default attachment: automatic caching
+    /// and full synchronization, the setup the boot disk has always used. Full
+    /// synchronization means the guest's flushes reach the host file, so the
+    /// build disk is complete on the host once the VM has stopped and before
+    /// the runner publishes it. `bus` chooses the device the guest sees.
     unsafe fn disk(
         path: &Path,
         read_only: bool,
+        bus: DiskBus,
     ) -> io::Result<Retained<VZStorageDeviceConfiguration>> {
         unsafe {
             let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
@@ -97,11 +98,18 @@ mod native {
                 read_only,
             )
             .map_err(error)?;
-            Ok(VZVirtioBlockDeviceConfiguration::initWithAttachment(
-                VZVirtioBlockDeviceConfiguration::alloc(),
-                &attachment,
-            )
-            .into_super())
+            Ok(match bus {
+                DiskBus::Virtio => VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                    VZVirtioBlockDeviceConfiguration::alloc(),
+                    &attachment,
+                )
+                .into_super(),
+                DiskBus::Usb => VZUSBMassStorageDeviceConfiguration::initWithAttachment(
+                    VZUSBMassStorageDeviceConfiguration::alloc(),
+                    &attachment,
+                )
+                .into_super(),
+            })
         }
     }
 
@@ -124,7 +132,7 @@ mod native {
             let disks: Vec<_> = plan
                 .disks()
                 .iter()
-                .map(|d| disk(&d.path, d.read_only))
+                .map(|d| disk(&d.path, d.read_only, d.bus))
                 .collect::<io::Result<_>>()?;
             config.setStorageDevices(&NSArray::from_retained_slice(&disks));
             let socket: Retained<VZSocketDeviceConfiguration> =
@@ -266,23 +274,26 @@ mod native {
     }
 
     pub fn run() -> io::Result<()> {
-        let mut args = std::env::args().skip(1);
-        let command = args.next().ok_or_else(|| {
-            error("usage: motor-macvm job <request-json> | image-build <image-directory>")
-        })?;
-        let argument = args
-            .next()
-            .ok_or_else(|| error("missing subcommand argument"))?;
-        let restore = args.next();
-        if args.next().is_some() || (command == "job" && restore.is_some()) {
-            return Err(error("unexpected subcommand argument"));
-        }
-        match command.as_str() {
-            "job" => run_job(JobVmConfig::new(serde_json::from_str(&argument)?)?),
-            "image-build" => unsafe {
-                image_build(Path::new(&argument), restore.as_deref().map(Path::new))
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match args[..] {
+            ["job", request] => run_job(JobVmConfig::new(serde_json::from_str(request)?)?),
+            // The job helper with the build disk on another bus, which only
+            // the build disk probe starts.
+            ["probe-job", bus, request] => run_job(
+                JobVmConfig::new(serde_json::from_str(request)?)?
+                    .with_build_disk_bus(DiskBus::parse(bus)?),
+            ),
+            ["image-build", image] => unsafe { image_build(Path::new(image), None) },
+            ["image-build", image, restore] => unsafe {
+                image_build(Path::new(image), Some(Path::new(restore)))
             },
-            _ => Err(error("unknown subcommand; expected job or image-build")),
+            ["build-disk-probe", image, work] => {
+                motor_macvm::probe::run(Path::new(image), Path::new(work))
+            }
+            _ => Err(error(
+                "usage: motor-macvm job <request-json> | image-build <image-directory> [<restore.ipsw>] | build-disk-probe <sealed-image> <new-work-directory>",
+            )),
         }
     }
 
@@ -490,6 +501,7 @@ mod native {
             config.setStorageDevices(&NSArray::from_retained_slice(&[disk(
                 &image.join(BOOT_DISK),
                 false,
+                DiskBus::Virtio,
             )?]));
             let network = VZVirtioNetworkDeviceConfiguration::new();
             network.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
@@ -617,17 +629,39 @@ mod native {
                 assert_eq!(config.graphicsDevices().len(), 0);
                 assert_eq!(config.directorySharingDevices().len(), 3);
                 for (index, expected) in plan.disks().iter().enumerate() {
-                    let block = config
-                        .storageDevices()
-                        .objectAtIndex(index)
-                        .downcast::<VZVirtioBlockDeviceConfiguration>()
-                        .unwrap();
-                    let attachment = block
-                        .attachment()
-                        .downcast::<VZDiskImageStorageDeviceAttachment>()
-                        .unwrap();
+                    let device = config.storageDevices().objectAtIndex(index);
+                    let attachment = match expected.bus {
+                        DiskBus::Virtio => device
+                            .downcast::<VZVirtioBlockDeviceConfiguration>()
+                            .unwrap()
+                            .attachment(),
+                        DiskBus::Usb => device
+                            .downcast::<VZUSBMassStorageDeviceConfiguration>()
+                            .unwrap()
+                            .attachment(),
+                    }
+                    .downcast::<VZDiskImageStorageDeviceAttachment>()
+                    .unwrap();
                     assert_eq!(attachment.isReadOnly(), expected.read_only);
                 }
+                // The build disk, and only it, is a USB mass storage device.
+                assert!(
+                    config
+                        .storageDevices()
+                        .objectAtIndex(2)
+                        .downcast::<VZUSBMassStorageDeviceConfiguration>()
+                        .is_ok()
+                );
+                let virtio = VZVirtualMachineConfiguration::new();
+                apply_job_devices(&virtio, &plan.clone().with_build_disk_bus(DiskBus::Virtio))
+                    .unwrap();
+                assert!(
+                    virtio
+                        .storageDevices()
+                        .objectAtIndex(2)
+                        .downcast::<VZVirtioBlockDeviceConfiguration>()
+                        .is_ok()
+                );
                 for (index, expected) in plan.shares().iter().enumerate() {
                     let device = config
                         .directorySharingDevices()
