@@ -1,5 +1,6 @@
 //! Cold boots use ordinary guest RAM, not the legacy userfaultfd snapshot pool.
 use super::{cache, cgroup, fs, process, tenant};
+use crate::lock_order::{Lock, Mutex};
 use crate::{
     config::{Config, JobVms},
     job::{self, ExitReport, Operation, Start, Workspace},
@@ -20,6 +21,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -35,6 +37,8 @@ const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vd
 
 mod conntrack;
 mod memory;
+mod registry;
+use registry::{Entry, JobCell, JobState, State};
 mod namespace;
 pub(super) mod network;
 #[cfg(feature = "linux-root-tests")]
@@ -119,6 +123,10 @@ impl Record {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExitStep {
+    Launch,
+    Stop,
+    Adopt,
+    Ack,
     Captured,
     Recorded,
     Removed,
@@ -143,29 +151,36 @@ pub struct LinuxJobs {
     jail: PathBuf,
     cache_store: PathBuf,
     workspaces: PathBuf,
-    records: BTreeMap<String, Record>,
-    children: BTreeMap<String, Child>,
-    collection_failures: BTreeMap<String, BTreeSet<CollectionFailure>>,
-    #[cfg(test)]
-    collection_logs: Vec<String>,
-    #[cfg(test)]
-    tap_release_check: Option<Box<dyn FnMut() + Send>>,
-    next_prune: Option<SystemTime>,
+    // Admission excludes conflicting reservations and workspace/image changes.
+    // Starts keep it through launch; collection and read-only polls never use it.
+    admission: Mutex<()>,
+    // The registry contains only published copies and cell handles. Never do
+    // I/O or acquire another lock while its memory-only guard is held.
+    registry: Mutex<BTreeMap<String, Entry>>,
+    next_prune: std::sync::Mutex<Option<SystemTime>>,
     network: Box<dyn network::Access>,
     #[cfg(test)]
-    exit_fault: Option<ExitStep>,
-    #[cfg(test)]
-    exit_pause: Option<(ExitStep, Box<dyn FnMut() + Send>)>,
+    hooks: std::sync::Mutex<TestHooks>,
     #[cfg(test)]
     remove_test_group: Option<fn(&Path) -> std::io::Result<()>>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    collection_logs: Vec<String>,
+    tap_release_check: Option<Box<dyn FnMut() + Send>>,
+    exit_fault: Option<ExitStep>,
+    exit_pause: Option<(ExitStep, Box<dyn FnMut() + Send>)>,
+}
+
 impl LinuxJobs {
-    pub fn images(&mut self, op: crate::images::Operation) -> Result<Response> {
+    pub fn images(&self, op: crate::images::Operation) -> Result<Response> {
         op.validate()?;
+        let _admission = self.admission.lock();
         if let crate::images::Operation::Remove(id) = &op {
             if self
-                .records
+                .records()
                 .values()
                 .any(|r| !r.released && &r.start.image_generation_id == id)
             {
@@ -175,6 +190,7 @@ impl LinuxJobs {
         super::images::handle(op)
     }
     pub fn create_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
+        let _admission = self.admission.lock();
         self.check_workspace_size(request.size_bytes)?;
         let grant = self.disk_grant(request.cache_write_job_id.as_deref());
         workspace::create_bound(
@@ -187,6 +203,7 @@ impl LinuxJobs {
     /// The host's EnsureWorkspace: create the disk bound to the job's write
     /// grant, or keep an existing disk and the binding it was created with.
     pub(super) fn ensure_workspace(&self, request: job::CreateWorkspace) -> Result<()> {
+        let _admission = self.admission.lock();
         self.check_workspace_size(request.size_bytes)?;
         self.disk_available_identity(&request.workspace_disk_id)?;
         let grant = self.disk_grant(request.cache_write_job_id.as_deref());
@@ -209,7 +226,7 @@ impl LinuxJobs {
         Ok(())
     }
     /// A seed/clone holds this shared lease until it has synced its new disk.
-    /// Base eviction takes the exclusive lease under the same helper mutex.
+    /// Base eviction takes the exclusive lease under job admission.
     pub fn lease_base(&self, account: &str, disk_id: &str) -> Result<File> {
         workspace::base_lease(&self.workspaces, account, disk_id, false)
     }
@@ -222,19 +239,12 @@ impl LinuxJobs {
             jail: Path::new(super::BUILD_ROOT).join("jail/jobs"),
             cache_store: cache::STORE.into(),
             workspaces: job::WORKSPACES.into(),
-            records: BTreeMap::new(),
-            children: BTreeMap::new(),
-            collection_failures: BTreeMap::new(),
-            #[cfg(test)]
-            collection_logs: Vec::new(),
-            #[cfg(test)]
-            tap_release_check: None,
-            next_prune: None,
+            admission: Mutex::new(Lock::A, ()),
+            registry: Mutex::new(Lock::R, BTreeMap::new()),
+            next_prune: std::sync::Mutex::new(None),
             network: Box::new(network::System(config.clone())),
             #[cfg(test)]
-            exit_fault: None,
-            #[cfg(test)]
-            exit_pause: None,
+            hooks: std::sync::Mutex::new(TestHooks::default()),
             #[cfg(test)]
             remove_test_group: None,
         }
@@ -249,7 +259,8 @@ impl LinuxJobs {
     fn root(&self, id: &str) -> PathBuf {
         self.boundary(id).join(format!("firecracker/job-{id}/root"))
     }
-    fn save(&self, record: &Record) -> Result<()> {
+    fn write_record(&self, record: &Record) -> Result<()> {
+        crate::lock_order::assert_held(Lock::J);
         tenant::durable_write(
             &self
                 .records_path
@@ -258,10 +269,10 @@ impl LinuxJobs {
         )
     }
 
-    pub fn reconcile(&mut self) -> Result<()> {
+    pub fn reconcile(&self) -> Result<()> {
         self.reconcile_records(network::read_records(&self.records_path)?)?;
         let abandoned: Vec<_> = self
-            .records
+            .records()
             .values()
             .filter(|r| r.start.kind == job::VmKind::Fill)
             .filter_map(|r| match self.pid(r) {
@@ -291,7 +302,7 @@ impl LinuxJobs {
                 }
                 // A live fill survives a helper restart just like a job.
                 if self
-                    .records
+                    .records()
                     .values()
                     .any(|r| !r.released && r.start.workspace_disk_id == id)
                 {
@@ -319,7 +330,7 @@ impl LinuxJobs {
         workspace::finish_deletions(&self.workspaces)
     }
 
-    fn reconcile_records(&mut self, records: Vec<Record>) -> Result<()> {
+    fn reconcile_records(&self, records: Vec<Record>) -> Result<()> {
         let tenants = self.network.tenants()?;
         if let Some(settings) = &self.settings {
             network::check_capacity(settings.uid_count, tenants.len())?;
@@ -335,11 +346,11 @@ impl LinuxJobs {
             self.adopt_record(record)?;
         }
         let mut taps = tenants;
-        taps.extend(self.records.values().filter_map(Record::tap));
+        taps.extend(self.records().values().filter_map(Record::tap));
         super::tenant_network::validate_taps(&taps)?;
         self.maintain()?;
         let retained = self
-            .records
+            .records()
             .values()
             .filter(|r| !r.is_tombstone())
             .map(|r| r.start.job_id.clone())
@@ -347,7 +358,7 @@ impl LinuxJobs {
         self.network.reconcile_namespaces(&retained)
     }
 
-    fn adopt_record(&mut self, record: Record) -> Result<()> {
+    fn adopt_record(&self, record: Record) -> Result<()> {
         // A trusted, fresh cgroup identifies the process even if the helper
         // died between spawning jailer and recording its pid. Never signal a
         // stale saved pid or move an unrelated process into this group.
@@ -363,7 +374,18 @@ impl LinuxJobs {
         {
             return Err(Error("job record TAP outside range 1..254".into()));
         }
-        self.records.insert(record.start.job_id.clone(), record);
+        let state = if record.released {
+            State::Released
+        } else if record.oom_kill.is_some() {
+            State::Exited
+        } else {
+            State::Running
+        };
+        let cleanup_pending = state == State::Exited
+            && (record.tap_index.is_some() || self.group(&record.start.job_id).try_exists()?);
+        let cell = Arc::new(JobCell::new(JobState::new(record, state, cleanup_pending)));
+        let guard = cell.0.lock();
+        self.insert_cell(cell.clone(), &guard);
         Ok(())
     }
 
@@ -399,50 +421,56 @@ impl LinuxJobs {
         Ok(Some(pid))
     }
 
-    fn reap(&mut self) {
-        let mut ended = Vec::new();
-        let mut failed = Vec::new();
-        for (id, child) in &mut self.children {
-            match child.try_wait() {
-                Ok(Some(status)) => ended.push((id.clone(), status.success(), status)),
-                Ok(None) => (),
-                Err(error) => failed.push((id.clone(), error)),
-            }
-        }
-        for (id, success, status) in ended {
-            eprintln!("job {id} VMM exited: {status}");
-            log_console_tail(&id, &self.boundary(&id));
-            let mut record = self.records[&id].clone();
-            if record.start.kind == job::VmKind::Fill {
-                record.fill_exit_success = Some(success);
-                if let Err(error) = self.save(&record) {
-                    self.log_collection_failure(&id, CollectionFailure::Evidence, &error);
-                    continue;
+    fn reap_job(&self, state: &mut JobState) {
+        let Some(child) = state.child.as_mut() else {
+            return;
+        };
+        let id = state.record.start.job_id.clone();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!("job {id} VMM exited: {status}");
+                log_console_tail(&id, &self.boundary(&id));
+                if state.record.start.kind == job::VmKind::Fill {
+                    let mut record = state.record.clone();
+                    record.fill_exit_success = Some(status.success());
+                    if let Err(error) = self.persist(state, record) {
+                        self.log_collection_failure(state, CollectionFailure::Evidence, &error);
+                        return;
+                    }
                 }
-                self.records.insert(id.clone(), record);
+                state.child = None;
             }
-            self.children.remove(&id);
+            Ok(None) => (),
+            Err(error) => {
+                self.log_collection_failure(state, CollectionFailure::Reap, &error);
+            }
         }
-        for (id, error) in failed {
-            self.log_collection_failure(&id, CollectionFailure::Reap, &error);
+    }
+
+    #[cfg(test)]
+    fn reap(&self) {
+        for (_, cell, _) in self.snapshot() {
+            if let Some(mut state) = cell.0.try_lock() {
+                self.reap_job(&mut state);
+            }
         }
     }
 
     fn log_collection_failure(
-        &mut self,
-        id: &str,
+        &self,
+        state: &mut JobState,
         kind: CollectionFailure,
         error: &dyn std::fmt::Display,
     ) -> bool {
-        if self
-            .collection_failures
-            .entry(id.into())
-            .or_default()
-            .insert(kind)
-        {
+        if state.failures.insert(kind) {
+            let id = &state.record.start.job_id;
             let line = format!("job {id} exit evidence {kind:?}: {error}");
             #[cfg(test)]
-            self.collection_logs.push(line.clone());
+            self.hooks
+                .lock()
+                .unwrap()
+                .collection_logs
+                .push(line.clone());
             eprintln!("{line}");
             true
         } else {
@@ -450,33 +478,41 @@ impl LinuxJobs {
         }
     }
 
-    pub fn collect_exits(&mut self) -> Result<()> {
-        self.reap();
-        let ids: Vec<_> = self
-            .records
-            .values()
-            .filter(|record| !record.is_tombstone())
-            .map(|record| record.start.job_id.clone())
-            .collect();
-        for id in ids {
+    pub fn collect_exits(&self) -> Result<()> {
+        for (_, cell, view) in self.snapshot() {
+            if view.state == State::Booting
+                || (view.state == State::Released
+                    && !view.cleanup_pending
+                    && view.record.is_tombstone())
+            {
+                continue;
+            }
+            let Some(mut state) = cell.0.try_lock() else {
+                continue;
+            };
+            if state.state == State::Booting {
+                continue;
+            }
             // A failed record stays reserved and retries independently. It must
             // never disable another VM's stop, relay, start or exit delivery.
-            let _ = self.collect_exit(&id);
+            self.reap_job(&mut state);
+            let _ = self.collect_exit_locked(&mut state);
         }
         Ok(())
     }
 
-    pub fn maintain(&mut self) -> Result<()> {
+    pub fn maintain(&self) -> Result<()> {
         self.maintain_at(SystemTime::now())
     }
 
-    fn maintain_at(&mut self, now: SystemTime) -> Result<()> {
+    fn maintain_at(&self, now: SystemTime) -> Result<()> {
         let collection = self.collect_exits();
         // Maintenance runs every 100 ms. Retention needs only a minute's
         // cadence, not a metadata lookup per tombstone on every tick.
-        let pruning = if self.next_prune.is_none_or(|deadline| now >= deadline) {
+        let mut next_prune = self.next_prune.lock().unwrap();
+        let pruning = if next_prune.is_none_or(|deadline| now >= deadline) {
             self.prune_records(now).map(|()| {
-                self.next_prune = now.checked_add(TOMBSTONE_PRUNE_INTERVAL);
+                *next_prune = now.checked_add(TOMBSTONE_PRUNE_INTERVAL);
             })
         } else {
             Ok(())
@@ -484,14 +520,17 @@ impl LinuxJobs {
         collection.and(pruning)
     }
 
-    fn prune_records(&mut self, now: SystemTime) -> Result<()> {
-        let ids: Vec<_> = self
-            .records
-            .values()
-            .filter(|record| record.is_tombstone())
-            .map(|record| record.start.job_id.clone())
-            .collect();
-        for id in ids {
+    fn prune_records(&self, now: SystemTime) -> Result<()> {
+        for (id, cell, view) in self.snapshot() {
+            if !view.record.is_tombstone() {
+                continue;
+            }
+            let Some(state) = cell.0.try_lock() else {
+                continue;
+            };
+            if !state.record.is_tombstone() {
+                continue;
+            }
             let path = self.records_path.join(format!("{id}.json"));
             // Atomic rewrites refresh mtime, so the full replay window begins
             // only after both release and acknowledgement have been recorded.
@@ -502,30 +541,43 @@ impl LinuxJobs {
             {
                 std::fs::remove_file(&path)?;
                 File::open(&self.records_path)?.sync_all()?;
-                self.records.remove(&id);
-                self.collection_failures.remove(&id);
+                self.registry.lock().remove(&id);
             }
         }
         Ok(())
     }
 
-    fn collect_exit(&mut self, id: &str) -> Result<()> {
+    #[cfg(test)]
+    fn collect_exit(&self, id: &str) -> Result<()> {
+        let cell = self.cell(id)?;
+        let mut state = cell.0.lock();
+        self.collect_exit_locked(&mut state)
+    }
+
+    fn collect_exit_locked(&self, state: &mut JobState) -> Result<()> {
         let mut kind = CollectionFailure::Cgroup;
-        let result = self.collect_exit_inner(id, &mut kind);
+        let result = self.collect_exit_inner(state, &mut kind);
         if let Err(error) = &result {
-            self.log_collection_failure(id, kind, error);
+            self.log_collection_failure(state, kind, error);
         }
         result
     }
 
-    fn collect_exit_inner(&mut self, id: &str, kind: &mut CollectionFailure) -> Result<()> {
-        let group = self.group(id);
+    fn collect_exit_inner(&self, state: &mut JobState, kind: &mut CollectionFailure) -> Result<()> {
+        let id = state.record.start.job_id.clone();
+        let group = self.group(&id);
         if !group.try_exists()? {
             // A reboot can erase cgroups. No count is better than an invented 0.
             *kind = CollectionFailure::Credentials;
-            self.remove_credentials(id)?;
+            self.remove_credentials(&id)?;
             *kind = CollectionFailure::Network;
-            return self.remove_network(id);
+            self.remove_network(state)?;
+            if !state.record.released {
+                state.state = State::Exited;
+            }
+            state.cleanup_pending = false;
+            self.publish(state);
+            return Ok(());
         }
         if !std::fs::read_to_string(group.join("cgroup.procs"))?
             .trim()
@@ -534,8 +586,8 @@ impl LinuxJobs {
             return Ok(());
         }
         *kind = CollectionFailure::Credentials;
-        self.remove_credentials(id)?;
-        let mut record = self.records.get(id).unwrap().clone();
+        self.remove_credentials(&id)?;
+        let mut record = state.record.clone();
         if record.oom_kill.is_none() {
             *kind = CollectionFailure::Evidence;
             record.oom_kill = Some(read_oom_kill(&group)?);
@@ -549,47 +601,56 @@ impl LinuxJobs {
                 .flatten();
             if record.tap_index.is_some() && record.egress_bytes.is_none() {
                 self.log_collection_failure(
-                    id,
+                    state,
                     CollectionFailure::MissingEgress,
                     &"counter missing; egress unmeasured",
                 );
             }
             self.exit_checkpoint(ExitStep::Captured)?;
-            self.save(&record).map_err(|e| {
+            self.write_record(&record).map_err(|e| {
                 Error(format!(
                     "persist final job exit {}: {e}",
                     self.records_path.join(format!("{id}.json")).display()
                 ))
             })?;
-            self.records.insert(id.into(), record);
+            state.record = record;
+            state.state = if state.record.released {
+                State::Released
+            } else {
+                State::Exited
+            };
+            state.cleanup_pending = true;
+            self.publish(state);
             self.exit_checkpoint(ExitStep::Recorded)?;
         }
         *kind = CollectionFailure::Network;
-        self.remove_network(id)?;
+        self.remove_network(state)?;
         *kind = CollectionFailure::Cgroup;
         self.remove_empty_group(&group)?;
+        state.cleanup_pending = false;
+        self.publish(state);
         self.exit_checkpoint(ExitStep::Removed)
     }
 
-    fn remove_network(&mut self, id: &str) -> Result<()> {
-        let mut record = self.records.get(id).unwrap().clone();
+    fn remove_network(&self, state: &mut JobState) -> Result<()> {
+        let mut record = state.record.clone();
+        let id = record.start.job_id.clone();
         if let Some(tap) = record.tap() {
             // Keep one non-reentrant network lock through the durable release:
             // a network policy render must not restore this TAP before the write.
             let lock = self.network.lock()?;
-            self.network.remove(id, &tap, &lock)?;
-            self.network.remove_namespace(id)?;
+            self.network.remove(&id, &tap, &lock)?;
+            self.network.remove_namespace(&id)?;
             // A crash before this write retries idempotent removal, never the
             // measurement. Until it succeeds the allocation cannot be reused.
             record.tap_index = None;
-            self.save(&record)?;
+            self.persist(state, record)?;
             #[cfg(test)]
-            if let Some(check) = self.tap_release_check.as_mut() {
+            if let Some(check) = self.hooks.lock().unwrap().tap_release_check.as_mut() {
                 check();
             }
-            self.records.insert(id.into(), record);
         } else {
-            self.network.remove_namespace(id)?;
+            self.network.remove_namespace(&id)?;
         }
         Ok(())
     }
@@ -627,56 +688,85 @@ impl LinuxJobs {
     }
 
     #[cfg(test)]
-    pub(super) fn pause_exit_at(&mut self, step: ExitStep, pause: impl FnMut() + Send + 'static) {
-        self.exit_pause = Some((step, Box::new(pause)));
+    pub(super) fn pause_exit_at(&self, step: ExitStep, pause: impl FnMut() + Send + 'static) {
+        self.hooks.lock().unwrap().exit_pause = Some((step, Box::new(pause)));
     }
 
-    pub(super) fn exit_checkpoint(&mut self, step: ExitStep) -> Result<()> {
+    pub(super) fn exit_checkpoint(&self, step: ExitStep) -> Result<()> {
         // A one-shot pause holds the same phase open as the fault hook, without
         // replacing any process, permission, or durable-record checks.
         #[cfg(test)]
-        if self.exit_pause.as_ref().is_some_and(|(at, _)| *at == step) {
-            let (_, mut pause) = self.exit_pause.take().unwrap();
-            pause();
-        }
-        #[cfg(test)]
-        if self.exit_fault == Some(step) {
-            self.exit_fault = None;
-            return Err(Error(format!("injected exit fault at {step:?}")));
+        {
+            let pause = {
+                let mut hooks = self.hooks.lock().unwrap();
+                if hooks.exit_pause.as_ref().is_some_and(|(at, _)| *at == step) {
+                    hooks.exit_pause.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, mut pause)) = pause {
+                pause();
+            }
+            let mut hooks = self.hooks.lock().unwrap();
+            if hooks.exit_fault == Some(step) {
+                hooks.exit_fault = None;
+                return Err(Error(format!("injected exit fault at {step:?}")));
+            }
         }
         let _ = step;
         Ok(())
     }
 
-    fn acknowledge_exit(&mut self, report: ExitReport) -> Result<Response> {
-        let mut record = self
-            .records
-            .get(&report.job_id)
-            .cloned()
+    fn acknowledge_exit(&self, report: ExitReport) -> Result<Response> {
+        let view = self
+            .view(&report.job_id)
             .ok_or_else(|| Error("unknown job VM".into()))?;
+        Self::check_ack(&view.record, &report)?;
+        if view.record.exit_acknowledged {
+            return Ok(Response::new(Reply::Ok));
+        }
+        self.exit_checkpoint(ExitStep::Ack)?;
+        let cell = self.cell(&report.job_id)?;
+        let mut state = cell.0.lock();
+        Self::check_ack(&state.record, &report)?;
+        if !state.record.exit_acknowledged {
+            let mut record = state.record.clone();
+            record.exit_acknowledged = true;
+            self.persist(&mut state, record)?;
+        }
+        Ok(Response::new(Reply::Ok))
+    }
+
+    fn check_ack(record: &Record, report: &ExitReport) -> Result<()> {
         if record.oom_kill != Some(report.oom_kill) || record.egress_bytes != report.egress_bytes {
             return Err(Error(
                 "job exit report does not match durable evidence".into(),
             ));
         }
-        if !record.exit_acknowledged {
-            record.exit_acknowledged = true;
-            self.save(&record)?;
-            self.records.insert(report.job_id, record);
-        }
-        Ok(Response::new(Reply::Ok))
+        Ok(())
     }
 
-    pub fn handle(&mut self, op: Operation, peer: Peer) -> Result<Response> {
+    pub fn handle(&self, op: Operation, peer: Peer) -> Result<Response> {
         op.validate()?;
         // Invalid acknowledgements must not change any evidence or cgroups.
         if let Operation::AckExit(report) = op {
             return self.acknowledge_exit(report);
         }
-        // Stop must not even wait for collection of an unrelated record.
-        if !matches!(op, Operation::Stop(_)) {
-            self.collect_exits()?;
-        }
+        // Only reservation and workspace operations take admission. Polls use
+        // published views; stop and ack serialize only with their own writer.
+        let _admission = if matches!(
+            op,
+            Operation::PrepareFill(_)
+                | Operation::SeedWorkspace(_)
+                | Operation::WorkspaceUsage { .. }
+                | Operation::EvictBase { .. }
+                | Operation::DeleteWorkspace { .. }
+        ) {
+            Some(self.admission.lock())
+        } else {
+            None
+        };
         match op {
             Operation::PrepareFill(fill) => {
                 self.check_workspace_size(fill.size_bytes)?;
@@ -700,7 +790,7 @@ impl LinuxJobs {
                     let (_, disk) = workspace::open_disk(&self.workspaces, &account, &disk_id)?;
                     let meta = disk.metadata()?;
                     if let Some(record) = self
-                        .records
+                        .records()
                         .values()
                         .find(|r| !r.released && r.start.workspace_disk_id == disk_id)
                     {
@@ -761,10 +851,10 @@ impl LinuxJobs {
                 self.status(&id)
             }
             Operation::Relay(id, port) => {
-                let record = self
-                    .records
-                    .get(&id)
-                    .ok_or_else(|| Error("unknown job VM".into()))?;
+                let cell = self.cell(&id)?;
+                self.running_view(&id)?;
+                let state = cell.0.lock();
+                let record = &state.record;
                 if self.pid(record)?.is_none() {
                     return Err(Error("job VM is not running".into()));
                 }
@@ -779,7 +869,7 @@ impl LinuxJobs {
             }
             Operation::Exits => {
                 let exits = self
-                    .records
+                    .records()
                     .values()
                     .filter_map(Record::pending_exit)
                     .collect();
@@ -792,7 +882,7 @@ impl LinuxJobs {
 
     fn disk_available_identity(&self, disk_id: &str) -> Result<()> {
         if self
-            .records
+            .records()
             .values()
             .any(|r| !r.released && r.start.workspace_disk_id == disk_id)
         {
@@ -801,7 +891,8 @@ impl LinuxJobs {
         Ok(())
     }
 
-    fn finish_fill(&mut self, fill: &job::Fill, mut published: bool) -> Result<bool> {
+    fn finish_fill(&self, fill: &job::Fill, mut published: bool) -> Result<bool> {
+        let _admission = self.admission.lock();
         let id = fill.disk_id();
         if self.workspaces.join(&id).try_exists()? {
             let (registry, _) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
@@ -818,24 +909,28 @@ impl LinuxJobs {
         } else {
             published = false;
         }
-        let record = self.records.get(&fill.fill_id).cloned();
-        if published {
-            published = if let Some(record) = record.as_ref() {
-                self.pid(record)?.is_none()
-                    && record.oom_kill == Some(0)
-                    && record.fill_exit_success == Some(true)
-            } else {
-                false
-            };
-        }
-        if let Some(record) = record {
+        if let Ok(cell) = self.cell(&fill.fill_id) {
+            let mut state = cell.0.lock();
+            let record = &state.record;
             if record.start.kind != job::VmKind::Fill
                 || record.start.account != fill.account
                 || record.start.workspace_disk_id != id
             {
                 return Err(Error("fill execution identity mismatch".into()));
             }
-            self.stop(&fill.fill_id)?;
+            // Finishing must observe this fill's final child status and evidence
+            // even when maintenance has not run since the guest exited.
+            self.reap_job(&mut state);
+            self.collect_exit_locked(&mut state)?;
+            let record = &state.record;
+            if published {
+                published = self.pid(record)?.is_none()
+                    && record.oom_kill == Some(0)
+                    && record.fill_exit_success == Some(true);
+            }
+            self.stop_locked(&mut state)?;
+        } else {
+            published = false;
         }
         self.disk_available_identity(&id)?;
         if published {
@@ -852,7 +947,7 @@ impl LinuxJobs {
     }
 
     fn status(&self, id: &str) -> Result<Response> {
-        let Some(record) = self.records.get(id) else {
+        let Some(mut view) = self.view(id) else {
             self.prove_absent(id)?;
             return Ok(Response::new(Reply::Job {
                 known: false,
@@ -862,6 +957,13 @@ impl LinuxJobs {
                 exit_report: None,
             }));
         };
+        self.exit_checkpoint(ExitStep::Adopt)?;
+        if view.state == State::Booting {
+            let cell = self.cell(id)?;
+            let _state = cell.0.lock();
+            view = self.view(id).unwrap();
+        }
+        let record = &view.record;
         let pid = self.pid(record)?;
         Ok(Response::new(Reply::Job {
             known: true,
@@ -893,7 +995,7 @@ impl LinuxJobs {
     }
 
     fn disk_available(&self, start: &Start, device: u64, inode: u64) -> Result<()> {
-        if self.records.values().any(|r| {
+        if self.records().values().any(|r| {
             !r.released
                 && ((r.start.account == start.account
                     && r.start.workspace_disk_id == start.workspace_disk_id)
@@ -910,7 +1012,7 @@ impl LinuxJobs {
         // Uids are separate from tenant VMMs, legacy slots, and host accounts.
         // Never reuse one while its previous jail still owns disk resources.
         for uid in settings.uid_base..settings.uid_base + settings.uid_count {
-            if self.records.values().any(|r| !r.released && r.uid == uid) {
+            if self.records().values().any(|r| !r.released && r.uid == uid) {
                 continue;
             }
             process::refuse_passwd_entries(uid, 1)?;
@@ -932,13 +1034,14 @@ impl LinuxJobs {
         Err(Error("job VMM uid capacity exhausted".into()))
     }
 
-    fn start(&mut self, start: Start, peer: Peer) -> Result<Response> {
+    fn start(&self, start: Start, peer: Peer) -> Result<Response> {
+        let _admission = self.admission.lock();
         start.validate_fresh_at(SystemTime::now())?;
         let settings = self
             .settings
             .clone()
             .ok_or_else(|| Error("job VM settings are required".into()))?;
-        if self.records.contains_key(&start.job_id) {
+        if self.view(&start.job_id).is_some() {
             return Err(Error("job id already booted; use adopt_job".into()));
         }
         // Keep a start for an already attached identity out of all filesystem
@@ -986,7 +1089,7 @@ impl LinuxJobs {
             fixed_path_policy(&settings, &registry, start.kind),
         )?;
         self.disk_available(&start, meta.dev(), meta.ino())?;
-        // The helper is a singleton; its serialized requests and durable intent
+        // The helper is a singleton; serialized admission and durable intent
         // records exclude concurrent use by both workspace id and device/inode.
         // A local flock would expire when start returns, not when the VM exits.
         let image = Path::new(job::IMAGES).join(&start.image_generation_id);
@@ -1038,7 +1141,7 @@ impl LinuxJobs {
         let tap_index = if start.kind == job::VmKind::Recovery {
             None
         } else {
-            Some(network::allocate(&tenants, &self.records)?)
+            Some(network::allocate(&tenants, &self.records())?)
         };
         let host_score = host_oom_score(peer.uid)?;
         let helper_score = read_oom_score(std::process::id())?;
@@ -1048,22 +1151,19 @@ impl LinuxJobs {
             trusted_directory(path)?;
         }
         let record = Record::new(start.clone(), uid, meta.dev(), meta.ino(), tap_index);
-        // The intent is durable before any jail or VMM can open the disk. A
-        // crash in setup keeps it reserved until explicit stop has cleaned up.
-        self.save(&record)?;
-        self.records.insert(start.job_id.clone(), record);
-        // Durable intent already prevents another VM, including after restart.
-        // Failures before intent leave the admission grant reusable by a retry.
-        let job_write = take_job_write_grant(&self.cache_write_grants, &start, &registry);
-        let id = &start.job_id;
-        let boundary = self.boundary(id);
-        let root = self.root(id);
-        let group = self.group(id);
-        let launch = (|| -> Result<()> {
+        self.launch_record(record, |state| {
+            // Consume the cache-write grant only after the disk reservation is
+            // durable. Earlier failures leave that grant available for a retry.
+            let job_write = take_job_write_grant(&self.cache_write_grants, &start, &registry);
+            let id = &start.job_id;
+            let boundary = self.boundary(id);
+            let root = self.root(id);
+            let group = self.group(id);
             let netns = self.network.create_namespace(id)?;
             if let Some(tap_index) = tap_index {
                 self.prepare_network(id, tenants, Tap { tap_index, uid })?;
             }
+            self.exit_checkpoint(ExitStep::Launch)?;
             cgroup::create_job(&group, start.vcpus)?;
             super::create_boundary(&boundary)?;
             let boundary_fd = OpenOptions::new()
@@ -1120,7 +1220,9 @@ impl LinuxJobs {
             }
             let child = command.spawn()?;
             let pid = child.id();
-            self.children.insert(id.clone(), child);
+            let pidfd = memory::pin_pidfd(pid);
+            state.child = Some(child);
+            state.pidfd = Some(Arc::new(pidfd?));
             // A /proc/fd alias avoids Unix-domain socket path length limits.
             let root_fd = File::open(&root)?;
             let short_root = PathBuf::from(format!("/proc/self/fd/{}", root_fd.as_raw_fd()));
@@ -1133,17 +1235,10 @@ impl LinuxJobs {
                 tenant::api(&short_root, "PUT", path, &body)?;
             }
             Ok(())
-        })();
-        if let Err(error) = launch {
-            if let Err(cleanup) = self.stop(id) {
-                return Err(Error(format!("{error}; job cleanup failed: {cleanup}")));
-            }
-            return Err(error);
-        }
-        self.status(id)
+        })
     }
 
-    fn prepare_network(&mut self, id: &str, tenants: Vec<Tap>, tap: Tap) -> Result<()> {
+    fn prepare_network(&self, id: &str, tenants: Vec<Tap>, tap: Tap) -> Result<()> {
         // The installer reads durable job allocations after taking the network
         // lock; a snapshot of self.records taken before that lock could be stale.
         self.network.install(&tenants)?;
@@ -1160,25 +1255,33 @@ impl LinuxJobs {
         cache::stage(&self.cache_store, &start.account, start.kind, boundary, uid)
     }
 
-    fn stop(&mut self, id: &str) -> Result<()> {
-        let Some(record) = self.records.get(id).cloned() else {
+    fn stop(&self, id: &str) -> Result<()> {
+        let Ok(cell) = self.cell(id) else {
             return self.prove_absent(id);
         };
+        let mut state = cell.0.lock();
+        self.stop_locked(&mut state)
+    }
+
+    fn stop_locked(&self, state: &mut JobState) -> Result<()> {
+        let record = state.record.clone();
+        let id = &record.start.job_id;
+        self.exit_checkpoint(ExitStep::Stop)?;
         if record.released {
             return Ok(());
         }
         let group = self.group(id);
         if group.try_exists()? {
             std::fs::write(group.join("cgroup.kill"), "1")?;
-            if let Some(mut child) = self.children.remove(id) {
+            if let Some(mut child) = state.child.take() {
                 let status = child.wait()?;
                 eprintln!("job {id} VMM stopped by the helper: {status}");
                 log_console_tail(id, &self.boundary(id));
             }
             tenant::wait_empty(&group)?;
         }
-        self.collect_exit(id)?;
-        let mut record = self.records.get(id).unwrap().clone();
+        self.collect_exit_locked(state)?;
+        let mut record = state.record.clone();
         tenant::cleanup_boundary(&self.boundary(id))?;
         let disk_path = self
             .workspaces
@@ -1188,8 +1291,9 @@ impl LinuxJobs {
         disk.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         fs::chown(&disk, 0)?;
         record.released = true;
-        self.save(&record)?;
-        self.records.insert(id.into(), record);
+        self.persist(state, record)?;
+        state.state = State::Released;
+        self.publish(state);
         Ok(())
     }
 }

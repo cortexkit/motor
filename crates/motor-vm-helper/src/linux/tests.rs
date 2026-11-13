@@ -78,7 +78,7 @@ fn legacy_machine(base: &Path) -> LinuxMachine {
         },
         tenants,
         cache_write_grants: jobs.cache_write_grants.clone(),
-        jobs: Arc::new(Mutex::new(jobs)),
+        jobs: Arc::new(jobs),
     }
 }
 
@@ -467,7 +467,7 @@ fn cgroup_placement_service() {
         cgroups: groups,
         tenants,
         cache_write_grants: jobs.cache_write_grants.clone(),
-        jobs: Arc::new(Mutex::new(jobs)),
+        jobs: Arc::new(jobs),
     };
     let mut helper = crate::Helper::new(machine, 1, vec![1000]).unwrap();
     assert!(!child.wait().unwrap().success());

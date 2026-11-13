@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod exit_tests;
 mod network_tests;
+mod plane_tests;
 mod security_tests;
 
 #[test]
 fn absent_job_stop_and_adopt_are_idempotent_without_exit_evidence() {
     let base = scratch();
-    let mut jobs = machine(&base);
+    let jobs = machine(&base);
     let id = start().job_id;
     jobs.stop(&id).unwrap();
     let reply = serde_json::to_value(jobs.status(&id).unwrap().reply).unwrap();
@@ -18,14 +19,14 @@ fn absent_job_stop_and_adopt_are_idempotent_without_exit_evidence() {
     // Readers that ignore additive fields can still confirm that no VM
     // holds the workspace; no exit receipt is synthesized.
     assert_eq!(reply["result"], "job");
-    assert!(jobs.records.is_empty());
+    assert!(jobs.records().is_empty());
     std::fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
 fn absent_job_requires_empty_cgroup_and_no_unreconciled_jail() {
     let base = scratch();
-    let mut jobs = machine(&base);
+    let jobs = machine(&base);
     let id = start().job_id;
     let group = jobs.group(&id);
     std::fs::create_dir_all(&group).unwrap();
@@ -48,11 +49,11 @@ fn absent_job_requires_empty_cgroup_and_no_unreconciled_jail() {
 #[test]
 fn balloon_refuses_target_above_recorded_ram_before_opening_any_process_or_socket() {
     let base = scratch();
-    let mut jobs = machine(&base);
+    let jobs = machine(&base);
     let record = record();
     let id = record.start.job_id.clone();
     let amount = record.start.memory_mib + 1;
-    jobs.records.insert(id.clone(), record);
+    jobs.insert_record(record);
     assert!(jobs
         .balloon(&id, amount)
         .err()
@@ -276,22 +277,21 @@ fn legacy_job_records_have_no_clean_fill_exit_evidence() {
 fn fill_process_exit_success_is_durable_and_failure_never_becomes_success() {
     for (program, success) in [("/bin/true", true), ("/bin/false", false)] {
         let base = scratch();
-        let mut jobs = machine(&base);
+        let jobs = machine(&base);
         std::fs::create_dir_all(&jobs.records_path).unwrap();
         let mut record = record();
         record.start.kind = job::VmKind::Fill;
         let id = record.start.job_id.clone();
-        jobs.records.insert(id.clone(), record);
-        jobs.children
-            .insert(id.clone(), Command::new(program).spawn().unwrap());
+        jobs.insert_record(record);
+        jobs.cell(&id).unwrap().0.lock().child = Some(Command::new(program).spawn().unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !jobs.children.is_empty() {
+        while jobs.cell(&id).unwrap().0.lock().child.is_some() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "fixture child did not exit"
             );
             jobs.reap();
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(5));
         }
         let durable: Record = serde_json::from_slice(
             &std::fs::read(jobs.records_path.join(format!("{id}.json"))).unwrap(),
@@ -329,15 +329,11 @@ pub(super) fn machine_with_config(base: &Path, config: &Config) -> LinuxJobs {
         jail: base.join("jail"),
         cache_store: base.join("remote-cache"),
         workspaces: base.join("workspaces"),
-        records: BTreeMap::new(),
-        children: BTreeMap::new(),
-        collection_failures: BTreeMap::new(),
-        collection_logs: Vec::new(),
-        tap_release_check: None,
-        next_prune: None,
+        admission: Mutex::new(Lock::A, ()),
+        registry: Mutex::new(Lock::R, BTreeMap::new()),
+        next_prune: std::sync::Mutex::new(None),
         network: Box::<network_tests::Fake>::default(),
-        exit_fault: None,
-        exit_pause: None,
+        hooks: std::sync::Mutex::new(TestHooks::default()),
         remove_test_group: Some(|path| std::fs::remove_dir_all(path)),
     }
 }
@@ -849,7 +845,9 @@ fn attached_disk_is_refused_by_identity_and_inode_until_released() {
     alias.account = "other".into();
     assert!(jobs.disk_available(&alias, 8, 99).is_err());
     jobs.disk_available(&alias, 8, 100).unwrap();
-    jobs.records.get_mut(&start().job_id).unwrap().released = true;
+    let mut released = jobs.records()[&start().job_id].clone();
+    released.released = true;
+    jobs.insert_record(released);
     jobs.disk_available(&start(), 8, 99).unwrap();
     std::fs::remove_dir_all(base).unwrap();
 }
@@ -857,18 +855,18 @@ fn attached_disk_is_refused_by_identity_and_inode_until_released() {
 #[test]
 fn helper_restart_re_adopts_a_live_vmm_without_killing_it() {
     let mut vmm = Vmm::new();
-    let mut old = machine(&vmm.base);
+    let old = machine(&vmm.base);
     let group = old.group(&start().job_id);
     std::fs::create_dir_all(&group).unwrap();
     std::fs::write(group.join("cgroup.procs"), vmm.child.id().to_string()).unwrap();
     old.adopt_record(record()).unwrap();
-    let durable = serde_json::to_vec(old.records.get(&start().job_id).unwrap()).unwrap();
+    let durable = serde_json::to_vec(old.records().get(&start().job_id).unwrap()).unwrap();
     // Dropping the old helper's child handles must not signal their processes.
     let child = Command::new("/bin/sleep").arg("300").spawn().unwrap();
     let child_pid = child.id();
-    old.children.insert(start().job_id, child);
+    old.cell(&start().job_id).unwrap().0.lock().child = Some(child);
     drop(old);
-    let mut restarted = machine(&vmm.base);
+    let restarted = machine(&vmm.base);
     restarted
         .adopt_record(serde_json::from_slice(&durable).unwrap())
         .unwrap();
@@ -961,7 +959,7 @@ fn saved_start_record_reconciles_a_live_vmm_across_processes() {
 #[test]
 fn adoption_refuses_a_cgroup_with_the_wrong_uid() {
     let vmm = Vmm::new();
-    let mut jobs = machine(&vmm.base);
+    let jobs = machine(&vmm.base);
     let group = jobs.group(&start().job_id);
     std::fs::create_dir_all(&group).unwrap();
     std::fs::write(group.join("cgroup.procs"), vmm.child.id().to_string()).unwrap();
@@ -1183,8 +1181,8 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 !placement.contains("motor-vm-helper-job-test.service"),
                 "{placement}"
             );
-            jobs.children.insert(record.start.job_id.clone(), child);
             jobs.adopt_record(record).unwrap();
+            jobs.cell(&start().job_id).unwrap().0.lock().child = Some(child);
             assert_eq!(
                 std::fs::read_to_string(group.join("memory.max"))
                     .unwrap()
@@ -1201,7 +1199,9 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 .unwrap()
                 .contains("/motor-vm-helper-job-test.service/helper"));
             wait_for_file(&base.join("allow-helper-exit"));
-            let child = jobs.children.get_mut(&start().job_id).unwrap();
+            let cell = jobs.cell(&start().job_id).unwrap();
+            let mut state = cell.0.lock();
+            let child = state.child.as_mut().unwrap();
             let status = child.try_wait().unwrap();
             eprintln!("inner before exit: child try_wait={status:?}");
             assert!(
@@ -1404,7 +1404,7 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     assert_eq!(metadata.uid(), 0);
     assert_eq!(metadata.mode() & 0o777, 0o600);
     restarted.acknowledge_exit(report.clone()).unwrap();
-    restarted.records.clear();
+    restarted.registry.lock().clear();
     restarted.reconcile().unwrap();
     assert!(
         matches!(restarted.handle(Operation::Exits, Peer { uid: 0, gid: 0 }).unwrap().reply,
@@ -1454,14 +1454,14 @@ fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
     let account = record.start.account.clone();
     crate::cache_write::tests::with_fresh_token(&id, &account, |config, token| {
         for tombstone in [false, true] {
-            let mut first = machine_with_config(&base, config);
+            let first = machine_with_config(&base, config);
             first.cache_write_grants.admit(token).unwrap();
             std::fs::create_dir_all(&first.records_path).unwrap();
             record.released = tombstone;
             record.exit_acknowledged = tombstone;
             record.oom_kill = tombstone.then_some(0);
             first.save(&record).unwrap();
-            first.records.insert(id.clone(), record.clone());
+            first.insert_record(record.clone());
             first.cache_write_grants.consume(&id);
             assert!(first.status(&id).is_ok());
             assert!(first.cache_write_grants.get(&id).is_none());
@@ -1546,7 +1546,7 @@ fn start_retry_before_durable_intent_reuses_grant_for_write_boot_configuration()
     let mut start = start();
     start.account = crate::cache_write::tests::ACCOUNT.into();
     crate::cache_write::tests::with_fresh_token(&start.job_id, &start.account, |config, token| {
-        let mut jobs = machine_with_config(&base, config);
+        let jobs = machine_with_config(&base, config);
         jobs.cache_write_grants.admit(token).unwrap();
         for _ in 0..2 {
             let error = jobs

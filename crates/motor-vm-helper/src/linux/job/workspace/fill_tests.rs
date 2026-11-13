@@ -37,12 +37,12 @@ fn exited(jobs: &mut LinuxJobs, fill: &job::Fill, success: Option<bool>, oom: Op
     record.released = true;
     record.fill_exit_success = success;
     record.oom_kill = oom;
-    jobs.records.insert(fill.fill_id.clone(), record);
+    jobs.insert_record(record);
 }
 
 #[test]
 fn isolated_fill_provisioning_owns_provenance_and_cannot_relabel_job_disks() {
-    let (base, mut jobs, fill) = fixture();
+    let (base, jobs, fill) = fixture();
     let peer = Peer { uid: 0, gid: 0 };
     jobs.handle(Operation::PrepareFill(fill.clone()), peer)
         .unwrap();
@@ -114,7 +114,7 @@ fn isolated_fill_promotion_requires_publication_clean_exit_evidence_and_detachme
         }
         std::fs::remove_dir_all(base).unwrap();
     }
-    let (base, mut jobs, fill) = fixture();
+    let (base, jobs, fill) = fixture();
     prepare_fill(&jobs.workspaces, &fill).unwrap();
     // A Fill role alone never proves that any VM ran or cleanly exited.
     assert!(!jobs.finish_fill(&fill, true).unwrap());
@@ -128,7 +128,7 @@ fn isolated_fill_promotion_requires_publication_clean_exit_evidence_and_detachme
     attached.start.job_id = job::test_id(704);
     attached.start.workspace_disk_id = fill.disk_id();
     attached.released = false;
-    jobs.records.insert(attached.start.job_id.clone(), attached);
+    jobs.insert_record(attached);
     assert!(jobs.finish_fill(&fill, true).is_err());
     assert_eq!(
         open_disk(&jobs.workspaces, &fill.account, &fill.disk_id())
@@ -243,7 +243,7 @@ fn isolated_restart_discards_abandoned_fill_but_keeps_published_base() {
     prepare_fill(&jobs.workspaces, &fill).unwrap();
     exited(&mut jobs, &fill, Some(true), Some(0));
     assert!(jobs.finish_fill(&fill, true).unwrap());
-    jobs.records.clear();
+    jobs.registry.lock().clear();
     let partial = jobs.workspaces.join(format!("fill-{}", job::test_id(703)));
     std::fs::create_dir(&partial).unwrap();
     jobs.reconcile().unwrap();

@@ -17,7 +17,7 @@ use std::{
         unix::{fs::OpenOptionsExt, net::UnixStream},
     },
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -29,7 +29,7 @@ pub struct LinuxMachine {
     base_path: PathBuf,
     cgroups: cgroup::Cgroups,
     tenants: crate::tenant::Controller<tenant::LinuxTenants>,
-    jobs: Arc<Mutex<job::LinuxJobs>>,
+    jobs: Arc<job::LinuxJobs>,
     cache_write_grants: crate::cache_write::Authority,
 }
 impl LinuxMachine {
@@ -60,7 +60,7 @@ impl LinuxMachine {
             base_path: PathBuf::from(BUILD_ROOT),
             cgroups,
             tenants,
-            jobs: Arc::new(Mutex::new(jobs)),
+            jobs: Arc::new(jobs),
             cache_write_grants,
         })
     }
@@ -147,7 +147,7 @@ impl Machine for LinuxMachine {
         self.cgroups.enable()?;
         // Job evidence and leftover TAPs must be reconciled before the tenant
         // policy renderer can discard any no-longer-allocated counter.
-        self.jobs.lock().unwrap().reconcile()?;
+        self.jobs.reconcile()?;
         self.tenants.0.reconcile()
     }
     fn start(&mut self, _slot: usize, _lease: &Lease, _kind: Kind) -> Result<Vec<OwnedFd>> {
@@ -189,11 +189,11 @@ impl Machine for LinuxMachine {
         self.tenants.handle(tenant, op)
     }
     fn images(&mut self, op: crate::images::Operation) -> Result<crate::Response> {
-        // The Helper lock protects image operations. Removal keeps the job lock
+        // The Helper lock protects image operations. Removal keeps admission
         // from the reservation check through the durable fencing rename, so a
         // concurrent start cannot reserve a generation that is being removed.
         if matches!(op, crate::images::Operation::Remove(_)) {
-            self.jobs.lock().unwrap().images(op)
+            self.jobs.images(op)
         } else {
             images::handle(op)
         }

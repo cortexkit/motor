@@ -9,14 +9,18 @@ struct Process {
     directory: File,
 }
 
+pub(super) fn pin_pidfd(pid: u32) -> Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
 impl Process {
     fn pin(pid: u32) -> Result<Self> {
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
         let pin = Self {
-            pidfd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+            pidfd: pin_pidfd(pid)?,
             directory: OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -67,10 +71,10 @@ impl LinuxJobs {
     }
 
     pub(super) fn memory(&self, id: &str) -> Result<Response> {
-        let record = self
-            .records
-            .get(id)
-            .ok_or_else(|| Error("unknown job VM".into()))?;
+        self.running_view(id)?;
+        let cell = self.cell(id)?;
+        let state = cell.0.lock();
+        let record = &state.record;
         let process = self.memory_process(record)?;
         let resident_bytes = guest_resident_bytes(&process.smaps()?, record.start.memory_mib)?;
         process.alive()?;
@@ -78,10 +82,10 @@ impl LinuxJobs {
     }
 
     pub(super) fn balloon(&self, id: &str, amount_mib: u64) -> Result<Response> {
-        let record = self
-            .records
-            .get(id)
-            .ok_or_else(|| Error("unknown job VM".into()))?;
+        self.running_view(id)?;
+        let cell = self.cell(id)?;
+        let state = cell.0.lock();
+        let record = &state.record;
         if amount_mib > record.start.memory_mib {
             return Err(Error("balloon target exceeds guest RAM".into()));
         }

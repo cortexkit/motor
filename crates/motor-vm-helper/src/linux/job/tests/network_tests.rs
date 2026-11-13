@@ -28,6 +28,12 @@ impl Default for Fake {
     }
 }
 
+impl Fake {
+    pub(super) fn has_namespace(&self, id: &str) -> bool {
+        self.0.lock().unwrap().namespaces.contains(id)
+    }
+}
+
 impl Access for Fake {
     fn lock(&self) -> Result<tenant_network::lock::Guard> {
         tenant_network::lock::acquire_at(&self.1.join("network"), unsafe { libc::geteuid() })
@@ -35,7 +41,7 @@ impl Access for Fake {
     fn tenants(&self) -> Result<Vec<Tap>> {
         Ok(self.0.lock().unwrap().tenants.clone())
     }
-    fn install(&mut self, taps: &[Tap]) -> Result<()> {
+    fn install(&self, taps: &[Tap]) -> Result<()> {
         tenant_network::validate_taps(taps)?;
         self.0.lock().unwrap().events.push("install".into());
         if self.0.lock().unwrap().fail_install {
@@ -43,11 +49,11 @@ impl Access for Fake {
         }
         Ok(())
     }
-    fn create_namespace(&mut self, id: &str) -> Result<PathBuf> {
+    fn create_namespace(&self, id: &str) -> Result<PathBuf> {
         self.0.lock().unwrap().namespaces.insert(id.into());
         namespace::path(id)
     }
-    fn reconcile_namespaces(&mut self, retained: &BTreeSet<String>) -> Result<()> {
+    fn reconcile_namespaces(&self, retained: &BTreeSet<String>) -> Result<()> {
         self.0
             .lock()
             .unwrap()
@@ -55,7 +61,7 @@ impl Access for Fake {
             .retain(|id| retained.contains(id));
         Ok(())
     }
-    fn remove_namespace(&mut self, id: &str) -> Result<()> {
+    fn remove_namespace(&self, id: &str) -> Result<()> {
         let mut state = self.0.lock().unwrap();
         if state.fail_namespace_remove {
             return Err(Error("namespace removal interrupted".into()));
@@ -63,7 +69,7 @@ impl Access for Fake {
         state.namespaces.remove(id);
         Ok(())
     }
-    fn ensure(&mut self, _id: &str, tap: &Tap) -> Result<()> {
+    fn ensure(&self, _id: &str, tap: &Tap) -> Result<()> {
         self.0
             .lock()
             .unwrap()
@@ -71,7 +77,7 @@ impl Access for Fake {
             .push(format!("ensure:{}", tap.tap_index));
         Ok(())
     }
-    fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>> {
+    fn egress_bytes(&self, tap: &Tap) -> Result<Option<u64>> {
         let mut state = self.0.lock().unwrap();
         state.events.push(format!("read:{}", tap.tap_index));
         if let Some(command) = &state.egress_command {
@@ -82,7 +88,7 @@ impl Access for Fake {
         }
         Ok(state.bytes.get(&tap.tap_index).copied())
     }
-    fn remove(&mut self, _id: &str, tap: &Tap, _lock: &tenant_network::lock::Guard) -> Result<()> {
+    fn remove(&self, _id: &str, tap: &Tap, _lock: &tenant_network::lock::Guard) -> Result<()> {
         let mut state = self.0.lock().unwrap();
         if let Some(path) = &state.record_path {
             let record: Record = serde_json::from_slice(&std::fs::read(path)?).unwrap();
@@ -137,8 +143,8 @@ fn persisted(jobs: &LinuxJobs) -> Record {
 
 #[test]
 fn network_policy_failure_prevents_tap_activation() {
-    let (base, mut jobs, fake) = fixture();
-    let tap = jobs.records[&start().job_id].tap().unwrap();
+    let (base, jobs, fake) = fixture();
+    let tap = jobs.records()[&start().job_id].tap().unwrap();
     fake.0.lock().unwrap().fail_install = true;
     assert!(jobs
         .prepare_network(&start().job_id, Vec::new(), tap)
@@ -244,10 +250,12 @@ fn startup_removes_leftover_job_network_only_after_durable_final_counters() {
 
 #[test]
 fn failed_removal_replays_frozen_egress_and_ack_matches_the_entire_report() {
-    let (base, mut jobs, fake) = fixture();
+    let (base, jobs, fake) = fixture();
     fake.0.lock().unwrap().fail_remove = true;
     jobs.collect_exits().unwrap();
-    assert!(jobs.collection_failures[&start().job_id].contains(&CollectionFailure::Network));
+    assert!(jobs
+        .failures(&start().job_id)
+        .contains(&CollectionFailure::Network));
     let saved = persisted(&jobs);
     assert_eq!(saved.tap_index, Some(17));
     assert_eq!(saved.egress_bytes, Some(1234));
@@ -277,7 +285,7 @@ fn failed_removal_replays_frozen_egress_and_ack_matches_the_entire_report() {
 
 #[test]
 fn missing_counter_records_absent_egress_once_and_releases_network_without_retry() {
-    let (base, mut jobs, fake) = fixture();
+    let (base, jobs, fake) = fixture();
     fake.0.lock().unwrap().bytes.remove(&17);
     jobs.collect_exits().unwrap();
     let saved = persisted(&jobs);
@@ -290,11 +298,11 @@ fn missing_counter_records_absent_egress_once_and_releases_network_without_retry
         .get("egress_bytes")
         .is_none());
     assert_eq!(
-        jobs.collection_failures[&start().job_id],
+        jobs.failures(&start().job_id),
         BTreeSet::from([CollectionFailure::MissingEgress])
     );
     assert!(!jobs.log_collection_failure(
-        &start().job_id,
+        &mut jobs.cell(&start().job_id).unwrap().0.lock(),
         CollectionFailure::MissingEgress,
         &"same missing counter"
     ));
@@ -338,7 +346,7 @@ fn timed_out_egress_publishes_unmeasured_report_once_and_replays_after_restart()
     assert_eq!(poll(&mut jobs), std::slice::from_ref(&report));
     assert_eq!(poll(&mut jobs), std::slice::from_ref(&report));
     assert_eq!(
-        jobs.collection_logs,
+        jobs.hooks.lock().unwrap().collection_logs,
         [format!(
             "job {} exit evidence MissingEgress: counter missing; egress unmeasured",
             start().job_id
@@ -350,7 +358,7 @@ fn timed_out_egress_publishes_unmeasured_report_once_and_replays_after_restart()
     restarted.adopt_record(persisted(&restarted)).unwrap();
     assert_eq!(poll(&mut restarted), [report]);
     assert_eq!(persisted(&restarted).egress_bytes, None);
-    assert!(restarted.collection_logs.is_empty());
+    assert!(restarted.hooks.lock().unwrap().collection_logs.is_empty());
     assert_eq!(fake.0.lock().unwrap().events, ["read:17", "remove:17"]);
     std::fs::remove_dir_all(base).unwrap();
 }
@@ -358,11 +366,11 @@ fn timed_out_egress_publishes_unmeasured_report_once_and_replays_after_restart()
 #[test]
 fn network_release_holds_lock_until_tap_clear_is_durable() {
     use std::os::fd::AsRawFd;
-    let (base, mut jobs, fake) = fixture();
+    let (base, jobs, fake) = fixture();
     let path = jobs.records_path.join(format!("{}.json", start().job_id));
     let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let check_flag = checked.clone();
-    jobs.tap_release_check = Some(Box::new(move || {
+    jobs.hooks.lock().unwrap().tap_release_check = Some(Box::new(move || {
         let saved: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved.tap_index, None);
         let other = File::open(fake.1.join("network/lock")).unwrap();
@@ -384,7 +392,7 @@ fn network_release_holds_lock_until_tap_clear_is_durable() {
 
 #[test]
 fn missing_cgroup_removes_the_allocation_without_inventing_egress() {
-    let (base, mut jobs, fake) = fixture();
+    let (base, jobs, fake) = fixture();
     std::fs::remove_dir_all(jobs.group(&start().job_id)).unwrap();
     fake.0.lock().unwrap().record_path = None;
     jobs.collect_exits().unwrap();
@@ -420,7 +428,7 @@ fn live_vmm_network_is_never_sampled_or_removed() {
 
 #[test]
 fn namespace_removal_failure_keeps_index_fenced_and_replays_saved_evidence() {
-    let (base, mut jobs, mut fake) = fixture();
+    let (base, jobs, fake) = fixture();
     let id = start().job_id;
     fake.create_namespace(&id).unwrap();
     fake.0.lock().unwrap().fail_namespace_remove = true;
@@ -430,7 +438,7 @@ fn namespace_removal_failure_keeps_index_fenced_and_replays_saved_evidence() {
     assert_eq!(saved.egress_bytes, Some(1234));
     assert!(jobs.group(&id).exists());
     assert!(fake.0.lock().unwrap().namespaces.contains(&id));
-    assert!(jobs.collection_failures[&id].contains(&CollectionFailure::Network));
+    assert!(jobs.failures(&id).contains(&CollectionFailure::Network));
     fake.0.lock().unwrap().fail_namespace_remove = false;
     jobs.collect_exits().unwrap();
     assert_eq!(persisted(&jobs).tap_index, None);
@@ -445,13 +453,13 @@ fn namespace_removal_failure_keeps_index_fenced_and_replays_saved_evidence() {
 
 #[test]
 fn recovery_namespace_is_removed_without_a_tap_or_invented_egress() {
-    let (base, mut jobs, mut fake) = fixture();
+    let (base, jobs, fake) = fixture();
     let id = start().job_id;
     let mut saved = persisted(&jobs);
     saved.start.kind = job::VmKind::Recovery;
     saved.tap_index = None;
     jobs.save(&saved).unwrap();
-    jobs.records.insert(id.clone(), saved);
+    jobs.insert_record(saved);
     fake.create_namespace(&id).unwrap();
     jobs.collect_exits().unwrap();
     assert!(!fake.0.lock().unwrap().namespaces.contains(&id));
@@ -474,4 +482,53 @@ fn legacy_record_is_tolerant_but_unmeasured_egress_is_not_zero() {
         .unwrap()
         .get("egress_bytes")
         .is_none());
+}
+
+#[test]
+fn acknowledgement_and_tap_clear_serialize_whole_record_writes() {
+    use std::sync::mpsc;
+    let (base, jobs, _) = fixture();
+    let (entered, waiting) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    jobs.pause_exit_at(ExitStep::Recorded, move || {
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let jobs = Arc::new(jobs);
+    let collecting = jobs.clone();
+    let collector = std::thread::spawn(move || collecting.collect_exits().unwrap());
+    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (begun, begins) = mpsc::channel();
+    jobs.pause_exit_at(ExitStep::Ack, move || begun.send(()).unwrap());
+    let (done, completion) = mpsc::channel();
+    let acknowledging = jobs.clone();
+    let ack = std::thread::spawn(move || {
+        let result = acknowledging.acknowledge_exit(ExitReport {
+            job_id: start().job_id,
+            oom_kill: 3,
+            egress_bytes: Some(1234),
+        });
+        done.send(result.map(|response| matches!(response.reply, Reply::Ok)))
+            .unwrap();
+    });
+    begins.recv_timeout(Duration::from_secs(2)).unwrap();
+    let early = completion.recv_timeout(Duration::from_millis(100));
+    release.send(()).unwrap();
+    collector.join().unwrap();
+    ack.join().unwrap();
+    assert!(
+        matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+        "ack bypassed the collector's writer lock"
+    );
+    assert!(completion
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap());
+    let saved = persisted(&jobs);
+    assert!(saved.exit_acknowledged);
+    assert_eq!(saved.tap_index, None);
+    assert!(jobs.records()[&start().job_id].exit_acknowledged);
+    assert_eq!(jobs.records()[&start().job_id].tap_index, None);
+    drop(jobs);
+    std::fs::remove_dir_all(base).unwrap();
 }

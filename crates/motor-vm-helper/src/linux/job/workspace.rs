@@ -494,8 +494,7 @@ mod tests {
         create(&root, request(), job::WorkspaceRole::Job).unwrap();
         assert!(delete(&root, "other", &disk_id).is_err());
         assert!(delete(&root, &account, "../escape").is_err());
-        jobs.records
-            .insert(record.start.job_id.clone(), record.clone());
+        jobs.insert_record(record.clone());
         assert!(jobs
             .handle(
                 Operation::DeleteWorkspace {
@@ -506,7 +505,7 @@ mod tests {
             )
             .is_err());
         assert!(root.join(&disk_id).exists());
-        jobs.records.clear();
+        jobs.registry.lock().clear();
         // Simulate death after the durable rename but before recursive removal.
         std::fs::rename(root.join(&disk_id), root.join(format!(".trash-{disk_id}"))).unwrap();
         finish_deletions(&root).unwrap();
@@ -633,7 +632,7 @@ mod tests {
     fn isolated_base_eviction_refuses_vm_seed_clone_job_and_fill_holders() {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         let base = super::super::tests::scratch();
-        let mut jobs = super::super::tests::machine(&base);
+        let jobs = super::super::tests::machine(&base);
         let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let peer = Peer { uid: 0, gid: 0 };
         let op = || Operation::EvictBase {
@@ -661,9 +660,9 @@ mod tests {
         let mut record = super::super::tests::record();
         record.start.workspace_disk_id = "disk-1".into();
         record.start.kind = job::VmKind::BaseBuild;
-        jobs.records.insert(record.start.job_id.clone(), record);
+        jobs.insert_record(record);
         assert!(jobs.handle(op(), peer).is_err());
-        jobs.records.clear();
+        jobs.registry.lock().clear();
         jobs.handle(op(), peer).unwrap();
         jobs.handle(op(), peer).unwrap();
         assert!(!jobs.workspaces.join("disk-1").exists());

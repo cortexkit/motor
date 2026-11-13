@@ -1,13 +1,13 @@
 use super::*;
 
-fn peer() -> Peer {
+pub(super) fn peer() -> Peer {
     Peer {
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
     }
 }
 
-fn fixture(base: &Path) -> LinuxJobs {
+pub(super) fn fixture(base: &Path) -> LinuxJobs {
     let mut jobs = machine(base);
     jobs.settings = Some(JobVms {
         workspace_disk_max_bytes: Some(1073741824),
@@ -25,11 +25,11 @@ fn record_path(jobs: &LinuxJobs) -> PathBuf {
     jobs.records_path.join(format!("{}.json", start().job_id))
 }
 
-fn read_record(jobs: &LinuxJobs) -> Record {
+pub(super) fn read_record(jobs: &LinuxJobs) -> Record {
     serde_json::from_slice(&std::fs::read(record_path(jobs)).unwrap()).unwrap()
 }
 
-fn empty_group(jobs: &LinuxJobs, count: u64) -> PathBuf {
+pub(super) fn empty_group(jobs: &LinuxJobs, count: u64) -> PathBuf {
     let group = jobs.group(&start().job_id);
     std::fs::create_dir_all(&group).unwrap();
     std::fs::write(group.join("cgroup.procs"), "").unwrap();
@@ -42,7 +42,7 @@ fn empty_group(jobs: &LinuxJobs, count: u64) -> PathBuf {
 }
 
 fn restart(base: &Path) -> LinuxJobs {
-    let mut jobs = fixture(base);
+    let jobs = fixture(base);
     // Exercise the persisted record and the production adoption checks without
     // requiring root ownership of the portable test's scratch ancestors.
     jobs.adopt_record(read_record(&jobs)).unwrap();
@@ -50,6 +50,9 @@ fn restart(base: &Path) -> LinuxJobs {
 }
 
 fn reports(jobs: &mut LinuxJobs) -> Vec<ExitReport> {
+    // Drive the independent maintenance step explicitly in single-threaded
+    // fixtures. Polling itself must never collect or touch a cgroup.
+    jobs.collect_exits().unwrap();
     match jobs.handle(Operation::Exits, peer()).unwrap().reply {
         Reply::JobExits { exits } => exits,
         reply => panic!("unexpected exit poll: {reply:?}"),
@@ -113,7 +116,7 @@ fn job_relay_failure_does_not_block_concurrent_exit_collection() {
         let (entered, rx) = mpsc::channel();
         let worker = jobs.clone();
         let relay = std::thread::spawn(move || {
-            // Ordinary helper RPC dispatch holds this mutex for the whole open.
+            // This fixture deliberately holds an outer mutex for the whole open.
             let _guard = worker.lock().unwrap();
             entered.send(()).unwrap();
             assert!(tenant::connect_job_relay(&root, peer().uid, 53).is_err());
@@ -163,12 +166,13 @@ fn job_relay_accepts_a_valid_peer_and_clears_handshake_timeouts() {
 
 fn fault_replays_one_report(step: ExitStep) {
     let base = scratch();
-    let mut jobs = fixture(&base);
+    let jobs = fixture(&base);
     jobs.save(&record()).unwrap();
     jobs.adopt_record(record()).unwrap();
     let group = empty_group(&jobs, 3);
-    jobs.exit_fault = Some(step);
+    jobs.hooks.lock().unwrap().exit_fault = Some(step);
     let error = if step == ExitStep::Delivery {
+        jobs.collect_exits().unwrap();
         jobs.handle(Operation::Exits, peer()).err().unwrap()
     } else {
         jobs.collect_exit(&start().job_id).unwrap_err()
@@ -257,9 +261,9 @@ fn failed_durable_write_keeps_cgroup_evidence_and_disk_reservation() {
     let records = jobs.records_path.clone();
     jobs.records_path = base.join("missing-directory");
     jobs.collect_exits().unwrap();
-    assert!(!jobs.collection_failures[&start().job_id].is_empty());
+    assert!(!jobs.failures(&start().job_id).is_empty());
     assert!(group.exists());
-    assert_eq!(jobs.records[&start().job_id].oom_kill, None);
+    assert_eq!(jobs.records()[&start().job_id].oom_kill, None);
     assert!(jobs.disk_available(&start(), 8, 99).is_err());
     jobs.records_path = records;
     assert_eq!(read_record(&jobs).oom_kill, None);
@@ -278,7 +282,7 @@ fn failed_cgroup_removal_keeps_durable_count_for_restart() {
     jobs.remove_test_group =
         Some(|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
     jobs.collect_exits().unwrap();
-    assert!(!jobs.collection_failures[&start().job_id].is_empty());
+    assert!(!jobs.failures(&start().job_id).is_empty());
     assert_eq!(read_record(&jobs).oom_kill, Some(6));
     assert!(group.exists());
     drop(jobs);
@@ -300,7 +304,7 @@ fn failed_ack_write_replays_until_durable_ack_and_survives_lost_ack_reply() {
     assert!(jobs
         .handle(Operation::AckExit(expected(0)), peer())
         .is_err());
-    assert!(!jobs.records[&start().job_id].exit_acknowledged);
+    assert!(!jobs.records()[&start().job_id].exit_acknowledged);
     drop(jobs);
     let mut jobs = restart(&base);
     assert_eq!(jobs.records_path, records);
@@ -317,6 +321,90 @@ fn failed_ack_write_replays_until_durable_ack_and_survives_lost_ack_reply() {
             .reply,
         Reply::Ok
     ));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn acknowledgements_compare_immutable_evidence_before_and_after_ack_and_restart() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    let mut saved = record();
+    saved.oom_kill = Some(3);
+    saved.egress_bytes = Some(1234);
+    jobs.save(&saved).unwrap();
+    jobs.adopt_record(saved).unwrap();
+    let report = ExitReport {
+        job_id: start().job_id,
+        oom_kill: 3,
+        egress_bytes: Some(1234),
+    };
+    for acknowledged in [false, true] {
+        if acknowledged {
+            jobs.acknowledge_exit(report.clone()).unwrap();
+        }
+        for restarted in [false, true] {
+            if restarted {
+                drop(jobs);
+                jobs = restart(&base);
+            }
+            let bytes = std::fs::read(record_path(&jobs)).unwrap();
+            let file = File::open(record_path(&jobs)).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+            let modified = file.metadata().unwrap().modified().unwrap();
+            for wrong in [
+                ExitReport {
+                    job_id: job::test_id(2),
+                    ..report.clone()
+                },
+                ExitReport {
+                    oom_kill: 4,
+                    ..report.clone()
+                },
+                ExitReport {
+                    egress_bytes: None,
+                    ..report.clone()
+                },
+            ] {
+                assert!(jobs.handle(Operation::AckExit(wrong), peer()).is_err());
+                assert_eq!(std::fs::read(record_path(&jobs)).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::metadata(record_path(&jobs))
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    modified
+                );
+                assert!(!jobs
+                    .records_path
+                    .join(format!("{}.json", job::test_id(2)))
+                    .exists());
+            }
+            if acknowledged {
+                assert!(matches!(
+                    jobs.handle(Operation::AckExit(report.clone()), peer())
+                        .unwrap()
+                        .reply,
+                    Reply::Ok
+                ));
+                assert_eq!(std::fs::read(record_path(&jobs)).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::metadata(record_path(&jobs))
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    modified
+                );
+            }
+            assert_eq!(
+                jobs.records()[&start().job_id].exit_acknowledged,
+                acknowledged
+            );
+        }
+    }
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -373,7 +461,7 @@ fn absent_or_nonempty_cgroup_never_invents_an_exit_count() {
     std::fs::write(group.join("cgroup.procs"), "").unwrap();
     std::fs::write(group.join("memory.events"), "oom 8\n").unwrap();
     jobs.collect_exits().unwrap();
-    assert!(!jobs.collection_failures[&start().job_id].is_empty());
+    assert!(!jobs.failures(&start().job_id).is_empty());
     assert!(group.exists());
     assert_eq!(read_record(&jobs).oom_kill, None);
     std::fs::remove_dir_all(base).unwrap();
@@ -397,7 +485,7 @@ fn job_records_default_acknowledgement_and_accept_newer_fields() {
 #[test]
 fn socket_delivery_failure_replays_after_restart() {
     let base = scratch();
-    let mut jobs = fixture(&base);
+    let jobs = fixture(&base);
     jobs.save(&record()).unwrap();
     jobs.adopt_record(record()).unwrap();
     empty_group(&jobs, 2);
@@ -496,7 +584,7 @@ fn younger_than_48_hour_tombstone_remains_and_refuses_replayed_start() {
     jobs.maintain_at(modified + Duration::from_secs(48 * 60 * 60 - 1))
         .unwrap();
     assert!(path.exists());
-    assert!(jobs.records.contains_key(&start().job_id));
+    assert!(jobs.records().contains_key(&start().job_id));
     let error = jobs
         .handle(Operation::Start(start()), peer())
         .err()
@@ -522,7 +610,7 @@ fn expired_tombstone_is_pruned_only_by_maintenance_not_requests() {
     jobs.maintain_at(modified + Duration::from_secs(48 * 60 * 60 + 1))
         .unwrap();
     assert!(!path.exists());
-    assert!(!jobs.records.contains_key(&start().job_id));
+    assert!(!jobs.records().contains_key(&start().job_id));
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -542,7 +630,7 @@ fn unacknowledged_or_unreleased_records_are_never_pruned_regardless_of_age() {
         .unwrap();
     assert!(first.exists());
     assert!(second.exists());
-    assert_eq!(jobs.records.len(), 2);
+    assert_eq!(jobs.records().len(), 2);
     assert_eq!(reports(&mut jobs), [expected(3)]);
     std::fs::remove_dir_all(base).unwrap();
 }
@@ -562,7 +650,7 @@ fn prune_waits_for_full_48_hours_and_keeps_future_timestamps() {
     jobs.prune_records(modified + Duration::from_secs(48 * 60 * 60))
         .unwrap();
     assert!(!path.exists());
-    assert!(jobs.records.is_empty());
+    assert!(jobs.records().is_empty());
     std::fs::remove_dir_all(base).unwrap();
 }
 

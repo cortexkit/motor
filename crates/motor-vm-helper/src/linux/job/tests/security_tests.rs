@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn failed_record_does_not_block_other_exit_delivery_stop_start_or_relay() {
     let mut vmm = Vmm::new();
-    let mut jobs = machine(&vmm.base);
+    let jobs = machine(&vmm.base);
     std::fs::create_dir_all(&jobs.records_path).unwrap();
     let first = record();
     jobs.adopt_record(first.clone()).unwrap();
@@ -19,26 +19,28 @@ fn failed_record_does_not_block_other_exit_delivery_stop_start_or_relay() {
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
     };
+    jobs.collect_exits().unwrap();
     let response = jobs.handle(Operation::Exits, peer).unwrap();
     assert!(
         matches!(response.reply, Reply::JobExits { exits } if exits == vec![second.pending_exit().unwrap()])
     );
-    let failures = jobs.collection_failures.clone();
+    let failures = jobs.all_failures();
     let first_group = jobs.group(&first.start.job_id);
     std::fs::remove_dir(first_group.join("cgroup.procs")).unwrap();
     std::fs::write(first_group.join("cgroup.procs"), "").unwrap();
     std::fs::write(first_group.join("memory.events"), "oom_kill 5\n").unwrap();
     jobs.handle(Operation::Stop(second.start.job_id.clone()), peer)
         .unwrap();
-    assert_eq!(jobs.collection_failures, failures);
+    assert_eq!(jobs.all_failures(), failures);
     assert_eq!(
-        jobs.records[&first.start.job_id].oom_kill, None,
+        jobs.records()[&first.start.job_id].oom_kill,
+        None,
         "stop must not collect a different record"
     );
     std::fs::remove_file(first_group.join("cgroup.procs")).unwrap();
     std::fs::create_dir(first_group.join("cgroup.procs")).unwrap();
     assert!(!jobs.log_collection_failure(
-        &first.start.job_id,
+        &mut jobs.cell(&first.start.job_id).unwrap().0.lock(),
         CollectionFailure::Cgroup,
         &"same failure"
     ));
@@ -83,7 +85,7 @@ fn failed_record_does_not_block_other_exit_delivery_stop_start_or_relay() {
     ));
     server.join().unwrap();
     assert!(vmm.child.try_wait().unwrap().is_none());
-    assert_eq!(jobs.collection_failures[&first.start.job_id].len(), 1);
+    assert_eq!(jobs.failures(&first.start.job_id).len(), 1);
 }
 
 #[cfg(feature = "linux-root-tests")]
@@ -105,7 +107,7 @@ mod root {
     fn isolated_job_relay_refuses_symlink_and_wrong_owner_without_connecting() {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         let vmm = Vmm::new();
-        let mut jobs = machine(&vmm.base);
+        let jobs = machine(&vmm.base);
         let record = record();
         let id = record.start.job_id.clone();
         let group = jobs.group(&id);
@@ -196,7 +198,7 @@ mod root {
                         }
                     ));
                 }
-                assert!(jobs.records.is_empty());
+                assert!(jobs.records().is_empty());
                 assert!(!jobs.jail.exists());
                 assert!(!jobs.groups.exists());
             }
@@ -246,7 +248,7 @@ mod root {
                     ..
                 }
             ));
-            assert!(jobs.records.is_empty());
+            assert!(jobs.records().is_empty());
             assert!(!jobs.jail.exists());
             assert!(!jobs.groups.exists());
         }

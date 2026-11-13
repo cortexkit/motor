@@ -10,6 +10,7 @@ use std::{
 
 pub(in crate::linux) struct Guard {
     _file: File,
+    _held: crate::lock_order::Held,
 }
 
 pub(in crate::linux) fn acquire() -> Result<Guard> {
@@ -17,6 +18,9 @@ pub(in crate::linux) fn acquire() -> Result<Guard> {
 }
 
 pub(in crate::linux) fn acquire_at(directory: &Path, owner: u32) -> Result<Guard> {
+    // Track acquisition as well as ownership: waiting for the flock while a
+    // later lock is held is already an inversion, even before flock succeeds.
+    let held = crate::lock_order::enter(crate::lock_order::Lock::N);
     match fs::DirBuilder::new().mode(0o700).create(directory) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -45,7 +49,10 @@ pub(in crate::linux) fn acquire_at(directory: &Path, owner: u32) -> Result<Guard
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(Guard { _file: file })
+    Ok(Guard {
+        _file: file,
+        _held: held,
+    })
 }
 
 #[cfg(test)]
