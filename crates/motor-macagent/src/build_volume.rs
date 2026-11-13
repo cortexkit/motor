@@ -7,16 +7,20 @@
 //! mounts the volume `nosuid,nodev`. The host only creates, clones and renames
 //! the disk's file; formatting and mounting happen here.
 //!
-//! Before the command, `attach` finds the disk by its fixed size, formats it as
-//! APFS only while it is still blank (all zero, as the host creates it), mounts
-//! its volume over the empty shared `target/` directory and gives the volume's
-//! root to the job account. A volume that is missing, ambiguous or refuses to
-//! mount is reformatted, and the job's output says its build starts cold.
+//! Before the command, `attach` refuses a workspace below any directory the job
+//! account could change, finds the disk by its fixed size, formats it as APFS
+//! only while it is still blank (all zero, as the host creates it), mounts its
+//! volume over the empty shared `target/` directory and gives the volume's root
+//! to the job account. A volume that is missing, ambiguous, refuses to mount or
+//! cannot be handed over is reformatted, and the job's output says its build
+//! starts cold. It records the volume root's file system ID and inode.
 //!
-//! After the command, `detach` copies the requested returned files under
-//! `target/` into a private local folder, unmounts the volume (forcing it if a
-//! killed process still holds it busy), and then writes them into the now
-//! uncovered shared `target/`, where the host's usual collection reads them.
+//! After the command, `detach` reaches `target/` again from `/` without
+//! following links and requires that recorded root. It copies the requested
+//! returned files under `target/` into a private local folder, unmounts the
+//! volume (forcing it if a killed process still holds it busy), and then writes
+//! them into the now uncovered shared `target/`, where the host's usual
+//! collection reads them.
 //! The agent reports the command's exit only after this, so the host publishes
 //! a disk only when its volume was unmounted cleanly.
 use crate::Mount;
