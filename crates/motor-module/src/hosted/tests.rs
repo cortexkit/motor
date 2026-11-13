@@ -366,17 +366,19 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
 }
 
 #[tokio::test]
-async fn hosted_capacity_replaces_three_times_but_auth_and_expiry_do_not() {
-    for (reason, error, count) in [
-        ("host_full", Error::HostFull, 3),
-        ("capacity", Error::Capacity, 3),
-        ("auth", Error::Auth, 1),
-        ("expired", Error::Expired, 1),
+async fn hosted_capacity_queues_on_replace_but_auth_and_expiry_never_replace() {
+    for (reason, error, replaces) in [
+        ("host_full", Error::NoCapacity(1000), true),
+        ("capacity", Error::NoCapacity(1000), true),
+        ("auth", Error::Auth, false),
+        ("expired", Error::Expired, false),
     ] {
         let h = Harness::new(Behavior::Refuse(reason)).await;
         let scratch = Scratch::new();
         let id = Uuid::now_v7();
-        let storage = stored(&scratch, id, h.route.clone());
+        let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+        storage.create(id, 3, None, None, false).unwrap();
+        storage.hosted_route(id, h.route.clone()).unwrap();
         assert_eq!(
             Client::new(h.route.clone())
                 .run(id, &Harness::request(&scratch.0), &storage)
@@ -385,24 +387,25 @@ async fn hosted_capacity_replaces_three_times_but_auth_and_expiry_do_not() {
             Some(error)
         );
         let requests = h.requests.lock().unwrap();
+        // After replace starts revocation, the broker answers lease re-requests
+        // with replace_pending until a move succeeds. Only replace can advance it.
         assert_eq!(
             requests
                 .iter()
                 .filter(|p| p.as_str() == "/v1/leases")
                 .count(),
-            count
+            1
         );
-        assert_eq!(
-            requests.iter().filter(|p| p.ends_with("/replace")).count(),
-            usize::from(matches!(reason, "host_full" | "capacity"))
-        );
-        assert_eq!(h.tokens.load(Ordering::SeqCst), count);
-        assert!(h
-            .iats
-            .lock()
-            .unwrap()
-            .windows(2)
-            .all(|pair| pair[1] > pair[0]));
+        let replacements = requests.iter().filter(|p| p.ends_with("/replace")).count();
+        if replaces {
+            assert!(replacements > 1, "{reason}: {requests:?}");
+        } else {
+            assert_eq!(replacements, 0, "{reason}");
+        }
+        assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+        assert_eq!(h.iats.lock().unwrap().len(), 1);
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+        assert!(!storage.job(id).unwrap().hosted.unwrap().run_sent);
     }
 }
 

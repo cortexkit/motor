@@ -149,6 +149,8 @@ pub struct Harness {
     pub requests: Arc<Mutex<Vec<String>>>,
     pub lease_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     pub lease_replies: LeaseReplies,
+    /// Model a revocation discovered by a lease re-request, not by this client.
+    pub lease_rerequest_pending: Arc<std::sync::atomic::AtomicBool>,
     pub replacement_hosts: ReplacementHosts,
     pub replace_replies: LeaseReplies,
     pub tokens: Arc<AtomicUsize>,
@@ -828,6 +830,7 @@ impl Harness {
             VecDeque::<(u16, serde_json::Value, &'static str)>::new(),
         ));
         let replacement_hosts = ReplacementHosts::default();
+        let lease_rerequest_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let replace_replies = LeaseReplies::default();
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -841,6 +844,7 @@ impl Harness {
             let requests = requests.clone();
             let lease_bodies = lease_bodies.clone();
             let lease_replies = lease_replies.clone();
+            let lease_rerequest_pending = lease_rerequest_pending.clone();
             let replacement_hosts = replacement_hosts.clone();
             let replace_replies = replace_replies.clone();
             let finished = finished.clone();
@@ -857,6 +861,7 @@ impl Harness {
                 let mut reservations =
                     std::collections::BTreeMap::<String, serde_json::Value>::new();
                 let mut lease_requests = std::collections::BTreeMap::<String, Vec<u8>>::new();
+                let mut revoking = std::collections::BTreeSet::new();
                 while let Ok((mut socket, _)) = http.accept().await {
                     timeline.mark("broker TCP accepted");
                     let mut bytes = Vec::new();
@@ -919,26 +924,34 @@ impl Harness {
                             unanswered.push(socket);
                             continue;
                         }
-                        lease_replies.lock().unwrap().pop_front().or_else(|| {
-                            // CLOUD's per-host ceilings answer no_host_fits
-                            // before the broker looks at any heartbeat.
-                            let lease: serde_json::Value = serde_json::from_slice(&body).ok()?;
-                            let vcpus = u32::try_from(lease["vcpus"].as_u64()?).ok()?;
-                            if broker
-                                .lock()
-                                .unwrap()
-                                .knobs
-                                .max_vcpus
-                                .is_some_and(|max| vcpus > max)
-                            {
-                                return None;
-                            }
-                            capacity
-                                .lock()
-                                .unwrap()
-                                .as_mut()?
-                                .broker_answer(lease["job_id"].as_str()?, vcpus)
-                        })
+                        let job: LeaseRequest = serde_json::from_slice(&body).unwrap();
+                        if revoking.contains(&job.job_id)
+                            || (number > 1 && lease_rerequest_pending.load(Ordering::SeqCst))
+                        {
+                            Some((503, serde_json::json!({"error":"replace_pending"}), "1"))
+                        } else {
+                            lease_replies.lock().unwrap().pop_front().or_else(|| {
+                                // The broker's per-host ceilings answer no_host_fits
+                                // before the broker looks at any heartbeat.
+                                let lease: serde_json::Value =
+                                    serde_json::from_slice(&body).ok()?;
+                                let vcpus = u32::try_from(lease["vcpus"].as_u64()?).ok()?;
+                                if broker
+                                    .lock()
+                                    .unwrap()
+                                    .knobs
+                                    .max_vcpus
+                                    .is_some_and(|max| vcpus > max)
+                                {
+                                    return None;
+                                }
+                                capacity
+                                    .lock()
+                                    .unwrap()
+                                    .as_mut()?
+                                    .broker_answer(lease["job_id"].as_str()?, vcpus)
+                            })
+                        }
                     } else {
                         None
                     };
@@ -957,6 +970,7 @@ impl Harness {
                         motor_lease::fake::BrokerReply::error(409, "job_finished")
                     } else if path.ends_with("/replace") {
                         assert_eq!(body, b"{}");
+                        revoking.insert(path.split('/').nth(3).unwrap().to_owned());
                         if let Some((status, body, delay)) =
                             replace_replies.lock().unwrap().pop_front()
                         {
@@ -1016,6 +1030,7 @@ impl Harness {
                         reply.body["lease_id"] = lease_id.clone();
                     } else if path.ends_with("/replace") && reply.status == 201 {
                         let job = reply.body["job_id"].as_str().unwrap();
+                        revoking.remove(job);
                         reply.body["lease_id"] = reservations[job].clone();
                     }
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
@@ -1047,6 +1062,7 @@ impl Harness {
             requests,
             lease_bodies,
             lease_replies,
+            lease_rerequest_pending,
             replacement_hosts,
             replace_replies,
             tokens,

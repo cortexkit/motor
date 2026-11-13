@@ -113,8 +113,8 @@ pub struct HostedJobState {
     /// before requesting a lease so retries and restarts keep the same policy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) fleet_no_spill: bool,
-    /// Hosts refused before Run for which no further replacement is attempted.
-    /// Pending revocation fences do not count as refusals.
+    /// Hosts already replaced before Run. Never accept a later replacement
+    /// back onto one of them; pending or capacity replies do not retire a host.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub(crate) replacement_hosts: std::collections::BTreeSet<String>,
     /// Set durably just before ck-motor sends the Run frame to a hosted
@@ -686,6 +686,25 @@ fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
         remaining
     }
 }
+fn validate_replacement(
+    previous: &Lease,
+    next: &Lease,
+    replaced_hosts: &std::collections::BTreeSet<String>,
+) -> Result<(), Error> {
+    if next.lease_id != previous.lease_id
+        || next.job_id != previous.job_id
+        || next.max_s != previous.max_s
+        || next.reserved_vcpu_ms != previous.reserved_vcpu_ms
+        || next.placement.host == previous.placement.host
+        || replaced_hosts.contains(&next.placement.host)
+        || next.placement.host.starts_with("boat:")
+        || next.ssh.is_some()
+    {
+        return Err(Error::Auth);
+    }
+    Ok(())
+}
+
 /// The first leased resource whose token claim differs from what ck-motor
 /// requested, as (field, expected, actual). A first-party host's token states
 /// the broker-raised statement when memory was specified. Otherwise its memory
@@ -1224,10 +1243,12 @@ impl Client {
                     {
                         Error::ReplacePending(retry_after_ms)
                     }
-                    Some("no_capacity")
+                    Some("capacity" | "no_capacity")
                         if status == 503
-                            && path == "/v1/leases"
-                            && self.route.capacity_routed() =>
+                            && (path.ends_with("/replace")
+                                || (path == "/v1/leases"
+                                    && broker_code == Some("no_capacity")
+                                    && self.route.capacity_routed())) =>
                     {
                         Error::NoCapacity(bounded_provisioning_retry_ms(retry_after_ms))
                     }
@@ -1442,6 +1463,13 @@ impl Client {
         // transport failure the cut-off causes.
         let mut cut_off = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
         let mut boat_host_full = false;
+        // Replacement tokens stay bound to this requester. Keep the key and
+        // revocation step together for the active submission; after a restart,
+        // an unsent job is retired as never ran, not placed with a new key.
+        let key = requester()?;
+        body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
+        let mut replacing = false;
+        let mut previous_lease: Option<Lease> = None;
         'lease_requests: loop {
             if self.cancel_pending() {
                 return Err(Error::Cancelled);
@@ -1452,6 +1480,9 @@ impl Client {
                 .job(id)
                 .and_then(|j| j.hosted)
                 .ok_or(Error::Broker)?;
+            if replacing && state.run_sent {
+                return Err(Error::Admitted);
+            }
             if state.placement_attempts >= 3 {
                 return Err(Error::Connect);
             }
@@ -1472,8 +1503,6 @@ impl Client {
             let hosted_test = state.hosted_test;
             let capacity_routed = state.capacity_routed();
             let runner_id = state.runner_id(id);
-            let key = requester()?;
-            body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
             // means no HTTP request was sent to create a reservation for it.
             let bearer = match self
@@ -1508,19 +1537,44 @@ impl Client {
                 // follow one workspace across hosts in the log, and reveals no path.
                 workspace = %body.workspace_key_hash.get(..8).unwrap_or_default(),
                 spilled, "hosted lease requested");
-            let mut lease: Lease = match self
-                .post_ready_authorized(
+            let request_cut_off =
+                std::mem::replace(&mut cut_off, Error::Provisioning(MIN_PROVISIONING_RETRY_MS));
+            let reply = if replacing {
+                self.post_ready_authorized(
+                    &format!("/v1/leases/{runner_id}/replace"),
+                    &serde_json::json!({}),
+                    bearer,
+                    provisioning_deadline,
+                    request_cut_off,
+                )
+                .await
+            } else {
+                self.post_ready_authorized(
                     "/v1/leases",
                     &body,
                     bearer,
                     provisioning_deadline,
                     // The host-full wait ends with this request: whatever the
                     // broker answers decides what happens next.
-                    std::mem::replace(&mut cut_off, Error::Provisioning(MIN_PROVISIONING_RETRY_MS)),
+                    request_cut_off,
                 )
                 .await
-            {
-                Ok(l) => l,
+            };
+            let mut lease: Lease = match reply {
+                Ok(next) => {
+                    if replacing {
+                        let previous = previous_lease.as_ref().ok_or(Error::Auth)?;
+                        validate_replacement(previous, &next, &state.replacement_hosts)?;
+                        storage
+                            .hosted_update(id, |state| {
+                                state
+                                    .replacement_hosts
+                                    .insert(previous.placement.host.clone());
+                            })
+                            .map_err(|_| Error::Broker)?;
+                    }
+                    next
+                }
                 Err(error) => {
                     tracing::info!(job_id = %id, attempt, code = error.code(), "hosted lease not granted");
                     if let Some(status) = self.broker_client_error() {
@@ -1534,6 +1588,24 @@ impl Client {
                         );
                     }
                     match error {
+                        Error::ReplacePending(_)
+                            if !replacing && !state.run_sent && previous_lease.is_some() =>
+                        {
+                            // Lease re-requests cannot advance a revocation,
+                            // even after the old host acknowledges it. The retry
+                            // wait already honored Retry-After; use only replace
+                            // from now on, with the original requester key.
+                            replacing = true;
+                            storage
+                                .hosted_update(id, |state| {
+                                    state.placement_attempts =
+                                        state.placement_attempts.saturating_sub(1);
+                                })
+                                .map_err(|_| Error::Broker)?;
+                            cut_off = error;
+                            continue;
+                        }
+                        error if replacing => return Err(error),
                         Error::NoCapacity(_) | Error::Provisioning(_) if boat_host_full => {
                             return Err(Error::BoatHostFull);
                         }
@@ -1558,6 +1630,7 @@ impl Client {
                 }
             };
             loop {
+                previous_lease = Some(lease.clone());
                 let boat = lease.ssh.is_some() || lease.placement.host.starts_with("boat:");
                 // Record the placement before judging the lease. A booked Boat job
                 // can only be settled with finish (release answers job_admitted), so
@@ -1670,7 +1743,9 @@ impl Client {
                             "hosted capacity refusal; requesting replacement");
                         // A refusal proves this connection never reached Run. Keep
                         // the reservation and requester key while the broker tries
-                        // another host; any refusal leaves the old placement intact.
+                        // another host. Once revocation begins, lease re-requests
+                        // cannot advance its fence, so all later attempts use replace.
+                        replacing = true;
                         let replacement = async {
                             let bearer = self
                                 .while_placing(tokio::time::timeout_at(
@@ -1691,16 +1766,7 @@ impl Client {
                         .await;
                         match replacement {
                             Ok(next) => {
-                                if next.lease_id != lease.lease_id
-                                    || next.job_id != lease.job_id
-                                    || next.max_s != lease.max_s
-                                    || next.reserved_vcpu_ms != lease.reserved_vcpu_ms
-                                    || next.placement.host == lease.placement.host
-                                    || next.placement.host.starts_with("boat:")
-                                    || next.ssh.is_some()
-                                {
-                                    return Err(Error::Auth);
-                                }
+                                validate_replacement(&lease, &next, &state.replacement_hosts)?;
                                 storage
                                     .hosted_update(id, |state| {
                                         state
@@ -1717,31 +1783,7 @@ impl Client {
                                 // refusal instead of waiting on the closed booking.
                                 return Err(connected.err().unwrap().error);
                             }
-                            Err(error) if self.wait_answers.lock().unwrap().expired => {
-                                return Err(error);
-                            }
-                            Err(error) => {
-                                if matches!(
-                                    error,
-                                    Error::Admitted
-                                        | Error::Finished
-                                        | Error::Released
-                                        | Error::Rejected
-                                        | Error::NotGranted
-                                        | Error::Capacity
-                                        | Error::BrokerRefused
-                                ) {
-                                    storage
-                                        .hosted_update(id, |state| {
-                                            state
-                                                .replacement_hosts
-                                                .insert(lease.placement.host.clone());
-                                        })
-                                        .map_err(|_| Error::Broker)?;
-                                }
-                                tracing::info!(job_id = %id, code = error.code(),
-                                    "hosted replace refused; waiting on current placement");
-                            }
+                            Err(error) => return Err(error),
                         }
                     }
                 }
@@ -1808,7 +1850,9 @@ impl Client {
         self.post(path, body).await
     }
     /// Posts until the broker grants or refuses, waiting out `202
-    /// provisioning`, routed `503 no_capacity` and `replace_pending` answers until `deadline`.
+    /// provisioning`, retryable `503 no_capacity` and replacement-route
+    /// `replace_pending` answers until `deadline`. A lease-route fence returns
+    /// after Retry-After so the placement loop can switch to replace.
     /// When the deadline passes first, the request in flight is dropped and
     /// the last definite placement or transport answer is returned. Replacement
     /// fences preserve that answer; before any answer, `cut_off` describes the
@@ -1881,6 +1925,9 @@ impl Client {
                     }
                     self.while_placing(tokio::time::sleep_until(retry_at))
                         .await?;
+                    if path == "/v1/leases" && matches!(error, Error::ReplacePending(_)) {
+                        return Err(pending);
+                    }
                     bearer = match self
                         .while_placing(tokio::time::timeout_at(deadline, self.bearer()))
                         .await?
