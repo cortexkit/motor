@@ -221,7 +221,19 @@ same fields for both, as the `/home` vectors in
 6.2. On Windows the same path is mapped under `C:\m`; see
 [windows-jobs.md](windows-jobs.md#4-paths).
 
-6.3. Changes a job makes to the workspace stay on the runner. They are not
+6.3. Git in the job sees the caller's commit: `HEAD` is the caller's `HEAD`
+commit (also given as `CK_REMOTE_SOURCE_COMMIT`), and the index matches it.
+The caller's uncommitted changes therefore show as unstaged changes. A file
+the caller added but has not committed is untracked in the job, even if the
+caller staged it, so `git ls-files` does not list it. A job submitted while a
+merge is being committed on the caller's machine can capture the merge result
+as uncommitted changes to the earlier commit; the next job, after the commit,
+has the same tree under the new `HEAD`. Test:
+`remote_copy_reports_caller_commit_for_head_when_clean_and_dirty`
+(`crates/motor-runner/src/tests.rs`); the staged new file case is not covered
+by a test.
+
+6.4. Changes a job makes to the workspace stay on the runner. They are not
 copied back; the terminal record lists changed paths in `workspace_changes`.
 Not covered by a test in this repository.
 
