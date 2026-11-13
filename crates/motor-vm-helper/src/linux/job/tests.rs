@@ -361,10 +361,16 @@ impl Vmm {
     fn new() -> Self {
         let base = scratch();
         let binary = base.join("firecracker");
-        std::fs::copy("/bin/sleep", &binary).unwrap();
+        // A copied shell blocked on its own stdin pipe, not a copied `sleep`:
+        // multi-call coreutils (uutils, as on Ubuntu 26.04 hosts) pick the
+        // program from the executable's file name and refuse "firecracker".
+        // `read` keeps the fixture a single process with no children; the
+        // Child holds the pipe's write end until it is killed.
+        std::fs::copy("/bin/sh", &binary).unwrap();
         let child = Command::new(binary)
-            .arg0("sleep")
-            .arg("300")
+            .arg0("sh")
+            .args(["-c", "read -r _"])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         // spawn can return while the child is still inside execve: the kernel
