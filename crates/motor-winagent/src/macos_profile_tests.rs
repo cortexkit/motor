@@ -151,7 +151,8 @@ fn eof_before_exit_or_signal_is_an_error_in_every_phase() {
 
 #[test]
 fn hello_with_any_other_version_is_rejected() {
-    for version in [0, 2, PROTOCOL_VERSION, u32::MAX] {
+    // Version 1 agents predate the build disk and must be refused.
+    for version in [0, 1, 3, PROTOCOL_VERSION, u32::MAX] {
         let mut protocol = protocol();
         let error = protocol
             .accept(
