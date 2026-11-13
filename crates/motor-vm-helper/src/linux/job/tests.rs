@@ -1121,8 +1121,12 @@ fn isolated_job_vmm_survives_helper_service_restart() {
                 .unwrap()
                 .parse()
                 .unwrap();
-            assert!(matches!(jobs.status(&start().job_id).unwrap().reply,
-                Reply::Job { known: true, running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == expected));
+            let reply = jobs.status(&start().job_id).unwrap().reply;
+            assert!(
+                matches!(reply,
+                    Reply::Job { known: true, running: true, vmm_pid: Some(pid), exit_report: None, tap_index: None } if pid == expected),
+                "after the helper restart, expected the running job VMM {expected}, got {reply:?}"
+            );
             assert_eq!(read_oom_score(expected).unwrap(), JOB_OOM_SCORE);
         }
         return;
