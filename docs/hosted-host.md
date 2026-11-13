@@ -584,6 +584,14 @@ and billing ends at the terminal, not at VM shutdown. Export may retain the VM's
 memory, CPU permits and workspace disk for up to 300 seconds; failure or timeout
 discards only the new fill source.
 
+Export checks every Git dependency commit locked by the default-branch tip before
+creating bundles. A job snapshot can use a different dependency graph, and an
+online Cargo fetch does not populate the trusted mirrors. If a locked commit is
+unavailable or is not a verified commit object, export skips the new source and
+the host logs `fill_source_incomplete` at info level with its URL and commit. The
+previous source is kept; export never fetches missing dependencies or sends a
+partial source.
+
 The host checks bundle lengths, chunk offsets and SHA-256 before atomically
 replacing its per-account, per-repository source slot. Each slot is capped at
 1 GiB and counts in storage admission; an oversized export is refused, never

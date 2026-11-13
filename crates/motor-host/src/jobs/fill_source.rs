@@ -269,6 +269,13 @@ impl Drop for UncommittedGeneration {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "reason", deny_unknown_fields)]
+enum ExportSkip {
+    #[serde(rename = "fill_source_incomplete")]
+    Incomplete { url: String, commit: String },
+}
+
 fn export_with(
     host: &Arc<Mutex<Host>>,
     control: &dyn Control,
@@ -304,6 +311,21 @@ fn export_with(
             "guest export refused: {}",
             reply["error"]
         );
+        if let Some(skipped) = reply.get("skipped") {
+            ensure!(
+                reply.get("source").is_none(),
+                "skipped export includes source"
+            );
+            let ExportSkip::Incomplete { url, commit } = serde_json::from_value(skipped.clone())?;
+            tracing::info!(
+                jti = job,
+                tip = request.integration_tip,
+                url,
+                commit,
+                "fill_source_incomplete"
+            );
+            return Ok(());
+        }
         let source: FillSource = serde_json::from_value(reply["source"].clone())?;
         ensure!(
             source.repository_root == request.repository_root

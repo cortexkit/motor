@@ -214,13 +214,19 @@ fn bundle(
     })
 }
 
+#[derive(Debug)]
+pub(crate) enum Export {
+    Complete(FillSource),
+    Incomplete { url: String, commit: String },
+}
+
 pub(crate) fn export(
     trees: &Trees,
     root: &str,
     tip: &str,
     directory: &Path,
     cap: u64,
-) -> io::Result<FillSource> {
+) -> io::Result<Export> {
     let mut source = FillSource {
         repository_root: root.into(),
         integration_tip: tip.into(),
@@ -229,6 +235,26 @@ pub(crate) fn export(
     };
     if !matches!(tip.len(), 40 | 64) || !tip.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid("missing integration tip"));
+    }
+    let dependencies = crate::writer::fill::locked_git(trees, root, tip)?;
+    // Jobs receive their snapshot's dependencies, which need not include the
+    // default-branch tip's graph. Cargo's online cache is not a trusted mirror.
+    // Check the whole graph before creating any export files.
+    for dependency in &dependencies {
+        let mirror = trees.dependency_mirror(&dependency.url);
+        let lock = trees.dependency_lock(&mirror);
+        let _guard = lock.lock().unwrap();
+        for commit in &dependency.commits {
+            if !mirror.try_exists()?
+                || !workspace::git(&mirror, &["cat-file", "-t", commit])
+                    .is_ok_and(|kind| kind == "commit")
+            {
+                return Ok(Export::Incomplete {
+                    url: dependency.url.clone(),
+                    commit: commit.clone(),
+                });
+            }
+        }
     }
     fs::create_dir(directory)?;
     let mirror = trees.mirror(root);
@@ -248,7 +274,7 @@ pub(crate) fn export(
     if total > cap.min(FILL_SOURCE_MAX_BYTES) {
         return Err(invalid("fill source exceeds byte cap"));
     }
-    for dependency in crate::writer::fill::locked_git(trees, root, tip)? {
+    for dependency in dependencies {
         for commit in dependency.commits {
             let mirror = trees.dependency_mirror(&dependency.url);
             let lock = trees.dependency_lock(&mirror);
@@ -276,7 +302,7 @@ pub(crate) fn export(
         }
     }
     source.validate(cap)?;
-    Ok(source)
+    Ok(Export::Complete(source))
 }
 
 #[cfg(target_os = "linux")]
@@ -332,11 +358,23 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
                 .state_dir()
                 .join(format!("fill-export-{}", motor_protocol::Uuid::now_v7()));
             let scratch = Scratch(directory.clone());
-            let source = tokio::task::spawn_blocking(move || {
+            let exported = tokio::task::spawn_blocking(move || {
                 runner.export_fill_source(job_id, &directory, max_bytes)
             })
             .await
             .map_err(io::Error::other)??;
+            let source = match exported {
+                Export::Complete(source) => source,
+                Export::Incomplete { url, commit } => {
+                    return crate::tenant_agent::write_json(
+                        socket,
+                        &serde_json::json!({"ok":true,"skipped":{
+                            "reason":"fill_source_incomplete","url":url,"commit":commit,
+                        }}),
+                    )
+                    .await;
+                }
+            };
             tracing::info!(
                 tip = source.integration_tip,
                 bundle_bytes = source.validate(max_bytes)?,

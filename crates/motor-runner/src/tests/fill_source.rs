@@ -179,6 +179,127 @@ fn source_fixture() -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSourc
     source_fixture_with_aliases(false)
 }
 
+#[test]
+fn export_skips_a_tip_dependency_absent_from_the_job_snapshot() {
+    let f = Fixture::new();
+    let dep = "a".repeat(40);
+    fs::write(
+        f.main.join("Cargo.lock"),
+        format!("version = 3\n[[package]]\nname='dep'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency?rev={dep}#{dep}'\n"),
+    )
+    .unwrap();
+    let (tip, _) = commit(&f.main, "default branch adds a locked dependency");
+    fs::remove_file(f.main.join("Cargo.lock")).unwrap();
+    commit(&f.main, "job snapshot does not use the dependency");
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (mut request, bytes) = f.run("true");
+    request.integration_tip = tip;
+    assert!(request.git_dependencies.is_empty());
+    let upload = f.spool(&runner, &request, &bytes);
+    runner
+        .core
+        .trees
+        .fetch(
+            &upload.directory,
+            &request.bundles,
+            &request.repository_root,
+            &request.snapshot_commit,
+            &request.integration_tip,
+            &request.siblings,
+        )
+        .unwrap();
+    runner
+        .core
+        .trees
+        .import_dependencies(&upload.directory, &request.git_dependencies)
+        .unwrap();
+    assert!(crate::writer::fill::locked_git(
+        &runner.core.trees,
+        &request.repository_root,
+        &request.snapshot_commit,
+    )
+    .unwrap()
+    .is_empty());
+    assert!(!runner
+        .core
+        .trees
+        .dependency_mirror("https://example.invalid/dependency")
+        .exists());
+    let directory = f.scratch.join("unreceived-export");
+    let result = crate::fill_source::export(
+        &runner.core.trees,
+        &request.repository_root,
+        &request.integration_tip,
+        &directory,
+        motor_protocol::FILL_SOURCE_MAX_BYTES,
+    );
+    assert!(result.is_ok(), "{result:?}");
+    let crate::fill_source::Export::Incomplete { url, commit } = result.unwrap() else {
+        panic!("a tip-only dependency must skip export");
+    };
+    assert_eq!(url, "https://example.invalid/dependency");
+    assert_eq!(commit, dep);
+    assert!(!directory.exists());
+}
+
+#[test]
+fn export_checks_every_tip_dependency_commit_before_writing_bundles() {
+    for non_commit in [false, true] {
+        let (f, runner, _, _, source) = source_fixture();
+        let dependency = f.scratch.join("dependency");
+        let missing = if non_commit {
+            git(&dependency, &["rev-parse", "HEAD^{tree}"])
+        } else {
+            commit(&dependency, "revision the job never received").0
+        };
+        let present = &source.git_dependencies[0].commits[0];
+        fs::write(
+            f.main.join("Cargo.lock"),
+            format!("version = 3\n[[package]]\nname='dep'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency#{present}'\n[[package]]\nname='dep'\nversion='0.2.0'\nsource='git+https://example.invalid/dependency?rev={missing}#{missing}'\n"),
+        )
+        .unwrap();
+        commit(&f.main, "default branch changes dependency revision");
+        let (request, bytes) = f.run("true");
+        let upload = f.spool(&runner, &request, &bytes);
+        runner
+            .core
+            .trees
+            .fetch(
+                &upload.directory,
+                &request.bundles,
+                &request.repository_root,
+                &request.snapshot_commit,
+                &request.integration_tip,
+                &request.siblings,
+            )
+            .unwrap();
+        let directory = f.scratch.join("incomplete-export");
+        let exported = crate::fill_source::export(
+            &runner.core.trees,
+            &request.repository_root,
+            &request.integration_tip,
+            &directory,
+            motor_protocol::FILL_SOURCE_MAX_BYTES,
+        )
+        .unwrap();
+        let crate::fill_source::Export::Incomplete { url, commit } = exported else {
+            panic!("missing or non-commit dependency must skip export");
+        };
+        assert_eq!(url, "https://example.invalid/dependency");
+        assert_eq!(commit, missing);
+        assert!(!directory.exists());
+        assert_eq!(
+            git(
+                &runner.core.trees.dependency_mirror(&url),
+                &["rev-parse", &format!("refs/ck-motor/dep/{present}")],
+            ),
+            *present
+        );
+    }
+}
+
 fn source_fixture_with_aliases(
     aliases: bool,
 ) -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSource) {
@@ -240,14 +361,16 @@ fn source_fixture_with_aliases(
         );
     }
     let directory = f.scratch.join("export");
-    let source = crate::fill_source::export(
+    let crate::fill_source::Export::Complete(source) = crate::fill_source::export(
         &runner.core.trees,
         &request.repository_root,
         &request.integration_tip,
         &directory,
         motor_protocol::FILL_SOURCE_MAX_BYTES,
     )
-    .unwrap();
+    .unwrap() else {
+        panic!("fixture contains all locked dependency commits");
+    };
     (f, runner, request, directory, source)
 }
 

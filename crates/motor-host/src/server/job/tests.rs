@@ -9,6 +9,7 @@ use std::sync::Condvar;
 mod admin_tests;
 mod cache_write_tests;
 mod deadline_tests;
+mod fill_source_tests;
 mod heartbeat_tests;
 mod recovery_tests;
 mod scale_tests;
