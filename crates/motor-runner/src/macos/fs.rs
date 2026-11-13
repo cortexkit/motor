@@ -16,16 +16,6 @@ use std::{
 
 pub(super) struct Dir(File);
 pub(super) const MAX_TREE_DEPTH: usize = 64;
-struct ReadFrame {
-    dir: Dir,
-    entries: DirectoryStream,
-}
-impl ReadFrame {
-    fn new(dir: Dir) -> io::Result<Self> {
-        let entries = DirectoryStream::from_dir(dir.child(".".as_ref(), false)?)?;
-        Ok(Self { dir, entries })
-    }
-}
 struct CopyFrame {
     source: Dir,
     destination: Dir,
@@ -140,76 +130,6 @@ fn cv(value: libc::c_int) -> io::Result<libc::c_int> {
 }
 impl Dir {
     pub(super) fn sync_directory(&self) -> io::Result<()> {
-        self.0.sync_all()
-    }
-    pub(super) fn sync_all(&self) -> io::Result<()> {
-        let mut stack = vec![ReadFrame::new(self.child(".".as_ref(), false)?)?];
-        while !stack.is_empty() {
-            let Some(name) = stack.last_mut().unwrap().entries.next()? else {
-                stack.last().unwrap().dir.0.sync_all()?;
-                stack.pop();
-                continue;
-            };
-            let frame = stack.last().unwrap();
-            match frame.dir.kind(&name)? {
-                libc::S_IFDIR => {
-                    if stack.len() >= MAX_TREE_DEPTH {
-                        return Err(invalid("guest tree depth limit exceeded"));
-                    }
-                    let child = frame.dir.child(&name, false)?;
-                    stack.push(ReadFrame::new(child)?);
-                }
-                libc::S_IFREG => frame.dir.file(&name, false)?.sync_all()?,
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-    pub(super) fn publish(
-        &self,
-        temporary: &std::ffi::OsStr,
-        store: &std::ffi::OsStr,
-    ) -> io::Result<()> {
-        let from = c(temporary)?;
-        let to = c(store)?;
-        if self.contains(store)? {
-            self.child(store, false)?;
-            #[cfg(target_os = "macos")]
-            cv(unsafe {
-                libc::renameatx_np(
-                    self.0.as_raw_fd(),
-                    from.as_ptr(),
-                    self.0.as_raw_fd(),
-                    to.as_ptr(),
-                    libc::RENAME_SWAP,
-                )
-            })?;
-            // The raw syscall: musl's libc bindings have no renameat2 wrapper,
-            // and the tenant runner is a static musl build. The return value is
-            // 0 or -1, so narrowing it to c_int is exact.
-            #[cfg(target_os = "linux")]
-            cv(unsafe {
-                libc::syscall(
-                    libc::SYS_renameat2,
-                    self.0.as_raw_fd(),
-                    from.as_ptr(),
-                    self.0.as_raw_fd(),
-                    to.as_ptr(),
-                    libc::RENAME_EXCHANGE,
-                ) as libc::c_int
-            })?;
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            return Err(invalid("atomic target exchange is unsupported"));
-        } else {
-            cv(unsafe {
-                libc::renameat(
-                    self.0.as_raw_fd(),
-                    from.as_ptr(),
-                    self.0.as_raw_fd(),
-                    to.as_ptr(),
-                )
-            })?;
-        }
         self.0.sync_all()
     }
     pub(super) fn open(path: &Path, create: bool) -> io::Result<Self> {
@@ -566,43 +486,7 @@ impl Dir {
     }
     fn clone_leaf(&self, to: &Dir, name: &std::ffi::OsStr, kind: libc::mode_t) -> io::Result<()> {
         match kind {
-            libc::S_IFREG => {
-                let source = self.file(name, false)?;
-                #[cfg(target_os = "macos")]
-                {
-                    unsafe extern "C" {
-                        fn fclonefileat(
-                            src: libc::c_int,
-                            dst: libc::c_int,
-                            name: *const libc::c_char,
-                            flags: u32,
-                        ) -> libc::c_int;
-                    }
-                    cv(unsafe {
-                        fclonefileat(source.as_raw_fd(), to.0.as_raw_fd(), c(name)?.as_ptr(), 0)
-                    })?;
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let output = to.file(name, true)?;
-                    #[cfg(target_os = "linux")]
-                    cv(unsafe {
-                        libc::ioctl(
-                            output.as_raw_fd(),
-                            0x40049409 as libc::Ioctl,
-                            source.as_raw_fd(),
-                        )
-                    })?;
-                    cv(unsafe {
-                        libc::fchmod(output.as_raw_fd(), source.metadata()?.permissions().mode())
-                    })?;
-                    #[cfg(not(target_os = "linux"))]
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "clonefile requires macOS or Linux reflinks",
-                    ));
-                }
-            }
+            libc::S_IFREG => to.clone_file(&self.file(name, false)?, name)?,
             libc::S_IFLNK => {
                 cv(unsafe {
                     libc::symlinkat(
@@ -620,6 +504,65 @@ impl Dir {
             }
         }
         Ok(())
+    }
+    /// Clones the open regular file `source` as `name` in this directory,
+    /// sharing its blocks (an APFS clone, or a reflink on Linux test hosts).
+    /// An existing `name` is refused, never replaced or followed.
+    pub(super) fn clone_file(&self, source: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn fclonefileat(
+                    src: libc::c_int,
+                    dst: libc::c_int,
+                    name: *const libc::c_char,
+                    flags: u32,
+                ) -> libc::c_int;
+            }
+            cv(unsafe {
+                fclonefileat(source.as_raw_fd(), self.0.as_raw_fd(), c(name)?.as_ptr(), 0)
+            })?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let output = self.file(name, true)?;
+            #[cfg(target_os = "linux")]
+            cv(unsafe {
+                libc::ioctl(
+                    output.as_raw_fd(),
+                    0x40049409 as libc::Ioctl,
+                    source.as_raw_fd(),
+                )
+            })?;
+            cv(unsafe {
+                libc::fchmod(output.as_raw_fd(), source.metadata()?.permissions().mode())
+            })?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "clonefile requires macOS or Linux reflinks",
+            ));
+        }
+        Ok(())
+    }
+    /// Renames `name` to `destination` in `to`, replacing a file already there,
+    /// then makes both directory entries durable.
+    pub(super) fn replace_into(
+        &self,
+        name: &std::ffi::OsStr,
+        to: &Dir,
+        destination: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        cv(unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                c(name)?.as_ptr(),
+                to.0.as_raw_fd(),
+                c(destination)?.as_ptr(),
+            )
+        })?;
+        to.0.sync_all()?;
+        self.0.sync_all()
     }
 }
 
@@ -663,27 +606,6 @@ fn clear_job_file(parent: libc::c_int, name: &std::ffi::OsStr) -> io::Result<boo
     {
         let _ = (parent, name);
         Ok(false)
-    }
-}
-
-/// Only for the stopped job's disposable target temporary, before publication.
-/// A clone must not publish an immutable bit resurrected across a crash, even
-/// if a durable source journal already says cleared.
-pub(super) fn clear_job_target(path: &Path) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        Dir::visit_owned_files(path, |dir, name, stat| {
-            if stat.st_flags & libc::UF_IMMUTABLE != 0 && !clear_job_file(dir.0.as_raw_fd(), name)?
-            {
-                return Err(invalid("immutable job target file is not runner-owned"));
-            }
-            Ok(())
-        })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        Ok(())
     }
 }
 

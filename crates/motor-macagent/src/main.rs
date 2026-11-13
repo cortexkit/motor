@@ -74,6 +74,8 @@ mod guest {
             stream,
             boot.nonce,
             PathBuf::from(motor_macagent::CARGO_HOME),
+            &boot.mounts,
+            boot.build,
         )
         .await
     }

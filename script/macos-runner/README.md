@@ -212,6 +212,29 @@ There is no full-copy fallback.
 3. Re-run installed-daemon qualification before deploying the new image. Portable
    tests cannot prove APFS cloning, code-signing/TCC behavior, or guest startup.
 
+Agents speaking macOS protocol version 2 format and mount each job's build disk
+at `target/` (see `docs/macos-runner.md`). The runner refuses an image whose agent
+reports version 1, so install the runner and an image carrying a version 2 agent
+together. The offline agent update above is enough: nothing else in the
+sealed image changes, so the image need not be rebuilt and resealed. The agent
+uses only tools every macOS guest has: `/usr/sbin/diskutil`, `/usr/bin/plutil` and
+`/sbin/mount_apfs`. After installing, run
+`script/macos-runner/build-disk-e2e.sh` (below) once on the VM host.
+
+### Build disk end-to-end check
+
+`script/macos-runner/build-disk-e2e.sh <checkout under /Users> [<runner state root>]`
+runs two jobs through the installed runner on a new, disposable Cargo checkout.
+The first job checks that `target/` is an APFS volume mounted `nosuid,nodev`,
+separate from the shared checkout and owned by the job account; it then builds
+there and returns a file from `target/`, whose hash the script compares. The
+second job checks that the same volume comes back: it finds the first job's
+marker, and Cargo compiles nothing. Neither job may carry the reformatting
+notice. With a state root, the script also checks that the kept
+`targets/<key>.img` is exactly 128 GiB and sparse and that no old build folder
+remains. It prints each check, keeps both jobs' records beside the checkout, and
+exits non-zero at the first failure.
+
 Earlier sealing code set a non-login shell and `*` password marker for
 `motorbuild` but kept its password hash, enabled authority and admin
 membership. Older sealed images may retain that account in this weaker state.

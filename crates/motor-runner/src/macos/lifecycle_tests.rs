@@ -1,3 +1,4 @@
+use super::super::tests::{build_disk_marker, write_build_disk};
 use super::*;
 use crate::test_helpers::CanonicalScratchDir as ScratchDir;
 use std::sync::Barrier;
@@ -486,9 +487,14 @@ fn record_precedes_first_resource_and_recovery_removes_only_derived_paths() {
         }
         if window == "copy-back" {
             record.stop_proven = true;
-            let target = root.join("targets").join(key(&record.workspace));
-            std::fs::create_dir_all(&target).unwrap();
-            std::fs::write(target.join("whole"), "old store").unwrap();
+            write_build_disk(
+                &record.paths.clone.join(motor_macvm::BUILD_DISK),
+                b"new store",
+            );
+            write_build_disk(
+                &root.join("targets").join(image(&record.workspace)),
+                b"old store",
+            );
         }
         Runtime::save(&root, &record).unwrap();
         drop(entry);
@@ -502,13 +508,8 @@ fn record_precedes_first_resource_and_recovery_removes_only_derived_paths() {
         }
         if window == "copy-back" {
             assert_eq!(
-                std::fs::read_to_string(
-                    root.join("targets")
-                        .join(key(&record.workspace))
-                        .join("whole")
-                )
-                .unwrap(),
-                "old store"
+                build_disk_marker(&root.join("targets").join(image(&record.workspace)), 9),
+                b"old store"
             );
         }
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
@@ -676,8 +677,8 @@ fn crash_process_fixture() {
             guest: path.into(),
         };
         let plan = motor_macvm::JobVmConfig::new(motor_macvm::JobVmRequest {
-            clone: paths.clone,
-            nonce_disk: paths.nonce,
+            clone: paths.clone.clone(),
+            nonce_disk: paths.nonce.clone(),
             workspace: share("workspace", "/Users/test/repo"),
             siblings: vec![],
             cargo_home: share("cargo-home", motor_macvm::CARGO_HOME),
@@ -687,12 +688,11 @@ fn crash_process_fixture() {
         ready_now(helper.child.id());
     }
     assert_eq!(window, "copy-back");
-    let workspace = paths.tree.join("Users/test/repo");
-    std::fs::create_dir_all(workspace.join("target")).unwrap();
-    std::fs::write(workspace.join("target/whole"), "new").unwrap();
-    let store = root.join("targets").join(key("/Users/test/repo"));
-    std::fs::create_dir(&store).unwrap();
-    std::fs::write(store.join("whole"), "old").unwrap();
+    write_build_disk(&paths.clone.join(motor_macvm::BUILD_DISK), b"new");
+    write_build_disk(
+        &root.join("targets").join(image("/Users/test/repo")),
+        b"old",
+    );
     {
         let mut owned = entry.owned.lock().unwrap();
         owned.record.stop_proven = true;
@@ -707,7 +707,7 @@ fn crash_process_fixture() {
             }
         }
     }));
-    super::super::execution::target_out(&config, &entry, &workspace).unwrap();
+    super::super::execution::target_out(&config, &entry).unwrap();
     panic!("copy-back crash hook not reached");
 }
 #[cfg(target_os = "linux")]
@@ -783,13 +783,8 @@ fn runner_sigkill_crash_windows_recover_resources_and_whole_target() {
         }
         if window == "copy-back" {
             assert_eq!(
-                std::fs::read_to_string(
-                    root.join("targets")
-                        .join(key("/Users/test/repo"))
-                        .join("whole")
-                )
-                .unwrap(),
-                "old"
+                build_disk_marker(&root.join("targets").join(image("/Users/test/repo")), 3),
+                b"old"
             );
         }
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
@@ -1273,4 +1268,55 @@ fn vm_service_rows_accept_negative_system_uids() {
         Some((812, 501))
     );
     assert!(super::vm_service_row("812 x /bin/sh").is_err());
+}
+
+#[test]
+fn build_stores_are_evicted_legacy_first_then_least_recently_used_then_largest() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let scratch = ScratchDir::new("macos-build-store-order");
+    let targets = scratch.join("targets");
+    std::fs::create_dir_all(&targets).unwrap();
+    let key = |c: char| c.to_string().repeat(64);
+    let stamp = |path: &Path, seconds: u64| {
+        File::open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    };
+    let image = |c: char, bytes: usize, seconds: u64| {
+        let path = targets.join(format!("{}.img", key(c)));
+        std::fs::write(&path, vec![1; bytes]).unwrap();
+        stamp(&path, seconds);
+        format!("{}.img", key(c))
+    };
+    let small_old = image('a', 4096, 1_000);
+    let large_old = image('b', 1 << 20, 1_000);
+    let large_new = image('c', 2 << 20, 2_000);
+    let legacy = targets.join(key('d'));
+    std::fs::create_dir(&legacy).unwrap();
+    std::fs::write(legacy.join("app"), "old build").unwrap();
+    stamp(&legacy, 3_000);
+    // None of these is a build store.
+    std::fs::write(
+        targets.join(format!("{}.source-mtimes.json", key('a'))),
+        "{}",
+    )
+    .unwrap();
+    std::fs::write(targets.join("not-a-key.img"), "x").unwrap();
+    std::fs::create_dir(targets.join(format!("{}.img", key('e')))).unwrap();
+    std::os::unix::fs::symlink(
+        targets.join(&large_new),
+        targets.join(format!("{}.img", key('f'))),
+    )
+    .unwrap();
+    std::fs::write(targets.join(key('g')), "a file, not a legacy folder").unwrap();
+    let stores = eviction_order(build_stores(&Dir::open(&targets, false).unwrap()).unwrap());
+    assert_eq!(
+        stores.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+        vec![key('d'), large_old, small_old, large_new]
+    );
+    assert!(stores[0].legacy && stores[0].allocated == 0);
+    assert_eq!(stores[1].key, key('b'));
+    assert!(stores[1].allocated >= 1 << 20);
+    assert!(stores[2].allocated < stores[1].allocated);
 }

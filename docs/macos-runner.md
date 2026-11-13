@@ -7,8 +7,9 @@ the job command has not run.
 ## Host preparation
 
 Unchanged source files keep their modification times between jobs of the same
-checkout, so Cargo can reuse the checkout's saved build folder. Reuse applies
-only to files sealed read-only in both jobs; changed files receive newer times.
+checkout, so Cargo can reuse the checkout's build disk (see
+[Build disk and `target/`](#build-disk-and-target)). Reuse applies only to files
+sealed read-only in both jobs; changed files receive newer times.
 
 ### Bun lockfiles
 
@@ -31,12 +32,16 @@ caller lifecycle scripts on the host; dependency installation uses
 
 `motor-macagent` runs as root in a single-job macOS VM. Its executable is built
 for `aarch64-apple-darwin`. It uses `motor-winagent`'s shared framing and macOS
-profile, version 1. The Windows profile remains version 4.
+profile, version 2. Version 2 agents mount the job's build disk at `target/`; the
+runner refuses a version 1 agent at Hello with a `guest_agent_version` error that
+names the image, so an older image never builds on the shared folder. The
+Windows profile is versioned separately.
 
 ### Nonce disk and connection
 
-The host attaches exactly two disks: the boot disk and a read-only raw nonce
-disk. At byte zero the nonce disk contains this header, nonce and bounded map:
+The host attaches exactly three disks: the boot disk, a read-only raw nonce disk
+and the writable build disk. At byte zero the nonce disk contains this header,
+nonce and bounded map:
 
 ```text
 MOTOR-NONCE-V2\n
@@ -44,11 +49,27 @@ MOTOR-NONCE-V2\n
 <4-byte big-endian length><JSON mount map>
 ```
 
-Here `\n` means one newline byte, not two literal characters. Remaining disk
-bytes are zero padding, to a fixed 69,632-byte disk. The JSON array has at most
+Here `\n` means one newline byte, not two literal characters. The rest of that
+first 69,632-byte block is zero padding. The JSON array has at most
 64 entries and is at most 64 KiB: `[{"tag":"workspace","destination":"/Users/motor/repo","read_only":false}, ...]`.
 The nonce is generated per job. There is no v1 reader or compatibility mode.
-The guest reads the entire image into a 4096-byte-aligned buffer with one
+
+The build extension follows at byte 69,632 and fills a fixed 1,638,400-byte block:
+
+```text
+MOTOR-BUILD-V1\n
+<4-byte big-endian length><JSON build configuration>
+```
+
+The JSON object is `{"returns":["debug/app", ...],"return_max_bytes":N}`, with
+no other fields: the requested returned files inside `target/`, relative to it,
+and the caller's byte cap (see [returned files](#returned-files-under-target)).
+At most 64 paths, each at most 4096 bytes with no empty, `.` or `..` component.
+The whole disk is 1,708,032 bytes. A wrong header, length, field, path or any
+non-zero padding byte refuses the boot configuration; the extension is never
+partly read. An agent older than the extension reads only the first block, so
+it still boots and reaches Hello, where the runner refuses its version.
+The guest reads the entire image, both blocks, into a 4096-byte-aligned buffer with one
 sector-aligned read before parsing it; neither discovery nor the explicit-device
 path probes a short header on a raw device. Every padding byte is checked.
 The guest probes whole raw
@@ -59,11 +80,13 @@ devices must not be readable by `motorjob`; the image must give that account an
 unprivileged primary group, with no disk-access groups.
 
 The root agent connects to `VMADDR_CID_HOST` (2), vsock port **5000**, and sends
-`Hello { version: 1, nonce }`. The host must already be listening. It accepts
+`Hello { version: 2, nonce }`. The host must already be listening. It accepts
 one session, authenticates the nonce and refuses further connections. The wire
 sequence is `Hello` → host `TreeEnd { command }` → agent `Started` → zero or more
 `Output` → `Exit { code }` or `Signal { signal }`. There is no `TreeReceived` or
 host `Start`. The host may send `Cancel` after `TreeEnd` until terminal status.
+The agent mounts the build disk between `TreeEnd` and `Started`, and unmounts it
+before `Exit` or `Signal`; the host allows two minutes for `Started`.
 
 ### Shares and command execution
 
@@ -129,6 +152,91 @@ allow-list, then pins `HOME=/Users/motorjob`, a fresh writable job `TMPDIR`,
 `RUSTUP_HOME=/opt/motor/rustup`, `CARGO_HOME=/opt/motor/job/cargo-home`, and
 `PATH=/opt/motor/cargo/bin:/opt/motor/bun/bin:/opt/motor/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 `CARGO_TARGET_DIR` is unset.
+
+### Build disk and `target/`
+
+The job's `target/` is not on the shared folder. On that share, listing a
+directory while entries in it are deleted can skip real files, so `cargo clean`
+left files behind and rustc's incremental garbage collection failed with
+"Directory not empty". Each checkout instead keeps its build folder on its own
+disk, which the job VM formats and mounts as APFS. Builds see `target/` exactly
+where they did, and `CARGO_TARGET_DIR` stays unset.
+
+- **On the host**, the runner keeps one file per checkout, `targets/<key>.img`
+  under its state root: a sparse raw disk of exactly **128 GiB**, of which only
+  written blocks use host disk. For each job it makes an APFS clone of that
+  file, a constant-time copy, in the job's clone directory, and attaches it as
+  the VM's third disk, writable, with the boot disk's caching and
+  synchronization settings. A checkout's first job gets a new, empty disk.
+  The staged checkout's `target/` is an empty directory.
+- **In the VM**, before the command starts, the root agent finds the disk by
+  its fixed size, the one property the guest cannot change and no other disk
+  shares. It formats the disk as APFS only while it is still blank (all zero,
+  as the host creates it). It then mounts the volume `nosuid,nodev` over the
+  empty `target/` directory and gives the volume's root to `motorjob`,
+  clearing any user flags such as `uchg` an earlier job set on it. The raw
+  and block devices must not be writable by `motorjob`. A `target` that is a
+  file, a link or a non-empty directory refuses the job, and so does a
+  workspace below a directory `motorjob` owns or can write, its home
+  directory included, or below a link: the job could otherwise rename that
+  directory during its run and redirect the agent's later unmount. If an
+  existing volume is missing, will not mount or cannot be handed to
+  `motorjob`, the agent reformats the disk, and the job's standard error
+  starts with a line saying so: that build starts cold. The agent never runs
+  the command with the shared folder in the volume's place.
+- **After the command**, once every `motorjob` process is gone, the agent
+  reaches `target/` again from `/`, one directory at a time without following
+  links, and requires the volume root it recorded before the command (the
+  same file system ID and inode). It copies the returned files out (below),
+  then unmounts the volume, which must have exactly one mount, forcing the
+  unmount if a killed process left it busy. Only then does it send `Exit` or
+  `Signal`. If any of this fails, it closes the session without either.
+- **Publication.** After the VM has provably stopped, the runner renames the
+  job's disk over `targets/<key>.img` whenever the agent reported `Exit` or
+  `Signal`, because only then was the volume cleanly unmounted. **A failed job
+  publishes its disk too**: a non-zero exit, such as a compile error, or a
+  command killed by a signal keeps its build output for the next job, as a
+  Linux workspace keeps its `target/`. A cancelled job, a session that ended
+  without terminal status, or an unproven stop publishes nothing; the next job
+  uses the previous disk. The rename is the commit point: a cancel that
+  arrives first stops it, and one that arrives during it waits until it is
+  done and finds the disk published. The host never mounts or reads the disk's contents: it only
+  creates, clones, renames, measures and deletes the file.
+- **A full disk.** The volume holds at most 128 GiB. A build that fills it fails
+  like one on a full disk, with "No space left on device" (`ENOSPC`) from the
+  compiler or linker. Deleting files under `target/` in a job frees the space
+  for the checkout. `target/` itself is the volume's mount point: removing the
+  directory itself fails with "Resource busy", so a tool that deletes the whole
+  directory, as `cargo clean` does, reports an error after emptying it.
+- **Eviction.** Below 40 GiB free on the state volume, admission-time cleanup
+  deletes build disks least recently used first, measured by the host disk they
+  take, not their 128 GiB apparent size; a disk whose checkout has a job in
+  progress is kept. See [scheduling](scheduling.md).
+- **Migration.** A build folder kept by an older runner (`targets/<key>`) is
+  never converted. The checkout's first job on a build disk builds cold, and the
+  old folder is deleted when that job's disk is published. Eviction deletes old
+  folders before any disk.
+
+#### Returned files under `target/`
+
+The host cannot read the volume, so the agent copies requested returned files
+that name something under `target/` before it unmounts it. In request order, a
+file is copied while its size still fits under the caller's cap, the same rule
+the host applies, into a private root-only folder on the guest's own disk.
+After unmounting, the agent writes the copies into the shared `target/`, now an
+empty directory again, at their requested paths. The host then collects every
+returned file from the stopped share as before, with its usual confinement
+checks; return paths outside `target/` are unchanged. A file over the cap is
+written as a sparse placeholder with none of its bytes, sized one byte over
+the whole cap (or the file's own size, if larger). The host budgets every
+returned path, the agent only those under `target/`, so a placeholder of the
+file's real size could fit the host's remaining budget and come back as
+zeros; one larger than the cap never fits, and the host reports it over the
+cap. The agent never follows a link on the volume or crosses onto another file
+system mounted below it: a returned path under `target/` must name a regular
+file on the build volume through real directories, or the host reports it
+missing. A path written with `..` is
+resolved on the shared folder and finds only files the agent copied there.
 
 The image recipe installs Rust 1.91.0, 1.92.0, 1.96.0, 1.99.0 and 1.100.0, plus
 an independent stable copy of 1.99.0. The default remains 1.99.0. Rust 1.100.0
@@ -228,8 +336,8 @@ An unproven stop retains both the record and VM slot. Once disk release is prove
 the runner fsyncs `slot: null` before releasing that slot. Filesystem cleanup is
 separate: it restores owner rwx on owned directories through no-follow directory
 capabilities, streams an iterative deletion walk, and caps depth at 64. Input
-projection, copy-back and sync also use explicit heap stacks with that depth
-limit; the input-copy buffer is one heap allocation, never a recursive frame.
+projection also uses explicit heap stacks with that depth limit; the input-copy
+buffer is one heap allocation, never a recursive frame.
 Unremovable/deep trees are moved under
 the job's recorded `quarantine/<job_id>` path (or remain at the recorded original
 path if relocation fails). Their inventory remains for retry/operator attention,
@@ -300,10 +408,13 @@ A sealed directory contains four regular read-only files: `disk.img`,
 `machine-identifier` (its data representation). The directory itself is
 read-only. `clone_image` makes an APFS `clonefile` copy with no ordinary-copy
 fallback and makes only the clone's boot disk and auxiliary storage writable.
+It also creates a blank build disk, `build-disk.img`, in the clone; the runner
+replaces it with a clone of the checkout's kept disk when there is one.
 The runner must record the clone and nonce paths durably **before** creating them;
 creation failures intentionally leave any partial resource for recorded cleanup.
-`create_nonce_disk` exclusively creates a 69,632-byte, owner-readable, read-only
-raw image with the nonce format above, zero padding, and fsyncs it and its parent.
+`create_job_nonce_disk` exclusively creates the 1,708,032-byte, owner-readable,
+read-only raw image with the nonce format and build extension above, zero
+padding, and fsyncs it and its parent.
 
 `spawn_job_helper(executable, plan, slot_file)` starts one helper per VM, blocked
 on its stdin gate. The caller retains the slot lock; an inherited descriptor
@@ -345,7 +456,7 @@ SIGKILL escalation; the overall stop/proof polling budget is 1.4 s. It then call
 `process::release_proven` until the stop
 bound expires. It requires both that the recorded service PID/start identity is
 no longer alive and that no inspectable same-UID process holds the clone boot
-disk, auxiliary storage or nonce disk by descriptor or fileport. Query errors,
+disk, auxiliary storage, nonce disk or build disk by descriptor or fileport. Query errors,
 partial scans and missing disk paths are **not** proof. Do not delete the paths
 or reuse the slot if proof fails; retain the record and report degraded for
 operator attention. With no reported service, the same descriptor/fileport scan
@@ -407,13 +518,16 @@ root guest output spools. The 20/40 GiB admission/eviction floors are host-wide
 pressure policy, not per-job byte limits; a hostile job can still consume state
 volume space. Operators must monitor the volume and quarantined inventories.
 
-The target store is untrusted guest output and is published after non-cancelled
-failed jobs as well as successful ones, including signals or an incomplete agent
-session once VM disk release is proven. This deliberately matches Linux, where a
+The build disk is untrusted guest output and is published after failed jobs as
+well as successful ones, including signals, once the agent reported terminal
+status and VM disk release is proven. This deliberately matches Linux, where a
 workspace retains its target between jobs. The case-insensitive workspace key is
 not a branch/principal integrity boundary: later jobs may consume earlier build
-artifacts. The host only clones, swaps and removes that data; it never executes
-or parses it. Neither cache integrity partitioning nor quotas are provided here.
+artifacts. The host only creates, clones, renames and removes that file; it never
+mounts, executes or parses it. The guest kernel mounts a volume that an earlier
+job of the checkout wrote through ordinary file operations only, since `motorjob`
+cannot write the raw device. Each checkout's disk is capped at 128 GiB; there is
+no cache integrity partitioning.
 
 ### Additional rented-Mac/guest audit qualification
 

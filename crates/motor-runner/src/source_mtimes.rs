@@ -23,17 +23,15 @@ struct DiskIdentity {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Store<'a> {
+    /// A regular file whose identity names the build store: a Windows cache
+    /// disk, or a macOS checkout's build-disk image.
     File(&'a Path),
-    #[cfg(unix)]
-    Directory(&'a Path),
 }
 
 impl<'a> Store<'a> {
     fn path(self) -> &'a Path {
         match self {
             Store::File(path) => path,
-            #[cfg(unix)]
-            Store::Directory(path) => path,
         }
     }
 }
@@ -43,8 +41,6 @@ fn identity(store: Store<'_>) -> Option<DiskIdentity> {
     let metadata = fs::symlink_metadata(disk).ok()?;
     let valid = match store {
         Store::File(_) => metadata.is_file(),
-        #[cfg(unix)]
-        Store::Directory(_) => metadata.is_dir(),
     };
     if !valid {
         return None;
@@ -242,17 +238,19 @@ pub(crate) fn ended(store: Store<'_>, record_path: &Path, now_ms: u64) -> io::Re
     write_record(record_path, &record)
 }
 
-/// Bind history to an atomically replaced directory store, only after proving
-/// the VM stopped and publishing its build folder. A crash before this write
-/// leaves an identity mismatch, so older history cannot authorize reuse.
+/// Bind history to a store that was atomically replaced, only after proving
+/// the VM stopped and publishing its build store. Each publication renames a
+/// new file over the store, so the identity recorded at preparation no longer
+/// matches; this binds the history to the published one. A crash before this
+/// write leaves an identity mismatch, so older history cannot authorize reuse.
 #[cfg(unix)]
 pub(crate) fn replaced(
     mut record: Record,
-    directory: &Path,
+    store: Store<'_>,
     record_path: &Path,
     now: SystemTime,
 ) -> io::Result<()> {
-    record.disk = identity(Store::Directory(directory));
+    record.disk = identity(store);
     if record.disk.is_none() {
         return forget(record_path);
     }
@@ -759,6 +757,58 @@ mod tests {
         let candidate = load(&f.record).unwrap();
         fs::rename(&f.disk, f.root.join("old-disk")).unwrap();
         commit(candidate, Store::File(&f.disk), &f.record).unwrap();
+        assert!(!f.record.exists());
+    }
+
+    /// A macOS build-disk image is replaced after every job by renaming a new
+    /// file over it, so preparation recorded the old file's identity. The
+    /// history must follow the published file, or the next job would stamp
+    /// every source file as new and Cargo would rebuild everything.
+    #[cfg(unix)]
+    #[test]
+    fn replaced_file_store_keeps_unchanged_times_across_publication() {
+        let f = Fixture::new();
+        f.stage("first", 1_800_000_000);
+        let (second, exported) = f.extract("second");
+        let (candidate, _) = f.apply(
+            &second,
+            &exported,
+            &seal(&exported),
+            1,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_010),
+        );
+        let published = f.root.join("published");
+        fs::write(&published, "new cache disk").unwrap();
+        fs::rename(&published, &f.disk).unwrap();
+        replaced(
+            candidate,
+            Store::File(&f.disk),
+            &f.record,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_020),
+        )
+        .unwrap();
+        let (third, exported) = f.extract("third");
+        let (_, times) = f.apply(
+            &third,
+            &exported,
+            &seal(&exported),
+            1,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_030),
+        );
+        for repo in ["main", "sibling"] {
+            assert_eq!(mtime(&times, repo, "unchanged.rs"), 1_800_000_000);
+        }
+        // A store path that no longer names a regular file forgets history.
+        let candidate = load(&f.record).unwrap();
+        fs::remove_file(&f.disk).unwrap();
+        fs::create_dir(&f.disk).unwrap();
+        replaced(
+            candidate,
+            Store::File(&f.disk),
+            &f.record,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_040),
+        )
+        .unwrap();
         assert!(!f.record.exists());
     }
 

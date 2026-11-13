@@ -16,14 +16,24 @@ pub const AUXILIARY_STORAGE: &str = "auxiliary-storage";
 pub const HARDWARE_MODEL: &str = "hardware-model";
 pub const MACHINE_IDENTIFIER: &str = "machine-identifier";
 pub const VSOCK_PORT: u32 = 5000;
+pub mod apfs;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod disk_release;
 mod nonce;
 pub use nonce::{
-    BootConfig, Mount, NONCE_DISK_SIZE, NONCE_HEADER, create_nonce_disk, decode_boot_config,
-    nonce_bytes, read_boot_candidate, read_boot_config,
+    BUILD_EXTENSION_HEADER, BUILD_EXTENSION_SIZE, BootConfig, BuildConfig, MAX_BUILD_RETURN_BYTES,
+    MAX_BUILD_RETURNS, Mount, NONCE_DISK_SIZE, NONCE_HEADER, NONCE_IMAGE_SIZE,
+    create_job_nonce_disk, create_nonce_disk, decode_boot_config, nonce_bytes, read_boot_candidate,
+    read_boot_config,
 };
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
+/// The job's writable build disk, in its clone directory beside the boot disk.
+/// The guest agent mounts it at the checkout's `target/`.
+pub const BUILD_DISK: &str = "build-disk.img";
+/// Every build disk has exactly this size. The guest agent identifies the disk
+/// by it: the guest cannot resize a block device, and no other disk the job VM
+/// sees has this size (the boot disk is 96 GiB, the nonce disk under 2 MiB).
+pub const BUILD_DISK_SIZE: u64 = 128 << 30;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +68,7 @@ pub struct Disk {
 #[derive(Clone, Debug)]
 pub struct JobVmConfig {
     request: JobVmRequest,
-    disks: [Disk; 2],
+    disks: [Disk; 3],
     shares: Vec<Share>,
 }
 
@@ -144,13 +154,17 @@ impl JobVmConfig {
                     path: request.nonce_disk.clone(),
                     read_only: true,
                 },
+                Disk {
+                    path: request.clone.join(BUILD_DISK),
+                    read_only: false,
+                },
             ],
             request,
             shares,
         })
     }
 
-    pub fn disks(&self) -> &[Disk; 2] {
+    pub fn disks(&self) -> &[Disk; 3] {
         &self.disks
     }
     pub fn auxiliary_storage(&self) -> PathBuf {
@@ -429,6 +443,8 @@ pub fn clone_image(sealed: &Path, destination: &Path) -> io::Result<()> {
             std::fs::Permissions::from_mode(0o600),
         )?;
     }
+    // Every job VM gets a build disk; the runner may swap in its checkout's kept one.
+    create_blank_build_disk(&destination.join(BUILD_DISK))?;
     std::fs::File::open(destination)?.sync_all()?;
     std::fs::File::open(
         destination
@@ -436,6 +452,22 @@ pub fn clone_image(sealed: &Path, destination: &Path) -> io::Result<()> {
             .ok_or_else(|| invalid("clone has no parent"))?,
     )?
     .sync_all()
+}
+
+/// Creates a new, empty build disk: a sparse file of exactly `BUILD_DISK_SIZE`
+/// bytes, readable and writable only by its owner. Its blocks are all zero, so
+/// the guest agent formats it before its first use.
+#[cfg(unix)]
+pub fn create_blank_build_disk(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let disk = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    disk.set_len(BUILD_DISK_SIZE)?;
+    disk.sync_all()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -564,6 +596,10 @@ mod tests {
                 Disk {
                     path: "/state/nonces/job.raw".into(),
                     read_only: true
+                },
+                Disk {
+                    path: "/state/clones/job/build-disk.img".into(),
+                    read_only: false
                 }
             ]
         );
@@ -818,7 +854,7 @@ mod tests {
         create_nonce_disk(&path, NONCE, &[]).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
-            NONCE_DISK_SIZE as u64
+            NONCE_IMAGE_SIZE as u64
         );
         assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
         assert_eq!(
@@ -877,12 +913,41 @@ mod tests {
     #[test]
     fn nonce_parser_refuses_bad_header_padding_and_length() {
         for index in [0, NONCE_HEADER.len(), NONCE_DISK_SIZE - 1] {
-            let mut bytes = nonce_bytes(NONCE, &[]).unwrap();
+            let mut bytes = nonce_bytes(NONCE, &[], &BuildConfig::default()).unwrap();
             bytes[index] = b'X';
             assert!(read_boot_config(bytes.as_slice()).is_err());
         }
         assert!(read_boot_config(&b"short"[..]).is_err());
-        assert!(nonce_bytes("ABCDEF01234567890123456789012345", &[]).is_err());
+        assert!(
+            nonce_bytes(
+                "ABCDEF01234567890123456789012345",
+                &[],
+                &BuildConfig::default()
+            )
+            .is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn blank_build_disk_is_sparse_private_exact_and_never_overwritten() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = cortexkit_test_support::scratch_root()
+            .join(format!("macvm-build-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(BUILD_DISK);
+        create_blank_build_disk(&path).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), BUILD_DISK_SIZE);
+        assert_eq!(metadata.len(), 128 * 1024 * 1024 * 1024);
+        // Sparse: a blank 128 GiB disk must not take 128 GiB of host disk.
+        assert!(metadata.blocks() * 512 < 64 * 1024 * 1024);
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        assert!(create_blank_build_disk(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &path).unwrap();
+        assert!(create_blank_build_disk(&path).is_err());
+        assert!(!root.join("elsewhere").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -1181,11 +1246,19 @@ pub mod process {
         if service.map(identity_alive).transpose()?.unwrap_or(false) {
             return Ok(false);
         }
-        let keys = [
+        let mut keys = vec![
             file_key(&clone.join(BOOT_DISK))?,
             file_key(&clone.join(AUXILIARY_STORAGE))?,
             file_key(nonce_disk)?,
         ];
+        // The build disk is published by renaming it out of the clone, so no
+        // process may still hold it. A job that failed before its clone got a
+        // build disk has none to hold.
+        match file_key(&clone.join(BUILD_DISK)) {
+            Ok(key) => keys.push(key),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         for pid in same_uid_pids()? {
             match open_files(pid, service, &keys) {
                 Ok(open) if open.iter().any(|key| keys.contains(key)) => return Ok(false),

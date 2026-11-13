@@ -124,16 +124,57 @@ pub(super) struct Entry {
     pub active: AtomicBool,
     pub failed: AtomicBool,
     cleanup: Mutex<()>,
+    /// True once the job's build disk is published. Held from publication's
+    /// last cancellation check through its rename, and by every cancel.
+    publication: Mutex<bool>,
     #[cfg(test)]
     pub output_blocked: AtomicBool,
 }
 impl Entry {
+    fn new(record: Record, slot: Option<File>, active: bool) -> Self {
+        Self {
+            owned: Mutex::new(Owned {
+                record,
+                slot,
+                workspace_lock: None,
+                helper: None,
+            }),
+            cancel: Cancellation::default(),
+            active: AtomicBool::new(active),
+            failed: AtomicBool::new(false),
+            cleanup: Mutex::new(()),
+            publication: Mutex::new(false),
+            #[cfg(test)]
+            output_blocked: AtomicBool::new(false),
+        }
+    }
     pub fn check(&self) -> io::Result<()> {
         if self.cancel.0.load(Ordering::Acquire) {
             Err(invalid("macOS job cancelled"))
         } else {
             Ok(())
         }
+    }
+    /// Cancels the job. A cancel either lands before the build disk's
+    /// publication commits, which then publishes nothing, or waits for it to
+    /// finish; returns whether the disk was already published.
+    pub fn cancel_job(&self) -> bool {
+        let published = self.publication.lock().unwrap();
+        self.cancel.cancel();
+        *published
+    }
+    /// Runs `commit`, the build disk's rename, unless the job is cancelled,
+    /// with cancellation held off until it returns, and records success.
+    pub fn publish(&self, commit: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let mut published = self.publication.lock().unwrap();
+        self.check()?;
+        commit()?;
+        *published = true;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub fn published(&self) -> bool {
+        *self.publication.lock().unwrap()
     }
 }
 
@@ -157,7 +198,7 @@ pub(super) trait Host: Send + Sync {
     }
 }
 struct Native;
-const RELEASE_PROOF_VERSION: u8 = 2;
+pub(super) const RELEASE_PROOF_VERSION: u8 = 2;
 fn release_slot(owned: &mut Owned) -> io::Result<()> {
     if !owned.record.stop_proven
         || owned.record.proof_version != RELEASE_PROOF_VERSION
@@ -372,20 +413,7 @@ impl Runtime {
         };
         // This durable inventory precedes staging, including the first job directory.
         Self::save(root, &record)?;
-        let entry = Arc::new(Entry {
-            owned: Mutex::new(Owned {
-                record,
-                slot: None,
-                workspace_lock: None,
-                helper: None,
-            }),
-            cancel: Cancellation::default(),
-            active: AtomicBool::new(true),
-            failed: AtomicBool::new(false),
-            cleanup: Mutex::new(()),
-            #[cfg(test)]
-            output_blocked: AtomicBool::new(false),
-        });
+        let entry = Arc::new(Entry::new(record, None, true));
         if self.cancelled.lock().unwrap().contains(&id) {
             entry.cancel.cancel();
         }
@@ -398,13 +426,15 @@ impl Runtime {
     pub fn cancel(&self, id: Uuid) {
         self.cancelled.lock().unwrap().insert(id);
         if let Some(entry) = self.entry(id) {
-            entry.cancel.cancel();
+            if entry.cancel_job() {
+                tracing::info!(job_id = %id, "cancel arrived after the build disk was published");
+            }
         }
     }
     pub fn interrupt(&self, id: Uuid) {
         if let Some(entry) = self.entry(id) {
             self.cancelled.lock().unwrap().insert(id);
-            entry.cancel.cancel();
+            entry.cancel_job();
         }
     }
     pub fn cancelled(&self, id: Uuid) -> bool {
@@ -800,23 +830,10 @@ impl Runtime {
                 let _ = fs2::FileExt::try_lock_exclusive(file);
             }
             let id = record.id;
-            self.jobs.lock().unwrap().insert(
-                id,
-                Arc::new(Entry {
-                    owned: Mutex::new(Owned {
-                        record,
-                        slot,
-                        workspace_lock: None,
-                        helper: None,
-                    }),
-                    cancel: Cancellation::default(),
-                    active: AtomicBool::new(false),
-                    failed: AtomicBool::new(false),
-                    cleanup: Mutex::new(()),
-                    #[cfg(test)]
-                    output_blocked: AtomicBool::new(false),
-                }),
-            );
+            self.jobs
+                .lock()
+                .unwrap()
+                .insert(id, Arc::new(Entry::new(record, slot, false)));
         }
         let entries: Vec<_> = self.jobs.lock().unwrap().values().cloned().collect();
         for entry in entries {
@@ -862,6 +879,81 @@ pub(super) fn key(workspace: &str) -> String {
         "{:x}",
         Sha256::digest(workspace.to_ascii_lowercase().as_bytes())
     )
+}
+/// File name of a checkout's kept build disk in `targets/`.
+pub(super) fn image(workspace: &str) -> String {
+    format!("{}.img", key(workspace))
+}
+
+/// One checkout's kept build store in `targets/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BuildStore {
+    pub name: String,
+    /// The checkout's key, which names its workspace lock.
+    pub key: String,
+    /// A build folder kept before build disks existed. No job reads one again;
+    /// each is deleted after its checkout's first build disk is published.
+    pub legacy: bool,
+    /// Last modification as (seconds, nanoseconds). Publication stamps a
+    /// build disk, so this is when its checkout last finished a job.
+    pub modified: (i64, i64),
+    /// Bytes the store's file occupies on the host disk. An image's apparent
+    /// size is always the fixed build-disk size and says nothing about cost.
+    /// Legacy folders are not measured and count as zero.
+    pub allocated: u64,
+}
+
+/// Lists build disks (`<key>.img`) and legacy build folders (`<key>`),
+/// ignoring everything else in `targets/`, such as source-time histories.
+pub(super) fn build_stores(targets: &Dir) -> io::Result<Vec<BuildStore>> {
+    let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut stores = Vec::new();
+    for name in targets.names()? {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let (key, legacy) = match name.strip_suffix(".img") {
+            Some(key) if hex(key) => (key, false),
+            None if hex(name) => (name, true),
+            _ => continue,
+        };
+        let stat = match targets.stat(name.as_ref()) {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let kind = stat.st_mode & libc::S_IFMT;
+        if kind != if legacy { libc::S_IFDIR } else { libc::S_IFREG } {
+            continue;
+        }
+        stores.push(BuildStore {
+            name: name.into(),
+            key: key.into(),
+            legacy,
+            #[allow(clippy::unnecessary_cast)]
+            modified: (stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+            allocated: if legacy {
+                0
+            } else {
+                u64::try_from(stat.st_blocks).unwrap_or(0) * 512
+            },
+        });
+    }
+    Ok(stores)
+}
+
+/// Legacy folders go first, since no job will read them again. Build disks
+/// follow least recently used first; between disks last used at the same
+/// moment, the one holding more host disk goes first.
+pub(super) fn eviction_order(mut stores: Vec<BuildStore>) -> Vec<BuildStore> {
+    stores.sort_by(|a, b| {
+        b.legacy
+            .cmp(&a.legacy)
+            .then(a.modified.cmp(&b.modified))
+            .then(b.allocated.cmp(&a.allocated))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    stores
 }
 pub(super) fn control(cancel: Cancellation) -> Control {
     Control {
@@ -925,23 +1017,25 @@ pub(crate) fn evict(
             }
         }
         if let Ok(targets) = Dir::open(&root.join("targets"), false) {
-            for name in targets.names()? {
+            for store in eviction_order(build_stores(&targets)?) {
                 if probe()? >= 40 << 30 {
                     break;
                 }
-                let Some(key) = name
-                    .to_str()
-                    .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-                else {
-                    continue;
-                };
+                // A running job holds its checkout's lock for its whole life,
+                // including while it clones the image in and renames it back.
                 let lock = lock_file(
                     &root
                         .join("macvm-locks")
-                        .join(format!("workspace-{key}.lock")),
+                        .join(format!("workspace-{}.lock", store.key)),
                 )?;
                 if let Ok(_lock) = ScopedLock::try_exclusive(lock) {
-                    targets.remove(&name)?;
+                    targets.remove(store.name.as_ref())?;
+                    tracing::info!(
+                        name = store.name,
+                        legacy = store.legacy,
+                        allocated_bytes = store.allocated,
+                        "evicted macOS build store"
+                    );
                 }
             }
         }

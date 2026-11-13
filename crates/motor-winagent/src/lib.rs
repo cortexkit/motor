@@ -27,7 +27,10 @@ pub mod transport;
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
 pub const PROTOCOL_VERSION: u32 = 10;
 /// Version of the macOS profile, versioned independently of the Windows one.
-pub const MACOS_PROTOCOL_VERSION: u32 = 1;
+/// Version 2 agents mount the job's build disk at the checkout's `target/`
+/// and copy returned files out of it; a version 1 agent would build on the
+/// shared folder instead, so the runner refuses it.
+pub const MACOS_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
