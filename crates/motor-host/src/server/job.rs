@@ -159,11 +159,7 @@ impl Runtime {
                     .lock()
                     .expect("host lock")
                     .job_stop_intent(job, unclean)?;
-                self.control.stop_job(job)?;
-                self.helper_stopped_jobs
-                    .lock()
-                    .expect("helper stopped jobs")
-                    .insert(job.to_owned());
+                self.release_job_vm(job)?;
                 self.collect_job_exits(unix_ms())?;
                 // A successful stop call alone is not the durable exit receipt.
                 // Retain reservations until receipt/ack, or the evidence bound.
@@ -193,12 +189,18 @@ impl Runtime {
         stream::publish_settlement(self, job, &stream)
     }
 
-    /// Forgets that this process stopped a job's VM, once the job has ended.
-    fn forget_helper_stop(&self, job: &str) {
-        self.helper_stopped_jobs
+    /// Lease settlement does not release the helper's durable disk ownership.
+    /// Repeat stop after a host restart, but not on every tick in one process.
+    fn release_job_vm(&self, job: &str) -> Result<()> {
+        let mut stopped = self
+            .helper_stopped_jobs
             .lock()
-            .expect("helper stopped jobs")
-            .remove(job);
+            .expect("helper stopped jobs");
+        if !stopped.contains(job) {
+            self.control.stop_job(job)?;
+            stopped.insert(job.to_owned());
+        }
+        Ok(())
     }
 
     pub(super) fn recover_jobs(self: &Arc<Self>) -> Result<()> {
@@ -575,6 +577,12 @@ impl Runtime {
                         })
                 };
                 if expired {
+                    // Keep the disk attached until the helper has released it.
+                    // Absence and even a durable receipt prove no such release.
+                    if let Err(error) = self.release_job_vm(job) {
+                        tick_step(&mut failure, "release_gone_vm", Err::<(), _>(error));
+                        continue;
+                    }
                     let result = self
                         .host
                         .lock()
@@ -603,8 +611,21 @@ impl Runtime {
             .lock()
             .expect("released jobs")
             .retain(|job| ended.binary_search(job).is_ok());
+        let known: BTreeSet<_> = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions
+            .keys()
+            .cloned()
+            .collect();
+        self.helper_stopped_jobs
+            .lock()
+            .expect("helper stopped jobs")
+            .retain(|job| known.contains(job));
         for job in ended {
-            self.forget_helper_stop(&job);
             if self
                 .host
                 .lock()
@@ -756,7 +777,14 @@ impl Runtime {
             .per_job
             .executions
             .values()
-            .filter(|e| !e.ended)
+            .filter(|e| {
+                !e.ended
+                    || !self
+                        .helper_stopped_jobs
+                        .lock()
+                        .expect("helper stopped jobs")
+                        .contains(&e.claims.jti)
+            })
             .filter_map(|e| e.evidence.as_ref()?.exit.as_ref().map(|r| r.report()))
             .collect();
         for report in receipts {
@@ -766,6 +794,14 @@ impl Runtime {
     }
 
     fn finish_job_exit(&self, report: &motor_vm_helper::job::ExitReport) -> Result<()> {
+        let already_ended = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions[&report.job_id]
+            .ended;
         let acknowledged = self
             .host
             .lock()
@@ -783,28 +819,9 @@ impl Runtime {
                 .expect("host lock")
                 .job_exit_acknowledged(report)?;
         }
-        // A VM that ended by itself still holds its jail and workspace disk in
-        // the helper until a stop releases them; without it the disk stays
-        // "awaiting cleanup" and its next job or recovery is refused. A VM
-        // this host stopped already went through the helper's stop, and an
-        // ended job (a repeated report) was released the first time.
-        let ended = self
-            .host
-            .lock()
-            .expect("host lock")
-            .snapshot
-            .per_job
-            .executions[&report.job_id]
-            .ended;
-        if !ended
-            && !self
-                .helper_stopped_jobs
-                .lock()
-                .expect("helper stopped jobs")
-                .contains(&report.job_id)
-        {
-            self.control.stop_job(&report.job_id)?;
-        }
+        // A late receipt may belong to a lease already ended through the
+        // evidence bound. It still needs the helper's disk release.
+        self.release_job_vm(&report.job_id)?;
         {
             let mut host = self.host.lock().expect("host lock");
             let unclean = host.snapshot.per_job.executions[&report.job_id]
@@ -814,7 +831,9 @@ impl Runtime {
                 .unwrap_or(true);
             host.job_stopped_at(&report.job_id, unclean, unix_ms())?;
         }
-        self.publish_job_settlement(&report.job_id)?;
+        if !already_ended {
+            self.publish_job_settlement(&report.job_id)?;
+        }
         self.job_resources.release(&report.job_id)
     }
 

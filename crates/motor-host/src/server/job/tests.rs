@@ -110,6 +110,10 @@ struct Fake {
     write_block_reply: Mutex<Option<Value>>,
     write_block_errors: Mutex<usize>,
     recovery_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
+    disk_holders: Mutex<BTreeMap<String, String>>,
+    refuse_recovery_start: AtomicBool,
+    fail_stop: AtomicBool,
+    defer_stop_exit: AtomicBool,
     /// A refusal the fake runner sends instead of `accepted` for a Run.
     refuse_run: Mutex<Option<Value>>,
     /// After refusing, stop reading the channel but keep it open until the
@@ -288,6 +292,18 @@ impl Control for Fake {
         self.wait("boot");
         if start.kind == motor_vm_helper::job::VmKind::Recovery {
             self.recovery_starts.lock().unwrap().push(start.clone());
+            ensure!(
+                !self
+                    .disk_holders
+                    .lock()
+                    .unwrap()
+                    .contains_key(&start.workspace_disk_id),
+                "workspace disk still held by a VM"
+            );
+            ensure!(
+                !self.refuse_recovery_start.load(Ordering::Acquire),
+                "start refused"
+            );
             return Ok(json!({"result":"job","running":true}));
         }
         Ok(json!({"result":"job","running":true,"tap_index":1}))
@@ -365,23 +381,43 @@ impl Control for Fake {
     }
     fn delete_workspace(&self, _: &str, disk_id: &str) -> Result<()> {
         self.calls.lock().unwrap().push(format!("delete:{disk_id}"));
+        ensure!(
+            !self.disk_holders.lock().unwrap().contains_key(disk_id),
+            "workspace disk still held by a VM"
+        );
         Ok(())
     }
     fn stop_job(&self, job: &str) -> Result<()> {
         self.wait("stop");
         self.calls.lock().unwrap().push(format!("stop:{job}"));
-        self.stopped.store(true, Ordering::SeqCst);
-        *self.gate.0.lock().unwrap() = true;
-        self.gate.1.notify_all();
-        self.peers.lock().unwrap().clear();
-        self.exits
+        ensure!(!self.fail_stop.load(Ordering::Acquire), "stop unavailable");
+        self.disk_holders
             .lock()
             .unwrap()
-            .push(motor_vm_helper::job::ExitReport {
-                job_id: job.into(),
-                oom_kill: 0,
-                egress_bytes: None,
-            });
+            .retain(|_, holder| holder != job);
+        self.stopped.store(true, Ordering::SeqCst);
+        if *self.hang.lock().unwrap() != "recovery"
+            || self
+                .recovery_starts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|start| start.job_id == job)
+        {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+        self.peers.lock().unwrap().clear();
+        if !self.defer_stop_exit.load(Ordering::Acquire) {
+            self.exits
+                .lock()
+                .unwrap()
+                .push(motor_vm_helper::job::ExitReport {
+                    job_id: job.into(),
+                    oom_kill: 0,
+                    egress_bytes: None,
+                });
+        }
         Ok(())
     }
     fn job_relay(&self, _: &str, port: u32) -> Result<UnixStream> {

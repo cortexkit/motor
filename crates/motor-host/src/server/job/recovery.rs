@@ -44,10 +44,14 @@ impl Runtime {
         let Some(mut recovery) = disk.recovery.clone() else {
             return Ok(());
         };
+        if recovery.retry_after_ms.is_some_and(|at| now_ms < at) {
+            return Ok(());
+        }
         let mut workers = self.job_recoveries.lock().expect("recovery workers");
-        if recovery
-            .started_at_ms
-            .is_some_and(|at| now_ms >= at.saturating_add(timeout))
+        if !matches!(recovery.phase, Phase::Stopping | Phase::Deleting)
+            && recovery
+                .started_at_ms
+                .is_some_and(|at| now_ms >= at.saturating_add(timeout))
         {
             self.host.lock().expect("host lock").recovery_phase(
                 disk_id,
@@ -88,38 +92,51 @@ impl Runtime {
             {
                 return Ok(());
             }
-            if let Err(error) = self.control.stop_job(&recovery.id) {
-                self.host.lock().expect("host lock").recovery_phase(
-                    disk_id,
-                    &recovery.id,
-                    Phase::Deleting,
-                    now_ms,
-                    Some("stop_failed"),
-                )?;
-                recovery.phase = Phase::Deleting;
-                // An unsuccessful start may have no helper record. Deletion
-                // still independently refuses every disk held by any VM.
-                tracing::warn!(disk_id, %error, "recovery_stop_before_delete_failed");
-            }
-            for report in self.control.job_exits()? {
-                if report.job_id == recovery.id {
-                    self.control.ack_job_exit(&report)?;
+            let cleanup = (|| -> Result<()> {
+                if let Err(error) = self.control.stop_job(&recovery.id) {
+                    // A failed start may have no VM, even if helper cleanup
+                    // still needs retrying. Absence is not release.
+                    if matches!(self.control.adopt_job(&recovery.id), Ok(false)) {
+                        self.host
+                            .lock()
+                            .expect("host lock")
+                            .recovery_vm_released(disk_id)?;
+                    }
+                    return Err(error);
                 }
+                self.host
+                    .lock()
+                    .expect("host lock")
+                    .recovery_vm_released(disk_id)?;
+                // Older hosts could detach a finished job without releasing
+                // its helper record. Repair those holders before deletion too.
+                self.release_recovery_holders(disk_id)?;
+                for report in self.control.job_exits()? {
+                    if report.job_id == recovery.id {
+                        self.control.ack_job_exit(&report)?;
+                    }
+                }
+                if recovery.phase == Phase::Deleting {
+                    self.control.delete_workspace(&disk.sub, disk_id)?;
+                }
+                self.job_resources.release(&recovery.id)?;
+                self.host
+                    .lock()
+                    .expect("host lock")
+                    .recovery_finished(disk_id, recovery.phase == Phase::Deleting)?;
+                Ok(())
+            })();
+            if let Err(error) = cleanup {
+                return self.defer_recovery(disk_id, now_ms, &error);
             }
-            let deleted = recovery.phase == Phase::Deleting;
-            if deleted {
-                self.control.delete_workspace(&disk.sub, disk_id)?;
-            }
-            self.job_resources.release(&recovery.id)?;
-            self.host
-                .lock()
-                .expect("host lock")
-                .recovery_finished(disk_id, deleted)?;
             workers.remove(&recovery.id);
             return Ok(());
         }
         if workers.contains_key(&recovery.id) {
             return Ok(());
+        }
+        if let Err(error) = self.release_recovery_holders(disk_id) {
+            return self.defer_recovery(disk_id, now_ms, &error);
         }
         let fresh = recovery.phase == Phase::Reserved;
         let assignment = match self
@@ -130,18 +147,21 @@ impl Runtime {
             Err(error) => {
                 // A reservation manager can be unavailable temporarily. There
                 // has been no VM start, so its recovery clock has not begun.
-                tracing::warn!(disk_id, %error, "workspace_recovery_image_wait");
-                return Ok(());
+                return self.defer_recovery(disk_id, now_ms, &error);
             }
         };
         if fresh {
-            self.host.lock().expect("host lock").recovery_phase(
+            let result = self.host.lock().expect("host lock").recovery_phase(
                 disk_id,
                 &recovery.id,
                 Phase::Running,
                 now_ms,
                 None,
-            )?;
+            );
+            if let Err(error) = result {
+                self.job_resources.release(&recovery.id)?;
+                return self.defer_recovery(disk_id, now_ms, &error.into());
+            }
         }
         let control = self.control.clone();
         let start = recovery_start(disk_id, &disk.sub, &recovery, &assignment);
@@ -180,6 +200,33 @@ impl Runtime {
                 result: rx,
             },
         );
+        Ok(())
+    }
+
+    fn release_recovery_holders(&self, disk_id: &str) -> Result<()> {
+        let holders: Vec<_> = self
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .filter(|e| e.disk_id == disk_id && e.boot_started && e.ended)
+            .map(|e| e.claims.jti.clone())
+            .collect();
+        for holder in holders {
+            self.release_job_vm(&holder)?;
+        }
+        Ok(())
+    }
+
+    fn defer_recovery(&self, disk_id: &str, now_ms: u64, error: &anyhow::Error) -> Result<()> {
+        self.host
+            .lock()
+            .expect("host lock")
+            .recovery_retry(disk_id, now_ms)?;
+        tracing::warn!(disk_id, %error, "workspace_recovery_wait");
         Ok(())
     }
 }

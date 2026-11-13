@@ -145,6 +145,12 @@ impl Runtime {
             drop(host);
             // A file commit can outlive its following state transaction. Restore
             // observations and the watermark before exposing any committed bytes.
+            if store.ended() {
+                self.host
+                    .lock()
+                    .expect("host lock")
+                    .job_replay_closed(job, ReplayCompletion::Terminal)?;
+            }
             for position in 0..store.len() {
                 let frame =
                     crate::replay::decode(&store.frame(position)?.context("replay frame")?)?;
@@ -451,7 +457,7 @@ async fn collect(
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let seq = frame.value["seq"].as_u64();
                 s.with_store(|s| {
-                    let delivery = if frame.value["type"] == "terminal" {
+                    let delivery = if frame.value["type"] == "terminal" && !s.ended() {
                         r.observe_job_frame(&job, &frame.value)?
                             .map(|terminal| host_terminal_delivery(terminal, s.last_seq()))
                             .filter(|terminal| *terminal != frame.value)

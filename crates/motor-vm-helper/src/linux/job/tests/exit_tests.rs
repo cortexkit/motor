@@ -64,6 +64,96 @@ fn expected(count: u64) -> ExitReport {
     }
 }
 
+#[test]
+fn missing_oom_evidence_names_path_and_retries_without_inventing_zero() {
+    let base = scratch();
+    let mut jobs = fixture(&base);
+    jobs.save(&record()).unwrap();
+    jobs.adopt_record(record()).unwrap();
+    let group = empty_group(&jobs, 3);
+    std::fs::remove_file(group.join("memory.events")).unwrap();
+    let error = jobs.collect_exit(&start().job_id).unwrap_err();
+    assert!(error.0.contains("read final job oom evidence"), "{error}");
+    assert!(
+        error
+            .0
+            .contains(&group.join("memory.events").display().to_string()),
+        "{error}"
+    );
+    assert!(reports(&mut jobs).is_empty());
+    assert_eq!(read_record(&jobs).oom_kill, None);
+    std::fs::write(group.join("memory.events"), "oom_kill 3\n").unwrap();
+    assert_eq!(reports(&mut jobs), [expected(3)]);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn job_relay_failure_does_not_block_concurrent_exit_collection() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::{mpsc, Arc, Mutex};
+    for socket_state in ["absent", "refused", "silent", "backlog"] {
+        let base = scratch();
+        let root = base.join("relay");
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = (socket_state != "absent")
+            .then(|| UnixListener::bind(root.join("vsock.sock")).unwrap());
+        let listener = if socket_state == "refused" {
+            drop(listener);
+            None
+        } else {
+            listener
+        };
+        let mut queued = Vec::new();
+        if socket_state == "backlog" {
+            let listener = listener.as_ref().unwrap();
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+            queued.push(UnixStream::connect(root.join("vsock.sock")).unwrap());
+        }
+        let jobs = Arc::new(Mutex::new(fixture(&base)));
+        let (entered, rx) = mpsc::channel();
+        let worker = jobs.clone();
+        let relay = std::thread::spawn(move || {
+            // Ordinary helper RPC dispatch holds this mutex for the whole open.
+            let _guard = worker.lock().unwrap();
+            entered.send(()).unwrap();
+            assert!(tenant::connect_job_relay(&root, peer().uid, 53).is_err());
+        });
+        rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert!(reports(&mut jobs.lock().unwrap()).is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{socket_state} relay delayed job_exits: {:?}",
+            started.elapsed()
+        );
+        relay.join().unwrap();
+        drop((listener, queued, jobs));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[test]
+fn job_relay_accepts_a_valid_peer_and_clears_handshake_timeouts() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let base = scratch();
+    let listener = UnixListener::bind(base.join("vsock.sock")).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 11];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"CONNECT 53\n");
+        stream.write_all(b"OK 53\n").unwrap();
+    });
+    let fd = tenant::connect_job_relay(&base, peer().uid, 53).unwrap();
+    let stream = UnixStream::from(fd);
+    assert_eq!(stream.read_timeout().unwrap(), None);
+    assert_eq!(stream.write_timeout().unwrap(), None);
+    server.join().unwrap();
+    drop(stream);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 fn fault_replays_one_report(step: ExitStep) {
     let base = scratch();
     let mut jobs = fixture(&base);

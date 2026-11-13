@@ -222,7 +222,8 @@ fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_wa
             memory_debit_mib: 600,
             guest_ram_mib: 700,
             started_at_ms: None,
-            phase: crate::state::jobs::recovery::Phase::Reserved,
+            phase: crate::state::jobs::recovery::Phase::Running,
+            retry_after_ms: None,
         });
     host.job_vm_file_mib = Some(512);
     let fill_debit = host

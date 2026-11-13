@@ -75,6 +75,7 @@ fn amended_contract_cold_idle_busy_quarantine_and_recovery_bytes() {
         guest_ram_mib: 134,
         started_at_ms: Some(AT),
         phase: Phase::Running,
+        retry_after_ms: None,
     });
     assert_eq!(
         bytes(&mut h, AT),

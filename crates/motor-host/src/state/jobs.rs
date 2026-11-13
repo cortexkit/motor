@@ -267,6 +267,7 @@ impl Host {
             .disks
             .values()
             .filter_map(|d| d.recovery.as_ref())
+            .filter(|r| r.holds_vm_capacity())
             .fold(free, |free, r| free.saturating_sub(r.memory_debit_mib));
         self.snapshot
             .per_job
@@ -317,6 +318,7 @@ impl Host {
             .disks
             .values()
             .filter_map(|disk| disk.recovery.as_ref())
+            .filter(|recovery| recovery.holds_vm_capacity())
             .fold(0u64, |sum, recovery| {
                 sum.saturating_add(recovery.memory_debit_mib)
             });

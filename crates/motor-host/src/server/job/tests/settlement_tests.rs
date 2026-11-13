@@ -440,6 +440,98 @@ fn reboot_gap_bound_starts_at_first_gone_observation_and_survives_restart() {
 }
 
 #[test]
+fn evidence_gap_stops_helper_before_detaching_disk_and_late_exit_retries_release() {
+    let (runtime, fake, _) = fixture();
+    running(&runtime, JOB, true, true);
+    let now = unix_ms();
+    fake.gone.lock().unwrap().insert(JOB.into());
+    runtime.tick_jobs(now).unwrap();
+    fake.fail_stop.store(true, Ordering::Release);
+    assert!(runtime.tick_jobs(now + 1000).is_err());
+    let disk = {
+        let host = runtime.host.lock().unwrap();
+        let e = &host.snapshot.per_job.executions[JOB];
+        assert!(!e.ended);
+        assert_eq!(
+            host.snapshot.per_job.disks[&e.disk_id]
+                .attached_job
+                .as_deref(),
+            Some(JOB)
+        );
+        e.disk_id.clone()
+    };
+    fake.fail_stop.store(false, Ordering::Release);
+    runtime.tick_jobs(now + 1001).unwrap();
+    assert!(runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended);
+    assert!(runtime.host.lock().unwrap().snapshot.per_job.disks[&disk]
+        .attached_job
+        .is_none());
+    // An old host could have ended the job without stopping its VM. A late
+    // receipt must repair release even if acknowledgement already succeeded.
+    runtime.helper_stopped_jobs.lock().unwrap().clear();
+    fake.exits.lock().unwrap().clear();
+    fake.fail_stop.store(true, Ordering::Release);
+    fake.exits.lock().unwrap().push(exit(JOB, 0));
+    assert!(runtime.collect_job_exits(now + 3000).is_err());
+    assert!(fake.exits.lock().unwrap().is_empty());
+    fake.fail_stop.store(false, Ordering::Release);
+    runtime.collect_job_exits(now + 3001).unwrap();
+    assert!(runtime.helper_stopped_jobs.lock().unwrap().contains(JOB));
+}
+
+#[test]
+fn late_terminal_replaces_gap_only_before_any_outward_commitment() {
+    for commitment in ["none", "replay", "delivered", "enqueued", "accepted", "oom"] {
+        let (runtime, _, _) = fixture();
+        running(&runtime, JOB, true, true);
+        let mut host = runtime.host.lock().unwrap();
+        host.job_vmm_gone(JOB, 300).unwrap();
+        host.job_vmm_gone(JOB, 1300).unwrap();
+        host.job_stopped_at(JOB, true, 1300).unwrap();
+        host.job_exit_received(&exit(JOB, if commitment == "oom" { 3 } else { 0 }), 1400)
+            .unwrap();
+        match commitment {
+            "replay" => host
+                .job_replay_closed(JOB, crate::state::jobs::storage::ReplayCompletion::Terminal)
+                .unwrap(),
+            "delivered" => host.terminal_delivered(JOB, 1400).unwrap(),
+            "enqueued" => {
+                host.snapshot.billing.get_mut(JOB).unwrap().enqueued = true;
+            }
+            "accepted" => {
+                host.snapshot
+                    .per_job
+                    .executions
+                    .get_mut(JOB)
+                    .unwrap()
+                    .usage_accepted_at_ms = Some(1400);
+            }
+            _ => (),
+        }
+        host.receive_terminal(JOB, terminal(JOB), 1500).unwrap();
+        let b = &host.snapshot.billing[JOB];
+        assert_eq!(
+            b.terminal.as_ref().unwrap()["outcome"]["type"],
+            if commitment == "none" {
+                "exit"
+            } else {
+                "outcome_unknown"
+            },
+            "{commitment}"
+        );
+        assert_eq!(
+            b.usage.as_ref().unwrap().outcome,
+            if commitment == "none" {
+                UsageOutcome::Exit
+            } else {
+                UsageOutcome::Lost
+            },
+            "{commitment}"
+        );
+    }
+}
+
+#[test]
 fn helper_restart_re_adopts_running_jobs_and_keeps_their_outcomes_separate() {
     let (runtime, _, storage) = fixture();
     running(&runtime, JOB, true, true);
@@ -855,6 +947,7 @@ fn evidence_deadline_runs_through_poll_failure_but_never_releases_an_unacked_rec
 #[test]
 fn late_receipt_after_bound_cannot_add_egress_or_change_the_guest_winner() {
     let (runtime, fake, _) = fixture();
+    fake.defer_stop_exit.store(true, Ordering::Release);
     running(&runtime, JOB, true, true);
     let result = runtime
         .observe_job_frame(JOB, &terminal(JOB))

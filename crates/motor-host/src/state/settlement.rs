@@ -228,7 +228,12 @@ impl Host {
             .as_ref()
             .is_some_and(|e| e.unclean_stop == Some(false))
             && report.oom_kill == 0;
-        if !clean {
+        if !clean
+            && !next.per_job.executions[&report.job_id]
+                .evidence
+                .as_ref()
+                .is_some_and(|e| e.evidence_expired)
+        {
             super::jobs::have::invalidate(&mut next, &report.job_id);
             super::jobs::recovery::quarantine(&mut next, &report.job_id);
         }
@@ -315,6 +320,17 @@ impl Host {
     ) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
         super::jobs::have::transfer_terminal(&mut next, job, &frame);
+        let execution = &next.per_job.executions[job];
+        let replace_gap = execution
+            .evidence
+            .as_ref()
+            .is_some_and(|e| e.winner == Some(Winner::EvidenceExpired) && e.stop.is_none())
+            && execution.replay_completion.is_none()
+            && execution.usage_accepted_at_ms.is_none()
+            && next
+                .billing
+                .get(job)
+                .is_none_or(|b| !b.delivered && !b.enqueued);
         let evidence = next
             .per_job
             .executions
@@ -322,8 +338,19 @@ impl Host {
             .unwrap()
             .evidence
             .get_or_insert_with(Default::default);
-        if evidence.winner.is_some() {
+        if evidence.winner.is_some() && !replace_gap {
             return Ok(());
+        }
+        if replace_gap {
+            // A gap is provisional only until replay or billing commits its
+            // outcome. Never replace a terminal the caller could already see.
+            evidence.usage_inputs = None;
+            let b = next.billing.entry(job.into()).or_default();
+            b.usage = None;
+            b.hosted_terminal = None;
+            b.host_settled = false;
+            b.synthesized_output = None;
+            b.restart_pending = None;
         }
         // A guest can report its own job limit, but cannot attest a host stop.
         if matches!(
@@ -350,6 +377,7 @@ impl Host {
         b.terminal = Some(frame);
         crate::billing::finalize_ready(&mut next, now_ms);
         defer_usage(&mut next, job);
+        finalize_usage(&mut next, job);
         self.save(next)
     }
 }

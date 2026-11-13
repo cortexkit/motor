@@ -8,6 +8,8 @@ pub struct Recovery {
     pub guest_ram_mib: u64,
     pub started_at_ms: Option<u64>,
     pub phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
@@ -37,7 +39,8 @@ impl Host {
             .per_job
             .disks
             .values()
-            .filter(|d| d.recovery.is_some())
+            .filter_map(|d| d.recovery.as_ref())
+            .filter(|r| r.holds_vm_capacity())
             .count() as u32
     }
 
@@ -85,6 +88,7 @@ impl Host {
             guest_ram_mib: owner.guest_ram_mib,
             started_at_ms: None,
             phase: Phase::Reserved,
+            retry_after_ms: None,
         };
         let mut next = self.snapshot.clone();
         let disk = next.per_job.disks.get_mut(disk_id).unwrap();
@@ -116,6 +120,13 @@ impl Host {
         if r.id != id {
             return Err(Error::Refused(Refusal::Auth));
         }
+        if phase == Phase::Running
+            && r.phase == Phase::Reserved
+            && (self.job_free_vcpus(at_ms) == 0
+                || self.job_free_mem_mib(at_ms) < r.memory_debit_mib)
+        {
+            return Err(Error::Refused(Refusal::HostFull));
+        }
         // A late guest reply may not reverse a timeout or deletion decision.
         if r.phase == Phase::Deleting && phase != Phase::Deleting {
             return Ok(());
@@ -128,6 +139,38 @@ impl Host {
         if let Some(result) = result {
             disk.recovery_result = Some(result.into());
         }
+        self.save(next)
+    }
+
+    pub(crate) fn recovery_retry(&mut self, disk_id: &str, now_ms: u64) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        next.per_job
+            .disks
+            .get_mut(disk_id)
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap()
+            .retry_after_ms = Some(now_ms.saturating_add(5000));
+        self.save(next)
+    }
+
+    /// A stopped recovery may still have filesystem cleanup to retry. Its VM
+    /// cannot consume memory or CPU while a different holder blocks deletion.
+    pub(crate) fn recovery_vm_released(&mut self, disk_id: &str) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        let recovery = next
+            .per_job
+            .disks
+            .get_mut(disk_id)
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap();
+        if recovery.memory_debit_mib == 0 {
+            return Ok(());
+        }
+        recovery.memory_debit_mib = 0;
         self.save(next)
     }
 
@@ -161,6 +204,12 @@ impl Host {
             next.per_job.disks.insert(fresh_id, fresh);
         }
         self.save(next)
+    }
+}
+
+impl Recovery {
+    pub(crate) fn holds_vm_capacity(&self) -> bool {
+        self.phase != Phase::Reserved && self.memory_debit_mib != 0
     }
 }
 

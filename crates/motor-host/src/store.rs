@@ -1155,6 +1155,7 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
             guest_ram_mib: 20,
             started_at_ms: Some(123),
             phase,
+            retry_after_ms: None,
         });
         journal.store(&current).unwrap();
         drop(journal);

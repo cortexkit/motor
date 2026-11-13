@@ -911,6 +911,22 @@ pub(crate) fn protect_vmm_with(
 }
 
 pub(super) fn connect_relay(root: &Path, uid: u32, port: u32) -> Result<OwnedFd> {
+    connect_relay_with_budget(root, uid, port, true, Duration::from_secs(10))
+}
+
+/// A job VMM already owns its socket. Retrying a refused connect after it
+/// reboots only stalls the helper mutex and every other VM's exit collection.
+pub(super) fn connect_job_relay(root: &Path, uid: u32, port: u32) -> Result<OwnedFd> {
+    connect_relay_with_budget(root, uid, port, false, Duration::from_millis(100))
+}
+
+fn connect_relay_with_budget(
+    root: &Path,
+    uid: u32,
+    port: u32,
+    retry: bool,
+    timeout: Duration,
+) -> Result<OwnedFd> {
     crate::tenant::validate_port(port)?;
     let context = |step: &str, error: &dyn std::fmt::Display| {
         Error(format!(
@@ -935,15 +951,36 @@ pub(super) fn connect_relay(root: &Path, uid: u32, port: u32) -> Result<OwnedFd>
         ));
     }
     let socket_path = PathBuf::from(format!("/proc/self/fd/{}", socket.as_raw_fd()));
-    let mut stream = super::wait_socket(&socket_path, Duration::from_secs(10))
-        .map_err(|e| context("connect_uds", &e))?;
+    let mut stream = if retry {
+        super::wait_socket(&socket_path, timeout)
+    } else {
+        connect_job_socket(&socket_path)
+    }
+    .map_err(|e| context("connect_uds", &e))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(timeout))
         .map_err(|e| context("set_read_timeout", &e))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
+        .set_write_timeout(Some(timeout))
         .map_err(|e| context("set_write_timeout", &e))?;
-    relay_handshake(&mut stream, port).map_err(|e| context("handshake", &e))?;
+    let handshake = if retry {
+        relay_handshake(&mut stream, port)
+    } else {
+        let deadline = std::time::Instant::now() + timeout;
+        relay_handshake_with(&mut stream, port, |stream, byte| {
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "job relay handshake deadline",
+                    )
+                })?;
+            stream.set_read_timeout(Some(left))?;
+            stream.read_exact(byte)
+        })
+    };
+    handshake.map_err(|e| context("handshake", &e))?;
     stream
         .set_read_timeout(None)
         .map_err(|e| context("clear_read_timeout", &e))?;
@@ -953,7 +990,51 @@ pub(super) fn connect_relay(root: &Path, uid: u32, port: u32) -> Result<OwnedFd>
     Ok(stream.into())
 }
 
+fn connect_job_socket(path: &Path) -> Result<UnixStream> {
+    use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() {
+        return Err(Error("job relay socket path too long".into()));
+    }
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *byte as libc::c_char;
+    }
+    if unsafe {
+        libc::connect(
+            fd,
+            &address as *const _ as *const libc::sockaddr,
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 fn relay_handshake(stream: &mut (impl Read + Write), port: u32) -> Result<()> {
+    relay_handshake_with(stream, port, |stream, byte| stream.read_exact(byte))
+}
+
+fn relay_handshake_with<S: Read + Write>(
+    stream: &mut S,
+    port: u32,
+    mut read: impl FnMut(&mut S, &mut [u8]) -> std::io::Result<()>,
+) -> Result<()> {
     // Firecracker 1.17 parses CONNECT on the first readable event, without
     // buffering fragments. Formatting directly into the socket can send the
     // prefix before the port and newline, so prepare the entire line first.
@@ -963,9 +1044,7 @@ fn relay_handshake(stream: &mut (impl Read + Write), port: u32) -> Result<()> {
     let mut answer = Vec::new();
     while answer.len() < 128 {
         let mut byte = [0];
-        stream
-            .read_exact(&mut byte)
-            .map_err(|e| Error(format!("read_CONNECT_ack: {e}")))?;
+        read(stream, &mut byte).map_err(|e| Error(format!("read_CONNECT_ack: {e}")))?;
         answer.push(byte[0]);
         if byte[0] == b'\n' {
             break;
