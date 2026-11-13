@@ -99,8 +99,17 @@ pub(super) struct Entry {
 }
 
 impl LinuxJobs {
+    pub(super) fn start_available(&self, start: &Start, device: u64, inode: u64) -> Result<()> {
+        crate::lock_order::assert_held(Lock::A);
+        if self.view(&start.job_id).is_some() {
+            return Err(Error("job id already booted; use adopt_job".into()));
+        }
+        self.disk_available(start, device, inode)
+    }
+
     pub(super) fn launch_record(
         &self,
+        admission: crate::lock_order::Guard<'_, ()>,
         record: Record,
         launch: impl FnOnce(&mut JobState) -> Result<()>,
     ) -> Result<Response> {
@@ -112,6 +121,9 @@ impl LinuxJobs {
         let mut state = cell.0.lock();
         self.write_record(&state.record)?;
         self.insert_cell(cell.clone(), &state);
+        // The durable Booting view reserves every resource. Launch needs only
+        // its own writer; admission must remain free during network and API I/O.
+        drop(admission);
         let result = launch(&mut state);
         if let Err(error) = result {
             if let Err(cleanup) = self.stop_locked(&mut state) {

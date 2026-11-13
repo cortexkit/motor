@@ -133,7 +133,7 @@ fn watcher_retries_failed_launch_cleanup_without_releasing_the_disk() {
     {
         let _admission = jobs.admission.lock();
         let error = jobs
-            .launch_record(intent, |_| {
+            .launch_record(_admission, intent, |_| {
                 jobs.network.create_namespace(&id)?;
                 Err(Error("launch failed".into()))
             })
