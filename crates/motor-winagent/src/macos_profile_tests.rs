@@ -90,7 +90,7 @@ fn sessions() -> (Session, Session) {
 #[test]
 fn profiles_are_versioned_independently() {
     assert_eq!(Profile::Windows.version(), 10);
-    assert_eq!(Profile::Macos.version(), 1);
+    assert_eq!(Profile::Macos.version(), 2);
     assert_eq!(Protocol::new("n").unwrap().profile(), Profile::Windows);
     assert_eq!(
         Session::new(Peer::Host, "n").unwrap().profile(),

@@ -227,13 +227,14 @@ pub(super) fn prepare_times(
     crate::source_mtimes::prepare(
         trees,
         staging,
-        crate::source_mtimes::Store::Directory(store),
+        crate::source_mtimes::Store::File(store),
         record,
         crate::source_mtimes::Policy {
             exported: &exported,
             sealed: &sealed,
             // The workspace lock is held from staging through VM stop and
-            // copy-back. Serializing jobs of a checkout makes time reuse safe.
+            // build disk publication. Serializing jobs of a checkout makes time
+            // reuse safe.
             concurrent_jobs: 1,
             validate_path: |path| {
                 if path.is_empty() || path.split('/').any(|part| matches!(part, "" | "." | "..")) {

@@ -136,7 +136,7 @@ fn prepare(
         entry.check()?;
         std::thread::park_timeout(Duration::from_millis(10));
     }
-    target_in(config, &entry, &staged)?;
+    target_in(&staged)?;
     entry.check()?;
     let selected = super::source_seal::plan(
         staged.source_files.clone(),
@@ -187,6 +187,7 @@ fn prepare(
         .ok_or_else(|| invalid("missing macOS VM config"))?;
     let paths = entry.owned.lock().unwrap().record.paths.clone();
     motor_macvm::clone_image(&vm.image, &paths.clone)?;
+    build_disk_in(config, &entry)?;
     let nonce = Uuid::now_v7().simple().to_string();
     let share = |host: &Path, tag: String, guest: String| ShareLocation {
         host: host.to_path_buf(),
@@ -208,7 +209,12 @@ fn prepare(
             motor_macvm::CARGO_HOME.into(),
         ),
     })?;
-    motor_macvm::create_nonce_disk(&paths.nonce, &nonce, &job.mounts())?;
+    motor_macvm::create_job_nonce_disk(
+        &paths.nonce,
+        &nonce,
+        &job.mounts(),
+        &build_config(&setup.request)?,
+    )?;
     {
         let mut owned = entry.owned.lock().unwrap();
         let helper = motor_macvm::spawn_job_helper(
@@ -333,55 +339,130 @@ pub(super) fn capture_completion(
     capture_returns(&config.macos_runtime, trees, entry, request, staged);
 }
 
-pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::Result<()> {
-    let record = entry.owned.lock().unwrap().record.clone();
+/// Leaves the staged checkout's `target/` an empty directory. The guest agent
+/// mounts the job's build disk over it, so builds never write `target/` on the
+/// shared folder, and after unmounting it puts the returned files there.
+pub(super) fn target_in(staged: &Staged) -> io::Result<()> {
     let workspace = Dir::open(&staged.workspace, false)?;
     workspace.remove_job("target".as_ref())?;
-    let target = config
-        .state_root
-        .join("targets")
-        .join(lifecycle::key(&record.workspace));
-    match Dir::open(&target, false) {
-        Ok(store) => store.clone_into(
-            &workspace.child("target".as_ref(), true)?,
-            &lifecycle::control(entry.cancel.clone()),
-        ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    workspace.child("target".as_ref(), true)?;
+    Ok(())
 }
+
+/// Puts a clone of the checkout's kept build disk in the job's clone directory,
+/// in place of the blank disk `clone_image` created there. Without a kept disk,
+/// the checkout's first job keeps the blank one, which its guest formats.
+pub(super) fn build_disk_in(config: &Config, entry: &Entry) -> io::Result<()> {
+    let record = entry.owned.lock().unwrap().record.clone();
+    let clone = Dir::open(&record.paths.clone, false)?;
+    let targets = Dir::open(&config.state_root.join("targets"), false)?;
+    let kept = match targets.file(lifecycle::image(&record.workspace).as_ref(), false) {
+        Ok(kept) => kept,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let length = kept.metadata()?.len();
+    if length != motor_macvm::BUILD_DISK_SIZE {
+        // Not a disk this runner wrote; the job's publication replaces it.
+        tracing::warn!(job_id = %record.id, length, "kept macOS build disk has the wrong size; building cold");
+        return Ok(());
+    }
+    clone.remove(motor_macvm::BUILD_DISK.as_ref())?;
+    clone.clone_file(&kept, motor_macvm::BUILD_DISK.as_ref())
+}
+
+/// What the guest agent needs to copy returned files out of the build disk:
+/// each requested return path inside the checkout's `target/`, relative to
+/// it. Paths with `.` or `..` are left out: the host's own collection still
+/// resolves them, and finds only what the agent copied to the shared `target/`.
+fn build_config(request: &motor_protocol::Run) -> io::Result<motor_macvm::BuildConfig> {
+    let mut returns = Vec::new();
+    for path in crate::caller_path::run(request).caller_return_paths {
+        let Ok(relative) = crate::return_paths::relative(request, path) else {
+            continue;
+        };
+        let mut components = relative.components();
+        if !matches!(components.next(),
+            Some(std::path::Component::Normal(first)) if first.eq_ignore_ascii_case("target"))
+        {
+            continue;
+        }
+        let rest: Option<Vec<&str>> = components
+            .map(|c| match c {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect();
+        if let Some(rest) = rest.filter(|rest| !rest.is_empty()) {
+            returns.push(rest.join("/"));
+        }
+    }
+    let config = motor_macvm::BuildConfig {
+        returns,
+        return_max_bytes: request.return_max_bytes,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
 fn timestamp_paths(config: &Config, entry: &Entry) -> (std::path::PathBuf, std::path::PathBuf) {
-    let key = lifecycle::key(&entry.owned.lock().unwrap().record.workspace);
+    let workspace = entry.owned.lock().unwrap().record.workspace.clone();
     let parent = config.state_root.join("targets");
     (
-        parent.join(&key),
-        parent.join(format!("{key}.source-mtimes.json")),
+        parent.join(lifecycle::image(&workspace)),
+        parent.join(format!("{}.source-mtimes.json", lifecycle::key(&workspace))),
     )
 }
 
-pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io::Result<bool> {
-    // APFS clones may carry inode flags into the persistent cache. Never clone
-    // until every source inode (including ones moved into target) is unsealed.
-    config.macos_runtime.unseal(&config.state_root, entry)?;
+/// Whether a finished job's build disk may become its checkout's kept disk.
+/// Only an agent that unmounted the build volume sends the terminal status,
+/// so a job without one (an agent failure, a crash or a lost session) left
+/// the volume mounted. A cancelled job publishes nothing either, and nothing
+/// is published before the VM is proven stopped.
+fn publishable(cancelled: bool, stop_proven: bool, terminal_received: bool) -> bool {
+    !cancelled && stop_proven && terminal_received
+}
+
+/// Renames the stopped job's build disk over its checkout's kept disk, then
+/// deletes the checkout's build folder from before build disks, if any. The
+/// host never mounts or reads the disk's contents.
+pub(super) fn target_out(config: &Config, entry: &Entry) -> io::Result<()> {
     let record = entry.owned.lock().unwrap().record.clone();
-    let source = match Dir::open(workspace, false)?.child("target".as_ref(), false) {
-        Ok(source) => source,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    let parent = Dir::open(&config.state_root.join("targets"), false)?;
-    let temporary = record.paths.target_tmp.file_name().unwrap();
-    let dest = parent.child(temporary, true)?;
-    source.clone_into(&dest, &lifecycle::control(entry.cancel.clone()))?;
-    super::fs::clear_job_target(&record.paths.target_tmp)?;
-    dest.sync_all()?;
+    if !record.stop_proven || record.proof_version != lifecycle::RELEASE_PROOF_VERSION {
+        return Err(invalid(
+            "build disk publication requires a durable VM stop proof",
+        ));
+    }
+    let clone = Dir::open(&record.paths.clone, false)?;
+    let disk = clone.file(motor_macvm::BUILD_DISK.as_ref(), false)?;
+    if disk.metadata()?.len() != motor_macvm::BUILD_DISK_SIZE {
+        return Err(invalid("job build disk has the wrong size"));
+    }
+    disk.sync_all()?;
+    // Eviction removes the least recently used disks first.
+    let now = [libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::UTIME_NOW,
+    }; 2];
+    if unsafe { libc::futimens(disk.as_raw_fd(), now.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(disk);
     #[cfg(test)]
     if let Some(hook) = &config.long_work {
         hook("macos-target-before-publish");
     }
     entry.check()?;
-    parent.publish(temporary, lifecycle::key(&record.workspace).as_ref())?;
-    Ok(true)
+    let targets = Dir::open(&config.state_root.join("targets"), false)?;
+    clone.replace_into(
+        motor_macvm::BUILD_DISK.as_ref(),
+        &targets,
+        lifecycle::image(&record.workspace).as_ref(),
+    )?;
+    if let Err(error) = targets.remove(lifecycle::key(&record.workspace).as_ref()) {
+        tracing::warn!(job_id = %record.id, %error, "old macOS build folder removal failed; eviction will retry");
+    }
+    Ok(())
 }
 
 struct VmExecution {
@@ -541,7 +622,9 @@ fn start_io(
                 while !thread_release.load(Ordering::Acquire) {
                     transport.pause()?;
                 }
-                transport.deadline = Some(Instant::now() + Duration::from_secs(30));
+                // The agent finds, formats if needed, and mounts the build disk
+                // before it reports Started.
+                transport.deadline = Some(Instant::now() + Duration::from_secs(120));
                 transport.send(&Frame::TreeEnd {
                     command: motor_winagent::Command {
                         command: request.command,
@@ -571,24 +654,22 @@ fn start_io(
                 &scan_request,
                 &staged,
             );
-            if !thread_entry.cancel.0.load(Ordering::Acquire)
-                && thread_entry.owned.lock().unwrap().record.stop_proven
-            {
-                let published =
-                    target_out(&config, &thread_entry, &staged.workspace).and_then(|published| {
-                        if published {
-                            let (store, history) = timestamp_paths(&config, &thread_entry);
-                            crate::source_mtimes::replaced(
-                                mtimes,
-                                &store,
-                                &history,
-                                std::time::SystemTime::now(),
-                            )?;
-                        }
-                        Ok(())
-                    });
+            if publishable(
+                thread_entry.cancel.0.load(Ordering::Acquire),
+                thread_entry.owned.lock().unwrap().record.stop_proven,
+                result.is_ok(),
+            ) {
+                let published = target_out(&config, &thread_entry).and_then(|()| {
+                    let (store, history) = timestamp_paths(&config, &thread_entry);
+                    crate::source_mtimes::replaced(
+                        mtimes,
+                        crate::source_mtimes::Store::File(&store),
+                        &history,
+                        std::time::SystemTime::now(),
+                    )
+                });
                 if let Err(error) = published {
-                    tracing::warn!(%error, "macOS target copy-back or source timestamp history failed");
+                    tracing::warn!(%error, "macOS build disk publication or source timestamp history failed");
                 }
             }
             drop(stdout_tx);

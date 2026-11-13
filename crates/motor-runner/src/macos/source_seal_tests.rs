@@ -124,8 +124,9 @@ fn unchanged_file_keeps_time_across_staged_jobs_and_changed_file_advances() {
     use std::time::{Duration, UNIX_EPOCH};
     let f = Tree::new();
     let destination = "/Users/motor/repo";
-    let store = f.0.join("targets/checkout");
-    std::fs::create_dir_all(&store).unwrap();
+    let store = f.0.join("targets/checkout.img");
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::write(&store, "build disk").unwrap();
     let history = store.with_extension("source-mtimes.json");
     let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     let end = start + Duration::from_secs(60);
@@ -187,11 +188,18 @@ fn unchanged_file_keeps_time_across_staged_jobs_and_changed_file_advances() {
             assert_eq!(modified("returned.rs"), end + Duration::from_secs(1));
         }
         previous = Some(unchanged);
-        // Copy-back replaces the build directory inode before saving history.
-        let old = f.0.join(format!("old-{job}"));
-        std::fs::rename(&store, old).unwrap();
-        std::fs::create_dir(&store).unwrap();
-        crate::source_mtimes::replaced(candidate, &store, &history, end).unwrap();
+        // Publication renames the job's build disk over the kept one before
+        // saving history, so the store's identity changes every job.
+        let published = f.0.join(format!("published-{job}"));
+        std::fs::write(&published, "build disk").unwrap();
+        std::fs::rename(&published, &store).unwrap();
+        crate::source_mtimes::replaced(
+            candidate,
+            crate::source_mtimes::Store::File(&store),
+            &history,
+            end,
+        )
+        .unwrap();
     }
 }
 
@@ -259,8 +267,9 @@ fn tracked_cache_paths_make_the_persisted_source_fact_false() {
             source_files: vec![tracked.into(), "protected".into()],
         };
         // The trusted manifest must still account for a tracked root target
-        // after cache publication replaces that directory in the staged tree.
-        super::super::execution::target_in(&config, &entry, &staged).unwrap();
+        // after the build disk's empty mount point replaces that directory in
+        // the staged tree.
+        super::super::execution::target_in(&staged).unwrap();
         if tracked.starts_with("target/") {
             assert!(!workspace.join(tracked).exists());
         }
@@ -624,11 +633,6 @@ fn native_apfs_clone_of_sealed_file_records_flag_propagation() {
         clone_flags,
         "unseal must not clear a different cloned inode"
     );
-    // A target clone must be clean before publication even if the journal's
-    // cleared marker survived a crash while an earlier flag clear did not.
-    Native.set(&cloned, clone_flags | IMMUTABLE).unwrap();
-    super::super::fs::clear_job_target(&tree.0.join("cloned")).unwrap();
-    assert_eq!(Native.inspect(&cloned).unwrap().1, clone_flags & !IMMUTABLE);
     forget(&journal).unwrap();
 }
 

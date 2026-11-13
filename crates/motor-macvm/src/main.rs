@@ -81,6 +81,11 @@ mod native {
         }
     }
 
+    /// Every disk, the build disk included, uses the framework's default
+    /// attachment: automatic caching and full synchronization, the setup the
+    /// boot disk has always used. Full synchronization means the guest's flushes
+    /// reach the host file, so the build disk is complete on the host once the
+    /// VM has stopped and before the runner publishes it.
     unsafe fn disk(
         path: &Path,
         read_only: bool,
@@ -606,7 +611,7 @@ mod native {
             unsafe {
                 let config = VZVirtualMachineConfiguration::new();
                 apply_job_devices(&config, &plan).unwrap();
-                assert_eq!(config.storageDevices().len(), 2);
+                assert_eq!(config.storageDevices().len(), 3);
                 assert_eq!(config.socketDevices().len(), 1);
                 assert_eq!(config.networkDevices().len(), 0);
                 assert_eq!(config.graphicsDevices().len(), 0);

@@ -6,6 +6,32 @@ use std::{
     os::unix::fs::{symlink, PermissionsExt},
 };
 
+/// Creates a sparse build disk of the real size whose first bytes are `marker`,
+/// so a test can tell disks apart without reading 128 GiB.
+pub(super) fn write_build_disk(path: &Path, marker: &[u8]) {
+    host::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = host::File::create(path).unwrap();
+    file.write_all(marker).unwrap();
+    file.set_len(motor_macvm::BUILD_DISK_SIZE).unwrap();
+}
+/// Overwrites the first bytes of an existing build disk, as a job's writes would.
+pub(super) fn write_build_disk_marker(path: &Path, marker: &[u8]) {
+    host::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .write_all(marker)
+        .unwrap();
+}
+pub(super) fn build_disk_marker(path: &Path, length: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut marker = vec![0; length];
+    host::File::open(path)
+        .unwrap()
+        .read_exact(&mut marker)
+        .unwrap();
+    marker
+}
 fn write(path: &Path, text: &str) {
     host::create_dir_all(path.parent().unwrap()).unwrap();
     host::write(path, text).unwrap();
@@ -1534,14 +1560,20 @@ fn disk_eviction_uses_canonical_workspace_and_prep_locks() {
     let store = config
         .state_root
         .join("targets")
+        .join(lifecycle::image(&request.workspace_key));
+    write_build_disk(&store, b"kept");
+    let legacy = config
+        .state_root
+        .join("targets")
         .join(lifecycle::key(&request.workspace_key));
-    host::create_dir_all(&store).unwrap();
-    host::write(store.join("cached"), "whole").unwrap();
+    host::create_dir_all(&legacy).unwrap();
+    host::write(legacy.join("cached"), "whole").unwrap();
     assert!(evict(&config, f.staging.trees.mirrors.clone())
         .unwrap()
         .is_none());
     assert!(canonical.exists());
     assert!(store.exists());
+    assert!(legacy.exists());
     assert!(config.state_root.join("prep-cargo").exists());
     // Controller guards explicitly unlock when dropped.
     drop(path_lock);
@@ -1551,6 +1583,7 @@ fn disk_eviction_uses_canonical_workspace_and_prep_locks() {
     evict(&config, f.staging.trees.mirrors.clone()).unwrap();
     assert!(!canonical.exists());
     assert!(!store.exists());
+    assert!(!legacy.exists());
     assert!(!config.state_root.join("prep-cargo").exists());
     assert!(prepared.workspace.exists());
     config.free_space_probe = Arc::new(|_| Ok(19 << 30));
@@ -1592,7 +1625,8 @@ fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
     symlink(&config.state_root, first.workspace.join("node_modules/x")).unwrap();
     symlink(&sentinel, first.workspace.join("target")).unwrap();
     runtime.stop(&config.state_root, &entry).unwrap();
-    assert!(execution::target_out(&config, &entry, &first.workspace).is_err());
+    // The job never got a build disk, so there is nothing to publish.
+    assert!(execution::target_out(&config, &entry).is_err());
     entry.owned.lock().unwrap().record.stop_proven = true;
     runtime.finish(&config.state_root, &entry);
     request.job_id = uuid::Uuid::now_v7();
@@ -1603,11 +1637,13 @@ fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
         .staging
         .prepare(&request, Cancellation::default())
         .unwrap();
-    execution::target_in(&config, &entry, &second).unwrap();
-    host::create_dir(second.workspace.join("target")).unwrap();
+    execution::target_in(&second).unwrap();
     host::write(second.workspace.join("target/whole"), "new job").unwrap();
+    let clone = entry.owned.lock().unwrap().record.paths.clone.clone();
+    host::create_dir_all(&clone).unwrap();
+    motor_macvm::create_blank_build_disk(&clone.join(motor_macvm::BUILD_DISK)).unwrap();
     runtime.stop(&config.state_root, &entry).unwrap();
-    execution::target_out(&config, &entry, &second.workspace).unwrap();
+    execution::target_out(&config, &entry).unwrap();
     entry.owned.lock().unwrap().record.stop_proven = true;
     runtime.finish(&config.state_root, &entry);
     assert!(!marker.exists());
@@ -1644,7 +1680,7 @@ fn apfs_case_aliases_share_locks_and_cannot_overlap() {
 }
 
 #[test]
-fn guest_copy_and_sync_reject_excessive_depth_before_stack_or_fd_exhaustion() {
+fn guest_copy_rejects_excessive_depth_before_stack_or_fd_exhaustion() {
     let scratch = ScratchDir::new("macos-copy-depth");
     let source = scratch.join("source");
     let destination = scratch.join("destination");
@@ -1665,11 +1701,6 @@ fn guest_copy_and_sync_reject_excessive_depth_before_stack_or_fd_exhaustion() {
             };
             assert!(source
                 .clone_into(&destination, &control)
-                .unwrap_err()
-                .to_string()
-                .contains("depth limit"));
-            assert!(source
-                .sync_all()
                 .unwrap_err()
                 .to_string()
                 .contains("depth limit"));

@@ -1,3 +1,4 @@
+use super::super::tests::{build_disk_marker, write_build_disk, write_build_disk_marker};
 use super::*;
 use crate::test_helpers::CanonicalScratchDir as ScratchDir;
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -292,104 +293,232 @@ fn adjacent_workspace_sibling_has_no_alias_share() {
     );
 }
 
-#[test]
-fn source_unseal_barrier_prevents_target_cache_publication() {
-    let scratch = ScratchDir::new("macos-target-seal-barrier");
-    let root = scratch.join("state");
-    let config = Config::new(&root, "macos");
-    let runtime = Runtime::default();
+/// A job's runtime entry with its workspace lock and an empty job clone
+/// directory holding the blank build disk that `clone_image` creates.
+fn job(root: &Path, runtime: &Runtime) -> Arc<Entry> {
     let entry = runtime
-        .begin(&root, Uuid::now_v7(), "/Users/test/repo")
+        .begin(root, Uuid::now_v7(), "/Users/test/repo")
         .unwrap();
-    let id = entry.owned.lock().unwrap().record.id;
-    let staged = staged(&root, id);
-    let store = root
-        .join("targets")
-        .join(lifecycle::key("/Users/test/repo"));
-    std::fs::create_dir(&store).unwrap();
-    std::fs::write(store.join("whole"), "old").unwrap();
-    std::fs::create_dir(staged.workspace.join("target")).unwrap();
-    std::fs::write(staged.workspace.join("target/new"), "must not publish").unwrap();
-    assert!(
-        target_out(&config, &entry, &staged.workspace).is_err(),
-        "stop proof is required even without an intent"
-    );
-    runtime.stop(&root, &entry).unwrap();
-    let journal = super::super::source_seal::path(&root, id);
-    crate::storage::atomic_json_private(&journal, &serde_json::json!({
-        "version": 1, "entries": [{"identity": {"device": 0, "inode": 0, "birth_seconds": 0, "birth_nanos": 0}, "original_flags": 0}],
-        "complete": true, "cleared": false,
-    })).unwrap();
-    assert!(target_out(&config, &entry, &staged.workspace).is_err());
-    assert_eq!(std::fs::read_to_string(store.join("whole")).unwrap(), "old");
-    assert!(!store.join("new").exists());
-    assert!(!entry.owned.lock().unwrap().record.paths.target_tmp.exists());
-    let saved: serde_json::Value = crate::storage::read_json(&journal).unwrap();
-    assert_eq!(saved["cleared"], false);
-    // The unresolved identity remains an obligation for lifecycle maintenance.
-    runtime.finish(&root, &entry);
-    assert!(runtime.entry(id).is_some());
-    assert!(journal.exists());
+    runtime.workspace(root, &entry).unwrap();
+    let clone = entry.owned.lock().unwrap().record.paths.clone.clone();
+    std::fs::create_dir_all(&clone).unwrap();
+    motor_macvm::create_blank_build_disk(&clone.join(motor_macvm::BUILD_DISK)).unwrap();
+    entry
 }
-#[test]
-fn target_store_is_cloned_and_atomically_replaced_with_recorded_old_store() {
-    let scratch = ScratchDir::new("macos-target-swap");
-    let root = scratch.join("state");
-    let config = Config::new(&root, "macos");
-    let runtime = Runtime::default();
-    let entry = runtime
-        .begin(&root, Uuid::now_v7(), "/Users/test/repo")
-        .unwrap();
-    runtime.workspace(&root, &entry).unwrap();
-    let staged = staged(&root, entry.owned.lock().unwrap().record.id);
-    let store = root
-        .join("targets")
-        .join(lifecycle::key("/Users/test/repo"));
-    std::fs::create_dir(&store).unwrap();
-    std::fs::write(store.join("whole"), "old").unwrap();
-    target_in(&config, &entry, &staged).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(staged.workspace.join("target/whole")).unwrap(),
-        "old"
-    );
-    std::fs::write(staged.workspace.join("target/whole"), "new").unwrap();
-    runtime.stop(&root, &entry).unwrap();
-    target_out(&config, &entry, &staged.workspace).unwrap();
-    assert_eq!(std::fs::read_to_string(store.join("whole")).unwrap(), "new");
-    let temporary = entry.owned.lock().unwrap().record.paths.target_tmp.clone();
-    assert_eq!(
-        std::fs::read_to_string(temporary.join("whole")).unwrap(),
-        "old"
-    );
-    // A restart may delete the recorded old store, but never the published one.
+fn kept(root: &Path) -> std::path::PathBuf {
+    root.join("targets").join(lifecycle::image("/Users/test/repo"))
+}
+fn job_disk(entry: &Entry) -> std::path::PathBuf {
+    entry
+        .owned
+        .lock()
+        .unwrap()
+        .record
+        .paths
+        .clone
+        .join(motor_macvm::BUILD_DISK)
+}
+fn finish(runtime: &Runtime, root: &Path, entry: &Entry) {
     entry.owned.lock().unwrap().record.stop_proven = true;
-    runtime.finish(&root, &entry);
-    assert!(!temporary.exists());
-    assert_eq!(std::fs::read_to_string(store.join("whole")).unwrap(), "new");
+    runtime.finish(root, entry);
 }
+
 #[test]
-fn top_level_target_symlink_never_reaches_outside_sentinel() {
-    use std::os::unix::fs::symlink;
-    let scratch = ScratchDir::new("macos-target-poison");
+fn kept_build_disk_is_cloned_per_job_and_replaced_only_after_stop_proof() {
+    let scratch = ScratchDir::new("macos-build-disk-swap");
     let root = scratch.join("state");
     let config = Config::new(&root, "macos");
     let runtime = Runtime::default();
-    let entry = runtime
-        .begin(&root, Uuid::now_v7(), "/Users/test/repo")
+    let entry = job(&root, &runtime);
+    write_build_disk(&kept(&root), b"old");
+    build_disk_in(&config, &entry).unwrap();
+    assert_eq!(build_disk_marker(&job_disk(&entry), 3), b"old");
+    // The job writes its own clone; the kept disk is a different file.
+    write_build_disk_marker(&job_disk(&entry), b"new");
+    assert_eq!(build_disk_marker(&kept(&root), 3), b"old");
+    assert!(
+        target_out(&config, &entry).is_err(),
+        "publication requires the stop proof"
+    );
+    assert_eq!(build_disk_marker(&kept(&root), 3), b"old");
+    runtime.stop(&root, &entry).unwrap();
+    target_out(&config, &entry).unwrap();
+    assert_eq!(build_disk_marker(&kept(&root), 3), b"new");
+    assert_eq!(
+        std::fs::metadata(kept(&root)).unwrap().len(),
+        motor_macvm::BUILD_DISK_SIZE
+    );
+    assert!(!job_disk(&entry).exists());
+    finish(&runtime, &root, &entry);
+    assert_eq!(build_disk_marker(&kept(&root), 3), b"new");
+}
+#[test]
+fn first_job_formats_a_blank_disk_and_its_publication_creates_the_kept_disk() {
+    let scratch = ScratchDir::new("macos-build-disk-first");
+    let root = scratch.join("state");
+    let config = Config::new(&root, "macos");
+    let runtime = Runtime::default();
+    let entry = job(&root, &runtime);
+    build_disk_in(&config, &entry).unwrap();
+    // The blank disk stays: all zero, so the guest formats it.
+    assert_eq!(build_disk_marker(&job_disk(&entry), 4096), vec![0; 4096]);
+    assert!(!kept(&root).exists());
+    runtime.stop(&root, &entry).unwrap();
+    target_out(&config, &entry).unwrap();
+    assert_eq!(
+        std::fs::metadata(kept(&root)).unwrap().len(),
+        motor_macvm::BUILD_DISK_SIZE
+    );
+    finish(&runtime, &root, &entry);
+}
+#[test]
+fn old_build_folder_is_deleted_only_after_the_first_build_disk_is_published() {
+    let scratch = ScratchDir::new("macos-build-disk-migration");
+    let root = scratch.join("state");
+    let config = Config::new(&root, "macos");
+    let runtime = Runtime::default();
+    let legacy = root
+        .join("targets")
+        .join(lifecycle::key("/Users/test/repo"));
+    std::fs::create_dir_all(legacy.join("debug")).unwrap();
+    std::fs::write(legacy.join("debug/app"), "old build").unwrap();
+    // A job that never publishes leaves the old folder alone.
+    let failed = job(&root, &runtime);
+    build_disk_in(&config, &failed).unwrap();
+    failed.cancel.cancel();
+    runtime.stop(&root, &failed).unwrap();
+    assert!(target_out(&config, &failed).is_err());
+    finish(&runtime, &root, &failed);
+    assert!(legacy.join("debug/app").exists());
+    assert!(!kept(&root).exists());
+    let entry = job(&root, &runtime);
+    build_disk_in(&config, &entry).unwrap();
+    // The old folder is never cloned into the disk: the first job builds cold.
+    assert_eq!(build_disk_marker(&job_disk(&entry), 4096), vec![0; 4096]);
+    runtime.stop(&root, &entry).unwrap();
+    target_out(&config, &entry).unwrap();
+    assert!(kept(&root).exists());
+    assert!(!legacy.exists());
+    finish(&runtime, &root, &entry);
+}
+#[test]
+fn nothing_is_published_without_terminal_status_stop_proof_or_with_cancel() {
+    assert!(publishable(false, true, true));
+    for (cancelled, stop_proven, terminal) in [
+        (true, true, true),
+        (false, false, true),
+        (false, true, false),
+        (true, false, false),
+    ] {
+        assert!(!publishable(cancelled, stop_proven, terminal));
+    }
+    let scratch = ScratchDir::new("macos-build-disk-cancel");
+    let root = scratch.join("state");
+    let config = Config::new(&root, "macos");
+    let runtime = Runtime::default();
+    write_build_disk(&kept(&root), b"old");
+    let entry = job(&root, &runtime);
+    build_disk_in(&config, &entry).unwrap();
+    write_build_disk_marker(&job_disk(&entry), b"new");
+    runtime.stop(&root, &entry).unwrap();
+    entry.cancel.cancel();
+    assert!(target_out(&config, &entry).is_err());
+    assert_eq!(build_disk_marker(&kept(&root), 3), b"old");
+    finish(&runtime, &root, &entry);
+    assert_eq!(build_disk_marker(&kept(&root), 3), b"old");
+}
+#[test]
+fn kept_disk_of_another_size_is_not_cloned_and_a_resized_job_disk_is_not_published() {
+    let scratch = ScratchDir::new("macos-build-disk-size");
+    let root = scratch.join("state");
+    let config = Config::new(&root, "macos");
+    let runtime = Runtime::default();
+    std::fs::create_dir_all(root.join("targets")).unwrap();
+    std::fs::write(kept(&root), "short").unwrap();
+    let entry = job(&root, &runtime);
+    build_disk_in(&config, &entry).unwrap();
+    assert_eq!(build_disk_marker(&job_disk(&entry), 5), vec![0; 5]);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(job_disk(&entry))
+        .unwrap()
+        .set_len(4096)
         .unwrap();
-    let staged = staged(&root, entry.owned.lock().unwrap().record.id);
+    runtime.stop(&root, &entry).unwrap();
+    assert!(target_out(&config, &entry).is_err());
+    assert_eq!(std::fs::read(kept(&root)).unwrap(), b"short");
+    finish(&runtime, &root, &entry);
+}
+#[test]
+fn staged_target_becomes_an_empty_directory_without_following_a_link() {
+    use std::os::unix::fs::symlink;
+    let scratch = ScratchDir::new("macos-target-mount-point");
+    let root = scratch.join("state");
+    let staged = staged(&root, Uuid::now_v7());
     let sentinel = scratch.join("sentinel");
     std::fs::create_dir(&sentinel).unwrap();
     std::fs::write(sentinel.join("whole"), "unchanged").unwrap();
     symlink(&sentinel, staged.workspace.join("target")).unwrap();
-    runtime.stop(&root, &entry).unwrap();
-    assert!(target_out(&config, &entry, &staged.workspace).is_err());
-    target_in(&config, &entry, &staged).unwrap();
-    assert!(!staged.workspace.join("target").exists());
-    entry.owned.lock().unwrap().record.stop_proven = true;
-    runtime.finish(&root, &entry);
+    target_in(&staged).unwrap();
+    let target = staged.workspace.join("target");
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     assert_eq!(
         std::fs::read_to_string(sentinel.join("whole")).unwrap(),
         "unchanged"
     );
+    std::fs::write(target.join("stale"), "from the checkout").unwrap();
+    target_in(&staged).unwrap();
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+}
+#[test]
+fn only_return_paths_inside_target_reach_the_guest_relative_to_target() {
+    let mut request = motor_protocol::Run {
+        return_paths: [
+            "/Users/test/repo/target/debug/app",
+            "/Users/test/repo/Target/doc/index.html",
+            "/Users/test/repo/src/main.rs",
+            "/Users/test/repo/target",
+            "/Users/test/repo/target/../src/lib.rs",
+            "/Users/test/repo/target/./release/app",
+            "/Users/test/repo/targets/x",
+        ]
+        .map(String::from)
+        .to_vec(),
+        return_max_bytes: 1234,
+        return_chunked: true,
+        gate_job: false,
+        network: None,
+        platform: Some(motor_protocol::Platform::Macos),
+        workspace_kind: None,
+        job_id: Uuid::now_v7(),
+        workspace_key: "/Users/test/repo".into(),
+        repository_root: "/Users/test/repo".into(),
+        cwd: "/Users/test/repo".into(),
+        command: "true".into(),
+        env: Default::default(),
+        weight_hint: None,
+        timeout: None,
+        queue_wait_limit_s: 300,
+        snapshot_commit: "a".repeat(40),
+        tree_hash: String::new(),
+        integration_tip: "a".repeat(40),
+        siblings: vec![],
+        bundles: vec![],
+        git_dependencies: vec![],
+        base_commit: None,
+    };
+    assert_eq!(
+        build_config(&request).unwrap(),
+        motor_macvm::BuildConfig {
+            returns: vec![
+                "debug/app".into(),
+                "doc/index.html".into(),
+                "release/app".into()
+            ],
+            return_max_bytes: 1234,
+        }
+    );
+    request.return_paths.clear();
+    assert!(build_config(&request).unwrap().returns.is_empty());
 }

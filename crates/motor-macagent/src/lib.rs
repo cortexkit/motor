@@ -1,7 +1,9 @@
 //! Single-job guest execution using the shared macOS agent protocol.
 
-pub use motor_macvm::{BootConfig, Mount, read_boot_config};
+pub use motor_macvm::{BootConfig, BuildConfig, Mount, read_boot_config};
 use std::io::{self, Read};
+#[cfg(unix)]
+pub mod build_volume;
 #[cfg(unix)]
 pub mod mounts;
 
@@ -32,14 +34,14 @@ mod nonce_tests {
     use super::*;
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     fn disk() -> Vec<u8> {
-        motor_macvm::nonce_bytes(NONCE, &[]).unwrap()
+        motor_macvm::nonce_bytes(NONCE, &[], &BuildConfig::default()).unwrap()
     }
     #[test]
     fn discovery_uses_one_aligned_full_device_read() {
         struct Device(Vec<u8>);
         impl Read for Device {
             fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-                assert_eq!(out.len(), motor_macvm::NONCE_DISK_SIZE);
+                assert_eq!(out.len(), motor_macvm::NONCE_IMAGE_SIZE);
                 assert_eq!(out.as_ptr() as usize % 4096, 0);
                 out.copy_from_slice(&self.0);
                 Ok(out.len())
@@ -375,11 +377,21 @@ mod execution {
         cargo_home: PathBuf,
         temporary_root: PathBuf,
         scope: Arc<KillScope>,
+        /// Mounted at `target/` before the command and unmounted before its
+        /// exit is reported. Only tests run without one.
+        build: Option<Box<dyn crate::build_volume::BuildVolume>>,
     }
 
     /// Only the root launch daemon calls this entry point. Tests use a private
     /// process group instead of the real job uid, so they cannot kill other jobs.
-    pub async fn serve_guest<S>(stream: S, nonce: String, cargo_home: PathBuf) -> io::Result<()>
+    /// `mounts` is the verified boot map; its workspace share holds `target/`.
+    pub async fn serve_guest<S>(
+        stream: S,
+        nonce: String,
+        cargo_home: PathBuf,
+        mounts: &[Mount],
+        build: BuildConfig,
+    ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -422,6 +434,15 @@ mod execution {
                 gid: (*entry).pw_gid,
             })?
         };
+        #[cfg(target_os = "macos")]
+        let volume: Box<dyn crate::build_volume::BuildVolume> = Box::new(
+            crate::build_volume::Native::new(mounts, build, user.uid, user.gid)?,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let volume: Box<dyn crate::build_volume::BuildVolume> = {
+            let _ = (mounts, build);
+            Box::new(crate::build_volume::Unsupported)
+        };
         serve(
             stream,
             nonce,
@@ -430,6 +451,7 @@ mod execution {
                 cargo_home,
                 temporary_root: "/var/tmp".into(),
                 scope: Arc::new(KillScope::User(user)),
+                build: Some(volume),
             },
         )
         .await
@@ -536,7 +558,7 @@ mod execution {
         }
     }
 
-    async fn serve<S>(stream: S, nonce: String, settings: Settings) -> io::Result<()>
+    async fn serve<S>(stream: S, nonce: String, mut settings: Settings) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -554,6 +576,12 @@ mod execution {
         let Frame::TreeEnd { command } = receive(&mut reader, &protocol).await? else {
             return Err(io::Error::other("expected command"));
         };
+        // No job code runs until the build volume covers target/. A failure
+        // closes the session before Started.
+        let notice = match settings.build.as_mut() {
+            Some(volume) => volume.attach()?,
+            None => None,
+        };
         let tmpdir = tempfile::Builder::new()
             .prefix("motor-job-")
             .tempdir_in(&settings.temporary_root)?;
@@ -563,7 +591,7 @@ mod execution {
         let stdout = tempfile::NamedTempFile::new_in(&settings.temporary_root)?;
         let stderr = tempfile::NamedTempFile::new_in(&settings.temporary_root)?;
         let stdout_write = tokio::fs::File::from_std(stdout.reopen()?);
-        let stderr_write = tokio::fs::File::from_std(stderr.reopen()?);
+        let mut stderr_write = tokio::fs::File::from_std(stderr.reopen()?);
         let stdout_read = tokio::fs::File::from_std(stdout.reopen()?);
         let stderr_read = tokio::fs::File::from_std(stderr.reopen()?);
         let mut process = tokio::process::Command::new(&settings.shell);
@@ -610,6 +638,15 @@ mod execution {
         }
         let _cleanup = Cleanup(settings.scope.clone());
         let (output_tx, output_rx) = mpsc::unbounded_channel();
+        // The notice goes through the stderr spool ahead of the command's own
+        // output, so the job's log says why its build started cold.
+        if let Some(notice) = notice {
+            stderr_write.write_all(notice.as_bytes()).await?;
+            stderr_write.flush().await?;
+            output_tx
+                .send(Output::Chunk(Stream::Stderr, notice.len()))
+                .map_err(|_| io::Error::other("output closed"))?;
+        }
         let mut pipes = JoinSet::new();
         pipes.spawn(drain(
             child.stdout.take().unwrap(),
@@ -659,8 +696,14 @@ mod execution {
                 }
             }
         }
+        let terminal = termination(status.unwrap())?;
+        // Every job process is gone. The exit is reported only once the build
+        // volume is unmounted; without it the host publishes nothing.
+        if let Some(volume) = settings.build.as_mut() {
+            volume.detach()?;
+        }
         output_tx
-            .send(Output::Terminal(termination(status.unwrap())?))
+            .send(Output::Terminal(terminal))
             .map_err(|_| io::Error::other("output closed"))?;
         loop {
             tokio::select! {
@@ -814,6 +857,20 @@ mod execution {
         }
 
         async fn start(command: &str, suppress_kill: bool) -> Fixture {
+            let mut fixture = launch(command, suppress_kill, |_| None).await;
+            assert_eq!(
+                host_receive(&mut fixture.host).await.unwrap(),
+                Some(Frame::Started {})
+            );
+            fixture
+        }
+
+        /// Starts the agent and sends the command, before any Started frame.
+        async fn launch(
+            command: &str,
+            suppress_kill: bool,
+            build: impl FnOnce(&Path) -> Option<Box<dyn crate::build_volume::BuildVolume>>,
+        ) -> Fixture {
             let root = cortexkit_test_support::scratch_root();
             std::fs::create_dir_all(&root).unwrap();
             let directory = tempfile::tempdir_in(root).unwrap();
@@ -827,13 +884,14 @@ mod execution {
                 cargo_home: CARGO_HOME.into(),
                 temporary_root: directory.path().into(),
                 scope: scope.clone(),
+                build: build(directory.path()),
             };
             let (mut host, guest) = tokio::io::duplex(1024);
             let agent = Task(tokio::spawn(serve(guest, NONCE.into(), settings)));
             assert_eq!(
                 host_receive(&mut host).await.unwrap(),
                 Some(Frame::Hello {
-                    version: 1,
+                    version: motor_winagent::MACOS_PROTOCOL_VERSION,
                     nonce: NONCE.into()
                 })
             );
@@ -860,10 +918,6 @@ mod execution {
                 },
             )
             .await;
-            assert_eq!(
-                host_receive(&mut host).await.unwrap(),
-                Some(Frame::Started {})
-            );
             Fixture {
                 host,
                 agent,
@@ -1047,6 +1101,105 @@ mod execution {
             let mut second = start("printf '%s' \"$TMPDIR\"", false).await;
             let (stdout, _, _) = collect(&mut second).await;
             assert_ne!(String::from_utf8(stdout).unwrap(), first_tmp);
+        }
+
+        /// Stands in for the build disk and records what the agent asked of it.
+        struct FakeVolume {
+            directory: PathBuf,
+            events: Arc<Mutex<Vec<&'static str>>>,
+            notice: Option<String>,
+            fail_attach: bool,
+            fail_detach: bool,
+        }
+        impl crate::build_volume::BuildVolume for FakeVolume {
+            fn attach(&mut self) -> io::Result<Option<String>> {
+                self.events.lock().unwrap().push("attach");
+                if self.fail_attach {
+                    return Err(io::Error::other("no build disk"));
+                }
+                std::fs::write(self.directory.join("mounted"), "").unwrap();
+                Ok(self.notice.clone())
+            }
+            fn detach(&mut self) -> io::Result<()> {
+                // A slow unmount: the exit must still wait for it.
+                std::thread::sleep(Duration::from_millis(300));
+                self.events.lock().unwrap().push("detach");
+                if self.fail_detach {
+                    return Err(io::Error::other("volume busy"));
+                }
+                Ok(())
+            }
+        }
+        async fn launch_with_volume(
+            command: &str,
+            notice: Option<&str>,
+            fail_attach: bool,
+            fail_detach: bool,
+        ) -> (Fixture, Arc<Mutex<Vec<&'static str>>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let recorded = events.clone();
+            let fixture = launch(command, false, move |directory| {
+                Some(Box::new(FakeVolume {
+                    directory: directory.into(),
+                    events: recorded,
+                    notice: notice.map(str::to_owned),
+                    fail_attach,
+                    fail_detach,
+                }) as Box<dyn crate::build_volume::BuildVolume>)
+            })
+            .await;
+            (fixture, events)
+        }
+
+        #[tokio::test]
+        async fn build_volume_is_attached_before_the_command_and_detached_before_its_exit() {
+            let (mut fixture, events) =
+                launch_with_volume("test -f mounted && echo ran", Some("motor: cold\n"), false, false)
+                    .await;
+            assert_eq!(
+                host_receive(&mut fixture.host).await.unwrap(),
+                Some(Frame::Started {})
+            );
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let terminal = loop {
+                match host_receive(&mut fixture.host).await.unwrap().unwrap() {
+                    Frame::Output { stream: Stream::Stdout, bytes } => stdout.extend(bytes),
+                    Frame::Output { stream: Stream::Stderr, bytes } => stderr.extend(bytes),
+                    terminal => break terminal,
+                }
+            };
+            // Checked when the exit arrives, not after the agent ends.
+            assert_eq!(*events.lock().unwrap(), ["attach", "detach"]);
+            assert_eq!(terminal, Frame::Exit { code: 0 });
+            assert_eq!(stdout, b"ran\n");
+            assert_eq!(stderr, b"motor: cold\n");
+            (&mut fixture.agent.0).await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn failed_build_volume_attach_runs_no_command() {
+            let (mut fixture, events) =
+                launch_with_volume("touch ran", None, true, false).await;
+            assert!(host_receive(&mut fixture.host).await.unwrap().is_none());
+            assert!((&mut fixture.agent.0).await.unwrap().is_err());
+            assert_eq!(*events.lock().unwrap(), ["attach"]);
+            assert!(!fixture._directory.path().join("ran").exists());
+        }
+
+        #[tokio::test]
+        async fn failed_build_volume_detach_reports_no_exit() {
+            let (mut fixture, events) =
+                launch_with_volume("echo ran", None, false, true).await;
+            loop {
+                match host_receive(&mut fixture.host).await.unwrap() {
+                    Some(Frame::Started {} | Frame::Output { .. }) => {}
+                    None => break,
+                    Some(frame) => panic!("unexpected frame {frame:?}"),
+                }
+            }
+            assert!((&mut fixture.agent.0).await.unwrap().is_err());
+            assert_eq!(*events.lock().unwrap(), ["attach", "detach"]);
         }
     }
 }
