@@ -266,6 +266,57 @@ class QualificationReadinessTests(unittest.TestCase):
                 if passes:
                     self.assertIn("rustc 1.99.0 ", result.stdout)
 
+    def test_real_jobs_check_numbered_and_checkout_pinned_rust_even_with_a_custom_gate(self):
+        source = (HERE / "qualify-jobs.py").read_text().split("def run(root, runner, evidence, gate):", 1)[1]
+        self.assertIn('+ RUST_1100_VERSION_CHECK + " || exit $?; " + ', source)
+        self.assertIn('+ PINNED_TOOLCHAIN_CHECK + " || exit $?; " + ', source)
+        self.assertIn('command = "export RUSTUP_AUTO_INSTALL=0; ', source)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash Rust checks")
+    def test_numbered_and_pinned_rust_checks_reject_wrong_missing_and_failed_tools(self):
+        cargo = "cargo 1.100.0 (3acc79c0c 2026-11-05)"
+        rustc = "rustc 1.100.0 (0ef1bc386 2026-11-09)"
+        for check, arguments in ((JOBS.RUST_1100_VERSION_CHECK, '+1.100.0 --version'),
+                                 (JOBS.PINNED_TOOLCHAIN_CHECK, '--version')):
+            for cargo_version, rustc_version, cargo_code, rustc_code, passes in (
+                (cargo, rustc, 0, 0, True),
+                (cargo + "\r", rustc + "\r", 0, 0, True),
+                (cargo.replace("1.100.0", "1.99.0"), rustc, 0, 0, False),
+                (cargo, rustc.replace("1.100.0", "1.99.0"), 0, 0, False),
+                (cargo.replace("1.100.0", "1.100.00"), rustc, 0, 0, False),
+                (cargo, rustc.replace("1.100.0", "1.100.00"), 0, 0, False),
+                (cargo, rustc.replace("1.100.0", "1.100.0-nightly"), 0, 0, False),
+                (cargo.replace("3acc79c0c", "wronghash"), rustc, 0, 0, False),
+                (cargo, rustc.replace("0ef1bc386", "wronghash"), 0, 0, False),
+                ("", rustc, 127, 0, False),
+                (cargo, "", 0, 127, False),
+                (cargo, rustc, 1, 0, False),
+                (cargo, rustc, 0, 1, False),
+            ):
+                with self.subTest(arguments=arguments, cargo=cargo_version, rustc=rustc_version,
+                                  cargo_code=cargo_code, rustc_code=rustc_code):
+                    command = (
+                        f"cargo() {{ test \"$*\" = '{arguments}' || return 99; "
+                        f"printf '%s\\n' '{cargo_version}'; return {cargo_code}; }}; "
+                        f"rustc() {{ test \"$*\" = '{arguments}' || return 99; "
+                        f"printf '%s\\n' '{rustc_version}'; return {rustc_code}; }}; "
+                    ) + check
+                    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, passes, result.stderr)
+                    if passes:
+                        self.assertIn(cargo, result.stdout)
+                        self.assertIn(rustc, result.stdout)
+
+    def test_real_gate_fixture_commits_offline_rust_1100_pin(self):
+        def git(repo, *args):
+            return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT).decode().strip()
+
+        repo = self.root / "pinned-fixture"
+        with patch.object(JOBS, "git", side_effect=git):
+            commit, _ = JOBS.fixture(repo)
+        self.assertEqual(git(repo, "show", commit + ":rust-toolchain.toml"),
+                         '[toolchain]\nchannel = "1.100.0"')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

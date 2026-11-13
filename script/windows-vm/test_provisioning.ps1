@@ -19,7 +19,7 @@ foreach ($name in @('bootstrap.ps1', 'setup-guest.ps1', 'setup-job-baseline.ps1'
 # These assertions defend the provisioning inputs, not Windows installer behavior.
 $baseline = Get-Content (Join-Path $Scripts 'setup-job-baseline.ps1') -Raw
 $ast = [Management.Automation.Language.Parser]::ParseInput($baseline, [ref]$null, [ref]$null)
-foreach ($commandText in @('& $rustup component add clippy rustfmt --toolchain $toolchain', '& $rustup target add aarch64-pc-windows-msvc --toolchain $toolchain')) {
+foreach ($commandText in @('& $rustup component add clippy rustfmt --toolchain $toolchain', '& $rustup target add aarch64-pc-windows-msvc --toolchain $toolchain', '& $rustup toolchain install "$additionalToolchain-$hostTriple" --profile minimal --component clippy --component rustfmt --target aarch64-pc-windows-msvc')) {
     $commands = @($ast.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.Extent.Text -eq $commandText}, $true))
     Assert ($commands.Count -eq 1) "expected one unconditional $commandText"
     $parent = $commands[0].Parent
@@ -392,6 +392,61 @@ foreach ($case in @(
 }
 $checks++
 Write-Host 'PASS rust_stable_version_guard_rejects_wrong_missing_and_failed_tools'
+
+$additionalToolchain = '1.100.0'
+$additionalInstall = '$rustup toolchain install "$additionalToolchain-$hostTriple"'
+Assert ($baseline.Contains("`$additionalToolchain = '1.100.0'")) 'additional Rust must be pinned to 1.100.0'
+Assert ($baseline.IndexOf($additionalInstall) -gt $baseline.IndexOf('Compare-Object $targets $stableTargets')) 'additional Rust must follow default and stable setup'
+Assert ($baseline.IndexOf($additionalInstall) -lt $baseline.IndexOf('# Freeze toolchain files')) 'additional Rust must inherit the read-only ACL'
+Assert (-not $baseline.Contains('--default-toolchain $additionalToolchain')) 'additional Rust must not replace the default'
+$additionalVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$additionalRustc -notcontains')}, $true)
+Assert ($null -ne $additionalVersionGuard) 'missing additional Rust version guard'
+foreach ($case in @(
+    @{Version=@('release: 1.100.0', "host: $hostTriple"); Code=0; Reject=$false},
+    @{Version=@('release: 1.99.0', "host: $hostTriple"); Code=0; Reject=$true},
+    @{Version=@('release: 1.100.00', "host: $hostTriple"); Code=0; Reject=$true},
+    @{Version=@('release: 1.100.0-nightly', "host: $hostTriple"); Code=0; Reject=$true},
+    @{Version=@('release: 1.100.0', 'host: aarch64-pc-windows-msvc'); Code=0; Reject=$true},
+    @{Version=@(); Code=0; Reject=$true},
+    @{Version=@(); Code=127; Reject=$true},
+    @{Version=@('release: 1.100.0', "host: $hostTriple"); Code=1; Reject=$true}
+)) {
+    $additionalRustc = $case.Version
+    $LASTEXITCODE = $case.Code
+    $threw = $false
+    try { Invoke-Expression $additionalVersionGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Additional machine-wide Rust version/host verification failed')) "unexpected additional Rust version error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq $case.Reject) "wrong additional Rust version guard result: $($case.Version -join ' | '), exit $($case.Code)"
+}
+$checks++
+Write-Host 'PASS rust_1100_install_and_version_guard_preserve_default_and_stable'
+
+foreach ($inventory in @('components', 'targets')) {
+    $guard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains("throw 'Additional Rust $inventory differ from default toolchain'")}, $true)
+    Assert ($null -ne $guard) "missing additional Rust $inventory guard"
+    $complete = if ($inventory -eq 'components') { @("clippy-$hostTriple", "rustfmt-$hostTriple") } else { @($hostTriple, 'aarch64-pc-windows-msvc') }
+    Set-Variable -Name $inventory -Value $complete
+    foreach ($case in @(
+        @{Entries=$complete; Code=0; Reject=$false},
+        @{Entries=@($complete[0]); Code=0; Reject=$true},
+        @{Entries=@($complete[1]); Code=0; Reject=$true},
+        @{Entries=@($complete + 'unexpected'); Code=0; Reject=$true},
+        @{Entries=$complete; Code=1; Reject=$true}
+    )) {
+        Set-Variable -Name "additional$inventory" -Value $case.Entries
+        $LASTEXITCODE = $case.Code
+        $threw = $false
+        try { Invoke-Expression $guard.Extent.Text } catch {
+            Assert ($_.ToString().Contains("Additional Rust $inventory differ from default toolchain")) "unexpected additional Rust inventory error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq $case.Reject) "additional Rust $inventory guard accepted mismatched output or rejected matching output"
+    }
+    $checks++
+    Write-Host "PASS rust_1100_${inventory}_guard_rejects_mismatch_and_failure"
+}
 
 foreach ($inventory in @('components', 'targets')) {
     $guard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains("throw 'Rust stable $inventory differ from pinned toolchain'")}, $true)

@@ -13,6 +13,7 @@ if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Job baseline requires x64 
 if (-not $?) { throw 'Machine-wide PowerShell installation failed' }
 
 $toolchain = '1.99.0'
+$additionalToolchain = '1.100.0'
 $hostTriple = 'x86_64-pc-windows-msvc'
 $motor = 'C:\ProgramData\Motor'
 $jobUser = 'motor-job'
@@ -513,6 +514,23 @@ $stableTargets = & $rustup target list --installed --toolchain stable
 if ($LASTEXITCODE -ne 0 -or (Compare-Object $targets $stableTargets)) { throw 'Rust stable targets differ from pinned toolchain' }
 Write-Host "Verified machine-wide Rust stable $toolchain with matching components and targets"
 
+# Preinstall the next repository pin for offline jobs without moving the default
+# or the stable copy. Both numbered toolchains share the protected machine root.
+& $rustup toolchain install "$additionalToolchain-$hostTriple" --profile minimal --component clippy --component rustfmt --target aarch64-pc-windows-msvc
+if ($LASTEXITCODE -ne 0) { throw 'Additional job image Rust toolchain failed to install' }
+$additionalRustc = & 'C:\rust\cargo\bin\rustc.exe' "+$additionalToolchain" -vV
+if ($LASTEXITCODE -ne 0 -or $additionalRustc -notcontains "release: $additionalToolchain" -or $additionalRustc -notcontains "host: $hostTriple") {
+    throw 'Additional machine-wide Rust version/host verification failed'
+}
+$additionalRustc | Write-Host
+& 'C:\rust\cargo\bin\cargo.exe' "+$additionalToolchain" --version
+if ($LASTEXITCODE -ne 0) { throw 'Additional machine-wide Cargo verification failed' }
+$additionalComponents = & $rustup component list --installed --toolchain $additionalToolchain
+if ($LASTEXITCODE -ne 0 -or (Compare-Object $components $additionalComponents)) { throw 'Additional Rust components differ from default toolchain' }
+$additionalTargets = & $rustup target list --installed --toolchain $additionalToolchain
+if ($LASTEXITCODE -ne 0 -or (Compare-Object $targets $additionalTargets)) { throw 'Additional Rust targets differ from default toolchain' }
+Write-Host "Verified machine-wide Rust $additionalToolchain with matching components and targets; default and stable remain $toolchain"
+
 # Jobs are offline; install the verified Windows release beside Cargo before
 # the toolchain tree is made read-only for the job user.
 # SHA-256 source: https://github.com/cortexkit/aft/blob/main/.github/actions/setup-nextest/action.yml
@@ -659,13 +677,15 @@ if ($HyperVSpike -and -not $prebuiltHvsock) {
 if ($LASTEXITCODE -ne 0) { throw 'Read-only job toolchain ACL setup failed' }
 & icacls 'C:\rust\*' /reset /T /C /L /Q
 if ($LASTEXITCODE -ne 0) { throw 'Toolchain ACL inheritance reset failed' }
-# The freeze must leave the toolchain runnable; verify it after the ACL change.
-$rustc = & 'C:\rust\cargo\bin\rustc.exe' -vV
-if ($LASTEXITCODE -ne 0 -or $rustc -notcontains "release: $toolchain") {
-    throw 'Rust is not runnable after the toolchain ACL change'
+# The freeze must leave both numbered toolchains runnable.
+foreach ($installedToolchain in @($toolchain, $additionalToolchain)) {
+    $rustc = & 'C:\rust\cargo\bin\rustc.exe' "+$installedToolchain" -vV
+    if ($LASTEXITCODE -ne 0 -or $rustc -notcontains "release: $installedToolchain" -or $rustc -notcontains "host: $hostTriple") {
+        throw "Rust $installedToolchain is not runnable after the toolchain ACL change"
+    }
+    & 'C:\rust\cargo\bin\cargo.exe' "+$installedToolchain" --version
+    if ($LASTEXITCODE -ne 0) { throw "Cargo $installedToolchain is not runnable after the toolchain ACL change" }
 }
-& 'C:\rust\cargo\bin\cargo.exe' --version
-if ($LASTEXITCODE -ne 0) { throw 'Cargo is not runnable after the toolchain ACL change' }
 
 # A rerun must also remove SSH state, not merely skip installing the server.
 $sshd = Get-Service sshd -ErrorAction SilentlyContinue
