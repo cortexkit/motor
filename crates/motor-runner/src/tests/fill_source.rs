@@ -340,7 +340,8 @@ fn helper_fill_boot_refuses_run_and_job_boot_refuses_fill_before_import() {
 fn failed_writer_publication_is_not_reported_as_fill_success() {
     let (f, runner, _, _, _) = source_fixture();
     let id = Uuid::now_v7();
-    assert!(runner.fill_settled(id, &f.root).is_err());
+    let error = runner.fill_settled(id, &f.root).unwrap_err();
+    assert!(error.to_string().contains("record is missing"), "{error}");
     {
         let mut inner = runner.core.inner.lock().unwrap();
         let repository = inner
@@ -349,8 +350,31 @@ fn failed_writer_publication_is_not_reported_as_fill_success() {
             .entry(f.root.clone())
             .or_default();
         repository.result = Some(RebuildResult::Failed);
+        repository.failure_detail = Some("cache ACL repair/tracking: read-only file system".into());
     }
-    assert!(runner.fill_settled(id, &f.root).is_err());
+    let error = runner.fill_settled(id, &f.root).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cache ACL repair/tracking: read-only file system"),
+        "{error}"
+    );
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .repositories
+        .get_mut(&f.root)
+        .unwrap()
+        .failure_detail = Some(" ".into());
+    let error = runner.fill_settled(id, &f.root).unwrap_err();
+    assert!(
+        error.to_string().contains("Failed")
+            && error.to_string().contains("without a failure detail"),
+        "{error}"
+    );
     runner
         .core
         .inner
@@ -362,4 +386,82 @@ fn failed_writer_publication_is_not_reported_as_fill_success() {
         .unwrap()
         .result = Some(RebuildResult::Ok);
     assert!(runner.fill_settled(id, &f.root).unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn imported_fill_settles_ok_and_root_policy_publishes_a_fixed_path_base() {
+    use crate::build_base::{self, CompatibleInputs, FillLaunch, Timestamp, ToolchainIdentity};
+    let (f, _tenant, _, directory, source) = source_fixture();
+    let saved = f.scratch.join("filled-bd");
+    let mut config = f.config();
+    config.state_root = f.scratch.join("fill-vm-state");
+    config.manual_tick = true;
+    config.tenant_vm = true;
+    config.fill_vm = true;
+    config.tenant_write_key = Some(true);
+    config.base_commands = vec![format!(
+        "mkdir -p \"$CARGO_TARGET_DIR/bd\" && printf compiled > \"$CARGO_TARGET_DIR/bd/artifact\" && cp -R \"$CARGO_TARGET_DIR/bd\" {}",
+        saved.display()
+    )];
+    let runner = Runner::open(config.clone()).unwrap();
+    crate::fill_source::import(&runner.core.trees, &source, &directory).unwrap();
+    let id = runner.queue_imported_fill(&source).unwrap().unwrap();
+    runner.tick().unwrap();
+    assert_eq!(
+        terminal(&runner, id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    until(|| {
+        runner
+            .fill_settled(id, &source.repository_root)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(fs::read(saved.join("artifact")).unwrap(), b"compiled");
+
+    // The portable command uses the development backend. Exercise the root
+    // policy/publication layer with its real output and the existing fixture
+    // ownership seam. Real system accounts, unit shutdown and privileged UID
+    // transfer are covered by the ignored isolation tests, not this fixture.
+    config.isolate_jobs = true;
+    config.fixed_path_repositories = vec!["*".into()];
+    config.account_subject = Some("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+    let mut job = runner.core.inner.lock().unwrap().jobs[&id].clone();
+    let request = job.request.as_ref().unwrap();
+    let checkout = paths::host_run(runner.config(), request).host_cwd;
+    let fixed = paths::fixed_paths(&config, request).unwrap().unwrap();
+    job.base_launch = Some(FillLaunch {
+        inputs: CompatibleInputs {
+            toolchain: ToolchainIdentity {
+                rustc_verbose: "portable fixture toolchain".into(),
+                rust_toolchain: None,
+                rust_toolchain_toml: None,
+                wrapper: None,
+            },
+            environment: "portable fixture environment".into(),
+        },
+        fixed_path: fixed.checkout.clone(),
+        reference: Timestamp::reference().unwrap(),
+    });
+    let generation = build_base::staging(&config.state_dir(), &source.repository_root, id);
+    fs::create_dir_all(generation.join("target")).unwrap();
+    fs::rename(&saved, generation.join("target/bd")).unwrap();
+    build_base::publish_with_fixture_ownership(&config, &runner.core.trees, &checkout, &job)
+        .unwrap();
+    let record = generation.parent().unwrap().join("current/base.json");
+    let record: build_base::Record = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+    assert_eq!(record.commit, source.integration_tip);
+    assert_eq!(record.fixed_path, fixed.checkout);
+    assert_eq!(
+        fs::read(
+            generation
+                .parent()
+                .unwrap()
+                .join("current/target/bd/artifact")
+        )
+        .unwrap(),
+        b"compiled"
+    );
+    assert!(runner.fill_settled(id, &source.repository_root).unwrap());
 }

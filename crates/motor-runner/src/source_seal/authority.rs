@@ -12,8 +12,31 @@ impl Authority {
     #[cfg(test)]
     /// A concrete fixture policy, not an exemption from state/root checks.
     pub(crate) fn for_fixture(config: &Config) -> Self {
+        Self::from_config(config)
+    }
+
+    fn from_config(config: &Config) -> Self {
         Self {
             states: BTreeMap::from([(config.state_dir(), roots(config))]),
+        }
+    }
+
+    /// A root runner's launch configuration is already privileged authority.
+    /// Only the delegated sudo helper needs an independently installed policy
+    /// to constrain paths supplied by an unprivileged runner.
+    pub(crate) fn for_staging(config: &Config) -> io::Result<Self> {
+        Self::staging_for_uid(config, unsafe { libc::geteuid() }, Self::load)
+    }
+
+    pub(crate) fn staging_for_uid(
+        config: &Config,
+        uid: u32,
+        load: impl FnOnce() -> io::Result<Self>,
+    ) -> io::Result<Self> {
+        if uid == 0 {
+            Ok(Self::from_config(config))
+        } else {
+            load()
         }
     }
 
@@ -108,6 +131,17 @@ pub(crate) fn roots(config: &Config) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn non_root_staging_still_requires_the_installed_policy() {
+        let scratch = cortexkit_test_support::ScratchDir::new("staging-missing-policy");
+        let config = Config::new(scratch.path(), "state");
+        let missing = scratch.join("missing-source-seal.json");
+        assert!(!missing.exists());
+        let error = Authority::staging_for_uid(&config, 1000, || Authority::read(&missing))
+            .err()
+            .expect("non-root staging must load the policy");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
     #[test]
     fn unknown_state_and_outside_workspace_are_not_authorized() {
         let scratch = cortexkit_test_support::ScratchDir::new("source-seal-authority");

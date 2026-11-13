@@ -3808,13 +3808,20 @@ impl Runner {
         if inner.base_finishes.contains_key(&id) {
             return Ok(false);
         }
-        if inner
-            .catalog
-            .repositories
-            .get(repository)
-            .is_none_or(|repository| repository.result != Some(RebuildResult::Ok))
-        {
-            return Err(invalid("fill writer publication failed"));
+        let record = inner.catalog.repositories.get(repository);
+        if record.is_none_or(|record| record.result != Some(RebuildResult::Ok)) {
+            let reason = record
+                .and_then(|record| record.failure_detail.as_deref())
+                .filter(|detail| !detail.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| match record {
+                    Some(record) => format!(
+                        "repository rebuild result is {:?} without a failure detail",
+                        record.result
+                    ),
+                    None => "repository rebuild record is missing".into(),
+                });
+            return Err(invalid(format!("fill writer publication failed: {reason}")));
         }
         Ok(true)
     }
@@ -11609,7 +11616,7 @@ impl Runner {
                 );
             }
             crate::build_base::publish(
-                &self.core.trees.state,
+                &self.core.config,
                 &self.core.trees,
                 &paths::job_workspace(&self.core.config, &job),
                 &job,
@@ -11736,7 +11743,7 @@ impl Runner {
                 id,
             );
         }
-        crate::permissions::staging_operation("remove-staging", &self.core.trees.state, key, id)
+        crate::permissions::staging_operation("remove-staging", &self.core.config, key, id)
     }
 
     /// Persist the attempt before setup can start, then advance it to the
@@ -11885,13 +11892,18 @@ impl Runner {
                         keys = keys.len(),
                         "remote cache fill published"
                     ),
-                    publication::Outcome::Failed { reason } => tracing::warn!(
-                        job_id = %r.job_id,
-                        repository = %paths::request(r).caller_repository_root.text(),
-                        %descriptor,
-                        reason = %reason,
-                        "remote cache fill did not publish"
-                    ),
+                    publication::Outcome::Failed { reason } => {
+                        if success {
+                            g.failure_detail = Some(format!("remote cache publication: {reason}"));
+                        }
+                        tracing::warn!(
+                            job_id = %r.job_id,
+                            repository = %paths::request(r).caller_repository_root.text(),
+                            %descriptor,
+                            reason = %reason,
+                            "remote cache fill did not publish"
+                        );
+                    }
                 }
             }
         }

@@ -61,8 +61,9 @@ refused before any mode changes.
 The two staging operations address only
 `STATE_ROOT/build-bases/REPO_KEY/staging-FILL_UUID`, where `REPO_KEY` is the
 repository's lowercase SHA-256 key. Both require the state root to appear in
-the root-owned `/etc/motor-runner/source-seal.json`, including for an in-process
-root runner. `build-bases` and its repository directory must belong to the runner
+the root-owned `/etc/motor-runner/source-seal.json` when invoked through the
+delegated sudo helper. An in-process root runner derives the same authority from
+its root-controlled launch configuration instead. `build-bases` and its repository directory must belong to the runner
 or root and permit no group or other write. Every staging inode must belong to
 the validated `motor-cache` fill account, which must differ from the runner,
 root and `motor-job`; publication requires staging directories to permit no group

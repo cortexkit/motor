@@ -1241,6 +1241,43 @@ pub(crate) fn job_vm_memory(slice: &std::path::Path) -> Result<crate::helper::Jo
     })
 }
 
+fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
+    let job = &execution.claims.jti;
+    if !runtime
+        .host
+        .lock()
+        .expect("host lock")
+        .job_workspace_is_new(job)
+    {
+        tracing::info!(jti = %job, reason = "disk_exists", "workspace_seed_not_needed; checkout disk already exists and keeps its own warm build");
+        return;
+    }
+    let seeded = (|| -> Result<bool> {
+        let plan = runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .job_seed_plan(job, &crate::jobs::fill_source::repository_key(root))?;
+        let Some(plan) = plan else {
+            return Ok(false);
+        };
+        runtime.control.seed_workspace(&plan.request)?;
+        runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .job_seeded(job, &plan, unix_ms())?;
+        Ok(true)
+    })();
+    match seeded {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(jti = %job, "workspace_base_missing; using empty workspace"),
+        Err(error) => {
+            tracing::warn!(jti = %job, %error, "workspace_base_seed_failed; ensuring workspace without seed")
+        }
+    }
+}
+
 async fn boot(
     runtime: &Arc<Runtime>,
     execution: &Execution,
@@ -1260,25 +1297,14 @@ async fn boot(
                 .context("workspace cap missing")?
                 .cap_bytes;
             if let Some(root) = repository_root {
-                let seeded = (|| -> Result<bool> {
-                    let plan = r.host.lock().expect("host lock").job_seed_plan(
-                        &e.claims.jti,
-                        &crate::jobs::fill_source::repository_key(&root),
-                    )?;
-                    let Some(plan) = plan else { return Ok(false); };
-                    r.control.seed_workspace(&plan.request)?;
-                    r.host.lock().expect("host lock").job_seeded(&e.claims.jti, &plan, unix_ms())?;
-                    Ok(true)
-                })();
-                match seeded {
-                    Ok(true) => {},
-                    Ok(false) => tracing::info!(jti = %e.claims.jti, "workspace_base_missing; using empty workspace"),
-                    Err(error) => tracing::warn!(jti = %e.claims.jti, %error, "workspace_base_seed_failed; ensuring workspace without seed"),
-                }
+                seed_workspace(&r, &e, &root);
             }
             let selector = (e.claims.cache_write == Some(true) && !r.remote_cache_write_blocked())
                 .then_some(e.claims.jti.as_str());
-            if let Err(error) = r.control.ensure_workspace_for_job(&e.claims.sub, &e.disk_id, cap, selector) {
+            if let Err(error) =
+                r.control
+                    .ensure_workspace_for_job(&e.claims.sub, &e.disk_id, cap, selector)
+            {
                 r.host
                     .lock()
                     .expect("host lock")

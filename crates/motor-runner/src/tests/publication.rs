@@ -737,6 +737,28 @@ async fn failed_puts_retry_only_after_the_interval_and_do_not_consume_the_build_
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_cache_publication_reason_reaches_fill_settlement() {
+    let f = Fixture::new();
+    declare(&f, &controlled_command(&f));
+    let runner = controlled_runner(&f);
+    let h = Harness::new();
+    submit_reader(&f, &runner).await;
+    let job = running_fill(&runner, 0).await;
+    let binding = attach(&runner, &job, &h, Tool::Ccache, Some(CCACHE_OK));
+    h.store.status(Some(500));
+    assert_eq!(h.put(&binding, "/compiled", b"compiled").await.status, 503);
+    settle(&f, &runner, &job).await;
+    let error = runner.fill_settled(job.id, &f.root).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("remote cache publication: 1 ccache write(s) failed"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn three_failed_build_retries_hold_a_published_descriptor_until_restart() {
     let f = Fixture::new();
