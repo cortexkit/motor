@@ -948,8 +948,17 @@ or `capacity`). Before Run, an unpinned registered-host job requests a replaceme
 that keeps the same reservation and excludes every host it was previously placed
 on. A `replace_pending` fence waits for `Retry-After` within the same queue budget.
 Lease bodies stay unchanged: `avoid_host` is part of the lease hash, not a retry
-option. If no replacement is available, a routed job waits two seconds and asks
-again with the same job ID and lease body. These capacity waits don't count
+option. Once replacement begins, every later placement attempt uses the replace
+endpoint, never a lease re-request: only replace can advance the revocation fence.
+Replacement `503 no_capacity` (or `capacity`) waits for `Retry-After` within the
+same queue budget, so a host that frees up later can take the job. A lease
+re-request that discovers `replace_pending` also switches to replace after
+`Retry-After`, keeping the active submission's requester key. After a module
+restart, an unsent job is instead settled and retired with `LostToRestart`
+(`ran: none`), safe to resubmit; placement does not resume with a new key.
+Definite replacement refusals stop placement. A settled replacement after a
+pre-Run host capacity refusal preserves that original host cause.
+These capacity waits don't count
 against the three placement attempts. If only capacity answers exhaust the
 queue budget, including a replacement fence after a capacity refusal, the job
 gets `runner_full` with cause `hosted_capacity` and `ran: none`, so it is safe to

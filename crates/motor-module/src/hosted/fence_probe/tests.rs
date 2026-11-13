@@ -283,11 +283,10 @@ async fn invalid_vm_refuses_without_booking() {
 #[tokio::test]
 async fn disconnected_operator_does_not_cancel_cleanup() {
     let h = Harness::new(Behavior::ConnectFailure).await;
-    h.replace_replies.lock().unwrap().push_back((
-        503,
-        serde_json::json!({"error":"replace_pending"}),
-        "1",
-    ));
+    h.replace_replies.lock().unwrap().extend([
+        (503, serde_json::json!({"error":"replace_pending"}), "1"),
+        (409, serde_json::json!({"error":"job_released"}), ""),
+    ]);
     let caller = tokio::spawn(run(config(&h), Some(tokens()), request(Mode::Replace)));
     tokio::time::timeout(Duration::from_secs(5), async {
         while !h

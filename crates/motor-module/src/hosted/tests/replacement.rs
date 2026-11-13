@@ -13,6 +13,137 @@ fn replace_count(h: &Harness) -> usize {
         .count()
 }
 
+#[tokio::test]
+async fn replacement_no_capacity_retries_replace_instead_of_revoking_lease_route() {
+    let first = Harness::with_host(Behavior::Refuse("host_full"), "first-host").await;
+    let second = Harness::with_host(Behavior::CompleteRun, "second-host").await;
+    first.replace_replies.lock().unwrap().push_back((
+        503,
+        serde_json::json!({"error":"no_capacity"}),
+        "1",
+    ));
+    first
+        .replacement_hosts
+        .lock()
+        .unwrap()
+        .push_back(second.broker.clone());
+    let (scratch, repo) = committed_repo();
+    let motor = Motor::with_connector(
+        first.config(),
+        &scratch.0.join("state"),
+        Arc::new(NoSsh(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    let mut request = Harness::request(&repo);
+    request.queue_wait_limit_s = Some(6);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::Exit { code: 23 },
+        "detail={:?}; replace_count={}; lease_requests={}",
+        terminal.refusal_detail,
+        replace_count(&first),
+        first.lease_bodies.lock().unwrap().len(),
+    );
+    assert_eq!(replace_count(&first), 2);
+    assert_eq!(first.lease_bodies.lock().unwrap().len(), 1);
+    assert_eq!(first.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(first.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(second.runs.load(Ordering::SeqCst), 1);
+    let state = motor.hosted_state(id).unwrap();
+    assert_eq!(state.placement.unwrap().host, "second-host");
+    assert!(state.replacement_hosts.contains("first-host"));
+}
+
+#[tokio::test]
+async fn replacement_capacity_deadline_releases_the_unused_booking() {
+    let h = Harness::new(Behavior::Refuse("host_full")).await;
+    h.replace_replies.lock().unwrap().push_back((
+        503,
+        serde_json::json!({"error":"no_capacity"}),
+        "15",
+    ));
+    let (scratch, repo) = committed_repo();
+    let motor = Motor::with_connector(
+        h.config(),
+        &scratch.0.join("state"),
+        Arc::new(NoSsh(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    let mut request = Harness::request(&repo);
+    request.queue_wait_limit_s = Some(1);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    motor.wait_hosted_cleanup(id).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerFull
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms, Some(15_000));
+    assert!(terminal
+        .refusal_detail
+        .unwrap()
+        .contains("last_response=hosted_capacity"));
+    assert_eq!(replace_count(&h), 1);
+    assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
+    assert!(h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.ends_with("/release")));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(motor.hosted_state(id).unwrap().finish_done);
+}
+
+#[tokio::test]
+async fn replacement_validation_keeps_reservation_shape_and_excludes_retired_hosts() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let storage = stored(&scratch, id, h.route.clone());
+    let (_, previous) = Client::new(h.route.clone())
+        .run(id, &Harness::request(&scratch.0), &storage)
+        .await
+        .unwrap();
+    let mut next = previous.clone();
+    next.response.placement.host = "second-host".into();
+    let retired = ["retired-host".to_owned()].into();
+    assert_eq!(validate_replacement(&previous, &next, &retired), Ok(()));
+    for field in [
+        "lease_id",
+        "job_id",
+        "max_s",
+        "reserved_vcpu_ms",
+        "same_host",
+        "retired_host",
+        "boat",
+    ] {
+        let mut invalid = next.clone();
+        match field {
+            "lease_id" => invalid.response.lease_id = Uuid::now_v7().to_string(),
+            "job_id" => invalid.response.job_id = Uuid::now_v7().to_string(),
+            "max_s" => invalid.response.max_s += 1,
+            "reserved_vcpu_ms" => invalid.response.reserved_vcpu_ms += 1,
+            "same_host" => invalid.response.placement.host = previous.placement.host.clone(),
+            "retired_host" => invalid.response.placement.host = "retired-host".into(),
+            "boat" => invalid.response.placement.host = "boat:unexpected".into(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            validate_replacement(&previous, &invalid, &retired),
+            Err(Error::Auth),
+            "{field}"
+        );
+    }
+}
+
 #[test]
 fn queue_expiry_uses_last_definite_answer_and_explains_mixed_attempts() {
     for (answers, expected, mixed) in [
@@ -342,57 +473,104 @@ async fn pending_replace_deadline_keeps_host_eligible_and_carries_retry_after() 
 }
 
 #[tokio::test]
-async fn lease_rerequest_pending_retries_identical_bytes_and_preserves_stored_body_on_restart() {
-    let h = Harness::new(Behavior::Normal).await;
+async fn lease_rerequest_pending_switches_to_replace_with_the_original_requester() {
+    let first = Harness::with_host(Behavior::ConnectFailure, "first-host").await;
+    let second = Harness::with_host(Behavior::Normal, "second-host").await;
+    first.lease_rerequest_pending.store(true, Ordering::SeqCst);
+    first
+        .replacement_hosts
+        .lock()
+        .unwrap()
+        .push_back(second.broker.clone());
     let scratch = Scratch::new();
     let id = Uuid::now_v7();
-    let request = Harness::request(&scratch.0);
     let route = HostedJobState {
         fleet_routed: true,
-        ..h.route.clone()
+        ..first.route.clone()
     };
-    let mut storage = stored(&scratch, id, route);
-    let mut stored_body = None;
-    for _ in 0..2 {
-        drop(storage);
-        storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
-        h.lease_replies.lock().unwrap().push_back((
-            503,
-            serde_json::json!({"error":"replace_pending"}),
-            "1",
-        ));
-        let route = storage.job(id).unwrap().hosted.unwrap();
-        let start = tokio::time::Instant::now();
-        drop(
-            Client::new(route)
-                .run(id, &request, &storage)
-                .await
-                .unwrap(),
-        );
-        assert!(start.elapsed() >= Duration::from_secs(1));
-        let body = storage
-            .job(id)
-            .unwrap()
-            .hosted
-            .unwrap()
-            .lease_request
-            .unwrap();
-        if let Some(original) = &stored_body {
-            assert_eq!(&body, original);
-        } else {
-            stored_body = Some(body);
+    let storage = stored(&scratch, id, route.clone());
+    let start = tokio::time::Instant::now();
+    let (_, lease) = Client::new(route)
+        .run(id, &Harness::request(&scratch.0), &storage)
+        .await
+        .unwrap();
+    assert_eq!(lease.placement.host, "second-host");
+    assert!(start.elapsed() >= Duration::from_secs(1));
+    assert_eq!(replace_count(&first), 1);
+    let bodies = first.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(
+        bodies[0], bodies[1],
+        "a live submission keeps its requester key"
+    );
+    assert_eq!(second.tokens.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn restart_during_replacement_retires_never_sent_job_and_releases_without_placing() {
+    let h = Harness::new(Behavior::Refuse("host_full")).await;
+    h.replace_replies.lock().unwrap().push_back((
+        503,
+        serde_json::json!({"error":"replace_pending"}),
+        "15",
+    ));
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    {
+        let route = HostedJobState {
+            fleet_routed: true,
+            ..h.route.clone()
+        };
+        let storage = stored(&scratch, id, route.clone());
+        let client = Client::new(route);
+        let request = Harness::request(&scratch.0);
+        let run = client.run(id, &request, &storage);
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("placement ended before restart: {:?}", result.err()),
+            _ = tokio::time::timeout(Duration::from_secs(5), async {
+                while replace_count(&h) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => {}
         }
+        assert_eq!(replace_count(&h), 1);
+        let state = storage.job(id).unwrap().hosted.unwrap();
+        assert!(state.lease_attempted);
+        assert!(!state.run_sent);
     }
-    let bodies = h.lease_bodies.lock().unwrap();
-    assert_eq!(bodies.len(), 4);
-    assert_eq!(bodies[0], bodies[1]);
-    assert_eq!(bodies[2], bodies[3]);
-    assert_ne!(bodies[0], bodies[2], "a restart rotates the requester key");
-    let original = canonical_lease_bytes(stored_body.as_ref().unwrap());
-    for body in bodies.iter() {
-        let sent: LeaseRequest = serde_json::from_slice(body).unwrap();
-        assert_eq!(canonical_lease_bytes(&sent), original);
-    }
+    let motor = Motor::with_connector(
+        h.config(),
+        &scratch.0.join("state"),
+        Arc::new(NoSsh(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    motor.machine_jobs_health().await;
+    motor.wait_hosted_cleanup(id).await;
+    let terminal = motor.job_status(id).await.unwrap().terminal.unwrap();
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::LostToRestart
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(replace_count(&h), 1);
+    assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
+    assert!(h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.ends_with("/release")));
+    assert!(!h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.ends_with("/reattach")));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(motor.hosted_state(id).unwrap().finish_done);
 }
 
 #[tokio::test]
@@ -458,19 +636,16 @@ async fn host_full_replaces_onto_second_or_third_host_with_one_job_and_reservati
 }
 
 #[tokio::test]
-async fn replace_refusals_wait_on_the_same_job_and_try_each_host_only_once() {
-    for (status, code) in [
-        (404, "job_unknown"),
-        (409, "job_released"),
-        (409, "job_finished"),
-        (409, "job_admitted"),
-        (503, "no_capacity"),
+async fn definite_replace_refusals_stop_with_typed_errors_and_release_the_booking() {
+    for (status, code, expected) in [
+        (404, "job_unknown", Error::NotGranted),
+        (409, "job_released", Error::Released),
+        (409, "job_finished", Error::HostFull),
+        (409, "job_admitted", Error::Admitted),
+        (409, "job_conflict", Error::Rejected),
+        (409, "unexpected_conflict", Error::BrokerRefused),
     ] {
-        let h = Harness::new(Behavior::Normal).await;
-        h.host_refusals
-            .lock()
-            .unwrap()
-            .extend(["host_full", "host_full"]);
+        let h = Harness::new(Behavior::Refuse("host_full")).await;
         h.replace_replies.lock().unwrap().push_back((
             status,
             serde_json::json!({"error":code}),
@@ -483,53 +658,42 @@ async fn replace_refusals_wait_on_the_same_job_and_try_each_host_only_once() {
             ..h.route.clone()
         };
         let storage = stored(&scratch, id, route.clone());
-        let start = tokio::time::Instant::now();
-        let result = Client::new(route)
-            .run(id, &Harness::request(&scratch.0), &storage)
-            .await;
-        if code == "job_finished" {
-            assert_eq!(result.err(), Some(Error::HostFull));
-            assert_eq!(replace_count(&h), 1);
-            assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
-            assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
-            assert_eq!(h.runs.load(Ordering::SeqCst), 0);
-            assert!(!storage.job(id).unwrap().hosted.unwrap().run_sent);
-            continue;
-        }
-        let (_, lease) = result.unwrap();
-        assert_eq!(lease.job_id, id.to_string());
-        assert!(start.elapsed() >= Duration::from_millis(HOST_FULL_RETRY_MS * 2));
+        let client = Client::new(route);
+        assert_eq!(
+            client
+                .run(id, &Harness::request(&scratch.0), &storage)
+                .await
+                .err(),
+            Some(expected),
+            "{code}"
+        );
         assert_eq!(replace_count(&h), 1, "{code}");
-        let bodies = h.lease_bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 3, "{code}");
-        for bytes in bodies.iter() {
-            let body: LeaseRequest = serde_json::from_slice(bytes).unwrap();
-            assert_eq!(body.job_id, id.to_string());
-        }
-        assert!(storage
-            .job(id)
+        assert_eq!(h.lease_bodies.lock().unwrap().len(), 1, "{code}");
+        assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+        let state = storage.job(id).unwrap().hosted.unwrap();
+        assert!(!state.run_sent);
+        assert!(state.replacement_hosts.is_empty());
+        client.release(id).await.unwrap();
+        assert!(h
+            .requests
+            .lock()
             .unwrap()
-            .hosted
-            .unwrap()
-            .replacement_hosts
-            .contains("test-host"));
+            .iter()
+            .any(|p| p.ends_with("/release")));
     }
 }
 
 #[tokio::test]
-async fn second_host_refusal_attempts_replace_once_then_uses_capacity_wait() {
+async fn transport_retry_after_replacement_never_returns_to_the_lease_route() {
     let first = Harness::with_host(Behavior::Refuse("host_full"), "first-host").await;
-    let second = Harness::with_host(Behavior::Normal, "second-host").await;
-    second
-        .host_refusals
-        .lock()
-        .unwrap()
-        .extend(["host_full", "host_full"]);
+    let second = Harness::with_host(Behavior::ConnectFailure, "second-host").await;
+    let third = Harness::with_host(Behavior::Normal, "third-host").await;
     first
         .replacement_hosts
         .lock()
         .unwrap()
-        .push_back(second.broker.clone());
+        .extend([second.broker.clone(), third.broker.clone()]);
     let scratch = Scratch::new();
     let id = Uuid::now_v7();
     let route = HostedJobState {
@@ -541,10 +705,15 @@ async fn second_host_refusal_attempts_replace_once_then_uses_capacity_wait() {
         .run(id, &Harness::request(&scratch.0), &storage)
         .await
         .unwrap();
-    assert_eq!(lease.placement.host, "second-host");
+    assert_eq!(lease.placement.host, "third-host");
     assert_eq!(replace_count(&first), 2);
-    assert_eq!(first.lease_bodies.lock().unwrap().len(), 3);
-    assert_eq!(second.tokens.load(Ordering::SeqCst), 3);
+    assert_eq!(first.lease_bodies.lock().unwrap().len(), 1);
+    assert_eq!(first.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(third.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        storage.job(id).unwrap().hosted.unwrap().replacement_hosts,
+        ["first-host".to_owned(), "second-host".to_owned()].into()
+    );
 }
 
 #[tokio::test]
