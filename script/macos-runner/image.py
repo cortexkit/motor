@@ -17,6 +17,7 @@ import time
 from download import fetch
 import parity
 import pinlock
+import guest_services
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parent.parent
@@ -167,7 +168,7 @@ def provision(args, manifest):
     inputs = prepare_inputs(args, manifest)
     recipe = args.work / "recipe"
     recipe.mkdir(exist_ok=False)
-    for name in ("guest.py", "parity.py", "pinlock.py", "bootstrap.sh"):
+    for name in ("guest.py", "guest_services.py", "guest-services-off.txt", "parity.py", "pinlock.py", "bootstrap.sh"):
         shutil.copyfile(HERE / name, recipe / name)
     (recipe / "toolchain.json").write_text(json.dumps(manifest, indent=2) + "\n")
     run("/usr/bin/ssh", *options, args.guest, "test ! -e " + REMOTE + " && mkdir -m 700 " + REMOTE)
@@ -180,8 +181,34 @@ def provision(args, manifest):
         run("/usr/bin/ssh", *options, args.guest, "sudo -n cat " + REMOTE + "/candidate.json", stdout=stream)
     with (args.work / "tools.tar").open("wb") as stream:
         run("/usr/bin/ssh", *options, args.guest, "sudo -n tar -cf - -C " + REMOTE + " tools", stdout=stream)
+    reboot_for_service_policy(args, options)
     print("Measured candidate: " + str(args.work / "candidate.json"))
-    print("NOT DEPLOYABLE: review candidate, mark release_status reviewed, commit lock; then seal this stopped image.")
+    print("NOT DEPLOYABLE: review candidate, mark release_status reviewed, commit lock; then seal this measured image.")
+
+
+def reboot_for_service_policy(args, options):
+    # Disable overrides affect the next boot, not already-running services.
+    # Keep the build account/SSH route until seal has checked the new boot.
+    ssh = ["/usr/bin/ssh", *options, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", args.guest]
+    command = "sudo -n /bin/launchctl print system >/dev/null && /usr/sbin/sysctl -n kern.bootsessionuuid"
+    before = subprocess.check_output([*ssh, command], text=True, timeout=15).strip()
+    if not re.fullmatch(r"[A-Fa-f0-9-]{36}", before):
+        raise ValueError("cannot determine guest boot session before reboot")
+    reboot = subprocess.run([*ssh, "sudo -n /sbin/shutdown -r now"], capture_output=True, text=True, timeout=30)
+    if reboot.returncode not in (0, 255):
+        raise ValueError("guest reboot failed: " + reboot.stderr)
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        try:
+            ready = subprocess.run([*ssh, command], capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            ready = None
+        if ready is not None and ready.returncode == 0:
+            after = ready.stdout.strip()
+            if re.fullmatch(r"[A-Fa-f0-9-]{36}", after) and after != before:
+                return
+        time.sleep(2)
+    raise ValueError("guest did not return on a new boot after applying service policy")
 
 
 def seal(args, manifest):
@@ -197,7 +224,7 @@ def seal(args, manifest):
     run("/usr/bin/scp", *options, args.manifest, args.guest + ":" + REMOTE + "/recipe/toolchain.json")
     # Seal with this commit's guest code, not the copy uploaded when the guest
     # was provisioned, so a seal fix doesn't need a new measurement.
-    run("/usr/bin/scp", *options, *(HERE / name for name in ("guest.py", "parity.py", "pinlock.py")),
+    run("/usr/bin/scp", *options, *(HERE / name for name in ("guest.py", "guest_services.py", "guest-services-off.txt", "parity.py", "pinlock.py")),
         args.guest + ":" + REMOTE + "/recipe/")
     result = subprocess.run(["/usr/bin/ssh", *options, args.guest,
                              "sudo -n /usr/bin/python3 " + REMOTE + "/recipe/guest.py seal --scratch " + REMOTE],
@@ -205,7 +232,14 @@ def seal(args, manifest):
     marker = "MOTOR_SEALED " + parity.digest(args.manifest)
     if marker not in result.stdout.splitlines() or result.returncode not in (0, 255):
         raise ValueError("guest did not acknowledge Remote Login/key sealing: " + result.stderr)
-    (args.work / "guest-sealed.json").write_text(json.dumps({"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"}) + "\n")
+    services = [line.removeprefix("MOTOR_GUEST_SERVICES ") for line in result.stdout.splitlines()
+                if line.startswith("MOTOR_GUEST_SERVICES ")]
+    if len(services) != 1:
+        raise ValueError("guest did not report service seal outcomes")
+    service_receipt = json.loads(services[0])
+    guest_services.validate_receipt(service_receipt)
+    (args.work / "guest-sealed.json").write_text(json.dumps({"manifest_sha256": parity.digest(args.manifest),
+                                                          "remote_login": "Off", "guest_services": service_receipt}) + "\n")
     (args.work / "build_key").unlink()
     (args.work / "build_key.pub").unlink(missing_ok=True)
     print("Guest acknowledged seal and shutdown. Wait for the image-build helper to exit, then run finalize.")
@@ -221,12 +255,13 @@ def require_stopped(directory):
             raise ValueError("image still open, or lsof could not prove it stopped")
 
 
-def write_seal(directory, manifest_sha256, ipsw, agent, tcc):
+def write_seal(directory, manifest_sha256, ipsw, agent, tcc, guest_services=None):
     (directory / "agent.sha256").write_text(agent["sha256"] + "\n")
     files = {name: parity.digest(directory / name) for name in (*IMAGE_FILES, "agent.sha256")}
-    (directory / "image.json").write_text(json.dumps({"manifest_sha256": manifest_sha256,
-                                                    "ipsw": ipsw, "agent": agent,
-                                                    "tcc": tcc, "files": files}, indent=2) + "\n")
+    metadata = {"manifest_sha256": manifest_sha256, "ipsw": ipsw, "agent": agent, "tcc": tcc, "files": files}
+    if guest_services is not None:
+        metadata["guest_services"] = guest_services
+    (directory / "image.json").write_text(json.dumps(metadata, indent=2) + "\n")
     for path in directory.iterdir():
         path.chmod(0o444)
     directory.chmod(0o555)
@@ -236,12 +271,15 @@ def finalize(args, manifest):
     pinlock.require_ready(manifest)
     require_committed(args.manifest)
     receipt = json.loads((args.work / "guest-sealed.json").read_text())
-    if receipt != {"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"} or (args.work / "build_key").exists():
+    guest_services.validate_receipt(receipt.get("guest_services", {}))
+    if ({key: value for key, value in receipt.items() if key != "guest_services"}
+            != {"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"}
+            or (args.work / "build_key").exists()):
         raise ValueError("missing guest seal acknowledgement or build key still exists")
     require_stopped(args.image)
     tcc = grant_agent_access(args.image / "disk.img", lock_build_account=True)
     require_stopped(args.image)
-    write_seal(args.image, parity.digest(args.manifest), manifest["ipsw"], manifest["agent"], tcc)
+    write_seal(args.image, parity.digest(args.manifest), manifest["ipsw"], manifest["agent"], tcc, receipt.get("guest_services"))
     print("Sealed read-only image; installed-daemon qualification is still required.")
 
 
@@ -399,14 +437,16 @@ def swap_guest(mount, args, manifest, source):
     if "tcc" in source and agent_requirement(mount) != source["tcc"]["requirement"]:
         raise ValueError("source installed requirement differs from sealed TCC grant")
     receipt = json.loads(seal_receipt.read_text())
-    if receipt != {"manifest_sha256": source["manifest_sha256"], "agent_sha256": source["agent"]["sha256"], "remote_login": "Off"}:
+    expected_receipt = {"manifest_sha256": source["manifest_sha256"], "agent_sha256": source["agent"]["sha256"], "remote_login": "Off"}
+    if "guest_services" in source:
+        expected_receipt["guest_services"] = source["guest_services"]
+    if receipt != expected_receipt:
         raise ValueError("source guest seal receipt differs")
     replace_agent(mount, args.agent, manifest["agent"]["sha256"])
+    expected_receipt.update(manifest_sha256=parity.digest(args.manifest), agent_sha256=manifest["agent"]["sha256"])
     for name, payload in (("toolchain.json", args.manifest.read_bytes()),
                           ("agent.sha256", (manifest["agent"]["sha256"] + "\n").encode()),
-                          ("sealed.json", (json.dumps({"manifest_sha256": parity.digest(args.manifest),
-                                                       "agent_sha256": manifest["agent"]["sha256"],
-                                                       "remote_login": "Off"}) + "\n").encode())):
+                          ("sealed.json", (json.dumps(expected_receipt) + "\n").encode())):
         path = prefix / name
         path.chmod(0o644)
         path.write_bytes(payload)
@@ -435,7 +475,7 @@ def agent_swap(args, manifest):
             swap_guest(mount, args, manifest, source)
         tcc = grant_agent_access(staging / "disk.img")
         require_stopped(staging)
-        write_seal(staging, parity.digest(args.manifest), source["ipsw"], manifest["agent"], tcc)
+        write_seal(staging, parity.digest(args.manifest), source["ipsw"], manifest["agent"], tcc, source.get("guest_services"))
         if args.destination.exists() or args.destination.is_symlink():
             raise ValueError("destination already exists")
         staging.rename(args.destination)

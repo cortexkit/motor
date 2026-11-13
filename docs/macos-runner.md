@@ -156,6 +156,32 @@ allow-list, then pins `HOME=/Users/motorjob`, a fresh writable job `TMPDIR`,
 `PATH=/opt/motor/cargo/bin:/opt/motor/bun/bin:/opt/motor/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 `CARGO_TARGET_DIR` is unset.
 
+### Background services in job VMs
+
+The image recipe disables unused system services to leave more memory for builds
+and avoid background indexing, downloads and update work. Its pinned policy is
+`script/macos-runner/guest-services-off.txt`: Spotlight, analytics and telemetry,
+location and Find My, Bluetooth and Wi-Fi (jobs use virtio networking), iCloud
+and push notifications, software updates and assets, personal activity history,
+power telemetry and MDM. Spotlight indexing is also turned off on all volumes
+mounted during provisioning with `mdutil -a -i off`.
+
+System Integrity Protection stays enabled. Provisioning reboots the guest before
+sealing so the seal can check persistent launchd overrides and actual running
+services, rather than trust a successful disable command. New policy entries
+start as `unverified`; a service still running after reboot is recorded as
+`kept-sip`, not silently reported as off. Once an entry is pinned `off`, running
+again fails the seal. Outcomes are kept in the guest policy file and sealed image
+metadata. The seal also requires Spotlight indexing on `/` to be disabled.
+
+The guest agent, security and permission checks, DNS, file-system mounting,
+logging and crash reporting remain enabled. User-session services such as Siri,
+suggestions and user Spotlight workers are not disabled without evidence of a
+running user domain; job VMs have no GUI login. Services without a confirmed
+system launchd label are left alone. Volumes mounted later need their own
+mount-time Spotlight exclusion; the provisioning command does not set that
+policy for future build disks or workspace shares.
+
 ### Build disk and `target/`
 
 The job's `target/` is not on the shared folder. On that share, listing a

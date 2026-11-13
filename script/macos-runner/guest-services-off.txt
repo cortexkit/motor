@@ -1,0 +1,38 @@
+# Headless job image policy: expected-outcome system-label # reason
+# Labels checked against Apple's LaunchDaemons on macOS 27.2 (26B123).
+# off: must stay disabled and not running after reboot; kept-sip: leave alone.
+# unverified: first build resolves to off or kept-sip from post-reboot state.
+# The guest copy appends a JSON provisioning-results section; the seal records
+# those outcomes in sealed.json and image.json for review and pinning here.
+unverified com.apple.metadata.mds # No Spotlight indexing during builds.
+unverified com.apple.metadata.mds.index # No writable Spotlight index stores.
+unverified com.apple.metadata.mds.index.readonly # No read-only Spotlight index stores.
+unverified com.apple.metadata.mds.scan # No background Spotlight volume scans.
+unverified com.apple.analyticsd # No analytics collection or upload for disposable VMs.
+unverified com.apple.osanalytics.osanalyticshelper # No diagnostics upload; crash reporters stay enabled.
+unverified com.apple.cloudtelemetryd # No cloud telemetry upload.
+unverified com.apple.triald.system # No background feature experiments or downloads.
+unverified com.apple.locationd # Build jobs do not use location services.
+unverified com.apple.icloud.searchpartyd # Disposable VMs do not use Find My.
+unverified com.apple.icloud.findmydeviced # Disposable VMs do not use Find My device tracking.
+unverified com.apple.bluetoothd # The VM has no Bluetooth peripherals.
+unverified com.apple.airportd # Networking uses virtio NAT, not Wi-Fi.
+unverified com.apple.cloudd # No iCloud accounts or synchronization in job VMs.
+unverified com.apple.apsd # No Apple push notifications in job VMs.
+unverified com.apple.softwareupdated # Tools and OS updates belong to image builds, not jobs.
+unverified com.apple.mobile.softwareupdated # No background mobile software updates.
+unverified com.apple.mobileassetd # No background asset downloads during builds.
+unverified com.apple.coreduetd # No personal activity learning in headless job VMs.
+unverified com.apple.contextstored # No personal context history in job VMs.
+unverified com.apple.biomed # No personal activity stream processing in job VMs.
+unverified com.apple.PerfPowerServices # No background power/performance telemetry in job VMs.
+unverified com.apple.mdmclient.daemon # Disposable build VMs are not MDM-enrolled.
+unverified com.apple.mdmclient.daemon.runatboot # No MDM enrollment work at boot.
+# Kept: geod and the MobileAsset DownloadService have no standalone launchd
+# label in the observed plist inventory; do not guess XPC service labels.
+# Kept: Siri, suggestions, triald and mdworker LaunchAgents lack evidence of
+# running in a particular user domain in a job VM with no GUI login.
+# Kept: com.apple.metadata.mds.spindump is an mdworker diagnostic job; do not
+# risk interfering with crash diagnostics. ReportCrash and spindump stay on.
+# All agent, security, DNS, mount, logging and crash-reporting services remain
+# untouched; this is an allowlist, not a wildcard disable of Apple services.
