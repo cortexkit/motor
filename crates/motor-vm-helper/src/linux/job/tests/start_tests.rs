@@ -423,5 +423,58 @@ fn isolated_workspace_removal_before_start_refuses_real_admission() {
 #[cfg(feature = "linux-root-tests")]
 #[test]
 fn isolated_image_removal_before_start_refuses_real_admission() {
+    let root = Path::new(job::IMAGES);
+    let host_identity = match std::fs::metadata(root) {
+        Ok(meta) => Some((meta.dev(), meta.ino())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("stat host image store: {error}"),
+    };
+    // Declare scratch before isolation so namespace restoration precedes its
+    // cleanup, including when admission or image removal panics.
+    let private = cortexkit_test_support::ScratchDir::new("start-removal-images");
+    let _isolation = namespace::root_tests::Fixture::new();
+    let images = private.join("images");
+    std::fs::create_dir(&images).unwrap();
+    if host_identity.is_none() {
+        // A private mount namespace does not make mkdir private. Hide the
+        // closest existing ancestor before creating a missing mount point.
+        let ancestor = root.ancestors().skip(1).find(|path| path.exists()).unwrap();
+        assert!(
+            !private.starts_with(ancestor),
+            "image-store ancestor overlay would hide the test scratch root"
+        );
+        let parents = private.join("parents");
+        std::fs::create_dir(&parents).unwrap();
+        namespace::root_tests::command(
+            "/usr/bin/mount",
+            &[
+                "--bind",
+                parents.to_str().unwrap(),
+                ancestor.to_str().unwrap(),
+            ],
+        );
+        let mounted = std::fs::metadata(ancestor).unwrap();
+        let scratch = std::fs::metadata(&parents).unwrap();
+        assert_eq!(
+            (mounted.dev(), mounted.ino()),
+            (scratch.dev(), scratch.ino())
+        );
+        std::fs::create_dir_all(root).unwrap();
+    }
+    namespace::root_tests::command(
+        "/usr/bin/mount",
+        &["--bind", images.to_str().unwrap(), job::IMAGES],
+    );
+    let mounted = std::fs::metadata(root).unwrap();
+    let scratch = std::fs::metadata(&images).unwrap();
+    assert_eq!(
+        (mounted.dev(), mounted.ino()),
+        (scratch.dev(), scratch.ino())
+    );
+    assert_ne!(
+        Some((mounted.dev(), mounted.ino())),
+        host_identity,
+        "image test must not write to the host's real image store"
+    );
     real_removal_before_start(true);
 }
