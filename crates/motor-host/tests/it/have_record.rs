@@ -617,6 +617,22 @@ async fn storage_control_provisions_sparse_capped_disks_and_keeps_admission_enfo
     assert!(host.snapshot.per_job.is_empty());
 }
 
+/// Prerequisite commit ids from a git bundle's text header. The header ends at
+/// the first blank line; the pack after it is binary and can hold any byte
+/// pair, so scanning the whole bundle for `\n-` fails at random.
+fn bundle_prerequisites(bundle: &[u8]) -> Vec<String> {
+    let end = bundle
+        .windows(2)
+        .position(|pair| pair == b"\n\n")
+        .expect("bundle header ends with a blank line");
+    String::from_utf8(bundle[..end].to_vec())
+        .expect("bundle header is text")
+        .lines()
+        .filter_map(|line| line.strip_prefix('-'))
+        .map(|rest| rest.split(' ').next().unwrap_or_default().to_owned())
+        .collect()
+}
+
 #[tokio::test]
 async fn false_two_repository_entries_refuse_once_clear_every_mirror_and_resend_full_history() {
     let mut f = Fixture::new();
@@ -630,7 +646,7 @@ async fn false_two_repository_entries_refuse_once_clear_every_mirror_and_resend_
             json!([f.base[index]])
         );
         assert!(
-            String::from_utf8_lossy(data).contains(&format!("-{}", f.base[index])),
+            bundle_prerequisites(data).contains(&f.base[index].to_string()),
             "bundle must be thin"
         );
     }
@@ -647,9 +663,7 @@ async fn false_two_repository_entries_refuse_once_clear_every_mirror_and_resend_
         .all(|r| r["commits"] == json!([])));
     assert_eq!(have["git_dependencies"][0]["commits"], json!([]));
     assert!(
-        bytes
-            .iter()
-            .all(|b| !String::from_utf8_lossy(b).contains("\n-")),
+        bytes.iter().all(|b| bundle_prerequisites(b).is_empty()),
         "resend must have no prerequisites"
     );
     assert!(started);
