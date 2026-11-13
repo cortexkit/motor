@@ -367,7 +367,7 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let copy = runner.clone();
             let imported = source.clone();
-            let id = tokio::task::spawn_blocking(move || {
+            let (id, _hold) = tokio::task::spawn_blocking(move || {
                 let result = copy.import_fill_source(&imported, &upload.directory);
                 drop(upload);
                 result
@@ -388,73 +388,74 @@ pub(crate) async fn control<S: AsyncRead + AsyncWrite + Unpin>(
                 .await?;
                 return Ok(());
             };
-            loop {
-                let terminal = runner.job_status(id)?.terminal;
-                if let Some(terminal) = terminal {
-                    let successful =
-                        matches!(terminal.outcome, motor_protocol::Outcome::Exit { code: 0 });
-                    if !successful {
-                        return Err(invalid(format!(
-                            "fill command failed ({:?}): {}",
-                            terminal.outcome,
-                            output_tail(&runner, id)
-                        )));
-                    }
-                    // Wait for publication and ownership repair to finish before
-                    // reporting success and allowing this VM to power off.
-                    if !runner
-                        .fill_settled(id, crate::caller_path::fill_source(&source).caller.text())?
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                        continue;
-                    }
-                    let base = runner
-                        .config()
-                        .state_dir()
-                        .join("build-bases")
-                        .join(workspace::name(
-                            crate::caller_path::fill_source(&source).caller.text(),
-                        ))
-                        .join("current/base.json");
-                    tracing::info!(
-                        tip = source.integration_tip,
-                        base_published = base.is_file(),
-                        writer_ran = true,
-                        "fill_source_completed"
-                    );
-                    let have = if base.is_file() {
-                        runner.fill_source_pins(&source)?
-                    } else {
-                        vec![]
-                    };
-                    let mut reply =
-                        serde_json::json!({"ok":true,"base_published":base.is_file(),"have":have});
-                    if let Some(samples) = runner.fill_write_samples(
-                        id,
-                        crate::caller_path::fill_source(&source).caller.text(),
-                    ) {
-                        reply["cache_write_keys"] = serde_json::json!(samples);
-                    }
-                    crate::tenant_agent::write_json(socket, &reply).await?;
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
+            let reply = completion(&runner, id, &source).await?;
+            // The import hold remains alive until the reply has been written,
+            // including while publication and ownership repair are settling.
+            crate::tenant_agent::write_json(socket, &reply).await
         }
         _ => Err(invalid("operation_refused")),
     }
 }
 
-/// The last 2 KiB of a failed fill's output, on one line. A fill VM and its
-/// disk are gone moments after a failure, so the refusal the host logs is the
-/// only record of why the trusted build failed.
+#[cfg(target_os = "linux")]
+pub(crate) async fn completion(
+    runner: &Runner,
+    id: motor_protocol::Uuid,
+    source: &FillSource,
+) -> io::Result<serde_json::Value> {
+    loop {
+        if let Some(terminal) = runner.job_status(id)?.terminal {
+            if !matches!(terminal.outcome, motor_protocol::Outcome::Exit { code: 0 }) {
+                return Err(invalid(format!(
+                    "fill command failed ({:?}): {}",
+                    terminal.outcome,
+                    output_tail(runner, id)
+                )));
+            }
+            // A terminal alone does not prove publication and ownership repair
+            // finished; powering off early could lose the new base.
+            let repository = crate::caller_path::fill_source(source).caller;
+            if !runner.fill_settled(id, repository.text())? {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+            let base = runner
+                .config()
+                .state_dir()
+                .join("build-bases")
+                .join(workspace::name(repository.text()))
+                .join("current/base.json");
+            let published = base.is_file();
+            tracing::info!(
+                tip = source.integration_tip,
+                base_published = published,
+                writer_ran = true,
+                "fill_source_completed"
+            );
+            let have = if published {
+                runner.fill_source_pins(source)?
+            } else {
+                vec![]
+            };
+            let mut reply = serde_json::json!({"ok":true,"base_published":published,"have":have});
+            if let Some(samples) = runner.fill_write_samples(id, repository.text()) {
+                reply["cache_write_keys"] = serde_json::json!(samples);
+            }
+            return Ok(reply);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Recent diagnostics plus the final output, bounded to 2 KiB on one line.
+/// Cargo can print progress after its error, and the failed fill VM's disk
+/// disappears, so the host's refusal must retain more than the progress tail.
 #[cfg(target_os = "linux")]
 fn output_tail(runner: &Runner, id: motor_protocol::Uuid) -> String {
-    const TAIL_BYTES: usize = 2048;
     let Ok(frames) = runner.replay(id, 0) else {
         return "output unavailable".into();
     };
-    let mut bytes: Vec<u8> = frames
+    let bytes: Vec<u8> = frames
         .into_iter()
         .filter_map(|frame| match frame {
             Frame::Output(output) => Some(output.bytes.0),
@@ -462,15 +463,53 @@ fn output_tail(runner: &Runner, id: motor_protocol::Uuid) -> String {
         })
         .flatten()
         .collect();
-    if bytes.len() > TAIL_BYTES {
-        bytes.drain(..bytes.len() - TAIL_BYTES);
+    output_summary(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn output_summary(bytes: &[u8]) -> String {
+    const MAX_BYTES: usize = 2048;
+    const DIAGNOSTIC_BYTES: usize = MAX_BYTES / 2;
+    fn prefix(text: &str, limit: usize) -> &str {
+        let mut end = text.len().min(limit);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
     }
-    String::from_utf8_lossy(&bytes)
+    fn tail(text: &str, limit: usize) -> &str {
+        let mut start = text.len().saturating_sub(limit);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        &text[start..]
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let lines = text
         .split(['\n', '\r'])
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty());
+    let mut diagnostics = lines
+        .clone()
+        .rev()
+        .filter(|line| line.starts_with("error") || line.starts_with("warning: build failed"))
+        .take(4)
+        .collect::<Vec<_>>();
+    let output = lines.collect::<Vec<_>>().join(" | ");
+    if diagnostics.is_empty() {
+        return tail(&output, MAX_BYTES).into();
+    }
+    diagnostics.reverse();
+    let line_bytes = (DIAGNOSTIC_BYTES - (diagnostics.len() - 1) * 3) / diagnostics.len();
+    let diagnostics = diagnostics
+        .into_iter()
+        .map(|line| prefix(line, line_bytes))
         .collect::<Vec<_>>()
-        .join(" | ")
+        .join(" | ");
+    format!(
+        "{diagnostics} | {}",
+        tail(&output, MAX_BYTES - diagnostics.len() - 3)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -491,5 +530,32 @@ pub(crate) async fn serve_control(runner: Runner) -> io::Result<()> {
                 tracing::warn!(%error, "fill control channel failed");
             }
         });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::output_summary;
+
+    #[test]
+    fn output_summary_is_utf8_bounded_and_retains_recent_diagnostics() {
+        let output = format!("error: old failure\r\nerror: recent one\nerror: recent two\n{}\r\nwarning: build failed, waiting\r\n{}\nlast line\n",
+            "error: 日本語".repeat(500), "Compiling 日本語\n".repeat(500));
+        let summary = output_summary(output.as_bytes());
+        assert!(summary.len() <= 2048);
+        assert!(!summary.contains("old failure"));
+        assert!(summary.contains("error: 日本語"));
+        assert!(summary.contains("warning: build failed, waiting"));
+        assert!(summary.ends_with("last line"));
+        assert!(!summary.contains(['\n', '\r', '\u{fffd}']));
+    }
+
+    #[test]
+    fn output_without_diagnostics_keeps_the_tail_budget() {
+        assert_eq!(output_summary(b"first\r\n\nlast\n"), "first | last");
+        let summary = output_summary(format!("{}final line", "progress\n".repeat(500)).as_bytes());
+        assert_eq!(summary.len(), 2048);
+        assert!(summary.ends_with("final line"));
+        assert!(output_summary(b"").is_empty());
     }
 }

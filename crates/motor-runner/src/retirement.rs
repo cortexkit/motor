@@ -260,6 +260,12 @@ impl Runner {
                 block(mirror, expires.saturating_sub(HELD_OFFER_MS), "held refs");
             }
         }
+        #[cfg(target_os = "linux")]
+        for hold in self.core.fill_source_holds.lock().unwrap().values() {
+            for mirror in hold.keys() {
+                block(mirror, now, "fill control reply");
+            }
+        }
         for mirror in self.core.trees.compacting.lock().unwrap().iter() {
             block(mirror, 0, "compaction");
         }
