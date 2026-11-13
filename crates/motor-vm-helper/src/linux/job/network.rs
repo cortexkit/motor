@@ -1,16 +1,16 @@
 use super::*;
 use crate::linux::tenant_network::{self, Tap};
 
-pub(super) trait Access: Send {
+pub(super) trait Access: Send + Sync {
     fn lock(&self) -> Result<tenant_network::lock::Guard>;
     fn tenants(&self) -> Result<Vec<Tap>>;
-    fn install(&mut self, taps: &[Tap]) -> Result<()>;
-    fn create_namespace(&mut self, id: &str) -> Result<PathBuf>;
-    fn reconcile_namespaces(&mut self, retained: &BTreeSet<String>) -> Result<()>;
-    fn remove_namespace(&mut self, id: &str) -> Result<()>;
-    fn ensure(&mut self, id: &str, tap: &Tap) -> Result<()>;
-    fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>>;
-    fn remove(&mut self, id: &str, tap: &Tap, lock: &tenant_network::lock::Guard) -> Result<()>;
+    fn install(&self, taps: &[Tap]) -> Result<()>;
+    fn create_namespace(&self, id: &str) -> Result<PathBuf>;
+    fn reconcile_namespaces(&self, retained: &BTreeSet<String>) -> Result<()>;
+    fn remove_namespace(&self, id: &str) -> Result<()>;
+    fn ensure(&self, id: &str, tap: &Tap) -> Result<()>;
+    fn egress_bytes(&self, tap: &Tap) -> Result<Option<u64>>;
+    fn remove(&self, id: &str, tap: &Tap, lock: &tenant_network::lock::Guard) -> Result<()>;
 }
 
 pub(super) struct System(pub Config);
@@ -22,25 +22,25 @@ impl Access for System {
     fn tenants(&self) -> Result<Vec<Tap>> {
         tenant_taps(Path::new(crate::tenant::REGISTRY))
     }
-    fn install(&mut self, taps: &[Tap]) -> Result<()> {
+    fn install(&self, taps: &[Tap]) -> Result<()> {
         tenant_network::install_taps(taps, &self.0)?.require_ready()
     }
-    fn create_namespace(&mut self, id: &str) -> Result<PathBuf> {
+    fn create_namespace(&self, id: &str) -> Result<PathBuf> {
         namespace::create(id)
     }
-    fn reconcile_namespaces(&mut self, retained: &BTreeSet<String>) -> Result<()> {
+    fn reconcile_namespaces(&self, retained: &BTreeSet<String>) -> Result<()> {
         namespace::reconcile(retained)
     }
-    fn remove_namespace(&mut self, id: &str) -> Result<()> {
+    fn remove_namespace(&self, id: &str) -> Result<()> {
         namespace::remove(id)
     }
-    fn ensure(&mut self, id: &str, tap: &Tap) -> Result<()> {
+    fn ensure(&self, id: &str, tap: &Tap) -> Result<()> {
         namespace::connect(id, tap)
     }
-    fn egress_bytes(&mut self, tap: &Tap) -> Result<Option<u64>> {
+    fn egress_bytes(&self, tap: &Tap) -> Result<Option<u64>> {
         tenant_network::optional_egress_bytes(tap)
     }
-    fn remove(&mut self, id: &str, tap: &Tap, lock: &tenant_network::lock::Guard) -> Result<()> {
+    fn remove(&self, id: &str, tap: &Tap, lock: &tenant_network::lock::Guard) -> Result<()> {
         namespace::disconnect(id, tap)?;
         tenant_network::remove_allocated_locked(tap, lock)?;
         // The host owns the NAT mapping; the job namespace tracks forwarding

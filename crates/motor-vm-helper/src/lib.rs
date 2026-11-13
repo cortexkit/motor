@@ -11,6 +11,7 @@ pub mod images;
 pub mod job;
 #[cfg(target_os = "linux")]
 pub mod linux;
+mod lock_order;
 pub mod removal;
 pub mod signals;
 pub mod tenant;

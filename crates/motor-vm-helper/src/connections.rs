@@ -34,6 +34,7 @@ impl ConnectionGate {
     }
 
     pub(crate) fn connect(&self, peer: Peer) -> Result<u64> {
+        let _held = crate::lock_order::enter(crate::lock_order::Lock::C);
         let mut connections = self.connections.lock().unwrap();
         if !connections.allowed_uids.contains(&peer.uid) {
             return Err(Error("unauthorised peer uid".into()));
@@ -48,6 +49,7 @@ impl ConnectionGate {
     }
 
     pub(crate) fn authorize(&self, id: u64) -> Result<Peer> {
+        let _held = crate::lock_order::enter(crate::lock_order::Lock::C);
         let connections = self.connections.lock().unwrap();
         let peer = *connections
             .peers
@@ -58,6 +60,7 @@ impl ConnectionGate {
     }
 
     pub(crate) fn disconnect(&self, id: u64) {
+        let _held = crate::lock_order::enter(crate::lock_order::Lock::C);
         self.connections.lock().unwrap().peers.remove(&id);
     }
 
