@@ -173,22 +173,34 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
   its fixed size, the one property the guest cannot change and no other disk
   shares. It formats the disk as APFS only while it is still blank (all zero,
   as the host creates it). It then mounts the volume `nosuid,nodev` over the
-  empty `target/` directory and gives the volume's root to `motorjob`. The raw
+  empty `target/` directory and gives the volume's root to `motorjob`,
+  clearing any user flags such as `uchg` an earlier job set on it. The raw
   and block devices must not be writable by `motorjob`. A `target` that is a
-  file, a link or a non-empty directory refuses the job. If an existing volume
-  is missing or will not mount, the agent reformats the disk, and the job's
-  standard error starts with a line saying so: that build starts cold. The
-  agent never runs the command with the shared folder in the volume's place.
+  file, a link or a non-empty directory refuses the job, and so does a
+  workspace below a directory `motorjob` owns or can write, its home
+  directory included, or below a link: the job could otherwise rename that
+  directory during its run and redirect the agent's later unmount. If an
+  existing volume is missing, will not mount or cannot be handed to
+  `motorjob`, the agent reformats the disk, and the job's standard error
+  starts with a line saying so: that build starts cold. The agent never runs
+  the command with the shared folder in the volume's place.
 - **After the command**, once every `motorjob` process is gone, the agent
-  copies the returned files out (below) and unmounts the volume, forcing the
+  reaches `target/` again from `/`, one directory at a time without following
+  links, and requires the volume root it recorded before the command (the
+  same file system ID and inode). It copies the returned files out (below),
+  then unmounts the volume, which must have exactly one mount, forcing the
   unmount if a killed process left it busy. Only then does it send `Exit` or
-  `Signal`. If it cannot unmount, it closes the session without either.
+  `Signal`. If any of this fails, it closes the session without either.
 - **Publication.** After the VM has provably stopped, the runner renames the
-  job's disk over `targets/<key>.img`. That happens only when the agent
-  reported `Exit` or `Signal`, whatever the exit code, because only then was
-  the volume cleanly unmounted. A cancelled job, a session that ended without
-  terminal status, or an unproven stop publishes nothing; the next job uses the
-  previous disk. The host never mounts or reads the disk's contents: it only
+  job's disk over `targets/<key>.img` whenever the agent reported `Exit` or
+  `Signal`, because only then was the volume cleanly unmounted. **A failed job
+  publishes its disk too**: a non-zero exit, such as a compile error, or a
+  command killed by a signal keeps its build output for the next job, as a
+  Linux workspace keeps its `target/`. A cancelled job, a session that ended
+  without terminal status, or an unproven stop publishes nothing; the next job
+  uses the previous disk. The rename is the commit point: a cancel that
+  arrives first stops it, and one that arrives during it waits until it is
+  done and finds the disk published. The host never mounts or reads the disk's contents: it only
   creates, clones, renames, measures and deletes the file.
 - **A full disk.** The volume holds at most 128 GiB. A build that fills it fails
   like one on a full disk, with "No space left on device" (`ENOSPC`) from the
@@ -215,10 +227,15 @@ After unmounting, the agent writes the copies into the shared `target/`, now an
 empty directory again, at their requested paths. The host then collects every
 returned file from the stopped share as before, with its usual confinement
 checks; return paths outside `target/` are unchanged. A file over the cap is
-written as a sparse placeholder of its size with none of its bytes, so the
-host reports it over the cap as it would have. The agent never follows a link
-on the volume: a returned path under `target/` must name a regular file through
-real directories, or the host reports it missing. A path written with `..` is
+written as a sparse placeholder with none of its bytes, sized one byte over
+the whole cap (or the file's own size, if larger). The host budgets every
+returned path, the agent only those under `target/`, so a placeholder of the
+file's real size could fit the host's remaining budget and come back as
+zeros; one larger than the cap never fits, and the host reports it over the
+cap. The agent never follows a link on the volume or crosses onto another file
+system mounted below it: a returned path under `target/` must name a regular
+file on the build volume through real directories, or the host reports it
+missing. A path written with `..` is
 resolved on the shared folder and finds only files the agent copied there.
 
 The image recipe installs Rust 1.91.0, 1.92.0, 1.96.0, 1.99.0 and 1.100.0, plus
