@@ -77,7 +77,8 @@ fn legacy_machine(base: &Path) -> LinuxMachine {
             root: base.join("cgroups"),
         },
         tenants,
-        jobs,
+        cache_write_grants: jobs.cache_write_grants.clone(),
+        jobs: Arc::new(Mutex::new(jobs)),
     }
 }
 

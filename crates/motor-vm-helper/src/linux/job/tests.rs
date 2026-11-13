@@ -337,6 +337,7 @@ pub(super) fn machine_with_config(base: &Path, config: &Config) -> LinuxJobs {
         next_prune: None,
         network: Box::<network_tests::Fake>::default(),
         exit_fault: None,
+        exit_pause: None,
         remove_test_group: Some(|path| std::fs::remove_dir_all(path)),
     }
 }

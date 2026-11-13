@@ -118,7 +118,7 @@ impl Record {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitStep {
+pub(super) enum ExitStep {
     Captured,
     Recorded,
     Removed,
@@ -154,6 +154,8 @@ pub struct LinuxJobs {
     network: Box<dyn network::Access>,
     #[cfg(test)]
     exit_fault: Option<ExitStep>,
+    #[cfg(test)]
+    exit_pause: Option<(ExitStep, Box<dyn FnMut() + Send>)>,
     #[cfg(test)]
     remove_test_group: Option<fn(&Path) -> std::io::Result<()>>,
 }
@@ -231,6 +233,8 @@ impl LinuxJobs {
             network: Box::new(network::System(config.clone())),
             #[cfg(test)]
             exit_fault: None,
+            #[cfg(test)]
+            exit_pause: None,
             #[cfg(test)]
             remove_test_group: None,
         }
@@ -622,7 +626,19 @@ impl LinuxJobs {
         Ok(std::fs::remove_dir(group)?)
     }
 
-    fn exit_checkpoint(&mut self, step: ExitStep) -> Result<()> {
+    #[cfg(test)]
+    pub(super) fn pause_exit_at(&mut self, step: ExitStep, pause: impl FnMut() + Send + 'static) {
+        self.exit_pause = Some((step, Box::new(pause)));
+    }
+
+    pub(super) fn exit_checkpoint(&mut self, step: ExitStep) -> Result<()> {
+        // A one-shot pause holds the same phase open as the fault hook, without
+        // replacing any process, permission, or durable-record checks.
+        #[cfg(test)]
+        if self.exit_pause.as_ref().is_some_and(|(at, _)| *at == step) {
+            let (_, mut pause) = self.exit_pause.take().unwrap();
+            pause();
+        }
         #[cfg(test)]
         if self.exit_fault == Some(step) {
             self.exit_fault = None;

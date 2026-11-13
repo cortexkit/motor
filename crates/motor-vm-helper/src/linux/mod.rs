@@ -17,6 +17,7 @@ use std::{
         unix::{fs::OpenOptionsExt, net::UnixStream},
     },
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -28,7 +29,8 @@ pub struct LinuxMachine {
     base_path: PathBuf,
     cgroups: cgroup::Cgroups,
     tenants: crate::tenant::Controller<tenant::LinuxTenants>,
-    jobs: job::LinuxJobs,
+    jobs: Arc<Mutex<job::LinuxJobs>>,
+    cache_write_grants: crate::cache_write::Authority,
 }
 impl LinuxMachine {
     pub fn new(config: Config) -> Result<Self> {
@@ -51,13 +53,15 @@ impl LinuxMachine {
         let tenants =
             crate::tenant::Controller(tenant::LinuxTenants::new(&config, cgroups.root.clone()));
         let jobs = job::LinuxJobs::new(&config);
+        let cache_write_grants = jobs.cache_write_grants.clone();
         Ok(Self {
             config,
             base,
             base_path: PathBuf::from(BUILD_ROOT),
             cgroups,
             tenants,
-            jobs,
+            jobs: Arc::new(Mutex::new(jobs)),
+            cache_write_grants,
         })
     }
     fn boundary(&self, slot: usize) -> PathBuf {
@@ -98,7 +102,7 @@ impl LinuxMachine {
 }
 impl Machine for LinuxMachine {
     fn cache_write_authority(&self) -> Option<crate::cache_write::Authority> {
-        Some(self.jobs.cache_write_grants.clone())
+        Some(self.cache_write_grants.clone())
     }
     fn reconcile(&mut self) -> Result<()> {
         // Check no-internal-process constraints even before cleanup. Never fix
@@ -143,7 +147,7 @@ impl Machine for LinuxMachine {
         self.cgroups.enable()?;
         // Job evidence and leftover TAPs must be reconciled before the tenant
         // policy renderer can discard any no-longer-allocated counter.
-        self.jobs.reconcile()?;
+        self.jobs.lock().unwrap().reconcile()?;
         self.tenants.0.reconcile()
     }
     fn start(&mut self, _slot: usize, _lease: &Lease, _kind: Kind) -> Result<Vec<OwnedFd>> {
@@ -184,11 +188,15 @@ impl Machine for LinuxMachine {
     fn tenant(&mut self, tenant: &str, op: crate::tenant::Operation) -> Result<crate::Response> {
         self.tenants.handle(tenant, op)
     }
-    fn job(&mut self, op: crate::job::Operation, peer: crate::Peer) -> Result<crate::Response> {
-        self.jobs.handle(op, peer)
-    }
     fn images(&mut self, op: crate::images::Operation) -> Result<crate::Response> {
-        self.jobs.images(op)
+        // The Helper lock protects image operations. Removal keeps the job lock
+        // from the reservation check through the durable fencing rename, so a
+        // concurrent start cannot reserve a generation that is being removed.
+        if matches!(op, crate::images::Operation::Remove(_)) {
+            self.jobs.lock().unwrap().images(op)
+        } else {
+            images::handle(op)
+        }
     }
     fn job_vms_configured(&self) -> bool {
         self.config.job_vms.is_some()
@@ -198,9 +206,6 @@ impl Machine for LinuxMachine {
             .job_vms
             .as_ref()
             .and_then(|settings| settings.workspace_disk_max_bytes)
-    }
-    fn maintain_jobs(&mut self) -> Result<()> {
-        self.jobs.maintain()
     }
     fn shutdown(&mut self) -> Result<()> {
         // stop_all logs each tenant's outcome; this only summarises.
