@@ -92,15 +92,28 @@ impl LinuxJobs {
             return Err(Error("balloon target exceeds guest RAM".into()));
         }
         let process = self.memory_process(record)?;
-        let mut stream = api_socket(&self.root(id), record.uid)?;
+        // One absolute deadline covers connect, request and status line, so no
+        // API peer state can hold this request thread without a bound.
+        let deadline = std::time::Instant::now() + API_DEADLINE;
+        let mut stream = api_socket(&self.root(id), record.uid, deadline)?;
         process.alive()?;
-        patch_balloon(&mut stream, amount_mib)?;
+        patch_balloon(&mut stream, amount_mib, deadline)?;
         process.alive()?;
         Ok(Response::new(Reply::Ok))
     }
 }
 
-fn api_socket(root: &Path, uid: u32) -> Result<UnixStream> {
+const API_DEADLINE: Duration = Duration::from_secs(2);
+
+fn remaining(deadline: std::time::Instant) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return Err(Error("Firecracker balloon API deadline passed".into()));
+    }
+    Ok(left)
+}
+
+fn api_socket(root: &Path, uid: u32, deadline: std::time::Instant) -> Result<UnixStream> {
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -112,18 +125,26 @@ fn api_socket(root: &Path, uid: u32) -> Result<UnixStream> {
     if !metadata.file_type().is_socket() || metadata.uid() != uid {
         return Err(Error("API socket must be owned by the VM jail uid".into()));
     }
-    let stream = UnixStream::connect(format!("/proc/self/fd/{}", socket.as_raw_fd()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    // A non-blocking connect is refused at once when the listener's backlog is
+    // full, where a blocking one would wait until the VMM accepted.
+    let stream =
+        tenant::connect_job_socket(Path::new(&format!("/proc/self/fd/{}", socket.as_raw_fd())))?;
+    let left = remaining(deadline)?;
+    stream.set_read_timeout(Some(left))?;
+    stream.set_write_timeout(Some(left))?;
     Ok(stream)
 }
 
-fn patch_balloon(stream: &mut UnixStream, amount_mib: u64) -> Result<()> {
+fn patch_balloon(
+    stream: &mut UnixStream,
+    amount_mib: u64,
+    deadline: std::time::Instant,
+) -> Result<()> {
     let body = json!({"amount_mib":amount_mib}).to_string();
+    stream.set_write_timeout(Some(remaining(deadline)?))?;
     write!(stream, "PATCH /balloon HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !status.ends_with('\n') {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() || status.len() >= 1024 {

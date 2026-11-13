@@ -3,12 +3,44 @@ use std::{
     io::Read,
     os::fd::AsRawFd,
     process::{Child, Command, Output, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
 const DEADLINE: Duration = Duration::from_secs(2);
+// A killed query normally exits within milliseconds and is reaped here.
+const KILL_GRACE: Duration = Duration::from_millis(200);
+// Each background reaper owns a query that ignored SIGKILL, such as one stuck
+// in the kernel. Past this many, new queries are not started at all.
+pub(super) const MAX_REAPERS: usize = 4;
+static REAPERS: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn output(command: &mut Command) -> Result<Option<Output>> {
+    output_with(
+        command,
+        &REAPERS,
+        crate::linux::process::wait_child,
+        |mut child| {
+            let _ = child.wait();
+        },
+    )
+}
+
+/// Runs `command` for at most DEADLINE plus KILL_GRACE. A query that `settle`
+/// has not reaped within KILL_GRACE of its kill goes to `reap` on a background
+/// thread and the result is unmeasured (None). Exit collection calls this
+/// while it holds a finished job's lock and before it has recorded the job's
+/// exit, so waiting longer here would delay that job's exit report.
+pub(super) fn output_with(
+    command: &mut Command,
+    reapers: &'static AtomicUsize,
+    settle: impl FnOnce(&mut Child, Duration) -> std::io::Result<Option<std::process::ExitStatus>>,
+    reap: impl FnOnce(Child) + Send + 'static,
+) -> Result<Option<Output>> {
+    if reapers.load(Ordering::Acquire) >= MAX_REAPERS {
+        eprintln!("egress counter query skipped: {MAX_REAPERS} earlier queries are still exiting");
+        return Ok(None);
+    }
     let deadline = Instant::now() + DEADLINE;
     let mut child = command
         .stdin(Stdio::null())
@@ -18,9 +50,23 @@ pub(super) fn output(command: &mut Command) -> Result<Option<Output>> {
     let result = read_output(&mut child, deadline);
     if !matches!(result, Ok(Some(_))) {
         // Neither wait_with_output nor a reader thread bounds pipe reads. Stop
-        // reading at the deadline, kill the query, and reap it before returning.
+        // reading at the deadline and kill the query. Reap it here if it dies
+        // promptly; never wait without a bound on the caller's thread.
         let _ = child.kill();
-        child.wait()?;
+        if settle(&mut child, KILL_GRACE)?.is_none() {
+            reapers.fetch_add(1, Ordering::AcqRel);
+            let spawned = std::thread::Builder::new()
+                .name("counter-reaper".into())
+                .spawn(move || {
+                    reap(child);
+                    reapers.fetch_sub(1, Ordering::AcqRel);
+                });
+            if let Err(error) = spawned {
+                // The closure, and with it the unreaped child, is dropped.
+                reapers.fetch_sub(1, Ordering::AcqRel);
+                eprintln!("egress counter reaper spawn failed: {error}");
+            }
+        }
     }
     result
 }

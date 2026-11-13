@@ -100,3 +100,46 @@ fn render_waiting_for_release_cannot_restore_freed_tap() {
     );
     assert!(!text.contains("mtap17"));
 }
+
+#[test]
+fn job_render_reads_tenant_registries_after_taking_the_network_lock() {
+    let root = cortexkit_test_support::ScratchDir::new("network-render-tenants");
+    let path = root.join("network");
+    let tenants = root.join("tenants");
+    std::fs::write(&tenants, "").unwrap();
+    let guard = acquire(&path).unwrap();
+    let (waiting, ready) = mpsc::channel();
+    let worker_path = path.clone();
+    let worker_tenants = tenants.clone();
+    let worker = std::thread::spawn(move || {
+        with_registered_taps(
+            || {
+                waiting.send(()).unwrap();
+                acquire(&worker_path)
+            },
+            || {
+                Ok(std::fs::read_to_string(worker_tenants)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .ok()
+                    .map(|tap_index| Tap {
+                        tap_index,
+                        uid: 400001,
+                    })
+                    .into_iter()
+                    .collect())
+            },
+            || Ok(Vec::new()),
+            |taps| policy_rules("eno1", &taps, None, &Default::default()),
+        )
+        .unwrap()
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    // A tenant registered while a job start waits for the lock must be part
+    // of that start's render, or the render would drop its rules.
+    std::fs::write(&tenants, "17").unwrap();
+    drop(guard);
+    let text = worker.join().unwrap();
+    assert!(text.contains("tenant_mtap17_egress"), "{text}");
+}

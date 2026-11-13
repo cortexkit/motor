@@ -115,6 +115,56 @@ pub fn place_here(procs: &Path) -> io::Result<()> {
     fs::write(procs, std::process::id().to_string())
 }
 
+/// Waits at most `timeout` for an owned child to exit, then reaps it. Returns
+/// None while it still runs, leaving the child unreaped and owned by the caller.
+/// A plain `Child::wait` has no bound, and a process stuck in the kernel can
+/// ignore SIGKILL for as long as that lasts.
+pub fn wait_child(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    // An unreaped child keeps its pid, so this pidfd cannot name another process.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+    let pidfd = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        // Round up so a sub-millisecond remainder still waits instead of spinning.
+        let millis = left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+        match &pidfd {
+            Some(pidfd) => {
+                let mut poll = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut poll, 1, millis) } < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                if poll.revents != 0 {
+                    if let Some(status) = child.try_wait()? {
+                        return Ok(Some(status));
+                    }
+                    // The pidfd can report exit just before the child becomes
+                    // waitable; yield briefly rather than polling a ready fd.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            // Kernels without pidfd_open still get a bounded, sleeping wait.
+            None => std::thread::sleep(left.min(std::time::Duration::from_millis(10))),
+        }
+    }
+}
+
 /// A static loader is executed by fd after chroot. Its runtime needs no path
 /// access, networking, process creation, or privilege-changing syscalls.
 pub fn loader_program(exec_fd: i32) -> Vec<libc::sock_filter> {

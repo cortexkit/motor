@@ -990,7 +990,7 @@ fn connect_relay_with_budget(
     Ok(stream.into())
 }
 
-fn connect_job_socket(path: &Path) -> Result<UnixStream> {
+pub(super) fn connect_job_socket(path: &Path) -> Result<UnixStream> {
     use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
     let fd = unsafe {
         libc::socket(

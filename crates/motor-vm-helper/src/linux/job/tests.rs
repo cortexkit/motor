@@ -1,11 +1,14 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod absence_tests;
 mod exit_tests;
+mod fill_tests;
 mod network_tests;
 mod plane_tests;
 #[cfg(feature = "linux-service-tests")]
 mod real_exit_tests;
+mod reap_tests;
 mod security_tests;
 #[cfg(feature = "linux-service-tests")]
 mod service_cleanup;

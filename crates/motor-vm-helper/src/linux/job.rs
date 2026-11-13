@@ -15,7 +15,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             process::CommandExt,
         },
     },
@@ -31,6 +31,11 @@ const JOB_CACHE_WRITE_BOOT_SUFFIX: &str = " motor.cache_write=1";
 const FILL_BOOT_SUFFIX: &str = " motor.fill=1";
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+// The kernel takes an exiting task out of cgroup.procs a moment before the task
+// becomes a zombie its parent can reap, so collection may briefly wait for it.
+const REAP_WAIT: Duration = Duration::from_secs(5);
+// After cgroup.kill a VMM still has to release guest RAM before it exits.
+const STOP_WAIT: Duration = Duration::from_secs(10);
 // Without huge pages, the guest defaults to reporting only whole 4 MiB blocks.
 // Report 128 KiB blocks so fragmented pages freed from file cache reach the host.
 const JOB_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/motor-init net.ifnames=0 systemd.unified_cgroup_hierarchy=1 motor.per_job=1 page_reporting.page_reporting_order=5";
@@ -133,6 +138,10 @@ pub(super) enum ExitStep {
     RelayConnected,
     #[cfg(test)]
     MemoryRead,
+    #[cfg(test)]
+    Reap,
+    #[cfg(test)]
+    FillAdmission,
     Stop,
     Adopt,
     Ack,
@@ -153,6 +162,15 @@ enum CollectionFailure {
     MissingEgress,
 }
 
+/// How collection takes the machine-wide network flock to release a TAP.
+/// Requests that must finish cleanup wait for it; background collectors only
+/// try, so a held flock never keeps a job's writer lock occupied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkLock {
+    Wait,
+    Try,
+}
+
 pub struct LinuxJobs {
     pub(super) cache_write_grants: crate::cache_write::Authority,
     settings: Option<JobVms>,
@@ -162,7 +180,9 @@ pub struct LinuxJobs {
     cache_store: PathBuf,
     workspaces: PathBuf,
     // Admission excludes conflicting reservations and workspace/image changes.
-    // Starts keep it through launch; collection and read-only polls never use it.
+    // A start holds it until its durable Booting record is in the registry,
+    // then launches without it. Stop and status take it only for an id with no
+    // record, to prove and record absence; collection and polls never use it.
     admission: Mutex<()>,
     // The registry contains only published copies and cell handles. Never do
     // I/O or acquire another lock while its memory-only guard is held.
@@ -183,6 +203,7 @@ struct TestHooks {
     exit_fault: Option<ExitStep>,
     exit_pause: Option<(ExitStep, Box<dyn FnMut() + Send>)>,
     collector_spawns: usize,
+    child_wait: Option<Duration>,
 }
 
 impl LinuxJobs {
@@ -445,37 +466,67 @@ impl LinuxJobs {
         Ok(Some(pid))
     }
 
-    fn reap_job(&self, state: &mut JobState) {
+    /// Reaps this helper's own VMM child once it has exited, waiting at most
+    /// `wait`, and returns false while the child still runs. The child's pidfd
+    /// is dropped with it, so a finished job never keeps a descriptor open
+    /// until its record is pruned.
+    fn reap_job(&self, state: &mut JobState, wait: Duration) -> Result<bool> {
         let Some(child) = state.child.as_mut() else {
-            return;
+            if state.pidfd.take().is_some() {
+                self.publish(state);
+            }
+            return Ok(true);
+        };
+        let Some(status) = process::wait_child(child, wait)? else {
+            return Ok(false);
         };
         let id = state.record.start.job_id.clone();
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                eprintln!("job {id} VMM exited: {status}");
-                log_console_tail(&id, &self.boundary(&id));
-                if state.record.start.kind == job::VmKind::Fill {
-                    let mut record = state.record.clone();
-                    record.fill_exit_success = Some(status.success());
-                    if let Err(error) = self.persist(state, record) {
-                        self.log_collection_failure(state, CollectionFailure::Evidence, &error);
-                        return;
-                    }
-                }
-                state.child = None;
-            }
-            Ok(None) => (),
-            Err(error) => {
-                self.log_collection_failure(state, CollectionFailure::Reap, &error);
-            }
+        eprintln!("job {id} VMM exited: {status}");
+        log_console_tail(&id, &self.boundary(&id));
+        if state.record.start.kind == job::VmKind::Fill {
+            // std keeps the reaped status in the Child, so a failed write is
+            // retried with the same status while the child stays recorded.
+            let mut record = state.record.clone();
+            record.fill_exit_success = Some(status.success());
+            self.persist(state, record)?;
         }
+        state.child = None;
+        state.pidfd = None;
+        self.publish(state);
+        Ok(true)
+    }
+
+    /// An empty cgroup.procs proves the VMM has stopped running, not that it
+    /// has been reaped. Until it is, its zombie keeps the job's uid busy and a
+    /// fill's exit status is unknown, so evidence waits for the reap.
+    fn reap_exited(&self, state: &mut JobState) -> Result<()> {
+        #[cfg(test)]
+        if state.child.is_some() {
+            self.exit_checkpoint(ExitStep::Reap)?;
+        }
+        let wait = self.child_wait(REAP_WAIT);
+        if self.reap_job(state, wait)? {
+            Ok(())
+        } else {
+            Err(Error(format!(
+                "job VMM left its cgroup but was not reaped within {wait:?}; retrying"
+            )))
+        }
+    }
+
+    fn child_wait(&self, wait: Duration) -> Duration {
+        #[cfg(test)]
+        if let Some(wait) = self.hooks.lock().unwrap().child_wait {
+            return wait;
+        }
+        wait
     }
 
     #[cfg(test)]
     fn reap(&self) {
         for (_, cell, _) in self.snapshot() {
             if let Some(mut state) = cell.0.try_lock() {
-                self.reap_job(&mut state);
+                let _ = self.reap_job(&mut state, Duration::ZERO);
             }
         }
     }
@@ -555,10 +606,72 @@ impl LinuxJobs {
                 .is_ok_and(|age| age >= TOMBSTONE_RETENTION)
             {
                 self.exit_checkpoint(ExitStep::Prune)?;
+                // Policy renders list this directory and then open each record
+                // under the network flock; an unlink between the two would fail
+                // an unrelated start. Order: J, N, then R.
+                let _network = self.network.lock()?;
                 std::fs::remove_file(&path)?;
                 File::open(&self.records_path)?.sync_all()?;
                 self.registry.lock().remove(&id);
             }
+        }
+        self.prune_absences(now)
+    }
+
+    fn absence_path(&self, id: &str) -> PathBuf {
+        // Not a .json name: record readers, including older helpers, skip it.
+        self.records_path.join(format!("absent-{id}"))
+    }
+
+    /// Makes an "absent" answer final for the retention window: a Start for
+    /// this id still queued behind admission is refused once it gets there.
+    fn record_absence(&self, id: &str) -> Result<()> {
+        crate::lock_order::assert_held(Lock::A);
+        let path = self.absence_path(id);
+        if path.try_exists()? {
+            return Ok(());
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.records_path)?;
+        tenant::durable_write(
+            &path,
+            &serde_json::to_vec(&json!({ "job_id": id })).map_err(|e| Error(e.to_string()))?,
+        )
+    }
+
+    fn proven_absent(&self, id: &str) -> Result<bool> {
+        Ok(self.absence_path(id).try_exists()?)
+    }
+
+    fn prune_absences(&self, now: SystemTime) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.records_path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut removed = false;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name
+                .to_str()
+                .is_some_and(|name| name.starts_with("absent-"))
+            {
+                continue;
+            }
+            let modified = entry.metadata()?.modified()?;
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age >= TOMBSTONE_RETENTION)
+            {
+                std::fs::remove_file(entry.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            File::open(&self.records_path)?.sync_all()?;
         }
         Ok(())
     }
@@ -567,31 +680,39 @@ impl LinuxJobs {
     fn collect_exit(&self, id: &str) -> Result<()> {
         let cell = self.cell(id)?;
         let mut state = cell.0.lock();
-        self.collect_exit_locked(&mut state)
+        self.collect_exit_locked(&mut state, NetworkLock::Wait)
     }
 
-    fn collect_exit_locked(&self, state: &mut JobState) -> Result<()> {
+    fn collect_exit_locked(&self, state: &mut JobState, network: NetworkLock) -> Result<()> {
         let mut kind = CollectionFailure::Cgroup;
-        let result = self.collect_exit_inner(state, &mut kind);
+        let result = self.collect_exit_inner(state, &mut kind, network);
         if let Err(error) = &result {
             self.log_collection_failure(state, kind, error);
         }
         result
     }
 
-    fn collect_exit_inner(&self, state: &mut JobState, kind: &mut CollectionFailure) -> Result<()> {
+    fn collect_exit_inner(
+        &self,
+        state: &mut JobState,
+        kind: &mut CollectionFailure,
+        network: NetworkLock,
+    ) -> Result<()> {
         let id = state.record.start.job_id.clone();
         let group = self.group(&id);
         if !group.try_exists()? {
             // A reboot can erase cgroups. No count is better than an invented 0.
+            // A removed group says nothing about our own child: reap it first.
+            *kind = CollectionFailure::Reap;
+            self.reap_exited(state)?;
             *kind = CollectionFailure::Credentials;
             self.remove_credentials(&id)?;
             *kind = CollectionFailure::Network;
-            self.remove_network(state)?;
+            let removed = self.remove_network(state, network)?;
             if !state.record.released {
                 state.state = State::Exited;
             }
-            state.cleanup_pending = false;
+            state.cleanup_pending = !removed;
             self.publish(state);
             return Ok(());
         }
@@ -601,6 +722,8 @@ impl LinuxJobs {
         {
             return Ok(());
         }
+        *kind = CollectionFailure::Reap;
+        self.reap_exited(state)?;
         *kind = CollectionFailure::Credentials;
         self.remove_credentials(&id)?;
         let mut record = state.record.clone();
@@ -642,9 +765,13 @@ impl LinuxJobs {
         self.publish(state);
         self.exit_checkpoint(ExitStep::Recorded)?;
         // Phase 2 keeps J because freeing the TAP rewrites the whole record;
-        // an acknowledgement must not be lost against that write.
+        // an acknowledgement must not be lost against that write. A collector
+        // must not wait for the network flock while holding J, or the host's
+        // acknowledgement of this exit would stall its receipt of every other.
         *kind = CollectionFailure::Network;
-        self.remove_network(state)?;
+        if !self.remove_network(state, network)? {
+            return Ok(());
+        }
         *kind = CollectionFailure::Cgroup;
         self.remove_empty_group(&group)?;
         state.cleanup_pending = false;
@@ -652,13 +779,22 @@ impl LinuxJobs {
         self.exit_checkpoint(ExitStep::Removed)
     }
 
-    fn remove_network(&self, state: &mut JobState) -> Result<()> {
+    /// Removes the job's network. Returns false, with nothing changed, when
+    /// `network` is Try and another holder has the network flock; the watcher
+    /// retries on its next tick because cleanup is still pending.
+    fn remove_network(&self, state: &mut JobState, network: NetworkLock) -> Result<bool> {
         let mut record = state.record.clone();
         let id = record.start.job_id.clone();
         if let Some(tap) = record.tap() {
             // Keep one non-reentrant network lock through the durable release:
             // a network policy render must not restore this TAP before the write.
-            let lock = self.network.lock()?;
+            let lock = match network {
+                NetworkLock::Wait => self.network.lock()?,
+                NetworkLock::Try => match self.network.try_lock()? {
+                    Some(lock) => lock,
+                    None => return Ok(false),
+                },
+            };
             self.network.remove(&id, &tap, &lock)?;
             self.network.remove_namespace(&id)?;
             // A crash before this write retries idempotent removal, never the
@@ -672,7 +808,7 @@ impl LinuxJobs {
         } else {
             self.network.remove_namespace(&id)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn remove_credentials(&self, id: &str) -> Result<()> {
@@ -773,8 +909,9 @@ impl LinuxJobs {
         if let Operation::AckExit(report) = op {
             return self.acknowledge_exit(report);
         }
-        // Only reservation and workspace operations take admission. Polls use
-        // published views; stop and ack serialize only with their own writer.
+        // Only reservation and workspace operations take admission here. Polls
+        // use published views; stop and ack of a known job serialize only with
+        // its own writer.
         let _admission = if matches!(
             op,
             Operation::PrepareFill(_)
@@ -905,6 +1042,33 @@ impl LinuxJobs {
         }
     }
 
+    /// Opens the disk a finished fill's VM wrote, as named by its execution
+    /// record. None means the disk is gone and there is nothing to promote.
+    /// The open descriptor keeps the inode allocated, so no later disk at
+    /// the same path can share its device and inode numbers.
+    fn open_executed_disk(&self, record: &Record) -> Result<Option<(u64, u64, File)>> {
+        let path = self
+            .workspaces
+            .join(&record.start.workspace_disk_id)
+            .join("workspace.img");
+        let disk = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(disk) => disk,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let meta = disk.metadata()?;
+        if (meta.dev(), meta.ino()) != (record.disk_device, record.disk_inode) {
+            return Err(Error(
+                "fill disk is not the disk its VM ran on; refusing promotion".into(),
+            ));
+        }
+        Ok(Some((meta.dev(), meta.ino(), disk)))
+    }
+
     fn disk_available_identity(&self, disk_id: &str) -> Result<()> {
         if self
             .records()
@@ -930,38 +1094,66 @@ impl LinuxJobs {
     fn finish_fill(&self, fill: &job::Fill, mut published: bool) -> Result<bool> {
         let requested_publication = published;
         let id = fill.disk_id();
+        // The disk this fill's VM wrote: its identity from the execution record,
+        // and an open descriptor so the inode number cannot be reused by a
+        // replacement disk before promotion compares it under admission.
+        let mut executed = None;
+        let mut registered = false;
         // Only this fill's writer is needed while waiting for its VM to stop.
         // Holding admission here would delay every unrelated start/workspace.
         if let Ok(cell) = self.cell(&fill.fill_id) {
             let mut state = cell.0.lock();
-            let record = &state.record;
-            if record.start.kind != job::VmKind::Fill
-                || record.start.account != fill.account
-                || record.start.workspace_disk_id != id
-            {
-                return Err(Error("fill execution identity mismatch".into()));
+            // Pruning can retire an expired tombstone between the lookup and
+            // J. A retired cell is finished: never change or publish it again.
+            registered = self.is_registered(&fill.fill_id, &cell);
+            if registered {
+                let record = &state.record;
+                if record.start.kind != job::VmKind::Fill
+                    || record.start.account != fill.account
+                    || record.start.workspace_disk_id != id
+                {
+                    return Err(Error("fill execution identity mismatch".into()));
+                }
+                // Finishing must observe this fill's final child status and
+                // evidence even when maintenance has not run since the exit.
+                self.reap_job(&mut state, Duration::ZERO)?;
+                self.collect_exit_locked(&mut state, NetworkLock::Wait)?;
+                let record = &state.record;
+                if published {
+                    published = self.pid(record)?.is_none()
+                        && record.oom_kill == Some(0)
+                        && record.fill_exit_success == Some(true);
+                }
+                self.stop_locked(&mut state)?;
+                if published {
+                    executed = self.open_executed_disk(&state.record)?;
+                    published = executed.is_some();
+                }
             }
-            // Finishing must observe this fill's final child status and evidence
-            // even when maintenance has not run since the guest exited.
-            self.reap_job(&mut state);
-            self.collect_exit_locked(&mut state)?;
-            let record = &state.record;
-            if published {
-                published = self.pid(record)?.is_none()
-                    && record.oom_kill == Some(0)
-                    && record.fill_exit_success == Some(true);
-            }
-            self.stop_locked(&mut state)?;
-        } else {
+        }
+        if !registered {
             published = false;
         }
+        #[cfg(test)]
+        self.exit_checkpoint(ExitStep::FillAdmission)?;
         // The job guard is gone before admission: disk identity and promotion
         // must serialize with new reservations, never with a running VM's I/O.
         let _admission = self.admission.lock();
         if self.workspaces.join(&id).try_exists()? {
-            let (registry, _) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
+            let (registry, disk) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
             if workspace::read_fill(&self.workspaces, &id)? != *fill {
                 return Err(Error("fill provenance mismatch".into()));
+            }
+            // Between J and admission, a discard of this fill and a new
+            // PrepareFill can put an unbuilt disk with identical provenance at
+            // this path. Only the disk the VM wrote may become a base.
+            if let Some((device, inode, _)) = &executed {
+                let meta = disk.metadata()?;
+                if (meta.dev(), meta.ino()) != (*device, *inode) {
+                    return Err(Error(
+                        "fill disk was replaced after its VM ran; refusing promotion".into(),
+                    ));
+                }
             }
             if registry.role == job::WorkspaceRole::Base {
                 return if requested_publication {
@@ -988,8 +1180,11 @@ impl LinuxJobs {
     }
 
     fn status(&self, id: &str) -> Result<Response> {
-        let Some(mut view) = self.view(id) else {
-            self.prove_absent(id)?;
+        let view = match self.view(id) {
+            Some(view) => Some(view),
+            None => self.known_or_absent(id)?.and_then(|_| self.view(id)),
+        };
+        let Some(mut view) = view else {
             return Ok(Response::new(Reply::Job {
                 known: false,
                 running: false,
@@ -1199,7 +1394,7 @@ impl LinuxJobs {
             let group = self.group(id);
             let netns = self.network.create_namespace(id)?;
             if let Some(tap_index) = tap_index {
-                self.prepare_network(id, tenants, Tap { tap_index, uid })?;
+                self.prepare_network(id, Tap { tap_index, uid })?;
             }
             self.exit_checkpoint(ExitStep::Launch)?;
             cgroup::create_job(&group, start.vcpus)?;
@@ -1287,10 +1482,11 @@ impl LinuxJobs {
         Ok(())
     }
 
-    fn prepare_network(&self, id: &str, tenants: Vec<Tap>, tap: Tap) -> Result<()> {
-        // The installer reads durable job allocations after taking the network
-        // lock; a snapshot of self.records taken before that lock could be stale.
-        self.network.install(&tenants)?;
+    fn prepare_network(&self, id: &str, tap: Tap) -> Result<()> {
+        // The installer reads tenant registries and durable job allocations
+        // after taking the network lock; lists read before that lock, such as
+        // the ones start used for admission, could be stale by now.
+        self.network.install()?;
         self.network.ensure(id, &tap)
     }
 
@@ -1305,11 +1501,29 @@ impl LinuxJobs {
     }
 
     fn stop(&self, id: &str) -> Result<()> {
-        let Ok(cell) = self.cell(id) else {
-            return self.prove_absent(id);
+        let Some(cell) = self.known_or_absent(id)? else {
+            return Ok(());
         };
         let mut state = cell.0.lock();
         self.stop_locked(&mut state)
+    }
+
+    /// Returns the cell for `id`, or proves and records that no VM exists.
+    /// A Start inserts its id into the registry before releasing admission,
+    /// so after taking admission a missing id has no Start in progress; the
+    /// recorded absence refuses any Start still queued behind admission.
+    fn known_or_absent(&self, id: &str) -> Result<Option<Arc<JobCell>>> {
+        if let Ok(cell) = self.cell(id) {
+            return Ok(Some(cell));
+        }
+        job::validate_job_id(id)?;
+        let _admission = self.admission.lock();
+        if let Ok(cell) = self.cell(id) {
+            return Ok(Some(cell));
+        }
+        self.prove_absent(id)?;
+        self.record_absence(id)?;
+        Ok(None)
     }
 
     fn stop_locked(&self, state: &mut JobState) -> Result<()> {
@@ -1322,14 +1536,20 @@ impl LinuxJobs {
         let group = self.group(id);
         if group.try_exists()? {
             std::fs::write(group.join("cgroup.kill"), "1")?;
-            if let Some(mut child) = state.child.take() {
-                let status = child.wait()?;
-                eprintln!("job {id} VMM stopped by the helper: {status}");
-                log_console_tail(id, &self.boundary(id));
+            if state.child.is_some() {
+                let wait = self.child_wait(STOP_WAIT);
+                if !self.reap_job(state, wait)? {
+                    // Without proof that the VMM is gone nothing may be
+                    // reported or released; the child stays ours to reap.
+                    return Err(Error(format!(
+                        "job {id} VMM did not exit within {wait:?} of cgroup.kill; its disk, uid and TAP stay reserved"
+                    )));
+                }
+                eprintln!("job {id} VMM stopped by the helper");
             }
             tenant::wait_empty(&group)?;
         }
-        self.collect_exit_locked(state)?;
+        self.collect_exit_locked(state, NetworkLock::Wait)?;
         let mut record = state.record.clone();
         tenant::cleanup_boundary(&self.boundary(id))?;
         let disk_path = self
@@ -1342,6 +1562,7 @@ impl LinuxJobs {
         record.released = true;
         self.persist(state, record)?;
         state.state = State::Released;
+        state.pidfd = None;
         self.publish(state);
         Ok(())
     }
