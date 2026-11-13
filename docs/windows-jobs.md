@@ -208,8 +208,11 @@ Git Bash may prepend its own normal shell directories. A caller cannot replace
 `PATH` through the request allowlist. Test:
 `managed_paths_win_and_windows_machine_then_user_paths_survive`.
 
-3.5. The toolchain is the baseline's machine-wide Rust for
-`x86_64-pc-windows-msvc`, with clippy, rustfmt, cargo-nextest 0.9.138, MSVC Build
+3.5. The toolchains are the baseline's machine-wide Rust 1.99.0 and 1.100.0 for
+`x86_64-pc-windows-msvc`, each with clippy, rustfmt and the
+`aarch64-pc-windows-msvc` target. The default and `stable` remain 1.99.0;
+repositories can select the preinstalled 1.100.0 offline with `rust-toolchain.toml`
+or `+1.100.0`. The baseline also includes cargo-nextest 0.9.138, MSVC Build
 Tools, Git, Bun and PowerShell 7.6.7 at `C:\Program Files\PowerShell\7`.
 `cargo-nextest.exe` is installed beside Cargo at `C:\rust\cargo\bin` so
 `cargo nextest` works offline. The job can read and execute the

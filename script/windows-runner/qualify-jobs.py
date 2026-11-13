@@ -262,6 +262,8 @@ def fixture(path):
     (path / "src").mkdir()
     (path / "Cargo.toml").write_text('[package]\nname="hyperv-qualification"\nversion="0.1.0"\nedition="2021"\n')
     (path / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "hyperv-qualification"\nversion = "0.1.0"\n')
+    # The unqualified gate must select the repository pin without a download.
+    (path / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.100.0"\n')
     (path / "src/lib.rs").write_text(r'''
 #[test]
 fn real_gate_standard_account_cache_boundary_and_large_collection() {
@@ -343,6 +345,18 @@ LLVM_CHECK = (
     "test -f '/c/Program Files/LLVM/bin/libclang.dll'"
 )
 STABLE_VERSION_CHECK = "stable_version=$(rustc +stable --version) && printf '%s\\n' \"$stable_version\" && [[ \"$stable_version\" == 'rustc 1.99.0 '* ]]"
+RUST_1100_VERSION_CHECK = (
+    "cargo_version=$(cargo +1.100.0 --version) && printf '%s\\n' \"$cargo_version\" && "
+    "test \"${cargo_version%$'\\r'}\" = 'cargo 1.100.0 (3acc79c0c 2026-11-05)' && "
+    "rustc_version=$(rustc +1.100.0 --version) && printf '%s\\n' \"$rustc_version\" && "
+    "test \"${rustc_version%$'\\r'}\" = 'rustc 1.100.0 (0ef1bc386 2026-11-09)'"
+)
+PINNED_TOOLCHAIN_CHECK = (
+    "cargo_version=$(cargo --version) && printf '%s\\n' \"$cargo_version\" && "
+    "test \"${cargo_version%$'\\r'}\" = 'cargo 1.100.0 (3acc79c0c 2026-11-05)' && "
+    "rustc_version=$(rustc --version) && printf '%s\\n' \"$rustc_version\" && "
+    "test \"${rustc_version%$'\\r'}\" = 'rustc 1.100.0 (0ef1bc386 2026-11-09)'"
+)
 
 
 GIT_DEP_URL = "https://dep.invalid/itoa-fixture"
@@ -587,7 +601,7 @@ def run(root, runner, evidence, gate):
         job = str(uuid.uuid4())
         channel = Channel(runner, root, evidence / f"bridge-{iteration}.log")
         try:
-            command = "printf 'MOTOR_CLOCK_UTC='; date -u +%s; " + BUN_VERSION_CHECK + " || exit $?; " + JQ_VERSION_CHECK + " || exit $?; " + CACHE_DRIVE_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + PYTHON_CHECK + " || exit $?; " + NATS_VERSION_CHECK + " || exit $?; " + LLVM_CHECK + " || exit $?; " + STABLE_VERSION_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
+            command = "export RUSTUP_AUTO_INSTALL=0; printf 'MOTOR_CLOCK_UTC='; date -u +%s; " + BUN_VERSION_CHECK + " || exit $?; " + JQ_VERSION_CHECK + " || exit $?; " + CACHE_DRIVE_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + PYTHON_CHECK + " || exit $?; " + NATS_VERSION_CHECK + " || exit $?; " + LLVM_CHECK + " || exit $?; " + STABLE_VERSION_CHECK + " || exit $?; " + RUST_1100_VERSION_CHECK + " || exit $?; " + PINNED_TOOLCHAIN_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
             request = dict(type="run", job_id=job, gate_job=True, platform="windows", workspace_key="/qualification/workspace", repository_root="/qualification/workspace", cwd="/qualification/workspace", command=command, env={}, weight_hint=4, timeout=600, queue_wait_limit_s=60, snapshot_commit=commit, tree_hash=tree, integration_tip=commit, siblings=[], git_dependencies=[], bundles=[dict(index=0, repository="/qualification/workspace", length=len(data), sha256=hashlib.sha256(data).hexdigest())])
             channel.send(request)
             channel.until("accepted")

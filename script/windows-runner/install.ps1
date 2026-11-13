@@ -226,7 +226,7 @@ guest_agent_sha256 = '$parentAgentHash'
 memory_mib = 8192
 cpu_set = [0, 1, 2, 3]
 concurrent_jobs = 1
-toolchain_version = 'rustc 1.99.0 (Windows MSVC)'
+toolchain_version = 'rustc 1.99.0 + 1.100.0 (Windows MSVC; default/stable 1.99.0)'
 "@ | Set-Content "$Root\vm.toml" -Encoding ascii
 $serviceDefinition = Get-RunnerServiceDefinition $Root $MetricsEndpoint $MetricsHostId
 New-Service -Name MotorRunner -BinaryPathName $serviceDefinition.binary -DisplayName $serviceDefinition.display_name -StartupType Automatic -DependsOn $serviceDefinition.dependencies | Out-Null

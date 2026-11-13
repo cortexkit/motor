@@ -110,9 +110,10 @@ administrator, randomizes local passwords and runs, in order:
    `C:\Program Files\Bun\bun.exe`, owned by Administrators with Users read/execute
    and on machine `PATH` for offline Git Bash jobs; the standard
    `motor-job` user and its batch-logon
-   right and `SeCreateSymbolicLinkPrivilege`, a machine-wide Rust toolchain for `x86_64-pc-windows-msvc` under
-   `C:\rust` (read-only to the job user, including clippy, rustfmt and
-   cargo-nextest 0.9.138), the virtio-serial driver, and the
+   right and `SeCreateSymbolicLinkPrivilege`, machine-wide Rust 1.99.0 and 1.100.0
+   toolchains for `x86_64-pc-windows-msvc` under `C:\rust` (read-only to the job
+   user, each with clippy, rustfmt and the `aarch64-pc-windows-msvc` target;
+   default and `stable` remain 1.99.0), cargo-nextest 0.9.138, the virtio-serial driver, and the
    guest agent built from the seed's source with
    `cargo build --release --locked --target x86_64-pc-windows-msvc` and
    installed as an automatic LocalSystem service at

@@ -13,6 +13,10 @@ LOCAL_USER_DESCRIPTION_MAX = 48
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_cache_identity_records_both_guest_rust_toolchains_and_unchanged_default(self):
+        install = (HERE / 'install.ps1').read_text()
+        self.assertIn("toolchain_version = 'rustc 1.99.0 + 1.100.0 (Windows MSVC; default/stable 1.99.0)'", install)
+
     def test_metrics_install_update_key_and_stage_paths_are_wired(self):
         install = (HERE / 'install.ps1').read_text()
         update = (HERE / 'update.ps1').read_text()

@@ -392,6 +392,38 @@ class BaselineInputsTests(unittest.TestCase):
         ):
             self.assertIn(expected, source)
 
+    def test_baseline_preinstalls_rust_1100_without_moving_default_or_stable(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        install = '& $rustup toolchain install "$additionalToolchain-$hostTriple" --profile minimal --component clippy --component rustfmt --target aarch64-pc-windows-msvc'
+        for expected in (
+            "$toolchain = '1.99.0'", "$additionalToolchain = '1.100.0'",
+            install,
+            'if ($LASTEXITCODE -ne 0) { throw \'Additional job image Rust toolchain failed to install\' }',
+            r'''$additionalRustc = & 'C:\rust\cargo\bin\rustc.exe' "+$additionalToolchain" -vV''',
+            '$LASTEXITCODE -ne 0 -or $additionalRustc -notcontains "release: $additionalToolchain" -or $additionalRustc -notcontains "host: $hostTriple"',
+            r'''& 'C:\rust\cargo\bin\cargo.exe' "+$additionalToolchain" --version''',
+            '& $rustup component list --installed --toolchain $additionalToolchain',
+            'Compare-Object $components $additionalComponents',
+            '& $rustup target list --installed --toolchain $additionalToolchain',
+            'Compare-Object $targets $additionalTargets',
+        ):
+            self.assertIn(expected, source)
+        self.assertLess(source.index('Compare-Object $targets $stableTargets'), source.index(install))
+        self.assertLess(source.index(install), source.index('# Freeze toolchain files'))
+        extra_setup = source.split(install, 1)[1].split('$nextestVersion = ', 1)[0]
+        self.assertNotIn('$HyperVSpike', extra_setup)
+        self.assertNotIn('rustup default', source)
+        self.assertNotIn('--default-toolchain $additionalToolchain', source)
+        freeze = source.split('# Freeze toolchain files', 1)[1]
+        for expected in (
+            'foreach ($installedToolchain in @($toolchain, $additionalToolchain))',
+            r'''& 'C:\rust\cargo\bin\rustc.exe' "+$installedToolchain" -vV''',
+            '$rustc -notcontains "release: $installedToolchain"',
+            '$rustc -notcontains "host: $hostTriple"',
+            r'''& 'C:\rust\cargo\bin\cargo.exe' "+$installedToolchain" --version''',
+        ):
+            self.assertIn(expected, freeze)
+
     def test_baseline_installs_and_verifies_rustfmt_and_clippy_for_all_images(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()
         self.assertIn("\n& $rustup component add clippy rustfmt --toolchain $toolchain\n", source)
