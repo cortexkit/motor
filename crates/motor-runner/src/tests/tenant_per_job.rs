@@ -12,6 +12,40 @@ fn job_config(f: &Fixture) -> Config {
     config
 }
 
+#[test]
+fn forked_marker_is_read_at_first_run_before_workspace_binding_and_only_once() {
+    for forked in [false, true] {
+        let f = Fixture::new();
+        let marker = f.scratch.join("motor-workspace-forked");
+        let mut config = job_config(&f);
+        config.fixture_workspace_forked_marker = Some(marker.clone());
+        let runner = Runner::open(config).unwrap();
+        assert_eq!(runner.core.inner.lock().unwrap().workspace_forked, None);
+        if forked {
+            fs::write(&marker, "1").unwrap();
+        }
+        let (request, _) = f.run("true");
+        runner.accept(request.clone()).unwrap();
+        {
+            let inner = runner.core.inner.lock().unwrap();
+            assert_eq!(inner.workspace_forked, Some(forked));
+            assert_eq!(inner.per_job_workspace.as_deref(), Some(f.key.as_str()));
+            assert_eq!(inner.per_job_id, Some(request.job_id));
+        }
+        if forked {
+            fs::remove_file(&marker).unwrap();
+        } else {
+            fs::write(&marker, "1").unwrap();
+        }
+        let (second, _) = f.run("true");
+        runner.accept(second).unwrap();
+        assert_eq!(
+            runner.core.inner.lock().unwrap().workspace_forked,
+            Some(forked)
+        );
+    }
+}
+
 pub(super) async fn raw_terminal(client: &mut tokio::io::DuplexStream) -> serde_json::Value {
     use tokio::io::AsyncReadExt;
     loop {

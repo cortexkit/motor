@@ -383,6 +383,8 @@ pub struct Config {
     /// over /etc/resolv.conf, just as with the service's fixed /run paths.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fixture_tenant_dns: Option<(PathBuf, PathBuf)>,
+    #[cfg(test)]
+    pub(crate) fixture_workspace_forked_marker: Option<PathBuf>,
     /// Called with an operation label so tests can hold filesystem work or the
     /// admission handoff open without holding the runner state lock.
     #[cfg(test)]
@@ -395,6 +397,8 @@ pub struct Config {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+pub(crate) const WORKSPACE_FORKED_MARKER: &str = "/run/motor-workspace-forked";
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) async fn net_operator_case(mode: &str) {
@@ -726,6 +730,8 @@ impl Config {
             fixture_cargo_home: None,
             #[cfg(all(test, target_os = "linux"))]
             fixture_tenant_dns: None,
+            #[cfg(test)]
+            fixture_workspace_forked_marker: None,
             #[cfg(test)]
             long_work: None,
             #[cfg(all(test, target_os = "linux"))]
@@ -1160,6 +1166,7 @@ impl QueueProgress {
 }
 
 struct Inner {
+    workspace_forked: Option<bool>,
     per_job_workspace: Option<String>,
     per_job_id: Option<Uuid>,
     #[cfg(target_os = "linux")]
@@ -3001,6 +3008,7 @@ impl Runner {
                 trees,
                 snapshots: crate::sibling_snapshots::store::SnapshotStore::default(),
                 inner: crate::state_lock::StateLock::new(Inner {
+                    workspace_forked: None,
                     per_job_workspace: jobs.values().find_map(|job| {
                         job.request.as_ref().map(|request| {
                             paths::request(request).caller_workspace_key.text().clone()
@@ -4451,6 +4459,17 @@ impl Runner {
                 return Ok(Admission::Duplicate);
             }
             if self.core.config.per_job {
+                if inner.workspace_forked.is_none() {
+                    let marker = Path::new(WORKSPACE_FORKED_MARKER);
+                    #[cfg(test)]
+                    let marker = self
+                        .core
+                        .config
+                        .fixture_workspace_forked_marker
+                        .as_deref()
+                        .unwrap_or(marker);
+                    inner.workspace_forked = Some(marker.try_exists()?);
+                }
                 inner.per_job_workspace.get_or_insert_with(|| {
                     paths::request(&request).caller_workspace_key.text().clone()
                 });

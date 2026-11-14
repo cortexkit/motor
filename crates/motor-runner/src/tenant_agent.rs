@@ -856,6 +856,13 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     Ok(())
 }
 
+fn mark_workspace_forked(marker: &Path, generation: u64, forked: bool) -> io::Result<()> {
+    if forked {
+        fs::write(marker, generation.to_string())?;
+    }
+    Ok(())
+}
+
 fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Result<()> {
     let per_job = per_job::enabled()?;
     let job_args = if per_job {
@@ -867,6 +874,7 @@ fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Resul
         generation,
         recovery_required,
         recovery_budget_ms,
+        forked,
         unix_ms,
         seed,
         address,
@@ -919,9 +927,14 @@ fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Resul
     }
     let layout = paths::prepare_disk_layout(Path::new("/tenant"), 0)?;
     if per_job {
-        layout.initialize_job_history(Path::new("/run/motor-job-state-initialized"))?;
+        layout.initialize_job_history(Path::new("/run/motor-job-state-initialized"), forked)?;
         cache_drive::install()?;
     }
+    mark_workspace_forked(
+        Path::new(crate::engine::WORKSPACE_FORKED_MARKER),
+        generation,
+        forked,
+    )?;
     layout.runner.remove_stale_socket("runner.sock")?;
     let args = match job_args {
         Some(args) => args,
@@ -1341,6 +1354,18 @@ mod tests {
             now.get().duration_since(started),
             Duration::from_millis(500)
         );
+    }
+
+    #[test]
+    fn workspace_forked_marker_is_written_only_for_forked_attaches() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-forked-marker");
+        let marker = scratch.join("motor-workspace-forked");
+        mark_workspace_forked(&marker, 7, false).unwrap();
+        assert!(!marker.exists());
+        mark_workspace_forked(&marker, 7, true).unwrap();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "7");
+        mark_workspace_forked(&marker, 7, true).unwrap();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "7");
     }
 
     #[test]
