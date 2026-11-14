@@ -12,6 +12,158 @@ fn job_config(f: &Fixture) -> Config {
     config
 }
 
+pub(super) async fn raw_terminal(client: &mut tokio::io::DuplexStream) -> serde_json::Value {
+    use tokio::io::AsyncReadExt;
+    loop {
+        let length = client.read_u32().await.unwrap() as usize;
+        assert!(length <= motor_protocol::MAX_FRAME_BYTES);
+        let mut bytes = vec![0; length];
+        client.read_exact(&mut bytes).await.unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if frame["type"] == "terminal" {
+            return frame;
+        }
+    }
+}
+
+#[tokio::test]
+async fn per_job_terminal_stream_carries_accounting_and_only_burst_overage() {
+    for burst in [false, true] {
+        let f = Fixture::new();
+        let runner = job_runner(&f);
+        let (request, bytes) = f.run("true");
+        f.submit(&runner, &request, &bytes);
+        runner.tick().unwrap();
+        let expected = terminal(&runner, request.job_id).await;
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let job = inner.jobs.get_mut(&request.job_id).unwrap();
+            job.memory_stated_mib = Some(8);
+            job.memory_burst_mib = burst.then_some(4);
+            job.memory_accounting_pending = true;
+            job.process = Some(platform::ProcessIdentity {
+                pid: 0,
+                start: 0,
+                unit: Some(request.job_id),
+            });
+            let working = if burst { 10 } else { 6 };
+            job.mem_working_peak_mib = serde_json::from_value(working.into()).unwrap();
+            let over = crate::working_memory::OverIntegral::default();
+            over.sample(Some(10 << 20), 8, 0);
+            over.sample(Some(10 << 20), 8, 50);
+            // Even a stray measured integral must not escape a no-burst lease.
+            job.mem_over_mib_ms = Some(over);
+        }
+        let unit = runner
+            .core
+            .backend
+            .unit_name(runner.config(), request.job_id);
+        let peak = if burst { "11.0M" } else { "7.0M" };
+        runner.collect_accounting(request.job_id, format!("Running as unit: {unit}\nFinished with result: success\nCPU time consumed: 95ms\nMemory peak: {peak}\n").as_bytes());
+        let (mut client, task) =
+            connect(&runner, lease(request.job_id, LeasePurpose::Attach)).await;
+        write_frame_async(
+            &mut client,
+            &Frame::Attach(AttachRequest::new(request.job_id, 0)),
+        )
+        .await
+        .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(10), raw_terminal(&mut client))
+            .await
+            .unwrap();
+        assert_eq!(frame["mem_peak_mib"], if burst { 12 } else { 8 });
+        assert_eq!(frame["mem_working_peak_mib"], if burst { 10 } else { 6 });
+        assert_eq!(
+            frame.get("mem_over_mib_ms").and_then(|v| v.as_u64()),
+            burst.then_some(100)
+        );
+        assert_eq!(frame.get("mem_over_mib_ms").is_some(), burst);
+        assert_eq!(
+            serde_json::from_value::<Frame>(frame).unwrap(),
+            Frame::Terminal(expected)
+        );
+        write_frame_async(
+            &mut client,
+            &Frame::TerminalStored {
+                jti: request.job_id,
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn per_job_terminal_waits_at_most_two_seconds_for_accounting() {
+    let f = Fixture::new();
+    let runner = job_runner(&f);
+    let (request, bytes) = f.run("true");
+    f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
+    let expected = terminal(&runner, request.job_id).await;
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&request.job_id).unwrap();
+        job.memory_accounting_pending = true;
+    }
+    let (mut client, task) = connect(&runner, lease(request.job_id, LeasePurpose::Attach)).await;
+    write_frame_async(
+        &mut client,
+        &Frame::Attach(AttachRequest::new(request.job_id, 0)),
+    )
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let mut read = tokio::spawn(async move {
+        let frame = raw_terminal(&mut client).await;
+        (frame, client)
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut read)
+            .await
+            .is_err(),
+        "terminal escaped before accounting settled"
+    );
+    let (frame, mut client) = tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    eprintln!(
+        "pending launcher terminal wait: {} ms",
+        started.elapsed().as_millis()
+    );
+    for name in ["mem_peak_mib", "mem_working_peak_mib", "mem_over_mib_ms"] {
+        assert!(frame.get(name).is_none(), "unknown {name} must be absent");
+    }
+    assert_eq!(
+        serde_json::from_value::<Frame>(frame).unwrap(),
+        Frame::Terminal(expected)
+    );
+    assert!(
+        !runner.core.inner.lock().unwrap().jobs[&request.job_id].memory_accounting_pending,
+        "terminal delivery must also release lifecycle accounting"
+    );
+    write_frame_async(
+        &mut client,
+        &Frame::TerminalStored {
+            jti: request.job_id,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn host_admitted_run_survives_expiry_while_waiting_for_boot() {
     let f = Fixture::new();

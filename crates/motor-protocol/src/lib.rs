@@ -15,7 +15,8 @@ mod types;
 
 pub use codec::{
     decode_frame, read_frame, read_frame_async, read_record, read_record_async, write_frame,
-    write_frame_async, DecodedFrame, MAX_FRAME_BYTES,
+    write_frame_async, write_terminal_with_memory_async, DecodedFrame, TerminalMemory,
+    MAX_FRAME_BYTES,
 };
 pub use create_only_probe::*;
 pub use environment::allowed_env;

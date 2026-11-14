@@ -10457,6 +10457,46 @@ impl Runner {
         let _ = id;
     }
 
+    pub(crate) fn terminal_memory_ready(&self, id: Uuid, wait_elapsed: bool) -> bool {
+        // The attach loop also enforces the existing final-summary deadline,
+        // even when a scheduler tick has not yet expired the pending reader.
+        self.expire_memory_accounting();
+        if wait_elapsed {
+            let log = self.job_log(id);
+            let _write = log.lock_write();
+            let job = self.core.inner.lock().unwrap().jobs.get(&id).cloned();
+            if let Some(job) =
+                job.filter(|job| job.terminal.is_some() && job.memory_accounting_pending)
+            {
+                self.memory_peak_unavailable(job, "terminal accounting wait elapsed");
+            }
+        }
+        self.core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .is_none_or(|job| !job.memory_accounting_pending)
+    }
+
+    pub(crate) fn terminal_memory(&self, id: Uuid) -> motor_protocol::TerminalMemory {
+        let inner = self.core.inner.lock().unwrap();
+        let Some(job) = inner.jobs.get(&id) else {
+            return Default::default();
+        };
+        motor_protocol::TerminalMemory {
+            mem_peak_mib: (!job.memory_accounting_pending)
+                .then_some(job.mem_peak_mib)
+                .flatten(),
+            mem_working_peak_mib: job.mem_working_peak_mib.get(),
+            mem_over_mib_ms: job
+                .memory_burst_mib
+                .and(job.mem_over_mib_ms.as_ref())
+                .and_then(|over| over.get()),
+        }
+    }
+
     fn spawn_accounting_reader(
         &self,
         id: Uuid,
