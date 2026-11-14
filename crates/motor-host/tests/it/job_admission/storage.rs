@@ -157,6 +157,7 @@ fn memory_host(available: u64) -> Host {
     let mut host = super::memory_host(available);
     if let motor_host::config::HostSettings::PerJob(s) = &mut host.settings {
         s.workspace_disk_cap_bytes = CAP;
+        s.workspace_growth_reservation_bytes = CAP;
     }
     host
 }
@@ -164,6 +165,7 @@ fn durable_host(path: &std::path::Path, available: u64) -> Host {
     let mut host = super::durable_host(path, available);
     if let motor_host::config::HostSettings::PerJob(s) = &mut host.settings {
         s.workspace_disk_cap_bytes = CAP;
+        s.workspace_growth_reservation_bytes = CAP;
     }
     host
 }
@@ -265,6 +267,7 @@ impl Control for Storage {
 fn enable(h: &mut Host, storage: &Arc<Storage>) {
     if let motor_host::config::HostSettings::PerJob(s) = &mut h.settings {
         s.workspace_disk_cap_bytes = CAP;
+        s.workspace_growth_reservation_bytes = CAP;
     }
     h.set_job_storage(storage.clone());
     h.enforce_storage();
@@ -319,6 +322,69 @@ fn same_disk_queue_reserves_growth_once_and_each_jobs_replay() {
     h.claim(job(JOB2), AT).unwrap();
     assert!(h.begin_job_boot(JOB2).unwrap().is_none());
     assert_eq!(h.snapshot.per_job.disks.len(), 1);
+    full(h.claim(job(JOB3), AT));
+}
+
+#[test]
+fn bounded_growth_admits_three_disks_then_refuses_the_fourth_for_storage() {
+    use motor_host::claim_log::RefusalCause;
+
+    const GROWTH: u64 = CAP / 8;
+    const FOURTH: &str = "00000000-0000-7000-8000-000000000004";
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + 3 * (GROWTH + JOB_BYTES));
+    enable(&mut h, &storage);
+    if let motor_host::config::HostSettings::PerJob(s) = &mut h.settings {
+        s.workspace_growth_reservation_bytes = GROWTH;
+    }
+    for (index, id) in [JOB, JOB2, JOB3].into_iter().enumerate() {
+        h.claim(other(id, index as u8), AT).unwrap();
+        h.begin_job_boot(id).unwrap().unwrap();
+        let reservation = h.snapshot.per_job.disks[&disk(&h, id)]
+            .storage
+            .as_ref()
+            .unwrap();
+        assert_eq!(reservation.growth_reservation_bytes, GROWTH);
+        assert_eq!(reservation.cap_bytes, CAP);
+    }
+    assert_eq!(h.snapshot.per_job.disks.len(), 3);
+    let logs = crate::test_logs::capture(|| full(h.claim(other(FOURTH, 3), AT)));
+    let refusal = logs
+        .iter()
+        .find(|line| line.contains("message=run_claim "))
+        .expect("fourth claim must record its refusal cause");
+    assert!(refusal.contains("reason=\"host_full\""), "{refusal}");
+    assert!(
+        refusal.contains(&format!("cause=\"{}\"", RefusalCause::Storage.as_str())),
+        "{refusal}"
+    );
+    assert_eq!(h.snapshot.per_job.disks.len(), 3);
+    assert!(storage.evicted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn remaining_disk_growth_below_the_reservation_bound_is_not_over_reserved() {
+    const REMAINING: u64 = 4096;
+    let mut h = memory_host(10_000);
+    h.claim(job(JOB), AT).unwrap();
+    let first = disk(&h, JOB);
+    let storage = Storage::new(FLOOR + 2 * JOB_BYTES + REMAINING);
+    storage
+        .exclusive
+        .lock()
+        .unwrap()
+        .insert(first.clone(), CAP - REMAINING);
+    enable(&mut h, &storage);
+    if let motor_host::config::HostSettings::PerJob(s) = &mut h.settings {
+        s.workspace_growth_reservation_bytes = CAP / 4;
+    }
+    h.claim(job(JOB2), AT).unwrap();
+    let reservation = h.snapshot.per_job.disks[&first].storage.as_ref().unwrap();
+    assert_eq!(reservation.growth_reservation_bytes, REMAINING);
+    assert_eq!(reservation.cap_bytes, CAP);
+    storage
+        .free
+        .store(FLOOR + 3 * JOB_BYTES + REMAINING - 1, Ordering::SeqCst);
     full(h.claim(job(JOB3), AT));
 }
 
@@ -382,6 +448,7 @@ fn a_raised_cap_grows_an_existing_disk_on_its_next_claim_and_never_shrinks_it() 
     let set_cap = |h: &mut Host, bytes| {
         if let motor_host::config::HostSettings::PerJob(s) = &mut h.settings {
             s.workspace_disk_cap_bytes = bytes;
+            s.workspace_growth_reservation_bytes = bytes;
         }
     };
     set_cap(&mut h, 2 * CAP);

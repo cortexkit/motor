@@ -138,7 +138,9 @@ impl Host {
         // shrink: the helper refuses a disk larger than the size it is asked
         // for, and the guest filesystem cannot shrink.
         storage.cap_bytes = storage.cap_bytes.max(default_cap);
-        storage.growth_reservation_bytes = storage.cap_bytes;
+        storage.growth_reservation_bytes = storage
+            .cap_bytes
+            .min(settings.workspace_growth_reservation_bytes);
         self.reserve_storage(next, disk_id, now_ms)
     }
 
@@ -157,6 +159,7 @@ impl Host {
         if !self.storage_enforced() {
             return Ok(());
         }
+        let growth_bound = settings.workspace_growth_reservation_bytes;
         let control = self.job_storage.clone().ok_or(RefusalCause::Storage)?;
         let mut attempted = std::collections::BTreeSet::new();
         loop {
@@ -201,7 +204,7 @@ impl Host {
                     .unwrap_or(0)
                     .min(cap);
                 let storage = disk.storage.get_or_insert_with(|| Disk::new(cap, now_ms));
-                storage.growth_reservation_bytes = cap - exclusive;
+                storage.growth_reservation_bytes = (cap - exclusive).min(growth_bound);
                 reserved = reserved
                     .checked_add(storage.growth_reservation_bytes)
                     .ok_or(RefusalCause::Storage)?;

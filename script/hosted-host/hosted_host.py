@@ -135,7 +135,7 @@ def host_config(host_id: str, port: int = PORT, mode: str = "tenant",
             raise ValueError("per_job mode requires --per-job-settings (no defaults)")
         config["mode"] = mode
         # motor-host check-config validates the complete object with the same
-        # typed settings and online CPU bounds used at startup.
+        # typed settings, storage growth bounds and online CPU bounds used at startup.
         config["per_job"] = json.loads(per_job_settings.read_text())
     return config
 

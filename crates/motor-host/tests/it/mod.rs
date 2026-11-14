@@ -103,6 +103,7 @@ fn host_settings() -> [motor_host::config::HostSettings; 2] {
             reclaim_timeout_ms: 5000,
             hysteresis_mib: 512,
             workspace_disk_cap_bytes: 10737418240,
+            workspace_growth_reservation_bytes: 10737418240,
             boot_deadline_ms: 30000,
             recovery_timeout_ms: 120000,
             exit_evidence_bound_ms: 10000,

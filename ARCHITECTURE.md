@@ -145,7 +145,8 @@ defaults:
 | `per_vm_overhead_mib` | MiB added to stated memory before resident guest RAM counts as overage. |
 | `reclaim_timeout_ms` | Wait after balloon inflation before rechecking pressure. |
 | `hysteresis_mib` | MiB above the reserve needed before balloon deflation. |
-| `workspace_disk_cap_bytes` | Workspace disk cap and growth reservation bound in bytes. |
+| `workspace_disk_cap_bytes` | Workspace disk size cap in bytes, enforced by the helper. |
+| `workspace_growth_reservation_bytes` | Maximum physical growth reserved per active checkout disk in bytes, capped at the disk's remaining growth. Growth beyond this reservation consumes the storage threshold margin; the disk size cap still applies. |
 | `boot_deadline_ms` | Boot-to-runner-hello deadline. |
 | `recovery_timeout_ms` | Recovery-start deadline, with disk deletion on timeout. |
 | `exit_evidence_bound_ms` | Wait after the Firecracker virtual machine monitor (VMM) disappears; without exit evidence the job settles as lost. |
