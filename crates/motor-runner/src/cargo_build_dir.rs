@@ -35,12 +35,21 @@ pub(crate) fn prepare(config: &Config, request: &Run, target: &Path) {
                 .flat_map(|fixed| fixed.siblings.iter().map(PathBuf::as_path)),
         )
         .collect();
+    let mut legacy_candidates = 0u64;
+    let mut foreign_candidates = 0u64;
     let result = maintain(target, &roots, |path| {
+        if path.starts_with(target.join("bd")) {
+            foreign_candidates += 1;
+        } else {
+            legacy_candidates += 1;
+        }
         if !config.boat_profile {
             crate::isolation::reclaim_runtime(path)?;
         }
         Ok(())
     });
+    tracing::info!(job_id = %request.job_id, legacy_candidates, foreign_candidates,
+        success = result.is_ok(), "Cargo build-folder maintenance");
     // Target contents are job-controlled. Bad permissions, malformed trees or
     // bounded-walker limits must not prevent the next job from starting.
     if let Err(error) = result {

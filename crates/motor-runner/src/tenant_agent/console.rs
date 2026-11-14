@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const UNIT: &str = "motor-tenant-runner.service";
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const WARNING_LINES: usize = 20;
+const DECISION_LINES: usize = 6;
 
 pub(super) async fn watch() -> io::Result<()> {
     let mut command = tokio::process::Command::new("journalctl");
@@ -48,6 +49,7 @@ struct Relay {
     panic_lines: usize,
     lines: usize,
     bytes: usize,
+    decisions: usize,
 }
 
 impl Relay {
@@ -113,6 +115,19 @@ impl Relay {
                     );
                 }
                 self.panic_body = panic_header;
+            } else if line.starts_with("[motor-runner] INFO motor_runner::")
+                && (redacted.starts_with("build base seed ")
+                    || redacted.starts_with("build base published")
+                    || redacted.starts_with("Cargo build-folder maintenance ")
+                    || redacted.starts_with("runner build base eviction ")
+                    || redacted.starts_with("runner admission cleared its own build outputs "))
+            {
+                // Successful jobs lose their private journal at VM teardown too.
+                // Relay only redacted cache decisions, not arbitrary INFO output.
+                if self.decisions < DECISION_LINES {
+                    self.decisions += 1;
+                    self.emit(redacted, &mut output);
+                }
             // The runner's stderr subscriber encodes severity in MESSAGE,
             // not journald's PRIORITY. Never select arbitrary job-unit output.
             } else if line.starts_with("[motor-runner] WARN motor_runner::")
@@ -246,5 +261,41 @@ mod tests {
         assert!(output.concat().len() <= CONSOLE_MAX_BYTES);
         assert!(output.iter().all(|line| line.starts_with(CONSOLE_TAG)));
         assert!(!output.concat().contains("SECRET"));
+    }
+
+    #[test]
+    fn successful_job_seed_decisions_reach_console_without_a_runner_failure() {
+        let mut relay = Relay::default();
+        let id = "01a1d8c8-f1ac-7333-b943-a32753fd8936";
+        let mut output = relay.entry(&runner(
+            "[motor-runner] INFO motor_runner::seed: build base seed refused: record mismatch inputs_match=false times_valid=true workspace=/SECRET"
+        ));
+        output.extend(relay.entry(&runner(&format!(
+            "[motor-runner] INFO motor_runner::seed: build base seed skipped job_id={id} reason=record_mismatch"
+        ))));
+        assert_eq!(output.len(), 2);
+        assert!(output[0].contains("inputs_match=false times_valid=true"));
+        assert!(output[1].contains(&format!("job_id={id} reason=record_mismatch")));
+        assert!(!output.concat().contains("SECRET"));
+        assert!(relay.entry(&exited()).is_empty());
+    }
+
+    #[test]
+    fn cache_decision_relay_is_bounded_and_excludes_job_units_and_other_info() {
+        let mut relay = Relay::default();
+        let message =
+            "[motor-runner] INFO motor_runner::seed: build base seed skipped reason=no_base";
+        let mut job = runner(message);
+        job["_SYSTEMD_UNIT"] = json!("motor-job-123.service");
+        assert!(relay.entry(&job).is_empty());
+        assert!(relay
+            .entry(&runner("[motor-runner] INFO motor_runner::seed: SECRET"))
+            .is_empty());
+        let mut output = Vec::new();
+        for _ in 0..100 {
+            output.extend(relay.entry(&runner(message)));
+        }
+        assert_eq!(output.len(), DECISION_LINES);
+        assert!(output.concat().len() <= CONSOLE_MAX_BYTES);
     }
 }
