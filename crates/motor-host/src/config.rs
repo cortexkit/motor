@@ -83,6 +83,10 @@ pub enum HostSettings {
 }
 
 impl HostSettings {
+    pub(crate) fn background_fills_enabled(&self) -> bool {
+        !matches!(self, Self::PerJob(settings) if settings.fork_checkouts)
+    }
+
     pub fn from_config(
         mode: HostMode,
         per_job: Option<PerJobSettings>,

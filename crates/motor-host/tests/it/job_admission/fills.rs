@@ -90,7 +90,10 @@ impl Control for Helper {
         Ok(4)
     }
 }
-struct Images;
+#[derive(Default)]
+struct Images {
+    released: Mutex<Vec<String>>,
+}
 impl Resources for Images {
     fn acquire_fill(
         &self,
@@ -109,13 +112,131 @@ impl Resources for Images {
     fn prepare(&self, _: &motor_host::state::jobs::Execution) -> anyhow::Result<()> {
         unreachable!()
     }
-    fn release(&self, _: &str) -> anyhow::Result<()> {
+    fn release(&self, job: &str) -> anyhow::Result<()> {
+        self.released.lock().unwrap().push(job.into());
         Ok(())
     }
 }
 struct Guest {
     success: bool,
     calls: AtomicUsize,
+}
+
+fn set_forks(host: &mut Host, enabled: bool) {
+    let motor_host::config::HostSettings::PerJob(settings) = &mut host.settings else {
+        unreachable!()
+    };
+    settings.fork_checkouts = enabled;
+}
+
+#[test]
+fn checkout_forks_stop_new_fills_and_disabling_forks_resumes_the_same_scheduler() {
+    let host = Arc::new(Mutex::new(memory_host(64 * 1024)));
+    let helper = Arc::new(Helper::default());
+    let images = Arc::new(Images::default());
+    let guest = Arc::new(Guest {
+        success: true,
+        calls: AtomicUsize::new(0),
+    });
+    let mut scheduler = Scheduler::new(guest.clone());
+    set_forks(&mut host.lock().unwrap(), true);
+    scheduler
+        .tick(host.clone(), helper.clone(), images.clone(), AT)
+        .unwrap();
+    assert!(host.lock().unwrap().snapshot.per_job.is_empty());
+    assert!(helper.starts.lock().unwrap().is_empty());
+    assert_eq!(guest.calls.load(Ordering::SeqCst), 0);
+
+    set_forks(&mut host.lock().unwrap(), false);
+    scheduler
+        .tick(host.clone(), helper.clone(), images.clone(), AT)
+        .unwrap();
+    assert_eq!(guest.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(host.lock().unwrap().snapshot.per_job.fills.len(), 1);
+    // Turning forks back on must drain the already-admitted worker, not strand it.
+    set_forks(&mut host.lock().unwrap(), true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !host.lock().unwrap().snapshot.per_job.fills.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fill worker did not finish"
+        );
+        scheduler
+            .tick(host.clone(), helper.clone(), images.clone(), AT)
+            .unwrap();
+        std::thread::yield_now();
+    }
+    scheduler
+        .tick(host.clone(), helper.clone(), images.clone(), AT)
+        .unwrap();
+    assert_eq!(guest.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(helper.starts.lock().unwrap().len(), 1);
+    assert_eq!(*helper.finishes.lock().unwrap(), [true]);
+    assert_eq!(images.released.lock().unwrap().len(), 1);
+    assert_eq!(host.lock().unwrap().snapshot.per_job.bases.len(), 1);
+}
+
+#[test]
+fn checkout_forks_drain_persisted_fills_and_release_storage_and_image_holds() {
+    for published in [false, true] {
+        let root = scratch();
+        let mut h = durable_host(root.path(), 64 * 1024);
+        let artifact = motor_vm_helper::images::Artifact {
+            bytes: 4096,
+            sha256: "a".repeat(64),
+        };
+        h.begin_image_publication(
+            "image",
+            motor_vm_helper::images::Manifest {
+                kernel: artifact.clone(),
+                rootfs: artifact.clone(),
+                toolchain: artifact,
+                hello: json!({"type":"hello","protocol_version":1}),
+                guest_init: json!({}),
+            },
+            AT,
+        )
+        .unwrap();
+        h.image_artifacts_ready("image").unwrap();
+        h.finish_image_publication("image").unwrap();
+        let fill = h
+            .reserve_fill(&job(JOB).sub, "repo", 100, AT)
+            .unwrap()
+            .unwrap();
+        let id = fill.fill.fill_id.clone();
+        assert!(h.snapshot.per_job.images["image"]
+            .recovery_holders
+            .contains_key(&id));
+        if published {
+            h.fill_publication(&id, pins()).unwrap();
+        }
+        drop(h);
+
+        let mut h = durable_host(root.path(), 64 * 1024);
+        set_forks(&mut h, true);
+        let free_before = h.job_free_mem_mib(AT);
+        let host = Arc::new(Mutex::new(h));
+        let helper = Arc::new(Helper::default());
+        let images = Arc::new(Images::default());
+        let mut scheduler = Scheduler::default();
+        scheduler
+            .tick(host.clone(), helper.clone(), images.clone(), AT)
+            .unwrap();
+        assert_eq!(*helper.finishes.lock().unwrap(), [published]);
+        assert_eq!(*images.released.lock().unwrap(), [id]);
+        let h = host.lock().unwrap();
+        // The fill record is its storage growth reservation; a successful finish
+        // keeps only the published base, not a new fill reservation.
+        assert!(h.snapshot.per_job.fills.is_empty());
+        assert!(h.snapshot.per_job.images["image"]
+            .recovery_holders
+            .is_empty());
+        assert_eq!(h.job_free_mem_mib(AT), free_before + fill.memory_debit_mib);
+        assert_eq!(h.snapshot.per_job.bases.len(), usize::from(published));
+        if published {
+            assert_eq!(h.snapshot.per_job.bases[&fill.fill.disk_id()].have, pins());
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -153,7 +274,12 @@ fn cache_write_samples_are_log_only_and_never_change_heartbeat_metrics_or_billin
             motor_host::server::Runtime::new("host".into(), memory_host(64 * 1024), helper.clone());
         let mut scheduler = Scheduler::new(Arc::new(Samples(samples)));
         scheduler
-            .tick(runtime.host.clone(), helper.clone(), Arc::new(Images), AT)
+            .tick(
+                runtime.host.clone(),
+                helper.clone(),
+                Arc::new(Images::default()),
+                AT,
+            )
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !runtime
@@ -167,7 +293,12 @@ fn cache_write_samples_are_log_only_and_never_change_heartbeat_metrics_or_billin
         {
             assert!(std::time::Instant::now() < deadline);
             scheduler
-                .tick(runtime.host.clone(), helper.clone(), Arc::new(Images), AT)
+                .tick(
+                    runtime.host.clone(),
+                    helper.clone(),
+                    Arc::new(Images::default()),
+                    AT,
+                )
                 .unwrap();
             std::thread::yield_now();
         }
@@ -396,7 +527,12 @@ fn scheduler_uses_recent_repository_and_success_have_but_discards_failures_and_n
             calls: AtomicUsize::new(0),
         }));
         scheduler
-            .tick(host.clone(), helper.clone(), Arc::new(Images), AT)
+            .tick(
+                host.clone(),
+                helper.clone(),
+                Arc::new(Images::default()),
+                AT,
+            )
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !host.lock().unwrap().snapshot.per_job.fills.is_empty() {
@@ -405,7 +541,12 @@ fn scheduler_uses_recent_repository_and_success_have_but_discards_failures_and_n
                 "fill worker did not finish"
             );
             scheduler
-                .tick(host.clone(), helper.clone(), Arc::new(Images), AT)
+                .tick(
+                    host.clone(),
+                    helper.clone(),
+                    Arc::new(Images::default()),
+                    AT,
+                )
                 .unwrap();
             std::thread::yield_now();
         }
@@ -501,7 +642,12 @@ fn unavailable_guest_is_disabled_once_and_reserves_nothing() {
     let mut scheduler = Scheduler::new(guest.clone());
     for _ in 0..3 {
         scheduler
-            .tick(host.clone(), helper.clone(), Arc::new(Images), AT)
+            .tick(
+                host.clone(),
+                helper.clone(),
+                Arc::new(Images::default()),
+                AT,
+            )
             .unwrap();
     }
     assert!(host.lock().unwrap().snapshot.per_job.is_empty());

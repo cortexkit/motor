@@ -168,7 +168,15 @@ impl Scheduler {
             resources.release(&fill.fill.fill_id)?;
             return Ok(());
         }
-        if self.disabled {
+        // Keep draining admitted fills when checkout forks take over. Do not
+        // latch this setting: turning forks off must allow fresh fills again.
+        if self.disabled
+            || !host
+                .lock()
+                .expect("host lock")
+                .settings
+                .background_fills_enabled()
+        {
             return Ok(());
         }
         let mut candidates = match self.guest.candidates() {
