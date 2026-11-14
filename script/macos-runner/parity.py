@@ -94,9 +94,9 @@ def tree_digest(directory):
 # carries every build-server component.
 PENDING_MACOS_COMPONENTS = set()
 
-# Rust 1.100.0 is installed on Linux first. The macOS job image gains it with
-# its next rebuild; remove the pending entry when that image includes it.
-PENDING_MACOS_TOOLCHAINS = {"1.100.0"}
+# Build-server Rust toolchains the sealed macOS image does not carry yet, with
+# the same lifetime as the sets above. Empty while the image carries every one.
+PENDING_MACOS_TOOLCHAINS = set()
 
 # (tool, version) pairs the sealed macOS image may carry while the build server
 # has moved to a newer version, with the same lifetime as the sets above.
