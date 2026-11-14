@@ -115,14 +115,6 @@ claiming real service or nonce-issuance qualification.
 an operator can test the broker, a hosted runner and the account token.
 No other job changes route.
 
-`ck motor run --boat-only` sends one spill-eligible job straight to a Boat
-overflow sandbox, without considering the first-party hosts, to compare Boat
-with them before spill is enabled. It is an operator CLI flag; the broker accepts
-it only for accounts allowed Boat-only leases. The job must be spill-eligible:
-a timeout within the broker's Boat limit, and not networked, a gate job or
-repository-routed. Each run is a Boat start and counts against the account's
-Boat start limits.
-
 - Only a direct caller can ask for it, and only while `admit_direct_exec` is
   on. The agent's and scheduler's routes cannot: their requests ignore the key.
 - ck-motor needs `broker_url` and a usable broker token source (the account
@@ -150,6 +142,19 @@ need a checkout under `/Users` or `/home`, so they are ignored by default),
 `direct_hosted_route_is_only_for_its_job_and_its_refusal_never_falls_back`,
 `hosted_test_lease_is_not_retried_for_capacity_and_keeps_the_broker_code` and
 `hosted_runs_are_direct_only_and_need_a_configured_broker`.
+
+`ck motor run --boat-only` sends one spill-eligible job straight to a Boat
+overflow sandbox, without considering the first-party hosts, to compare Boat
+with them before spill is enabled. It is an operator CLI flag; the broker accepts
+it only for accounts allowed Boat-only leases. The job must be spill-eligible:
+a timeout within the broker's Boat limit, and not networked, a gate job or
+repository-routed. Each run is a Boat start and counts against the account's
+Boat start limits. Like `--hosted`, it is direct-only and never falls back to
+another route; a broker refusal is a before-start refusal, exit 200. Tests:
+`boat_only_is_direct_only_and_checks_eligibility_before_submission`,
+`boat_only_body_matches_cloud_canonical_bytes_and_keeps_placement_last`,
+`broker_boat_only_shape_refusal_names_its_limits_and_never_runs_elsewhere` and
+`rollback_boat_only_journal_and_checkpoint_open_and_refuse_replay`.
 
 Ordinary hosted lease requests do not exclude a host from placement. Linux
 jobs do not begin on a direct build-server runner.
