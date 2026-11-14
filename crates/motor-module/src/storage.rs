@@ -250,6 +250,11 @@ impl Job {
         let hosted = self.hosted.as_mut().unwrap();
         hosted.terminal = Some(terminal.clone());
         hosted.hosted_no_fallback = true;
+        // A released booking never reports usage. Pending would make every
+        // status read follow the job again and print "billed: pending".
+        if hosted.billing == crate::BillingStatus::Pending {
+            hosted.billing = crate::BillingStatus::Unavailable;
+        }
         if self.remote_terminal.is_some() {
             self.remote_terminal = Some(terminal.clone());
         }

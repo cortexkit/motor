@@ -1312,7 +1312,15 @@ async fn hosted_job_released_stops_reattaching_without_resubmitting() {
     let motor =
         crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
-    assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    // The seeded lease never sent Run, so the released booking proves the job
+    // never started. A release after Run stays may-have-run; that case is in
+    // motor::hosted_released_tests.
+    assert_eq!(
+        result.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::LostToRestart
+        }
+    );
     assert_eq!(
         motor.hosted_state(id).unwrap().billing,
         BillingStatus::Unavailable
