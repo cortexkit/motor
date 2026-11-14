@@ -1197,6 +1197,12 @@ To return to service, run `--check`, then `--start`.
 
 ### Per-job mode rollback
 
+Before rolling `motor-host` back to a version without the durable workspace
+`forked` marker, ensure no disk still has `forked` set without a finished job.
+An older host boots such a disk without the guest's forked flag, so the guest
+could replay the donor's job history and reports. The marker clears only after
+a job that reached runner hello ends; a cancelled or failed boot does not clear it.
+
 Rollback from per-job mode keeps placement drained throughout: select tenant
 mode, restart using the retained tenant disks and complete their recovery, and
 install the helper's **current** remote-cache credential sets into the tenant

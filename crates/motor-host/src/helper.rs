@@ -29,6 +29,12 @@ pub trait Control: Send + Sync {
     fn seed_workspace(&self, _seed: &motor_vm_helper::job::Seed) -> Result<()> {
         anyhow::bail!("base seeding unavailable")
     }
+    fn fork_workspace(
+        &self,
+        _fork: &motor_vm_helper::job::Fork,
+    ) -> Result<motor_vm_helper::job::Forked> {
+        anyhow::bail!("workspace forking unavailable")
+    }
     fn inspect_job_images(&self, _generation: &str) -> Result<motor_vm_helper::images::Manifest> {
         anyhow::bail!("image publication unavailable")
     }
@@ -434,6 +440,22 @@ impl Control for Helper {
     fn seed_workspace(&self, seed: &motor_vm_helper::job::Seed) -> Result<()> {
         self.request(json!({"op":"seed_workspace", "seed":seed}))?;
         Ok(())
+    }
+    fn fork_workspace(
+        &self,
+        fork: &motor_vm_helper::job::Fork,
+    ) -> Result<motor_vm_helper::job::Forked> {
+        let (reply, _) = self.request(json!({"op":"fork_workspace", "fork":fork}))?;
+        ensure!(
+            reply["result"] == "workspace_forked",
+            "unexpected fork reply"
+        );
+        Ok(motor_vm_helper::job::Forked {
+            donor_id: reply["donor_id"]
+                .as_str()
+                .context("missing fork donor")?
+                .into(),
+        })
     }
     fn inspect_job_images(&self, generation: &str) -> Result<motor_vm_helper::images::Manifest> {
         let (reply, _) =

@@ -105,6 +105,9 @@ fn fixture() -> (tempfile::TempDir, Arc<Runtime>, Arc<RollbackControl>) {
         next.per_job.disks.insert(
             "ws-old".into(),
             motor_host::state::jobs::WorkspaceDisk {
+                repository_key: None,
+                forked_from: None,
+                forked: false,
                 storage: None,
                 sub: claims(JOB).sub,
                 workspace_key_hash: "hash".into(),

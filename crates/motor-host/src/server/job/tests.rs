@@ -10,6 +10,7 @@ mod admin_tests;
 mod cache_write_tests;
 mod deadline_tests;
 mod fill_source_tests;
+mod fork_tests;
 mod heartbeat_tests;
 mod recovery_tests;
 mod residency_tests;
@@ -84,6 +85,12 @@ struct Fake {
     job_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
     seeds: Mutex<Vec<motor_vm_helper::job::Seed>>,
     fail_seed: AtomicBool,
+    forks: Mutex<Vec<motor_vm_helper::job::Fork>>,
+    fork_reply: Mutex<Option<String>>,
+    fork_error: Mutex<Option<String>>,
+    fork_reply_lost: AtomicBool,
+    fork_journal: Mutex<Option<std::path::PathBuf>>,
+    fork_marks_on_entry: Mutex<Vec<bool>>,
     workspace_contents: Mutex<BTreeMap<String, Option<String>>>,
     calls: Mutex<Vec<String>>,
     inputs: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -244,6 +251,40 @@ impl Control for Fake {
         );
         disks.insert(seed.disk_id.clone(), Some(seed.base_id.clone()));
         Ok(())
+    }
+    fn fork_workspace(
+        &self,
+        fork: &motor_vm_helper::job::Fork,
+    ) -> Result<motor_vm_helper::job::Forked> {
+        self.wait("fork");
+        self.forks.lock().unwrap().push(fork.clone());
+        if let Some(path) = &*self.fork_journal.lock().unwrap() {
+            let snapshot: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            self.fork_marks_on_entry
+                .lock()
+                .unwrap()
+                .push(snapshot["per_job"]["disks"][&fork.disk_id]["forked"] == true);
+        }
+        if let Some(error) = &*self.fork_error.lock().unwrap() {
+            anyhow::bail!("{error}");
+        }
+        let donor_id = self
+            .fork_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| fork.donor_ids[0].clone());
+        let mut disks = self.workspace_contents.lock().unwrap();
+        ensure!(
+            !disks.contains_key(&fork.disk_id),
+            "existing disk cannot be forked"
+        );
+        disks.insert(fork.disk_id.clone(), Some(donor_id.clone()));
+        ensure!(
+            !self.fork_reply_lost.load(Ordering::SeqCst),
+            "fork reply lost after publication"
+        );
+        Ok(motor_vm_helper::job::Forked { donor_id })
     }
     fn job_memory(&self, job: &str) -> Result<u64> {
         self.resident_reads.lock().unwrap().push(job.into());
