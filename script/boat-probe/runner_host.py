@@ -23,6 +23,7 @@ import tarfile
 import tempfile
 import time
 from typing import Any, Optional
+import zlib
 
 from credential_audit import SOURCE
 from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
@@ -921,12 +922,17 @@ def prepared_image_digest(revision, inventory):
 def parity_source(job=False, gnu_test_sha256=None, cargo_seed_sha256=None):
     # Run the operator checkout's checker, not an image's possibly stale checker
     # or its build-time inventory. Every phase measures the current filesystem.
+    #
+    # The files travel compressed: the whole program is one argument of
+    # `python3 -c`, and Linux refuses a single argument over MAX_ARG_STRLEN
+    # (128 KiB) with E2BIG. Inline, the checker and manifest outgrew that limit.
     files = {name: (PARITY_DIR / name).read_text() for name in PARITY_FILES}
-    return ("import importlib.util, json, tempfile\n"
+    packed = base64.b64encode(zlib.compress(json.dumps(files).encode(), 9)).decode()
+    return ("import base64, importlib.util, json, tempfile, zlib\n"
             "from pathlib import Path\n"
             "with tempfile.TemporaryDirectory() as directory:\n"
             "    root = Path(directory)\n"
-            f"    for name, content in {files!r}.items():\n"
+            f"    for name, content in json.loads(zlib.decompress(base64.b64decode({packed!r}))).items():\n"
             "        (root / name).write_text(content)\n"
             "    spec = importlib.util.spec_from_file_location('toolchain_parity', root / 'toolchain-parity.py')\n"
             "    parity = importlib.util.module_from_spec(spec)\n"

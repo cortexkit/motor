@@ -145,6 +145,14 @@ class RunnerHostTests(unittest.TestCase):
             self.assertIn("label + '.toolchain_parity'", phase)
             self.assertIn('("job_toolchain_parity", "cargo --version', phase)
 
+    def test_parity_source_fits_one_command_argument(self):
+        # The program is passed as one `python3 -c` argument; Linux refuses a
+        # single argument over MAX_ARG_STRLEN (128 KiB) with E2BIG. Keep half
+        # of it spare so the manifest can keep growing.
+        for job in (False, True):
+            argument = shlex.quote(host.parity_source(job=job, cargo_seed_sha256='0' * 64))
+            self.assertLess(len(argument.encode()), 64 * 1024)
+
     def test_root_owned_path_check_runs_the_operator_rule_on_boat_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
             checker = Path(tmp, 'root_paths.py')
