@@ -1034,6 +1034,25 @@ impl Config {
     }
 }
 
+/// The OOM advice for a job that stated its memory. The job is stopped at its
+/// stated memory plus any burst allowance its account has, so the message names
+/// that whole limit and suggests half as much again.
+pub(crate) fn stated_memory_limit_detail(
+    stated_mib: u64,
+    burst_mib: Option<u64>,
+    weight: u32,
+) -> String {
+    let burst = burst_mib.unwrap_or(0);
+    let limit = stated_mib.saturating_add(burst);
+    let size_gib = limit.div_ceil(1024).saturating_mul(3).div_ceil(2);
+    let reached = if burst > 0 {
+        format!("{limit} MiB limit ({stated_mib} MiB stated plus {burst} MiB burst)")
+    } else {
+        format!("{limit} MiB limit")
+    };
+    format!("out of memory: the job reached its {reached}; ask for {size_gib}gb (linux,{weight}c,{size_gib}gb)")
+}
+
 /// The OOM advice for a stopped job. `slice_ceiling` is the jobs slice's
 /// `MemoryMax` as the runner last recorded it, or `NO_JOB_MEMORY_BUDGET` when
 /// no reading is kept: the slice caps every job unit's limit, so a request it
@@ -10697,16 +10716,15 @@ impl Runner {
         self.finish_step(id, &job.kill, "unit result read", finish_started);
         let memory_limit_detail = oom_stopped.then(|| {
             if let Some(memory) = job.memory_stated_mib {
-                let size_gib = memory.div_ceil(1024).saturating_mul(3).div_ceil(2);
-                format!("out of memory: the job reached its {memory} MiB limit; ask for {size_gib}gb (linux,{}c,{size_gib}gb)", job.weight)
+                stated_memory_limit_detail(memory, job.memory_burst_mib, job.weight)
             } else {
                 oom_memory_limit_detail(
-                &self.core.config,
-                job.weight,
-                self.core.cpus.claim_limit(),
-                self.core
-                    .slice_budget
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                    &self.core.config,
+                    job.weight,
+                    self.core.cpus.claim_limit(),
+                    self.core
+                        .slice_budget
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 )
             }
         });

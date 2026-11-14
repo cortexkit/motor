@@ -41,6 +41,24 @@ fn oom_detail_keeps_per_job_limit_and_advice_without_claiming_which_budget_was_h
     );
 }
 
+/// A job that stated its memory is stopped at stated plus burst, so the advice
+/// names that limit, not the stated figure alone, and sizes from it.
+#[test]
+fn stated_memory_oom_detail_names_the_limit_including_burst() {
+    assert_eq!(
+        crate::engine::stated_memory_limit_detail(4096, Some(2048), 2),
+        "out of memory: the job reached its 6144 MiB limit (4096 MiB stated plus 2048 MiB burst); ask for 9gb (linux,2c,9gb)"
+    );
+    assert_eq!(
+        crate::engine::stated_memory_limit_detail(4096, None, 2),
+        "out of memory: the job reached its 4096 MiB limit; ask for 6gb (linux,2c,6gb)"
+    );
+    assert_eq!(
+        crate::engine::stated_memory_limit_detail(4096, Some(0), 2),
+        "out of memory: the job reached its 4096 MiB limit; ask for 6gb (linux,2c,6gb)"
+    );
+}
+
 /// A job limit the jobs slice clamps cannot be raised by asking for more
 /// vCPUs, so the OOM advice stops recommending that: the job is already at
 /// the ceiling the host allows. A slice above the job's request leaves the
