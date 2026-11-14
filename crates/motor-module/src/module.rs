@@ -785,6 +785,9 @@ impl Handler {
                     /// agent route's request parser ignores the key.
                     #[serde(default)]
                     hosted: bool,
+                    /// Operator-only placement, ignored by the agent route.
+                    #[serde(default)]
+                    boat_only: bool,
                 }
                 let spill: SpillOptions = parse(envelope.params.clone())?;
                 let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
@@ -811,7 +814,15 @@ impl Handler {
                     pump_direct_secret(&ctx, stream, Some(secret)).await?;
                     return Ok(HandlerOutcome::Streamed);
                 }
-                if spill.hosted {
+                if spill.boat_only {
+                    if let Some(message) = motor.boat_only_refusal(&request) {
+                        return Ok(HandlerOutcome::Error {
+                            code: "boat_only_ineligible".into(),
+                            message: message.into(),
+                        });
+                    }
+                }
+                if spill.hosted || spill.boat_only {
                     if let Some(message) = self.hosted_test_unavailable() {
                         return Ok(HandlerOutcome::Error {
                             code: HOSTED_TEST_UNAVAILABLE.into(),
@@ -832,14 +843,23 @@ impl Handler {
                     pump_direct_secret(&ctx, stream, Some(secret)).await?;
                     return Ok(HandlerOutcome::Streamed);
                 }
-                let stream = motor.run_direct_authorized(
-                    request,
-                    self.attribution(route, envelope.preset),
-                    returns,
-                    spill.allow_spill,
-                    spill.hosted,
-                    secret.hash(),
-                )?;
+                let stream = if spill.boat_only {
+                    motor.run_direct_boat_only_authorized(
+                        request,
+                        self.attribution(route, envelope.preset),
+                        returns,
+                        secret.hash(),
+                    )?
+                } else {
+                    motor.run_direct_authorized(
+                        request,
+                        self.attribution(route, envelope.preset),
+                        returns,
+                        spill.allow_spill,
+                        spill.hosted,
+                        secret.hash(),
+                    )?
+                };
 
                 self.direct_jobs
                     .lock()

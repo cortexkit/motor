@@ -2023,6 +2023,56 @@ async fn cli_returns_the_timeout_code_when_the_runner_stops_the_command() {
 }
 
 #[tokio::test]
+async fn boat_only_is_direct_only_and_checks_eligibility_before_submission() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    for (channel, principal) in [(DIRECT_CHANNEL, direct()), (AFT_CHANNEL, aft())] {
+        assert_eq!(
+            daemon.bind(channel, principal).await.header.ty,
+            FrameType::Response
+        );
+    }
+    let mut request = timed(&f, "true", 60);
+    request.queue_wait_limit_s = None;
+    let mut params = json!(request);
+    params["boat_only"] = json!(true);
+    let unavailable = error(
+        &daemon
+            .request(DIRECT_CHANNEL, "exec.run", params.clone())
+            .await,
+    );
+    assert_eq!(unavailable["code"], module::HOSTED_TEST_UNAVAILABLE);
+    let mut net = params.clone();
+    net["network"] = json!(motor_protocol::Network::Outbound);
+    let refused = error(&daemon.request(DIRECT_CHANNEL, "exec.run", net).await);
+    assert_eq!(refused["code"], "boat_only_ineligible");
+    assert!(refused["message"]
+        .as_str()
+        .unwrap()
+        .contains("network-free"));
+    assert!(f.proxy.frames.lock().unwrap().is_empty());
+    let mut frames = daemon
+        .send(AFT_CHANNEL, json!({"op":"exec.run", "params":params}))
+        .await;
+    let terminal = loop {
+        let frame = next(&mut frames).await;
+        assert_eq!(frame.header.ty, FrameType::StreamData, "{}", body(&frame));
+        if let StreamRecord::Terminal(terminal) = serde_json::from_slice(&frame.body).unwrap() {
+            break terminal;
+        }
+    };
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+    assert!(f
+        .proxy
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame,
+        motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id)));
+}
+
+#[tokio::test]
 async fn hosted_runs_are_direct_only_and_need_a_configured_broker() {
     // No broker URL, and a broker URL whose account token source is missing.
     for broker_url in [None, Some("https://runners.example".to_string())] {

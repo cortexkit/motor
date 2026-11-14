@@ -115,6 +115,14 @@ claiming real service or nonce-issuance qualification.
 an operator can test the broker, a hosted runner and the account token.
 No other job changes route.
 
+`ck motor run --boat-only` sends one spill-eligible job straight to a Boat
+overflow sandbox, without considering the first-party hosts, to compare Boat
+with them before spill is enabled. It is an operator CLI flag; the broker accepts
+it only for accounts allowed Boat-only leases. The job must be spill-eligible:
+a timeout within the broker's Boat limit, and not networked, a gate job or
+repository-routed. Each run is a Boat start and counts against the account's
+Boat start limits.
+
 - Only a direct caller can ask for it, and only while `admit_direct_exec` is
   on. The agent's and scheduler's routes cannot: their requests ignore the key.
 - ck-motor needs `broker_url` and a usable broker token source (the account

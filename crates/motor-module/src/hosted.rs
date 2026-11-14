@@ -83,7 +83,11 @@ pub struct HostedJobState {
     pub(crate) placement_attempts: u8,
     #[serde(default)]
     pub(crate) retry_iat: Option<u64>,
-    #[serde(default, deserialize_with = "stored_lease_request")]
+    #[serde(
+        default,
+        deserialize_with = "stored_lease_request",
+        serialize_with = "store_lease_request"
+    )]
     pub(crate) lease_request: Option<LeaseRequest>,
     /// The host the broker must not place this job's lease on. Only a spill
     /// sets it, to the build server's host id; it is fixed when the route is
@@ -96,6 +100,10 @@ pub struct HostedJobState {
     /// retried for capacity and the job never falls back to the build server.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) hosted_test: bool,
+    /// Keep operator placement across retries without adding a member to the
+    /// stored lease body that older clients decode with a strict schema.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) boat_only: bool,
     /// Selected by hosted_repositories, rather than a spill or manual test.
     /// Persist the decision so retries and restarts cannot enable local fallback.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -129,9 +137,21 @@ pub struct HostedJobState {
     pub(crate) broker_url: String,
     pub(crate) token_source: BrokerTokenSource,
 }
-/// Reads a stored lease body. Bodies stored before the broker required
-/// `avoid_host` lack the key; they are read as avoiding no host, so an older
-/// job record still loads instead of making the whole store unreadable.
+/// Store the operator selection on the route only, so older clients can still
+/// decode the strict lease body when opening a journal or checkpoint.
+fn store_lease_request<S: serde::Serializer>(
+    request: &Option<LeaseRequest>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut stored = request.clone();
+    if let Some(body) = &mut stored {
+        body.placement = None;
+    }
+    stored.serialize(serializer)
+}
+
+/// Older bodies lack `avoid_host`; default only that member so one legacy job
+/// does not make the whole store unreadable.
 fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<LeaseRequest>, D::Error> {
@@ -336,6 +356,7 @@ pub(crate) enum Error {
     /// account was closed for good, so no job of it may run anywhere. Final:
     /// never retried, never sent back to the build server, never run locally.
     AccountClosed,
+    BoatOnlyNotAllowed,
     InternalFailure,
     /// The host refused the lease because its disk is full. It recorded
     /// nothing and no runner saw the job, so this attempt never started it
@@ -429,6 +450,7 @@ impl Error {
             Self::Capacity | Self::NoCapacity(_) => "hosted_capacity",
             Self::NoHostFits(_, _) => "hosted_no_host_fits",
             Self::AccountClosed => "hosted_account_closed",
+            Self::BoatOnlyNotAllowed => "boat_only_not_allowed",
             Self::InternalFailure => "hosted_internal_failure",
             Self::StorageFull => "hosted_storage_full",
             Self::Connect => "hosted_connect_failed",
@@ -814,6 +836,8 @@ pub(crate) fn invalid_lease_field(body: &LeaseRequest) -> Option<&'static str> {
         .is_some_and(|mib| mib == 0 || mib > 9_007_199_254_740_991 || mib % 1024 != 0)
     {
         Some("mem_mib")
+    } else if body.placement.is_some() && body.allow_spill != Some(true) {
+        Some("placement")
     } else {
         None
     }
@@ -877,6 +901,7 @@ fn lease_body(
         requester_jwk,
         allow_spill,
         mem_mib: request.memory_mib,
+        placement: None,
     })
 }
 fn reattach_body(key: &SigningKey) -> ReattachRequest {
@@ -1213,9 +1238,12 @@ impl Client {
             *self.broker_status.lock().unwrap() = Some(status);
             *self.broker_failure.lock().unwrap() =
                 Some(format!("HTTP {status}, broker_code={broker_code:?}"));
-            // A closed account's new lease is the one 403 that is not an
-            // authentication failure. The contract sends it on lease creation
-            // only; anywhere else a 403 stays an authentication failure.
+            // Account policy refusals apply only to lease creation; other
+            // routes must keep treating a 403 as an authentication failure.
+            if status == 403 && path == "/v1/leases" && broker_code == Some("boat_only_not_allowed")
+            {
+                return Err(Error::BoatOnlyNotAllowed);
+            }
             if status == 403
                 && path == "/v1/leases"
                 && code
@@ -1445,6 +1473,11 @@ impl Client {
                 )?
             }
         };
+        // Older clients cannot decode placement in a stored lease body. Restore
+        // it from the route before every send, including after a restart.
+        if self.route.boat_only {
+            body.placement = Some(motor_lease::LeasePlacement::Boat);
+        }
         // Never send a body the broker would refuse. The requester key that
         // each attempt below puts in is freshly generated and always valid.
         if let Some(field) = invalid_lease_field(&body) {
@@ -1988,6 +2021,8 @@ pub(crate) async fn wait_after_iat(iat: u64) {
     }
 }
 
+#[cfg(test)]
+mod boat_only_tests;
 #[cfg(test)]
 pub(crate) mod boat_tests;
 #[cfg(all(test, target_os = "linux"))]

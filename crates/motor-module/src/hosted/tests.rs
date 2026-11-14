@@ -349,6 +349,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
                 requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
                 allow_spill: Some(true),
                 mem_mib: None,
+                placement: None,
             },
         )
         .await

@@ -248,6 +248,13 @@ impl FakeBroker {
         {
             return BrokerReply::error(400, "bad_request");
         }
+        if request.placement.is_some() {
+            if request.allow_spill != Some(true) {
+                return BrokerReply::json(400, json!({"error":"bad_request", "field":"placement"}));
+            }
+            // The fake has no account authorized for Boat-only admissions.
+            return BrokerReply::error(403, "boat_only_not_allowed");
+        }
         if let Some(job) = self.jobs.get(&request.job_id) {
             if job.release.is_some() {
                 return BrokerReply::error(409, "job_released");
@@ -694,6 +701,9 @@ fn lease_identity(request: &LeaseRequest) -> Value {
     }
     if let Some(mem_mib) = request.mem_mib {
         identity["mem_mib"] = json!(mem_mib);
+    }
+    if let Some(placement) = request.placement {
+        identity["placement"] = json!(placement);
     }
     identity
 }

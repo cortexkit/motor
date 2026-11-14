@@ -15,6 +15,46 @@ fn vector(name: &str) -> Value {
 }
 
 #[test]
+fn boat_only_request_pins_canonical_bytes_and_strict_final_placement() {
+    let vector = vector("boat-only-lease.json");
+    let request: LeaseRequest =
+        serde_json::from_value(vector["granted"]["request"]["body"].clone()).unwrap();
+    assert_eq!(request.placement, Some(LeasePlacement::Boat));
+    let wire = serde_json::to_string(&request).unwrap();
+    assert!(wire.ends_with(r#","placement":"boat"}"#));
+    let requester = format!(
+        ",\"requester_jwk\":{}",
+        serde_json::to_string(&request.requester_jwk).unwrap()
+    );
+    let canonical = wire.replacen(&requester, "", 1);
+    assert_eq!(canonical, vector["canonical_lease_bytes"]);
+    assert_eq!(sha256_hex(canonical.as_bytes()), vector["lease_hash"]);
+    let mut memory = request.clone();
+    memory.mem_mib = Some(4096);
+    assert!(serde_json::to_string(&memory)
+        .unwrap()
+        .ends_with("\"mem_mib\":4096,\"placement\":\"boat\"}"));
+    for placement in [Value::Null, json!("other"), json!(false), json!(1)] {
+        let mut invalid = vector["granted"]["request"]["body"].clone();
+        invalid["placement"] = placement;
+        assert!(serde_json::from_value::<LeaseRequest>(invalid).is_err());
+    }
+    let mut ordinary = request;
+    ordinary.placement = None;
+    assert!(!serde_json::to_string(&ordinary)
+        .unwrap()
+        .contains("\"placement\":"));
+    let mut broker = FakeBroker::new("boat-only-vector", config()).unwrap();
+    for (scenario, status) in [("forbidden", 403), ("allow_spill_conflict", 400)] {
+        let body: LeaseRequest =
+            serde_json::from_value(vector[scenario]["request"]["body"].clone()).unwrap();
+        let reply = post(&mut broker, "/v1/leases", &body, 1_900_000_000);
+        assert_eq!(reply.status, status);
+        assert_eq!(reply.body, vector[scenario]["reply"]["body"]);
+    }
+}
+
+#[test]
 fn tenant_disk_heartbeats_match_accepted_cloud_vector_bytes() {
     let vector = vector("tenant-disk.json");
     let cases = vector["disk_cases"].as_array().unwrap();

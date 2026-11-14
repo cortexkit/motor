@@ -748,7 +748,7 @@ swapped for a symlink), and in
 
 ## Direct runs
 
-`ck motor run [--vcpus N] [--memory N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] -- COMMAND...`
+`ck motor run [--vcpus N] [--memory N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] [--hosted | --boat-only] -- COMMAND...`
 runs one command on the runner from a script with no agent behind it, streams
 its output, and exits with its status. It works only when `admit_direct_exec`
 is `true` in the configuration file ([Configuration](#configuration)).
@@ -812,6 +812,14 @@ agent jobs; see [scheduling.md](scheduling.md). Source:
 server, as the operator's test of the hosted path; without a configured broker
 it exits 204 and submits nothing. See
 [hosted-cutover.md](hosted-cutover.md#smoke-test-the-hosted-path).
+
+`ck motor run --boat-only` sends one spill-eligible job straight to a Boat
+overflow sandbox, without considering the first-party hosts, to compare Boat
+with them before spill is enabled. It is an operator CLI flag; the broker accepts
+it only for accounts allowed Boat-only leases. The job must be spill-eligible:
+a timeout within the broker's Boat limit, and not networked, a gate job or
+repository-routed. Each run is a Boat start and counts against the account's
+Boat start limits.
 
 ### Checkouts and WSL
 

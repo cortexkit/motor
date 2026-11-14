@@ -38,6 +38,7 @@ impl Motor {
                 false,
                 false,
                 false,
+                false,
                 crate::ReturnOptions::default(),
                 (key, caller.into()),
             );
@@ -45,6 +46,7 @@ impl Motor {
         let stream = self.run_classified_keyed(
             request,
             (attribution, None),
+            false,
             false,
             false,
             false,
