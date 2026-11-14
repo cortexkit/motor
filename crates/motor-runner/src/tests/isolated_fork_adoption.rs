@@ -62,8 +62,50 @@ fn snapshot(f: &Fixture) {
     );
 }
 
+fn job_config(f: &Fixture) -> Config {
+    let mut config = base_store_config(f, BUILD);
+    config.tenant_vm = true;
+    config.per_job = true;
+    config.image_cargo = f.scratch.join("image-cargo");
+    config.cargo_home = Some(f.scratch.join("cargo-home"));
+    let dns = f.scratch.join("tenant-attachment");
+    fs::create_dir(&dns).unwrap();
+    let marker = dns.join("generation");
+    fs::write(&marker, "1\n").unwrap();
+    // Fetch validates the dependency-free locked graph without DNS traffic,
+    // but its tenant helper still requires a real attachment and resolver file.
+    fs::write(dns.join("resolv.conf"), "nameserver 127.0.0.1\n").unwrap();
+    config.fixture_tenant_dns = Some((marker, dns));
+    // Relocate the checkout disk and per-boot marker as well, without replacing
+    // the real root, isolation, account or Cargo ACL checks.
+    config.fixture_adoption_roots = Some(f.scratch.join("remote"));
+    config.fixture_workspace_forked_marker = Some(f.scratch.join("forked"));
+    config
+}
+
+#[test]
+fn adoption_config_supplies_the_tenant_prefetch_attachment() {
+    let f = Fixture::new();
+    let config = job_config(&f);
+    let directory = f.scratch.join("tenant-attachment");
+    assert_eq!(
+        crate::sibling_snapshots::helper::TenantResolver::new(&config),
+        crate::sibling_snapshots::helper::TenantResolver::Attached {
+            directory: directory.clone()
+        }
+    );
+    assert_eq!(
+        fs::read(directory.join("resolv.conf")).unwrap(),
+        b"nameserver 127.0.0.1\n"
+    );
+}
+
 fn fixture() -> (AdoptionFixture, Config) {
     assert_eq!(unsafe { libc::geteuid() }, 0, "operator-only fixture");
+    assert!(
+        Path::new("/usr/local/lib/motor/bun/bin/bun").is_file(),
+        "adoption acceptance needs the job image's toolchain tree: mount the live job image toolchain disk read-only at /usr/local/lib/motor before running these tests"
+    );
     let mut f = AdoptionFixture {
         inner: Fixture::new(),
         mounts: Vec::new(),
@@ -92,12 +134,8 @@ fn fixture() -> (AdoptionFixture, Config) {
     );
     save(&f.main, "b/src/input", "first\n");
     snapshot(&f);
-    let mut config = base_store_config(&f, BUILD);
-    config.tenant_vm = true;
-    config.per_job = true;
-    config.image_cargo = f.scratch.join("image-cargo");
-    let cargo_home = f.scratch.join("cargo-home");
-    config.cargo_home = Some(cargo_home.clone());
+    let config = job_config(&f);
+    let cargo_home = config.cargo_home().unwrap();
     fs::create_dir_all(cargo_home.join("bin")).unwrap();
     // Keep only tool links in this Cargo home. The toolchain itself is already
     // mounted read-only from RUSTUP_HOME, never from the operator's Cargo cache.
@@ -151,10 +189,6 @@ fn fixture() -> (AdoptionFixture, Config) {
         );
         f.mounts.push(layer.target);
     }
-    // Relocate the checkout disk and per-boot marker as well, without replacing
-    // the real root, isolation, account or Cargo ACL checks.
-    config.fixture_adoption_roots = Some(f.scratch.join("remote"));
-    config.fixture_workspace_forked_marker = Some(f.scratch.join("forked"));
     (f, config)
 }
 
