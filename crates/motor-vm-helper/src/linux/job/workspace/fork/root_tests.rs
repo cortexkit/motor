@@ -151,7 +151,14 @@ fn isolated_fork_refuses_booting_running_and_inode_alias_donors() {
             jobs.insert_cell(cell.clone(), &guard);
             drop(guard);
             let err = fork(&jobs, request(&["donor"])).err().unwrap();
-            assert!(err.0.contains("attached"), "{}", err.0);
+            assert_eq!(
+                err.0,
+                if alias {
+                    "fork donor is attached or awaiting cleanup"
+                } else {
+                    "workspace disk still held by a VM"
+                }
+            );
             assert!(!jobs.workspaces.join("new").exists());
         }
     }
