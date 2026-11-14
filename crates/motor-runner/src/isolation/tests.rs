@@ -1588,6 +1588,8 @@ fn isolated_warm_target_keeps_runner_owned_files_and_directories_writable() {
     let file = directory.join("existing-output");
     fs::write(&file, "runner output\n").unwrap();
     fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+    let release = directory.join("release");
+    fs::write(&release, "").unwrap();
     let runner = unsafe { libc::geteuid() };
     assert_eq!(fs::metadata(&directory).unwrap().uid(), runner);
     assert_eq!(fs::metadata(&file).unwrap().uid(), runner);
@@ -1610,11 +1612,39 @@ fn isolated_warm_target_keeps_runner_owned_files_and_directories_writable() {
         0o500,
         "preparation expanded an existing job owner's access"
     );
-    let (status, stdout, stderr) = output(
-        &sandbox,
-        "set -eu; printf 'rebuilt\\n' >> target/runner-created/existing-output; grep -q rebuilt target/runner-created/existing-output; touch target/runner-created/new-output; if touch target/owner-read-only/forbidden; then exit 41; fi",
-        &f.workspace,
+    let mut launch = sandbox
+        .launch(
+            "set -eu; printf 'rebuilt\\n' >> target/runner-created/existing-output; grep -q rebuilt target/runner-created/existing-output; touch target/runner-created/new-output; if touch target/owner-read-only/forbidden; then exit 41; fi; touch target/runner-created/ready; while [ ! -s target/runner-created/release ]; do sleep 0.025; done",
+            &f.workspace,
+            &[],
+        )
+        .unwrap();
+    launch.release().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !directory.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "job did not reach the live read probe"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        unit_alive(sandbox.id).unwrap(),
+        "job ended before the live read probe"
     );
+    assert_eq!(fs::metadata(&file).unwrap().uid(), runner);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "runner output\nrebuilt\n"
+    );
+    // Releasing an existing runner-owned file needs no directory write grant.
+    fs::write(&release, "finish\n").unwrap();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    launch.stdout.read_to_string(&mut stdout).unwrap();
+    launch.stderr.read_to_string(&mut stderr).unwrap();
+    let status = launch.wait().unwrap();
+    launch.reap();
     assert!(status.success(), "{stdout}\n{stderr}");
     restore_runner_access(&f.scratch).unwrap();
     fs::write(directory.join("runner-cleanup-probe"), "reclaimed\n").unwrap();

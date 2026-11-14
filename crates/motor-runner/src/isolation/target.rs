@@ -18,6 +18,7 @@ pub(super) fn restrict_directories(
     ownership_repaired: bool,
 ) -> io::Result<()> {
     let started = Instant::now();
+    let runner = unsafe { libc::geteuid() };
     let directories = physical_directories(root)?;
     let mut ownership = Vec::new();
     let mut masks: BTreeMap<String, Vec<&Path>> = BTreeMap::new();
@@ -40,10 +41,14 @@ pub(super) fn restrict_directories(
             // Transfer that access to owner bits before masking named writes.
             7
         };
-        masks
-            .entry(directory_acl(owner, metadata.mode()))
-            .or_default()
-            .push(path);
+        let mut acl = directory_acl(owner, metadata.mode());
+        if !ownership_repaired && metadata.uid() != uid && metadata.uid() == runner {
+            // The runner could traverse its private directory as owner during
+            // the walk. Preserve that access after chown; the explicit mask
+            // keeps its named write ineffective until post-job reclamation.
+            acl.push_str(&format!(",u:{runner}:rwx"));
+        }
+        masks.entry(acl).or_default().push(path);
     }
     for paths in ownership.chunks(BATCH) {
         checked(
