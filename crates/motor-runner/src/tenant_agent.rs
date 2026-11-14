@@ -14,6 +14,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod cache_drive;
+mod console;
 mod diagnostics;
 pub(crate) mod dns;
 mod network;
@@ -51,6 +52,15 @@ pub async fn serve_agent() -> io::Result<()> {
     let listener = crate::vsock::Listener::bind(54)?;
     let attach = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut tasks = tokio::task::JoinSet::new();
+    if per_job::enabled()? {
+        // Serial evidence must survive runner exit without making diagnostics
+        // availability a prerequisite for starting or running a job.
+        tasks.spawn(async {
+            if console::watch().await.is_err() {
+                tracing::warn!("runner console watcher unavailable");
+            }
+        });
+    }
     let trim_lock = attach.clone();
     if !recovery::enabled()? {
         tasks.spawn(async move { trim::watch(trim_lock).await });

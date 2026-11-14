@@ -2,6 +2,7 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod absence_tests;
+mod console_tests;
 mod exit_tests;
 mod fill_tests;
 mod network_tests;
