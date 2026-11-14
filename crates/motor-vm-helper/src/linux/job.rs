@@ -1629,17 +1629,27 @@ fn stage_boot(
     Ok((nonce, requests))
 }
 
-/// Copies the tail of a job VM's serial console to the helper journal, one
-/// line per entry with control characters replaced, so guest-written bytes
-/// cannot forge journal fields or terminal sequences.
 fn log_console_tail(id: &str, boundary: &Path) {
+    let _ = write_console_tail(id, boundary, &mut std::io::stderr().lock());
+}
+
+/// Preserve bounded exit evidence, re-redacting tagged runner messages even
+/// when a compromised guest bypasses the agent's console redactor.
+fn write_console_tail(
+    id: &str,
+    boundary: &Path,
+    output: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    use motor_protocol::runner_diagnostics::{
+        console_message, CONSOLE_LINE_CHARS, CONSOLE_MAX_BYTES, CONSOLE_MAX_LINES, CONSOLE_TAG,
+    };
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(boundary.join(CONSOLE_LOG))
     else {
-        return;
+        return Ok(());
     };
     let length = file.metadata().map_or(0, |meta| meta.len());
     let start = length.saturating_sub(CONSOLE_TAIL_BYTES);
@@ -1650,21 +1660,45 @@ fn log_console_tail(id: &str, boundary: &Path) {
             .read_to_end(&mut tail)
             .is_err()
     {
-        return;
+        return Ok(());
     }
-    for line in String::from_utf8_lossy(&tail)
-        .lines()
-        .skip(usize::from(start > 0))
-    {
+    let text = String::from_utf8_lossy(&tail);
+    let mut lines = text.lines();
+    if start > 0 {
+        lines.next();
+    }
+    let mut lines: Vec<_> = lines.rev().take(64).collect();
+    lines.reverse();
+    let mut runner_lines = 0;
+    let mut runner_bytes = 0;
+    for line in lines {
+        if line.contains(CONSOLE_TAG) {
+            let message = line
+                .strip_prefix(CONSOLE_TAG)
+                .map(console_message)
+                .unwrap_or_else(|| "[message omitted]".into());
+            let line: String = message
+                .chars()
+                .take(CONSOLE_LINE_CHARS)
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect();
+            if runner_lines < CONSOLE_MAX_LINES && runner_bytes + line.len() <= CONSOLE_MAX_BYTES {
+                runner_lines += 1;
+                runner_bytes += line.len();
+                writeln!(output, "job {id} runner-console: {line}")?;
+            }
+            continue;
+        }
         let line: String = line
             .chars()
             .take(300)
             .map(|c| if c.is_control() { '?' } else { c })
             .collect();
         if !line.trim().is_empty() {
-            eprintln!("job {id} console: {line}");
+            writeln!(output, "job {id} console: {line}")?;
         }
     }
+    Ok(())
 }
 
 fn jailer_command(binaries: &Path, boundary: &Path, netns: &Path, id: &str, uid: u32) -> Command {

@@ -1,5 +1,6 @@
 //! Fixed, read-only diagnostics for the host-only tenant administration socket.
 use super::runner_socket;
+use motor_protocol::runner_diagnostics::journal_message;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -368,287 +369,6 @@ fn flocks(proc: &Path, state: &Path) -> io::Result<(Vec<Value>, bool)> {
     Ok((locks, truncated))
 }
 
-fn writer_outcome(value: &str) -> Option<String> {
-    if matches!(
-        value,
-        "None" | "Some(Cancelled)" | "Some(OutcomeUnknown)" | "Some(HistoryExpired)"
-    ) {
-        return Some(value.into());
-    }
-    if let Some(reason) = value
-        .strip_prefix("Some(RefusedBeforeStart { reason: ")
-        .and_then(|v| v.strip_suffix(" })"))
-    {
-        if matches!(
-            reason,
-            "Unreachable"
-                | "RunnerVersionMismatch"
-                | "SnapshotFailed"
-                | "WorkspaceKeyRejected"
-                | "RunnerFull"
-                | "RunnerDraining"
-                | "RunnerDiskFull"
-                | "QueueWaitExceeded"
-                | "TransferInterrupted"
-                | "TreeHashMismatch"
-                | "BundleRejected"
-                | "WorkspaceSetupFailed"
-                | "NetworkUnsupported"
-                | "PlatformUnsupported"
-                | "LostToRestart"
-                | "RequestRejected"
-                | "RunnerAuthenticationFailed"
-                | "SubmissionNeverAccepted"
-        ) {
-            return Some(value.into());
-        }
-    }
-    for (prefix, signed) in [
-        ("Some(Exit { code: ", true),
-        ("Some(WindowsExit { code: ", false),
-        ("Some(Signal { signal: ", true),
-    ] {
-        if let Some(number) = value
-            .strip_prefix(prefix)
-            .and_then(|v| v.strip_suffix(" })"))
-        {
-            if if signed {
-                number.parse::<i32>().is_ok()
-            } else {
-                number.parse::<u32>().is_ok()
-            } {
-                return Some(value.into());
-            }
-        }
-    }
-    None
-}
-
-fn writer_kill(value: &str) -> bool {
-    value == "None"
-        || ["Deadline", "Cancel"].iter().any(|reason| {
-            value
-                .strip_prefix(&format!("Some(({reason}, "))
-                .and_then(|v| v.strip_suffix("))"))
-                .is_some_and(|number| number.parse::<u64>().is_ok())
-        })
-}
-
-fn journal_message(message: &str) -> String {
-    // Journal entries and subprocess errors can quote uploaded text. Only the
-    // runner's fixed setup messages and numeric/allowlisted fields cross vsock.
-    let startup = message.strip_prefix("Error: ").unwrap_or(message);
-    if let Some(rest) = startup.strip_prefix("immutable Cargo source ACL check failed: ") {
-        if let Some((path, _)) = rest.split_once(';') {
-            if matches!(
-                path,
-                "/usr/local/lib/motor/cargo/registry" | "/usr/local/lib/motor/cargo/git"
-            ) {
-                return format!("immutable Cargo source ACL check failed: {path}");
-            }
-        }
-    }
-    let Some((_, rest)) = message.split_once("motor_runner::") else {
-        return "[message omitted]".into();
-    };
-    let Some((_, rest)) = rest.split_once(": ") else {
-        return "[message omitted]".into();
-    };
-    let names = [
-        "materialize started",
-        "materialize finished",
-        "setup lock wait started",
-        "setup lock wait finished",
-        "handing materialized job to execution",
-        "job Started recorded",
-        "bundle upload complete",
-        "bundles fetched; job queued",
-        "placed job CPUs",
-        "runner deadline signal was late",
-        "runner maintenance pass exceeded ten seconds",
-        "writer lifecycle",
-        "build base seed refused: record mismatch",
-        "build base seed failed; building without seed",
-        "build base seed environment changed during sandbox preparation; building without seed",
-        "build base seed succeeded",
-        "build base seed skipped",
-        "build base published",
-        // Job-stream lifecycle on the tenant boundary: why a connection from
-        // motor-host closed, and on which side. Their fields are the runner's
-        // own labels, counters and job ids, never frame contents.
-        "runner hello received",
-        "runner hello written",
-        "runner job stream attached",
-        "runner job stream refused frame",
-        "runner cancel frame received",
-        "runner cancel handled",
-        "runner terminal written to client",
-        "runner frame write failed",
-        "runner_channel_closed",
-        "operation_refused",
-        "tenant frame read failed",
-        "tenant_job_stream_ended",
-    ];
-    let Some(name) = names.iter().find(|name| {
-        rest.strip_prefix(**name).is_some_and(|suffix| {
-            suffix.is_empty()
-                || suffix.strip_prefix(' ').is_some_and(|fields| {
-                    !name.starts_with("build base ")
-                        || fields
-                            .split_whitespace()
-                            .next()
-                            .is_some_and(|t| t.contains('='))
-                })
-        })
-    }) else {
-        return "[message omitted]".into();
-    };
-    let mut output = name.to_string();
-    let fields = &rest[name.len()..];
-    let (fields, writer_debug) = if *name == "writer lifecycle" {
-        fields
-            .split_once(" outcome=")
-            .map_or((fields, None), |(before, after)| (before, Some(after)))
-    } else {
-        (fields, None)
-    };
-    let mut stopped = false;
-    for token in fields.split_whitespace() {
-        let Some((key, value)) = token.split_once('=') else {
-            continue;
-        };
-        // These events contain unquoted paths or Debug values with spaces. Once
-        // one begins, later whitespace-delimited text is not a reliable field.
-        if (name.starts_with("build base ") || *name == "writer lifecycle")
-            && matches!(
-                key,
-                "repository" | "workspace" | "outcome" | "kill" | "error" | "cleanup" | "inputs"
-            )
-        {
-            stopped = true;
-            break;
-        }
-        let valid = match key {
-            "job_id" => uuid::Uuid::parse_str(value).is_ok(),
-            "cache_fill" | "success" => matches!(value, "true" | "false"),
-            "reason" if *name == "build base seed skipped" => matches!(
-                value,
-                "no_base"
-                    | "unreadable_record"
-                    | "siblings"
-                    | "base_job"
-                    | "not_fixed_path"
-                    | "not_isolated"
-                    | "target_not_empty"
-                    | "workspace_not_tracked"
-                    | "record_mismatch"
-                    | "symlink_change"
-                    | "seed_failed"
-            ),
-            "inputs_match" | "times_valid"
-                if *name == "build base seed refused: record mismatch" =>
-            {
-                matches!(value, "true" | "false")
-            }
-            "tip" if *name == "build base published" => {
-                value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
-            }
-            "event" if *name == "writer lifecycle" => matches!(
-                value,
-                "started" | "kill_requested" | "runtime_expired" | "finished"
-            ),
-            "kind" if *name == "writer lifecycle" => {
-                matches!(value, "base_build" | "compile_cache_fill")
-            }
-            "started_ms" | "age_ms" if *name == "writer lifecycle" => {
-                value == "None"
-                    || value.parse::<u64>().is_ok()
-                    || value
-                        .strip_prefix("Some(")
-                        .and_then(|v| v.strip_suffix(')'))
-                        .is_some_and(|v| v.parse::<u64>().is_ok())
-            }
-            "unit" if *name == "writer lifecycle" => {
-                value == "not_started"
-                    || value
-                        .strip_prefix("motor-job-")
-                        .and_then(|v| v.strip_suffix(".service"))
-                        .is_some_and(|v| uuid::Uuid::parse_str(v).is_ok())
-            }
-            "lock" => matches!(
-                value.trim_matches('"'),
-                "tree_access" | "dependency_mirror" | "build_wrapper"
-            ),
-            "elapsed_ms"
-            | "wait_ms"
-            | "bytes"
-            | "requested_cpus"
-            | "from_seq"
-            | "frames"
-            | "lateness_ms"
-            | "slice_budget_ms"
-            | "source_unseals_ms"
-            | "runtime_cleanup_ms"
-            | "state_ms"
-            | "expired_jobs_ms"
-            | "returned_files_ms"
-            | "return_reservations_ms"
-            | "build_folders_ms"
-            | "sibling_snapshots_ms"
-            | "prune_refs_ms"
-            | "retire_repositories_ms" => value.parse::<u64>().is_ok(),
-            "jti" => uuid::Uuid::parse_str(
-                value
-                    .strip_prefix("Some(")
-                    .and_then(|v| v.strip_suffix(')'))
-                    .unwrap_or(value),
-            )
-            .is_ok(),
-            "seq" => {
-                value == "None"
-                    || value
-                        .strip_prefix("Some(")
-                        .and_then(|v| v.strip_suffix(')'))
-                        .is_some_and(|v| v.parse::<u64>().is_ok())
-            }
-            // Code labels: a direction, close reason, frame type tag or I/O
-            // error kind, possibly in an Option's Debug form.
-            "direction" | "reason" | "frame_type" | "frame" | "kind" | "error_kind"
-            | "supports_started" => {
-                value.len() <= 48
-                    && value
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'(' | b')'))
-            }
-            _ => false,
-        };
-        if *name == "writer lifecycle" && key == "unit" && !valid {
-            stopped = true;
-            break;
-        }
-        if valid {
-            output.push(' ');
-            output.push_str(token);
-        }
-    }
-    if let Some((outcome, rest)) = writer_debug
-        .filter(|_| !stopped)
-        .and_then(|fields| fields.split_once(" kill="))
-    {
-        if let Some(outcome) = writer_outcome(outcome) {
-            output.push_str(" outcome=");
-            output.push_str(&outcome);
-            if let Some((kill, _)) = rest.split_once(" repository=") {
-                if writer_kill(kill) {
-                    output.push_str(" kill=");
-                    output.push_str(kill);
-                }
-            }
-        }
-    }
-    output
-}
-
 async fn journal(query: JournalQuery) -> io::Result<Value> {
     let mut command = tokio::process::Command::new("journalctl");
     command.args(query.args());
@@ -804,6 +524,37 @@ fn journal_entries(bytes: &[u8], limit: u64, query: &JournalQuery) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_redactor_preserves_early_close_journal_output() {
+        let messages = [
+            ("[motor-runner] WARN motor_runner::server: runner_channel_closed reason=eof bytes=42 error=SECRET", "runner_channel_closed reason=eof bytes=42"),
+            ("Error: immutable Cargo source ACL check failed: /usr/local/lib/motor/cargo/git; SECRET", "immutable Cargo source ACL check failed: /usr/local/lib/motor/cargo/git"),
+            ("thread 'main' panicked at crates/motor-runner/src/tenant.rs:1:2:", "[message omitted]"),
+            ("called `Result::unwrap()` on an `Err` value: SECRET", "[message omitted]"),
+            ("job stdout SECRET", "[message omitted]"),
+        ];
+        let bytes = messages
+            .iter()
+            .enumerate()
+            .map(|(index, (message, _))| {
+                json!({"__REALTIME_TIMESTAMP":index.to_string(),"MESSAGE":message}).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reply = journal_entries(
+            bytes.as_bytes(),
+            MAX_JOURNAL_BYTES,
+            &JournalQuery::default(),
+        );
+        let actual: Vec<_> = reply["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, messages.map(|(_, expected)| expected));
+    }
 
     #[test]
     fn journal_query_reads_the_boot_machine_id_after_tenant_attachment() {

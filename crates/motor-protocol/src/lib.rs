@@ -8,6 +8,7 @@ mod create_only_probe;
 mod environment;
 mod fill_source;
 pub mod logging;
+pub mod runner_diagnostics;
 pub use fill_source::*;
 mod tenant;
 mod types;
