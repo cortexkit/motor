@@ -385,6 +385,8 @@ pub struct Config {
     pub(crate) fixture_tenant_dns: Option<(PathBuf, PathBuf)>,
     #[cfg(test)]
     pub(crate) fixture_workspace_forked_marker: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) fixture_adoption_roots: Option<PathBuf>,
     /// Called with an operation label so tests can hold filesystem work or the
     /// admission handoff open without holding the runner state lock.
     #[cfg(test)]
@@ -732,6 +734,8 @@ impl Config {
             fixture_tenant_dns: None,
             #[cfg(test)]
             fixture_workspace_forked_marker: None,
+            #[cfg(test)]
+            fixture_adoption_roots: None,
             #[cfg(test)]
             long_work: None,
             #[cfg(all(test, target_os = "linux"))]
@@ -2503,6 +2507,13 @@ impl Runner {
             .write(true)
             .open(state.join("daemon.lock"))?;
         lock.try_lock_exclusive()?;
+        #[cfg(target_os = "linux")]
+        if config.per_job {
+            let roots = Path::new("/tenant/roots");
+            #[cfg(test)]
+            let roots = config.fixture_adoption_roots.as_deref().unwrap_or(roots);
+            crate::fork_adoption::clean_staging(roots)?;
+        }
         // Collect mappings from both files and all job records before dropping
         // duplicate keys. A caller-catalog.json copy that loses to catalog.json
         // can still be the only record requiring a caller-root flag.
@@ -4409,6 +4420,124 @@ impl Runner {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn adopt_checkout(
+        &self,
+        inner: &mut Inner,
+        request: &Run,
+        roots: &Path,
+    ) -> Result<(), crate::fork_adoption::MoveError> {
+        let donor = crate::fork_adoption::donor(&inner.catalog, request)?;
+        let caller = paths::request(request).caller_workspace_key.text();
+        let source = crate::fork_adoption::checkout_path(roots, &donor)?;
+        let destination = crate::fork_adoption::checkout_path(roots, caller)?;
+        let previous = inner.catalog.clone();
+        let mut rekeyed = false;
+        let result = crate::fork_adoption::move_checkout(
+            roots,
+            &source,
+            &destination,
+            || {
+                let host = paths::host_path(&self.core.config, &donor);
+                let intent = self
+                    .core
+                    .trees
+                    .state
+                    .join("seed-intents")
+                    .join(workspace::name(&host.to_string_lossy()));
+                if intent.try_exists()? {
+                    tracing::info!(%donor, "settling interrupted seed before checkout adoption");
+                    crate::seed::settle(&self.core.trees.state, &host)?;
+                }
+                Ok(())
+            },
+            || {
+                rekeyed = true;
+                let mut workspace = inner.catalog.workspaces.remove(&donor).unwrap();
+                workspace.last_job_id = None;
+                inner.catalog.workspaces.insert(caller.clone(), workspace);
+                // These two maps describe the old filesystem location, not
+                // objects borrowed by the checkout. Forget their cached claims.
+                inner.catalog.sibling_commits.remove(&donor);
+                inner.catalog.legacy_checkouts.remove(&donor);
+                for repository in inner.catalog.repositories.values_mut() {
+                    if let Some(desired) = &mut repository.desired {
+                        if paths::base(desired).caller.text() == &donor {
+                            desired.workspace = caller.clone();
+                        }
+                    }
+                }
+                self.catalog(inner)
+            },
+        );
+        if let Err(error) = result {
+            inner.catalog = previous;
+            // A catalog rename can succeed before its directory sync fails.
+            // Publish the restored catalog too before running anything cold.
+            if rekeyed {
+                self.catalog(inner)
+                    .map_err(crate::fork_adoption::MoveError::Recovery)?;
+            }
+            return Err(error);
+        }
+        // Upkeep observations are caches of the old path's contents. The
+        // target-local build-dir marker travels with the checkout itself.
+        for key in [&donor, caller] {
+            inner.build_swept_ms.remove(key);
+            inner.build_guard_pending.remove(key);
+            inner.build_folder_sizes.remove(key);
+            inner.build_retry_after.remove(key);
+            inner.rotation.remove(key);
+            inner
+                .eviction_retry_after
+                .remove(&paths::host_path(&self.core.config, key));
+        }
+        tracing::info!(%donor, workspace = %caller, "forked checkout adopted");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_forked_workspace(&self, inner: &mut Inner, request: &Run) -> io::Result<()> {
+        let refusal = if inner.workspace_forked != Some(true) {
+            Some("forked marker absent")
+        } else if unsafe { libc::geteuid() } != 0 {
+            Some("checkout adoption requires root")
+        } else if !inner.jobs.is_empty()
+            || !inner.preparing.is_empty()
+            || !inner.reserved.is_empty()
+        {
+            Some("runner already has execution state")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            tracing::info!(%reason, "forked checkout adoption refused; using cold checkout");
+            return Ok(());
+        }
+        // Adoption must not mutate a path ordinary admission would refuse,
+        // notably a bind root itself rather than a checkout below that root.
+        if let Err(error) = paths::authorize_run(&self.core.config, request, false) {
+            tracing::info!(reason = %error, "forked checkout adoption refused; using cold checkout");
+            return Ok(());
+        }
+        let roots = Path::new("/tenant/roots");
+        #[cfg(test)]
+        let roots = self
+            .core
+            .config
+            .fixture_adoption_roots
+            .as_deref()
+            .unwrap_or(roots);
+        match self.adopt_checkout(inner, request, roots) {
+            Ok(()) => (),
+            Err(crate::fork_adoption::MoveError::Refused(error)) => {
+                tracing::info!(reason = %error, "forked checkout adoption refused; using cold checkout");
+            }
+            Err(crate::fork_adoption::MoveError::Recovery(error)) => return Err(error),
+        }
+        Ok(())
+    }
+
     pub(crate) fn accept(&self, request: Run) -> io::Result<Admission> {
         self.accept_from(request, false, None, None, |_| None)
     }
@@ -4469,6 +4598,8 @@ impl Runner {
                         .as_deref()
                         .unwrap_or(marker);
                     inner.workspace_forked = Some(marker.try_exists()?);
+                    #[cfg(target_os = "linux")]
+                    self.adopt_forked_workspace(&mut inner, &request)?;
                 }
                 inner.per_job_workspace.get_or_insert_with(|| {
                     paths::request(&request).caller_workspace_key.text().clone()
