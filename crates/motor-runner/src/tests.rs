@@ -3,6 +3,8 @@ use super::*;
 mod activation;
 #[path = "tests/tenant.rs"]
 mod tenant;
+#[path = "tests/terminal_record.rs"]
+mod terminal_record;
 use crate::spool::Upload;
 use crate::test_helpers::CanonicalScratchDir as ScratchDir;
 use crate::writer::declaration::Compilers;
