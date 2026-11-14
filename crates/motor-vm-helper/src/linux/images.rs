@@ -220,9 +220,16 @@ pub fn handle(op: Operation) -> Result<Response> {
     op.validate()?;
     if let Operation::Readiness {
         job_vms_configured,
+        memory_max_bytes,
         workspace_disk_max_bytes,
     } = op
     {
+        if job_vms_configured {
+            super::cgroup::prepare_job_slice(
+                memory_max_bytes
+                    .ok_or_else(|| Error("job slice memory ceiling is required".into()))?,
+            )?;
+        }
         return Ok(Response::new(Reply::PerJobReadiness {
             job_vms_configured,
             workspace_disk_max_bytes,

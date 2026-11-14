@@ -462,6 +462,46 @@ fn unreadable_slice_file_withdraws_a_previously_fresh_capacity_sample() {
 }
 
 #[test]
+fn missing_slice_logs_path_and_remedy_only_when_failure_changes() {
+    let (runtime, _, storage) = fixture();
+    let slice = storage.root.path().join("missing-motorvm.slice");
+    let detail = format!("{:#}", job_vm_memory(&slice).unwrap_err());
+    let mut host = runtime.host.lock().unwrap();
+    let sample = host.fresh_host_resources(unix_ms()).unwrap();
+    let logs = crate::test_logs::capture(|| {
+        // An earlier heartbeat must not hide the more specific probe failure.
+        assert!(host.fresh_host_resources(1000).is_none());
+        for now in 1000..1003 {
+            host.host_resources_unavailable(&detail);
+            let heartbeat = host.heartbeat(now, host.job_free_mem_mib(now), true);
+            assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0));
+        }
+        host.host_resources_unavailable("different probe failure");
+        host.host_resources_unavailable("different probe failure");
+        host.record_host_resources(HostResources {
+            at_ms: 1004,
+            ..sample
+        });
+        assert!(host.job_free_mem_mib(1004) > 0);
+        host.host_resources_unavailable(&detail);
+        host.host_resources_unavailable(&detail);
+    });
+    let failures: Vec<_> = logs
+        .iter()
+        .filter(|line| line.contains("message=host_resources_unavailable "))
+        .collect();
+    assert_eq!(failures.len(), 3, "{logs:?}");
+    for line in [failures[0], failures[2]] {
+        assert!(line.contains(slice.to_str().unwrap()), "{line}");
+        assert!(line.contains("memory.max"), "{line}");
+        assert!(
+            line.contains("sudo systemctl restart motor-vm-helper.service"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn host_sample_freshness_bounds_both_past_age_and_future_skew() {
     let (runtime, _, _) = fixture();
     let mut host = runtime.host.lock().unwrap();

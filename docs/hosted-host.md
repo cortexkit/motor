@@ -367,7 +367,11 @@ same sample: permits, stated memory plus boot reserve (never burst), disk growth
 generation and replay. After runner hello, memory counts through host-measured
 available memory. The host measures `/proc/meminfo`'s `MemAvailable` and the
 job-VM cgroup's room from
-`/sys/fs/cgroup/motorvm.slice/{memory.max,memory.current,memory.stat}`. Slice room
+`/sys/fs/cgroup/motorvm.slice/{memory.max,memory.current,memory.stat}`. In per-job
+mode, the helper creates the slice and checks its configured memory ceiling at
+startup and on every `per_job_readiness` check, before any job starts, and each
+job start checks it again. The ceiling is a runtime systemd property, so a host
+reboot removes it; the helper's startup creates it again. Slice room
 is `memory.max - (memory.current - file)`, floored at zero, with file pages
 counted as reclaimable but anonymous, kernel and other charged memory not counted
 as free. The slice uses `host_reserve_mib` as its margin too: VM residency can

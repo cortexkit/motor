@@ -358,6 +358,9 @@ pub trait Machine {
     fn job_vms_configured(&self) -> bool {
         false
     }
+    fn job_slice_memory_max_bytes(&self) -> Option<u64> {
+        None
+    }
     fn workspace_disk_max_bytes(&self) -> Option<u64> {
         None
     }
@@ -459,6 +462,7 @@ impl<M: Machine> Helper<M> {
                 let workspace_disk_max_bytes = self.machine.workspace_disk_max_bytes();
                 self.machine.images(images::Operation::Readiness {
                     job_vms_configured,
+                    memory_max_bytes: self.machine.job_slice_memory_max_bytes(),
                     workspace_disk_max_bytes,
                 })
             }

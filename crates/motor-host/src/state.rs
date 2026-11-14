@@ -284,7 +284,7 @@ pub struct Host {
     pub(crate) job_vm_file_mib: Option<u64>,
     job_memory_logged: std::cell::Cell<Option<(u64, u64)>>,
     fill_capacity_refused_at_ms: Option<u64>,
-    host_resources_failed: std::cell::Cell<bool>,
+    host_resources_failed: std::cell::RefCell<Option<jobs::HostResourcesFailure>>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
     /// The jobs whose lease has not ended, kept in step with `snapshot` by
     /// [`Host::save`], so a save checks drain completion and overlapping
@@ -330,7 +330,7 @@ impl Host {
             job_vm_file_mib: None,
             job_memory_logged: std::cell::Cell::new(None),
             fill_capacity_refused_at_ms: None,
-            host_resources_failed: std::cell::Cell::new(false),
+            host_resources_failed: std::cell::RefCell::new(None),
             job_storage: None,
             unended: std::collections::BTreeSet::new(),
         }

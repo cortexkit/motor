@@ -3,6 +3,114 @@ use cortexkit_test_support::ScratchDir;
 
 use motor_runner::image_source_tree_already_readable as runner_readable;
 
+fn readiness() -> Operation {
+    Operation::Readiness {
+        job_vms_configured: true,
+        memory_max_bytes: Some(4194304),
+        workspace_disk_max_bytes: Some(8388608),
+    }
+}
+
+#[test]
+fn readiness_prepares_slice_before_any_job_start() {
+    for fail_at in [1, 2] {
+        let scratch = ScratchDir::new("motor-readiness-slice-command");
+        let slice = scratch.join("motorvm.slice");
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked = calls.clone();
+        let error = super::super::cgroup::with_test_job_slice(
+            slice.clone(),
+            move |args| {
+                invoked.borrow_mut().push(args.to_vec());
+                if invoked.borrow().len() == fail_at {
+                    return Err(Error(format!(
+                        "systemctl {} refused by fixture",
+                        args.join(" ")
+                    )));
+                }
+                Ok(())
+            },
+            || {
+                handle(readiness())
+                    .err()
+                    .expect("readiness must fail when slice setup fails")
+            },
+        );
+        let expected = [
+            vec!["start", "motorvm.slice"],
+            vec![
+                "set-property",
+                "--runtime",
+                "motorvm.slice",
+                "MemoryMax=4194304",
+            ],
+        ];
+        assert_eq!(*calls.borrow(), expected[..fail_at]);
+        assert!(error.0.contains(slice.to_str().unwrap()), "{error}");
+        assert!(error.0.contains("refused by fixture"), "{error}");
+        assert!(!slice.exists());
+    }
+}
+
+#[test]
+fn readiness_keeps_real_slice_trust_checks_after_systemctl() {
+    let scratch = ScratchDir::new("motor-readiness-slice-trust");
+    let slice = scratch.join("motorvm.slice");
+    let created = slice.clone();
+    let error = super::super::cgroup::with_test_job_slice(
+        slice.clone(),
+        move |args| {
+            if args[0] == "set-property" {
+                std::fs::create_dir(&created)?;
+                std::fs::set_permissions(&created, std::fs::Permissions::from_mode(0o777))?;
+                std::fs::write(created.join("memory.max"), "4194304\n")?;
+                std::fs::write(created.join("cgroup.subtree_control"), "unchanged")?;
+            }
+            Ok(())
+        },
+        || {
+            handle(readiness())
+                .err()
+                .expect("readiness must reject an untrusted slice")
+        },
+    );
+    assert!(
+        error
+            .0
+            .contains("root-owned, non-writable and not a symlink"),
+        "{error}"
+    );
+    assert!(error.0.contains(slice.to_str().unwrap()), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(slice.join("cgroup.subtree_control")).unwrap(),
+        "unchanged"
+    );
+}
+
+#[test]
+fn legacy_readiness_does_not_prepare_a_job_slice() {
+    let scratch = ScratchDir::new("motor-readiness-legacy");
+    super::super::cgroup::with_test_job_slice(
+        scratch.join("motorvm.slice"),
+        |_| panic!("legacy readiness must not invoke systemctl"),
+        || {
+            let response = handle(Operation::Readiness {
+                job_vms_configured: false,
+                memory_max_bytes: None,
+                workspace_disk_max_bytes: None,
+            })
+            .unwrap();
+            assert!(matches!(
+                response.reply,
+                Reply::PerJobReadiness {
+                    job_vms_configured: false,
+                    ..
+                }
+            ));
+        },
+    );
+}
+
 #[test]
 fn expired_account_copy_removes_partial_files_without_publishing_a_target() {
     let scratch = ScratchDir::new("motor-image-copy-timeout");

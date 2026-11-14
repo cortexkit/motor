@@ -11,34 +11,108 @@ pub const JOB_SLICE: &str = "/sys/fs/cgroup/motorvm.slice";
 /// Its aggregate ceiling protects host services; individual VM leaves stay
 /// unbounded so accounting for one VM cannot reclaim another VM's pmem pages.
 pub fn prepare_job_slice(memory_max_bytes: u64) -> Result<()> {
-    if memory_max_bytes == 0 {
-        return Err(Error("job slice memory ceiling is required".into()));
+    #[cfg(test)]
+    if let Some(result) = TEST_JOB_SLICE.with(|fixture| {
+        fixture
+            .borrow()
+            .as_ref()
+            .map(|(path, systemctl)| prepare_job_slice_at(path, memory_max_bytes, systemctl))
+    }) {
+        return result;
     }
-    for args in [
-        vec!["start".into(), "motorvm.slice".into()],
-        vec![
-            "set-property".into(),
-            "--runtime".into(),
-            "motorvm.slice".into(),
-            format!("MemoryMax={memory_max_bytes}"),
-        ],
-    ] {
+    prepare_job_slice_at(Path::new(JOB_SLICE), memory_max_bytes, |args| {
         let output = std::process::Command::new("systemctl")
             .args(args)
             .output()?;
         if !output.status.success() {
             return Err(Error(format!(
-                "job slice setup failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "systemctl {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        Ok(())
+    })
+}
+
+fn prepare_job_slice_at(
+    path: &Path,
+    memory_max_bytes: u64,
+    systemctl: impl Fn(&[String]) -> Result<()>,
+) -> Result<()> {
+    prepare_job_slice_inner(path, memory_max_bytes, systemctl).map_err(|error| {
+        Error(format!(
+            "job slice {} setup failed: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn prepare_job_slice_inner(
+    path: &Path,
+    memory_max_bytes: u64,
+    systemctl: impl Fn(&[String]) -> Result<()>,
+) -> Result<()> {
+    if memory_max_bytes == 0 {
+        return Err(Error("job slice memory ceiling is required".into()));
     }
-    let path = Path::new(JOB_SLICE);
+    let ceiling = memory_max_bytes.to_string();
+    let configured = match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            super::fs::trusted(path, &meta)?;
+            fs::read_to_string(path.join("memory.max"))?.trim() == ceiling
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    // The runtime property disappears on reboot. Repair it before admission,
+    // without rewriting an already configured slice on every readiness probe.
+    if !configured {
+        systemctl(&["start".into(), "motorvm.slice".into()])?;
+        systemctl(&[
+            "set-property".into(),
+            "--runtime".into(),
+            "motorvm.slice".into(),
+            format!("MemoryMax={memory_max_bytes}"),
+        ])?;
+    }
     super::fs::trusted(path, &fs::symlink_metadata(path)?)?;
-    if fs::read_to_string(path.join("memory.max"))?.trim() != memory_max_bytes.to_string() {
-        return Err(Error("job slice memory ceiling readback mismatch".into()));
+    let actual = fs::read_to_string(path.join("memory.max"))?;
+    if actual.trim() != ceiling {
+        return Err(Error(format!(
+            "job slice memory ceiling readback mismatch: expected {ceiling}, got {}",
+            actual.trim()
+        )));
     }
     enable(path)
+}
+
+#[cfg(test)]
+type TestJobSlice = (PathBuf, Box<dyn Fn(&[String]) -> Result<()>>);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_JOB_SLICE: std::cell::RefCell<Option<TestJobSlice>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_job_slice<T>(
+    path: PathBuf,
+    systemctl: impl Fn(&[String]) -> Result<()> + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_JOB_SLICE.with(|fixture| *fixture.borrow_mut() = None);
+        }
+    }
+    TEST_JOB_SLICE.with(|fixture| {
+        assert!(fixture.borrow().is_none());
+        *fixture.borrow_mut() = Some((path, Box::new(systemctl)));
+    });
+    let _reset = Reset;
+    run()
 }
 
 pub fn create_job(path: &Path, vcpus: u32) -> Result<()> {
@@ -134,7 +208,13 @@ pub fn enable(path: &Path) -> Result<()> {
             return Err(Error(format!("missing delegated controller {controller}")));
         }
     }
-    fs::write(path.join("cgroup.subtree_control"), CONTROLLERS)?;
+    let enabled = fs::read_to_string(path.join("cgroup.subtree_control"))?;
+    if !["cpu", "cpuset", "memory", "io"]
+        .iter()
+        .all(|controller| enabled.split_whitespace().any(|c| c == *controller))
+    {
+        fs::write(path.join("cgroup.subtree_control"), CONTROLLERS)?;
+    }
     Ok(())
 }
 fn remove(path: &Path) -> Result<()> {
@@ -154,6 +234,24 @@ fn remove(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn already_enabled_controllers_are_not_rewritten() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-slice-idempotent");
+        fs::write(scratch.join("cgroup.procs"), "").unwrap();
+        fs::write(scratch.join("cgroup.controllers"), "cpu cpuset memory io").unwrap();
+        fs::write(
+            scratch.join("cgroup.subtree_control"),
+            "cpu cpuset memory io\n",
+        )
+        .unwrap();
+        enable(&scratch).unwrap();
+        enable(&scratch).unwrap();
+        assert_eq!(
+            fs::read_to_string(scratch.join("cgroup.subtree_control")).unwrap(),
+            "cpu cpuset memory io\n"
+        );
+    }
+
     #[test]
     fn job_leaf_is_new_and_does_not_set_memory_limits() {
         let path =

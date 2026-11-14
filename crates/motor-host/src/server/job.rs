@@ -1209,11 +1209,21 @@ pub(crate) fn job_vm_headroom_mib(slice: &std::path::Path) -> Result<u64> {
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn job_vm_memory(slice: &std::path::Path) -> Result<crate::helper::JobVmMemory> {
-    let limit: u64 = std::fs::read_to_string(slice.join("memory.max"))?
+    let read = |name| {
+        let path = slice.join(name);
+        std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "cannot read job-VM slice file {}; run `sudo systemctl restart motor-vm-helper.service` to prepare {} with its configured memory ceiling",
+                path.display(),
+                slice.display()
+            )
+        })
+    };
+    let limit: u64 = read("memory.max")?
         .trim()
         .parse()
         .context("job-VM memory.max must be finite bytes")?;
-    let stat = std::fs::read_to_string(slice.join("memory.stat"))?;
+    let stat = read("memory.stat")?;
     let mut file = None;
     for line in stat.lines() {
         let mut fields = line.split_whitespace();
@@ -1229,7 +1239,7 @@ pub(crate) fn job_vm_memory(slice: &std::path::Path) -> Result<crate::helper::Jo
         }
     }
     let file = file.context("job-VM file memory missing")?;
-    let current: u64 = std::fs::read_to_string(slice.join("memory.current"))?
+    let current: u64 = read("memory.current")?
         .trim()
         .parse()
         .context("invalid job-VM memory.current")?;

@@ -27,6 +27,7 @@ pub(crate) struct Service {
     lifecycle: RwLock<()>,
     authority: Option<crate::cache_write::Authority>,
     job_vms_configured: bool,
+    job_slice_memory_max_bytes: Option<u64>,
     workspace_disk_max_bytes: Option<u64>,
 }
 
@@ -37,6 +38,7 @@ impl Service {
             lifecycle: RwLock::new(()),
             authority: helper.machine.cache_write_authority(),
             job_vms_configured: helper.machine.job_vms_configured(),
+            job_slice_memory_max_bytes: helper.machine.job_slice_memory_max_bytes(),
             workspace_disk_max_bytes: helper.machine.workspace_disk_max_bytes(),
         }
     }
@@ -298,6 +300,7 @@ pub(crate) fn connection_loop<M: crate::Machine>(
                     }
                     Request::PerJobReadiness {} => crate::images::Operation::Readiness {
                         job_vms_configured: service.job_vms_configured,
+                        memory_max_bytes: service.job_slice_memory_max_bytes,
                         workspace_disk_max_bytes: service.workspace_disk_max_bytes,
                     },
                     Request::RemoveJobImages { generation } => {
