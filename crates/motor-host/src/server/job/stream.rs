@@ -35,6 +35,13 @@ pub(crate) struct Stream {
     export_limit: Mutex<Option<Duration>>,
 }
 impl Stream {
+    #[cfg(test)]
+    pub(super) async fn enqueue_for_test(&self, value: &Value) {
+        let body = serde_json::to_vec(value).unwrap();
+        let bytes = [(body.len() as u32).to_be_bytes().as_slice(), &body].concat();
+        let sender = self.input.lock().unwrap().as_ref().unwrap().clone();
+        sender.send(Input { bytes, reply: None }).await.unwrap();
+    }
     fn export_timeout(&self) -> Duration {
         #[cfg(test)]
         if let Some(limit) = *self.export_limit.lock().unwrap() {
@@ -329,6 +336,7 @@ async fn collect(
                         unreachable!()
                     };
                     let mut host = runtime.host.lock().expect("host lock");
+                    host.note_job_repository(&claims.jti, &run.repository_root)?;
                     host.job_relayed_run(&claims.jti, !run.return_paths.is_empty())?;
                     if let Err(error) = if default_branch_tip {
                         host.note_fill_source(&claims.jti, &run, unix_ms())
@@ -366,9 +374,11 @@ async fn collect(
                 biased;
                 Some(input) = commands.recv() => {
                     let frame = crate::replay::decode(&input.bytes)?;
-                    if default_branch_tip && frame["type"] == "run" {
+                    if frame["type"] == "run" {
                         if let Ok(motor_protocol::Frame::Run(run)) = serde_json::from_value(frame.clone()) {
-                            if let Err(error) = runtime.host.lock().expect("host lock").note_fill_source(&claims.jti, &run, unix_ms()) {
+                            let mut host = runtime.host.lock().expect("host lock");
+                            host.note_job_repository(&claims.jti, &run.repository_root)?;
+                            if let Err(error) = if default_branch_tip { host.note_fill_source(&claims.jti, &run, unix_ms()) } else { Ok(()) } {
                                 tracing::warn!(jti=claims.jti, %error, "fill_export_setup_failed");
                             }
                         }

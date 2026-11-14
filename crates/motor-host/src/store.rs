@@ -897,6 +897,8 @@ mod rollback_tests {
         snapshot.per_job.disks.insert(
             "ws-rollback".into(),
             crate::state::jobs::WorkspaceDisk {
+                repository_key: None,
+                forked_from: None,
                 storage: Some(crate::state::jobs::storage::Disk::new(1024, 17)),
                 sub: "account".into(),
                 workspace_key_hash: "hash".into(),
@@ -994,6 +996,8 @@ mod rollback_tests {
         snapshot.per_job.disks.insert(
             "ws-rollback".into(),
             crate::state::jobs::WorkspaceDisk {
+                repository_key: None,
+                forked_from: None,
                 storage: None,
                 sub: "account".into(),
                 workspace_key_hash: "hash".into(),
@@ -1055,6 +1059,8 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     snapshot.per_job.disks.insert(
         "ws-rollback".into(),
         crate::state::jobs::WorkspaceDisk {
+            repository_key: None,
+            forked_from: None,
             storage: Some(crate::state::jobs::storage::Disk {
                 cap_bytes: 1024,
                 last_used_ms: 123,

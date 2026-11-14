@@ -1279,6 +1279,57 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
         tracing::info!(jti = %job, reason = "disk_exists", "workspace_seed_not_needed; checkout disk already exists and keeps its own warm build");
         return;
     }
+    let fork_plan = runtime
+        .host
+        .lock()
+        .expect("host lock")
+        .job_fork_plan(job, root);
+    let mut fork_failed = false;
+    match fork_plan {
+        Ok(Some(plan)) => {
+            let started = std::time::Instant::now();
+            let cloned = runtime.control.fork_workspace(&plan.request);
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match cloned {
+                Ok(reply) => {
+                    let committed = runtime.host.lock().expect("host lock").job_forked(
+                        job,
+                        &plan,
+                        &reply.donor_id,
+                    );
+                    let selected_position = plan
+                        .request
+                        .donor_ids
+                        .iter()
+                        .position(|id| id == &reply.donor_id);
+                    tracing::info!(jti = %job, donor_id = reply.donor_id,
+                        candidate_count = plan.request.donor_ids.len(), ?selected_position,
+                        size_rule = "size rule applied by the helper",
+                        clone_elapsed_ms = elapsed_ms, committed = committed.is_ok(),
+                        error = ?committed.err(), "workspace_forked");
+                    // A synced clone remains usable cold even if recording the fork in host state fails.
+                    return;
+                }
+                Err(error) => {
+                    runtime
+                        .host
+                        .lock()
+                        .expect("host lock")
+                        .release_job_fork(&plan);
+                    tracing::info!(jti = %job, donor_ids = ?plan.request.donor_ids,
+                        candidate_count = plan.request.donor_ids.len(),
+                        size_rule = "size rule applied by the helper", clone_elapsed_ms = elapsed_ms,
+                        committed = false, %error, "workspace_fork_failed; falling back to base or empty");
+                    fork_failed = true;
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::info!(jti = %job, %error, "workspace_fork_plan_failed; falling back to base or empty");
+            fork_failed = true;
+        }
+    }
     let started = std::time::Instant::now();
     let seeded = (|| -> Result<Option<String>> {
         let plan = runtime
@@ -1290,11 +1341,13 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
             return Ok(None);
         };
         runtime.control.seed_workspace(&plan.request)?;
-        runtime
-            .host
-            .lock()
-            .expect("host lock")
-            .job_seeded(job, &plan, unix_ms())?;
+        if !fork_failed {
+            runtime
+                .host
+                .lock()
+                .expect("host lock")
+                .job_seeded(job, &plan, unix_ms())?;
+        }
         Ok(Some(plan.request.base_id.clone()))
     })();
     match seeded {
@@ -1393,12 +1446,24 @@ async fn boot(
         .as_u64()
         .filter(|n| (1..=254).contains(n))
         .ok_or_else(|| anyhow::anyhow!("missing job network allocation"))?;
-    let request = crate::jobs::guest_attach_request(
+    let mut request = crate::jobs::guest_attach_request(
         &assignment.guest_init,
         &runtime.job_resolvers,
         &execution.claims.jti,
         tap,
     )?;
+    if runtime
+        .host
+        .lock()
+        .expect("host lock")
+        .snapshot
+        .per_job
+        .disks[&execution.disk_id]
+        .forked_from
+        .is_some()
+    {
+        request["forked"] = serde_json::json!(true);
+    }
     let control = runtime.control.clone();
     let job = execution.claims.jti.clone();
     let wait = runtime.boot_remaining(execution, unix_ms());

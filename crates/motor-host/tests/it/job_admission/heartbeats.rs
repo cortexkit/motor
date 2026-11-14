@@ -21,6 +21,8 @@ fn disk(h: &mut Host, id: &str, used: u64) {
     h.snapshot.per_job.disks.insert(
         id.into(),
         WorkspaceDisk {
+            repository_key: None,
+            forked_from: None,
             storage: Some(motor_host::state::jobs::storage::Disk::new(1024, used)),
             sub: TENANT.into(),
             workspace_key_hash: HASH.into(),

@@ -8,6 +8,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 pub mod fills;
+pub(crate) mod forks;
 pub(crate) mod have;
 pub mod images;
 pub mod recovery;
@@ -77,6 +78,10 @@ impl Ledger {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct WorkspaceDisk {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<storage::Disk>,
     pub sub: String,
@@ -501,6 +506,8 @@ impl Host {
                 .disks
                 .entry(disk_id.clone())
                 .or_insert_with(|| WorkspaceDisk {
+                    repository_key: None,
+                    forked_from: None,
                     storage: Some(storage::Disk::new(
                         settings.workspace_disk_cap_bytes,
                         now_ms,
@@ -581,6 +588,7 @@ impl Host {
                 let disk = &self.snapshot.per_job.disks[&e.disk_id];
                 !e.boot_started
                     && !e.ended
+                    && !self.fork_holds.contains_key(&e.disk_id)
                     && !disk.quarantined
                     && disk.attached_job.is_none()
                     && disk.queue.first().map(String::as_str) == Some(job)
@@ -664,6 +672,9 @@ impl Host {
             .is_none()
             .then_some(storage::REPLAY_RECORD_BYTES);
         let disk = next.per_job.disks.get_mut(&execution.disk_id).unwrap();
+        if execution.runner_hello {
+            disk.forked_from = None;
+        }
         disk.queue.retain(|queued| queued != job);
         if disk.attached_job.as_deref() == Some(job) {
             disk.attached_job = None;

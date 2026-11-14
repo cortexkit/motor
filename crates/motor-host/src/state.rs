@@ -287,6 +287,7 @@ pub struct Host {
     fill_capacity_refused_at_ms: Option<u64>,
     host_resources_failed: std::cell::RefCell<Option<jobs::HostResourcesFailure>>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
+    fork_holds: BTreeMap<String, jobs::forks::Hold>,
     /// The jobs whose lease has not ended, kept in step with `snapshot` by
     /// [`Host::save`], so a save checks drain completion and overlapping
     /// leases without reading every finished job's lease.
@@ -334,6 +335,7 @@ impl Host {
             fill_capacity_refused_at_ms: None,
             host_resources_failed: std::cell::RefCell::new(None),
             job_storage: None,
+            fork_holds: BTreeMap::new(),
             unended: std::collections::BTreeSet::new(),
         }
         .with_unended_index()
@@ -402,6 +404,7 @@ impl Host {
             crate::billing::mark_overlap(&mut next, &unended);
         }
         self.journal.store(&next)?;
+        self.update_fork_holds(&next);
         self.snapshot = next;
         // The previous snapshot is gone, so its bases are normally owned by
         // this snapshot alone and the changes fold in place.
