@@ -3,6 +3,14 @@ use crate::jobs::fill_source::{self, Request, Slot};
 use motor_protocol::{BundleManifest, FillSource};
 use sha2::{Digest, Sha256};
 
+fn set_forks(runtime: &Runtime, enabled: bool) {
+    let crate::config::HostSettings::PerJob(settings) = &mut runtime.host.lock().unwrap().settings
+    else {
+        unreachable!()
+    };
+    settings.fork_checkouts = enabled;
+}
+
 fn incomplete_reply() -> Value {
     json!({"ok":true,"skipped":{
         "reason":"fill_source_incomplete",
@@ -31,6 +39,7 @@ async fn incomplete_export_keeps_previous_source_and_clears_reservation_only_onc
         (json!({"ok":false,"error":"export failure"}), false),
     ] {
         let (runtime, fake, storage) = fixture();
+        set_forks(&runtime, false);
         let request = Request {
             account: claims(JOB).sub,
             repository_root: "/home/source".into(),
@@ -184,6 +193,7 @@ fn candidate_read_retires_stored_duplicate_sources_and_their_bundles() {
     use crate::jobs::fills::FillGuest;
 
     let (runtime, _, _storage) = fixture();
+    set_forks(&runtime, false);
     let slot = duplicate_source_slot();
     let key = fill_source::key(&slot.request.account, &slot.request.repository_root);
     let journal = {
@@ -217,4 +227,165 @@ fn candidate_read_retires_stored_duplicate_sources_and_their_bundles() {
     drop(runtime);
     let (_, snapshot) = crate::journal::FileJournal::open(&journal).unwrap();
     assert!(snapshot.per_job.fill_sources.is_empty());
+}
+
+fn valid_source_slot() -> Slot {
+    let mut slot = duplicate_source_slot();
+    slot.source.bundles.truncate(1);
+    slot.source.git_dependencies.clear();
+    slot.bytes = 1;
+    slot
+}
+
+#[test]
+fn checkout_forks_retire_persisted_sources_and_pending_exports_but_other_modes_keep_them() {
+    for mode in ["forks", "fills", "tenant"] {
+        let (runtime, _, storage) = fixture();
+        let slot = valid_source_slot();
+        let key = fill_source::key(&slot.request.account, &slot.request.repository_root);
+        let directory = fill_source::directory(storage.root.path(), &slot.generation);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("0"), b"x").unwrap();
+        claim(&runtime, &claims(JOB));
+        {
+            let mut host = runtime.host.lock().unwrap();
+            let mut next = host.snapshot.clone();
+            next.per_job
+                .export_tips
+                .insert(JOB.into(), slot.request.clone());
+            next.per_job.fill_sources.insert(key.clone(), slot.clone());
+            host.save(next).unwrap();
+            match mode {
+                "fills" => {
+                    let crate::config::HostSettings::PerJob(settings) = &mut host.settings else {
+                        unreachable!()
+                    };
+                    settings.fork_checkouts = false;
+                }
+                "tenant" => host.settings = crate::config::HostSettings::Tenant,
+                _ => {}
+            }
+            host.clean_fill_sources().unwrap();
+            if mode == "forks" {
+                assert!(host.snapshot.per_job.export_tips.is_empty());
+                assert!(host.snapshot.per_job.fill_sources.is_empty());
+            } else {
+                assert_eq!(host.snapshot.per_job.export_tips[JOB], slot.request);
+                assert_eq!(host.snapshot.per_job.fill_sources[&key], slot);
+            }
+        }
+        assert_eq!(directory.exists(), mode != "forks");
+        drop(runtime);
+        let (_, snapshot) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+        assert_eq!(snapshot.per_job.fill_sources.is_empty(), mode == "forks");
+        assert_eq!(snapshot.per_job.export_tips.is_empty(), mode == "forks");
+    }
+}
+
+#[test]
+fn disabling_checkout_forks_rebuilds_a_source_from_the_next_default_branch_job() {
+    let (runtime, fake, _storage) = fixture();
+    set_forks(&runtime, false);
+    let mut value = run(JOB);
+    value["integration_tip"] = json!("a".repeat(40));
+    let motor_protocol::Frame::Run(mut run) = serde_json::from_value(value).unwrap() else {
+        unreachable!()
+    };
+    claim(&runtime, &claims(JOB));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .note_fill_source(JOB, &run, unix_ms())
+        .unwrap();
+    assert_eq!(
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .snapshot
+            .per_job
+            .export_tips
+            .len(),
+        1
+    );
+    set_forks(&runtime, true);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.clean_fill_sources().unwrap();
+        host.note_fill_source(JOB, &run, unix_ms()).unwrap();
+        assert!(host.snapshot.per_job.export_tips.is_empty());
+    }
+    // Retiring sources when forks turn on must not permanently disable exports.
+    set_forks(&runtime, false);
+    claim(&runtime, &claims(JOB2));
+    run.job_id = JOB2.parse().unwrap();
+    let request = {
+        let mut host = runtime.host.lock().unwrap();
+        host.note_fill_source(JOB2, &run, unix_ms()).unwrap();
+        host.snapshot.per_job.export_tips[JOB2].clone()
+    };
+    let bytes = b"fresh source";
+    let source = FillSource {
+        repository_root: request.repository_root.clone(),
+        integration_tip: request.integration_tip.clone(),
+        bundles: vec![BundleManifest {
+            index: 0,
+            repository: request.repository_root.clone(),
+            length: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }],
+        git_dependencies: vec![],
+    };
+    let (socket, mut guest) = UnixStream::pair().unwrap();
+    *fake.fill_export.lock().unwrap() = Some(socket);
+    let guest = std::thread::spawn(move || {
+        assert_eq!(
+            crate::helper::read_json(&mut guest).unwrap()["op"],
+            "export_tip"
+        );
+        crate::helper::write_json(&mut guest, &json!({"ok":true,"source":source})).unwrap();
+        motor_protocol::write_frame(
+            &mut guest,
+            &motor_protocol::Frame::BundleChunk {
+                index: 0,
+                offset: 0,
+                data: motor_protocol::BytePayload(bytes.to_vec()),
+            },
+        )
+        .unwrap();
+    });
+    fill_source::export(
+        &runtime.host,
+        &*fake,
+        JOB2,
+        std::time::Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    guest.join().unwrap();
+    let key = fill_source::key(&request.account, &request.repository_root);
+    {
+        let host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.per_job.export_tips.is_empty());
+        let slot = &host.snapshot.per_job.fill_sources[&key];
+        assert_eq!(slot.request, request);
+        assert_eq!(
+            std::fs::read(
+                fill_source::directory(&host.journal_directory().unwrap(), &slot.generation)
+                    .join("0")
+            )
+            .unwrap(),
+            bytes
+        );
+    }
+    set_forks(&runtime, true);
+    runtime.host.lock().unwrap().clean_fill_sources().unwrap();
+    assert!(runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .fill_sources
+        .is_empty());
 }

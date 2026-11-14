@@ -138,7 +138,7 @@ defaults:
 
 | Setting | Meaning |
 | --- | --- |
-| `fork_checkouts` | Copy a new worktree's checkout disk from the repository's most recent warm disk; requires a job image whose runner adopts forked disks. |
+| `fork_checkouts` | Copy a new worktree's checkout disk from the repository's most recent warm disk; requires a job image whose runner adopts forked disks. When true, background fills and fill-source exports stop; pending exports and stored fill sources are retired. When false, background fills and exports continue. Existing fill bases remain available as seed fallbacks in either case. |
 | `vcpu_ceiling` | Maximum job vCPUs, at most the online CPU count. |
 | `permit_budget` | Host vCPU permits with overcommit, at least the ceiling and at most four times online CPUs. |
 | `host_reserve_mib` | Host available-memory floor in MiB. |

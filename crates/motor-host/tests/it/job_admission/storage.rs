@@ -37,6 +37,40 @@ fn fill_source_slot() -> crate::jobs::fill_source::Slot {
 }
 
 #[test]
+fn checkout_forks_free_pending_export_and_stored_source_growth_promises() {
+    let scratch = scratch();
+    let mut h = durable_host(scratch.path(), 10_000);
+    let storage = Storage::new(u64::MAX);
+    enable(&mut h, &storage);
+    h.claim(job(JOB), AT).unwrap();
+    let slot = fill_source_slot();
+    let key = crate::jobs::fill_source::key(&slot.request.account, &slot.request.repository_root);
+    let directory = crate::jobs::fill_source::directory(scratch.path(), &slot.generation);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("0"), b"x").unwrap();
+    h.snapshot
+        .per_job
+        .export_tips
+        .insert(JOB.into(), slot.request.clone());
+    h.snapshot.per_job.fill_sources.insert(key, slot);
+    storage
+        .free
+        .store(FLOOR + CAP + JOB_BYTES, Ordering::SeqCst);
+    let mut next = h.snapshot.clone();
+    assert!(h.reserve_storage(&mut next, "", AT).is_err());
+    let motor_host::config::HostSettings::PerJob(settings) = &mut h.settings else {
+        unreachable!()
+    };
+    settings.fork_checkouts = true;
+    h.clean_fill_sources().unwrap();
+    assert!(h.snapshot.per_job.export_tips.is_empty());
+    assert!(h.snapshot.per_job.fill_sources.is_empty());
+    assert!(!directory.exists());
+    let mut next = h.snapshot.clone();
+    assert!(h.reserve_storage(&mut next, "", AT).is_ok());
+}
+
+#[test]
 fn source_slot_growth_and_atomic_replacement_are_both_reserved_before_a_fill() {
     // Leave room for the 24 GiB fill floor so only storage controls admission.
     let mut h = memory_host(64 * 1024);

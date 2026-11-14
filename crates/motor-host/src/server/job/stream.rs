@@ -520,13 +520,11 @@ async fn collect(
                 let job = claims.jti.clone();
                 let limit = store.export_timeout();
                 let deadline = std::time::Instant::now() + limit;
-                let due = host
-                    .lock()
-                    .expect("host lock")
-                    .snapshot
-                    .per_job
-                    .export_tips
-                    .contains_key(&job);
+                let due = {
+                    let host = host.lock().expect("host lock");
+                    host.settings.background_fills_enabled()
+                        && host.snapshot.per_job.export_tips.contains_key(&job)
+                };
                 // The terminal is already durable and billing has ended. Do not
                 // make a connected caller wait for maintenance before seeing it.
                 let export = async {

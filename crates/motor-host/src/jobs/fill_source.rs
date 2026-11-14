@@ -196,7 +196,7 @@ impl Host {
         run: &motor_protocol::Run,
         now_ms: u64,
     ) -> Result<()> {
-        if run.integration_tip.is_empty() {
+        if !self.settings.background_fills_enabled() || run.integration_tip.is_empty() {
             return Ok(());
         }
         let execution = self
@@ -299,7 +299,11 @@ fn export_with(
     before_commit: impl FnOnce(),
 ) -> Result<()> {
     let (request, journal) = {
-        let host = host.lock().expect("host lock");
+        let mut host = host.lock().expect("host lock");
+        if !host.settings.background_fills_enabled() {
+            host.clean_fill_sources()?;
+            return Ok(());
+        }
         let Some(request) = host.snapshot.per_job.export_tips.get(job).cloned() else {
             return Ok(());
         };
@@ -368,6 +372,10 @@ fn export_with(
         }
         before_commit();
         let mut host = host.lock().expect("host lock");
+        ensure!(
+            host.settings.background_fills_enabled(),
+            "fill exports disabled"
+        );
         ensure!(Instant::now() < deadline, "fill export timed out");
         ensure!(
             host.snapshot.per_job.export_tips.get(job) == Some(&request),
@@ -438,6 +446,12 @@ impl Read for Deadline<'_> {
 impl Host {
     pub(crate) fn clean_fill_sources(&mut self) -> Result<()> {
         let mut next = self.snapshot.clone();
+        if !self.settings.background_fills_enabled() {
+            // Retire both the stored bundles and outstanding export reservations
+            // before unlinking generations, including requests from older hosts.
+            next.per_job.export_tips.clear();
+            next.per_job.fill_sources.clear();
+        }
         // Older exporters wrote a bundle for every package, even when packages
         // shared a locked Git source. Retire those generations rather than
         // rewriting bundle indices or relaxing the guest's import validation.

@@ -1610,6 +1610,11 @@ async fn slow_live_caller_and_restarted_attach_receive_truncation_then_all_retai
 #[tokio::test]
 async fn failed_export_starts_after_caller_terminal_and_does_not_extend_billing_or_change_replay() {
     let (runtime, fake, _) = fixture();
+    if let crate::config::HostSettings::PerJob(settings) =
+        &mut runtime.host.lock().unwrap().settings
+    {
+        settings.fork_checkouts = false;
+    }
     let (export_host, mut export_guest) = UnixStream::pair().unwrap();
     *fake.fill_export.lock().unwrap() = Some(export_host);
     let (mut client, task, mut guest) = launched(&runtime, &fake).await;
@@ -1696,6 +1701,11 @@ async fn failed_export_starts_after_caller_terminal_and_does_not_extend_billing_
 #[tokio::test]
 async fn timed_out_export_stops_the_vm_without_changing_the_terminal_or_billed_end() {
     let (runtime, fake, _) = fixture();
+    if let crate::config::HostSettings::PerJob(settings) =
+        &mut runtime.host.lock().unwrap().settings
+    {
+        settings.fork_checkouts = false;
+    }
     let (export_host, _stuck_guest) = UnixStream::pair().unwrap();
     *fake.fill_export.lock().unwrap() = Some(export_host);
     let (mut client, task, mut guest) = launched(&runtime, &fake).await;
@@ -1748,5 +1758,55 @@ async fn timed_out_export_stops_the_vm_without_changing_the_terminal_or_billed_e
             json!({"type":"exit","code":0})
         );
     }
+    assert_eq!(replayed(&runtime).await, frames);
+}
+
+#[tokio::test]
+async fn checkout_forks_drop_a_persisted_export_at_terminal_without_contacting_the_guest() {
+    let (runtime, fake, _) = fixture();
+    let (export_host, _export_guest) = UnixStream::pair().unwrap();
+    *fake.fill_export.lock().unwrap() = Some(export_host);
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let mut next = host.snapshot.clone();
+        next.per_job.export_tips.insert(
+            JOB.into(),
+            crate::jobs::fill_source::Request {
+                account: claims(JOB).sub,
+                repository_root: "/home/source".into(),
+                integration_tip: "a".repeat(40),
+                mem_mib: 100,
+                observed_ms: unix_ms(),
+            },
+        );
+        host.save(next).unwrap();
+    }
+    let frames = records();
+    for frame in &frames {
+        guest.write_all(frame).await.unwrap();
+    }
+    for frame in &frames {
+        assert_eq!(next_record(&mut client).await.bytes, *frame);
+    }
+    task.await.unwrap().unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(10), guest_frame(&mut guest))
+        .await
+        .expect("terminal acknowledgement must not wait for an export");
+    assert_eq!(ack["type"], "terminal_stored");
+    assert!(
+        fake.fill_export.lock().unwrap().is_some(),
+        "no export relay may be opened"
+    );
+    {
+        let host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.per_job.export_tips.is_empty());
+        assert!(host.snapshot.per_job.fill_sources.is_empty());
+        assert_eq!(
+            host.snapshot.billing[JOB].terminal.as_ref().unwrap()["outcome"],
+            json!({"type":"exit","code":0})
+        );
+    }
+    runtime.stop_job(JOB, false, true).unwrap();
     assert_eq!(replayed(&runtime).await, frames);
 }
