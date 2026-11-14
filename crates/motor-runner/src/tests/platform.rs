@@ -393,8 +393,11 @@ fn macos_request(f: &Fixture) -> Run {
 fn macos_drain_survives_restart_with_typed_refusal_and_resume_clears_it() {
     let f = Fixture::new();
     let config = platform_config(&f, BackendKind::MacosVm);
-    let open =
-        || Runner::open_with_backend(config.clone(), Box::new(backend::HostBackend)).unwrap();
+    // Dropping a runner releases its daemon lock only after its background
+    // threads stop, so reopen through the shared helper that waits for it.
+    let open = || {
+        reopen_with(|| Runner::open_with_backend(config.clone(), Box::new(backend::HostBackend)))
+    };
     let runner = open();
     runner
         .try_begin_drain_request(Duration::from_secs(30), true)
