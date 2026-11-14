@@ -4622,7 +4622,9 @@ impl Runner {
         // Validate the destination before retiring any donor. A bad caller path
         // must not turn a refused request into deletion of inherited data.
         crate::fork_adoption::confined(roots, &destination)?;
-        let keys: Vec<_> = inner.catalog.workspaces.keys().cloned().collect();
+        let keys: Vec<String> = paths::keys(&inner.catalog.workspaces)
+            .map(|plan| plan.caller.text().clone())
+            .collect();
         for key in &keys {
             match self.adoption_path(roots, key).and_then(|path| {
                 crate::fork_adoption::confined(roots, &path)?;

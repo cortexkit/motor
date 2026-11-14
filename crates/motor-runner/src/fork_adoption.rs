@@ -45,9 +45,8 @@ pub(crate) fn donor(catalog: &Catalog, request: &Run) -> io::Result<String> {
     if !request.siblings.is_empty() {
         return Err(refusal("request has siblings"));
     }
-    let matching: Vec<_> = catalog
-        .workspaces
-        .iter()
+    let matching: Vec<_> = paths::entries(&catalog.workspaces)
+        .map(|(plan, workspace)| (plan.caller.text(), workspace))
         .filter(|(_, workspace)| {
             paths::workspace_record(workspace).repository.caller.text()
                 == request_paths.caller_repository_root.text()

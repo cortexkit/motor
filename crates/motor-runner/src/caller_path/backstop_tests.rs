@@ -7,6 +7,7 @@ use std::{
 const ALLOWLIST: &[&str] = &[
     "windows.rs",
     "macos.rs",
+    "macos/drain.rs",
     "macos/execution.rs",
     "macos/execution_tests.rs",
     "macos/fs.rs",
