@@ -85,6 +85,32 @@ fn tap_objects(index: u8) -> BTreeSet<String> {
         .into()
 }
 
+/// Joins the exit watcher before the private-namespace fixture is dropped.
+///
+/// The watcher thread shares the test thread's filesystem state, and
+/// `setns(CLONE_NEWNS)` back to the host mount namespace fails (EINVAL) while
+/// any thread shares it. The watcher exits within 100 ms of the last
+/// `LinuxJobs` reference dropping, so declare this guard before every holder
+/// of that reference: locals drop in reverse order, so it runs after them.
+struct WatcherGuard(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.0.take() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            eprintln!("exit watcher still running after 30 s; namespace restore will fail");
+        }
+    }
+}
+
 fn wait_for(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !ready() {
@@ -112,11 +138,14 @@ fn wait_for(mut ready: impl FnMut() -> bool) {
 fn isolated_job_exit_is_reported_while_another_job_boots() {
     assert_eq!(unsafe { libc::geteuid() }, 0, "run as the root operator");
     let _isolation = namespace::root_tests::Fixture::new();
+    let mut watcher = WatcherGuard(None);
     let base = scratch();
     let slice = format!("motorvmexit{}.slice", std::process::id());
     let config: Config =
         serde_json::from_str(include_str!("../../../../fixtures/helper.json")).unwrap();
     let mut jobs = machine_with_config(&base, &config);
+    // The production jail parent is created once at helper startup.
+    std::fs::create_dir_all(&jobs.jail).unwrap();
     jobs.groups = Path::new("/sys/fs/cgroup").join(&slice);
     jobs.remove_test_group = None;
     jobs.network = Box::new(fixture::PrivateNetwork {
@@ -163,7 +192,7 @@ fn isolated_job_exit_is_reported_while_another_job_boots() {
     fixture::command("systemctl", &["start", &resources.slice]);
     cgroup::enable(&resources.jobs.groups).unwrap();
     let jobs = resources.jobs.clone();
-    let watcher = jobs.start_exit_watcher();
+    watcher.0 = Some(jobs.start_exit_watcher());
     let request = |n| {
         let mut request = start();
         request.job_id = job::test_id(n);
@@ -283,5 +312,4 @@ fn isolated_job_exit_is_reported_while_another_job_boots() {
         matches!(reply, Reply::Job { running: true, tap_index: Some(reused), .. } if reused == index)
     );
     boot::guest_ready(&jobs, &third.job_id);
-    drop(watcher);
 }
