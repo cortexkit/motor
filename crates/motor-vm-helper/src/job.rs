@@ -179,6 +179,45 @@ pub struct Seed {
     pub cache_write_job_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fork {
+    pub account: String,
+    pub disk_id: String,
+    pub repository_root: String,
+    pub donor_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_job_id: Option<String>,
+}
+
+/// Helper-owned fork provenance and the result of a successful clone.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forked {
+    pub donor_id: String,
+}
+
+impl Fork {
+    pub fn validate(&self) -> Result<()> {
+        validate_account(&self.account)?;
+        validate_id(&self.disk_id)?;
+        if !std::path::Path::new(&self.repository_root).is_absolute()
+            || self.repository_root.contains('\0')
+        {
+            return Err(Error(
+                "fork repository root must be an absolute path".into(),
+            ));
+        }
+        for id in &self.donor_ids {
+            validate_id(id)?;
+        }
+        if let Some(id) = &self.cache_write_job_id {
+            validate_job_id(id)?;
+        }
+        Ok(())
+    }
+}
+
 /// Internal sparse-disk request. The provisioning operation chooses the role;
 /// ordinary workspace requests cannot select the Fill or Base role.
 pub struct CreateWorkspace {
@@ -234,6 +273,7 @@ pub enum Operation {
         published: bool,
     },
     SeedWorkspace(Seed),
+    ForkWorkspace(Fork),
     DeleteWorkspace {
         account: String,
         disk_id: String,
@@ -266,6 +306,7 @@ impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::PrepareFill(fill) | Self::FinishFill { fill, .. } => fill.validate(),
+            Self::ForkWorkspace(fork) => fork.validate(),
             Self::SeedWorkspace(seed) => {
                 validate_account(&seed.account)?;
                 validate_id(&seed.repository_key)?;
@@ -314,6 +355,56 @@ pub(crate) fn test_id(number: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_request_is_strict_and_reply_names_the_donor() {
+        let payload = serde_json::json!({
+            "account": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "disk_id": "new-disk", "repository_root": "/repo",
+            "donor_ids": ["recent", "large"]
+        });
+        let request = serde_json::json!({"op": "fork_workspace", "fork": payload});
+        let parsed: crate::Request = serde_json::from_value(request.clone()).unwrap();
+        let crate::Request::ForkWorkspace { fork } = parsed else {
+            panic!("wrong operation");
+        };
+        fork.validate().unwrap();
+        assert_eq!(fork.donor_ids, ["recent", "large"]);
+        assert!(!serde_json::to_value(&fork)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("cache_write_job_id"));
+        for field in ["path", "role", "size_bytes", "fixed_path_repositories"] {
+            let mut extra = request.clone();
+            extra[field] = serde_json::json!("forbidden");
+            assert!(serde_json::from_value::<crate::Request>(extra).is_err());
+            let mut extra = request.clone();
+            extra["fork"][field] = serde_json::json!("forbidden");
+            assert!(serde_json::from_value::<crate::Request>(extra).is_err());
+        }
+        for (field, value) in [
+            ("account", serde_json::json!("../other")),
+            ("disk_id", serde_json::json!("../other")),
+            ("repository_root", serde_json::json!("")),
+            ("repository_root", serde_json::json!("relative")),
+            ("repository_root", serde_json::json!("/repo\0bad")),
+            ("donor_ids", serde_json::json!(["valid", "../other"])),
+            ("cache_write_job_id", serde_json::json!("not-a-job")),
+        ] {
+            let mut bad = payload.clone();
+            bad[field] = value;
+            let bad: super::Fork = serde_json::from_value(bad).unwrap();
+            assert!(super::Operation::ForkWorkspace(bad).validate().is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(crate::Reply::WorkspaceForked(super::Forked {
+                donor_id: "large".into()
+            }))
+            .unwrap(),
+            serde_json::json!({"result": "workspace_forked", "donor_id": "large"})
+        );
+    }
+
     #[test]
     fn workspace_storage_operations_accept_identities_never_paths_or_roles() {
         for op in ["workspace_usage", "evict_base", "ensure_workspace"] {

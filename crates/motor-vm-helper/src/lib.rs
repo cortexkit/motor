@@ -58,6 +58,9 @@ pub enum Request {
     SeedWorkspace {
         seed: job::Seed,
     },
+    ForkWorkspace {
+        fork: job::Fork,
+    },
     InspectJobImages {
         generation: String,
     },
@@ -277,6 +280,7 @@ pub enum Reply {
     FillFinished {
         published: bool,
     },
+    WorkspaceForked(job::Forked),
     JobImages {
         manifest: images::Manifest,
     },
@@ -524,6 +528,7 @@ impl<M: Machine> Helper<M> {
                 self.job(job::Operation::FinishFill { fill, published }, peer)
             }
             Request::SeedWorkspace { seed } => self.job(job::Operation::SeedWorkspace(seed), peer),
+            Request::ForkWorkspace { fork } => self.job(job::Operation::ForkWorkspace(fork), peer),
             Request::EvictBase { account, disk_id } => {
                 self.job(job::Operation::EvictBase { account, disk_id }, peer)
             }

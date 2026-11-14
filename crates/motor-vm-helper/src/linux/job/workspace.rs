@@ -2,6 +2,8 @@ use super::*;
 use std::{ffi::CString, io::Write};
 mod usage;
 pub(super) use usage::exclusive_bytes;
+mod fork;
+pub(super) use fork::fork_bound;
 
 pub(super) fn open_disk(root: &Path, account: &str, disk_id: &str) -> Result<(Workspace, File)> {
     job::validate_account(account)?;

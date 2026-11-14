@@ -57,6 +57,7 @@ impl Service {
                 | crate::job::Operation::EnsureWorkspace { .. }
                 | crate::job::Operation::DeleteWorkspace { .. }
                 | crate::job::Operation::SeedWorkspace(_)
+                | crate::job::Operation::ForkWorkspace(_)
                 | crate::job::Operation::EvictBase { .. }
                 | crate::job::Operation::WorkspaceUsage { .. }
                 | crate::job::Operation::PrepareFill(_)
