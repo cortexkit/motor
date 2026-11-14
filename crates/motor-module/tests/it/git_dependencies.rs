@@ -3,7 +3,7 @@ use crate::snapshot::{self, Snapshots};
 use cortexkit_test_support::ScratchDir;
 use motor_protocol::*;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -106,6 +106,226 @@ async fn run_lockfile_source_is_commit_not_worktree() {
             .is_empty()
     );
 }
+fn isolated_tip_cargo_home(test: &str) -> bool {
+    const CHILD: &str = "MOTOR_TEST_TIP_DEPENDENCIES_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        return false;
+    }
+    // Cargo-home selection is process-wide; isolate it from parallel tests.
+    let home = ScratchDir::new("motor-tip-cargo-home");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("tests::git_dependencies::{test}"),
+            "--nocapture",
+        ])
+        .env(CHILD, test)
+        .env("CARGO_HOME", home.as_ref())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "tip dependency job failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+fn commit_all(path: &Path, message: &str) -> String {
+    git(path, &["add", "."]);
+    git(
+        path,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            message,
+        ],
+    );
+    git(path, &["rev-parse", "HEAD"])
+}
+
+fn tip_cargo_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("CARGO_HOME").unwrap())
+}
+
+const TIP_URL: &str = "https://example.invalid/commons.git";
+
+async fn tip_dependency_fixture(cache_tip: bool) -> (Fixture, String, String) {
+    let f = Fixture::new(Cut::None, 28).await;
+    let dependency = f.scratch.join("dependency");
+    fs::create_dir(&dependency).unwrap();
+    git(&dependency, &["init"]);
+    fs::write(dependency.join("source"), "revision A\n").unwrap();
+    let a = commit_all(&dependency, "dependency A");
+    let cache = tip_cargo_home().join("git/db/commons-test");
+    fs::create_dir_all(&cache).unwrap();
+    git(&cache, &["init", "--bare"]);
+    git(
+        &cache,
+        &[
+            "fetch",
+            dependency.to_str().unwrap(),
+            &format!("{a}:refs/heads/cached"),
+        ],
+    );
+    fs::write(dependency.join("source"), "revision B\n").unwrap();
+    let b = commit_all(&dependency, "dependency B");
+    if cache_tip {
+        git(
+            &cache,
+            &[
+                "fetch",
+                dependency.to_str().unwrap(),
+                &format!("{b}:refs/heads/cached"),
+            ],
+        );
+    }
+    git(&f.main, &["branch", "-M", "main"]);
+    fs::write(
+        f.main.join("Cargo.lock"),
+        lock(&[format!("git+{TIP_URL}#{b}")]),
+    )
+    .unwrap();
+    commit_all(&f.main, "default branch locks B");
+    let origin = f.scratch.join("origin.git");
+    git(&f.main, &["clone", "--bare", ".", origin.to_str().unwrap()]);
+    git(
+        &f.main,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    fs::write(
+        f.key.join("Cargo.lock"),
+        lock(&[format!("git+{TIP_URL}#{a}")]),
+    )
+    .unwrap();
+    commit_all(&f.key, "worktree locks A");
+    (f, a, b)
+}
+
+#[tokio::test]
+async fn cached_tip_dependency_is_offered_without_changing_snapshot() {
+    if isolated_tip_cargo_home("cached_tip_dependency_is_offered_without_changing_snapshot") {
+        return;
+    }
+    use super::recovery::{collect, terminal};
+    let (f, a, b) = tip_dependency_fixture(true).await;
+    let snapshot = git(&f.key, &["rev-parse", "HEAD"]);
+    let tree = git(&f.key, &["rev-parse", "HEAD^{tree}"]);
+    let tip = git(&f.main, &["rev-parse", "HEAD"]);
+    let cache_before = bytes(&tip_cargo_home());
+    let motor = f.motor();
+    for cold in [true, false] {
+        f.proxy.frames.lock().unwrap().clear();
+        let records = collect(motor.run(f.request("true")).unwrap()).await;
+        assert_eq!(terminal(&records).outcome, Outcome::Exit { code: 0 });
+        let frames = f.proxy.frames.lock().unwrap();
+        let run = frames
+            .iter()
+            .find_map(|frame| match frame {
+                Frame::Run(run) => Some(run),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(run.snapshot_commit, snapshot);
+        assert_eq!(run.tree_hash, tree);
+        assert_eq!(run.integration_tip, tip);
+        assert_eq!(run.git_dependencies.len(), 2, "tip-only B was not offered");
+        for commit in [&a, &b] {
+            let dependency = run
+                .git_dependencies
+                .iter()
+                .find(|dependency| {
+                    dependency.url == TIP_URL && dependency.commits == [commit.clone()]
+                })
+                .expect("locked commit offered");
+            assert_eq!(dependency.bundle.is_some(), cold);
+            if let Some(bundle) = &dependency.bundle {
+                assert_eq!(bundle.repository, TIP_URL);
+                assert!(bundle.length > 0);
+                assert!(frames.iter().any(|frame| matches!(frame, Frame::BundleChunk { index, .. } if *index == bundle.index)));
+            }
+        }
+        if cold {
+            assert_eq!(bytes(&tip_cargo_home()), cache_before);
+            // The second job must rely on Have, not on the client's cache.
+            fs::remove_dir_all(tip_cargo_home().join("git/db/commons-test")).unwrap();
+        }
+    }
+    assert!(snapshot::cached_commit(&tip_cargo_home(), TIP_URL, &b).is_none());
+    assert_eq!(git(&f.key, &["rev-parse", "HEAD"]), snapshot);
+    assert_eq!(
+        fs::read_to_string(f.key.join("Cargo.lock")).unwrap(),
+        lock(&[format!("git+{TIP_URL}#{a}")])
+    );
+}
+
+#[tokio::test]
+async fn missing_tip_only_dependency_does_not_block_job() {
+    if isolated_tip_cargo_home("missing_tip_only_dependency_does_not_block_job") {
+        return;
+    }
+    use super::recovery::{collect, terminal};
+    let (f, a, b) = tip_dependency_fixture(false).await;
+    // A new URL at the tip must participate in Have even when it cannot be
+    // supplied. The required snapshot URL still carries only its cached A.
+    let extra_url = "https://example.invalid/new-tip-dependency.git";
+    let unsupported = "file:///unavailable-tip-dependency";
+    fs::write(
+        f.main.join("Cargo.lock"),
+        lock(&[
+            format!("git+{TIP_URL}#{b}"),
+            format!("git+{extra_url}#{b}"),
+            format!("git+{unsupported}#{b}"),
+        ]),
+    )
+    .unwrap();
+    commit_all(&f.main, "default branch adds dependency URL");
+    git(
+        &f.scratch.join("origin.git"),
+        &[
+            "fetch",
+            f.main.to_str().unwrap(),
+            "refs/heads/main:refs/heads/main",
+        ],
+    );
+    let snapshots = Snapshots::build(
+        &f.config,
+        f.key.to_str().unwrap(),
+        f.main.to_str().unwrap(),
+        &[],
+        &f.scratch.join("spool"),
+        Uuid::now_v7(),
+        None,
+        &crate::storage::Storage::open(&f.scratch.join("capture-store")).unwrap(),
+    )
+    .unwrap_or_else(|_| panic!("snapshot failed"));
+    assert!(snapshots.git_dependencies[TIP_URL].contains(&b));
+    assert!(snapshots.git_dependencies.contains_key(extra_url));
+    assert!(!snapshots.git_dependencies.contains_key(unsupported));
+    assert!(snapshot::cached_commit(&tip_cargo_home(), TIP_URL, &b).is_none());
+    let motor = f.motor();
+    let records = collect(motor.run(f.request("true")).unwrap()).await;
+    assert_eq!(terminal(&records).outcome, Outcome::Exit { code: 0 });
+    let frames = f.proxy.frames.lock().unwrap();
+    assert!(frames.iter().any(|frame| matches!(frame, Frame::Have { git_dependencies, .. } if git_dependencies.contains(&TIP_URL.into()) && git_dependencies.contains(&extra_url.into()))));
+    let run = frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Run(run) => Some(run),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(run.git_dependencies.len(), 1);
+    assert_eq!(run.git_dependencies[0].url, TIP_URL);
+    assert_eq!(run.git_dependencies[0].commits, vec![a]);
+    assert!(run.git_dependencies[0].bundle.is_some());
+}
+
 #[test]
 fn cache_lookup_bundle_is_complete_single_ref_and_cache_byte_identical() {
     let scratch = ScratchDir::new("motor-dependency-cache");
@@ -155,6 +375,7 @@ fn cache_lookup_bundle_is_complete_single_ref_and_cache_byte_identical() {
     let mut upload = vec![];
     let deps = snapshot::dependency_bundles(
         &sources,
+        &BTreeSet::new(),
         Some(&[]),
         &home,
         &spool,
@@ -191,6 +412,7 @@ fn cache_lookup_bundle_is_complete_single_ref_and_cache_byte_identical() {
     }];
     assert!(snapshot::dependency_bundles(
         &sources,
+        &BTreeSet::new(),
         Some(&held),
         &home,
         &spool,
@@ -231,6 +453,7 @@ fn old_runner_without_capability_receives_no_dependency_chunks() {
     let mut upload = vec![];
     assert!(snapshot::dependency_bundles(
         &sources,
+        &BTreeSet::new(),
         None,
         &home,
         &spool,
@@ -243,6 +466,7 @@ fn old_runner_without_capability_receives_no_dependency_chunks() {
     assert_eq!(
         snapshot::dependency_bundles(
             &sources,
+            &BTreeSet::new(),
             Some(&[]),
             &home,
             &spool,

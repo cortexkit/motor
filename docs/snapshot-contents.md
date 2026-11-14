@@ -282,7 +282,15 @@ by Git. Tests: `no_bundle_when_runner_holds_a_snapshot_with_the_tip_behind_it`,
 (`crates/motor-module/src/snapshot.rs`).
 
 7.2. Git dependencies pinned in `Cargo.lock` are sent as separate bundles when
-the runner advertises support; older runners receive none. Tests:
+the runner advertises support; older runners receive none. The client's verified
+default-branch tip also contributes locked Git dependencies when the runner
+already holds them or the local Cargo Git cache can supply a bundle. Unavailable
+tip-only dependencies are omitted without blocking the job; dependencies locked
+by the captured snapshots remain required. A job VM can then hand the tip's
+dependencies to a trusted cache fill, which builds the base new worktrees start
+from. Tests:
 `run_lockfile_source_is_commit_not_worktree`,
-`old_runner_without_capability_receives_no_dependency_chunks`
+`old_runner_without_capability_receives_no_dependency_chunks`,
+`cached_tip_dependency_is_offered_without_changing_snapshot`,
+`missing_tip_only_dependency_does_not_block_job`
 (`git_dependencies.rs`).
