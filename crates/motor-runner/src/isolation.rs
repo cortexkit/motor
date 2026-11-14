@@ -2215,6 +2215,39 @@ pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
     crate::permissions::repair_tree(crate::permissions::Policy::OwnerWrite, &[path])
 }
 
+#[derive(Debug)]
+struct RunnerAccessFailure {
+    message: String,
+    eperm: bool,
+}
+
+impl RunnerAccessFailure {
+    fn new(command: &Command, stderr: &str) -> Self {
+        Self {
+            message: format!("{command:?}: {stderr}"),
+            eperm: stderr
+                .lines()
+                .any(|line| line.ends_with(": Operation not permitted")),
+        }
+    }
+}
+
+impl std::fmt::Display for RunnerAccessFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RunnerAccessFailure {}
+
+pub(crate) fn runner_access_eperm(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EPERM)
+        || error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RunnerAccessFailure>())
+            .is_some_and(|failure| failure.eperm)
+}
+
 pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
     let _access = crate::tree_access::lock(crate::caller_path::host(path));
     #[cfg(test)]
@@ -2226,11 +2259,51 @@ pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
     // Without -n, setfacl -m also recalculates the ACL mask of every entry it
     // writes, so a mask a job zeroed with chmod 0700 is restored on the way.
     let acl = format!("u:{}:rwX", unsafe { libc::geteuid() });
-    checked(
-        crate::privilege::command("/usr/bin/setfacl")
-            .args(["-R", "-P", "-m", &acl, "--"])
-            .arg(path),
-    )
+    let mut command = crate::privilege::command("/usr/bin/setfacl");
+    command
+        .env("LC_ALL", "C")
+        .args(["-R", "-P", "-m", &acl, "--"])
+        .arg(path);
+    let output = crate::systemd::output(&mut command)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // setfacl exits with a status, not errno. Keep its diagnostic while marking
+    // only C-locale EPERM failures for source_seal::recovery, which can clear
+    // immutable flags left by a dead single-job VM before retrying this ACL.
+    Err(io::Error::other(RunnerAccessFailure::new(
+        &command, &stderr,
+    )))
+}
+
+#[cfg(test)]
+mod runner_access_tests {
+    use super::*;
+
+    #[test]
+    fn acl_failure_preserves_details_and_classifies_only_eperm() {
+        let command = Command::new("/usr/bin/setfacl");
+        for (stderr, expected) in [
+            ("setfacl: checkout/source: Operation not permitted\n", true),
+            ("setfacl: checkout/source: Permission denied\n", false),
+            (
+                "setfacl: checkout/Operation not permitted: No such file or directory\n",
+                false,
+            ),
+        ] {
+            let error = io::Error::other(RunnerAccessFailure::new(&command, stderr));
+            assert_eq!(runner_access_eperm(&error), expected);
+            assert!(error.to_string().contains(stderr));
+            assert!(error.to_string().contains("/usr/bin/setfacl"));
+        }
+        assert!(runner_access_eperm(&io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        assert!(!runner_access_eperm(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+    }
 }
 
 /// Only call after the stopped fill's entire generation passed the helper link

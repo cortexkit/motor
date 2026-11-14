@@ -51,8 +51,36 @@ pub(crate) fn stopped_disk(state: &Path, roots: &[(&Path, &Path)]) -> io::Result
 /// seal, and the host only handles an opaque disk image. Only in this mode
 /// can an unrecorded flag be attributed to the runner rather than to another
 /// writer of the checkout filesystem.
-pub(crate) fn checkout(config: &Config, path: &Path) -> io::Result<()> {
-    if !config.per_job || !config.tenant_vm || !config.isolate_jobs || config.fill_vm {
+fn orphan_recovery_enabled(config: &Config) -> bool {
+    config.per_job && config.tenant_vm && config.isolate_jobs && !config.fill_vm
+}
+
+pub(crate) fn restore_access(
+    config: &Config,
+    path: &Path,
+    restore: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    restore_or_recover(orphan_recovery_enabled(config), restore, || {
+        checkout(config, path)
+    })
+}
+
+fn restore_or_recover(
+    enabled: bool,
+    mut restore: impl FnMut() -> io::Result<()>,
+    recover: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match restore() {
+        Err(error) if enabled && crate::isolation::runner_access_eperm(&error) => {
+            recover()?;
+            restore()
+        }
+        result => result,
+    }
+}
+
+fn checkout(config: &Config, path: &Path) -> io::Result<()> {
+    if !orphan_recovery_enabled(config) {
         return Ok(());
     }
     config.source_seals.check_host(path)?;
@@ -137,4 +165,94 @@ fn clear_tree(directory: &File) -> io::Result<usize> {
 
 pub(crate) fn access_error(error: io::Error) -> io::Error {
     io::Error::other(format!("restore workspace access (possible leftover source seals; immutable flags require a trusted seal record outside per-job VMs): {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn clean_checkout_restores_access_without_a_seal_walk() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-clean-seal-restore");
+        fs::write(scratch.join("source"), b"source").unwrap();
+        let restores = Cell::new(0);
+        let walks = Cell::new(0);
+        restore_or_recover(
+            true,
+            || {
+                restores.set(restores.get() + 1);
+                // The fixture owns these files, so a real ACL restore needs
+                // neither sudo nor immutable-flag capability.
+                let output = std::process::Command::new("/usr/bin/setfacl")
+                    .args([
+                        "-R",
+                        "-P",
+                        "-m",
+                        &format!("u:{}:rwX", unsafe { libc::geteuid() }),
+                        "--",
+                    ])
+                    .arg(scratch.path())
+                    .output()?;
+                if !output.status.success() {
+                    return Err(io::Error::other(
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ));
+                }
+                Ok(())
+            },
+            || {
+                walks.set(walks.get() + 1);
+                clear_tree(&open_mount(scratch.path())?).map(|_| ())
+            },
+        )
+        .unwrap();
+        assert_eq!(restores.get(), 1);
+        assert_eq!(
+            walks.get(),
+            0,
+            "clean checkout must not walk for orphan seals"
+        );
+    }
+
+    #[test]
+    fn eperm_recovers_then_retries_the_restore_only_once() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = restore_or_recover(
+            true,
+            || {
+                events.borrow_mut().push("restore");
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            },
+            || {
+                events.borrow_mut().push("recover");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(*events.borrow(), ["restore", "recover", "restore"]);
+    }
+
+    #[test]
+    fn other_errors_and_non_job_modes_never_walk_or_retry() {
+        for (enabled, errno) in [
+            (true, libc::EACCES),
+            (true, libc::EIO),
+            (false, libc::EPERM),
+        ] {
+            let restores = Cell::new(0);
+            let error = restore_or_recover(
+                enabled,
+                || {
+                    restores.set(restores.get() + 1);
+                    Err(io::Error::from_raw_os_error(errno))
+                },
+                || panic!("this failure cannot authorize orphan-seal recovery"),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(restores.get(), 1);
+        }
+    }
 }

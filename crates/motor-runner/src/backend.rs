@@ -776,8 +776,9 @@ impl Backend for HostBackend {
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && path.exists() {
             crate::setup_log::phase("restore workspace access", || {
-                crate::source_seal::recovery::checkout(config, &path)?;
-                crate::isolation::restore_runner_access(&path)
+                crate::source_seal::recovery::restore_access(config, &path, || {
+                    crate::isolation::restore_runner_access(&path)
+                })
             })
             .map_err(crate::source_seal::recovery::access_error)?;
             if path.is_dir() {

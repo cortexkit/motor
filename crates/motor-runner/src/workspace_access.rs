@@ -283,11 +283,12 @@ fn repair(config: &Config, root: crate::caller_path::HostPath<'_>, workspace: bo
     if config.isolate_jobs {
         return outcome(
             (if workspace {
-                crate::source_seal::recovery::checkout(config, root.as_path())
+                crate::source_seal::recovery::restore_access(config, root.as_path(), || {
+                    crate::isolation::restore_workspace_access(root.as_path())
+                })
             } else {
-                Ok(())
+                crate::isolation::restore_workspace_access(root.as_path())
             })
-            .and_then(|()| crate::isolation::restore_workspace_access(root.as_path()))
             .map_err(crate::source_seal::recovery::access_error),
         );
     }
