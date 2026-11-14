@@ -1508,6 +1508,120 @@ fn isolated_job_can_write_runner_owned_existing_target_files_after_preparation()
 
 #[test]
 #[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_target_directories_have_no_non_owner_write_after_preparation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let target = f.workspace.join("target");
+    let build = target.join("bd/ab/0123456789abcd/debug/build/package/hash/out");
+    fs::create_dir_all(&build).unwrap();
+    let runner = unsafe { libc::geteuid() };
+    let writer = account_uid(WRITER_USER).unwrap().unwrap();
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args([
+                "-m",
+                &format!("u:{runner}:rwx,u:{writer}:r-x,g::r-x,m::rwx,d:u:{USER}:rwx"),
+                "--",
+            ])
+            .args([&target, &build]),
+    )
+    .unwrap();
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let sandbox = f.sandbox();
+    for directory in std::iter::once(target.as_path())
+        .chain(build.ancestors().take_while(|path| *path != target))
+    {
+        let mode = fs::metadata(directory).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o022,
+            0,
+            "prepared target directory {} is group/other writable: {mode:o}",
+            directory.display()
+        );
+    }
+    for path in [&target, &build] {
+        let acl = Command::new("/usr/bin/getfacl")
+            .args(["-cpn", "--"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(acl.status.success());
+        let acl = String::from_utf8(acl.stdout).unwrap();
+        assert!(acl.contains(&format!("user:{runner}:rwx")), "{acl}");
+        assert!(acl.contains(&format!("user:{writer}:r-x")), "{acl}");
+        assert!(acl.contains("group::r-x"), "{acl}");
+        assert!(acl.contains("mask::r-x"), "{acl}");
+        assert!(!acl.contains("default:"), "{acl}");
+    }
+    let (status, stdout, stderr) = output(
+        &sandbox,
+        "set -eu; touch target/write-probe target/bd/ab/0123456789abcd/debug/build/package/hash/out/write-probe",
+        &f.workspace,
+    );
+    assert!(status.success(), "{stdout}\n{stderr}");
+    restore_runner_access(&f.scratch).unwrap();
+    fs::write(build.join("runner-cleanup-probe"), "reclaimed\n").unwrap();
+}
+
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_warm_target_keeps_runner_owned_files_and_directories_writable() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let f = Fixture::new();
+    let first = f.sandbox();
+    let (status, stdout, stderr) = output(
+        &first,
+        "set -eu; mkdir target/owner-read-only; chmod 500 target/owner-read-only",
+        &f.workspace,
+    );
+    assert!(status.success(), "{stdout}\n{stderr}");
+    drop(first);
+    restore_runner_access(&f.workspace).unwrap();
+    restore_runner_checkout_root(&f.workspace).unwrap();
+    let target = f.workspace.join("target");
+    let directory = target.join("runner-created");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let file = directory.join("existing-output");
+    fs::write(&file, "runner output\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+    let runner = unsafe { libc::geteuid() };
+    assert_eq!(fs::metadata(&directory).unwrap().uid(), runner);
+    assert_eq!(fs::metadata(&file).unwrap().uid(), runner);
+
+    let sandbox = f.sandbox();
+    assert_eq!(
+        fs::metadata(&directory).unwrap().permissions().mode() & 0o022,
+        0,
+        "a runner-created directory under a warm target retained mask write"
+    );
+    // The second setup skips recursive ownership repair.
+    // The file therefore needs its named job write grant, not owner access.
+    assert_eq!(fs::metadata(&file).unwrap().uid(), runner);
+    assert_eq!(
+        fs::metadata(target.join("owner-read-only"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o700,
+        0o500,
+        "preparation expanded an existing job owner's access"
+    );
+    let (status, stdout, stderr) = output(
+        &sandbox,
+        "set -eu; printf 'rebuilt\\n' >> target/runner-created/existing-output; grep -q rebuilt target/runner-created/existing-output; touch target/runner-created/new-output; if touch target/owner-read-only/forbidden; then exit 41; fi",
+        &f.workspace,
+    );
+    assert!(status.success(), "{stdout}\n{stderr}");
+    restore_runner_access(&f.scratch).unwrap();
+    fs::write(directory.join("runner-cleanup-probe"), "reclaimed\n").unwrap();
+}
+
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
 fn isolated_job_has_owned_sandbox_ancestors_and_private_tmp() {
     let f = Fixture::new();
     let sandbox = f.sandbox();

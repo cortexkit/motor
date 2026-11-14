@@ -31,6 +31,7 @@ pub(crate) use javascript_tools::ToolchainRole;
 pub(crate) use javascript_tools::{JavascriptTools, JOB_BUN_DIR};
 pub(crate) mod pid_init;
 pub(crate) mod readable;
+mod target;
 
 const USER: &str = "motor-job";
 pub(crate) const WRITER_USER: &str = "motor-cache";
@@ -1941,6 +1942,12 @@ fn grant_paths(paths: &[&Path]) -> io::Result<()> {
 }
 
 pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Result<()> {
+    prepare_job_target(state, path).map(|_| ())
+}
+
+// Return the resolved job UID and whether recursive ownership/mode repair ran,
+// so final directory preparation need not chown directories already repaired.
+fn prepare_job_target(state: &Path, path: &Path) -> io::Result<(u32, bool)> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(io::Error::other(format!(
@@ -1971,7 +1978,7 @@ pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Resu
     if metadata.uid() == uid
         && fs::read_to_string(&marker).ok().as_deref() == Some(identity.as_str())
     {
-        return Ok(());
+        return Ok((uid, false));
     }
     checked(
         crate::privilege::command("/usr/bin/chown")
@@ -1981,7 +1988,7 @@ pub(crate) fn prepare_job_writable_target(state: &Path, path: &Path) -> io::Resu
     crate::permissions::repair_tree(crate::permissions::Policy::OwnerWrite, &[path])?;
     fs::create_dir_all(marker.parent().unwrap())?;
     fs::write(marker, identity)?;
-    Ok(())
+    Ok((uid, true))
 }
 
 fn create_sandbox_root(path: &Path) -> io::Result<()> {
@@ -3650,10 +3657,9 @@ impl Sandbox {
             (&root_owned, "0755"),
             (std::slice::from_ref(&tmp), "1777"),
         ])?;
-        // Target repair changes owner permissions only. Complete it before the
-        // shared ACL grant, then restore the checkout root's final ACL mask with
-        // chmod, just as for an individual workspace grant.
-        prepare_job_writable_target(state, target)
+        // The recursive grant restores write-bearing masks even on job-owned
+        // target directories. Narrow those masks only after the last grant.
+        let (target_uid, target_repaired) = prepare_job_target(state, target)
             .map_err(|error| io::Error::other(format!("prepare job target: {error}")))?;
         grant_paths.extend([workspace.to_path_buf(), tmp.clone()]);
         if !target.starts_with(workspace) {
@@ -3661,6 +3667,9 @@ impl Sandbox {
         }
         self::grant_paths(&grant_paths.iter().map(PathBuf::as_path).collect::<Vec<_>>())?;
         prepare_job_checkout_root(workspace)?;
+        if !writer {
+            target::restrict_directories(target, target_uid, target_repaired)?;
+        }
         if let Some(account) = writer_account {
             prepare_writer_trees(&[workspace, target, &host_home, &tmp], account)?;
             if job_tree.fixed.is_some() {
