@@ -102,12 +102,19 @@ def verify(prefix, policy=POLICY):
     running = running_services(subprocess.check_output(["/bin/launchctl", "print", "system"], text=True))
     outcomes = {}
     for label, expected in services.items():
-        is_disabled = bool(re.search(r'^\s*"' + re.escape(label) + r'"\s*=>\s*true\s*$', disabled, re.M))
+        # macOS 27.2 prints `=> disabled`; older releases print `=> true`.
+        is_disabled = bool(re.search(r'^\s*"' + re.escape(label) + r'"\s*=>\s*(?:true|disabled)\s*$',
+                                     disabled, re.M))
         pid = running.get(label, 0)
-        if expected == "kept-sip" or (expected == "unverified" and pid > 0):
+        if expected == "kept-sip":
             outcome = "kept-sip"
         elif is_disabled and pid == 0:
             outcome = "off"
+        elif expected == "unverified" and not is_disabled:
+            # With SIP on, macOS 27.2 accepts `launchctl disable` for its own
+            # services and then ignores the override after reboot: they stay
+            # enabled, running or started on demand. Record that macOS kept it.
+            outcome = "kept-sip"
         else:
             raise ValueError(f"service is not disabled or is still running: {label} (disabled={is_disabled}, pid={pid})")
         outcomes[label] = {"outcome": outcome, "disabled": is_disabled, "pid": pid}
@@ -136,6 +143,6 @@ def validate_receipt(receipt, text=None):
             raise ValueError("invalid service state: " + label)
         off = actual == {"outcome": "off", "disabled": True, "pid": 0} and expected != "kept-sip"
         kept = (actual["outcome"] == "kept-sip" and expected != "off"
-                and (expected == "kept-sip" or actual["pid"] > 0))
+                and (expected == "kept-sip" or actual["pid"] > 0 or not actual["disabled"]))
         if not (off or kept):
             raise ValueError("unresolved or unexpected service outcome: " + label)
