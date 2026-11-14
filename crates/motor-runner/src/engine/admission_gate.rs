@@ -13,6 +13,10 @@ impl Runner {
     pub(crate) fn admission_blocked(&self) -> Option<String> {
         self.qualification_required()
             .then(|| "runner awaiting qualification".into())
+            .or_else(|| {
+                (self.config().backend == BackendKind::MacosVm && self.is_draining())
+                    .then(|| "runner_draining".into())
+            })
     }
 
     pub(super) fn qualification_refusal(
@@ -20,7 +24,10 @@ impl Runner {
         qualification: bool,
     ) -> Option<(RefusalReason, String)> {
         (!qualification)
-            .then(|| self.admission_blocked())
+            .then(|| {
+                self.qualification_required()
+                    .then(|| "runner awaiting qualification".into())
+            })
             .flatten()
             .map(|detail| (RefusalReason::RunnerFull, detail))
     }

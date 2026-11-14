@@ -3051,6 +3051,11 @@ impl Runner {
         }
         #[cfg(target_os = "linux")]
         let source_seals = config.source_seals.clone();
+        #[cfg(unix)]
+        let persisted_drain =
+            config.backend == BackendKind::MacosVm && crate::macos::drain::load(&config.state_root);
+        #[cfg(not(unix))]
+        let persisted_drain = false;
         let runner = Self {
             core: Arc::new(Core {
                 reserve_restore: Mutex::new(()),
@@ -3060,7 +3065,7 @@ impl Runner {
                 tenant_fills_off_logged: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 tenant_fills_off_logs: std::sync::atomic::AtomicUsize::new(0),
-                draining: std::sync::atomic::AtomicBool::new(false),
+                draining: std::sync::atomic::AtomicBool::new(persisted_drain),
                 service_stop: tokio::sync::watch::channel(false).0,
                 drain_control: Mutex::new(None),
                 background_deletes: config.background_deletes.clone(),
@@ -3091,7 +3096,7 @@ impl Runner {
                     fill_ledgers: BTreeMap::new(),
                     base_finishes: BTreeMap::new(),
                     base_settling: BTreeSet::new(),
-                    drain_deadline: None,
+                    drain_deadline: persisted_drain.then(std::time::Instant::now),
                     jobs,
                     pending_replays: BTreeSet::new(),
                     #[cfg(test)]
@@ -3664,8 +3669,36 @@ impl Runner {
     }
 
     pub(crate) fn begin_drain_request(&self, deadline: Duration, exit_after: bool) -> DrainWaiter {
+        let (waiter, result) = self.begin_drain_persisted(deadline, exit_after);
+        if let Err(error) = result {
+            tracing::error!(%error, "cannot persist macOS drain; admission is closed in this process only");
+        }
+        waiter
+    }
+    pub(crate) fn try_begin_drain_request(
+        &self,
+        deadline: Duration,
+        exit_after: bool,
+    ) -> io::Result<DrainWaiter> {
+        let (waiter, result) = self.begin_drain_persisted(deadline, exit_after);
+        result?;
+        Ok(waiter)
+    }
+    fn begin_drain_persisted(
+        &self,
+        deadline: Duration,
+        exit_after: bool,
+    ) -> (DrainWaiter, io::Result<()>) {
         let requested_deadline = std::time::Instant::now() + deadline;
         let mut inner = self.core.inner.lock().unwrap();
+        #[cfg(unix)]
+        let persisted = if self.core.config.backend == BackendKind::MacosVm {
+            crate::macos::drain::store(&self.core.config.state_root)
+        } else {
+            Ok(())
+        };
+        #[cfg(not(unix))]
+        let persisted = Ok(());
         let mut drain_control = self.core.drain_control.lock().unwrap();
         let waiter = if let Some(waiter) = drain_control.as_ref() {
             let mut state = waiter.0.lock().unwrap();
@@ -3683,7 +3716,8 @@ impl Runner {
         } else {
             let waiter = DrainWaiter(Arc::new(Mutex::new(DrainState {
                 deadline: requested_deadline,
-                exit_after,
+                // A failed durable hold must not exit into an open restart.
+                exit_after: exit_after && persisted.is_ok(),
                 result: None,
             })));
             inner.drain_deadline = Some(requested_deadline);
@@ -3694,7 +3728,7 @@ impl Runner {
         self.core
             .draining
             .store(true, std::sync::atomic::Ordering::Release);
-        waiter
+        (waiter, persisted)
     }
     pub(crate) fn drain_retry_after_ms(&self) -> u64 {
         let waiter = self.core.drain_control.lock().unwrap().clone();
@@ -3709,7 +3743,8 @@ impl Runner {
                     .as_millis()
             })
             .unwrap_or(0);
-        // Admission stays closed after the deadline, until resume or restart.
+        // Admission stays closed after the deadline; macOS also retains the
+        // hold across restart until resume clears its marker.
         // Keep callers from hot-looping even when no deadline remains.
         remaining_ms.clamp(5_000, u128::from(u64::MAX)) as u64
     }
@@ -3724,11 +3759,20 @@ impl Runner {
     /// Reopen admission after a deployment closed it. Running jobs continue;
     /// jobs already refused before start remain safe for callers to retry.
     pub fn resume(&self) {
+        if let Err(error) = self.try_resume() {
+            tracing::error!(%error, "cannot clear macOS drain; admission stays closed");
+        }
+    }
+    pub(crate) fn try_resume(&self) -> io::Result<()> {
         if *self.core.service_stop.borrow() {
             tracing::warn!("runner service stop cannot be resumed");
-            return;
+            return Ok(());
         }
         let mut inner = self.core.inner.lock().unwrap();
+        #[cfg(unix)]
+        if self.core.config.backend == BackendKind::MacosVm {
+            crate::macos::drain::clear(&self.core.config.state_root)?;
+        }
         inner.drain_deadline = None;
         if let Some(waiter) = self.core.drain_control.lock().unwrap().take() {
             let mut state = waiter.0.lock().unwrap();
@@ -3740,6 +3784,7 @@ impl Runner {
             .draining
             .store(false, std::sync::atomic::Ordering::Release);
         tracing::info!("runner admission resumed");
+        Ok(())
     }
     pub fn is_draining(&self) -> bool {
         *self.core.service_stop.borrow()

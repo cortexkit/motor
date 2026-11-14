@@ -157,6 +157,88 @@ fn only_a_last_motor_line_counts_as_the_agent_reason() {
     assert_eq!(agent_reason(b"motor: earlier\njob output\n"), None);
     assert_eq!(agent_reason(b""), None);
 }
+
+#[test]
+fn build_volume_diagnostics_survive_split_frames_and_are_logged_with_the_job_id() {
+    let scratch = ScratchDir::new("macos-diagnostics");
+    let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+    let job_id = transport.entry.owned.lock().unwrap().record.id;
+    for bytes in [
+        b"job-private-output\nmotor: build-vol".as_slice(),
+        b"ume diagnostic after-attach: inode=2\n",
+        b"motor: build-volume diagnostic before-detach: f_mntonname=share\n",
+        b"motor: build-volume diagnostic detach-failed: f_fsid=[3,4]\n",
+    ] {
+        motor_winagent::write_frame(
+            &mut peer,
+            &Frame::Output {
+                stream: Stream::Stderr,
+                bytes: bytes.to_vec(),
+            },
+        )
+        .unwrap();
+    }
+    drop(peer);
+    let logs = LogBytes::default();
+    let (tx, _rx) = mpsc::sync_channel(8);
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || assert!(run_output(&mut transport, &tx, &tx).is_err()),
+    );
+    let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for phase in ["after-attach", "before-detach", "detach-failed"] {
+        let line = log
+            .lines()
+            .find(|line| line.contains(phase))
+            .unwrap_or_else(|| panic!("missing {phase}: {log}"));
+        assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+    }
+    assert!(!log.contains("job-private-output"));
+}
+
+#[test]
+fn diagnostic_line_buffer_is_bounded_and_recovers_after_overlong_job_output() {
+    let mut lines = DiagnosticLines::default();
+    let mut reported = Vec::new();
+    lines.push(&vec![b'x'; BUILD_DIAGNOSTIC_MAX_BYTES * 2], |_| {
+        panic!("not a diagnostic")
+    });
+    assert_eq!(lines.line.len(), BUILD_DIAGNOSTIC_MAX_BYTES);
+    lines.push(
+        b"\nmotor: build-volume diagnostic before-detach: ok\n",
+        |line| reported.push(line.to_owned()),
+    );
+    assert_eq!(
+        reported,
+        ["motor: build-volume diagnostic before-detach: ok"]
+    );
+}
+
+#[test]
+fn staged_target_log_uses_lstat_type_and_inode() {
+    use std::os::unix::fs::{symlink, MetadataExt};
+    let scratch = ScratchDir::new("macos-stage-log");
+    let target = scratch.join("target");
+    let logs = LogBytes::default();
+    let job_id = Uuid::now_v7();
+    std::fs::create_dir(&target).unwrap();
+    let inode = std::fs::symlink_metadata(&target).unwrap().ino();
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || log_staged_target(job_id, &target),
+    );
+    std::fs::remove_dir(&target).unwrap();
+    symlink("absent", &target).unwrap();
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || log_staged_target(job_id, &target),
+    );
+    let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains(&format!("job_id={job_id}")), "{log}");
+    assert!(log.contains(&format!("inode={inode}")), "{log}");
+    assert!(log.contains("path_type=directory"), "{log}");
+    assert!(log.contains("path_type=symlink"), "{log}");
+}
 #[test]
 fn wrong_agent_version_refuses_with_image_name_before_command() {
     let scratch = ScratchDir::new("macos-agent-version");

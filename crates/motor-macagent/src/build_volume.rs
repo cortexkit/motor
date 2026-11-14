@@ -49,6 +49,30 @@ pub trait BuildVolume: Send {
     /// Call only once every job process is gone. Copies the returned files
     /// out, unmounts the volume and puts the copies in the shared `target/`.
     fn detach(&mut self) -> io::Result<()>;
+    /// Metadata only, sent on the existing stderr channel at lifecycle boundaries.
+    fn diagnostics(&self, _phase: &str) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+const DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
+
+#[cfg(any(target_os = "macos", test))]
+fn diagnostic_line(phase: &str, detail: &str) -> String {
+    const TRUNCATED: &str = " [truncated]";
+    let mut line =
+        format!("motor: build-volume diagnostic {phase}: {detail}").replace(['\n', '\r'], " ");
+    if line.len() >= DIAGNOSTIC_MAX_BYTES {
+        let mut end = DIAGNOSTIC_MAX_BYTES - TRUNCATED.len() - 1;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+        line.push_str(TRUNCATED);
+    }
+    line.push('\n');
+    line
 }
 
 fn invalid(message: impl std::fmt::Display) -> io::Error {
@@ -516,6 +540,99 @@ mod native {
                 root: None,
             })
         }
+
+        fn snapshot(&self, phase: &str) -> String {
+            use std::fmt::Write;
+            let mut detail = format!("target={:?} recorded={:?}", self.target, self.root);
+            match std::fs::symlink_metadata(&self.target) {
+                Ok(metadata) => {
+                    let kind = if metadata.is_symlink() {
+                        "symlink"
+                    } else if metadata.is_dir() {
+                        "directory"
+                    } else {
+                        "other"
+                    };
+                    let _ = write!(
+                        detail,
+                        " lstat(type={kind},inode={},dev={},mode={:#o})",
+                        metadata.ino(),
+                        metadata.dev(),
+                        metadata.mode()
+                    );
+                }
+                Err(error) => {
+                    let _ = write!(detail, " lstat_error={error}");
+                }
+            }
+            let resolved = (|| -> io::Result<_> {
+                let path = CString::new(self.target.as_os_str().as_bytes()).map_err(invalid)?;
+                let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+                check(unsafe { libc::statfs(path.as_ptr(), &mut stat) })?;
+                Ok((
+                    text(&stat.f_mntonname),
+                    fsid(stat.f_fsid),
+                    std::fs::metadata(&self.target)?.ino(),
+                ))
+            })();
+            match resolved {
+                Ok((on, id, inode)) => {
+                    let _ = write!(
+                        detail,
+                        " statfs(f_mntonname={on:?},f_fsid={id:?},inode={inode})"
+                    );
+                }
+                Err(error) => {
+                    let _ = write!(detail, " statfs_error={error}");
+                }
+            }
+            // A private fixed-capacity buffer avoids getmntinfo's shared static
+            // storage and bounds both allocation and the logged mount table.
+            const MOUNTS: usize = 128;
+            let mut mounts: Vec<libc::statfs> =
+                (0..MOUNTS).map(|_| unsafe { std::mem::zeroed() }).collect();
+            let count = unsafe {
+                libc::getfsstat(
+                    mounts.as_mut_ptr(),
+                    std::mem::size_of_val(mounts.as_slice()) as libc::c_int,
+                    libc::MNT_NOWAIT,
+                )
+            };
+            if count < 0 {
+                let _ = write!(detail, " getfsstat_error={}", io::Error::last_os_error());
+            } else {
+                let _ = write!(detail, " getfsstat=[");
+                for mount in mounts.iter().take((count as usize).min(MOUNTS)) {
+                    let _ = write!(
+                        detail,
+                        " {{on={:?},type={:?},flags={:#x},fsid={:?}}}",
+                        text(&mount.f_mntonname),
+                        text(&mount.f_fstypename),
+                        mount.f_flags,
+                        fsid(mount.f_fsid)
+                    );
+                }
+                let _ = write!(detail, " ]");
+                if count as usize >= MOUNTS {
+                    detail.push_str(" [mount table capacity reached]");
+                }
+            }
+            diagnostic_line(phase, &detail)
+        }
+    }
+
+    fn text(bytes: &[libc::c_char]) -> String {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        String::from_utf8_lossy(
+            &bytes[..end]
+                .iter()
+                .map(|byte| *byte as u8)
+                .collect::<Vec<_>>(),
+        )
+        .into_owned()
     }
 
     /// The real disk operations behind `attach_with`, before any job code runs.
@@ -662,8 +779,7 @@ mod native {
         }
 
         fn detach(&mut self) -> io::Result<()> {
-            let (Some(workspace), Some(recorded)) = (self.workspace.take(), self.root.take())
-            else {
+            let (Some(workspace), Some(recorded)) = (self.workspace.take(), self.root) else {
                 return Err(invalid("build volume is not attached"));
             };
             // Job code has run: reach target/ again from / without following
@@ -696,7 +812,13 @@ mod native {
             if shared.metadata()?.dev() != workspace.metadata()?.dev() {
                 return Err(invalid("target is still a mount point after unmounting"));
             }
-            place_returns(&shared, &staged, staging.path())
+            place_returns(&shared, &staged, staging.path())?;
+            self.root = None;
+            Ok(())
+        }
+
+        fn diagnostics(&self, phase: &str) -> Option<String> {
+            Some(self.snapshot(phase))
         }
     }
 
@@ -881,12 +1003,74 @@ mod native {
         file.read_exact(start)?;
         Ok(start.to_vec())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn snapshot_reports_target_metadata_and_mounts_without_reading_files() {
+            let scratch = tempfile::Builder::new()
+                .prefix("motor-volume-diagnostic-")
+                .tempdir_in(cortexkit_test_support::scratch_root())
+                .unwrap();
+            let target = scratch.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            let inode = std::fs::metadata(&target).unwrap().ino();
+            let volume = Native {
+                target: target.clone(),
+                build: BuildConfig {
+                    returns: Vec::new(),
+                    return_max_bytes: 0,
+                },
+                uid: 501,
+                gid: 20,
+                workspace: None,
+                root: None,
+            };
+            let snapshot = volume.snapshot("before-detach");
+            for field in [
+                "lstat(type=directory",
+                "statfs(f_mntonname=",
+                "f_fsid=",
+                "getfsstat=[",
+                "type=",
+                "flags=",
+            ] {
+                assert!(snapshot.contains(field), "{snapshot}");
+            }
+            assert!(snapshot.contains(&format!("inode={inode}")), "{snapshot}");
+            assert!(snapshot.len() <= DIAGNOSTIC_MAX_BYTES);
+            std::fs::remove_dir(&target).unwrap();
+            std::os::unix::fs::symlink("missing", &target).unwrap();
+            let snapshot = volume.snapshot("detach-failed");
+            assert!(snapshot.contains("lstat(type=symlink"), "{snapshot}");
+            assert!(snapshot.contains("statfs_error="), "{snapshot}");
+            std::fs::remove_file(&target).unwrap();
+            let snapshot = volume.snapshot("detach-failed");
+            assert!(snapshot.contains("lstat_error="), "{snapshot}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn diagnostics_are_one_bounded_utf8_line_with_explicit_truncation() {
+        let line = diagnostic_line("before-detach", &"é\n\r".repeat(DIAGNOSTIC_MAX_BYTES));
+        assert!(line.len() <= DIAGNOSTIC_MAX_BYTES);
+        assert!(line.starts_with("motor: build-volume diagnostic before-detach: "));
+        assert!(line.ends_with(" [truncated]\n"));
+        assert_eq!(line.lines().count(), 1);
+        assert!(!line.contains('\r'));
+        assert_eq!(
+            diagnostic_line("after-attach", "inode=2"),
+            "motor: build-volume diagnostic after-attach: inode=2\n"
+        );
+    }
 
     fn mounts(workspace: &str) -> Vec<Mount> {
         vec![

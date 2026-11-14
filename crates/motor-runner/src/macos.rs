@@ -18,6 +18,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+pub(crate) mod drain;
 mod execution;
 mod fs;
 mod lifecycle;

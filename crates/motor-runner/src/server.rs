@@ -1099,7 +1099,7 @@ async fn session(
                     if qualification {
                         r.resume_qualification()?;
                     }
-                    r.resume();
+                    r.try_resume()?;
                     Ok(!r.qualification_required())
                 })
                 .await?;
@@ -1140,10 +1140,10 @@ async fn session(
                 exit_after,
             } => {
                 let waiter = locked(&runner, move |r| {
-                    Ok(r.begin_drain_request(
+                    r.try_begin_drain_request(
                         Duration::from_secs(deadline_s.min(86400)),
                         exit_after,
-                    ))
+                    )
                 })
                 .await?;
                 loop {
