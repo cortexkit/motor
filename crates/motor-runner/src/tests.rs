@@ -69,6 +69,9 @@ mod disk_pressure;
 mod fill_source;
 #[path = "tests/fixture_cleanup.rs"]
 mod fixture_cleanup;
+#[cfg(target_os = "linux")]
+#[path = "tests/fork_adoption.rs"]
+mod fork_adoption;
 #[path = "tests/gate_priority.rs"]
 mod gate_priority;
 #[path = "tests/git_dependencies.rs"]
@@ -77,6 +80,9 @@ mod git_dependencies;
 mod health;
 #[path = "tests/held_prerequisites.rs"]
 mod held_prerequisites;
+#[cfg(target_os = "linux")]
+#[path = "tests/isolated_fork_adoption.rs"]
+mod isolated_fork_adoption;
 #[path = "tests/jobs_slice.rs"]
 mod jobs_slice;
 #[path = "tests/migration.rs"]

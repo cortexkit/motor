@@ -114,6 +114,12 @@ pub struct Config {
     pub tenant_vm: bool,
     /// A fresh job VM accepts one execution and one caller workspace for its lifetime.
     pub per_job: bool,
+    /// Immutable Cargo sources supplied by the job image, below registry/ and git/.
+    #[cfg(target_os = "linux")]
+    pub image_cargo: PathBuf,
+    /// Shared Cargo storage for isolated jobs; defaults to CARGO_HOME.
+    #[cfg(target_os = "linux")]
+    pub cargo_home: Option<PathBuf>,
     /// A per-job fill VM: a tenant runner (not `per_job`) booted only to run one
     /// imported fill. Like a job VM, it reads its cache credentials from the
     /// boot drive the guest agent installs, not from tenant provisioning.
@@ -385,6 +391,8 @@ pub struct Config {
     pub(crate) fixture_tenant_dns: Option<(PathBuf, PathBuf)>,
     #[cfg(test)]
     pub(crate) fixture_workspace_forked_marker: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) fixture_adoption_roots: Option<PathBuf>,
     /// Called with an operation label so tests can hold filesystem work or the
     /// admission handoff open without holding the runner state lock.
     #[cfg(test)]
@@ -559,6 +567,20 @@ pub(crate) fn check_fixed_path_options(
 }
 
 impl Config {
+    fn workspace_forked(&self) -> io::Result<bool> {
+        let marker = Path::new(WORKSPACE_FORKED_MARKER);
+        #[cfg(test)]
+        let marker = self
+            .fixture_workspace_forked_marker
+            .as_deref()
+            .unwrap_or(marker);
+        marker.try_exists()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cargo_home(&self) -> io::Result<PathBuf> {
+        crate::isolation::shared_cargo_home(self.cargo_home.as_deref())
+    }
+
     pub fn new(state_root: impl Into<PathBuf>, instance: impl Into<String>) -> Self {
         let state_root = state_root.into();
         Self {
@@ -567,6 +589,10 @@ impl Config {
             metrics: crate::metrics::Settings::default(),
             tenant_vm: false,
             per_job: false,
+            #[cfg(target_os = "linux")]
+            image_cargo: PathBuf::from(crate::isolation::cargo_sources::IMAGE_CARGO),
+            #[cfg(target_os = "linux")]
+            cargo_home: None,
             fill_vm: false,
             fixed_path_repositories: Vec::new(),
             account_subject: None,
@@ -732,6 +758,8 @@ impl Config {
             fixture_tenant_dns: None,
             #[cfg(test)]
             fixture_workspace_forked_marker: None,
+            #[cfg(test)]
+            fixture_adoption_roots: None,
             #[cfg(test)]
             long_work: None,
             #[cfg(all(test, target_os = "linux"))]
@@ -1167,6 +1195,8 @@ impl QueueProgress {
 
 struct Inner {
     workspace_forked: Option<bool>,
+    #[cfg(target_os = "linux")]
+    fresh_fork: bool,
     per_job_workspace: Option<String>,
     per_job_id: Option<Uuid>,
     #[cfg(target_os = "linux")]
@@ -2184,18 +2214,21 @@ fn prepare_job_shared_roots(config: &Config) -> io::Result<()> {
     }
     let javascript = crate::isolation::JavascriptTools::for_config(config);
     if config.per_job {
-        crate::isolation::prepare_job_vm_read_access(&javascript)?;
+        crate::isolation::prepare_job_vm_read_access(
+            &javascript,
+            &config.cargo_home()?,
+            &config.image_cargo,
+        )?;
     } else {
-        crate::isolation::prepare_shared_read_access(&javascript)?;
+        crate::isolation::prepare_shared_read_access(&javascript, config.cargo_home.as_deref())?;
     }
     if config.tenant_vm && !config.boat_profile && config.job_network.is_some() {
         // The scan runs independently of readiness and never takes runner state.
         // Offline jobs need no ownership invariant; pending or unsafe cache
         // ownership refuses only jobs that request writable Cargo overlays.
         crate::isolation::cargo_overlay::start_validation(
-            config
-                .per_job
-                .then(|| Path::new(crate::isolation::cargo_sources::IMAGE_CARGO)),
+            config.cargo_home.as_deref(),
+            config.per_job.then_some(config.image_cargo.as_path()),
         );
     }
     Ok(())
@@ -2503,13 +2536,28 @@ impl Runner {
             .write(true)
             .open(state.join("daemon.lock"))?;
         lock.try_lock_exclusive()?;
+        #[cfg(target_os = "linux")]
+        if config.per_job {
+            let roots = Path::new("/tenant/roots");
+            #[cfg(test)]
+            let roots = config.fixture_adoption_roots.as_deref().unwrap_or(roots);
+            crate::fork_adoption::clean_staging(roots)?;
+        }
         // Collect mappings from both files and all job records before dropping
         // duplicate keys. A caller-catalog.json copy that loses to catalog.json
         // can still be the only record requiring a caller-root flag.
         let persisted = paths::catalog::Split::read(&state)?;
         let mut pins = persisted.caller.pins();
+        #[cfg(target_os = "linux")]
+        let mut has_job_records = false;
         for entry in fs::read_dir(state.join("jobs"))? {
             let path = entry?.path().join("record.json");
+            #[cfg(target_os = "linux")]
+            match fs::symlink_metadata(&path) {
+                Ok(_) => has_job_records = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error),
+            }
             match read_json::<serde_json::Value>(&path) {
                 Ok(record) => {
                     if let Some(mappings) = record.get("mappings") {
@@ -2535,6 +2583,16 @@ impl Runner {
             }
         }
         let mut catalog = persisted.loaded();
+        #[cfg(target_os = "linux")]
+        let fresh_fork = config.per_job && !has_job_records && config.workspace_forked()?;
+        #[cfg(target_os = "linux")]
+        if fresh_fork {
+            // The copied catalog retains caches, not membership in the donor's
+            // execution history. Clear ids before any catalog save or status.
+            for workspace in catalog.workspaces.values_mut() {
+                workspace.last_job_id = None;
+            }
+        }
         paths::owner::check(&config)?;
         paths::catalog::fixed(&config.caller_roots, &pins)?;
         paths::startup::filesystem(&config)?;
@@ -2572,7 +2630,10 @@ impl Runner {
             let javascript = crate::isolation::JavascriptTools::for_config(&config);
             config.writer_account =
                 match crate::isolation::validate_writer_account().and_then(|account| {
-                    crate::isolation::prepare_writer_shared_read_access(&javascript)?;
+                    crate::isolation::prepare_writer_shared_read_access(
+                        &javascript,
+                        config.cargo_home.as_deref(),
+                    )?;
                     Ok(account)
                 }) {
                     Ok(account) => Some(account),
@@ -3009,6 +3070,8 @@ impl Runner {
                 snapshots: crate::sibling_snapshots::store::SnapshotStore::default(),
                 inner: crate::state_lock::StateLock::new(Inner {
                     workspace_forked: None,
+                    #[cfg(target_os = "linux")]
+                    fresh_fork,
                     per_job_workspace: jobs.values().find_map(|job| {
                         job.request.as_ref().map(|request| {
                             paths::request(request).caller_workspace_key.text().clone()
@@ -4409,6 +4472,204 @@ impl Runner {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn adoption_path(&self, roots: &Path, caller: &str) -> io::Result<PathBuf> {
+        paths::authorize(&self.core.config, caller, false)?;
+        #[cfg(test)]
+        if let Some(fixture) = &self.core.config.fixture_adoption_roots {
+            if roots == fixture && Path::new(caller).starts_with(fixture) {
+                return Ok(PathBuf::from(caller));
+            }
+        }
+        crate::fork_adoption::checkout_path(roots, caller)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_checkout(
+        &self,
+        inner: &mut Inner,
+        request: &Run,
+        roots: &Path,
+    ) -> Result<(), crate::fork_adoption::MoveError> {
+        let donor = crate::fork_adoption::donor(&inner.catalog, request)?;
+        let caller = paths::request(request).caller_workspace_key.text();
+        let source = self.adoption_path(roots, &donor)?;
+        let destination = self.adoption_path(roots, caller)?;
+        let previous = inner.catalog.clone();
+        let mut rekeyed = false;
+        let result = crate::fork_adoption::move_checkout(
+            roots,
+            &source,
+            &destination,
+            || {
+                let host = paths::host_path(&self.core.config, &donor);
+                let intent = self
+                    .core
+                    .trees
+                    .state
+                    .join("seed-intents")
+                    .join(workspace::name(&host.to_string_lossy()));
+                if intent.try_exists()? {
+                    tracing::info!(%donor, "settling interrupted seed before checkout adoption");
+                    crate::seed::settle(&self.core.trees.state, &host)?;
+                }
+                Ok(())
+            },
+            || {
+                rekeyed = true;
+                let mut workspace = inner.catalog.workspaces.remove(&donor).unwrap();
+                workspace.last_job_id = None;
+                inner.catalog.workspaces.insert(caller.clone(), workspace);
+                // These two maps describe the old filesystem location, not
+                // objects borrowed by the checkout. Forget their cached claims.
+                inner.catalog.sibling_commits.remove(&donor);
+                inner.catalog.legacy_checkouts.remove(&donor);
+                for repository in inner.catalog.repositories.values_mut() {
+                    if let Some(desired) = &mut repository.desired {
+                        if paths::base(desired).caller.text() == &donor {
+                            desired.workspace = caller.clone();
+                        }
+                    }
+                }
+                self.catalog(inner)
+            },
+        );
+        if let Err(error) = result {
+            inner.catalog = previous;
+            // A catalog rename can succeed before its directory sync fails.
+            // Publish the restored catalog too before running anything cold.
+            if rekeyed {
+                self.catalog(inner)
+                    .map_err(crate::fork_adoption::MoveError::Recovery)?;
+            }
+            return Err(error);
+        }
+        // Upkeep observations are caches of the old path's contents. The
+        // target-local build-dir marker travels with the checkout itself.
+        for key in [&donor, caller] {
+            inner.build_swept_ms.remove(key);
+            inner.build_guard_pending.remove(key);
+            inner.build_folder_sizes.remove(key);
+            inner.build_retry_after.remove(key);
+            inner.rotation.remove(key);
+            inner
+                .eviction_retry_after
+                .remove(&paths::host_path(&self.core.config, key));
+        }
+        tracing::info!(%donor, workspace = %caller, "forked checkout adopted");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cold_forked_checkout(
+        &self,
+        inner: &mut Inner,
+        request: &Run,
+        roots: &Path,
+    ) -> io::Result<()> {
+        if !inner.fresh_fork || !inner.jobs.is_empty() {
+            return Err(invalid(
+                "cold fork cleanup requires a fresh fork without job records",
+            ));
+        }
+        let caller = paths::request(request).caller_workspace_key.text();
+        let destination = self.adoption_path(roots, caller)?;
+        // Validate the destination before retiring any donor. A bad caller path
+        // must not turn a refused request into deletion of inherited data.
+        crate::fork_adoption::confined(roots, &destination)?;
+        let keys: Vec<_> = inner.catalog.workspaces.keys().cloned().collect();
+        for key in &keys {
+            match self.adoption_path(roots, key).and_then(|path| {
+                crate::fork_adoption::confined(roots, &path)?;
+                Ok(path)
+            }) {
+                Ok(path) => {
+                    self.discard(&path)?;
+                    crate::seed::forget(
+                        &self.core.trees.state,
+                        &paths::host_path(&self.core.config, key),
+                    )?;
+                }
+                Err(error) => {
+                    tracing::info!(workspace = %key, reason = %error, "retiring unaddressable inherited catalog entry without touching its tree")
+                }
+            }
+        }
+        // Discard the copied caller tree too: it may contain empty ancestors
+        // of a nested donor, or orphan files that would prevent a cold clone.
+        self.discard(&destination)?;
+        inner.catalog.workspaces.clear();
+        inner.catalog.sibling_commits.clear();
+        inner.catalog.legacy_checkouts.clear();
+        for key in keys.iter().chain(std::iter::once(caller)) {
+            inner.build_swept_ms.remove(key);
+            inner.build_guard_pending.remove(key);
+            inner.build_folder_sizes.remove(key);
+            inner.build_retry_after.remove(key);
+            inner.rotation.remove(key);
+            inner
+                .eviction_retry_after
+                .remove(&paths::host_path(&self.core.config, key));
+        }
+        self.catalog(inner)?;
+        tracing::info!(workspace = %caller, "inherited fork checkouts retired; using cold checkout");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_or_cold_checkout(
+        &self,
+        inner: &mut Inner,
+        request: &Run,
+        roots: &Path,
+    ) -> io::Result<()> {
+        match self.adopt_checkout(inner, request, roots) {
+            Ok(()) => (),
+            Err(crate::fork_adoption::MoveError::Refused(error)) => {
+                tracing::info!(reason = %error, "forked checkout adoption refused; using cold checkout");
+                self.cold_forked_checkout(inner, request, roots)?;
+            }
+            Err(crate::fork_adoption::MoveError::Recovery(error)) => return Err(error),
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_forked_workspace(&self, inner: &mut Inner, request: &Run) -> io::Result<()> {
+        let refusal = if inner.workspace_forked != Some(true) {
+            Some("forked marker absent")
+        } else if unsafe { libc::geteuid() } != 0 {
+            Some("checkout adoption requires root")
+        } else if !inner.fresh_fork
+            || !inner.jobs.is_empty()
+            || !inner.preparing.is_empty()
+            || !inner.reserved.is_empty()
+        {
+            Some("runner already has execution state")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            tracing::info!(%reason, "forked checkout adoption refused; using cold checkout");
+            return Ok(());
+        }
+        // Adoption must not mutate a path ordinary admission would refuse,
+        // notably a bind root itself rather than a checkout below that root.
+        if let Err(error) = paths::authorize_run(&self.core.config, request, false) {
+            tracing::info!(reason = %error, "forked checkout adoption refused; using cold checkout");
+            return Ok(());
+        }
+        let roots = Path::new("/tenant/roots");
+        #[cfg(test)]
+        let roots = self
+            .core
+            .config
+            .fixture_adoption_roots
+            .as_deref()
+            .unwrap_or(roots);
+        self.adopt_or_cold_checkout(inner, request, roots)
+    }
+
     pub(crate) fn accept(&self, request: Run) -> io::Result<Admission> {
         self.accept_from(request, false, None, None, |_| None)
     }
@@ -4460,15 +4721,9 @@ impl Runner {
             }
             if self.core.config.per_job {
                 if inner.workspace_forked.is_none() {
-                    let marker = Path::new(WORKSPACE_FORKED_MARKER);
-                    #[cfg(test)]
-                    let marker = self
-                        .core
-                        .config
-                        .fixture_workspace_forked_marker
-                        .as_deref()
-                        .unwrap_or(marker);
-                    inner.workspace_forked = Some(marker.try_exists()?);
+                    inner.workspace_forked = Some(self.core.config.workspace_forked()?);
+                    #[cfg(target_os = "linux")]
+                    self.adopt_forked_workspace(&mut inner, &request)?;
                 }
                 inner.per_job_workspace.get_or_insert_with(|| {
                     paths::request(&request).caller_workspace_key.text().clone()

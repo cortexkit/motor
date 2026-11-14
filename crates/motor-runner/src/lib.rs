@@ -22,6 +22,8 @@ mod cpu;
 mod engine;
 mod filesystem;
 #[cfg(target_os = "linux")]
+mod fork_adoption;
+#[cfg(target_os = "linux")]
 mod isolation;
 
 /// Image publication tests use the same access-control-list predicate as per-job guest startup.

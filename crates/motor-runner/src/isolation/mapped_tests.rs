@@ -125,6 +125,7 @@ fn mapped_job_binds_host_trees_at_caller_paths_and_never_names_h() {
             &JavascriptTools::for_role(ToolchainRole::BuildServer),
             None,
             false,
+            None,
         )
         .unwrap();
         let w = |path: &Path| word(path).unwrap();
@@ -212,6 +213,7 @@ fn mapped_writer_fill_binds_its_target_inside_the_caller_checkout() {
             false,
             true,
             None,
+            None,
         )
         .unwrap();
         for expected in [
@@ -268,6 +270,7 @@ fn mapped_source_only_writer_binds_existing_scratch_at_fixed_target() {
             false,
             false,
             true,
+            None,
             None,
         )
         .unwrap();

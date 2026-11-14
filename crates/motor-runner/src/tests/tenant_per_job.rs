@@ -46,6 +46,32 @@ fn forked_marker_is_read_at_first_run_before_workspace_binding_and_only_once() {
     }
 }
 
+#[test]
+fn per_job_warm_build_guard_blocks_fixed_path_base_fill_queueing() {
+    let f = Fixture::new();
+    let mut config = job_config(&f);
+    config.disable_warm_builds = false;
+    config.tenant_write_key = Some(true);
+    config.account_subject = Some("acct:00000000000000000000000000".into());
+    let runner = Runner::open(config).unwrap();
+    assert!(runner.config().tenant_write_key_held());
+    assert!(!runner.warm_builds_enabled("nonempty-tip"));
+    let (request, bytes) = f.run("true");
+    f.submit(&runner, &request, &bytes);
+    let inner = runner.core.inner.lock().unwrap();
+    let mut candidate_config = runner.config().clone();
+    candidate_config.fixed_path_repositories = vec![f.root.clone()];
+    assert!(runner
+        .build_base_candidates(&inner, &candidate_config)
+        .is_empty());
+    assert!(!inner.jobs.values().any(|job| job.base));
+    assert!(inner
+        .catalog
+        .repositories
+        .values()
+        .all(|repository| repository.desired.is_none()));
+}
+
 pub(super) async fn raw_terminal(client: &mut tokio::io::DuplexStream) -> serde_json::Value {
     use tokio::io::AsyncReadExt;
     loop {
