@@ -199,6 +199,9 @@ pub fn journal_message(message: &str) -> String {
         "build base seed succeeded",
         "build base seed skipped",
         "build base published",
+        "Cargo build-folder maintenance",
+        "runner admission cleared its own build outputs",
+        "runner build base eviction",
         // Job-stream lifecycle on the tenant boundary: why a connection from
         // motor-host closed, and on which side. Their fields are the runner's
         // own labels, counters and job ids, never frame contents.
@@ -255,6 +258,22 @@ pub fn journal_message(message: &str) -> String {
             break;
         }
         let valid = match key {
+            _ if matches!(
+                *name,
+                "Cargo build-folder maintenance"
+                    | "runner admission cleared its own build outputs"
+                    | "runner build base eviction"
+            ) =>
+            {
+                match key {
+                    "job_id" => uuid::Uuid::parse_str(value).is_ok(),
+                    "success" => matches!(value, "true" | "false"),
+                    "legacy_candidates" | "foreign_candidates" | "bytes" | "free_bytes"
+                    | "floor_bytes" | "goal_bytes" | "last_used_ms" | "bytes_freed"
+                    | "allocated_bytes" | "pass" => value.parse::<u64>().is_ok(),
+                    _ => false,
+                }
+            }
             "job_id" => uuid::Uuid::parse_str(value).is_ok(),
             "cache_fill" | "success" => matches!(value, "true" | "false"),
             "reason" if *name == "build base seed skipped" => matches!(
@@ -271,7 +290,8 @@ pub fn journal_message(message: &str) -> String {
                     | "symlink_change"
                     | "seed_failed"
             ),
-            "inputs_match" | "times_valid"
+            "inputs_match" | "times_valid" | "toolchain_match" | "environment_match"
+            | "fixed_path_match" | "device_match" | "format_match"
                 if *name == "build base seed refused: record mismatch" =>
             {
                 matches!(value, "true" | "false")
@@ -411,5 +431,38 @@ mod tests {
                 "runner panic location=[location omitted]"
             );
         }
+    }
+
+    #[test]
+    fn build_folder_maintenance_exposes_only_bounded_decision_fields() {
+        let raw = "[motor-runner] INFO motor_runner::cargo_build_dir: Cargo build-folder maintenance legacy_candidates=4 foreign_candidates=2 success=true path=/SECRET reason=SECRET";
+        let expected =
+            "Cargo build-folder maintenance legacy_candidates=4 foreign_candidates=2 success=true";
+        assert_eq!(console_message(raw), expected);
+        assert_eq!(console_message(expected), expected);
+    }
+
+    #[test]
+    fn admitting_target_cleanup_exposes_only_numeric_pressure_fields() {
+        let raw = "[motor-runner] INFO motor_runner::disk: runner admission cleared its own build outputs path=/SECRET bytes=400 free_bytes=500 floor_bytes=100 goal_bytes=350 reason=SECRET";
+        let expected = "runner admission cleared its own build outputs bytes=400 free_bytes=500 floor_bytes=100 goal_bytes=350";
+        assert_eq!(console_message(raw), expected);
+        assert_eq!(console_message(expected), expected);
+    }
+
+    #[test]
+    fn base_eviction_exposes_only_numeric_reclaim_fields() {
+        let raw = "[motor-runner] INFO motor_runner::disk: runner build base eviction repository=/SECRET generation=current last_used_ms=123 bytes_freed=400 allocated_bytes=500 pass=4 reason=SECRET";
+        let expected = "runner build base eviction last_used_ms=123 bytes_freed=400 allocated_bytes=500 pass=4";
+        assert_eq!(console_message(raw), expected);
+        assert_eq!(console_message(expected), expected);
+    }
+
+    #[test]
+    fn seed_refusal_separates_compatibility_dimensions_without_inputs() {
+        let raw = "[motor-runner] INFO motor_runner::seed: build base seed refused: record mismatch inputs_match=false times_valid=true toolchain_match=true environment_match=false fixed_path_match=true device_match=true format_match=true workspace=/SECRET";
+        let expected = "build base seed refused: record mismatch inputs_match=false times_valid=true toolchain_match=true environment_match=false fixed_path_match=true device_match=true format_match=true";
+        assert_eq!(console_message(raw), expected);
+        assert_eq!(console_message(expected), expected);
     }
 }

@@ -445,15 +445,18 @@ fn run(attempt: &Attempt<'_>, ops: &Operations<'_>, job: motor_protocol::Uuid) -
         Ok(record) => record,
         Err(_) => return Ok(skipped(job, "unreadable_record")),
     };
-    if !record_matches(
-        &record,
-        attempt,
-        Identity::of(&base.directory)?.device,
-        Identity::of(&target)?.device,
-    )? {
+    let base_device = Identity::of(&base.directory)?.device;
+    let target_device = Identity::of(&target)?.device;
+    if !record_matches(&record, attempt, base_device, target_device)? {
         tracing::info!(
+            job_id = %job,
             inputs_match = attempt.compatibility.for_seed().is_ok_and(|inputs| record.inputs == *inputs),
             times_valid = record.times_valid(),
+            toolchain_match = attempt.compatibility.for_seed().is_ok_and(|inputs| record.inputs.toolchain == inputs.toolchain),
+            environment_match = attempt.compatibility.for_seed().is_ok_and(|inputs| record.inputs.environment == inputs.environment),
+            fixed_path_match = record.fixed_path == attempt.fixed,
+            device_match = base_device == target_device,
+            format_match = record.format == 1,
             workspace = %attempt.workspace.display(),
             "build base seed refused: record mismatch"
         );
