@@ -1160,6 +1160,9 @@ async fn authoritative_terminals_are_byte_identical_live_and_on_replay_after_res
         }
         let mut forged = crate::replay::decode(frames.last().unwrap()).unwrap();
         forged["oom_kill"] = json!({"cause":"host_pressure"});
+        forged["mem_peak_mib"] = json!(140);
+        forged["mem_working_peak_mib"] = json!(120);
+        forged["mem_over_mib_ms"] = json!(222);
         if host_stop {
             forged["last_seq"] = json!(123);
         }
@@ -1174,6 +1177,14 @@ async fn authoritative_terminals_are_byte_identical_live_and_on_replay_after_res
         } else {
             assert!(delivered.value.get("oom_kill").is_none());
             assert_eq!(delivered.value["outcome"]["type"], "exit");
+            assert_eq!(
+                delivered.value,
+                crate::replay::decode(frames.last().unwrap()).unwrap(),
+                "guest accounting must not change the caller's terminal"
+            );
+        }
+        for name in ["mem_peak_mib", "mem_working_peak_mib", "mem_over_mib_ms"] {
+            assert!(delivered.value.get(name).is_none());
         }
         ack_at(&runtime, &mut guest, if host_stop { 5 } else { 4 }).await;
         let stored = runtime.job_stream(JOB).unwrap();

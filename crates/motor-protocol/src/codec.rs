@@ -1,5 +1,5 @@
-use crate::{types::FrameTag, Frame};
-use serde::Deserialize;
+use crate::{types::FrameTag, Frame, TerminalRecord};
+use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -46,7 +46,7 @@ pub fn decode_frame(bytes: &[u8]) -> io::Result<DecodedFrame> {
     }
 }
 
-fn json_bytes(frame: &Frame) -> io::Result<(Vec<u8>, [u8; 4])> {
+fn json_bytes(frame: &impl Serialize) -> io::Result<(Vec<u8>, [u8; 4])> {
     let bytes = serde_json::to_vec(frame).map_err(invalid_data)?;
     check_length(bytes.len())?;
     let length = u32::try_from(bytes.len())
@@ -114,6 +114,43 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(
     writer.write_all(&bytes).await
 }
 
+/// Guest-to-host accounting, separate from the shared caller terminal record.
+/// Unknown measurements stay absent; overage is present only for burst leases.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalMemory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_peak_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_working_peak_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_over_mib_ms: Option<u64>,
+}
+
+/// Add accounting only on the guest-to-host stream. Ordinary Frame decoders
+/// ignore these fields and still decode the unchanged terminal record.
+pub async fn write_terminal_with_memory_async<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    terminal: &TerminalRecord,
+    memory: &TerminalMemory,
+) -> io::Result<()> {
+    #[derive(Serialize)]
+    struct Envelope<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        #[serde(flatten)]
+        terminal: &'a TerminalRecord,
+        #[serde(flatten)]
+        memory: &'a TerminalMemory,
+    }
+    let (bytes, length) = json_bytes(&Envelope {
+        kind: "terminal",
+        terminal,
+        memory,
+    })?;
+    writer.write_all(&length).await?;
+    writer.write_all(&bytes).await
+}
+
 /// Like read_frame, with asynchronous IO. A caller must not cancel and retry a
 /// partially polled read on the same stream: cancellation detaches the channel.
 pub async fn read_frame_async<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Frame>> {
@@ -147,4 +184,56 @@ pub async fn read_record_async<R: AsyncRead + Unpin>(
         ));
     }
     decode_frame(&bytes).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_accounting_is_additive_and_absent_by_default() {
+        let terminal = TerminalRecord::new(
+            crate::Uuid::now_v7(),
+            crate::Outcome::Exit { code: 0 },
+            100,
+            0,
+            0,
+        );
+        let frame = Frame::Terminal(terminal.clone());
+        let mut ordinary = Vec::new();
+        write_frame_async(&mut ordinary, &frame).await.unwrap();
+        for memory in [
+            TerminalMemory::default(),
+            TerminalMemory {
+                mem_peak_mib: Some(12),
+                mem_working_peak_mib: Some(10),
+                mem_over_mib_ms: Some(100),
+            },
+        ] {
+            let mut bytes = Vec::new();
+            write_terminal_with_memory_async(&mut bytes, &terminal, &memory)
+                .await
+                .unwrap();
+            assert_eq!(
+                u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize,
+                bytes.len() - 4
+            );
+            assert_eq!(
+                decode_frame(&bytes[4..]).unwrap(),
+                DecodedFrame::Frame(frame.clone())
+            );
+            let value: serde_json::Value = serde_json::from_slice(&bytes[4..]).unwrap();
+            for (name, expected) in [
+                ("mem_peak_mib", memory.mem_peak_mib),
+                ("mem_working_peak_mib", memory.mem_working_peak_mib),
+                ("mem_over_mib_ms", memory.mem_over_mib_ms),
+            ] {
+                assert_eq!(value.get(name).and_then(|v| v.as_u64()), expected);
+                assert_eq!(value.get(name).is_some(), expected.is_some());
+            }
+            if memory == TerminalMemory::default() {
+                assert_eq!(bytes, ordinary);
+            }
+        }
+    }
 }

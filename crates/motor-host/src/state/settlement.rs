@@ -368,12 +368,22 @@ impl Host {
             .ok_or(Error::Refused(Refusal::Auth))?;
         lease.state = LeaseState::Ended;
         lease.ended_at_ms = Some(now_ms);
+        let memory = evidence.memory.as_ref();
+        if frame["mem_over_mib_ms"].as_u64().is_none() {
+            if let Some(over) = memory.and_then(|s| s.mem_over_mib_ms).flatten() {
+                frame["mem_over_mib_ms"] = over.into();
+            }
+        }
+        let sampled_peak = memory.and_then(|s| s.mem_working_peak_mib);
         let b = next.billing.entry(job.into()).or_default();
         b.terminal_received_ms = Some(now_ms);
         b.ended_observed_ms = Some(now_ms);
         b.terminal_live = live;
-        b.mem_peak_mib = frame["mem_peak_mib"].as_u64();
-        b.mem_working_peak_mib = frame["mem_working_peak_mib"].as_u64();
+        b.mem_peak_mib = frame["mem_peak_mib"].as_u64().or(b.mem_peak_mib);
+        b.mem_working_peak_mib = frame["mem_working_peak_mib"]
+            .as_u64()
+            .or(b.mem_working_peak_mib)
+            .or(sampled_peak);
         b.terminal = Some(frame);
         crate::billing::finalize_ready(&mut next, now_ms);
         defer_usage(&mut next, job);
@@ -391,7 +401,31 @@ pub(crate) fn defer_usage(next: &mut Snapshot, job: &str) {
         return;
     }
     let b = next.billing.entry(job.into()).or_default();
-    if let Some(usage) = b.usage.take() {
+    if let Some(mut usage) = b.usage.take() {
+        let claims = &next.leases[job].claims;
+        let limit = super::jobs::memory_limit_mib(claims);
+        // Guest telemetry is not authority to enlarge a bill. Use the signed
+        // job cap and the host-observed, runtime-capped settlement interval,
+        // never guest wall_ms or VM-wide resident memory.
+        usage.mem_peak_mib = usage.mem_peak_mib.zip(limit).map(|(v, cap)| v.min(cap));
+        usage.mem_working_peak_mib = usage
+            .mem_working_peak_mib
+            .map(|peak| peak.zip(limit).map(|(v, cap)| v.min(cap)));
+        usage.mem_over_mib_ms = claims.mem_burst_mib.and(usage.mem_over_mib_ms).map(|over| {
+            over.zip(limit).map(|(value, limit)| {
+                let possible = limit
+                    .saturating_sub(claims.mem_mib)
+                    .saturating_mul(usage.ended_at_ms.saturating_sub(usage.started_at_ms));
+                value.min(possible).min((1 << 53) - 1)
+            })
+        });
+        // Freeze billing inputs before discarding the private accounting
+        // envelope. Stored/replayed caller terminals keep their original shape.
+        if let Some(fields) = b.terminal.as_mut().and_then(Value::as_object_mut) {
+            for name in ["mem_peak_mib", "mem_working_peak_mib", "mem_over_mib_ms"] {
+                fields.remove(name);
+            }
+        }
         let evidence = next
             .per_job
             .executions

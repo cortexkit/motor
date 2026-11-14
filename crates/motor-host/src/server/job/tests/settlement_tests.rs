@@ -42,6 +42,128 @@ fn body(runtime: &Arc<Runtime>, job: &str) -> Vec<u8> {
     .unwrap()
 }
 
+#[tokio::test]
+async fn guest_terminal_accounting_reaches_usage_but_not_the_caller_record() {
+    for burst in [false, true] {
+        for impossible in [false, true] {
+            let (runtime, _, _) = fixture();
+            let mut c = claims(JOB);
+            c.mem_burst_mib = burst.then_some(50);
+            let id = claim(&runtime, &c);
+            {
+                let mut host = runtime.host.lock().unwrap();
+                boot_at(&mut host, JOB, 100);
+                host.job_runner_hello(JOB).unwrap();
+                host.delivered(id).unwrap();
+                host.event_observed(JOB, &event(JOB, 1, TenantEventKind::Admitted), 100, true)
+                    .unwrap();
+                host.job_started(JOB, 200).unwrap();
+            }
+            let terminal = motor_protocol::TerminalRecord::new(
+                JOB.parse().unwrap(),
+                motor_protocol::Outcome::Exit { code: 0 },
+                u64::MAX,
+                0,
+                0,
+            );
+            let memory = motor_protocol::TerminalMemory {
+                mem_peak_mib: Some(if impossible { u64::MAX } else { 99 }),
+                mem_working_peak_mib: Some(if impossible { u64::MAX } else { 90 }),
+                // A no-burst guest is malicious if it sends this member at all.
+                mem_over_mib_ms: Some(if impossible { u64::MAX } else { 222 }),
+            };
+            let mut wire = Vec::new();
+            motor_protocol::write_terminal_with_memory_async(&mut wire, &terminal, &memory)
+                .await
+                .unwrap();
+            let frame: Value = serde_json::from_slice(&wire[4..]).unwrap();
+            {
+                let mut host = runtime.host.lock().unwrap();
+                host.receive_terminal(JOB, frame.clone(), 400).unwrap();
+                host.job_exit_received(&exit(JOB, 0), 500).unwrap();
+                host.terminal_delivered(JOB, 500).unwrap();
+                host.billing_tick(100_000).unwrap();
+            }
+            let relayed = runtime.observe_job_frame(JOB, &frame).unwrap().unwrap();
+            let ordinary = serde_json::to_value(motor_protocol::Frame::Terminal(terminal)).unwrap();
+            assert_eq!(
+                relayed, ordinary,
+                "private accounting must not alter the caller terminal"
+            );
+            let host = runtime.host.lock().unwrap();
+            let requests: Vec<_> = host
+                .snapshot
+                .outbox
+                .iter()
+                .filter(|r| r.job.as_deref() == Some(JOB) && r.path.ends_with("/usage"))
+                .collect();
+            assert_eq!(requests.len(), 1);
+            let usage: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let limit = if burst { 150 } else { 100 };
+            assert_eq!(usage["mem_peak_mib"], if impossible { limit } else { 99 });
+            assert_eq!(
+                usage["mem_working_peak_mib"],
+                if impossible { limit } else { 90 }
+            );
+            assert_eq!(usage["started_at_ms"], 200);
+            assert_eq!(usage["ended_at_ms"], 400);
+            if burst {
+                assert_eq!(
+                    usage["mem_over_mib_ms"],
+                    if impossible { 10_000 } else { 222 }
+                );
+            } else {
+                assert!(usage.get("mem_over_mib_ms").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn old_guest_terminal_does_not_erase_already_observed_memory() {
+    let (runtime, _, _) = fixture();
+    running(&runtime, JOB, true, true);
+    let mut host = runtime.host.lock().unwrap();
+    let mut final_event = event(JOB, 3, TenantEventKind::Terminal);
+    final_event.mem_peak_mib = Some(140);
+    final_event.mem_working_peak_mib = Some(120);
+    host.event_observed(JOB, &final_event, 350, true).unwrap();
+    let mut frame = terminal(JOB);
+    for name in ["mem_peak_mib", "mem_working_peak_mib", "mem_over_mib_ms"] {
+        frame.as_object_mut().unwrap().remove(name);
+    }
+    host.receive_terminal(JOB, frame, 400).unwrap();
+    host.job_exit_received(&exit(JOB, 0), 500).unwrap();
+    let usage = host.snapshot.billing[JOB].usage.as_ref().unwrap();
+    assert_eq!(usage.mem_peak_mib, Some(140));
+    assert_eq!(usage.mem_working_peak_mib, Some(Some(120)));
+    assert_eq!(usage.mem_over_mib_ms, Some(None));
+}
+
+#[test]
+fn impossible_live_samples_are_bounded_on_host_stop_and_unknown_stays_unknown() {
+    for sampled in [false, true] {
+        let (runtime, _, _) = fixture();
+        running(&runtime, JOB, true, true);
+        let mut host = runtime.host.lock().unwrap();
+        if sampled {
+            host.job_memory_sample(motor_protocol::MemorySample {
+                jti: JOB.parse().unwrap(),
+                mem_working_peak_mib: Some(u64::MAX),
+                mem_over_mib_ms: Some(Some(u64::MAX)),
+            })
+            .unwrap();
+        }
+        host.job_host_stop(JOB, StopCause::HostPressure, 400)
+            .unwrap();
+        host.job_exit_received(&exit(JOB, 0), 500).unwrap();
+        let usage = host.snapshot.billing[JOB].usage.as_ref().unwrap();
+        assert_eq!(usage.mem_peak_mib, None);
+        assert_eq!(usage.mem_working_peak_mib, Some(sampled.then_some(150)));
+        assert_eq!(usage.mem_over_mib_ms, Some(sampled.then_some(10_000)));
+    }
+}
+
 #[test]
 fn failed_resource_cleanup_does_not_starve_billing_in_the_same_tick() {
     let (runtime, _, storage) = fixture();

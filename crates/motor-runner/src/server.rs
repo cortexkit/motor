@@ -425,11 +425,20 @@ async fn writer<W: AsyncWrite + Unpin>(
                 }
                 ctx.changed.notify_one();
                 result
-            } else if let (Some(ctx), Frame::Terminal(_)) = (&tenant, &frame) {
+            } else if let (Some(ctx), Frame::Terminal(terminal)) = (&tenant, &frame) {
                 // Hold the same lock as the reader through the flush so an ack
                 // arriving immediately cannot race terminal_written publication.
                 let mut state = ctx.state.lock().await;
-                let result = write_frame_async(&mut write, &frame).await;
+                let result = if ctx.runner.config().per_job {
+                    write_terminal_with_memory_async(
+                        &mut write,
+                        terminal,
+                        &ctx.runner.terminal_memory(ctx.lease.jti),
+                    )
+                    .await
+                } else {
+                    write_frame_async(&mut write, &frame).await
+                };
                 if result.is_ok() {
                     state.terminal_written = true;
                 }
@@ -1281,6 +1290,7 @@ async fn attach(
     tenant: bool,
 ) -> io::Result<()> {
     tracing::info!(job_id = %id, from_seq = from, supports_started = started, "runner job stream attached");
+    let mut memory_deadline = None;
     loop {
         let r = runner.clone();
         let frames = tokio::task::spawn_blocking(move || {
@@ -1293,6 +1303,17 @@ async fn attach(
         .await
         .map_err(io::Error::other)??;
         for frame in frames {
+            let terminal = matches!(frame, Frame::Terminal(_));
+            if terminal && tenant && runner.config().per_job {
+                // Accounting normally arrives with the launcher exit. A stuck
+                // launcher must not hold the caller's result for its longer
+                // lifecycle-accounting grace period.
+                let deadline = memory_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(2));
+                if !runner.terminal_memory_ready(id, tokio::time::Instant::now() >= *deadline) {
+                    break;
+                }
+            }
             match &frame {
                 Frame::Output(output) => from = output.seq + 1,
                 Frame::Started { seq, .. } => from = seq + 1,
@@ -1301,7 +1322,6 @@ async fn attach(
                 Frame::ReturnManifest(manifest) => from = manifest.seq + 1,
                 _ => {}
             }
-            let terminal = matches!(frame, Frame::Terminal(_));
             send(tx, frame).await?;
             if terminal {
                 return Ok(());
