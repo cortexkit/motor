@@ -92,6 +92,9 @@ pub(crate) mod progress;
 #[cfg(test)]
 mod progress_tests;
 pub(crate) mod submission_key;
+#[cfg(test)]
+#[path = "motor/upload_activity_tests.rs"]
+mod upload_activity_tests;
 
 struct Submission {
     motor: Motor,
@@ -1902,7 +1905,9 @@ impl Motor {
                     .await;
             }
         };
-        let uploaded = self.upload(&channel, &snapshots, &upload, Some(id)).await;
+        let uploaded = self
+            .upload(&mut channel, &snapshots, &upload, Some(id))
+            .await;
         drop(snapshots);
         if let Err(error) = &uploaded {
             if hosted {
@@ -1986,7 +1991,7 @@ impl Motor {
     }
     async fn upload(
         &self,
-        channel: &Channel,
+        channel: &mut Channel,
         snapshots: &Snapshots,
         bundles: &[BundleManifest],
         job: Option<Uuid>,
@@ -2025,11 +2030,27 @@ impl Motor {
                     break;
                 }
                 channel
-                    .send(Frame::BundleChunk {
-                        index: bundle.index,
-                        offset,
-                        data: BytePayload(bytes[..n].to_vec()),
-                    })
+                    .send_upload(
+                        Frame::BundleChunk {
+                            index: bundle.index,
+                            offset,
+                            data: BytePayload(bytes[..n].to_vec()),
+                        },
+                        |incoming| {
+                            if let Some(id) = job {
+                                match incoming {
+                                    Incoming::Frame(Frame::Heartbeat {
+                                        queue_status: Some(status),
+                                        ..
+                                    }) => self.report_queue_status(id, status),
+                                    Incoming::Frame(Frame::Started { .. }) => {
+                                        self.report_queue_started(id)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        },
+                    )
                     .await?;
                 offset += n as u64;
             }

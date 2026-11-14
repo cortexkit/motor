@@ -3,6 +3,7 @@ use crate::{agent::VaultAgent, Config};
 use cortexkit_claustrum_client::{CredentialErrorClass, CredentialResolver};
 use motor_protocol::*;
 use std::{
+    collections::VecDeque,
     ffi::OsStr,
     future::Future,
     io,
@@ -1333,6 +1334,7 @@ pub(crate) struct Channel {
     pub fill_tips: bool,
     tx: mpsc::Sender<WriteRequest>,
     rx: mpsc::Receiver<io::Result<Incoming>>,
+    pending: VecDeque<io::Result<Incoming>>,
     heartbeat_enabled: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -1572,6 +1574,7 @@ impl Channel {
         let (incoming, rx) = mpsc::channel(16);
         let (broken_tx, mut read_broken) = tokio::sync::watch::channel(false);
         let (heartbeat_enabled, mut heartbeat_state) = watch::channel(false);
+        let (peer_activity, last_frame) = watch::channel(tokio::time::Instant::now());
         let reading = tokio::spawn(async move {
             loop {
                 let mut frame_started = false;
@@ -1596,6 +1599,7 @@ impl Channel {
                 .await;
                 match result {
                     Ok(frame) => {
+                        peer_activity.send_replace(tokio::time::Instant::now());
                         if incoming.send(Ok(frame)).await.is_err() {
                             break;
                         }
@@ -1618,6 +1622,7 @@ impl Channel {
             }
         });
         let writing = tokio::spawn(async move {
+            let mut stall_limit = Duration::from_secs(60);
             let mut heartbeat = tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -1633,7 +1638,13 @@ impl Channel {
                         continue;
                     }
                 };
-                let result = write_active(&mut write, &frame).await;
+                if let Frame::Run(run) = &frame {
+                    stall_limit =
+                        Duration::from_secs(run.queue_wait_limit_s).max(Duration::from_secs(60));
+                }
+                let result =
+                    write_active_with_peer(&mut write, &frame, Some(&last_frame), stall_limit)
+                        .await;
                 let failed = result.is_err();
                 if let Some(ack) = ack {
                     let _ = ack.send(result);
@@ -1654,6 +1665,7 @@ impl Channel {
             fill_tips: false,
             tx,
             rx,
+            pending: VecDeque::new(),
             heartbeat_enabled,
             tasks: vec![reading, writing],
         }
@@ -1669,6 +1681,40 @@ impl Channel {
             .map_err(|_| io::Error::other("channel detached"))?;
         rx.await.map_err(|_| io::Error::other("channel detached"))?
     }
+    /// Drain the bounded inbox while an upload is backpressured. Report live
+    /// progress now, but retain every frame for `next_job` in wire order.
+    pub async fn send_upload(
+        &mut self,
+        frame: Frame,
+        mut progress: impl FnMut(&Incoming),
+    ) -> io::Result<()> {
+        let tx = self.tx.clone();
+        let sending = async move {
+            let (ack, received) = oneshot::channel();
+            tx.send((frame, ack))
+                .await
+                .map_err(|_| io::Error::other("channel detached"))?;
+            received
+                .await
+                .map_err(|_| io::Error::other("channel detached"))?
+        };
+        tokio::pin!(sending);
+        let mut open = true;
+        loop {
+            tokio::select! {
+                result = &mut sending => return result,
+                incoming = self.rx.recv(), if open => match incoming {
+                    Some(incoming) => {
+                        if let Ok(frame) = &incoming {
+                            progress(frame);
+                        }
+                        self.pending.push_back(incoming);
+                    }
+                    None => open = false,
+                },
+            }
+        }
+    }
     pub async fn next(&mut self) -> io::Result<Incoming> {
         loop {
             match self.next_job().await? {
@@ -1679,6 +1725,9 @@ impl Channel {
     }
     /// Job followers consume heartbeats too, since they carry queue lifecycle.
     pub async fn next_job(&mut self) -> io::Result<Incoming> {
+        if let Some(frame) = self.pending.pop_front() {
+            return frame;
+        }
         self.rx
             .recv()
             .await
@@ -2021,14 +2070,28 @@ async fn read_exact_active<R: AsyncRead + Unpin>(
     }
     Ok(())
 }
+#[cfg(test)]
 async fn write_active<W: AsyncWrite + Unpin>(write: &mut W, frame: &Frame) -> io::Result<()> {
+    write_active_with_peer(write, frame, None, Duration::from_secs(60)).await
+}
+
+async fn write_active_with_peer<W: AsyncWrite + Unpin>(
+    write: &mut W,
+    frame: &Frame,
+    peer: Option<&watch::Receiver<tokio::time::Instant>>,
+    stall_limit: Duration,
+) -> io::Result<()> {
     let mut bytes = Vec::new();
     motor_protocol::write_frame(&mut bytes, frame)?;
     let mut offset = 0;
     while offset < bytes.len() {
-        let n = tokio::time::timeout(Duration::from_secs(60), write.write(&bytes[offset..]))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write inactivity"))??;
+        let n = wait_write_active(
+            write.write(&bytes[offset..]),
+            peer,
+            stall_limit,
+            "write inactivity",
+        )
+        .await?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -2037,14 +2100,143 @@ async fn write_active<W: AsyncWrite + Unpin>(write: &mut W, frame: &Frame) -> io
         }
         offset += n;
     }
-    tokio::time::timeout(Duration::from_secs(60), write.flush())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "flush inactivity"))?
+    wait_write_active(write.flush(), peer, stall_limit, "flush inactivity").await
+}
+
+async fn wait_write_active<T>(
+    operation: impl Future<Output = io::Result<T>>,
+    peer: Option<&watch::Receiver<tokio::time::Instant>>,
+    stall_limit: Duration,
+    cause: &'static str,
+) -> io::Result<T> {
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // The peer can intentionally stop reading at its spool cap. Complete
+    // inbound frames prove it is alive, but cannot extend one continuous stall
+    // beyond the job's queue-wait budget (or shorten the normal 60s allowance).
+    let hard_deadline = tokio::time::Instant::now()
+        .checked_add(stall_limit.max(Duration::from_secs(60)))
+        .unwrap_or(deadline);
+    tokio::pin!(operation);
+    loop {
+        if let Ok(result) = tokio::time::timeout_at(deadline, &mut operation).await {
+            return result;
+        }
+        if let Some(peer) = peer {
+            deadline = (*peer.borrow() + Duration::from_secs(60)).min(hard_deadline);
+        }
+        if deadline <= tokio::time::Instant::now() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, cause));
+        }
+    }
 }
 
 #[cfg(test)]
 mod transfer_io_tests {
     use super::*;
+
+    struct DelayedFlush(Pin<Box<tokio::time::Sleep>>);
+    impl AsyncWrite for DelayedFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            self.0.as_mut().poll(cx).map(|()| Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn live_peer() -> (watch::Receiver<tokio::time::Instant>, JoinHandle<()>) {
+        let (tx, rx) = watch::channel(tokio::time::Instant::now());
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if tx.send(tokio::time::Instant::now()).is_err() {
+                    break;
+                }
+            }
+        });
+        (rx, task)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_peer_keeps_a_blocked_flush_alive() {
+        let (peer, heartbeats) = live_peer();
+        let mut write = DelayedFlush(Box::pin(tokio::time::sleep(Duration::from_secs(65))));
+        write_active_with_peer(
+            &mut write,
+            &Frame::Heartbeat {
+                queue_wait_ms: None,
+                queue_status: None,
+            },
+            Some(&peer),
+            Duration::from_secs(180),
+        )
+        .await
+        .unwrap();
+        heartbeats.abort();
+        let _ = heartbeats.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_peer_cannot_extend_a_stalled_write_past_the_queue_budget() {
+        let (peer, heartbeats) = live_peer();
+        let (mut write, _unread) = tokio::io::duplex(1);
+        let started = tokio::time::Instant::now();
+        let error = write_active_with_peer(
+            &mut write,
+            &Frame::Heartbeat {
+                queue_wait_ms: None,
+                queue_status: None,
+            },
+            Some(&peer),
+            Duration::from_secs(75),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "write inactivity");
+        assert_eq!(started.elapsed(), Duration::from_secs(75));
+        heartbeats.abort();
+        let _ = heartbeats.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_silence_after_heartbeats_restores_the_inactivity_bound() {
+        let (tx, peer) = watch::channel(tokio::time::Instant::now());
+        let updates = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            tx.send_replace(tokio::time::Instant::now());
+        });
+        let (mut write, _unread) = tokio::io::duplex(1);
+        let started = tokio::time::Instant::now();
+        let error = write_active_with_peer(
+            &mut write,
+            &Frame::Heartbeat {
+                queue_wait_ms: None,
+                queue_status: None,
+            },
+            Some(&peer),
+            Duration::from_secs(180),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), Duration::from_secs(90));
+        updates.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn slow_reads_count_each_byte_not_total_frame_duration() {
         let (mut read, mut write) = tokio::io::duplex(1);
