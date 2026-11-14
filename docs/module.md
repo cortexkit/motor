@@ -764,6 +764,13 @@ ignoring the override. Set such a variable inside the command instead.
 `RUSTUP_*` name is forwarded. Names containing `TOKEN`, `SECRET`, `PASSWORD`,
 `KEY` or `CREDENTIAL` remain refused.
 
+`--env` refuses names the Linux runner sets itself (`HOME`, `CARGO_HOME`,
+`RUSTUP_HOME`, `CARGO_NET_OFFLINE`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`,
+`TMP`, `TEMP`, `PATH`). Every Linux job runs Cargo offline
+(`CARGO_NET_OFFLINE=true`), `--net` included; to fetch from the network, set
+`CARGO_NET_OFFLINE=false` inside the command or pass
+`cargo --config net.offline=false`.
+
 The words after `--` follow two rules:
 
 - **One word** is passed verbatim as the runner's `bash -c` command string.
