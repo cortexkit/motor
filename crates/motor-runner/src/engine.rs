@@ -391,7 +391,7 @@ pub struct Config {
     pub(crate) fixture_tenant_dns: Option<(PathBuf, PathBuf)>,
     #[cfg(test)]
     pub(crate) fixture_workspace_forked_marker: Option<PathBuf>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fixture_adoption_roots: Option<PathBuf>,
     /// Called with an operation label so tests can hold filesystem work or the
     /// admission handoff open without holding the runner state lock.
@@ -758,7 +758,7 @@ impl Config {
             fixture_tenant_dns: None,
             #[cfg(test)]
             fixture_workspace_forked_marker: None,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             fixture_adoption_roots: None,
             #[cfg(test)]
             long_work: None,

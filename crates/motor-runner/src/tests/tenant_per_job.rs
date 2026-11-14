@@ -46,6 +46,8 @@ fn forked_marker_is_read_at_first_run_before_workspace_binding_and_only_once() {
     }
 }
 
+// Build-base candidates exist only on Linux, where fixed checkout paths do.
+#[cfg(target_os = "linux")]
 #[test]
 fn per_job_warm_build_guard_blocks_fixed_path_base_fill_queueing() {
     let f = Fixture::new();
