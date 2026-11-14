@@ -4,6 +4,42 @@ use super::*;
 
 const BUILD: &str = "cargo build --workspace --locked --offline --message-format=json";
 
+struct AdoptionFixture {
+    inner: Fixture,
+    mounts: Vec<PathBuf>,
+}
+
+impl std::ops::Deref for AdoptionFixture {
+    type Target = Fixture;
+
+    fn deref(&self) -> &Fixture {
+        &self.inner
+    }
+}
+
+impl Drop for AdoptionFixture {
+    fn drop(&mut self) {
+        // Stop units and release their source binds before unmounting. The
+        // inner fixture removes its scratch tree only after these mounts go.
+        assert!(
+            self.inner.cleanup.finish(),
+            "adoption fixture did not quiesce"
+        );
+        for target in self.mounts.iter().rev() {
+            let output = Command::new("/usr/bin/umount")
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "unmount {}: {}",
+                target.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
 fn save(root: &Path, path: &str, content: &str) {
     let path = root.join(path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -26,9 +62,12 @@ fn snapshot(f: &Fixture) {
     );
 }
 
-fn fixture() -> (Fixture, Config) {
+fn fixture() -> (AdoptionFixture, Config) {
     assert_eq!(unsafe { libc::geteuid() }, 0, "operator-only fixture");
-    let f = Fixture::new();
+    let mut f = AdoptionFixture {
+        inner: Fixture::new(),
+        mounts: Vec::new(),
+    };
     save(&f.main, ".gitignore", "/target/\n");
     save(
         &f.main,
@@ -56,8 +95,64 @@ fn fixture() -> (Fixture, Config) {
     let mut config = base_store_config(&f, BUILD);
     config.tenant_vm = true;
     config.per_job = true;
-    // Only the physical checkout-disk root and per-boot marker are relocated;
-    // the fixture still runs the real root check, isolation and account checks.
+    config.image_cargo = f.scratch.join("image-cargo");
+    let cargo_home = f.scratch.join("cargo-home");
+    config.cargo_home = Some(cargo_home.clone());
+    fs::create_dir_all(cargo_home.join("bin")).unwrap();
+    // Keep only tool links in this Cargo home. The toolchain itself is already
+    // mounted read-only from RUSTUP_HOME, never from the operator's Cargo cache.
+    for tool in ["cargo", "rustc", "rustdoc"] {
+        let output = Command::new("rustup")
+            .args(["which", tool])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        assert!(path.starts_with(std::env::var_os("RUSTUP_HOME").unwrap()));
+        std::os::unix::fs::symlink(path, cargo_home.join("bin").join(tool)).unwrap();
+    }
+    for name in ["registry", "git"] {
+        let lower = config.image_cargo.join(name);
+        fs::create_dir_all(&lower).unwrap();
+        let output = Command::new("/usr/bin/setfacl")
+            .args([
+                "-m",
+                "u:motor-job:r-x,m::r-x,d:u:motor-job:r-x,d:m::r-x",
+                "--",
+            ])
+            .arg(&lower)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The tenant agent normally mounts these two overlays before Runner::open.
+    // Reproduce that layout only under the fixture's own Cargo home.
+    for layer in crate::isolation::cargo_sources::layers(&cargo_home, &config.image_cargo) {
+        for path in [&layer.upper, &layer.work, &layer.target] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let output = Command::new("/usr/bin/mount")
+            .args(["-t", "overlay", "-o", &layer.options(), "overlay"])
+            .arg(&layer.target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        f.mounts.push(layer.target);
+    }
+    // Relocate the checkout disk and per-boot marker as well, without replacing
+    // the real root, isolation, account or Cargo ACL checks.
     config.fixture_adoption_roots = Some(f.scratch.join("remote"));
     config.fixture_workspace_forked_marker = Some(f.scratch.join("forked"));
     (f, config)

@@ -795,6 +795,7 @@ fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandb
                     false,
                     true,
                     None,
+                    None,
                 )
             } else {
                 Sandbox::prepare_role(
@@ -816,6 +817,7 @@ fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandb
                     &javascript,
                     None,
                     false,
+                    None,
                 )
                 .map(|sandbox| sandbox.with_boat_profile(true, true, Some(14 << 30)))
             }
@@ -1118,6 +1120,7 @@ impl Fixture {
             cache_generation: None,
             cargo_overlays: None,
             cargo_image: None,
+            shared_cargo: None,
             locked_git_commits: Vec::new(),
             parent_umask: 0o022,
             memory_floor_gib: None,
@@ -1303,6 +1306,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         cache_generation: None,
         cargo_overlays: None,
         cargo_image: None,
+        shared_cargo: None,
         locked_git_commits: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
@@ -1946,6 +1950,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 cache_generation: None,
                 cargo_overlays: None,
                 cargo_image: None,
+                shared_cargo: None,
                 locked_git_commits: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
@@ -2007,6 +2012,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 cache_generation: None,
                 cargo_overlays: None,
                 cargo_image: None,
+                shared_cargo: None,
                 locked_git_commits: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
@@ -2474,6 +2480,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         cache_generation: None,
         cargo_overlays: None,
         cargo_image: None,
+        shared_cargo: None,
         locked_git_commits: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
@@ -3166,6 +3173,7 @@ fn isolated_tenant_prepare_reads_snapshot_lockfile_before_dissociating_checkout(
         &JavascriptTools::for_role(ToolchainRole::BuildServer),
         None,
         false,
+        None,
     )
     .expect("tenant preparation must read the snapshot before removing mirror alternates");
     assert!(!alternates.exists());

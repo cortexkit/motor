@@ -44,6 +44,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_cargo_roots_do_not_read_operator_cargo_home() {
+        super::super::host_inputs::fixture::with(
+            super::super::host_inputs::fixture::Inputs {
+                environment: Default::default(),
+                existing: Default::default(),
+                directories: Default::default(),
+            },
+            || {
+                let mut config = crate::Config::new("/runner/state", "test");
+                config.cargo_home = Some("/scratch/cargo-home".into());
+                config.image_cargo = "/scratch/image-cargo".into();
+                assert_eq!(
+                    config.cargo_home().unwrap(),
+                    Path::new("/scratch/cargo-home")
+                );
+                for (layer, name) in layers(&config.cargo_home().unwrap(), &config.image_cargo)
+                    .iter()
+                    .zip(["registry", "git"])
+                {
+                    assert_eq!(layer.lower, Path::new("/scratch/image-cargo").join(name));
+                    assert_eq!(layer.target, Path::new("/scratch/cargo-home").join(name));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn default_cargo_roots_keep_image_constant_and_environment_home() {
+        super::super::host_inputs::fixture::with(
+            super::super::host_inputs::fixture::Inputs {
+                environment: [("CARGO_HOME", "/operator/cargo-home".into())].into(),
+                existing: Default::default(),
+                directories: Default::default(),
+            },
+            || {
+                let config = crate::Config::new("/runner/state", "test");
+                assert!(config.cargo_home.is_none());
+                assert_eq!(config.image_cargo, Path::new(IMAGE_CARGO));
+                assert_eq!(
+                    config.cargo_home().unwrap(),
+                    Path::new("/operator/cargo-home")
+                );
+            },
+        );
+    }
+
+    #[test]
     fn source_overlays_write_only_workspace_and_keep_the_image_as_lower() {
         let [registry, git] = layers(Path::new("/tenant/cargo-home"), Path::new(IMAGE_CARGO));
         for (layer, name) in [(&registry, "registry"), (&git, "git")] {

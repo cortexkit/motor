@@ -274,8 +274,22 @@ pub(crate) fn retire_writer_cache(fleet: &Path, retired: &Path) -> io::Result<()
 /// access ACLs once at daemon startup; recursive default ACLs on every Cargo
 /// cache directory let trusted Cargo fetches add readable content between jobs
 /// without rescanning the shared trees before each launch.
-pub(crate) fn prepare_shared_read_access(javascript: &JavascriptTools) -> io::Result<()> {
-    prepare_shared_read_access_as(USER, javascript)
+pub(crate) fn prepare_shared_read_access(
+    javascript: &JavascriptTools,
+    cargo_home: Option<&Path>,
+) -> io::Result<()> {
+    prepare_shared_read_access_as(USER, javascript, cargo_home)
+}
+
+pub(crate) fn shared_cargo_home(configured: Option<&Path>) -> io::Result<PathBuf> {
+    configured.map(Path::to_path_buf).map_or_else(
+        || {
+            host_inputs::environment("CARGO_HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| io::Error::other("CARGO_HOME unset"))
+        },
+        Ok,
+    )
 }
 
 /// Image access control lists (ACLs) need `u:motor-job:rX,m::rX` on entries and
@@ -283,12 +297,13 @@ pub(crate) fn prepare_shared_read_access(javascript: &JavascriptTools) -> io::Re
 /// read/search. Without an extended access ACL, group/other rX also suffices.
 /// Source entries must not be owned by motor-job. Missing image ACLs are refused,
 /// never rewritten through the overlay, which would copy all source files up.
-pub(crate) fn prepare_job_vm_read_access(javascript: &JavascriptTools) -> io::Result<()> {
-    let home = PathBuf::from(
-        std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
-    );
+pub(crate) fn prepare_job_vm_read_access(
+    javascript: &JavascriptTools,
+    home: &Path,
+    image: &Path,
+) -> io::Result<()> {
     let uid = account_uid(USER)?.ok_or_else(|| io::Error::other("motor-job account missing"))?;
-    for layer in cargo_sources::layers(&home, Path::new(cargo_sources::IMAGE_CARGO)) {
+    for layer in cargo_sources::layers(home, image) {
         // Image publication must provision its ACLs. Recursively granting them
         // through the merged mount would copy every crate onto each workspace.
         if !readable::already_readable(&layer.lower, uid, true) {
@@ -307,14 +322,19 @@ pub(crate) fn prepare_job_vm_read_access(javascript: &JavascriptTools) -> io::Re
     grant_read_only_tree_as(javascript.bun_dir(), false, USER)
 }
 
-pub(crate) fn prepare_writer_shared_read_access(javascript: &JavascriptTools) -> io::Result<()> {
-    prepare_shared_read_access_as(WRITER_USER, javascript)
+pub(crate) fn prepare_writer_shared_read_access(
+    javascript: &JavascriptTools,
+    cargo_home: Option<&Path>,
+) -> io::Result<()> {
+    prepare_shared_read_access_as(WRITER_USER, javascript, cargo_home)
 }
 
-fn prepare_shared_read_access_as(user: &str, javascript: &JavascriptTools) -> io::Result<()> {
-    let cargo_home = PathBuf::from(
-        std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
-    );
+fn prepare_shared_read_access_as(
+    user: &str,
+    javascript: &JavascriptTools,
+    cargo_home: Option<&Path>,
+) -> io::Result<()> {
+    let cargo_home = shared_cargo_home(cargo_home)?;
     let rustup_home = PathBuf::from(
         std::env::var_os("RUSTUP_HOME").ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
     );
@@ -2464,6 +2484,7 @@ pub(crate) struct Sandbox {
     tenant_vm: bool,
     private_pids: bool,
     cargo_image: Option<PathBuf>,
+    shared_cargo: Option<PathBuf>,
     boat_profile: bool,
     boat_memory_max: Option<u64>,
     /// Set for Boat jobs: the identity the PID namespace
@@ -3214,6 +3235,7 @@ impl Sandbox {
             &JavascriptTools::for_role(ToolchainRole::BuildServer),
             None,
             false,
+            None,
         )
     }
 
@@ -3239,6 +3261,7 @@ impl Sandbox {
         javascript: &JavascriptTools,
         remote: Option<&Transport>,
         network: bool,
+        cargo_home: Option<&Path>,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -3259,6 +3282,7 @@ impl Sandbox {
             javascript,
             remote,
             network,
+            cargo_home,
         )
     }
 
@@ -3278,6 +3302,7 @@ impl Sandbox {
         tenant_vm: bool,
         shared_compile_cache: bool,
         remote: Option<&Transport>,
+        cargo_home: Option<&Path>,
     ) -> io::Result<Self> {
         // On a tenant VM the caller sets `tenant_vm`, so the fill fetches
         // dependencies the way tenant jobs do, and clears
@@ -3303,6 +3328,7 @@ impl Sandbox {
             javascript,
             remote,
             false,
+            cargo_home,
         )
         .map(|sandbox| sandbox.with_boat_profile(boat_profile, true, None))
     }
@@ -3327,6 +3353,7 @@ impl Sandbox {
         javascript: &JavascriptTools,
         remote: Option<&Transport>,
         network: bool,
+        cargo_home: Option<&Path>,
     ) -> io::Result<Self> {
         // Every filesystem step uses the host checkout; bind destinations,
         // safe.directory entries and the prefetch view use the caller path.
@@ -3350,10 +3377,7 @@ impl Sandbox {
             // Read-only default ACLs on the shared Cargo registry and Git cache
             // make newly fetched files readable to jobs without rescanning the
             // cache after every trusted dependency fetch.
-            let cargo = PathBuf::from(
-                host_inputs::environment("CARGO_HOME")
-                    .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
-            );
+            let cargo = shared_cargo_home(cargo_home)?;
             let rustup = PathBuf::from(
                 host_inputs::environment("RUSTUP_HOME")
                     .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
@@ -3447,7 +3471,7 @@ impl Sandbox {
         let host_home = runtime.0.join("home");
         let tmp = runtime.0.join("tmp");
         fs::create_dir_all(&tmp)?;
-        let runner_binds = RunnerBindPlan::new(javascript);
+        let runner_binds = RunnerBindPlan::new(javascript, cargo_home);
         let home = runner_binds.private["home"].clone();
         // Only existing output inodes are writable, never the directory. A job
         // must not replace a log with a symlink that the trusted reader follows.
@@ -3498,10 +3522,7 @@ impl Sandbox {
         }
         write_safe_directories(&host_home.join(".gitconfig"), &safe)?;
         prepare_job_home(&host_home)?;
-        let shared_cargo = PathBuf::from(
-            host_inputs::environment("CARGO_HOME")
-                .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
-        );
+        let shared_cargo = shared_cargo_home(cargo_home)?;
         let rustup = PathBuf::from(
             host_inputs::environment("RUSTUP_HOME")
                 .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
@@ -3798,6 +3819,7 @@ impl Sandbox {
             tenant_vm: false,
             private_pids: true,
             cargo_image: None,
+            shared_cargo: cargo_home.map(Path::to_path_buf),
             boat_profile: false,
             boat_memory_max: None,
             pid_init: None,
@@ -3910,10 +3932,7 @@ impl Sandbox {
     pub(crate) fn with_network(mut self) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         if self.tenant_vm && !self.boat_profile {
-            let shared = PathBuf::from(
-                host_inputs::environment("CARGO_HOME")
-                    .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
-            );
+            let shared = shared_cargo_home(self.shared_cargo.as_deref())?;
             self.cargo_overlays = Some(cargo_overlay::Plan::prepare(
                 &self.runtime.0,
                 &shared,
@@ -3970,6 +3989,7 @@ impl Sandbox {
             cache_generation: None,
             cargo_overlays: None,
             cargo_image: None,
+            shared_cargo: None,
             locked_git_commits: Vec::new(),
             parent_umask: 0o022,
             memory_floor_gib: None,
@@ -4668,7 +4688,7 @@ struct RunnerBindPlan {
 }
 
 impl RunnerBindPlan {
-    fn new(javascript: &JavascriptTools) -> Self {
+    fn new(javascript: &JavascriptTools, cargo_home: Option<&Path>) -> Self {
         let mut read_only: Vec<_> = SYSTEM_READ_PATHS
             .into_iter()
             .filter(|path| host_inputs::exists(Path::new(path)))
@@ -4677,8 +4697,8 @@ impl RunnerBindPlan {
         if let Some(rustup) = host_inputs::environment("RUSTUP_HOME") {
             read_only.push((PathBuf::from(&rustup), PathBuf::from(rustup)));
         }
-        if let Some(cargo) = host_inputs::environment("CARGO_HOME") {
-            let bin = PathBuf::from(cargo).join("bin");
+        if let Ok(cargo) = shared_cargo_home(cargo_home) {
+            let bin = cargo.join("bin");
             read_only.push((bin.clone(), bin));
         }
         if host_inputs::is_dir(javascript.bun_dir()) {
@@ -4718,7 +4738,11 @@ thread_local! {
 }
 
 pub(crate) fn reserved_destinations(config: &crate::Config) -> Vec<PathBuf> {
-    let mut destinations = RunnerBindPlan::new(&JavascriptTools::for_config(config)).destinations();
+    let mut destinations = RunnerBindPlan::new(
+        &JavascriptTools::for_config(config),
+        config.cargo_home.as_deref(),
+    )
+    .destinations();
     if config.tenant_vm && !config.boat_profile && config.job_network.is_some() {
         destinations.push(cargo_overlay::LAYERS.into());
     }
@@ -4728,8 +4752,7 @@ pub(crate) fn reserved_destinations(config: &crate::Config) -> Vec<PathBuf> {
 /// Host sources shared by job, writer and snapshot-helper sandboxes.
 pub(crate) fn reserved_bind_sources(config: &crate::Config) -> Vec<PathBuf> {
     let mut sources: Vec<_> = SYSTEM_READ_PATHS.into_iter().map(PathBuf::from).collect();
-    if let Some(cargo) = host_inputs::environment("CARGO_HOME") {
-        let cargo = PathBuf::from(cargo);
+    if let Ok(cargo) = config.cargo_home() {
         sources.extend([cargo.join("bin"), cargo.join("registry"), cargo.join("git")]);
     }
     if let Some(rustup) = host_inputs::environment("RUSTUP_HOME") {

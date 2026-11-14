@@ -286,8 +286,8 @@ fn id_swap(kind: char, source: u32, job: u32) -> Vec<String> {
     mappings
 }
 
-pub(crate) fn start_validation(image: Option<&Path>) {
-    if let Some(home) = host_inputs::environment("CARGO_HOME") {
+pub(crate) fn start_validation(cargo_home: Option<&Path>, image: Option<&Path>) {
+    if let Ok(home) = super::shared_cargo_home(cargo_home) {
         let created = tree_fs::Directory::open(Path::new(&home))
             .and_then(|home| home.ensure_child(std::ffi::OsStr::new("registry")))
             .and_then(|registry| registry.ensure_child(std::ffi::OsStr::new("cache")));

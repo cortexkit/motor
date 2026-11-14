@@ -172,7 +172,7 @@ fn isolated_writer_cache_is_readable_by_existing_reader_and_never_writable() {
     let f = Fixture::new();
     let _reclaim = ReclaimWriterCache(f.scratch.clone());
     let account = validate_writer_account().unwrap();
-    prepare_writer_shared_read_access(&JavascriptTools::for_role(ToolchainRole::BuildServer))
+    prepare_writer_shared_read_access(&JavascriptTools::for_role(ToolchainRole::BuildServer), None)
         .unwrap();
     let config = crate::engine::Config::new(&f.scratch, "runner-state");
     let fleet = config.sccache_dir();
@@ -579,6 +579,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         cache_generation: None,
         cargo_overlays: None,
         cargo_image: None,
+        shared_cargo: None,
         locked_git_commits: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
@@ -705,7 +706,7 @@ fn isolated_reader_hits_across_workspaces_and_cannot_poison_cache() {
     }
     let _reclaim = Reclaim(f.scratch.clone());
     let account = validate_writer_account().unwrap();
-    prepare_writer_shared_read_access(&JavascriptTools::for_role(ToolchainRole::BuildServer))
+    prepare_writer_shared_read_access(&JavascriptTools::for_role(ToolchainRole::BuildServer), None)
         .unwrap();
     let config = crate::engine::Config::new(&f.scratch, "runner-state");
     let fleet = config.sccache_dir();

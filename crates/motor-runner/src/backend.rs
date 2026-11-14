@@ -1133,6 +1133,7 @@ impl Backend for HostBackend {
                             config.tenant_vm,
                             config.shared_compile_cache(),
                             remote.as_ref(),
+                            config.cargo_home.as_deref(),
                         )
                     } else {
                         crate::isolation::Sandbox::prepare_with_dependencies(
@@ -1154,6 +1155,7 @@ impl Backend for HostBackend {
                             &crate::isolation::JavascriptTools::for_config(config),
                             remote.as_ref(),
                             r.network == Some(Network::Outbound),
+                            config.cargo_home.as_deref(),
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its
@@ -1168,9 +1170,7 @@ impl Backend for HostBackend {
                             .with_writer_runtime_limit(config.writer_runtime_limit)
                             .retaining_failed_units()
                             .in_tenant_vm(config.tenant_vm)
-                            .with_cargo_image(config.per_job.then(|| {
-                                PathBuf::from(crate::isolation::cargo_sources::IMAGE_CARGO)
-                            }))
+                            .with_cargo_image(config.per_job.then(|| config.image_cargo.clone()))
                             .with_boat_profile(
                                 config.boat_profile,
                                 config.private_pids,

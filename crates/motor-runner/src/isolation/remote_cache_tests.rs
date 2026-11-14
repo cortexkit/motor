@@ -300,6 +300,7 @@ fn prepare_job_with_shared_cache(
         &JavascriptTools::for_role(ToolchainRole::BuildServer),
         remote,
         false,
+        None,
     )
     .unwrap_or_else(|error| panic!("prepare job sandbox: {error}"))
 }
@@ -330,6 +331,7 @@ fn prepare_fill(f: &Fixture, remote: Option<&Transport>) -> (Sandbox, PathBuf) {
         false,
         true,
         remote,
+        None,
     )
     .unwrap_or_else(|error| panic!("prepare fill sandbox: {error}"));
     (fill, workspace)
@@ -404,6 +406,7 @@ fn ccache_outputs_are_preallocated_bound_and_granted_for_jobs_and_no_cargo_fills
                     &JavascriptTools::for_role(ToolchainRole::BuildServer),
                     Some(&remote),
                     false,
+                    None,
                 )
                 .unwrap();
                 let stats = sandbox.runtime.0.join("output/ccache-stats");
@@ -960,7 +963,7 @@ fn prepare_fill_host(f: &Fixture) -> ReclaimScratch {
     let reclaim = ReclaimScratch(f.scratch.clone());
     let account =
         validate_writer_account().unwrap_or_else(|error| panic!("writer account: {error}"));
-    prepare_writer_shared_read_access(&JavascriptTools::for_role(ToolchainRole::BuildServer))
+    prepare_writer_shared_read_access(&JavascriptTools::for_role(ToolchainRole::BuildServer), None)
         .unwrap_or_else(|error| panic!("writer read access to the toolchain: {error}"));
     prepare_writer_cache(&f.state.join("sccache/fleet"), account)
         .unwrap_or_else(|error| panic!("writer compile cache: {error}"));

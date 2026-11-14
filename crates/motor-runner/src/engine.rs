@@ -114,6 +114,12 @@ pub struct Config {
     pub tenant_vm: bool,
     /// A fresh job VM accepts one execution and one caller workspace for its lifetime.
     pub per_job: bool,
+    /// Immutable Cargo sources supplied by the job image, below registry/ and git/.
+    #[cfg(target_os = "linux")]
+    pub image_cargo: PathBuf,
+    /// Shared Cargo storage for isolated jobs; defaults to CARGO_HOME.
+    #[cfg(target_os = "linux")]
+    pub cargo_home: Option<PathBuf>,
     /// A per-job fill VM: a tenant runner (not `per_job`) booted only to run one
     /// imported fill. Like a job VM, it reads its cache credentials from the
     /// boot drive the guest agent installs, not from tenant provisioning.
@@ -561,6 +567,11 @@ pub(crate) fn check_fixed_path_options(
 }
 
 impl Config {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cargo_home(&self) -> io::Result<PathBuf> {
+        crate::isolation::shared_cargo_home(self.cargo_home.as_deref())
+    }
+
     pub fn new(state_root: impl Into<PathBuf>, instance: impl Into<String>) -> Self {
         let state_root = state_root.into();
         Self {
@@ -569,6 +580,10 @@ impl Config {
             metrics: crate::metrics::Settings::default(),
             tenant_vm: false,
             per_job: false,
+            #[cfg(target_os = "linux")]
+            image_cargo: PathBuf::from(crate::isolation::cargo_sources::IMAGE_CARGO),
+            #[cfg(target_os = "linux")]
+            cargo_home: None,
             fill_vm: false,
             fixed_path_repositories: Vec::new(),
             account_subject: None,
@@ -2188,18 +2203,21 @@ fn prepare_job_shared_roots(config: &Config) -> io::Result<()> {
     }
     let javascript = crate::isolation::JavascriptTools::for_config(config);
     if config.per_job {
-        crate::isolation::prepare_job_vm_read_access(&javascript)?;
+        crate::isolation::prepare_job_vm_read_access(
+            &javascript,
+            &config.cargo_home()?,
+            &config.image_cargo,
+        )?;
     } else {
-        crate::isolation::prepare_shared_read_access(&javascript)?;
+        crate::isolation::prepare_shared_read_access(&javascript, config.cargo_home.as_deref())?;
     }
     if config.tenant_vm && !config.boat_profile && config.job_network.is_some() {
         // The scan runs independently of readiness and never takes runner state.
         // Offline jobs need no ownership invariant; pending or unsafe cache
         // ownership refuses only jobs that request writable Cargo overlays.
         crate::isolation::cargo_overlay::start_validation(
-            config
-                .per_job
-                .then(|| Path::new(crate::isolation::cargo_sources::IMAGE_CARGO)),
+            config.cargo_home.as_deref(),
+            config.per_job.then_some(config.image_cargo.as_path()),
         );
     }
     Ok(())
@@ -2583,7 +2601,10 @@ impl Runner {
             let javascript = crate::isolation::JavascriptTools::for_config(&config);
             config.writer_account =
                 match crate::isolation::validate_writer_account().and_then(|account| {
-                    crate::isolation::prepare_writer_shared_read_access(&javascript)?;
+                    crate::isolation::prepare_writer_shared_read_access(
+                        &javascript,
+                        config.cargo_home.as_deref(),
+                    )?;
                     Ok(account)
                 }) {
                     Ok(account) => Some(account),
