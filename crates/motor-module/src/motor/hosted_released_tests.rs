@@ -160,7 +160,7 @@ async fn restart_repairs_synthetic_no_run_outcomes_but_preserves_runner_full_ref
     }
 }
 
-async fn observe_release_before_its_reply(attach_first: bool) {
+async fn observe_release_before_its_reply(attach_first: bool, unknown: bool) {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = cortexkit_test_support::ScratchDir::new("hosted-release-in-flight");
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
@@ -178,6 +178,13 @@ async fn observe_release_before_its_reply(attach_first: bool) {
                 if path.ends_with("/release") {
                     entered.notify_one();
                     release.notified().await;
+                    if unknown {
+                        return (
+                            404,
+                            serde_json::to_vec(&serde_json::json!({"error": "job_unknown"}))
+                                .unwrap(),
+                        );
+                    }
                     (
                         202,
                         serde_json::to_vec(&serde_json::json!({"job_id": id, "release_at_ms": 0}))
@@ -186,8 +193,11 @@ async fn observe_release_before_its_reply(attach_first: bool) {
                 } else {
                     assert_eq!(path, format!("/v1/leases/{id}/reattach"));
                     (
-                        409,
-                        serde_json::to_vec(&serde_json::json!({"error": "job_released"})).unwrap(),
+                        if unknown { 404 } else { 409 },
+                        serde_json::to_vec(&serde_json::json!({
+                            "error": if unknown { "job_unknown" } else { "job_released" }
+                        }))
+                        .unwrap(),
                     )
                 }
             }
@@ -201,6 +211,7 @@ async fn observe_release_before_its_reply(attach_first: bool) {
         .hosted_update(id, |state| {
             state.broker_url = http.url.clone();
             state.lease_attempted = true;
+            state.billing = crate::hosted::BillingStatus::Pending;
         })
         .unwrap();
     motor.recover_hosted(id);
@@ -228,6 +239,10 @@ async fn observe_release_before_its_reply(attach_first: bool) {
     );
     assert_eq!(result.ran, Some(Ran::None));
     assert_eq!(motor.job_status(id).await.unwrap().terminal, Some(result));
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        crate::hosted::BillingStatus::Unavailable
+    );
     release.notify_one();
     motor.wait_hosted_cleanup(id).await;
     assert!(motor.storage.job(id).unwrap().hosted.unwrap().finish_done);
@@ -239,12 +254,159 @@ async fn observe_release_before_its_reply(attach_first: bool) {
 
 #[tokio::test]
 async fn attach_during_release_before_its_reply_is_never_started() {
-    observe_release_before_its_reply(true).await;
+    observe_release_before_its_reply(true, false).await;
 }
 
 #[tokio::test]
 async fn status_during_release_before_its_reply_is_never_started() {
-    observe_release_before_its_reply(false).await;
+    observe_release_before_its_reply(false, false).await;
+}
+
+#[tokio::test]
+async fn unknown_attach_during_release_before_its_reply_is_never_started() {
+    observe_release_before_its_reply(true, true).await;
+}
+
+#[tokio::test]
+async fn unknown_status_during_release_before_its_reply_is_never_started() {
+    observe_release_before_its_reply(false, true).await;
+}
+
+async fn unknown_cleanup_is_never_started(stored: Option<Outcome>, boat: bool) {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-unknown-cleanup");
+    let id = Uuid::now_v7();
+    let http = crate::hosted::test_http::Http::new(move |path, body| {
+        if boat {
+            assert_eq!(path, format!("/v1/leases/{id}/finish"));
+            assert_eq!(body, &serde_json::json!({"outcome": "lost", "run_ms": 0}));
+        } else {
+            assert_eq!(path, format!("/v1/leases/{id}/release"));
+            assert_eq!(body, &serde_json::json!({}));
+        }
+        (404, serde_json::json!({"error": "job_unknown"}))
+    })
+    .await;
+    let storage = Storage::open(&scratch).unwrap();
+    storage.create(id, 60, None, None, false).unwrap();
+    storage.hosted_route(id, h.route.clone()).unwrap();
+    storage
+        .hosted_update(id, |state| {
+            state.broker_url = http.url.clone();
+            state.lease_attempted = true;
+            state.billing = crate::hosted::BillingStatus::Pending;
+            if boat {
+                state.placement = Some(motor_lease::Placement {
+                    host: "boat:unused".into(),
+                    vm: None,
+                });
+                state.pending_finish = Some(crate::hosted::placement::Finish {
+                    outcome: "lost".into(),
+                    run_ms: 0,
+                });
+            }
+            state.terminal = stored.clone().map(|outcome| {
+                TerminalRecord::new(id, outcome, 0, 0, 0).with_ran(Ran::Unknown("maybe".into()))
+            });
+        })
+        .unwrap();
+    drop(storage);
+
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    assert!(!motor.hosted_state(id).unwrap().finish_done);
+    assert_eq!(motor.storage.unsettled_hosted(), vec![id]);
+    if stored.is_some() {
+        let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+        assert_eq!(result.ran, Some(Ran::None));
+        assert!(!motor.hosted_state(id).unwrap().finish_done);
+        assert!(http.requests.lock().unwrap().is_empty());
+    }
+    motor.resume_finishes().await;
+    motor.wait_hosted_cleanup(id).await;
+    let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(
+        result.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::LostToRestart
+        }
+    );
+    assert_eq!(result.ran, Some(Ran::None));
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.finish_done);
+    assert_eq!(state.billing, crate::hosted::BillingStatus::Unavailable);
+    assert!(state.pending_finish.is_none());
+    assert_eq!(state.terminal, Some(result.clone()));
+    assert_eq!(
+        motor.job_status(id).await.unwrap().terminal,
+        Some(result.clone())
+    );
+    motor.close().await;
+
+    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    motor.resume_finishes().await;
+    assert!(motor.storage.unsettled_hosted().is_empty());
+    assert_eq!(
+        terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await,
+        result
+    );
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+    assert!(h.requests.lock().unwrap().is_empty());
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn unknown_release_or_finish_cleanup_then_attach_is_never_started() {
+    for boat in [false, true] {
+        unknown_cleanup_is_never_started(None, boat).await;
+    }
+}
+
+#[tokio::test]
+async fn restart_repairs_unsettled_synthetic_no_run_outcomes_then_settles_unknown_booking() {
+    for outcome in [Outcome::OutcomeUnknown, Outcome::HistoryExpired] {
+        for boat in [false, true] {
+            unknown_cleanup_is_never_started(Some(outcome.clone()), boat).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_booking_with_run_sent_remains_may_have_run() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-unknown-run-sent");
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    let id = Uuid::now_v7();
+    let http = crate::hosted::test_http::Http::new(move |path, _| {
+        assert_eq!(path, format!("/v1/leases/{id}/reattach"));
+        (404, serde_json::json!({"error": "job_unknown"}))
+    })
+    .await;
+    motor.storage.create(id, 60, None, None, false).unwrap();
+    motor.storage.hosted_route(id, h.route.clone()).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.broker_url = http.url.clone();
+            state.run_sent = true;
+            state.retry_iat = Some(0);
+            state.max_runtime_s = Some(60);
+        })
+        .unwrap();
+    assert_eq!(
+        motor.open_job_channel_at(id, u64::MAX).await.err(),
+        Some(crate::hosted::Error::ReattachUnknown)
+    );
+    let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    assert_eq!(result.ran, Some(Ran::Unknown("maybe".into())));
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+    assert!(h.requests.lock().unwrap().is_empty());
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    motor.close().await;
 }
 
 #[tokio::test]

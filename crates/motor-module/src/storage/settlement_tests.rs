@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
+fn reopen_restores_no_run_records_without_replacing_real_terminals() {
     for case in [
         "never_started",
         "run_sent",
@@ -15,6 +15,9 @@ fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
         "remote_unknown",
         "hosted_refusal",
         "unsettled_unknown",
+        "unsettled_history_expired",
+        "unsettled_real_terminal",
+        "unsettled",
         "run_sent_unknown",
     ] {
         let scratch = cortexkit_test_support::ScratchDir::new("hosted-settlement-terminal");
@@ -23,7 +26,7 @@ fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
         let outcome = match case {
             "local_unknown" | "hosted_unknown" | "remote_unknown" | "unsettled_unknown"
             | "run_sent_unknown" => Outcome::OutcomeUnknown,
-            "hosted_history_expired" => Outcome::HistoryExpired,
+            "hosted_history_expired" | "unsettled_history_expired" => Outcome::HistoryExpired,
             "hosted_refusal" => Outcome::RefusedBeforeStart {
                 reason: RefusalReason::RunnerFull,
             },
@@ -36,9 +39,10 @@ fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
             .update(|s| {
                 let job = s.jobs.get_mut(&id).unwrap();
                 let hosted = job.hosted.as_mut().unwrap();
-                hosted.finish_done = case != "unsettled_unknown";
+                hosted.finish_done = !case.starts_with("unsettled");
+                hosted.billing = crate::hosted::BillingStatus::Pending;
                 match case {
-                    "never_started" => {}
+                    "never_started" | "unsettled" => {}
                     "run_sent" => hosted.run_sent = true,
                     "spill" => job.build_server_job_id = Some(Uuid::now_v7()),
                     "local_terminal" | "local_unknown" => {
@@ -48,7 +52,9 @@ fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
                     | "hosted_unknown"
                     | "hosted_history_expired"
                     | "hosted_refusal"
-                    | "unsettled_unknown" => hosted.terminal = Some(existing.clone()),
+                    | "unsettled_unknown"
+                    | "unsettled_history_expired"
+                    | "unsettled_real_terminal" => hosted.terminal = Some(existing.clone()),
                     "remote_terminal" | "remote_unknown" => {
                         job.remote_terminal = Some(existing.clone())
                     }
@@ -72,7 +78,14 @@ fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
                 | "hosted_unknown"
                 | "hosted_history_expired"
                 | "remote_unknown"
+                | "unsettled_unknown"
+                | "unsettled_history_expired"
         ) {
+            assert_eq!(
+                job.hosted.as_ref().unwrap().finish_done,
+                original.hosted.as_ref().unwrap().finish_done,
+                "terminal repair must not skip broker settlement"
+            );
             let terminal = job.local_terminal.as_ref().unwrap();
             assert_eq!(
                 terminal.outcome,
@@ -81,6 +94,10 @@ fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
                 }
             );
             assert_eq!(terminal.ran, Some(Ran::None));
+            assert_eq!(
+                job.hosted.as_ref().unwrap().billing,
+                crate::hosted::BillingStatus::Unavailable
+            );
             assert_eq!(
                 job.hosted.as_ref().unwrap().terminal.as_ref(),
                 Some(terminal)
@@ -96,6 +113,21 @@ fn reopen_restores_settled_no_run_records_without_replacing_real_terminals() {
             state.prune(until - 1);
             assert!(state.jobs.contains_key(&id));
             state.prune(until);
+            if !job.hosted.as_ref().unwrap().finish_done {
+                assert!(
+                    state.jobs.contains_key(&id),
+                    "unsettled booking must survive terminal retention expiry"
+                );
+                state
+                    .jobs
+                    .get_mut(&id)
+                    .unwrap()
+                    .hosted
+                    .as_mut()
+                    .unwrap()
+                    .finish_done = true;
+                state.prune(until);
+            }
             assert!(
                 !state.jobs.contains_key(&id),
                 "undelivered tombstone is bounded"
@@ -162,7 +194,10 @@ fn released_confirmation_rechecks_run_flag_and_excludes_archived_spills() {
             .unwrap();
         let before = storage.job(id).unwrap();
         assert!(!before.hosted.as_ref().unwrap().finish_done);
-        storage.confirm_hosted_release_before_run(id).unwrap();
+        assert_eq!(
+            storage.confirm_hosted_ended_before_run(id).unwrap(),
+            case == "never_started"
+        );
         let after = storage.job(id).unwrap();
         if case == "never_started" {
             assert!(after.hosted.as_ref().unwrap().finish_done);

@@ -214,16 +214,16 @@ impl Job {
                 .as_ref()
                 .is_some_and(|hosted| hosted.finish_done && !hosted.run_sent)
     }
-    fn needs_settlement_terminal(&self) -> bool {
-        self.settled_before_run()
-            && [
-                self.local_terminal.as_ref(),
-                self.remote_terminal.as_ref(),
-                self.hosted.as_ref().and_then(|s| s.terminal.as_ref()),
-            ]
-            .into_iter()
-            .flatten()
-            .all(|terminal| {
+    fn needs_unstarted_hosted_terminal(&self) -> bool {
+        let terminals = [
+            self.local_terminal.as_ref(),
+            self.remote_terminal.as_ref(),
+            self.hosted.as_ref().and_then(|s| s.terminal.as_ref()),
+        ];
+        self.build_server_job_id.is_none()
+            && self.hosted.as_ref().is_some_and(|s| !s.run_sent)
+            && (self.settled_before_run() || terminals.iter().any(Option::is_some))
+            && terminals.into_iter().flatten().all(|terminal| {
                 matches!(
                     terminal.outcome,
                     Outcome::OutcomeUnknown | Outcome::HistoryExpired
@@ -231,7 +231,7 @@ impl Job {
             })
     }
     fn record_unstarted_hosted_terminal(&mut self, id: Uuid, now: u64) {
-        if !self.needs_settlement_terminal() {
+        if !self.needs_unstarted_hosted_terminal() {
             return;
         }
         // Run is journaled before sending its frame. Once the submission ends,
@@ -622,7 +622,7 @@ impl Storage {
                 if let Some(hosted) = job.hosted.as_mut() {
                     f(hosted);
                 }
-                if retire_unstarted && job.needs_settlement_terminal() {
+                if retire_unstarted && job.needs_unstarted_hosted_terminal() {
                     job.record_unstarted_hosted_terminal(id, now_ms());
                 }
             }
@@ -630,7 +630,11 @@ impl Storage {
     }
     pub(crate) fn record_hosted_settlement_terminal(&self, id: Uuid) -> io::Result<()> {
         self.update_when(
-            |s| s.jobs.get(&id).is_some_and(Job::needs_settlement_terminal),
+            |s| {
+                s.jobs
+                    .get(&id)
+                    .is_some_and(Job::needs_unstarted_hosted_terminal)
+            },
             |s| {
                 if let Some(job) = s.jobs.get_mut(&id) {
                     job.record_unstarted_hosted_terminal(id, now_ms());
@@ -638,7 +642,8 @@ impl Storage {
             },
         )
     }
-    pub(crate) fn confirm_hosted_release_before_run(&self, id: Uuid) -> io::Result<()> {
+    pub(crate) fn confirm_hosted_ended_before_run(&self, id: Uuid) -> io::Result<bool> {
+        let mut confirmed = false;
         self.update_when(
             |s| {
                 s.jobs.get(&id).is_some_and(|job| {
@@ -650,8 +655,10 @@ impl Storage {
                 let job = s.jobs.get_mut(&id).unwrap();
                 job.hosted.as_mut().unwrap().finish_done = true;
                 job.record_unstarted_hosted_terminal(id, now_ms());
+                confirmed = true;
             },
-        )
+        )?;
+        Ok(confirmed)
     }
     /// Resolve the destination ID without changing the caller's stored job.
     /// A bounced spill uses its build-server mapping; a hosted retry uses the
@@ -764,14 +771,16 @@ impl Storage {
             write_count: std::sync::atomic::AtomicUsize::new(0),
         };
         // Older daemons could omit a never-started terminal or synthesize an
-        // unknown one from a released booking. Restore the no-Run evidence
-        // before pruning or broker reattach, without replacing real outcomes.
+        // unknown one from a released or forgotten booking. Restore the no-Run
+        // evidence before pruning or reattach, without replacing real outcomes.
+        // Unsettled bookings still need broker recovery; a terminal alone does
+        // not prove that the broker released the lease.
         storage.update_when(
-            |s| s.jobs.values().any(Job::needs_settlement_terminal),
+            |s| s.jobs.values().any(Job::needs_unstarted_hosted_terminal),
             |s| {
                 let now = now_ms();
                 for (id, job) in &mut s.jobs {
-                    if job.needs_settlement_terminal() {
+                    if job.needs_unstarted_hosted_terminal() {
                         job.record_unstarted_hosted_terminal(*id, now);
                     }
                 }
