@@ -30,6 +30,7 @@ pub struct PerJobSettings {
     pub reclaim_timeout_ms: u64,
     pub hysteresis_mib: u64,
     pub workspace_disk_cap_bytes: u64,
+    pub workspace_growth_reservation_bytes: u64,
     pub boot_deadline_ms: u64,
     pub recovery_timeout_ms: u64,
     pub exit_evidence_bound_ms: u64,
@@ -37,6 +38,16 @@ pub struct PerJobSettings {
 }
 
 impl PerJobSettings {
+    fn validate_storage(&self) -> Result<()> {
+        ensure!(
+            self.workspace_growth_reservation_bytes > 0
+                && self.workspace_growth_reservation_bytes <= self.workspace_disk_cap_bytes
+                && self.workspace_growth_reservation_bytes.is_multiple_of(4096),
+            "per_job workspace_growth_reservation_bytes must be positive, at most workspace_disk_cap_bytes, and a multiple of 4096"
+        );
+        Ok(())
+    }
+
     pub(crate) fn validate_cpus(&self, online: u32) -> Result<()> {
         ensure!(
             self.vcpu_ceiling >= 1 && self.vcpu_ceiling <= online,
@@ -68,6 +79,7 @@ impl HostSettings {
             HostMode::Tenant => Self::Tenant,
             HostMode::PerJob => {
                 let settings = per_job.context("per_job settings are required")?;
+                settings.validate_storage()?;
                 settings.validate_cpus(control.online_cpus()?)?;
                 Self::PerJob(settings)
             }

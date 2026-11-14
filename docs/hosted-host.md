@@ -293,6 +293,10 @@ no journal, key or socket and does not enable the per-job runtime. `--check` and
 `--mode per_job`, the installer keeps the tenant-mode config bytes unchanged and
 writes no `per_job` object.
 
+`check-config` refuses a per-job settings file without
+`workspace_growth_reservation_bytes`, so add the field when installing a build
+that requires it.
+
 Here VMM means the Firecracker virtual machine monitor process, and OOM means
 out of memory.
 
@@ -305,7 +309,8 @@ out of memory.
 | `per_vm_overhead_mib` | MiB | Added to stated memory when computing a VM's positive resident-RAM overage. |
 | `reclaim_timeout_ms` | milliseconds | Wait after balloon inflation before rechecking pressure and possibly stopping that VM. |
 | `hysteresis_mib` | MiB | Available memory above the reserve at both limits needed to deflate balloons. |
-| `workspace_disk_cap_bytes` | bytes | Sparse workspace-disk size cap; admission reserves remaining possible physical growth. Raising it grows each existing checkout disk to the new cap the next time a job claims it (the helper extends the file, the guest grows its filesystem at boot); lowering it never shrinks a disk. A helper older than this rule refuses a grown disk, so roll the helper back only with the cap unchanged. |
+| `workspace_disk_cap_bytes` | bytes | Sparse workspace-disk size cap, enforced by the helper. Raising it grows each existing checkout disk to the new cap the next time a job claims it (the helper extends the file, the guest grows its filesystem at boot); lowering it never shrinks a disk. A helper older than this rule refuses a grown disk, so roll the helper back only with the cap unchanged. |
+| `workspace_growth_reservation_bytes` | bytes | Maximum physical growth reserved per active checkout disk (attached, queued or recovering), capped at the disk's remaining growth. Must be positive, no greater than `workspace_disk_cap_bytes`, and a multiple of 4096. A job growing beyond this reservation consumes the storage threshold margin rather than reserving its entire disk cap in advance; the disk cap and storage admission threshold still apply. |
 | `boot_deadline_ms` | milliseconds | Bound from boot start to runner hello, excluding disk recovery. |
 | `recovery_timeout_ms` | milliseconds | Bound from recovery VM start; expiry stops recovery and deletes its workspace disk. |
 | `exit_evidence_bound_ms` | milliseconds | Maximum wait from discovering a gone VMM for durable exit/OOM evidence. |

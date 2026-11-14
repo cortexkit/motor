@@ -214,6 +214,7 @@ fn retained_host(directory: &std::path::Path, finished: usize) -> Host {
         reclaim_timeout_ms: 100,
         hysteresis_mib: 10,
         workspace_disk_cap_bytes: 1024,
+        workspace_growth_reservation_bytes: 1024,
         boot_deadline_ms: 1000,
         recovery_timeout_ms: 10000,
         exit_evidence_bound_ms: 1000,

@@ -151,9 +151,11 @@ class HostedHostConfigTests(CapacityConfigTests):
     def test_per_job_settings_are_explicit_and_copied_without_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
-            # Leave one required field absent: the renderer must not fill it in.
+            # Leave required fields absent: the renderer must not fill them in.
             # The built motor-host, not a second schema here, validates settings.
-            settings = {"permit_budget": 96, "host_reserve_mib": 4096}
+            settings = {"permit_budget": 96, "host_reserve_mib": 4096,
+                        "workspace_disk_cap_bytes": 96 * 1024 ** 3,
+                        "workspace_growth_reservation_bytes": 8 * 1024 ** 3}
             path.write_text(json.dumps(settings))
             output = renderer_cli("host", "--host-id", HOST_ID, "--mode", "per_job",
                                   "--per-job-settings", path)
@@ -163,6 +165,12 @@ class HostedHostConfigTests(CapacityConfigTests):
             self.assertEqual(config["per_job"], settings)
             del config["mode"], config["per_job"]
             self.assertEqual(config, hosted.host_config(HOST_ID))
+            del settings["workspace_growth_reservation_bytes"]
+            path.write_text(json.dumps(settings))
+            output = renderer_cli("host", "--host-id", HOST_ID, "--mode", "per_job",
+                                  "--per-job-settings", path)
+            self.assertEqual(output.returncode, 0, output.stderr)
+            self.assertEqual(json.loads(output.stdout)["per_job"], settings)
             for options, message in [
                 (["--mode", "per_job"], "--per-job-settings"),
                 (["--per-job-settings", path], "--mode per_job"),

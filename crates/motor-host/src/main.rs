@@ -546,6 +546,7 @@ mod config_tests {
             "host_reserve_mib": 1024, "boot_reserve_mib": 256,
             "per_vm_overhead_mib": 128, "reclaim_timeout_ms": 5000,
             "hysteresis_mib": 512, "workspace_disk_cap_bytes": 10737418240_u64,
+            "workspace_growth_reservation_bytes": 2147483648_u64,
             "boot_deadline_ms": 30000, "recovery_timeout_ms": 120000,
             "exit_evidence_bound_ms": 10000, "teardown_timeout_ms": 5000
         })
@@ -624,6 +625,7 @@ mod config_tests {
         assert_eq!(per_job.host_reserve_mib, 1024);
         assert_eq!(per_job.boot_deadline_ms, 30000);
         assert_eq!(per_job.workspace_disk_cap_bytes, 10737418240);
+        assert_eq!(per_job.workspace_growth_reservation_bytes, 2147483648);
         let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
         let (journal, snapshot) = motor_host::journal::FileJournal::open(dir.path()).unwrap();
         let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
@@ -678,7 +680,11 @@ mod config_tests {
             "per_job settings are required"
         );
         value["per_job"] = per_job();
-        for field in ["vcpu_ceiling", "permit_budget"] {
+        for field in [
+            "vcpu_ceiling",
+            "permit_budget",
+            "workspace_growth_reservation_bytes",
+        ] {
             let mut missing = value.clone();
             missing["per_job"].as_object_mut().unwrap().remove(field);
             write(&missing);
@@ -706,6 +712,33 @@ mod config_tests {
             assert!(check_config(&path).unwrap_err().to_string().contains(field));
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn config_check_validates_workspace_growth_reservation() {
+        let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let path = dir.path().join("host.json");
+        let mut value = config();
+        value["mode"] = json!("per_job");
+        value["per_job"] = per_job();
+        for bytes in [0, 10737418240_u64 + 4096, 4097] {
+            value["per_job"]["workspace_growth_reservation_bytes"] = json!(bytes);
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let error = check_config(&path).unwrap_err().to_string();
+            assert!(
+                error.contains("workspace_growth_reservation_bytes"),
+                "{error}"
+            );
+            assert!(serde_json::from_value::<Config>(value.clone())
+                .unwrap()
+                .startup_settings(&Control)
+                .is_err());
+        }
+        for bytes in [4096, 10737418240_u64] {
+            value["per_job"]["workspace_growth_reservation_bytes"] = json!(bytes);
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            check_config(&path).unwrap();
+        }
     }
 
     #[test]
