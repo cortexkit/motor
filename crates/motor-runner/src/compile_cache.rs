@@ -172,6 +172,7 @@ fn use_line_only_debug(env: &BTreeMap<String, String>, repository: &Path, tree: 
         let config: toml::Value = match toml::from_str(&text) {
             Ok(config) => config,
             Err(error) => {
+                profile_lookup_failed(file, "invalid_toml");
                 tracing::warn!(file, tree, %error, "cannot parse Cargo profile settings; treating file as unset");
                 continue;
             }
@@ -191,11 +192,24 @@ fn use_line_only_debug(env: &BTreeMap<String, String>, repository: &Path, tree: 
 }
 
 #[cfg(target_os = "linux")]
+fn profile_lookup_failed(file: &str, reason: &'static str) {
+    let source = match file {
+        "Cargo.toml" => "manifest",
+        ".cargo/config.toml" => "config_toml",
+        _ => "legacy_config",
+    };
+    tracing::info!(source, reason, "Cargo profile lookup failed");
+}
+
+#[cfg(target_os = "linux")]
 fn snapshot_profile(repository: &Path, tree: &str, file: &str) -> Option<String> {
     const MAX_BYTES: usize = 1024 * 1024;
-    let entry =
-        crate::workspace::git_bytes(repository, &["ls-tree", "-lz", tree, "--", file]).ok()?;
-    let entry = std::str::from_utf8(&entry).ok()?;
+    let entry = crate::workspace::git_bytes(repository, &["ls-tree", "-lz", tree, "--", file])
+        .inspect_err(|_| profile_lookup_failed(file, "git_tree"))
+        .ok()?;
+    let entry = std::str::from_utf8(&entry)
+        .inspect_err(|_| profile_lookup_failed(file, "invalid_utf8"))
+        .ok()?;
     let metadata = entry.strip_suffix(&format!("\t{file}\0"))?;
     let mut fields = metadata.split_whitespace();
     let mode = fields.next()?;
@@ -211,9 +225,12 @@ fn snapshot_profile(repository: &Path, tree: &str, file: &str) -> Option<String>
     }
     // Immutable regular blobs cannot follow checkout symlinks or grow between the size check
     // and the read. Never open caller-controlled profile paths on the host filesystem.
-    let blob =
-        crate::workspace::git_bytes(repository, &["show", &format!("{tree}:{file}")]).ok()?;
-    String::from_utf8(blob).ok()
+    let blob = crate::workspace::git_bytes(repository, &["show", &format!("{tree}:{file}")])
+        .inspect_err(|_| profile_lookup_failed(file, "git_blob"))
+        .ok()?;
+    String::from_utf8(blob)
+        .inspect_err(|_| profile_lookup_failed(file, "invalid_utf8"))
+        .ok()
 }
 
 /// sccache hashes CARGO_HOME, CARGO_TARGET_DIR, CARGO_BUILD_BUILD_DIR and

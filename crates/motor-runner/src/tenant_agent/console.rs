@@ -119,6 +119,7 @@ impl Relay {
                 && (redacted.starts_with("build base seed ")
                     || redacted.starts_with("build base published")
                     || redacted.starts_with("Cargo build-folder maintenance ")
+                    || redacted.starts_with("Cargo profile lookup failed ")
                     || redacted.starts_with("runner build base eviction ")
                     || redacted.starts_with("runner admission cleared its own build outputs "))
             {

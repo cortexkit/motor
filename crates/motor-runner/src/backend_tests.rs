@@ -278,6 +278,116 @@ fn pre_setup_fingerprint_matches_launched_setenv_in_build_server_and_tenant_vm()
 
 #[cfg(target_os = "linux")]
 #[test]
+fn job_profile_environment_uses_mirror_when_checkout_git_is_unavailable() {
+    use crate::remote_cache::{gateway::Tool, transport::Forwarder};
+    let scratch = ScratchDir::new("job-profile-mirror");
+    let source = scratch.join("source");
+    let checkout = scratch.join("checkout");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(
+        source.join("Cargo.toml"),
+        "[workspace]\n[profile.dev]\ndebug = 2\n[profile.test]\ndebug = 2\n",
+    )
+    .unwrap();
+    crate::workspace::git(&source, &["init", "-q"]).unwrap();
+    crate::workspace::git(&source, &["add", "."]).unwrap();
+    let tree = crate::workspace::git(&source, &["write-tree"]).unwrap();
+    crate::workspace::git(
+        &source,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "profiles",
+        ],
+    )
+    .unwrap();
+    let tip = crate::workspace::git(&source, &["rev-parse", "HEAD"]).unwrap();
+    let mut config = Config::new(scratch.join("state"), "main");
+    config.isolate_jobs = true;
+    config.tenant_vm = true;
+    let trees = trees(&config);
+    let repository = source.to_str().unwrap();
+    let mirror = trees.mirror(repository);
+    fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    crate::workspace::git(
+        &source,
+        &["clone", "--bare", repository, mirror.to_str().unwrap()],
+    )
+    .unwrap();
+    // Checkout Git metadata may be inaccessible after sandbox preparation.
+    // Only the trusted mirror's immutable tree should select profile defaults.
+    fs::write(checkout.join("Cargo.toml"), "[workspace]\n").unwrap();
+    assert!(crate::workspace::git(&checkout, &["rev-parse", "HEAD"]).is_err());
+    let mut setup = setup(&checkout);
+    setup.request.repository_root = repository.into();
+    setup.request.tree_hash = tree;
+    setup.request.snapshot_commit = tip.clone();
+    setup.request.base_commit = Some(tip);
+    setup.request.env.clear();
+    let generation = crate::remote_cache::gateway::tests::generation("profiles", "tenant");
+    let forwarders = vec![Forwarder::new(Tool::Sccache, 4181)];
+    let target = checkout.join("target");
+    let inputs = EnvironmentInputs::before_setup(
+        &config,
+        &setup,
+        &checkout,
+        &target,
+        Some((&generation, &forwarders)),
+    )
+    .unwrap();
+    let before = job_environment(&config, &trees, &setup, &inputs, 2).unwrap();
+    for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+        assert!(
+            !before.contains_key(key),
+            "pre-seed environment ignored snapshot profiles: {before:?}"
+        );
+    }
+    let arguments = Arc::new(Mutex::new(Vec::new()));
+    let prepared = Prepared {
+        host_cwd: checkout,
+        target,
+        wrapper: None,
+        sandbox: Some(Box::new(ArgumentIsolationLauncher {
+            scratch: scratch.path().into(),
+            tenant_vm: true,
+            generation: Some(generation),
+            forwarders,
+            arguments: arguments.clone(),
+        })),
+        vm: None,
+    };
+    let error = launch_error(HostBackend.launch(&config, &trees, &setup, &prepared, 4));
+    assert_eq!(error.to_string(), "unit arguments captured");
+    let launched: BTreeMap<_, _> = arguments
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|arg| {
+            arg.to_str()?
+                .strip_prefix("--setenv=")?
+                .split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        })
+        .collect();
+    for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+        assert!(
+            !launched.contains_key(key),
+            "launch environment ignored snapshot profiles: {launched:?}"
+        );
+    }
+    assert_eq!(
+        crate::compile_cache::environment_fingerprint(&before),
+        crate::compile_cache::environment_fingerprint(&launched)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn pre_setup_fingerprint_respects_configured_wrapper_and_fill_differences() {
     use crate::compile_cache::environment_fingerprint;
     let scratch = ScratchDir::new("pre-setup-wrapper");

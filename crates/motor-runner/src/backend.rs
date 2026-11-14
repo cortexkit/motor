@@ -1555,14 +1555,10 @@ pub(crate) fn job_environment(
     prepared: &EnvironmentInputs<'_>,
     weight: u32,
 ) -> io::Result<BTreeMap<String, String>> {
-    job_environment_in(
-        config,
-        trees,
-        s,
-        prepared,
-        weight,
-        &paths::host_run(config, &s.request).host_workspace,
-    )
+    // Sandbox preparation changes checkout ownership and Git visibility. Read
+    // profile inputs from the same immutable mirror before seeding and launch.
+    let repository = trees.mirror(paths::request(&s.request).caller_repository_root.text());
+    job_environment_in(config, trees, s, prepared, weight, &repository)
 }
 
 /// Use the same environment assembly for a checkout and a mirror-only fill

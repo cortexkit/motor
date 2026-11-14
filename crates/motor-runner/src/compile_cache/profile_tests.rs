@@ -1,6 +1,41 @@
 use super::*;
 use cortexkit_test_support::ScratchDir;
 
+#[test]
+fn unreadable_profile_snapshot_reports_closed_lookup_failure() {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let scratch = ScratchDir::new("profile-lookup-SECRET");
+    let logs = Logs::default();
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[motor-runner]", logs.clone()),
+        || profile_environment(&mut BTreeMap::new(), scratch.path(), "missing-tree"),
+    );
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("Cargo profile lookup failed").count(),
+        3,
+        "{logs}"
+    );
+    for source in ["manifest", "config_toml", "legacy_config"] {
+        assert!(
+            logs.contains(&format!("source={source} reason=git_tree")),
+            "{logs}"
+        );
+    }
+    assert!(!logs.contains("SECRET"), "{logs}");
+}
+
 const DEBUG_KEYS: [&str; 2] = ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"];
 
 fn assert_defaults(repository: &Path) {

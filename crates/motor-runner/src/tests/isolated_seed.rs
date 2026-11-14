@@ -323,6 +323,25 @@ async fn isolated_seed_base_is_warm_and_copy_on_write() {
     assert_eq!(fs::read(current.join("base.json")).unwrap(), record);
 }
 
+#[tokio::test]
+#[ignore = "requires root, systemd, motor-cache/motor-job accounts and reflink scratch"]
+async fn isolated_seed_declared_profiles_match_before_and_after_sandbox_preparation() {
+    let (f, config, _) = fixture();
+    save(
+        &f.main,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"leaf\", \"dependent\", \"stable\"]\nresolver = \"2\"\n[profile.dev]\ndebug = 2\n[profile.test]\ndebug = 2\n",
+    );
+    snapshot(&f);
+    let runner = base_store_runner(config);
+    fill(&f, &runner).await;
+    let command = format!(
+        "test -z \"${{CARGO_PROFILE_DEV_DEBUG+x}}\" && test -z \"${{CARGO_PROFILE_TEST_DEBUG+x}}\" || exit 1\n{BUILD}"
+    );
+    let (id, output) = run(&f, &runner, "declared-profiles", &command).await;
+    assert_build(&runner, id, &output, &[], true);
+}
+
 async fn configured_tool_change(kind: &str) {
     #[derive(Clone, Default)]
     struct Logs(Arc<Mutex<Vec<u8>>>);

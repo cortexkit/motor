@@ -200,6 +200,7 @@ pub fn journal_message(message: &str) -> String {
         "build base seed skipped",
         "build base published",
         "Cargo build-folder maintenance",
+        "Cargo profile lookup failed",
         "runner admission cleared its own build outputs",
         "runner build base eviction",
         // Job-stream lifecycle on the tenant boundary: why a connection from
@@ -258,6 +259,14 @@ pub fn journal_message(message: &str) -> String {
             break;
         }
         let valid = match key {
+            _ if *name == "Cargo profile lookup failed" => match key {
+                "source" => matches!(value, "manifest" | "config_toml" | "legacy_config"),
+                "reason" => matches!(
+                    value,
+                    "git_tree" | "git_blob" | "invalid_utf8" | "invalid_toml"
+                ),
+                _ => false,
+            },
             _ if matches!(
                 *name,
                 "Cargo build-folder maintenance"
@@ -464,5 +473,14 @@ mod tests {
         let expected = "build base seed refused: record mismatch inputs_match=false times_valid=true toolchain_match=true environment_match=false fixed_path_match=true device_match=true format_match=true";
         assert_eq!(console_message(raw), expected);
         assert_eq!(console_message(expected), expected);
+    }
+
+    #[test]
+    fn profile_lookup_failure_exposes_only_closed_source_and_reason_codes() {
+        let raw = "[motor-runner] INFO motor_runner::compile_cache: Cargo profile lookup failed source=manifest reason=git_tree path=/SECRET bytes=7";
+        let expected = "Cargo profile lookup failed source=manifest reason=git_tree";
+        assert_eq!(console_message(raw), expected);
+        assert_eq!(console_message(expected), expected);
+        assert_eq!(console_message("motor_runner::compile_cache: Cargo profile lookup failed source=SECRET reason=SECRET"), "Cargo profile lookup failed");
     }
 }
