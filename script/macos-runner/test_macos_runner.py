@@ -49,13 +49,11 @@ def pending():
     return pinlock.seed(SERVER)
 
 
-def ready(rebuild=None):
-    if rebuild is None:
-        rebuild = ("1.100.0-x86_64-unknown-linux-gnu" in SERVER["rust_toolchains"]
-                   and "1.100.0" not in parity.PENDING_MACOS_TOOLCHAINS)
+def ready(rebuild=True):
     manifest = pending()
     if not rebuild:
-        # Keep the existing parity tests exercising the measured live-image shape.
+        # Model the older image without Rust 1.100.0 or CMake, where the validator
+        # permits build-server toolchains and components listed as pending.
         manifest["rust_default"] = "1.99.0-aarch64-apple-darwin"
         manifest["rust_toolchains"] = {name: manifest["rust_toolchains"][name]
                                        for name in parity.rust_toolchains(SERVER) if name != parity.REBUILD_RUST}
@@ -71,11 +69,15 @@ def ready(rebuild=None):
 
     manifest = fill(manifest)
     manifest["release_status"] = "reviewed"
-    manifest["clt"]["version"] = "27.0.0.0.1.1790000000"
+    manifest["clt"]["version"] = "27.2.0.0.1792721180"
     manifest["tools"]["bash"]["version"] = "GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin26.0.0)"
     for row in manifest["rust_toolchains"].values():
         row["rustc_verbose"] = row["rustc"] + "\nbinary: rustc\nhost: aarch64-apple-darwin"
     return manifest
+
+
+def pre_rebuild_ready():
+    return ready(rebuild=False)
 
 
 def observed(manifest, tmp):
@@ -112,19 +114,22 @@ class ParityTests(unittest.TestCase):
         pinlock.require_ready(self.manifest)
         parity.validate(self.manifest, SERVER)
         self.assertEqual(parity.differences(self.manifest, self.actual, job=True), [])
-        self.assertEqual(self.manifest["rust_default"], "1.99.0-aarch64-apple-darwin")
+        self.assertEqual(self.manifest["rust_default"], "1.100.0-aarch64-apple-darwin")
         for chain in self.manifest["rust_toolchains"].values():
             self.assertEqual(chain["targets"], ["aarch64-apple-darwin"])
         self.assertEqual(self.manifest["sources"]["bash"]["version"], "5.2.37")
+        self.assertEqual(self.manifest["tools"]["cmake"]["version"], "cmake version 4.2.3")
+        self.assertEqual(self.manifest["sources"]["cmake"]["version"], "4.2.3")
 
     def test_real_manifest_validates_against_real_server_manifest(self):
         manifest = json.loads((HERE / "toolchain.json").read_text())
+        self.assertEqual(manifest["rust_default"], "1.100.0-aarch64-apple-darwin")
         parity.validate(manifest, SERVER)
 
-    def test_live_macos_default_remains_valid_after_linux_default_promotion(self):
-        manifest = json.loads((HERE / "toolchain.json").read_text())
+    def test_macos_may_keep_an_older_shared_default_after_linux_default_promotion(self):
+        manifest = copy.deepcopy(self.manifest)
         self.assertEqual(SERVER["rust_default"], "1.100.0-x86_64-unknown-linux-gnu")
-        self.assertEqual(manifest["rust_default"], "1.99.0-aarch64-apple-darwin")
+        manifest["rust_default"] = "1.99.0-aarch64-apple-darwin"
         parity.validate(manifest, SERVER)
 
     def test_default_not_installed_on_server_is_rejected(self):
@@ -132,26 +137,36 @@ class ParityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a shared installed toolchain"):
             parity.validate(self.manifest, SERVER)
 
-    def test_linux_default_not_installed_in_macos_image_is_rejected(self):
-        self.manifest["rust_default"] = "1.100.0-aarch64-apple-darwin"
-        with self.assertRaisesRegex(ValueError, "not a shared installed toolchain"):
-            parity.validate(self.manifest, SERVER)
+    def test_pending_linux_default_not_installed_in_pre_rebuild_image_is_rejected(self):
+        server = copy.deepcopy(SERVER)
+        server["rust_toolchains"]["1.101.0-x86_64-unknown-linux-gnu"] = dict(
+            server["rust_toolchains"].pop("1.100.0-x86_64-unknown-linux-gnu"),
+            rustc="rustc 1.101.0 (aaaaaaaaa 2026-12-21)")
+        server["rust_default"] = "1.101.0-x86_64-unknown-linux-gnu"
+        manifest = pre_rebuild_ready()
+        manifest["rust_default"] = "1.101.0-aarch64-apple-darwin"
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.101.0"}):
+            with self.assertRaisesRegex(ValueError, "not a shared installed toolchain"):
+                parity.validate(manifest, server)
 
     def test_observed_default_must_still_match_sealed_macos_default(self):
-        self.actual["rust_default"] = "1.100.0-aarch64-apple-darwin"
+        self.actual["rust_default"] = "1.99.0-aarch64-apple-darwin"
         errors = parity.differences(self.manifest, self.actual, job=True)
         self.assertEqual(len(errors), 1)
         self.assertIn("rust_default:", errors[0])
 
-    def test_linux_rust_1_100_waits_for_the_next_macos_image(self):
-        manifest = json.loads((HERE / "toolchain.json").read_text())
-        self.assertIn("1.100.0-x86_64-unknown-linux-gnu", SERVER["rust_toolchains"])
-        self.assertNotIn("1.100.0-" + parity.HOST, manifest["rust_toolchains"])
-        self.assertIn("1.100.0", parity.PENDING_MACOS_TOOLCHAINS)
-        parity.validate(manifest, SERVER)
-        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", parity.PENDING_MACOS_TOOLCHAINS - {"1.100.0"}):
-            with self.assertRaisesRegex(ValueError, "differ from build-server"):
-                parity.validate(manifest, SERVER)
+    def test_pre_rebuild_image_accepts_a_missing_toolchain_only_while_pending(self):
+        server = copy.deepcopy(SERVER)
+        server["rust_toolchains"]["1.101.0-x86_64-unknown-linux-gnu"] = dict(
+            server["rust_toolchains"].pop("1.100.0-x86_64-unknown-linux-gnu"),
+            rustc="rustc 1.101.0 (aaaaaaaaa 2026-12-21)")
+        server["rust_default"] = "1.101.0-x86_64-unknown-linux-gnu"
+        manifest = pre_rebuild_ready()
+        self.assertNotIn("1.101.0-" + parity.HOST, manifest["rust_toolchains"])
+        with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.101.0"}):
+            parity.validate(manifest, server)
+        with self.assertRaisesRegex(ValueError, "differ from build-server"):
+            parity.validate(manifest, server)
 
     def test_bun_version_outside_server_and_pending_versions_is_rejected(self):
         self.manifest["tools"]["bun"]["version"] = "1.4.3"
@@ -171,7 +186,7 @@ class ParityTests(unittest.TestCase):
     def test_pending_component_is_skipped_but_any_other_new_component_is_not(self):
         server = copy.deepcopy(SERVER)
         server["rust_toolchains"].pop("1.100.0-x86_64-unknown-linux-gnu", None)
-        manifest = ready(rebuild=False)
+        manifest = pre_rebuild_ready()
         components = server["rust_toolchains"]["1.99.0-x86_64-unknown-linux-gnu"]["components"]
         components.append("miri-x86_64-unknown-linux-gnu")
         with patch.object(parity, "PENDING_MACOS_COMPONENTS", {"miri"}):
@@ -182,7 +197,7 @@ class ParityTests(unittest.TestCase):
     def test_pending_toolchain_is_skipped_but_any_other_new_toolchain_is_not(self):
         server = copy.deepcopy(SERVER)
         server["rust_toolchains"].pop("1.100.0-x86_64-unknown-linux-gnu", None)
-        manifest = ready(rebuild=False)
+        manifest = pre_rebuild_ready()
         chains = server["rust_toolchains"]
         base = chains["1.99.0-x86_64-unknown-linux-gnu"]
         chains["1.93.0-x86_64-unknown-linux-gnu"] = dict(base, rustc="rustc 1.93.0 (aaaaaaaaa 2026-01-22)")
@@ -340,7 +355,7 @@ class RebuildRecipeTests(unittest.TestCase):
             rustc="rustc 1.100.0 (0ef1bc386 2026-11-09)")
         with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.100.0"}):
             parity.validate(manifest, server)
-            legacy = ready(rebuild=False)
+            legacy = pre_rebuild_ready()
             parity.validate(legacy, server)
         with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", set()):
             parity.validate(manifest, server)
@@ -1918,14 +1933,43 @@ class GuestServiceTests(unittest.TestCase):
             guest_services.apply(self.root, self.policy, self.daemons)
         run.assert_not_called()
 
-    def test_still_running_after_reboot_is_recorded_as_kept_sip(self):
+    def test_running_after_reboot_is_kept_sip_only_when_enabled(self):
         self.apply()
-        for disabled in ('"com.apple.analyticsd" => true', '"com.apple.analyticsd" => false'):
-            with self.subTest(disabled=disabled):
-                actual, _ = self.verify(disabled=disabled, pid=123)
-                self.assertEqual(actual["results"]["com.apple.analyticsd"], {
-                    "outcome": "kept-sip", "disabled": disabled.endswith("true"), "pid": 123})
-                self.assertIn('"outcome": "kept-sip"', (self.root / guest_services.POLICY.name).read_text())
+        actual, _ = self.verify(disabled='"com.apple.analyticsd" => false', pid=123)
+        self.assertEqual(actual["results"]["com.apple.analyticsd"], {
+            "outcome": "kept-sip", "disabled": False, "pid": 123})
+        self.assertIn('"outcome": "kept-sip"', (self.root / guest_services.POLICY.name).read_text())
+        for disabled in ('"com.apple.analyticsd" => true', '"com.apple.analyticsd" => disabled'):
+            with self.subTest(disabled=disabled), self.assertRaisesRegex(ValueError, "still running"):
+                self.verify(disabled=disabled, pid=123)
+
+    def test_macos_27_2_disabled_override_is_read_as_disabled(self):
+        self.policy.write_text("off com.apple.analyticsd # No uploads\n")
+        self.apply()
+        actual, _ = self.verify(disabled='disabled services = {\n "com.apple.analyticsd" => disabled\n}')
+        self.assertEqual(actual["results"]["com.apple.analyticsd"], {
+            "outcome": "off", "disabled": True, "pid": 0})
+        guest_services.validate_receipt(actual, self.policy.read_text())
+
+    def test_enabled_idle_service_is_kept_sip_only_for_unverified_policy(self):
+        for expected in ("unverified", "off"):
+            for disabled in ('"com.apple.analyticsd" => false', 'disabled services = {}'):
+                with self.subTest(expected=expected, disabled=disabled):
+                    self.policy.write_text(f"{expected} com.apple.analyticsd # No uploads\n")
+                    receipt, _ = self.apply()
+                    state = {"outcome": "kept-sip", "disabled": False, "pid": 0}
+                    if expected == "unverified":
+                        actual, _ = self.verify(disabled=disabled, pid=0)
+                        self.assertEqual(actual["results"]["com.apple.analyticsd"], state)
+                        guest_services.validate_receipt(actual, self.policy.read_text())
+                        self.assertIn('"outcome": "kept-sip"', (self.root / guest_services.POLICY.name).read_text())
+                    else:
+                        with self.assertRaisesRegex(ValueError, "not disabled"):
+                            self.verify(disabled=disabled, pid=0)
+                        receipt.update(verified_boot_session=NEXT_BOOT,
+                                       results={"com.apple.analyticsd": state})
+                        with self.assertRaisesRegex(ValueError, "unexpected service outcome"):
+                            guest_services.validate_receipt(receipt, self.policy.read_text())
 
     def test_disable_command_errors_fail_instead_of_becoming_kept_sip(self):
         with patch.object(guest_services.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["launchctl"])), \
@@ -1969,6 +2013,8 @@ class GuestServiceTests(unittest.TestCase):
             (["/bin/launchctl", "print-disabled", "system"],), (["/bin/launchctl", "print", "system"],),
             (["/usr/bin/mdutil", "-s", "/"],),
         ])
+        self.policy.write_text("off com.apple.analyticsd # No uploads\n")
+        self.apply()
         for disabled in ('"com.apple.analyticsd" => false', '"com.apple.analyticsd.extra" => true',
                          '"comXappleXanalyticsd" => true', "disabled services = {}"):
             with self.subTest(disabled=disabled), self.assertRaisesRegex(ValueError, "not disabled"):
