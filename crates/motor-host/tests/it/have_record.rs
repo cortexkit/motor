@@ -606,7 +606,10 @@ async fn storage_control_provisions_sparse_capped_disks_and_keeps_admission_enfo
     let mut host = f.runtime.host.lock().unwrap();
     assert!(host.storage_enforced());
     if let motor_host::config::HostSettings::PerJob(settings) = &mut host.settings {
+        // Reservations are bounded by the growth setting, so both must exceed
+        // any real filesystem for the claim to be refused.
         settings.workspace_disk_cap_bytes = u64::MAX;
+        settings.workspace_growth_reservation_bytes = u64::MAX;
     }
     assert!(matches!(
         host.claim(c, unix_ms()),
