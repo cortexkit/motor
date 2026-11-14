@@ -3402,6 +3402,8 @@ impl Runner {
         detail
     }
 
+    /// Cache fills run only on Linux runners, so only Linux builds call this.
+    #[cfg(target_os = "linux")]
     pub(crate) fn redact_fill_output(&self, id: Uuid, text: impl std::fmt::Display) -> String {
         let values = self
             .core
