@@ -89,7 +89,11 @@ fn paused_collector_does_not_delay_another_job_or_hide_its_durable_report() {
         let watcher = jobs.start_exit_watcher();
         waiting.recv_timeout(Duration::from_secs(2)).unwrap();
         std::fs::write(ygroup.join("cgroup.procs"), "").unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        // Wait for the watcher to collect y rather than sleeping a fixed time:
+        // on a loaded machine its 100 ms tick can miss a fixed sleep. The claim
+        // under test is that x's paused collector neither blocks y's collection
+        // nor slows the poll that reports it.
+        wait_for(|| jobs.view(&y.start.job_id).unwrap().state == State::Exited);
         let before = Instant::now();
         let reports = poll(&jobs);
         let spawns = jobs.hooks.lock().unwrap().collector_spawns;
