@@ -12,11 +12,16 @@ path = "src/main.rs"
 
 [features]
 bench-client = []
+operator-direct-probe = []
 
 [[bin]]
 name = "motor-bench-client-dev"
 path = "../../scripts/bench-client.rs"
 required-features = ["bench-client"]
+
+[[example]]
+name = "boat_probe"
+required-features = ["operator-direct-probe"]
 
 [dependencies]
 motor-protocol = { path = "../motor-protocol" }

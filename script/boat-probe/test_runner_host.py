@@ -27,6 +27,23 @@ finally:
 
 
 class RunnerHostTests(unittest.TestCase):
+    def test_operator_client_build_enables_only_the_direct_probe_feature(self):
+        seed = b'operator Cargo seed'
+        probe = Mock(data={}, cargo_seed_sha256=hashlib.sha256(seed).hexdigest())
+        probe.cargo_seed_manifest.read_bytes.return_value = seed
+        lane = host.RunnerHost(probe)
+        failed = {'exit_code': 1, 'stderr': 'build stopped before provider access'}
+        with patch.object(host.subprocess, 'check_output', return_value='revision\n'), \
+             patch.object(host.subprocess, 'run'), \
+             patch.object(host, 'process', return_value=failed) as build:
+            with self.assertRaisesRegex(ValueError, 'local operator client build failed'):
+                lane._run()
+        build.assert_called_once_with(
+            ['env', '-u', 'GIT_CONFIG_COUNT', '-u', 'GIT_CONFIG_KEY_0', '-u', 'GIT_CONFIG_VALUE_0',
+             'cargo', 'build', '--locked', '-p', 'motor-module', '--example', 'boat_probe',
+             '--features', 'operator-direct-probe'], timeout=600)
+        self.assertEqual(lane.data['client_build'], failed)
+
     def test_real_initial_job_checks_replay_without_relaxing_outcomes(self):
         live = json.loads(Path(__file__).with_name('fixtures').joinpath('pid-live-initial.json').read_text())
         lane = host.RunnerHost(Mock(data={}))

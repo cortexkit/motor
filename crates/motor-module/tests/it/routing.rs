@@ -1828,6 +1828,43 @@ async fn linux_run_omits_platform_and_forwards_linux_echo() {
         .all(|v| v.instance == "e2e" && v.root.is_none()));
 }
 
+#[cfg(feature = "operator-direct-probe")]
+#[tokio::test]
+async fn operator_direct_probe_uses_connector_without_hosted_account() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let motor =
+        Motor::with_operator_direct_probe(f.config.clone(), &peer.module_state, peer.clone())
+            .unwrap();
+    for platform in [None, Some(Platform::Linux)] {
+        let mut request = f.request("true").with_timeout(60).with_weight_hint(1);
+        request.platform = platform.clone();
+        let records = collect(motor.run(request).unwrap()).await;
+        let StreamRecord::Accepted(accepted) = &records[0] else {
+            panic!("{records:?}")
+        };
+        assert_eq!(accepted.platform, Some(Platform::Linux));
+        let status = motor.runner_status_for(platform.as_ref()).await.unwrap();
+        assert_eq!(status.status.rustc_version, "linux-toolchain");
+    }
+    let frames = peer.frames.lock().unwrap();
+    let runs: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Run(run) => Some(run),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|run| run.platform.is_none()));
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|visit| visit.instance == "e2e" && visit.root.is_none()));
+}
+
 #[tokio::test]
 async fn legacy_record_with_pending_cancel_stays_on_linux_and_missing_records_are_refused() {
     let f = Fixture::new(Cut::None, 28).await;
