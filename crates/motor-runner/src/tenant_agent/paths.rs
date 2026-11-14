@@ -181,7 +181,11 @@ pub(super) struct DiskLayout {
 }
 
 impl DiskLayout {
-    pub(super) fn initialize_job_history(&self, boot_marker: &Path) -> io::Result<()> {
+    pub(super) fn initialize_job_history(
+        &self,
+        boot_marker: &Path,
+        forked: bool,
+    ) -> io::Result<()> {
         match fs::symlink_metadata(boot_marker) {
             Ok(metadata) => {
                 if !metadata.is_file()
@@ -195,7 +199,22 @@ impl DiskLayout {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        // Source-seal journal recovery repairs inode flags and ownership, without replaying or settling jobs.
         self.clear_execution_history()?;
+        if forked {
+            for name in ["mirror-reports.json", "quarantine", "job-staging", "spools"] {
+                self.remove_history(&self.runner.fd_path().join(name))?;
+            }
+            for entry in fs::read_dir(self.runner.fd_path())? {
+                let entry = entry?;
+                if entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("mirror-reports.invalid-") && name.ends_with(".json")
+                }) {
+                    self.remove_history(&entry.path())?;
+                }
+            }
+            self.runner.file.sync_all()?;
+        }
         // The marker lives on /run, not the workspace disk. It is created before
         // starting a runner, so a restart in this boot cannot erase a live job.
         OpenOptions::new()
@@ -221,19 +240,23 @@ impl DiskLayout {
             .collect();
         crate::source_seal::recovery::stopped_disk(self.runner.path(), &roots)?;
         for path in self.execution_history() {
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if metadata.is_dir() {
-                fs::remove_dir_all(path)?;
-            } else {
-                // Unlink a symlink itself, never the object it names.
-                fs::remove_file(path)?;
-            }
+            self.remove_history(&path)?;
         }
         self.runner.file.sync_all()
+    }
+
+    fn remove_history(&self, path: &Path) -> io::Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            // Unlink a symlink itself, never the object it names.
+            fs::remove_file(path)
+        }
     }
 }
 
@@ -496,6 +519,19 @@ mod job_layout_tests {
         .unwrap();
         layout.clear_execution_history().unwrap();
         assert_eq!(fs::read(kept.join("page")).unwrap(), b"keep");
+        symlink(&kept, layout.runner.path().join("quarantine")).unwrap();
+        symlink(
+            kept.join("page"),
+            layout
+                .runner
+                .path()
+                .join("mirror-reports.invalid-donor.json"),
+        )
+        .unwrap();
+        layout
+            .initialize_job_history(&scratch.join("boot-marker"), true)
+            .unwrap();
+        assert_eq!(fs::read(kept.join("page")).unwrap(), b"keep");
     }
 
     #[test]
@@ -511,7 +547,7 @@ mod job_layout_tests {
         fs::write(job.join("seal"), b"invalid seal record").unwrap();
         fs::write(job.join("record.json"), b"previous execution").unwrap();
         let marker = scratch.join("boot-marker");
-        let error = layout.initialize_job_history(&marker).unwrap_err();
+        let error = layout.initialize_job_history(&marker, false).unwrap_err();
         assert!(
             error.to_string().contains("leftover source seals"),
             "{error}"
@@ -553,7 +589,7 @@ mod job_layout_tests {
         drop(seals);
         drop(layout);
         let next = prepare_disk_layout(&root, uid()).unwrap();
-        let result = next.initialize_job_history(&scratch.join("next-boot-marker"));
+        let result = next.initialize_job_history(&scratch.join("next-boot-marker"), false);
         // Clear flags even on assertion failure so the scratch tree is removable.
         let mut leftovers = Vec::new();
         for name in ["source", "old-snapshot-only"] {
@@ -583,6 +619,108 @@ mod job_layout_tests {
     }
 
     #[test]
+    fn forked_boot_never_replays_donor_jobs_or_pending_reports() {
+        use crate::{
+            engine::{Config, Runner},
+            storage::{atomic_job_json, Job},
+        };
+        use motor_protocol::{Frame, MirrorRef, Outcome, RefusalReason, Uuid};
+
+        let (scratch, root) = tenant_root("motor-forked-history");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let state = layout.runner.path();
+        let id = Uuid::now_v7();
+        let mut donor = Job::new(id, None, 1, 1, 2);
+        donor.terminal_ended(Outcome::Exit { code: 0 }, 2);
+        let directory = state.join("jobs").join(id.to_string());
+        fs::create_dir_all(&directory).unwrap();
+        atomic_job_json(&directory.join("record.json"), &donor).unwrap();
+        fs::create_dir(directory.join("returned-donor")).unwrap();
+        fs::write(directory.join("returned-donor/chunk-0"), b"returned bytes").unwrap();
+        fs::write(directory.join("exit"), b"0").unwrap();
+        let log = crate::tenant::EventLog::open_for_mode(state, true).unwrap();
+        log.admit(id).unwrap();
+        log.observe(&donor).unwrap();
+        log.mirror_refs(
+            true,
+            &state.join("mirrors/donor"),
+            vec![MirrorRef {
+                repository: Some("/home/donor".into()),
+                dependency: None,
+                reference: "refs/motor/snapshots/donor".into(),
+                commit: "a".repeat(40),
+            }],
+        )
+        .unwrap();
+        assert!(log.first().is_some());
+        assert!(state.join("mirror-reports.json").exists());
+        drop(log);
+
+        let forked_marker = scratch.join("motor-workspace-forked");
+        layout
+            .initialize_job_history(&scratch.join("boot-marker"), true)
+            .unwrap();
+        super::super::mark_workspace_forked(&forked_marker, 7, true).unwrap();
+        let mut config = Config::new(root.join("state"), "main");
+        config.tenant_vm = true;
+        config.per_job = true;
+        config.manual_tick = true;
+        config.fixture_workspace_forked_marker = Some(forked_marker);
+        let runner = Runner::open(config).unwrap();
+        assert!(!runner.has_job_record(id));
+        assert!(!directory.exists());
+        assert!(matches!(runner.replay(id, 0).unwrap().as_slice(),
+            [Frame::Terminal(terminal)] if matches!(terminal.outcome,
+                Outcome::RefusedBeforeStart { reason: RefusalReason::TransferInterrupted })));
+        let log = runner.tenant_events().unwrap();
+        log.enable_reports(true, true).unwrap();
+        while let Some(event) = log.first() {
+            assert_ne!(event.jti, Some(id), "donor lifecycle was reported");
+            assert!(
+                event.mirror_refs.is_none(),
+                "donor mirror report was replayed"
+            );
+            log.ack(event.event_seq).unwrap();
+        }
+    }
+
+    #[test]
+    fn fork_only_history_is_preserved_on_ordinary_boot_and_same_boot_restart() {
+        let (scratch, root) = tenant_root("motor-fork-only-history");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let state = layout.runner.path();
+        let leftovers = [
+            "mirror-reports.json",
+            "mirror-reports.invalid-donor.json",
+            "quarantine/donor.json",
+            "job-staging/donor/record.json",
+            "spools/donor/bundle",
+        ];
+        for name in leftovers {
+            let path = state.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"donor evidence").unwrap();
+        }
+        layout
+            .initialize_job_history(&scratch.join("ordinary-boot"), false)
+            .unwrap();
+        for name in leftovers {
+            assert!(state.join(name).exists(), "ordinary boot removed {name}");
+        }
+        let forked_boot = scratch.join("forked-boot");
+        layout.initialize_job_history(&forked_boot, true).unwrap();
+        for name in leftovers {
+            assert!(!state.join(name).exists(), "fork kept {name}");
+        }
+        fs::write(state.join("mirror-reports.json"), b"this boot's report").unwrap();
+        layout.initialize_job_history(&forked_boot, true).unwrap();
+        assert_eq!(
+            fs::read(state.join("mirror-reports.json")).unwrap(),
+            b"this boot's report"
+        );
+    }
+
+    #[test]
     fn second_initialization_in_one_boot_keeps_job_records() {
         let (scratch, root) = tenant_root("motor-job-boot-history");
         let layout = prepare_disk_layout(&root, uid()).unwrap();
@@ -590,18 +728,18 @@ mod job_layout_tests {
         let jobs = layout.runner.path().join("jobs");
         fs::create_dir(&jobs).unwrap();
         fs::write(jobs.join("old-record"), b"previous boot").unwrap();
-        layout.initialize_job_history(&marker).unwrap();
+        layout.initialize_job_history(&marker, false).unwrap();
         assert!(!jobs.exists());
         fs::create_dir(&jobs).unwrap();
         let record = jobs.join("record.json");
         fs::write(&record, b"this boot's execution").unwrap();
         drop(layout);
         let restarted = prepare_disk_layout(&root, uid()).unwrap();
-        restarted.initialize_job_history(&marker).unwrap();
+        restarted.initialize_job_history(&marker, false).unwrap();
         assert_eq!(fs::read(&record).unwrap(), b"this boot's execution");
         fs::remove_file(marker).unwrap();
         restarted
-            .initialize_job_history(&scratch.join("boot-marker"))
+            .initialize_job_history(&scratch.join("boot-marker"), false)
             .unwrap();
         assert!(!jobs.exists());
     }

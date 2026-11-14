@@ -584,6 +584,7 @@ fn isolated_vm(probe: Probe) {
         let init = motor_protocol::TenantAgentRequest::AttachTenant {
             generation: 1,
             recovery_required: false,
+            forked: false,
             recovery_budget_ms: None,
             unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

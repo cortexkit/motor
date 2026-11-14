@@ -342,6 +342,8 @@ pub enum TenantAgentRequest {
         generation: u64,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         recovery_required: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        forked: bool,
         /// Shared disk-check budget, excluding runner startup and reply time.
         /// Older hosts omit it and use the standard recovery allowance.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,4 +402,39 @@ pub enum SnapshotKind {
     Base,
     Suspend,
     Stop,
+}
+
+#[cfg(test)]
+mod attach_tenant_tests {
+    use super::*;
+
+    #[test]
+    fn forked_is_additive_and_omitted_unless_true() {
+        let legacy = serde_json::json!({
+            "op": "attach_tenant", "generation": 1, "unix_ms": 2,
+            "seed": "seed", "address": "10.200.1.2/30", "gateway": "10.200.1.1",
+            "resolvers": ["1.1.1.1"], "hostname": "host", "machine_id": "id"
+        });
+        let mut request: TenantAgentRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            request,
+            TenantAgentRequest::AttachTenant { forked: false, .. }
+        ));
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
+        let TenantAgentRequest::AttachTenant { forked, .. } = &mut request else {
+            unreachable!()
+        };
+        *forked = true;
+        let mut expected = legacy.clone();
+        expected["forked"] = true.into();
+        assert_eq!(serde_json::to_value(&request).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<TenantAgentRequest>(expected).unwrap(),
+            request
+        );
+        let mut explicit_false = legacy.clone();
+        explicit_false["forked"] = false.into();
+        let request: TenantAgentRequest = serde_json::from_value(explicit_false).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), legacy);
+    }
 }
