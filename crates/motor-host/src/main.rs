@@ -549,6 +549,7 @@ mod config_tests {
 
     fn per_job() -> serde_json::Value {
         json!({
+            "fork_checkouts": false,
             "vcpu_ceiling": 1, "permit_budget": 4,
             "host_reserve_mib": 1024, "boot_reserve_mib": 256,
             "per_vm_overhead_mib": 128, "reclaim_timeout_ms": 5000,
@@ -631,6 +632,7 @@ mod config_tests {
             panic!("per-job settings lost")
         };
         assert_eq!(per_job.host_reserve_mib, 1024);
+        assert!(!per_job.fork_checkouts);
         assert_eq!(per_job.boot_deadline_ms, 30000);
         assert_eq!(per_job.workspace_disk_cap_bytes, 10737418240);
         assert_eq!(per_job.workspace_growth_reservation_bytes, 2147483648);
@@ -654,6 +656,21 @@ mod config_tests {
                 .to_string(),
             "image publication unavailable"
         );
+    }
+
+    #[test]
+    fn fork_checkouts_preserves_both_explicit_boolean_settings() {
+        for enabled in [false, true] {
+            let mut value = config();
+            value["mode"] = json!("per_job");
+            value["per_job"] = per_job();
+            value["per_job"]["fork_checkouts"] = json!(enabled);
+            let config: Config = serde_json::from_value(value).unwrap();
+            let HostSettings::PerJob(settings) = config.checked_settings(&Control).unwrap() else {
+                panic!("per-job settings lost")
+            };
+            assert_eq!(settings.fork_checkouts, enabled);
+        }
     }
 
     #[test]

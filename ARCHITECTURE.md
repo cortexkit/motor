@@ -138,6 +138,7 @@ defaults:
 
 | Setting | Meaning |
 | --- | --- |
+| `fork_checkouts` | Copy a new worktree's checkout disk from the repository's most recent warm disk; requires a job image whose runner adopts forked disks. |
 | `vcpu_ceiling` | Maximum job vCPUs, at most the online CPU count. |
 | `permit_budget` | Host vCPU permits with overcommit, at least the ceiling and at most four times online CPUs. |
 | `host_reserve_mib` | Host available-memory floor in MiB. |

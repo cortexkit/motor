@@ -173,6 +173,63 @@ fn no_fork_without_cache_write_or_with_empty_root() {
     }
 }
 
+#[tokio::test]
+async fn disabled_checkout_forks_take_no_hold_send_no_request_and_attach_unmarked() {
+    let (runtime, fake, _storage, c, id) = setup();
+    let disk_id = {
+        let mut host = runtime.host.lock().unwrap();
+        donor(&mut host, "donor", 1);
+        let crate::config::HostSettings::PerJob(settings) = &mut host.settings else {
+            panic!("per-job settings lost")
+        };
+        settings.fork_checkouts = false;
+        assert!(host.job_fork_plan(JOB, ROOT).unwrap().is_none());
+        let mut queued = claims(JOB2);
+        queued.workspace_key_hash = Some(motor_lease::base64url(&[6; 32]));
+        host.claim(queued, unix_ms()).unwrap();
+        assert_eq!(host.snapshot.per_job.executions[JOB2].disk_id, "donor");
+        assert!(
+            host.job_boot_disk_ready(JOB2),
+            "disabled forks must not hold donors"
+        );
+        host.job_stopped_at(JOB2, false, unix_ms()).unwrap();
+        assert!(host.snapshot.per_job.disks["donor"].queue.is_empty());
+        host.snapshot.per_job.executions[JOB].disk_id.clone()
+    };
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    run_at_root(&mut client, ROOT).await;
+    assert!(fake.forks.lock().unwrap().is_empty());
+    assert!(fake.guest_identity.lock().unwrap()[0]
+        .get("forked")
+        .is_none());
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.disks[&disk_id].forked);
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn disabling_checkout_forks_keeps_a_previously_saved_cleanup_marker() {
+    let (runtime, fake, _storage, c, id) = setup();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        donor(&mut host, "donor", 1);
+        let plan = host.job_fork_plan(JOB, ROOT).unwrap().unwrap();
+        host.release_job_fork(&plan);
+        let crate::config::HostSettings::PerJob(settings) = &mut host.settings else {
+            panic!("per-job settings lost")
+        };
+        settings.fork_checkouts = false;
+    }
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    run_at_root(&mut client, ROOT).await;
+    assert!(fake.forks.lock().unwrap().is_empty());
+    assert_eq!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
 #[test]
 fn all_listed_donors_hold_queued_jobs_until_commit_or_failure() {
     for commit in [false, true] {

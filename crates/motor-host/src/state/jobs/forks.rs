@@ -33,6 +33,10 @@ impl Host {
     }
 
     pub(crate) fn job_fork_plan(&mut self, job: &str, root: &str) -> anyhow::Result<Option<Plan>> {
+        if !matches!(&self.settings, crate::config::HostSettings::PerJob(settings) if settings.fork_checkouts)
+        {
+            return Ok(None);
+        }
         let execution = self
             .snapshot
             .per_job

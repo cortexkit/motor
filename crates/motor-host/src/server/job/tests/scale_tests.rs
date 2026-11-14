@@ -206,6 +206,7 @@ fn retained_host(directory: &std::path::Path, finished: usize) -> Host {
     let (journal, snapshot) = crate::store::SqliteJournal::open(directory).unwrap();
     let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
     host.settings = crate::config::HostSettings::PerJob(crate::config::PerJobSettings {
+        fork_checkouts: false,
         vcpu_ceiling: 2,
         permit_budget: 4,
         host_reserve_mib: 50,
