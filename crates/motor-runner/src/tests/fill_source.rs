@@ -303,12 +303,24 @@ fn export_checks_every_tip_dependency_commit_before_writing_bundles() {
 fn source_fixture_with_aliases(
     aliases: bool,
 ) -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSource) {
+    source_fixture_with_packages(aliases, false)
+}
+
+fn source_fixture_with_packages(
+    aliases: bool,
+    duplicate_packages: bool,
+) -> (Fixture, Runner, Run, PathBuf, motor_protocol::FillSource) {
     let f = Fixture::new();
     let dependency = f.scratch.join("dependency");
     fs::create_dir(&dependency).unwrap();
     git(&dependency, &["init"]);
     let (dep, _) = commit(&dependency, "dependency");
     let mut locked = format!("version = 3\n[[package]]\nname='dep'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency#{dep}'\n");
+    if duplicate_packages {
+        for name in ["dep-core", "dep-macros", "dep-utils"] {
+            locked.push_str(&format!("[[package]]\nname='{name}'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency#{dep}'\n"));
+        }
+    }
     if aliases {
         let (second, _) = commit(&dependency, "second revision");
         locked.push_str(&format!("[[package]]\nname='dep'\nversion='0.2.0'\nsource='git+https://example.invalid/dependency?rev={second}#{second}'\n[[package]]\nname='alias'\nversion='0.1.0'\nsource='git+https://example.invalid/dependency.git#{dep}'\n"));
@@ -372,6 +384,37 @@ fn source_fixture_with_aliases(
         panic!("fixture contains all locked dependency commits");
     };
     (f, runner, request, directory, source)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_lockfile_packages_export_one_bundle_and_import_on_a_fresh_disk() {
+    let (f, _, _, directory, source) = source_fixture_with_packages(false, true);
+    assert_eq!(source.git_dependencies.len(), 1);
+    assert_eq!(source.bundles.len(), 2);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+    let mut config = f.config();
+    config.state_root = f.scratch.join("deduplicated-fill-state");
+    config.manual_tick = true;
+    config.tenant_vm = true;
+    config.fill_vm = true;
+    config.tenant_write_key = Some(true);
+    let runner = Runner::open(config).unwrap();
+    let (id, _hold) = runner
+        .import_fill_source_contents(&source, &directory)
+        .unwrap();
+    assert!(id.is_some());
+    let dependency = &source.git_dependencies[0];
+    assert_eq!(
+        git(
+            &runner.core.trees.dependency_mirror(&dependency.url),
+            &[
+                "rev-parse",
+                &format!("refs/ck-motor/dep/{}", dependency.commits[0])
+            ]
+        ),
+        dependency.commits[0]
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -770,4 +813,100 @@ async fn failed_fill_completion_retains_errors_before_the_progress_tail() {
     assert!(error.len() <= 2048 + 64, "{} bytes", error.len());
     drop(hold);
     assert!(runner.core.fill_source_holds.lock().unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_fill_completion_reaches_the_last_error_after_replay_pages() {
+    for redirect in ["", "exec 1>&2; "] {
+        let (f, _, _, directory, source) = source_fixture();
+        let mut config = f.config();
+        config.state_root = f.scratch.join("paged-failed-fill-state");
+        config.manual_tick = true;
+        config.tenant_vm = true;
+        config.fill_vm = true;
+        config.tenant_write_key = Some(true);
+        config.base_commands = vec![format!("{redirect}i=0; while [ $i -lt 40000 ]; do printf '   Compiling fixture-%s v0.1.0\\n' \"$i\"; i=$((i+1)); done; printf 'fill-test-environment-secret at /srv/build/private\\nerror: final cargo failure\\n'; exit 101")];
+        let runner = Runner::open(config).unwrap();
+        let (id, _hold) = runner
+            .import_fill_source_contents(&source, &directory)
+            .unwrap();
+        let id = id.unwrap();
+        let secret = "fill-test-environment-secret";
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get_mut(&id)
+            .unwrap()
+            .request
+            .as_mut()
+            .unwrap()
+            .env
+            .insert("FILL_TEST_SECRET".into(), secret.into());
+        runner.tick().unwrap();
+        assert_eq!(
+            terminal(&runner, id).await.outcome,
+            Outcome::Exit { code: 101 }
+        );
+        let first_page = runner.replay(id, 0).unwrap();
+        assert!(!first_page
+            .iter()
+            .any(|frame| matches!(frame, Frame::Terminal(_))));
+        let error = crate::fill_source::completion(&runner, id, &source)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with("error: final cargo failure"), "{error}");
+        assert!(!error.contains(secret), "{error}");
+        assert!(!error.contains("/srv/build"), "{error}");
+        assert!(
+            error.contains("runner environment at runner state/private"),
+            "{error}"
+        );
+        assert!(error.len() <= 2048 + 64, "{} bytes", error.len());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fill_completion_reports_kill_evidence_even_with_a_retained_exit_code() {
+    for (command, killed, detail, expected) in [
+        (
+            "exit 101",
+            None,
+            Some("rule=out_of_memory; cgroup process OOM-killed"),
+            "out_of_memory",
+        ),
+        ("true", Some(Killed::Deadline), None, "killed=Deadline"),
+    ] {
+        let (f, _, _, directory, source) = source_fixture();
+        let mut config = f.config();
+        config.state_root = f.scratch.join("killed-fill-state");
+        config.manual_tick = true;
+        config.tenant_vm = true;
+        config.fill_vm = true;
+        config.tenant_write_key = Some(true);
+        config.base_commands = vec![command.into()];
+        let runner = Runner::open(config).unwrap();
+        let (id, _hold) = runner
+            .import_fill_source_contents(&source, &directory)
+            .unwrap();
+        let id = id.unwrap();
+        runner.tick().unwrap();
+        terminal(&runner, id).await;
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let terminal = inner.jobs.get_mut(&id).unwrap().terminal.as_mut().unwrap();
+            terminal.killed = killed;
+            terminal.refusal_detail = detail.map(str::to_owned);
+        }
+        let error = crate::fill_source::completion(&runner, id, &source)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
 }

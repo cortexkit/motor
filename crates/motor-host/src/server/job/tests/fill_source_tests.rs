@@ -114,3 +114,107 @@ fn older_host_source_decode_refuses_the_additive_skip_reply() {
     let error = serde_json::from_value::<FillSource>(reply["source"].clone()).unwrap_err();
     assert!(error.to_string().contains("invalid type: null"), "{error}");
 }
+
+fn duplicate_source_slot() -> Slot {
+    let request = Request {
+        account: claims(JOB).sub,
+        repository_root: "/home/source".into(),
+        integration_tip: "a".repeat(40),
+        mem_mib: 100,
+        observed_ms: unix_ms(),
+    };
+    let mut source = FillSource {
+        repository_root: request.repository_root.clone(),
+        integration_tip: request.integration_tip.clone(),
+        bundles: vec![],
+        git_dependencies: vec![],
+    };
+    for index in 0..3 {
+        let bundle = BundleManifest {
+            index,
+            repository: if index == 0 {
+                request.repository_root.clone()
+            } else {
+                "https://example.invalid/dependency".into()
+            },
+            length: 1,
+            sha256: format!("{:x}", Sha256::digest(b"x")),
+        };
+        if index != 0 {
+            source.git_dependencies.push(motor_protocol::GitDependency {
+                url: bundle.repository.clone(),
+                commits: vec!["c".repeat(40)],
+                bundle: Some(bundle.clone()),
+            });
+        }
+        source.bundles.push(bundle);
+    }
+    source
+        .validate(motor_protocol::FILL_SOURCE_MAX_BYTES)
+        .unwrap();
+    Slot {
+        request,
+        generation: "duplicate-source".into(),
+        source,
+        bytes: 3,
+        last_fill_started_ms: Some(unix_ms()),
+    }
+}
+
+#[test]
+fn duplicate_exports_are_refused_before_allocating_host_storage() {
+    let (_, _, storage) = fixture();
+    let slot = duplicate_source_slot();
+    let path = fill_source::directory(storage.root.path(), "incoming-duplicate");
+    let result = fill_source::Incoming::new(path.clone(), slot.source);
+    let error = result
+        .err()
+        .expect("duplicate source must be refused")
+        .to_string();
+    assert!(
+        error.contains("https://example.invalid/dependency"),
+        "{error}"
+    );
+    assert!(error.contains(&"c".repeat(40)), "{error}");
+    assert!(!path.exists());
+}
+
+#[test]
+fn candidate_read_retires_stored_duplicate_sources_and_their_bundles() {
+    use crate::jobs::fills::FillGuest;
+
+    let (runtime, _, _storage) = fixture();
+    let slot = duplicate_source_slot();
+    let key = fill_source::key(&slot.request.account, &slot.request.repository_root);
+    let journal = {
+        let mut host = runtime.host.lock().unwrap();
+        let journal = host.journal_directory().unwrap();
+        let path = fill_source::directory(&journal, &slot.generation);
+        std::fs::create_dir_all(&path).unwrap();
+        for index in 0..3 {
+            std::fs::write(path.join(index.to_string()), b"x").unwrap();
+        }
+        let mut next = host.snapshot.clone();
+        next.per_job.fill_sources.insert(key, slot.clone());
+        host.save(next).unwrap();
+        journal
+    };
+    let guest = crate::jobs::fills::BundleFillGuest {
+        host: runtime.host.clone(),
+        resolvers: Default::default(),
+    };
+    assert!(guest.candidates().unwrap().is_empty());
+    assert!(runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .fill_sources
+        .is_empty());
+    assert!(!fill_source::directory(&journal, &slot.generation).exists());
+    drop(guest);
+    drop(runtime);
+    let (_, snapshot) = crate::journal::FileJournal::open(&journal).unwrap();
+    assert!(snapshot.per_job.fill_sources.is_empty());
+}

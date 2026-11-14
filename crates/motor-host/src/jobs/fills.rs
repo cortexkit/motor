@@ -236,7 +236,8 @@ pub struct BundleFillGuest {
 }
 impl FillGuest for BundleFillGuest {
     fn candidates(&self) -> Result<Vec<Candidate>> {
-        let host = self.host.lock().expect("host lock");
+        let mut host = self.host.lock().expect("host lock");
+        host.clean_fill_sources()?;
         let now = crate::server::unix_ms();
         Ok(host
             .snapshot
