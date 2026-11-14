@@ -399,7 +399,17 @@ fn macos_drain_survives_restart_with_typed_refusal_and_resume_clears_it() {
     runner
         .try_begin_drain_request(Duration::from_secs(30), true)
         .unwrap();
-    assert!(runner.drain_should_exit());
+    // The drain settles only once it can take the state lock, which a
+    // background pass started by `open` may briefly hold; poll as the server
+    // loop does rather than expecting the first check to win that race.
+    let settled = std::time::Instant::now() + Duration::from_secs(10);
+    while !runner.drain_should_exit() {
+        assert!(
+            std::time::Instant::now() < settled,
+            "an idle runner's drain must settle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     drop(runner);
     let runner = open();
     assert!(runner.is_draining());
