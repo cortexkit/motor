@@ -253,6 +253,7 @@ impl Motor {
             return Ok(true);
         };
         if job.hosted_booking_complete() {
+            self.storage.record_hosted_settlement_terminal(id)?;
             return Ok(true);
         }
         let active_route = job.hosted_route().is_some();
@@ -264,6 +265,7 @@ impl Motor {
             .as_ref()
             .is_some_and(|p| p.host.starts_with("boat:"));
         if state.settlement_done() && (!state.run_sent || state.has_real_terminal()) {
+            self.storage.record_hosted_settlement_terminal(id)?;
             if active_route {
                 self.storage.cancel(id, false)?;
             }
@@ -273,19 +275,20 @@ impl Motor {
         if !state.run_sent {
             tracing::info!(job_id = %id, step = "settlement_recovery", cause = "submission ended before Run", "settling unused hosted booking");
             if boat || state.pending_finish.is_some() {
-                client.finish_never_ran(id, &self.storage).await?;
+                client.finish_unused(id, &self.storage).await?;
             } else {
-                match client.release_stored(id, &self.storage).await {
+                match client.release_unused(id, &self.storage).await {
                     Ok(())
                     | Err(
                         crate::hosted::Error::Released
                         | crate::hosted::Error::Finished
                         | crate::hosted::Error::NotGranted,
                     ) => {
-                        self.storage.hosted_update(id, |s| s.finish_done = true)?;
+                        self.storage
+                            .hosted_settlement_update(id, true, |s| s.finish_done = true)?;
                     }
                     Err(crate::hosted::Error::Admitted) => {
-                        client.finish_never_ran(id, &self.storage).await?;
+                        client.finish_unused(id, &self.storage).await?;
                     }
                     Err(error) => {
                         return Err(io::Error::other(error.code()));

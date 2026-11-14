@@ -138,6 +138,8 @@ impl Drop for CancelInFlight {
 #[path = "hosted/account/boundary_tests.rs"]
 mod hosted_account_tests;
 mod hosted_cleanup;
+#[cfg(test)]
+mod hosted_released_tests;
 mod hosted_result;
 impl Motor {
     pub(crate) fn set_connector(&mut self, connector: Arc<dyn Connector>) {
@@ -2270,6 +2272,13 @@ impl Motor {
                 |d| d.saturating_mul(1000),
             );
             let opened = self.hosted_client(state).attach(id, &self.storage).await;
+            if matches!(opened, Err(crate::hosted::Error::Released)) {
+                // Release can reach the broker before its HTTP reply reaches
+                // cleanup. The durable Run flag already proves nothing ran.
+                self.storage
+                    .confirm_hosted_release_before_run(id)
+                    .map_err(|_| crate::hosted::Error::Broker)?;
+            }
             let cause = match &opened {
                 Err(crate::hosted::Error::Finished) => Some(
                     "broker reports the job finished; no result reached ck-motor",
@@ -2331,6 +2340,13 @@ impl Motor {
         let state = self
             .hosted_state(id)
             .ok_or_else(|| io::Error::other("missing hosted route"))?;
+        if !state.run_sent && state.finish_done {
+            if let Some(terminal) = self.storage.job(id).and_then(|job| job.local_terminal) {
+                // Cleanup may still hold the finish lock awaiting its release reply.
+                // The retained never-started result needs no further settlement.
+                return emit(tx, StreamRecord::Terminal(terminal)).await;
+            }
+        }
         let mut terminal = state.terminal.clone().unwrap_or_else(|| {
             let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
                 .with_ran(Ran::Unknown("maybe".into()));

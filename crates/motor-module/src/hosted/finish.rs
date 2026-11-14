@@ -14,6 +14,20 @@ enum Reply {
 
 impl Client {
     pub(crate) async fn release_stored(&self, id: Uuid, storage: &Storage) -> Result<(), Error> {
+        self.release_stored_inner(id, storage, false).await
+    }
+
+    /// Recovery has ended the submission, so successful release can publish a terminal.
+    pub(crate) async fn release_unused(&self, id: Uuid, storage: &Storage) -> Result<(), Error> {
+        self.release_stored_inner(id, storage, true).await
+    }
+
+    async fn release_stored_inner(
+        &self,
+        id: Uuid,
+        storage: &Storage,
+        retire_unstarted: bool,
+    ) -> Result<(), Error> {
         let _finish = storage.lock_finish(id).await;
         if storage
             .job(id)
@@ -25,7 +39,7 @@ impl Client {
         let result = self.release(id).await;
         if result.is_ok() || matches!(result, Err(Error::Released | Error::Finished)) {
             storage
-                .hosted_update(id, |s| {
+                .hosted_settlement_update(id, retire_unstarted, |s| {
                     s.finish_done = true;
                 })
                 .map_err(|_| Error::Broker)?;
@@ -38,6 +52,16 @@ impl Client {
         id: Uuid,
         terminal: Option<&TerminalRecord>,
         storage: &Storage,
+    ) -> std::io::Result<bool> {
+        self.finish_inner(id, terminal, storage, false).await
+    }
+
+    async fn finish_inner(
+        &self,
+        id: Uuid,
+        terminal: Option<&TerminalRecord>,
+        storage: &Storage,
+        retire_unstarted: bool,
     ) -> std::io::Result<bool> {
         // Normal completion, cancellation recovery and shutdown can meet here.
         // Serialize the request as well as the state updates, not just the body.
@@ -106,7 +130,7 @@ impl Client {
             }
             match self.finish_once(state.runner_id(id), &body).await {
                 Ok(Reply::Settled(settled)) => {
-                    storage.hosted_update(id, |s| {
+                    storage.hosted_settlement_update(id, retire_unstarted, |s| {
                         s.pending_finish = None;
                         s.finish_done = true;
                         s.billed_vcpu_ms = Some(settled);
@@ -116,7 +140,7 @@ impl Client {
                 }
                 Ok(result @ (Reply::Refused | Reply::Lost)) => {
                     let lost = matches!(result, Reply::Lost);
-                    storage.hosted_update(id, |s| {
+                    storage.hosted_settlement_update(id, retire_unstarted, |s| {
                         s.pending_finish = None;
                         s.finish_done = true;
                         s.billing = super::BillingStatus::Unavailable;
@@ -148,6 +172,20 @@ impl Client {
         id: Uuid,
         storage: &Storage,
     ) -> std::io::Result<()> {
+        self.finish_never_ran_inner(id, storage, false).await
+    }
+
+    /// Unlike placement retries, recovery will not request another booking after finish.
+    pub(crate) async fn finish_unused(&self, id: Uuid, storage: &Storage) -> std::io::Result<()> {
+        self.finish_never_ran_inner(id, storage, true).await
+    }
+
+    async fn finish_never_ran_inner(
+        &self,
+        id: Uuid,
+        storage: &Storage,
+        retire_unstarted: bool,
+    ) -> std::io::Result<()> {
         tracing::info!(job_id = %id, step = "finish", cause = "no Run frame sent", "Boat never-ran cleanup requested");
         storage.hosted_update(id, |state| {
             if !state.finish_done && state.pending_finish.is_none() {
@@ -157,7 +195,9 @@ impl Client {
                 });
             }
         })?;
-        self.finish(id, None, storage).await.map(|_| ())
+        self.finish_inner(id, None, storage, retire_unstarted)
+            .await
+            .map(|_| ())
     }
     async fn finish_once(&self, id: Uuid, body: &Finish) -> Result<Reply, Error> {
         *self.broker_failure.lock().unwrap() = Some("finish bearer acquisition pending".into());
