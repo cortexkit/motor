@@ -895,6 +895,7 @@ fn request_environment_policy_allows_build_controls_but_not_paths_or_credentials
         "RUST_BACKTRACE",
         "RUSTFLAGS",
         "RUSTDOCFLAGS",
+        "RUSTUP_TOOLCHAIN",
         "RUST_TEST_THREADS",
         "CARGO_INCREMENTAL",
         "CARGO_BUILD_JOBS",
@@ -919,11 +920,14 @@ fn request_environment_policy_allows_build_controls_but_not_paths_or_credentials
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_RUSTC",
         "RUSTUP_HOME",
+        "RUSTUP_DIST_SERVER",
+        "RUSTUP_UPDATE_ROOT",
+        "RUSTUP_TOOLCHAIN_PATH",
         "cargo_incremental",
     ] {
         assert!(!allowed_env(name), "allowed {name}");
     }
-    for prefix in ["RUST_", "CARGO_", "NEXTEST_"] {
+    for prefix in ["RUST_", "CARGO_", "NEXTEST_", "RUSTUP_TOOLCHAIN_"] {
         for secret in ["TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL"] {
             assert!(!allowed_env(&format!("{prefix}{secret}")));
         }

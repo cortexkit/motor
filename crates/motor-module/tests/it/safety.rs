@@ -336,11 +336,12 @@ fn transport_spy_bundle_base64_name_collision_is_not_environment_metadata() {
 #[tokio::test]
 async fn transport_spy_filters_names_and_values_before_serialization() {
     let f = Fixture::new(Cut::None, 28).await;
-    let mut request = f.request("true");
+    let mut request = f.request(r#"test "$RUSTUP_TOOLCHAIN" = 1"#);
     let allowed = [
         "RUST_BACKTRACE",
         "RUSTFLAGS",
         "RUSTDOCFLAGS",
+        "RUSTUP_TOOLCHAIN",
         "CARGO_INCREMENTAL",
         "CARGO_BUILD_JOBS",
         "NEXTEST_PROFILE",
@@ -370,6 +371,13 @@ async fn transport_spy_filters_names_and_values_before_serialization() {
         "NEXTEST_PASSWORD",
         "RUST_CREDENTIAL",
         "RUSTUP_HOME",
+        "RUSTUP_DIST_SERVER",
+        "RUSTUP_UPDATE_ROOT",
+        "RUSTUP_TOOLCHAIN_TOKEN",
+        "RUSTUP_TOOLCHAIN_SECRET",
+        "RUSTUP_TOOLCHAIN_PASSWORD",
+        "RUSTUP_TOOLCHAIN_KEY",
+        "RUSTUP_TOOLCHAIN_CREDENTIAL",
         "DYLD_LIBRARY_PATH",
         "SHELL",
         "LANG",
