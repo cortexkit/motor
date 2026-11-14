@@ -81,7 +81,7 @@ pub const HELP: &str = "\
 usage: ck motor run [--vcpus N] [--memory N] [--sibling PATH]... [--env NAME=VALUE]...
                     [--timeout SECONDS] [--cwd PATH] [--secret-file PATH]
                     [--platform linux|windows|macos] [--net]
-                    [--allow-spill | --hosted] -- COMMAND...
+                    [--allow-spill | --hosted | --boat-only] -- COMMAND...
 
 Runs COMMAND on the remote build server against a snapshot of the git checkout
 that contains --cwd (default: the current directory), and streams its stdout
@@ -118,6 +118,8 @@ and stderr here as they arrive.
                       hosted runner, never on the build server; a lease that
                       can't be granted or connected refuses (200). Needs a
                       broker configured in ck-motor (else 204)
+  --boat-only         operator parity test: send one spill-eligible job straight
+                      to Boat; requires an account allowed Boat-only leases
 
 One word after -- is passed verbatim to bash -c on the runner:
   ck motor run -- 'cargo test 2>&1 | tail -n 20'
@@ -221,6 +223,7 @@ pub struct RunArgs {
     pub return_max_bytes: Option<u64>,
     pub allow_spill: bool,
     pub hosted: bool,
+    pub boat_only: bool,
 }
 
 /// Parse the words after `ck motor run`. An option takes its value as the
@@ -243,6 +246,26 @@ fn parse_args_checked(args: &[String], wsl: &crate::wsl::Checks) -> Result<Invoc
             }
             if parsed.hosted && parsed.allow_spill {
                 return Err("--hosted and --allow-spill cannot be combined".into());
+            }
+            if parsed.boat_only {
+                if parsed.net {
+                    return Err(
+                        "--boat-only requires a network-free job; --net is not spill-eligible"
+                            .into(),
+                    );
+                }
+                if parsed.timeout > crate::hosted::BOAT_MAX_TIMEOUT_S {
+                    return Err(
+                        "--boat-only timeout exceeds ck-motor's spill-eligible timeout limit"
+                            .into(),
+                    );
+                }
+                if !matches!(
+                    parsed.platform,
+                    None | Some(motor_protocol::Platform::Linux)
+                ) {
+                    return Err("--boat-only requires a Linux job".into());
+                }
             }
             if parsed.platform == Some(motor_protocol::Platform::Macos)
                 && (parsed.hosted || parsed.allow_spill)
@@ -272,6 +295,10 @@ fn parse_args_checked(args: &[String], wsl: &crate::wsl::Checks) -> Result<Invoc
         }
         if word == "--hosted" {
             parsed.hosted = true;
+            continue;
+        }
+        if word == "--boat-only" {
+            parsed.boat_only = true;
             continue;
         }
         let (name, inline) = match word.split_once('=') {
@@ -1919,6 +1946,7 @@ pub struct SubcClient {
     return_workspace: Option<PathBuf>,
     allow_spill: bool,
     hosted: bool,
+    boat_only: bool,
 }
 
 struct ClientRoute {
@@ -1953,6 +1981,7 @@ impl SubcClient {
             return_workspace: workspace_root(Some(workspace)).ok(),
             allow_spill: false,
             hosted: false,
+            boat_only: false,
         })
     }
 
@@ -2069,6 +2098,9 @@ impl ExecClient for SubcClient {
         }
         if self.hosted {
             params["hosted"] = json!(true);
+        }
+        if self.boat_only {
+            params["boat_only"] = json!(true);
         }
         self.subscribe("exec.run", params, None).await
     }
@@ -2212,6 +2244,7 @@ async fn main_checked(args: &[String], wsl: &crate::wsl::Checks) -> u8 {
     };
     client.allow_spill = args.allow_spill;
     client.hosted = args.hosted;
+    client.boat_only = args.boat_only;
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     drive_run_recorded(
@@ -2842,6 +2875,7 @@ mod tests {
                 return_max_bytes: None,
                 allow_spill: false,
                 hosted: false,
+                boat_only: false,
             }
         );
         assert_eq!(command_line(&args.command), "cargo test -p x");
@@ -2876,6 +2910,28 @@ mod tests {
             panic!("expected a run")
         };
         assert_eq!(command_line(&args.command), "ls --help");
+    }
+
+    #[test]
+    fn boat_only_cli_checks_network_and_local_spill_timeout_before_submission() {
+        for command in ["--boat-only --net -- true", "--net --boat-only -- true"] {
+            assert!(parse_args(&words(command))
+                .unwrap_err()
+                .contains("network-free"));
+        }
+        let timeout = format!(
+            "--boat-only --timeout {} -- true",
+            crate::hosted::BOAT_MAX_TIMEOUT_S + 1
+        );
+        assert!(parse_args(&words(&timeout))
+            .unwrap_err()
+            .contains("timeout"));
+        let Ok(Invocation::Run(args)) = parse_args(&words("--boat-only --timeout 3601 -- true"))
+        else {
+            panic!("the broker owns its configured Boat timeout")
+        };
+        assert!(args.boat_only);
+        assert!(!args.hosted && !args.allow_spill);
     }
 
     #[test]

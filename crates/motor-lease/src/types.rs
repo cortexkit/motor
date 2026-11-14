@@ -154,6 +154,12 @@ fn present_workspace_hash<'de, D: serde::Deserializer<'de>>(
     String::deserialize(deserializer).map(Some)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeasePlacement {
+    Boat,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseRequest {
@@ -194,6 +200,9 @@ pub struct LeaseRequest {
         deserialize_with = "optional_memory"
     )]
     pub mem_mib: Option<u64>,
+    /// Operator-selected Boat placement; absent ordinary leases keep their bytes.
+    #[serde(default, deserialize_with = "optional_placement")]
+    pub placement: Option<LeasePlacement>,
 }
 
 impl Serialize for LeaseRequest {
@@ -201,7 +210,9 @@ impl Serialize for LeaseRequest {
         use serde::ser::SerializeStruct;
         let mut body = serializer.serialize_struct(
             "LeaseRequest",
-            10 + usize::from(self.allow_spill.is_some()) + usize::from(self.mem_mib.is_some()),
+            10 + usize::from(self.allow_spill.is_some())
+                + usize::from(self.mem_mib.is_some())
+                + usize::from(self.placement.is_some()),
         )?;
         body.serialize_field("job_id", &self.job_id)?;
         body.serialize_field("vcpus", &self.vcpus)?;
@@ -226,8 +237,17 @@ impl Serialize for LeaseRequest {
         if let Some(mem_mib) = self.mem_mib {
             body.serialize_field("mem_mib", &mem_mib)?;
         }
+        if let Some(placement) = self.placement {
+            body.serialize_field("placement", &placement)?;
+        }
         body.end()
     }
+}
+
+fn optional_placement<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<LeasePlacement>, D::Error> {
+    LeasePlacement::deserialize(deserializer).map(Some)
 }
 
 fn optional_boolean<'de, D: serde::Deserializer<'de>>(

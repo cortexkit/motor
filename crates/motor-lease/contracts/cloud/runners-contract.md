@@ -206,7 +206,7 @@ request and reply bytes.
 | 400 | `bad_request`, `platform_unsupported` |
 | 401 | `unauthorized` (client routes), `host_auth_failed` (host routes) |
 | 402 | `budget_exhausted` |
-| 403 | `account_closed` (lease only; never carries `Retry-After`) |
+| 403 | `account_closed`, `boat_only_not_allowed` (lease only; never carry `Retry-After`) |
 | 404 | `not_found`, `job_unknown` |
 | 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
 | 422 | `no_host_fits` (lease only; never carries `Retry-After`) |
@@ -235,17 +235,18 @@ The exact body fields, in canonical order, are:
 
 ```text
 {job_id, vcpus, platform, net, workspace_key_hash, repo_hash,
- placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill[, mem_mib]}
+ placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill[, mem_mib][, placement]}
 ```
 
-`allow_spill` is a required boolean, described under "Per-lease spill policy" below. `mem_mib` is
-optional; the brackets above denote optional presence, not JSON syntax. No other
-members are accepted.
+`allow_spill` is a required boolean, described under "Per-lease spill policy" below. `mem_mib` and
+`placement` are optional; the brackets above denote optional presence, not JSON syntax. `placement`,
+when present, must be exactly the string `"boat"` (see "Boat-only leases" below); any other value,
+including `null`, is 400 `bad_request` with `field: "placement"`. No other members are accepted.
 
 The canonical lease hash uses this exact member order:
 
 ```text
-{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill[, mem_mib] }
+{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill[, mem_mib][, placement] }
 ```
 
 It omits `requester_jwk`. `allow_spill` goes immediately after `timeout_s` with its exact boolean
@@ -253,6 +254,9 @@ value (`true` and `false` hash differently). Only when present, the original sta
 is appended after `allow_spill`, before applying the memory floor. Without it, canonical bytes
 and hashes are unchanged. A re-request must repeat its presence and exact value, even when two
 values would give the same effective memory; otherwise it gets the existing 409 `job_conflict`.
+`placement`, only when present, is appended last, after `mem_mib` if that is present, as
+`"placement":"boat"`; a lease without it hashes exactly as before. A re-request must repeat its
+presence, or it gets 409 `job_conflict`.
 `test-vectors/runners/no-spill-lease.json` records `canonical_lease_bytes`, the exact canonical
 JSON string hashed, for clients to byte-compare. A re-request must repeat the same `allow_spill`
 value or receive 409 `job_conflict` wherever a differing lease hash conflicts.
@@ -331,8 +335,10 @@ After authentication and schema validation, checks proceed in this order:
    `platform_unsupported`. If hosts are registered for it but none is active and selectable
    (including when every one is retired), return 503 `no_capacity`, unless no candidate host could ever fit the lease (below), which is 422
    `no_host_fits`. Before returning a refusal, repeat the existing-job check so a concurrent
-   successful lease wins over that refusal. When `allow_spill` is `true`, Boat spill is
-   enabled, the platform equals `BOAT_PLATFORM` and `timeout_s` is at most `BOAT_MAX_TIMEOUT_S`,
+   successful lease wins over that refusal. A Boat-only lease (`placement: "boat"`) skips this
+   step entirely and goes straight to [Boat-only leases](#boat-only-leases). When `allow_spill` is
+   `true`, Boat spill is enabled, `BOAT_SPILL_ENABLED` is `"true"`, the platform equals
+   `BOAT_PLATFORM` and `timeout_s` is at most `BOAT_MAX_TIMEOUT_S`,
    either 400 or 503 refusal is replaced by the
    spill path in [Boat placements](#boat-placements), and so is `no_host_fits` when a Boat size
    fits the lease.
@@ -350,14 +356,14 @@ After authentication and schema validation, checks proceed in this order:
    `Retry-After`. Without any candidate (no active host has the platform, or only the avoided host
    does, or all are explicit-only without a binding hint) the codes above apply unchanged. When
    the lease allows spill, Boat is available for its
-   platform (enabled, configured, with a current image, and `timeout_s` at most
-   `BOAT_MAX_TIMEOUT_S`) and a Boat size fits, the lease spills
+   platform (enabled, configured, `BOAT_SPILL_ENABLED` `"true"`, with a current image, and
+   `timeout_s` at most `BOAT_MAX_TIMEOUT_S`) and a Boat size fits, the lease spills
    instead. `N` is the largest vCPU count that could be placed: for each candidate, the largest
    `v` whose `v` and effective memory at `v` both fit its ceilings (0 if none), maximized over
    candidates, keeping the original stated memory if present. When spill is allowed and Boat is
-   available as above, also maximize over Boat sizes: without stated memory a size contributes
-   its `vcpus`; with stated memory it contributes the largest `v ≤ size.vcpus` for which
-   `max(stated, 2048 × v) ≤ size.mem_mib`, or 0 if none.
+   available as above, also maximize over Boat sizes: a size contributes the largest
+   `v ≤ size.vcpus` for which `max(stated, 2048 × v) ≤ size.mem_mib` (with `stated` taken as 0
+   when the lease states no memory), or 0 if none.
    `M` is independently the largest `max_job_mem_mib` among those candidate hosts and, only when
    spill is allowed and Boat is available as above, the largest configured usable `mem_mib` among
    its sizes. Do not filter these memory ceilings by the requested vCPUs or memory; the two
@@ -1176,9 +1182,13 @@ the broker's reservation authority. Allowances are lifetime vCPU-ms; a missing r
 ## Boat placements
 
 When no registered host fits a lease, the broker can spill it to a Boat (boat.dev) sandbox that it
-drives through Boat's API. Spill is off unless `BOAT_ENABLED` is `"true"` and every Boat setting
-is configured; with it off no lease spills, while sandboxes that already exist are still stopped
-and cleaned up. Each tenant may have at most `BOAT_MAX_SANDBOXES` sandboxes whose machines may be running
+drives through Boat's API. Boat is off unless `BOAT_ENABLED` is `"true"` and every Boat setting
+is configured; with it off no lease goes to Boat, while sandboxes that already exist are still
+stopped and cleaned up. A lease whose platform differs from `BOAT_PLATFORM` never goes to Boat
+either. `BOAT_SPILL_ENABLED` (`"true"` or `"false"`) governs only spill of ordinary leases; with
+it `"false"`, ordinary leases never spill but [Boat-only leases](#boat-only-leases) still run.
+Turning it off affects only new admissions; an already admitted provisioning claim or booked job continues.
+Each tenant may have at most `BOAT_MAX_SANDBOXES` sandboxes whose machines may be running
 (confirmed stopped sandboxes do not count), and **a sandbox serves at most one live lease**. Placement hints never select a sandbox.
 
 **Cleanup and provider debugging.** Idle ready sandboxes with no claim or live lease are
@@ -1219,15 +1229,45 @@ larger than every registered host's per-job ceiling returns 422 `no_host_fits` w
 callers sharing a fleet account can choose independently.
 It does not override the Boat enablement, platform, size or budget gates.
 
+### Boat-only leases
+
+A lease with `placement: "boat"` asks for Boat directly, even when a registered host has room. It
+exists so an operator can run the same job on Boat and on a registered host and compare them
+before real spill is turned on.
+
+- **Account gate.** The account's operator-set `allowances.boat_only_allowed` must be 1 (default
+  0). Otherwise the reply is **403** `{"error":"boat_only_not_allowed"}`, decided before any job
+  claim, reservation or Boat call.
+- **Spill flag.** It requires `allow_spill: true`. With `allow_spill: false` the body is 400
+  `bad_request` with `field: "placement"`, before any job claim.
+- **No registered host.** Step 3 of the lease order is skipped: no registered host is considered,
+  `placement_hint` and `avoid_host` choose nothing (they still count in the lease hash), and no
+  explicit-only binding applies.
+- **Boat gates.** `BOAT_ENABLED` and `BOAT_PLATFORM` apply as for spill. `BOAT_SPILL_ENABLED` does
+  not. With Boat off, or a platform other than `BOAT_PLATFORM`, the reply is 503 `no_capacity`
+  with Retry-After `5`. A lease whose `timeout_s` exceeds `BOAT_MAX_TIMEOUT_S`, or that no Boat
+  size fits under the eligibility rule below, is **422** `no_host_fits` whose `max_vcpus` and
+  `max_mem_mib` count Boat sizes only, computed as in step 3, and is 0 for both when the timeout
+  is what fails. Like any `no_host_fits`, it leaves no Boat claim or spill record.
+- **Everything else is a Boat spill.** Budget, breaker, start limits, the sandbox cap, warm reuse,
+  workspace affinity, provisioning hold, booking, billing on the broker's clock with the
+  60-second minimum, finish, release and reattach refusals, and replace refusal are exactly as
+  for a spilled lease. Its usage is charged to the tenant like any Boat job.
+- **Record.** D1 `provider_jobs.boat_only` is 1 for such a job and 0 otherwise, so parity runs
+  can be separated from real spill. `test-vectors/runners/boat-only-lease.json` pins a granted
+  request and its canonical bytes, the 403 for an account without the gate, and the 400 for
+  `allow_spill: false`.
+
 **Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), its `timeout_s` is at
 most `BOAT_MAX_TIMEOUT_S` (default 7200; the deploy preflight requires 10 to 7200, because Boat's
 own auto-stop is capped at three hours and must outlast the run and its deadline grace), and
 `BOAT_SIZES`
 (the usable `{type, vcpus, mem_mib}` measured inside each Boat size) has a size with
-`vcpus ≥ job.vcpus`; without a stated `mem_mib`, the smallest such size is used, unchanged.
-With stated memory, a size must also have usable `mem_mib ≥ max(stated, 2048 × job.vcpus)`;
-the smallest qualifying size is used. In both cases the Boat token keeps that size's configured
-usable memory, not the registered-host allocation, because the job owns the sandbox. No
+`vcpus ≥ job.vcpus` and usable `mem_mib ≥ max(stated, 2048 × job.vcpus)`, where `stated` is 0
+when the lease states no memory. So a lease without stated memory fits a size only when
+2048 MiB per vCPU fits its usable memory. The smallest qualifying size is used. The Boat token
+keeps that size's configured usable memory, not the registered-host allocation, because the
+job owns the sandbox. No
 fitting size is 503 `no_capacity`, or 422 `no_host_fits` when no registered host could ever fit
 the lease either (see step 3 of the lease order). A lease above `BOAT_MAX_TIMEOUT_S` never goes to
 Boat: it gets the registered-host answer unchanged, 503 `no_capacity` when no host
@@ -1251,9 +1291,16 @@ otherwise `BOAT_MAX_STARTS_PER_HOUR` (6). A fresh claim holds a persisted start 
 admission includes reservations plus sent starts in the last hour. The send fence counts the
 start and releases its reservation. Unsent claims ending release their reservation. A sent create
 is never refunded on failure or a lost reply, but exact-key replays count only once. Daily D1
-start reporting counts sent creates as well. A ready sandbox may be reused at either limit.
-Past the hourly limit, with no ready sandbox, the lease gets 503 `no_capacity` with Retry-After
-until a start leaves the hour; lack of a cap slot is also 503 `no_capacity`.
+start reporting counts sent creates as well.
+
+`BOAT_MAX_STARTS_PER_DAY` is also an admission limit, for the whole Boat account rather than one
+tenant: sent starts in the last 24 hours plus live start reservations, across all tenants, may not
+exceed it. Boat itself counts starts over a rolling 24 hours, so this limit does too.
+A reservation not sent within 10 minutes stops counting.
+
+A ready sandbox may be reused at any limit. Past the hourly or daily limit, with no ready
+sandbox, the lease gets 503 `no_capacity` with Retry-After until a start leaves that window;
+lack of a cap slot is also 503 `no_capacity`.
 
 **Provisioning hold.** The claiming transaction reserves a provisioning hold of
 `min(vcpus × 60000, vcpus × max_s × 1000)` vCPU-ms, the minimum a booked Boat job is charged; it
@@ -1464,6 +1511,9 @@ authorized_keys line.
 `test-vectors/runners/no-spill-lease.json` and `test-vectors/runners/no-host-fits-lease.json`
 pin the registered-host-only refusals: a full host's 503 `no_capacity`, and the 422
 `no_host_fits` for a job above the only host's per-job ceiling.
+
+`test-vectors/runners/boat-only-lease.json` pins a granted Boat-only request and its canonical
+lease bytes and hash, the account gate's 403, and the 400 for `allow_spill: false`.
 
 `test-vectors/runners/stated-memory-lease.json` pins 4-vCPU leases stating 12288 MiB and 2048 MiB
 (tokens carry 12288 and 8192 respectively), their lease hashes, a malformed `mem_mib` refusal and

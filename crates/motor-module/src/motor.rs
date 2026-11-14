@@ -300,6 +300,56 @@ impl Motor {
             returns,
         )
     }
+    pub(crate) fn boat_only_refusal(&self, request: &RunRequest) -> Option<&'static str> {
+        if !matches!(request.platform, None | Some(Platform::Linux)) {
+            Some("--boat-only requires a Linux job")
+        } else if request.network.is_some() {
+            Some("--boat-only requires a network-free job; --net is not spill-eligible")
+        } else if request.queue_wait_limit_s.is_some() {
+            Some("--boat-only cannot submit a gate job")
+        } else if request.timeout.is_none() {
+            Some("--boat-only requires a timeout")
+        } else if request
+            .timeout
+            .is_some_and(|s| s > crate::hosted::BOAT_MAX_TIMEOUT_S)
+        {
+            Some("--boat-only timeout exceeds ck-motor's spill-eligible timeout limit")
+        } else if std::fs::canonicalize(&request.repository_root).is_ok_and(|root| {
+            self.config
+                .hosted_repositories
+                .iter()
+                .any(|listed| std::fs::canonicalize(listed).is_ok_and(|listed| listed == root))
+        }) {
+            Some("--boat-only cannot submit a repository-routed job")
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn run_direct_boat_only_authorized(
+        &self,
+        request: RunRequest,
+        attribution: Option<JobAttribution>,
+        returns: crate::ReturnOptions,
+        secret_hash: [u8; 32],
+    ) -> io::Result<JobStream> {
+        if let Some(message) = self.boat_only_refusal(&request) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        // Gate priority orders first-party work. Boat-only jobs never enter
+        // that queue and must retain the normal non-gate spill policy.
+        self.run_classified_keyed(
+            request,
+            (attribution, Some(secret_hash)),
+            false,
+            false,
+            true,
+            true,
+            returns,
+            (None, "direct".into()),
+        )
+    }
+
     pub(crate) fn shutdown_storage(&self) -> io::Result<()> {
         self.storage.shutdown()
     }
@@ -347,6 +397,7 @@ impl Motor {
             gate_job,
             _allow_gate_spill,
             hosted_test,
+            false,
             returns,
             (None, "direct".into()),
         )
@@ -359,6 +410,7 @@ impl Motor {
         gate_job: bool,
         _allow_gate_spill: bool,
         hosted_test: bool,
+        boat_only: bool,
         returns: crate::ReturnOptions,
         (key, caller): (Option<submission_key::KeyRecord>, String),
     ) -> io::Result<JobStream> {
@@ -453,6 +505,7 @@ impl Motor {
         if wsl_refusal.is_none() && hosted_test && !macos_not_hosted {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
+            route.boat_only = boat_only;
             route.hosted_no_fallback = true;
             self.storage.hosted_route(id, route)?;
         } else if let Some(repository) = repository {
@@ -1397,8 +1450,17 @@ impl Motor {
                             error => {
                                 // A direct hosted test exists to show what the
                                 // broker answered, so name its error code too.
-                                let detail = if self.hosted_state(id).is_some_and(|s| s.hosted_test)
+                                let detail = if self.hosted_state(id).is_some_and(|s| s.boat_only)
+                                    && matches!(error, crate::hosted::Error::NoHostFits(_, _))
                                 {
+                                    let crate::hosted::Error::NoHostFits(vcpus, memory) = error
+                                    else {
+                                        unreachable!()
+                                    };
+                                    format!("{}: broker refused the Boat-only lease; max_vcpus={}, max_mem_mib={}",
+                                        error.code(), vcpus.map_or("unknown".into(), |v| v.to_string()),
+                                        memory.map_or("unknown".into(), |v| v.to_string()))
+                                } else if self.hosted_state(id).is_some_and(|s| s.hosted_test) {
                                     error.detail_with_broker_code(client.broker_code().as_deref())
                                 } else {
                                     error.detail()
@@ -4043,6 +4105,8 @@ mod queue_tests;
 
 #[cfg(test)]
 mod boat_capacity_tests;
+#[cfg(test)]
+mod boat_only_tests;
 #[cfg(test)]
 mod fleet_capacity_tests;
 #[cfg(test)]
