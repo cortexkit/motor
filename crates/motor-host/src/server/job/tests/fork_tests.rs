@@ -479,50 +479,81 @@ async fn helper_forks_unlocked_and_attach_carries_marker_until_booted_job_ends()
     );
 }
 
-#[tokio::test]
-async fn fork_errors_and_unknown_operation_fall_back_without_have_or_quarantine_and_job_runs() {
-    for error in ["clone failed", "unknown variant `fork_workspace`"] {
-        for use_base in [false, true] {
-            let (runtime, fake, _storage, c, id) = setup();
-            let disk_id = {
-                let mut host = runtime.host.lock().unwrap();
-                donor(&mut host, "donor", 1);
-                if use_base {
-                    let have = host.snapshot.per_job.disks["donor"].have.clone();
-                    host.snapshot.per_job.bases.insert(
-                        "base".into(),
-                        crate::state::jobs::storage::Base {
-                            sub: c.sub.clone(),
-                            repository_key: Some(crate::jobs::fill_source::repository_key(ROOT)),
-                            have,
-                            last_used_ms: 1,
-                            evicting: false,
-                        },
-                    );
-                }
-                host.snapshot.per_job.executions[JOB].disk_id.clone()
-            };
-            *fake.fork_error.lock().unwrap() = Some(error.into());
-            let (mut client, task) = start(runtime.clone(), c, id).await;
-            run_at_root(&mut client, ROOT).await;
-            assert_eq!(fake.forks.lock().unwrap().len(), 1);
-            assert_eq!(
-                fake.workspace_contents.lock().unwrap()[&disk_id],
-                use_base.then(|| "base".into())
+async fn assert_fork_fallback(error: &str, use_base: bool, fail_seed: bool) {
+    let (runtime, fake, _storage, c, id) = setup();
+    let base_have = vec![motor_protocol::MirrorRef {
+        repository: Some(ROOT.into()),
+        dependency: None,
+        reference: "refs/heads/base".into(),
+        commit: "base-commit".into(),
+    }];
+    let disk_id = {
+        let mut host = runtime.host.lock().unwrap();
+        donor(&mut host, "donor", 1);
+        if use_base {
+            host.snapshot.per_job.bases.insert(
+                "base".into(),
+                crate::state::jobs::storage::Base {
+                    sub: c.sub.clone(),
+                    repository_key: Some(crate::jobs::fill_source::repository_key(ROOT)),
+                    have: base_have.clone(),
+                    last_used_ms: 1,
+                    evicting: false,
+                },
             );
-            {
-                let host = runtime.host.lock().unwrap();
-                let disk = &host.snapshot.per_job.disks[&disk_id];
-                assert!(disk.have.is_empty());
-                assert!(disk.forked_from.is_none());
-                assert!(!disk.quarantined);
-                assert!(host.snapshot.leases[JOB].delivered);
-            }
-            assert_ne!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
-            drop(client);
-            task.await.unwrap().unwrap();
-            runtime.stop_job(JOB, true, false).unwrap();
         }
+        host.snapshot.per_job.executions[JOB].disk_id.clone()
+    };
+    *fake.fork_error.lock().unwrap() = Some(error.into());
+    fake.fail_seed.store(fail_seed, Ordering::SeqCst);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    run_at_root(&mut client, ROOT).await;
+    assert_eq!(fake.forks.lock().unwrap().len(), 1);
+    assert_eq!(fake.seeds.lock().unwrap().len(), usize::from(use_base));
+    assert_eq!(
+        fake.workspace_contents.lock().unwrap()[&disk_id],
+        (use_base && !fail_seed).then(|| "base".into())
+    );
+    {
+        let host = runtime.host.lock().unwrap();
+        let disk = &host.snapshot.per_job.disks[&disk_id];
+        if use_base && !fail_seed {
+            assert_eq!(disk.have, base_have);
+            assert!(host.snapshot.per_job.bases["base"].last_used_ms > 1);
+        } else {
+            assert!(disk.have.is_empty());
+            if use_base {
+                assert_eq!(host.snapshot.per_job.bases["base"].last_used_ms, 1);
+            }
+        }
+        assert!(disk.forked_from.is_none());
+        assert!(!disk.quarantined);
+        assert!(host.snapshot.leases[JOB].delivered);
+    }
+    assert_ne!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn fork_errors_and_unknown_operation_without_a_base_leave_empty_have_and_job_runs() {
+    for error in ["clone failed", "unknown variant `fork_workspace`"] {
+        assert_fork_fallback(error, false, false).await;
+    }
+}
+
+#[tokio::test]
+async fn fork_refused_then_base_seed_succeeds_records_base_have_and_last_used() {
+    for error in ["clone failed", "unknown variant `fork_workspace`"] {
+        assert_fork_fallback(error, true, false).await;
+    }
+}
+
+#[tokio::test]
+async fn fork_and_base_seed_errors_leave_empty_have_without_quarantine_and_job_runs() {
+    for error in ["clone failed", "unknown variant `fork_workspace`"] {
+        assert_fork_fallback(error, true, true).await;
     }
 }
 

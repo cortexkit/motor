@@ -1284,7 +1284,6 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
         .lock()
         .expect("host lock")
         .job_fork_plan(job, root);
-    let mut fork_failed = false;
     match fork_plan {
         Ok(Some(plan)) => {
             let started = std::time::Instant::now();
@@ -1320,14 +1319,12 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                         candidate_count = plan.request.donor_ids.len(),
                         size_rule = "size rule applied by the helper", clone_elapsed_ms = elapsed_ms,
                         committed = false, %error, "workspace_fork_failed; falling back to base or empty");
-                    fork_failed = true;
                 }
             }
         }
         Ok(None) => {}
         Err(error) => {
             tracing::info!(jti = %job, %error, "workspace_fork_plan_failed; falling back to base or empty");
-            fork_failed = true;
         }
     }
     let started = std::time::Instant::now();
@@ -1341,13 +1338,11 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
             return Ok(None);
         };
         runtime.control.seed_workspace(&plan.request)?;
-        if !fork_failed {
-            runtime
-                .host
-                .lock()
-                .expect("host lock")
-                .job_seeded(job, &plan, unix_ms())?;
-        }
+        runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .job_seeded(job, &plan, unix_ms())?;
         Ok(Some(plan.request.base_id.clone()))
     })();
     match seeded {
