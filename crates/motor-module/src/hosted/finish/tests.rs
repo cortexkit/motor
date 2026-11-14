@@ -43,6 +43,55 @@ fn boat_finish_outcomes_and_runtime_are_clamped() {
 }
 
 #[tokio::test]
+async fn unknown_release_settles_unused_booking_before_returning() {
+    std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+    let http = Http::new(|path, _| {
+        assert!(path.ends_with("/release"));
+        (404, serde_json::json!({"error":"job_unknown"}))
+    })
+    .await;
+    let scratch = ScratchDir::new("unknown-release");
+    let storage = Storage::open(&scratch.join("state")).unwrap();
+    let config = Config {
+        runner_instance: "test".into(),
+        broker_token_source: BrokerTokenSource::Fake,
+        broker_url: Some(http.url.clone()),
+        ..Config::default()
+    };
+    for run_sent in [false, true] {
+        let id = Uuid::now_v7();
+        let mut route = HostedJobState::new(&config);
+        route.run_sent = run_sent;
+        route.billing = crate::hosted::BillingStatus::Pending;
+        storage.hosted_route(id, route.clone()).unwrap();
+        assert_eq!(
+            Client::new(route).release_unused(id, &storage).await,
+            Err(Error::NotGranted)
+        );
+        let job = storage.job(id).unwrap();
+        let hosted = job.hosted.unwrap();
+        assert_eq!(hosted.finish_done, !run_sent);
+        if run_sent {
+            assert_eq!(hosted.billing, crate::hosted::BillingStatus::Pending);
+            assert!(hosted.terminal.is_none());
+            assert!(job.local_terminal.is_none());
+        } else {
+            assert_eq!(hosted.billing, crate::hosted::BillingStatus::Unavailable);
+            let terminal = hosted.terminal.unwrap();
+            assert_eq!(
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: motor_protocol::RefusalReason::LostToRestart,
+                }
+            );
+            assert_eq!(terminal.ran, Some(motor_protocol::Ran::None));
+            assert_eq!(job.local_terminal.as_ref(), Some(&terminal));
+        }
+    }
+    assert_eq!(http.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn boat_finish_nonretry_statuses_and_restart_resume() {
     std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
     let status = Arc::new(AtomicU16::new(503));

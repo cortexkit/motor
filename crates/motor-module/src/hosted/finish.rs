@@ -43,6 +43,12 @@ impl Client {
                     s.finish_done = true;
                 })
                 .map_err(|_| Error::Broker)?;
+        } else if retire_unstarted && matches!(result, Err(Error::NotGranted)) {
+            // A missing booking has nothing left to release. Recheck the Run
+            // journal before retiring it, just as an attach observation does.
+            storage
+                .confirm_hosted_ended_before_run(id)
+                .map_err(|_| Error::Broker)?;
         }
         result
     }

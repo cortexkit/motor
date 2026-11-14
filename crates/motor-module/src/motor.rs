@@ -2271,13 +2271,39 @@ impl Motor {
                 },
                 |d| d.saturating_mul(1000),
             );
-            let opened = self.hosted_client(state).attach(id, &self.storage).await;
-            if matches!(opened, Err(crate::hosted::Error::Released)) {
-                // Release can reach the broker before its HTTP reply reaches
-                // cleanup. The durable Run flag already proves nothing ran.
-                self.storage
-                    .confirm_hosted_release_before_run(id)
-                    .map_err(|_| crate::hosted::Error::Broker)?;
+            let mut opened = self.hosted_client(state).attach(id, &self.storage).await;
+            if matches!(
+                opened,
+                Err(crate::hosted::Error::Released | crate::hosted::Error::ReattachUnknown)
+            ) {
+                let confirmed = {
+                    // A live placement owner can still send Run. Serialize its
+                    // ownership check and durable confirmation with the gate
+                    // held when Run is journaled, before its frame is sent.
+                    let _booking_open = self.hosted_cleanup.booking_open.lock().unwrap();
+                    let submissions = self.submissions.lock().unwrap();
+                    if submissions.contains_key(&id)
+                        && self.hosted_state(id).is_some_and(|state| !state.run_sent)
+                    {
+                        // Released must not reach terminal synthesis while the
+                        // submission can still obtain a lease and send Run.
+                        return match opened {
+                            Err(crate::hosted::Error::Released) => {
+                                Err(crate::hosted::Error::Provisioning(1_000))
+                            }
+                            other => other,
+                        };
+                    }
+                    self.storage
+                        .confirm_hosted_ended_before_run(id)
+                        .map_err(|_| crate::hosted::Error::Broker)?
+                };
+                if confirmed {
+                    // The broker can end or forget a booking before cleanup
+                    // gets its reply. With no submission owner and no Run in
+                    // the journal, status and attach can use the retained terminal.
+                    opened = Err(crate::hosted::Error::Released);
+                }
             }
             let cause = match &opened {
                 Err(crate::hosted::Error::Finished) => Some(
@@ -2287,8 +2313,8 @@ impl Motor {
                     if now >= deadline => Some(
                         "host refused reattach with auth past the job's deadline; no result reached ck-motor",
                     ),
-                // Provisioning may return job_unknown before any lease is granted.
-                // Only the original deadline makes a missing broker record final.
+                // After Run, job_unknown cannot prove how the command ended.
+                // Keep the original deadline for retiring that unknown outcome.
                 Err(crate::hosted::Error::ReattachUnknown)
                     if now >= deadline => Some(
                         "broker no longer knows the job past its deadline; no result reached ck-motor",
