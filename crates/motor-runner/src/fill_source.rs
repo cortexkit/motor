@@ -443,10 +443,19 @@ pub(crate) async fn completion(
 ) -> io::Result<serde_json::Value> {
     loop {
         if let Some(terminal) = runner.job_status(id)?.terminal {
-            if !matches!(terminal.outcome, motor_protocol::Outcome::Exit { code: 0 }) {
+            if !matches!(terminal.outcome, motor_protocol::Outcome::Exit { code: 0 })
+                || terminal.killed.is_some()
+            {
+                let mut cause = format!("{:?}", terminal.outcome);
+                if let Some(killed) = terminal.killed {
+                    cause.push_str(&format!("; killed={killed:?}"));
+                }
+                if let Some(detail) = terminal.refusal_detail {
+                    cause.push_str(&format!("; {detail}"));
+                }
                 return Err(invalid(format!(
-                    "fill command failed ({:?}): {}",
-                    terminal.outcome,
+                    "fill command failed ({}): {}",
+                    runner.redact_fill_output(id, cause),
                     output_tail(runner, id)
                 )));
             }
@@ -490,18 +499,29 @@ pub(crate) async fn completion(
 /// disappears, so the host's refusal must retain more than the progress tail.
 #[cfg(target_os = "linux")]
 fn output_tail(runner: &Runner, id: motor_protocol::Uuid) -> String {
-    let Ok(frames) = runner.replay(id, 0) else {
-        return "output unavailable".into();
-    };
-    let bytes: Vec<u8> = frames
-        .into_iter()
-        .filter_map(|frame| match frame {
-            Frame::Output(output) => Some(output.bytes.0),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    output_summary(&bytes)
+    let mut bytes = Vec::new();
+    let mut from = 0;
+    loop {
+        let Ok(frames) = runner.replay(id, from) else {
+            return "output unavailable".into();
+        };
+        let previous = from;
+        for frame in frames {
+            if let Frame::Output(output) = frame {
+                from = output.seq + 1;
+                bytes.extend(output.bytes.0);
+            }
+        }
+        // Replay is paginated even after a job has finished. Walk every page
+        // so a long build's first progress page cannot stand in for its tail.
+        if from == previous {
+            break;
+        }
+    }
+    // Redact before selecting a suffix: truncating first could retain only a
+    // fragment of a secret instead of its complete environment value.
+    let redacted = runner.redact_fill_output(id, String::from_utf8_lossy(&bytes));
+    output_summary(redacted.as_bytes())
 }
 
 #[cfg(target_os = "linux")]

@@ -8,6 +8,7 @@ use motor_protocol::{FillSource, Frame, FILL_SOURCE_EXPORT_TIMEOUT_S, FILL_SOURC
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -48,6 +49,19 @@ pub fn directory(journal: &Path, generation: &str) -> PathBuf {
     journal.join("fill-sources").join(generation)
 }
 
+fn validate_dependency_declarations(source: &FillSource) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for dependency in &source.git_dependencies {
+        ensure!(
+            dependency.commits.len() == 1 && seen.insert((&dependency.url, &dependency.commits[0])),
+            "git dependency bundle must declare one unique commit: URL {} commits {:?}",
+            dependency.url,
+            dependency.commits
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn remove_unreferenced(
     journal: &Path,
     slots: &crate::state::Table<Slot>,
@@ -85,6 +99,7 @@ pub struct Incoming {
 impl Incoming {
     pub fn new(path: PathBuf, source: FillSource) -> Result<Self> {
         source.validate(FILL_SOURCE_MAX_BYTES)?;
+        validate_dependency_declarations(&source)?;
         fs::create_dir_all(path.parent().context("source parent")?)?;
         fs::create_dir(&path)?;
         let mut result = Self {
@@ -423,6 +438,17 @@ impl Read for Deadline<'_> {
 impl Host {
     pub(crate) fn clean_fill_sources(&mut self) -> Result<()> {
         let mut next = self.snapshot.clone();
+        // Older exporters wrote a bundle for every package, even when packages
+        // shared a locked Git source. Retire those generations rather than
+        // rewriting bundle indices or relaxing the guest's import validation.
+        next.per_job.fill_sources.retain(|_, slot| {
+            if let Err(error) = validate_dependency_declarations(&slot.source) {
+                tracing::warn!(generation = slot.generation, %error, "fill_source_invalidated");
+                false
+            } else {
+                true
+            }
+        });
         next.per_job
             .export_tips
             .retain(|job, _| next.per_job.executions.get(job).is_some_and(|e| !e.ended));

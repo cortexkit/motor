@@ -3390,6 +3390,37 @@ impl Runner {
         text: impl std::fmt::Display,
         environment_values: impl IntoIterator<Item = String>,
     ) -> String {
+        let mut detail = self.redact_refusal_detail(text, environment_values);
+        if detail.starts_with("git fetch ") {
+            return workspace::bounded_fetch_detail(&detail, REFUSAL_DETAIL_MAX_BYTES);
+        }
+        let mut end = detail.len().min(REFUSAL_DETAIL_MAX_BYTES);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+        detail
+    }
+
+    pub(crate) fn redact_fill_output(&self, id: Uuid, text: impl std::fmt::Display) -> String {
+        let values = self
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .and_then(|job| job.request.as_ref())
+            .map(|request| request.env.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        self.redact_refusal_detail(text, values)
+    }
+
+    fn redact_refusal_detail(
+        &self,
+        text: impl std::fmt::Display,
+        environment_values: impl IntoIterator<Item = String>,
+    ) -> String {
         let mut detail = text.to_string();
         for root in &self.core.config.caller_roots {
             detail = detail.replace(
@@ -3422,14 +3453,6 @@ impl Runner {
                 detail = detail.replace(&path, "runner state");
             }
         }
-        if detail.starts_with("git fetch ") {
-            return workspace::bounded_fetch_detail(&detail, REFUSAL_DETAIL_MAX_BYTES);
-        }
-        let mut end = detail.len().min(REFUSAL_DETAIL_MAX_BYTES);
-        while !detail.is_char_boundary(end) {
-            end -= 1;
-        }
-        detail.truncate(end);
         detail
     }
     pub fn tree_hash(&self, path: &Path) -> io::Result<String> {

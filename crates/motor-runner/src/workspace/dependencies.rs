@@ -32,9 +32,10 @@ pub(crate) fn validate_dependencies(dependencies: &[GitDependency]) -> io::Resul
                 || bundle.repository != d.url
                 || !bundled.insert((&d.url, &d.commits[0]))
             {
-                return Err(invalid(
-                    "git dependency bundle must declare one unique commit",
-                ));
+                return Err(invalid(format!(
+                    "git dependency bundle must declare one unique commit: URL {} commits {:?}, bundle repository {}",
+                    d.url, d.commits, bundle.repository
+                )));
             }
         }
     }
@@ -559,9 +560,14 @@ fn locked_sources(lockfile: &str) -> io::Result<Vec<(String, String, Option<Stri
 }
 
 pub(crate) fn locked_dependencies(lockfile: &str) -> io::Result<Vec<GitDependency>> {
+    // Cargo records a source on every package, but a bundle transports a
+    // repository commit, shared by all packages locked to that source.
     Ok(locked_sources(lockfile)?
         .into_iter()
-        .map(|(url, commit, _)| GitDependency {
+        .map(|(url, commit, _)| (url, commit))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|(url, commit)| GitDependency {
             url,
             commits: vec![commit],
             bundle: None,
@@ -741,10 +747,19 @@ mod validation_tests {
         alias.bundle.as_mut().unwrap().repository = alias.url.clone();
         alias.bundle.as_mut().unwrap().index = 2;
         validate_dependencies(&[dependency.clone(), alias]).unwrap();
-        assert!(validate_dependencies(&[dependency.clone(), dependency.clone()]).is_err());
+        let error = validate_dependencies(&[dependency.clone(), dependency.clone()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&dependency.url), "{error}");
+        assert!(error.contains(&dependency.commits[0]), "{error}");
         let mut multiple = dependency.clone();
         multiple.commits.push("c".repeat(40));
-        assert!(validate_dependencies(&[multiple]).is_err());
+        let error = validate_dependencies(std::slice::from_ref(&multiple))
+            .unwrap_err()
+            .to_string();
+        for commit in &multiple.commits {
+            assert!(error.contains(commit), "{error}");
+        }
         let mut wrong_url = dependency;
         wrong_url
             .bundle
