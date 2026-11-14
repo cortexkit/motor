@@ -202,14 +202,29 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
             "live host lost its backpressured upload"
         );
     }
+    // The last heartbeats can still be crossing the host fixture's socket and
+    // the reporter task when the clock stops; keep yielding (without advancing
+    // time or releasing the upload) until they arrive, so a loaded machine
+    // cannot turn scheduling delay into a false "delayed until after upload".
     let mut waits = Vec::new();
-    while let Ok(Ok(record)) = caller.try_recv() {
-        if let StreamRecord::Progress(progress) = record {
-            if progress.phase() == &ProgressPhase::QueueWait {
-                waits.push(progress.waiting_on().cloned());
+    for _ in 0..10_000 {
+        while let Ok(Ok(record)) = caller.try_recv() {
+            if let StreamRecord::Progress(progress) = record {
+                if progress.phase() == &ProgressPhase::QueueWait {
+                    waits.push(progress.waiting_on().cloned());
+                }
             }
         }
+        if waits.len() >= 65 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::yield_now();
     }
+    assert!(
+        !uploading.is_finished(),
+        "progress must arrive while the upload is still held"
+    );
     assert_eq!(
         waits.len(),
         65,
