@@ -696,12 +696,14 @@ mod config_tests {
                 .contains(&format!("missing field `{field}`")));
         }
         value["per_job"]["permit_budget"] = json!(1);
-        value["per_job"]["unused_memory_hold_percent"] = json!(101);
-        write(&value);
-        assert!(check_config(&path)
-            .unwrap_err()
-            .to_string()
-            .contains("per_job.unused_memory_hold_percent"));
+        for percent in [json!(101), json!(256), json!(-1), json!(u64::MAX)] {
+            value["per_job"]["unused_memory_hold_percent"] = percent;
+            write(&value);
+            assert!(check_config(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("per_job.unused_memory_hold_percent"));
+        }
         value["per_job"]["unused_memory_hold_percent"] = json!(25);
         write(&value);
         check_config(&path).unwrap();
