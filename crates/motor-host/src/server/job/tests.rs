@@ -251,6 +251,7 @@ impl Control for Fake {
             let host = host.upgrade().unwrap();
             let _guard = host.try_lock().expect("resident helper holds no host lock");
         }
+        self.wait("job-memory");
         ensure!(
             self.balloon_supported.load(Ordering::Acquire),
             crate::helper::BalloonUnavailable

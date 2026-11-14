@@ -262,6 +262,13 @@ async fn main() -> Result<()> {
         std::thread::sleep(Duration::from_secs(600));
         refresher.refresh_keys(0);
     });
+    if config.mode == motor_host::config::HostMode::PerJob {
+        let sampler = runtime.clone();
+        std::thread::spawn(move || loop {
+            sampler.sample_job_residents(unix_ms());
+            std::thread::sleep(Duration::from_secs(1));
+        });
+    }
     let ticker = runtime.clone();
     std::thread::spawn(move || loop {
         if let Err(error) = ticker.tick(unix_ms()) {

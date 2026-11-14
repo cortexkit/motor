@@ -729,7 +729,6 @@ impl Runtime {
             now_ms,
         );
         tick_step(&mut failure, "fills", result);
-        self.sample_job_residents(now_ms);
         self.tick_balloon(now_ms);
         if let Some(error) = failure {
             return Err(error);
@@ -737,7 +736,9 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) fn sample_job_residents(&self, now_ms: u64) {
+    /// Runs one sampling pass. Helper reads may block behind VM startup, so
+    /// callers must run this off the host's maintenance tick.
+    pub fn sample_job_residents(&self, now_ms: u64) {
         let due = self
             .host
             .lock()
