@@ -180,6 +180,7 @@ pub(crate) struct Snapshots {
     pub siblings: Vec<Snapshot>,
     pub spool: Spool,
     pub git_dependencies: BTreeMap<String, Vec<String>>,
+    tip_only_dependencies: BTreeSet<(String, String)>,
 }
 #[derive(Debug)]
 pub(crate) struct Failure {
@@ -939,6 +940,37 @@ impl Snapshots {
                 git_dependencies.entry(url).or_default().extend(commits);
             }
         }
+        let mut tip_only_dependencies = BTreeSet::new();
+        if let Some(tip) = &main.tip {
+            match lockfile_sources(&main.path, tip) {
+                Ok(sources) => {
+                    for (url, commits) in sources {
+                        // Have rejects unsupported URLs before bundle selection;
+                        // an optional tip source must not reject the whole job.
+                        if url.chars().any(char::is_control)
+                            || !reqwest::Url::parse(&url).is_ok_and(|u| {
+                                matches!(u.scheme(), "https" | "http" | "ssh" | "git")
+                                    && u.host_str().is_some_and(|host| !host.is_empty())
+                                    && u.password().is_none()
+                            })
+                        {
+                            tracing::debug!("skipping unsupported tip-only git dependency URL");
+                            continue;
+                        }
+                        let required = git_dependencies.entry(url.clone()).or_default();
+                        for commit in commits {
+                            if !required.contains(&commit) {
+                                tip_only_dependencies.insert((url.clone(), commit.clone()));
+                                required.push(commit);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%tip, %error, "skipping optional tip git dependencies");
+                }
+            }
+        }
         for commits in git_dependencies.values_mut() {
             commits.sort();
             commits.dedup();
@@ -948,6 +980,7 @@ impl Snapshots {
             siblings: snapshots,
             spool,
             git_dependencies,
+            tip_only_dependencies,
         })
     }
     pub fn commits(&self) -> BTreeMap<String, String> {
@@ -1146,6 +1179,7 @@ impl Snapshots {
         let mut upload = workspace.clone();
         let dependencies = dependency_bundles(
             &self.git_dependencies,
+            &self.tip_only_dependencies,
             dependency_capability,
             &cargo_home()?,
             &self.spool.0,
@@ -1302,6 +1336,7 @@ pub(crate) fn cached_commit(home: &Path, url: &str, commit: &str) -> Option<Path
 
 pub(crate) fn dependency_bundles(
     sources: &BTreeMap<String, Vec<String>>,
+    tip_only: &BTreeSet<(String, String)>,
     capability: Option<&[GitDependencyCandidates]>,
     home: &Path,
     spool: &Path,
@@ -1314,6 +1349,7 @@ pub(crate) fn dependency_bundles(
     let mut declarations = Vec::new();
     for (url, commits) in sources {
         for commit in commits {
+            let optional = tip_only.contains(&(url.clone(), commit.clone()));
             let mut dependency = GitDependency {
                 url: url.clone(),
                 commits: vec![commit.clone()],
@@ -1330,58 +1366,81 @@ pub(crate) fn dependency_bundles(
                 .any(|h| h.url == *url && h.commits.contains(commit))
             {
                 if let Some(cache) = cache {
-                    let index = upload.len() as u32;
-                    let temporary = spool.join(format!("dependency-{index}.git"));
-                    fs::create_dir(&temporary)?;
-                    git(
-                        &temporary,
-                        &[
-                            "init",
-                            "--bare",
-                            if commit.len() == 64 {
-                                "--object-format=sha256"
-                            } else {
-                                "--object-format=sha1"
-                            },
-                        ],
-                    )?;
-                    let reference = format!("refs/ck-motor/dep/{commit}");
-                    // Fetch into our own repository; even refs and gc metadata in
-                    // Cargo's cache must remain untouched.
-                    output(
-                        command(&temporary)
-                            .args([
-                                "-c",
-                                "gc.auto=0",
-                                "fetch",
-                                "--no-auto-maintenance",
-                                "--no-tags",
-                            ])
-                            .arg(&cache)
-                            .arg(format!("{commit}:{reference}")),
-                    )?;
-                    let bundle_path = spool.join(format!("bundle-{index}"));
-                    output(
-                        command(&temporary)
-                            .args(["bundle", "create"])
-                            .arg(&bundle_path)
-                            .arg(&reference),
-                    )?;
-                    let bytes = fs::read(&bundle_path)?;
-                    let manifest = BundleManifest {
-                        index,
-                        repository: url.clone(),
-                        length: bytes.len() as u64,
-                        sha256: format!("{:x}", Sha256::digest(&bytes)),
-                    };
-                    dependency.bundle = Some(manifest.clone());
-                    upload.push(manifest);
+                    match dependency_bundle(&cache, url, commit, spool, upload.len() as u32) {
+                        Ok(manifest) => {
+                            dependency.bundle = Some(manifest.clone());
+                            upload.push(manifest);
+                        }
+                        Err(error) if optional => {
+                            tracing::debug!(job_id = %id, url, commit, %error, "skipping unavailable tip-only git dependency");
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else if optional {
+                    tracing::debug!(job_id = %id, url, commit, "skipping uncached tip-only git dependency");
+                    continue;
                 }
             }
             declarations.push(dependency);
         }
     }
     Ok(declarations)
+}
+
+fn dependency_bundle(
+    cache: &Path,
+    url: &str,
+    commit: &str,
+    spool: &Path,
+    index: u32,
+) -> io::Result<BundleManifest> {
+    // A failed optional bundle must not leave a directory or lock at the next
+    // upload index, which a required dependency may need to reuse.
+    let temporary = spool.join(format!("dependency-{}.git", Uuid::now_v7().as_u128()));
+    fs::create_dir(&temporary)?;
+    git(
+        &temporary,
+        &[
+            "init",
+            "--bare",
+            if commit.len() == 64 {
+                "--object-format=sha256"
+            } else {
+                "--object-format=sha1"
+            },
+        ],
+    )?;
+    let reference = format!("refs/ck-motor/dep/{commit}");
+    // Fetch into our own repository; even refs and gc metadata in Cargo's
+    // cache must remain untouched.
+    output(
+        command(&temporary)
+            .args([
+                "-c",
+                "gc.auto=0",
+                "fetch",
+                "--no-auto-maintenance",
+                "--no-tags",
+            ])
+            .arg(cache)
+            .arg(format!("{commit}:{reference}")),
+    )?;
+    let bundle_path = temporary.join("bundle");
+    output(
+        command(&temporary)
+            .args(["bundle", "create"])
+            .arg(&bundle_path)
+            .arg(&reference),
+    )?;
+    let bytes = fs::read(&bundle_path)?;
+    fs::rename(&bundle_path, spool.join(format!("bundle-{index}")))?;
+    Ok(BundleManifest {
+        index,
+        repository: url.into(),
+        length: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    })
 }
 
 pub(crate) fn submodule_warning(cache: &Path, url: &str, commit: &str) -> Option<String> {
@@ -1929,6 +1988,62 @@ mod tests {
     }
 
     #[test]
+    fn failed_tip_only_bundle_does_not_block_required_bundle() {
+        let (scratch, dependency, spool, commit) = repository();
+        let home = scratch.join("cargo-home");
+        let broken = home.join("git/db/broken-test");
+        fs::create_dir_all(&broken).unwrap();
+        git(&broken, &["init", "--bare", "-q"]).unwrap();
+        // A cached commit object alone is insufficient: its tree/history may
+        // have been lost. An optional transfer failure must not poison index 0.
+        let object = Path::new(&commit[..2]).join(&commit[2..]);
+        fs::create_dir_all(broken.join("objects").join(&commit[..2])).unwrap();
+        fs::copy(
+            dependency.join(".git/objects").join(&object),
+            broken.join("objects").join(&object),
+        )
+        .unwrap();
+        let good = home.join("git/db/good-test");
+        git(&dependency, &["clone", "--bare", ".", text(&good).unwrap()]).unwrap();
+        let optional = "https://example.invalid/broken.git".to_owned();
+        let required = "https://example.invalid/good.git".to_owned();
+        let sources = BTreeMap::from([
+            (optional.clone(), vec![commit.clone()]),
+            (required.clone(), vec![commit.clone()]),
+        ]);
+        let tip_only = BTreeSet::from([(optional, commit.clone())]);
+        let mut upload = Vec::new();
+        let declarations = dependency_bundles(
+            &sources,
+            &tip_only,
+            Some(&[]),
+            &home,
+            &spool,
+            &mut upload,
+            Uuid::now_v7(),
+        )
+        .unwrap();
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].url, required);
+        assert_eq!(declarations[0].commits, vec![commit.clone()]);
+        assert_eq!(upload.len(), 1);
+        assert_eq!(declarations[0].bundle.as_ref(), Some(&upload[0]));
+        assert_eq!(upload[0].index, 0);
+        assert_eq!(
+            git(
+                &dependency,
+                &[
+                    "bundle",
+                    "list-heads",
+                    text(&spool.join("bundle-0")).unwrap()
+                ]
+            )
+            .unwrap(),
+            format!("{commit} refs/ck-motor/dep/{commit}")
+        );
+    }
+
+    #[test]
     fn sibling_lockfile_git_dependency_arrives_as_bundle() {
         const CHILD: &str = "MOTOR_TEST_SIBLING_DEPENDENCY_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2054,6 +2169,7 @@ mod tests {
         let mut upload = Vec::new();
         let declarations = dependency_bundles(
             &snapshots.git_dependencies,
+            &snapshots.tip_only_dependencies,
             Some(&[]),
             &home,
             &snapshots.spool.0,
@@ -2135,7 +2251,17 @@ mod tests {
         assert_eq!(upload.len(), 2);
 
         let spool = &snapshots.spool.0;
-        fs::write(spool.join("dependency-1.git/stale"), "old repository").unwrap();
+        let dependency_repository = fs::read_dir(spool)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("dependency-") && name.ends_with(".git"))
+            })
+            .unwrap();
+        fs::write(dependency_repository.join("stale"), "old repository").unwrap();
         fs::write(spool.join("bundle-1.lock"), "abandoned lock").unwrap();
         fs::write(spool.join("bundle-99"), "old bundle").unwrap();
         fs::create_dir(spool.join("dependency-99.git")).unwrap();
@@ -2160,8 +2286,8 @@ mod tests {
             assert_eq!(manifest.length, bytes.len() as u64);
             assert_eq!(manifest.sha256, format!("{:x}", Sha256::digest(&bytes)));
         }
+        assert!(!dependency_repository.exists(), "old dependency repository");
         for stale in [
-            "dependency-1.git/stale",
             "bundle-1.lock",
             "bundle-99",
             "dependency-99.git",
