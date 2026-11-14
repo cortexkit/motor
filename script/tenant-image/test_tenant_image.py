@@ -216,7 +216,9 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(pins["pnpm"], "11.1.2")
         self.assertIn("python3", pins["packages"])
         self.assertIn("systemd-sysv", pins["packages"])
-        self.assertEqual(pins["rust_default"], "1.99.0")
+        self.assertEqual(pins["rust_default"], "1.100.0")
+        self.assertIn("1.96.0", pins["rust_toolchains"])
+        self.assertIn("1.99.0", pins["rust_toolchains"])
         manifest = json.loads((image.REPO / "script/runner/toolchain.json").read_text())
         self.assertEqual(pins["rust_toolchains"]["1.100.0"],
                          manifest["rust_toolchains"]["1.100.0-x86_64-unknown-linux-gnu"]["targets"])
@@ -794,8 +796,11 @@ class ImageTests(unittest.TestCase):
     def test_capture_resolves_stable_alias_to_release_and_captures_all_targets(self):
         def output(*args):
             if args[:2] == ("rustup", "toolchain"):
-                return "stable-x86_64-unknown-linux-gnu\n1.99.0-x86_64-unknown-linux-gnu (default)"
+                return ("stable-x86_64-unknown-linux-gnu\n1.99.0-x86_64-unknown-linux-gnu\n"
+                        "1.100.0-x86_64-unknown-linux-gnu (default)")
             if args[0] == "rustc":
+                if args[1] in ("--version", "+1.100.0-x86_64-unknown-linux-gnu"):
+                    return "rustc 1.100.0 (test 2026-11-09)"
                 return "rustc 1.99.0 (test 2026-09-28)"
             if args[:2] == ("rustup", "target"):
                 return "x86_64-unknown-linux-gnu\nwasm32-wasip1"
@@ -803,8 +808,11 @@ class ImageTests(unittest.TestCase):
 
         with mock.patch.object(capture, "output", side_effect=output):
             pins = capture.capture()
-        self.assertEqual(pins["rust_toolchains"], {"1.99.0": ["wasm32-wasip1", "x86_64-unknown-linux-gnu"]})
-        self.assertEqual(pins["rust_default"], "1.99.0")
+        self.assertEqual(pins["rust_toolchains"], {
+            "1.99.0": ["wasm32-wasip1", "x86_64-unknown-linux-gnu"],
+            "1.100.0": ["wasm32-wasip1", "x86_64-unknown-linux-gnu"],
+        })
+        self.assertEqual(pins["rust_default"], "1.100.0")
         self.assertEqual(pins["node"], "24.21.0")
 
     def test_download_rejects_wrong_bytes(self):

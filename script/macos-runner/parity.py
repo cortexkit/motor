@@ -154,9 +154,12 @@ def validate(manifest, server):
     for name, row in chains.items():
         if not sha256(row.get("sha256")) or not row.get("rustc_verbose", "").startswith(row["rustc"] + "\n"):
             raise ValueError("missing measured Rust toolchain pin: " + name)
-    default = server["rust_default"].removesuffix("-x86_64-unknown-linux-gnu") + "-" + HOST
-    if manifest.get("rust_default") != default:
-        raise ValueError("macOS Rust default differs from build-server")
+    # The sealed macOS image may keep an older default after Linux promotes one.
+    # It must still select a toolchain shared with the build server.
+    server_chains = {name.removesuffix("-x86_64-unknown-linux-gnu") + "-" + HOST
+                     for name in server["rust_toolchains"]}
+    if manifest.get("rust_default") not in server_chains & expected.keys():
+        raise ValueError("macOS Rust default is not a shared installed toolchain")
     stable = expected["stable-" + HOST]
     numbered = stable["rustc"].split()[1] + "-" + HOST
     if manifest.get("stable_copy_from") != numbered or expected.get(numbered, {}).get("rustc") != stable["rustc"]:

@@ -197,6 +197,10 @@ See [job-isolation.md](job-isolation.md#2-accounts).
 
 ## 3. Install the tools jobs use
 
+Linux jobs default to Rust 1.100.0. Rust 1.99.0 and 1.96.0 remain installed for
+repositories that pin them through `rust-toolchain.toml`. macOS jobs remain on
+Rust 1.99.0 until the next image rebuild.
+
 Jobs run offline and see the shared Cargo home's `bin` read-only, so every
 tool a repository needs must be installed beforehand:
 
