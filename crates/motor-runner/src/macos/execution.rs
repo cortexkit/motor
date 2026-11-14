@@ -137,6 +137,7 @@ fn prepare(
         std::thread::park_timeout(Duration::from_millis(10));
     }
     target_in(&staged)?;
+    log_staged_target(setup.id, &staged.workspace.join("target"));
     entry.check()?;
     let selected = super::source_seal::plan(
         staged.source_files.clone(),
@@ -347,6 +348,25 @@ pub(super) fn target_in(staged: &Staged) -> io::Result<()> {
     workspace.remove_job("target".as_ref())?;
     workspace.child("target".as_ref(), true)?;
     Ok(())
+}
+
+fn log_staged_target(job_id: Uuid, target: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            let kind = if metadata.is_symlink() {
+                "symlink"
+            } else if metadata.is_dir() {
+                "directory"
+            } else {
+                "other"
+            };
+            tracing::info!(%job_id, target = ?target, path_type = kind, inode = metadata.ino(), device = metadata.dev(), "macOS staged target metadata");
+        }
+        Err(error) => {
+            tracing::warn!(%job_id, target = ?target, %error, "cannot inspect macOS staged target")
+        }
+    }
 }
 
 /// Puts a clone of the checkout's kept build disk in the job's clone directory,
@@ -748,6 +768,33 @@ fn run_output(
 }
 /// Bytes of the job's standard error kept to find the agent's last line.
 const STDERR_TAIL_BYTES: usize = 4096;
+const BUILD_DIAGNOSTIC_PREFIX: &[u8] = b"motor: build-volume diagnostic ";
+const BUILD_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
+
+/// Output frames may split a diagnostic anywhere. Retain only one bounded line
+/// and never copy ordinary job stderr into the runner log.
+#[derive(Default)]
+struct DiagnosticLines {
+    line: Vec<u8>,
+    overflow: bool,
+}
+impl DiagnosticLines {
+    fn push(&mut self, bytes: &[u8], mut report: impl FnMut(&str)) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                if !self.overflow && self.line.starts_with(BUILD_DIAGNOSTIC_PREFIX) {
+                    report(&String::from_utf8_lossy(&self.line));
+                }
+                self.line.clear();
+                self.overflow = false;
+            } else if self.line.len() < BUILD_DIAGNOSTIC_MAX_BYTES {
+                self.line.push(byte);
+            } else {
+                self.overflow = true;
+            }
+        }
+    }
+}
 /// The agent's reason for closing without Exit or Signal: its last stderr
 /// line, which starts with `motor: `. A session that ended for another reason
 /// has none.
@@ -762,6 +809,8 @@ fn forward_output(
     stderr: &SyncSender<Vec<u8>>,
     tail: &mut Vec<u8>,
 ) -> io::Result<ExecutionOutcome> {
+    let job_id = transport.entry.owned.lock().unwrap().record.id;
+    let mut diagnostics = DiagnosticLines::default();
     loop {
         match transport
             .receive()
@@ -769,6 +818,9 @@ fn forward_output(
         {
             Frame::Output { stream, bytes } => {
                 if stream == Stream::Stderr {
+                    diagnostics.push(&bytes, |diagnostic| {
+                        tracing::info!(%job_id, %diagnostic, "macOS agent build-volume metadata");
+                    });
                     tail.extend_from_slice(&bytes);
                     let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
                     tail.drain(..excess);

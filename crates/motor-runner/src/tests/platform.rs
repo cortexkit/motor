@@ -387,6 +387,134 @@ fn macos_request(f: &Fixture) -> Run {
     request.bundles[0].repository = request.repository_root.clone();
     request
 }
+
+#[cfg(unix)]
+#[test]
+fn macos_drain_survives_restart_with_typed_refusal_and_resume_clears_it() {
+    let f = Fixture::new();
+    let config = platform_config(&f, BackendKind::MacosVm);
+    let open =
+        || Runner::open_with_backend(config.clone(), Box::new(backend::HostBackend)).unwrap();
+    let runner = open();
+    runner
+        .try_begin_drain_request(Duration::from_secs(30), true)
+        .unwrap();
+    assert!(runner.drain_should_exit());
+    drop(runner);
+    let runner = open();
+    assert!(runner.is_draining());
+    assert!(
+        !runner.drain_should_exit(),
+        "a restored hold must remain available for resume"
+    );
+    assert_eq!(
+        runner
+            .runner_status()
+            .health
+            .unwrap()
+            .admission_blocked
+            .as_deref(),
+        Some("runner_draining")
+    );
+    let request = macos_request(&f);
+    let id = request.job_id;
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Refused(RefusalReason::RunnerDraining)
+    ));
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDraining
+        }
+    );
+    assert!(job.started_ms.is_none());
+    runner.try_resume().unwrap();
+    assert!(!runner.is_draining());
+    assert_eq!(
+        runner.runner_status().health.unwrap().admission_blocked,
+        None
+    );
+    drop(runner);
+    let runner = open();
+    assert!(!runner.is_draining());
+    assert!(matches!(
+        runner.accept(macos_request(&f)).unwrap(),
+        Admission::Accepted(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_failed_resume_keeps_admission_closed_and_qualification_has_priority() {
+    let f = Fixture::new();
+    let runner = platform_runner(&f, BackendKind::MacosVm);
+    runner
+        .try_begin_drain_request(Duration::from_secs(30), false)
+        .unwrap();
+    let marker = runner.config().state_root.join("macvm-drained");
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    assert!(runner.try_resume().is_err());
+    assert!(runner.is_draining());
+    assert!(matches!(
+        runner.accept(macos_request(&f)).unwrap(),
+        Admission::Refused(RefusalReason::RunnerDraining)
+    ));
+    fs::write(
+        runner.config().state_dir().join("qualification-required"),
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        runner
+            .runner_status()
+            .health
+            .unwrap()
+            .admission_blocked
+            .as_deref(),
+        Some("runner awaiting qualification")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_macos_drain_remains_transient_and_ignores_the_macos_marker() {
+    let f = Fixture::new();
+    let config = platform_config(&f, BackendKind::Host);
+    let open =
+        || Runner::open_with_backend(config.clone(), Box::new(backend::HostBackend)).unwrap();
+    let runner = open();
+    fs::write(config.state_root.join("macvm-drained"), "").unwrap();
+    runner
+        .try_begin_drain_request(Duration::from_secs(30), false)
+        .unwrap();
+    assert!(runner.is_draining());
+    assert_eq!(
+        runner.runner_status().health.unwrap().admission_blocked,
+        None
+    );
+    let (socket, server) = listener(&f, &runner);
+    let mut channel = connect(&socket).await;
+    write_frame_async(&mut channel, &Frame::Resume)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_next(&mut channel).await,
+        Frame::ResumeReply { resumed: true }
+    );
+    assert!(!runner.is_draining());
+    assert!(config.state_root.join("macvm-drained").exists());
+    server.abort();
+    let _ = server.await;
+    drop(channel);
+    runner.begin_drain(Duration::from_secs(30), false);
+    drop(runner);
+    assert!(!open().is_draining());
+}
 #[cfg(unix)]
 #[test]
 fn macos_capacity_roots_and_feature_refusals_are_backend_specific() {

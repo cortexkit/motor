@@ -592,7 +592,7 @@ mod execution {
         // runs no command: the caller gets the reason as one stderr line, which
         // the protocol only carries after Started, and the session then closes
         // without Exit, so the host publishes nothing.
-        let notice = match settings.build.as_mut().map(|volume| volume.attach()) {
+        let mut notice = match settings.build.as_mut().map(|volume| volume.attach()) {
             Some(Ok(notice)) => notice,
             Some(Err(error)) => {
                 eprintln!("motor-macagent: the build disk could not be mounted: {error}");
@@ -611,6 +611,13 @@ mod execution {
             }
             None => None,
         };
+        if let Some(diagnostic) = settings
+            .build
+            .as_ref()
+            .and_then(|volume| volume.diagnostics("after-attach"))
+        {
+            notice.get_or_insert_with(String::new).push_str(&diagnostic);
+        }
         let tmpdir = tempfile::Builder::new()
             .prefix("motor-job-")
             .tempdir_in(&settings.temporary_root)?;
@@ -737,8 +744,33 @@ mod execution {
         // volume is unmounted; without it the host publishes nothing. A failed
         // unmount still sends its reason as the last stderr line, then closes
         // the session without Exit.
+        if let Some(diagnostic) = settings
+            .build
+            .as_ref()
+            .and_then(|volume| volume.diagnostics("before-detach"))
+        {
+            // The command may leave stderr without a newline. Keep the
+            // metadata on its own line so the host can retain it reliably.
+            let diagnostic = format!("\n{diagnostic}");
+            stderr_append.write_all(diagnostic.as_bytes()).await?;
+            stderr_append.flush().await?;
+            output_tx
+                .send(Output::Chunk(Stream::Stderr, diagnostic.len()))
+                .map_err(|_| io::Error::other("output closed"))?;
+        }
         if let Some(Err(error)) = settings.build.as_mut().map(|volume| volume.detach()) {
             eprintln!("motor-macagent: the build disk could not be released: {error}");
+            if let Some(diagnostic) = settings
+                .build
+                .as_ref()
+                .and_then(|volume| volume.diagnostics("detach-failed"))
+            {
+                stderr_append.write_all(diagnostic.as_bytes()).await?;
+                stderr_append.flush().await?;
+                output_tx
+                    .send(Output::Chunk(Stream::Stderr, diagnostic.len()))
+                    .map_err(|_| io::Error::other("output closed"))?;
+            }
             let line = build_disk_failure("released", &error);
             stderr_append.write_all(line.as_bytes()).await?;
             stderr_append.flush().await?;
@@ -1182,6 +1214,18 @@ mod execution {
                 }
                 Ok(())
             }
+            fn diagnostics(&self, phase: &str) -> Option<String> {
+                let phase = match phase {
+                    "after-attach" => "after-attach",
+                    "before-detach" => "before-detach",
+                    "detach-failed" => "detach-failed",
+                    _ => panic!("unexpected diagnostic phase"),
+                };
+                self.events.lock().unwrap().push(phase);
+                Some(format!(
+                    "motor: build-volume diagnostic {phase}: metadata\n"
+                ))
+            }
         }
         async fn launch_with_volume(
             command: &str,
@@ -1234,10 +1278,13 @@ mod execution {
                 }
             };
             // Checked when the exit arrives, not after the agent ends.
-            assert_eq!(*events.lock().unwrap(), ["attach", "detach"]);
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["attach", "after-attach", "before-detach", "detach"]
+            );
             assert_eq!(terminal, Frame::Exit { code: 0 });
             assert_eq!(stdout, b"ran\n");
-            assert_eq!(stderr, b"motor: cold\n");
+            assert_eq!(stderr, b"motor: cold\nmotor: build-volume diagnostic after-attach: metadata\n\nmotor: build-volume diagnostic before-detach: metadata\n");
             (&mut fixture.agent.0).await.unwrap().unwrap();
         }
 
@@ -1266,7 +1313,7 @@ mod execution {
         #[tokio::test]
         async fn failed_build_volume_detach_says_why_and_reports_no_exit() {
             let (mut fixture, events) =
-                launch_with_volume("echo ran; echo job-err >&2", None, false, true).await;
+                launch_with_volume("echo ran; printf job-err >&2", None, false, true).await;
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             loop {
@@ -1285,12 +1332,21 @@ mod execution {
                 }
             }
             assert!((&mut fixture.agent.0).await.unwrap().is_err());
-            assert_eq!(*events.lock().unwrap(), ["attach", "detach"]);
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "attach",
+                    "after-attach",
+                    "before-detach",
+                    "detach",
+                    "detach-failed"
+                ]
+            );
             assert_eq!(stdout, b"ran\n");
             // The reason is the last line, after all of the command's output.
             assert_eq!(
                 String::from_utf8(stderr).unwrap(),
-                "job-err\nmotor: the build disk could not be released: volume busy\n"
+                "motor: build-volume diagnostic after-attach: metadata\njob-err\nmotor: build-volume diagnostic before-detach: metadata\nmotor: build-volume diagnostic detach-failed: metadata\nmotor: the build disk could not be released: volume busy\n"
             );
         }
 

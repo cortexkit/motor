@@ -392,6 +392,17 @@ as degraded status and a warning; direct runner admission can still use free slo
 Recovery ignores unrelated/temp record-directory entries, while valid ownership
 records with invalid resource paths still fail closed.
 
+`motor-runner drain --instance macos --state-root <path>` persists its admission
+hold as `macvm-drained` in the state root across runner restarts. Running jobs
+finish, but new jobs receive the existing typed never-started `runner_draining`
+refusal until `motor-runner resume --instance macos --state-root <path>` clears
+the hold. A launchd restart does not reopen admission. If the marker cannot be
+inspected at startup, admission stays closed and the runner logs why. The status
+reply's health field reports `admission_blocked: "runner_draining"` while closed.
+If operator qualification is also required, health reports
+`runner awaiting qualification` instead; resume does not clear that separate
+hold. A failed marker removal fails resume without reopening admission.
+
 The five job-level ignored `macos_qualification_*` integration tests run on the VM host
 against the **installed** Aqua-session LaunchAgent through `ck motor run --platform macos`,
 not a test-owned runner or an SSH command shell. Set
