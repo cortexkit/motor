@@ -137,7 +137,7 @@ impl Repairs {
         if self.0.contains_key(root.as_path()) {
             return false;
         }
-        let repair = repair(config, root);
+        let repair = repair(config, root, root.as_path() == workspace.as_path());
         let restored = repair == Repair::Restored;
         match &repair {
             Repair::Restored => {
@@ -256,7 +256,7 @@ fn checkout_root<'a>(
         .max_by_key(|root| root.as_path().as_os_str().len())
 }
 
-fn repair(config: &Config, root: crate::caller_path::HostPath<'_>) -> Repair {
+fn repair(config: &Config, root: crate::caller_path::HostPath<'_>, workspace: bool) -> Repair {
     // The runner owns a checkout by contract only beneath its owned
     // workspace roots, resolved; its writer storage lives there too, under
     // `.motor-base-` names, and caller paths must never reach it.
@@ -281,8 +281,17 @@ fn repair(config: &Config, root: crate::caller_path::HostPath<'_>) -> Repair {
     }
     #[cfg(target_os = "linux")]
     if config.isolate_jobs {
-        return outcome(crate::isolation::restore_workspace_access(root.as_path()));
+        return outcome(
+            (if workspace {
+                crate::source_seal::recovery::checkout(config, root.as_path())
+            } else {
+                Ok(())
+            })
+            .and_then(|()| crate::isolation::restore_workspace_access(root.as_path()))
+            .map_err(crate::source_seal::recovery::access_error),
+        );
     }
+    let _ = workspace;
     Repair::NotAttempted("this runner does not isolate jobs, so it holds no access repair")
 }
 

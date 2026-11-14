@@ -214,6 +214,12 @@ impl DiskLayout {
     }
 
     pub(super) fn clear_execution_history(&self) -> io::Result<()> {
+        let roots: Vec<_> = super::ROOTS
+            .iter()
+            .zip(&self.roots)
+            .map(|(guest, disk)| (Path::new(guest), disk.path()))
+            .collect();
+        crate::source_seal::recovery::stopped_disk(self.runner.path(), &roots)?;
         for path in self.execution_history() {
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -490,6 +496,90 @@ mod job_layout_tests {
         .unwrap();
         layout.clear_execution_history().unwrap();
         assert_eq!(fs::read(kept.join("page")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn job_vm_cleanup_retains_unrecoverable_seals_and_execution_history() {
+        let (scratch, root) = tenant_root("motor-job-history-seal-error");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let job = layout
+            .runner
+            .path()
+            .join("jobs")
+            .join(motor_protocol::Uuid::now_v7().to_string());
+        fs::create_dir_all(&job).unwrap();
+        fs::write(job.join("seal"), b"invalid seal record").unwrap();
+        fs::write(job.join("record.json"), b"previous execution").unwrap();
+        let marker = scratch.join("boot-marker");
+        let error = layout.initialize_job_history(&marker).unwrap_err();
+        assert!(
+            error.to_string().contains("leftover source seals"),
+            "{error}"
+        );
+        assert!(job.join("seal").exists());
+        assert!(job.join("record.json").exists());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    #[ignore = "requires root, file handles and CAP_LINUX_IMMUTABLE"]
+    fn isolated_next_job_boot_replays_seals_before_erasing_history() {
+        assert_eq!(uid(), 0);
+        let (scratch, root) = tenant_root("motor-job-history-seal-replay");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let workspace = root.join("roots/home/workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("source"), b"tracked source").unwrap();
+        fs::write(workspace.join("old-snapshot-only"), b"old tracked source").unwrap();
+        let id = motor_protocol::Uuid::now_v7();
+        let state = layout.runner.path();
+        let job = state.join("jobs").join(id.to_string());
+        fs::create_dir_all(&job).unwrap();
+        let plan = serde_json::from_value(serde_json::json!({
+            "unit": id, "workspace": workspace, "caller_workspace": "/home/workspace",
+            "files": ["c291cmNl", "b2xkLXNuYXBzaG90LW9ubHk="]
+        }))
+        .unwrap();
+        let seals = crate::source_seal::Runtime::default();
+        seals.seal(state, id, plan).unwrap();
+        // A real job sees this inode tree through the /home bind. Model the
+        // bind's spelling in the durable record without mounting over /home
+        // on the machine running the test.
+        let record_path = crate::source_seal::record_path(state, id);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["plan"]["workspace"] = "/home/workspace".into();
+        fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        drop(seals);
+        drop(layout);
+        let next = prepare_disk_layout(&root, uid()).unwrap();
+        let result = next.initialize_job_history(&scratch.join("next-boot-marker"));
+        // Clear flags even on assertion failure so the scratch tree is removable.
+        let mut leftovers = Vec::new();
+        for name in ["source", "old-snapshot-only"] {
+            use std::os::fd::AsRawFd;
+            let file = File::open(workspace.join(name)).unwrap();
+            let mut flags: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) },
+                0
+            );
+            if flags & 0x10 != 0 {
+                leftovers.push(name);
+            }
+            flags &= !0x10;
+            assert_eq!(
+                unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags) },
+                0
+            );
+        }
+        result.unwrap();
+        assert!(leftovers.is_empty(), "leftover seals on {leftovers:?}");
+        for name in ["source", "old-snapshot-only"] {
+            fs::write(workspace.join(name), b"writable again").unwrap();
+        }
+        assert!(!record_path.exists());
+        crate::isolation::restore_runner_access(&workspace).unwrap();
     }
 
     #[test]
