@@ -708,6 +708,21 @@ fn supplied_wsl_refusal(args: &RunArgs, wsl: &crate::wsl::Checks) -> Option<Stri
     )
 }
 
+// Names assigned after caller environment variables in motor-runner/src/isolation.rs.
+const RUNNER_OWNED_ENV: &[&str] = &[
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CARGO_NET_OFFLINE",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "PATH",
+];
+
 fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<RunRequest, String> {
     // Explicit CLI flags are intentional overrides, unlike an agent's full
     // environment. Refuse ignored overrides before reading or submitting sources.
@@ -715,6 +730,16 @@ fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<Run
         return Err(format!(
             "{name} is not forwarded to remote jobs; set it inside the command instead"
         ));
+    }
+    if let Some(name) = args
+        .env
+        .keys()
+        .find(|name| RUNNER_OWNED_ENV.contains(&name.as_str()))
+    {
+        if name == "CARGO_NET_OFFLINE" {
+            return Err("the runner sets CARGO_NET_OFFLINE=true in every Linux job so builds use locked, prefetched dependencies; on a --net job, set it inside the command (CARGO_NET_OFFLINE=false cargo …) or pass cargo --config net.offline=false".into());
+        }
+        return Err(format!("{name} is set by the runner"));
     }
     if let Some(message) = supplied_wsl_refusal(args, wsl) {
         return Err(message);
@@ -2986,10 +3011,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_owned_cargo_offline_is_refused_before_submission() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-cargo-offline-refusal");
+        let record_file = scratch.path().join("record.jsonl");
+        let input = vec![
+            "--net".into(),
+            "--env".into(),
+            "CARGO_NET_OFFLINE=false".into(),
+            "--cwd".into(),
+            scratch.path().join("missing").display().to_string(),
+            "--record-file".into(),
+            record_file.display().to_string(),
+            "--".into(),
+            "cargo".into(),
+            "build".into(),
+        ];
+        let Ok(Invocation::Run(args)) = parse_args(&input) else {
+            panic!("expected a run")
+        };
+        assert_eq!(
+            build_request(&args).unwrap_err(),
+            "the runner sets CARGO_NET_OFFLINE=true in every Linux job so builds use locked, prefetched dependencies; on a --net job, set it inside the command (CARGO_NET_OFFLINE=false cargo …) or pass cargo --config net.offline=false"
+        );
+        assert_eq!(
+            main_checked(&input, &crate::wsl::Checks::default()).await,
+            EXIT_REFUSED
+        );
+        assert!(!record_file.exists());
+    }
+
+    #[tokio::test]
     async fn refused_explicit_env_fails_before_request_or_upload() {
         let scratch = cortexkit_test_support::ScratchDir::new("cli-env-refusal");
         for name in [
+            "HOME",
+            "CARGO_HOME",
             "RUSTUP_HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "PATH",
             "RUSTUP_DIST_SERVER",
             "RUST_TOKEN",
             "CARGO_SECRET",
