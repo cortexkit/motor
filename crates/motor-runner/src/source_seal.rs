@@ -19,6 +19,7 @@ use std::{
 
 pub(crate) mod authority;
 mod probe;
+pub(crate) mod recovery;
 pub(crate) mod refresh;
 pub(crate) use probe::startup;
 
@@ -1010,6 +1011,18 @@ fn unseal_locked(
     authority: Option<&authority::Authority>,
     owners: Owners,
 ) -> io::Result<()> {
+    unseal_locked_at(directory, id, authority, owners, |workspace| {
+        Ok(workspace.to_owned())
+    })
+}
+
+fn unseal_locked_at(
+    directory: &JobDirectory,
+    id: Uuid,
+    authority: Option<&authority::Authority>,
+    owners: Owners,
+    workspace: impl FnOnce(&Path) -> io::Result<PathBuf>,
+) -> io::Result<()> {
     let started = std::time::Instant::now();
     let mut record_file = match directory.file(c"seal", libc::O_RDONLY) {
         Ok(file) => file,
@@ -1036,7 +1049,7 @@ fn unseal_locked(
     let mount = step(
         &record.plan.workspace,
         "pin unseal mount",
-        open_mount(&record.plan.workspace),
+        open_mount(&workspace(&record.plan.workspace)?),
     )?;
     if record.filesystem.as_ref() != Some(&Filesystem::read(&mount)?) {
         return Err(io::Error::other(

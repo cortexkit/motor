@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::{Backend, HostBackend};
 
 #[test]
 fn writer_job_reports_source_protection_was_not_applied() {
@@ -172,6 +173,93 @@ fn copy_tree(from: &Path, to: &Path) {
             fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+fn crashed_seal_prepare(per_job: bool) {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config.clone()).unwrap();
+    let (mut request, mut bytes) = f.run("true");
+    request.siblings.clear();
+    request.bundles.truncate(1);
+    bytes.truncate(1);
+    f.submit(&runner, &request, &bytes);
+    let setup = Setup {
+        cache_write_account: None,
+        id: request.job_id,
+        request,
+        cpus: vec![0],
+        memory_mib: None,
+        base: false,
+        recorded: BTreeMap::new(),
+        snapshots: None,
+    };
+    HostBackend
+        .materialize(&config, &runner.core.trees, &setup)
+        .unwrap();
+    let tree = workspace::snapshot_tree(
+        &runner.core.trees.mirror(&setup.request.repository_root),
+        &setup.request.tree_hash,
+    )
+    .unwrap();
+    let plan = crate::source_seal::plan(&config, &setup.request, &[], &tree).unwrap();
+    config
+        .source_seals
+        .seal(&config.state_dir(), setup.id, plan)
+        .unwrap();
+    let source = Path::new(&f.key).join("source");
+    assert_ne!(flags(&source) & 0x10, 0);
+    // Older VM boot cleanup erased the journal, but not the checkout's flags.
+    fs::remove_dir_all(config.state_dir().join("jobs").join(setup.id.to_string())).unwrap();
+    config.source_seals = Arc::default();
+    config.isolate_jobs = true;
+    config.tenant_vm = true;
+    config.per_job = per_job;
+    let result = HostBackend.materialize(&config, &runner.core.trees, &setup);
+    let leftover = flags(&source) & 0x10 != 0;
+    // Ensure the regression's red run cannot leave immutable scratch files.
+    for entry in tree
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+        let (_, path) = entry.split_at(entry.iter().position(|byte| *byte == b'\t').unwrap() + 1);
+        let file =
+            fs::File::open(Path::new(&f.key).join(std::ffi::OsStr::from_bytes(path))).unwrap();
+        let mut value = flags(&Path::new(&f.key).join(std::ffi::OsStr::from_bytes(path))) & !0x10;
+        assert_eq!(
+            unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &mut value) },
+            0
+        );
+    }
+    if per_job {
+        result.unwrap();
+        assert!(!leftover);
+        fs::write(source, b"writable again").unwrap();
+    } else {
+        let error = result
+            .err()
+            .expect("tenant mode must not clear unrecorded seals");
+        assert!(
+            error.to_string().contains("leftover source seals"),
+            "{error}"
+        );
+        assert!(leftover);
+    }
+}
+
+#[test]
+#[ignore = "requires root, file handles and CAP_LINUX_IMMUTABLE"]
+fn isolated_per_job_prepare_recovers_seals_without_a_record() {
+    crashed_seal_prepare(true);
+}
+
+#[test]
+#[ignore = "requires root, file handles and CAP_LINUX_IMMUTABLE"]
+fn isolated_tenant_prepare_refuses_seals_without_a_record() {
+    crashed_seal_prepare(false);
 }
 
 /// Bun installs a `file:` dependency by hard-linking its tracked files into
