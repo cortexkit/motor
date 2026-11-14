@@ -916,6 +916,7 @@ impl LinuxJobs {
             op,
             Operation::PrepareFill(_)
                 | Operation::SeedWorkspace(_)
+                | Operation::ForkWorkspace(_)
                 | Operation::WorkspaceUsage { .. }
                 | Operation::EvictBase { .. }
         ) {
@@ -940,6 +941,33 @@ impl LinuxJobs {
                 let grant = self.disk_grant(seed.cache_write_job_id.as_deref());
                 workspace::seed_bound(&self.workspaces, &seed, grant.as_ref())?;
                 Ok(Response::new(Reply::Ok))
+            }
+            Operation::ForkWorkspace(fork) => {
+                let allowed = self
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.fixed_path_repositories.get(&fork.account))
+                    .is_some_and(|roots| {
+                        roots.iter().any(|r| r == "*" || r == &fork.repository_root)
+                    });
+                if !allowed {
+                    return Err(Error(
+                        "fork requires an account fixed-path repository".into(),
+                    ));
+                }
+                self.disk_available_identity(&fork.disk_id)?;
+                let grant = self.disk_grant(fork.cache_write_job_id.as_deref());
+                let forked =
+                    workspace::fork_bound(&self.workspaces, &fork, grant.as_ref(), |id, meta| {
+                        self.disk_available_identity(id)?;
+                        if self.records().values().any(|r| {
+                            !r.released && (r.disk_device, r.disk_inode) == (meta.dev(), meta.ino())
+                        }) {
+                            return Err(Error("fork donor is attached or awaiting cleanup".into()));
+                        }
+                        Ok(())
+                    })?;
+                Ok(Response::new(Reply::WorkspaceForked(forked)))
             }
             Operation::WorkspaceUsage { account, disk_id } => {
                 let exclusive_bytes = (|| -> Result<u64> {

@@ -36,6 +36,7 @@ pub(super) fn job_request(request: Request) -> Result<job::Operation, Request> {
         Request::PrepareFill { fill } => job::Operation::PrepareFill(fill),
         Request::FinishFill { fill, published } => job::Operation::FinishFill { fill, published },
         Request::SeedWorkspace { seed } => job::Operation::SeedWorkspace(seed),
+        Request::ForkWorkspace { fork } => job::Operation::ForkWorkspace(fork),
         Request::EvictBase { account, disk_id } => job::Operation::EvictBase { account, disk_id },
         Request::WorkspaceUsage { account, disk_id } => {
             job::Operation::WorkspaceUsage { account, disk_id }
@@ -62,4 +63,23 @@ pub(super) fn job_request(request: Request) -> Result<job::Operation, Request> {
         }),
         request => return Err(request),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_request_dispatch_preserves_order_and_grant_selector() {
+        let fork = job::Fork {
+            account: "account".into(),
+            disk_id: "new".into(),
+            repository_root: "/repo".into(),
+            donor_ids: vec!["recent".into(), "largest".into()],
+            cache_write_job_id: Some(job::test_id(800)),
+        };
+        let op = job_request(Request::ForkWorkspace { fork: fork.clone() }).unwrap();
+        op.validate().unwrap();
+        assert!(matches!(op, job::Operation::ForkWorkspace(actual) if actual == fork));
+    }
 }
