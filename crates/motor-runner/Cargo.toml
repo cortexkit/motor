@@ -33,8 +33,11 @@ uuid = { version = "1", features = ["serde", "v7"] }
 [target.'cfg(not(windows))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only Linux workspaces clone with reflinks (platform::clone_target).
 cortexkit-cow = "=0.1.1"
+
+[target.'cfg(unix)'.dependencies]
 # The remote compile cache gateway: HTTP/1.1 parsing, SigV4 signing and TLS to
 # the object store.
 hmac = "0.12"
