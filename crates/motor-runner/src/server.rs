@@ -1308,11 +1308,23 @@ async fn attach(
                 // Accounting normally arrives with the launcher exit. A stuck
                 // launcher must not hold the caller's result for its longer
                 // lifecycle-accounting grace period.
-                let deadline = memory_deadline
-                    .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(2));
-                if !runner.terminal_memory_ready(id, tokio::time::Instant::now() >= *deadline) {
+                let (first_seen, deadline) = *memory_deadline.get_or_insert_with(|| {
+                    let now = tokio::time::Instant::now();
+                    (now, now + Duration::from_secs(2))
+                });
+                let timed_out = tokio::time::Instant::now() >= deadline;
+                if !runner.terminal_memory_ready(id, timed_out) {
                     break;
                 }
+                // How long the caller's result waited for memory accounting.
+                // The host log keeps this, so the wait on ordinary exits can be
+                // measured live rather than assumed.
+                tracing::info!(
+                    job_id = %id,
+                    wait_ms = first_seen.elapsed().as_millis() as u64,
+                    timed_out,
+                    "runner terminal memory wait"
+                );
             }
             match &frame {
                 Frame::Output(output) => from = output.seq + 1,

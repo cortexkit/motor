@@ -120,10 +120,12 @@ impl Relay {
                     || redacted.starts_with("build base published")
                     || redacted.starts_with("Cargo build-folder maintenance ")
                     || redacted.starts_with("runner build base eviction ")
-                    || redacted.starts_with("runner admission cleared its own build outputs "))
+                    || redacted.starts_with("runner admission cleared its own build outputs ")
+                    || redacted.starts_with("runner terminal memory wait "))
             {
                 // Successful jobs lose their private journal at VM teardown too.
-                // Relay only redacted cache decisions, not arbitrary INFO output.
+                // Relay only redacted cache and accounting decisions, not
+                // arbitrary INFO output.
                 if self.decisions < DECISION_LINES {
                     self.decisions += 1;
                     self.emit(redacted, &mut output);

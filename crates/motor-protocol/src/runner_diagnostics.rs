@@ -212,6 +212,7 @@ pub fn journal_message(message: &str) -> String {
         "runner cancel frame received",
         "runner cancel handled",
         "runner terminal written to client",
+        "runner terminal memory wait",
         "runner frame write failed",
         "runner_channel_closed",
         "operation_refused",
@@ -290,6 +291,9 @@ pub fn journal_message(message: &str) -> String {
                     | "symlink_change"
                     | "seed_failed"
             ),
+            "timed_out" if *name == "runner terminal memory wait" => {
+                matches!(value, "true" | "false")
+            }
             "inputs_match" | "times_valid" | "toolchain_match" | "environment_match"
             | "fixed_path_match" | "device_match" | "format_match"
                 if *name == "build base seed refused: record mismatch" =>
@@ -440,6 +444,18 @@ mod tests {
             "Cargo build-folder maintenance legacy_candidates=4 foreign_candidates=2 success=true";
         assert_eq!(console_message(raw), expected);
         assert_eq!(console_message(expected), expected);
+    }
+
+    #[test]
+    fn terminal_memory_wait_exposes_only_its_job_duration_and_timeout_flag() {
+        let raw = "[motor-runner] INFO motor_runner::server: runner terminal memory wait job_id=01a1d8c8-f1ac-7333-b943-a32753fd8936 wait_ms=12 timed_out=false path=/SECRET";
+        let expected = "runner terminal memory wait job_id=01a1d8c8-f1ac-7333-b943-a32753fd8936 wait_ms=12 timed_out=false";
+        assert_eq!(console_message(raw), expected);
+        assert_eq!(console_message(expected), expected);
+        assert_eq!(
+            console_message("runner terminal memory wait timed_out=maybe wait_ms=x"),
+            "runner terminal memory wait"
+        );
     }
 
     #[test]
