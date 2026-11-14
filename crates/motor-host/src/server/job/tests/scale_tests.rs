@@ -211,6 +211,7 @@ fn retained_host(directory: &std::path::Path, finished: usize) -> Host {
         host_reserve_mib: 50,
         boot_reserve_mib: 20,
         per_vm_overhead_mib: 10,
+        unused_memory_hold_percent: 0,
         reclaim_timeout_ms: 100,
         hysteresis_mib: 10,
         workspace_disk_cap_bytes: 1024,

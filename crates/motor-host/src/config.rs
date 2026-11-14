@@ -27,6 +27,7 @@ pub struct PerJobSettings {
     pub host_reserve_mib: u64,
     pub boot_reserve_mib: u64,
     pub per_vm_overhead_mib: u64,
+    pub unused_memory_hold_percent: u8,
     pub reclaim_timeout_ms: u64,
     pub hysteresis_mib: u64,
     pub workspace_disk_cap_bytes: u64,
@@ -79,6 +80,10 @@ impl HostSettings {
             HostMode::Tenant => Self::Tenant,
             HostMode::PerJob => {
                 let settings = per_job.context("per_job settings are required")?;
+                ensure!(
+                    settings.unused_memory_hold_percent <= 100,
+                    "per_job.unused_memory_hold_percent must be between 0 and 100"
+                );
                 settings.validate_storage()?;
                 settings.validate_cpus(control.online_cpus()?)?;
                 Self::PerJob(settings)

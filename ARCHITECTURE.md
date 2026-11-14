@@ -143,6 +143,7 @@ defaults:
 | `host_reserve_mib` | Host available-memory floor in MiB. |
 | `boot_reserve_mib` | MiB added to each stated-memory debit until runner hello. |
 | `per_vm_overhead_mib` | MiB added to stated memory before resident guest RAM counts as overage. |
+| `unused_memory_hold_percent` | Share (0–100%) of each running job's unused stated memory that admission keeps back. |
 | `reclaim_timeout_ms` | Wait after balloon inflation before rechecking pressure. |
 | `hysteresis_mib` | MiB above the reserve needed before balloon deflation. |
 | `workspace_disk_cap_bytes` | Workspace disk size cap in bytes, enforced by the helper. |

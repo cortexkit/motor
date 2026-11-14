@@ -729,11 +729,27 @@ impl Runtime {
             now_ms,
         );
         tick_step(&mut failure, "fills", result);
+        self.sample_job_residents(now_ms);
         self.tick_balloon(now_ms);
         if let Some(error) = failure {
             return Err(error);
         }
         Ok(())
+    }
+
+    pub(super) fn sample_job_residents(&self, now_ms: u64) {
+        let due = self
+            .host
+            .lock()
+            .expect("host lock")
+            .resident_samples_due(now_ms);
+        for job in due {
+            let result = self.control.job_memory(&job);
+            self.host
+                .lock()
+                .expect("host lock")
+                .record_job_resident(&job, now_ms, result);
+        }
     }
 
     fn collect_job_exits(&self, now_ms: u64) -> Result<()> {

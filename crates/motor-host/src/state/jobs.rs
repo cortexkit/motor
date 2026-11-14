@@ -11,6 +11,7 @@ pub mod fills;
 pub(crate) mod have;
 pub mod images;
 pub mod recovery;
+pub(crate) mod residency;
 pub mod storage;
 
 pub(super) const WARM_WORKSPACE_LIMIT: usize = 64;
@@ -277,12 +278,14 @@ impl Host {
             .filter_map(|d| d.recovery.as_ref())
             .filter(|r| r.holds_vm_capacity())
             .fold(free, |free, r| free.saturating_sub(r.memory_debit_mib));
-        self.snapshot
+        let free = self
+            .snapshot
             .per_job
             .fills
             .values()
             .filter(|f| !f.runner_hello)
-            .fold(free, |free, f| free.saturating_sub(f.memory_debit_mib))
+            .fold(free, |free, f| free.saturating_sub(f.memory_debit_mib));
+        free.saturating_sub(self.job_memory_hold(now_ms).held_back_mib)
     }
 
     pub(crate) fn log_job_memory(&self, now_ms: u64, free_mem_mib: u64) {
@@ -337,6 +340,7 @@ impl Host {
             .values()
             .filter(|fill| !fill.runner_hello)
             .fold(0u64, |sum, fill| sum.saturating_add(fill.memory_debit_mib));
+        let hold = self.job_memory_hold(now_ms);
         tracing::info!(
             free_mem_mib,
             available_mem_mib = sample.map(|s| s.available_mem_mib),
@@ -349,6 +353,8 @@ impl Host {
             recovery_memory_debit_mib,
             fill_memory_debit_mib,
             disk_waiters,
+            held_back_mib = hold.held_back_mib,
+            resident_samples_stale = hold.resident_samples_stale,
             "job_memory_advertised"
         );
     }

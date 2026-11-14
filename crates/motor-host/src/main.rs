@@ -545,6 +545,7 @@ mod config_tests {
             "vcpu_ceiling": 1, "permit_budget": 4,
             "host_reserve_mib": 1024, "boot_reserve_mib": 256,
             "per_vm_overhead_mib": 128, "reclaim_timeout_ms": 5000,
+            "unused_memory_hold_percent": 25,
             "hysteresis_mib": 512, "workspace_disk_cap_bytes": 10737418240_u64,
             "workspace_growth_reservation_bytes": 2147483648_u64,
             "boot_deadline_ms": 30000, "recovery_timeout_ms": 120000,
@@ -684,6 +685,7 @@ mod config_tests {
             "vcpu_ceiling",
             "permit_budget",
             "workspace_growth_reservation_bytes",
+            "unused_memory_hold_percent",
         ] {
             let mut missing = value.clone();
             missing["per_job"].as_object_mut().unwrap().remove(field);
@@ -694,6 +696,13 @@ mod config_tests {
                 .contains(&format!("missing field `{field}`")));
         }
         value["per_job"]["permit_budget"] = json!(1);
+        value["per_job"]["unused_memory_hold_percent"] = json!(101);
+        write(&value);
+        assert!(check_config(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("per_job.unused_memory_hold_percent"));
+        value["per_job"]["unused_memory_hold_percent"] = json!(25);
         write(&value);
         check_config(&path).unwrap();
         assert!(serde_json::from_value::<Config>(value.clone())
