@@ -3857,6 +3857,9 @@ impl Runner {
     }
     fn save(&self, job: &Job) -> io::Result<()> {
         let mut job = job.clone();
+        if let Some(terminal) = &mut job.terminal {
+            crate::terminal_record::bound(terminal)?;
+        }
         job.mappings = paths::job_mappings(&job, &self.core.config.caller_roots);
         let job = &job;
         if job.terminal.is_some() {
@@ -6833,7 +6836,8 @@ impl Runner {
             manifest.seq -= shift;
             frames.push(Frame::ReturnManifest(manifest));
         }
-        if let Some(terminal) = terminal {
+        if let Some(mut terminal) = terminal {
+            crate::terminal_record::bound(&mut terminal)?;
             frames.push(Frame::Terminal(terminal));
         }
         Ok(frames)
@@ -11558,7 +11562,13 @@ impl Runner {
             drop(inner);
             let saved = catalog
                 .and_then(|catalog| catalog.map_or(Ok(()), |catalog| self.write_catalog(catalog)))
-                .and_then(|()| self.save(&finished));
+                .and_then(|()| {
+                    // Every backend's change scan reaches this boundary. Publish
+                    // the same bounded record in memory and on disk so live
+                    // attach and restart replay cannot disagree about metadata.
+                    crate::terminal_record::bound(finished.terminal.as_mut().unwrap())?;
+                    self.save(&finished)
+                });
             self.finish_step(id, &job.kill, "terminal record written", finish_started);
             inner = self.core.inner.lock().unwrap();
             let terminal = finished.terminal.as_ref().unwrap();

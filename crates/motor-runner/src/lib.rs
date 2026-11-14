@@ -73,6 +73,7 @@ mod state_lock;
 mod storage;
 #[cfg(any(target_os = "linux", test))]
 mod systemd;
+mod terminal_record;
 mod working_memory;
 
 /// systemd-run properties for every job unit. PID 1 starts these system

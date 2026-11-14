@@ -359,7 +359,7 @@ async fn writer<W: AsyncWrite + Unpin>(
     let mut queue_updates = motor_protocol::QueueStatusUpdates::default();
     let status_started = tokio::time::Instant::now();
     loop {
-        let frame = tokio::select! {
+        let mut frame = tokio::select! {
             frame = rx.recv() => match frame { Some(f) => f, None => { trace.reason = "session_output_closed"; break; } },
             _ = heartbeat.tick() => {
                 let queue_status = job.borrow().as_ref().and_then(QueueProgress::status);
@@ -377,8 +377,15 @@ async fn writer<W: AsyncWrite + Unpin>(
                 break;
             }
         }
+        let bounded = if let Frame::Terminal(terminal) = &mut frame {
+            crate::terminal_record::bound(terminal)
+        } else {
+            Ok(())
+        };
         let result =
-            if let (Some(ctx), Frame::Accepted(_)) = (&tenant, &frame) {
+            if let Err(error) = bounded {
+                Err(error)
+            } else if let (Some(ctx), Frame::Accepted(_)) = (&tenant, &frame) {
                 let mut state = ctx.state.lock().await;
                 if state.closed || (ctx.checks_expiry() && unix_s() >= ctx.lease.exp) {
                     state.cause = RefusedCause::Expired;
@@ -1380,3 +1387,59 @@ fn all_bundles(
 #[cfg(test)]
 #[path = "server_transfer_tests.rs"]
 mod transfer_tests;
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn writer_drops_oversized_diagnostics_but_preserves_exit_and_accounting() {
+        let terminal = TerminalRecord::new(Uuid::now_v7(), Outcome::Exit { code: 23 }, 7, 8, 9)
+            .with_ran(Ran::Remote)
+            .with_execution_ended()
+            .with_pipestatus(vec![0, 23])
+            .with_last_seq(12)
+            .with_memory_stated_mib(4096)
+            .with_memory_peak_working_mib(123)
+            .with_hosted(HostedUsage::new("test").with_billed_vcpu_ms(456))
+            .with_workspace_changes(vec!["changed.rs".into()])
+            .with_untracked_files(UntrackedFiles::new(vec!["u".repeat(MAX_FRAME_BYTES)]))
+            .with_ignored_writes(
+                IgnoredWrites::new(99).with_sample_paths(vec!["i".repeat(MAX_FRAME_BYTES)]),
+            )
+            .with_git_state_changed(
+                GitStateChange::new(0, 1).with_ref_after("r".repeat(MAX_FRAME_BYTES)),
+            )
+            .with_tree_hash("t".repeat(MAX_FRAME_BYTES))
+            .with_oom_kill(OomKill::new("o".repeat(MAX_FRAME_BYTES)))
+            .with_refusal_detail("d".repeat(MAX_FRAME_BYTES));
+        let mut expected = terminal.clone();
+        expected.workspace_changes = None;
+        expected.untracked_files = None;
+        expected.ignored_writes = None;
+        expected.git_state_changed = None;
+        expected.tree_hash = None;
+        expected.oom_kill = None;
+        expected.refusal_detail = None;
+        let (tx, rx) = mpsc::channel(1);
+        let (_job_tx, job_rx) = watch::channel(None);
+        let (write, mut read) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        tx.send(Frame::Terminal(terminal)).await.unwrap();
+        drop(tx);
+        writer(write, rx, std::time::Instant::now(), job_rx, None).await;
+        loop {
+            match read_frame_async(&mut read).await.unwrap().unwrap() {
+                Frame::Terminal(actual) => {
+                    assert_eq!(actual, expected);
+                    assert!(
+                        serde_json::to_vec(&Frame::Terminal(actual)).unwrap().len()
+                            < MAX_FRAME_BYTES
+                    );
+                    break;
+                }
+                Frame::Heartbeat { .. } => {}
+                frame => panic!("unexpected frame: {frame:?}"),
+            }
+        }
+    }
+}
