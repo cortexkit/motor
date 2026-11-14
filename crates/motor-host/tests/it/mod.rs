@@ -100,6 +100,7 @@ fn host_settings() -> [motor_host::config::HostSettings; 2] {
             host_reserve_mib: 1024,
             boot_reserve_mib: 256,
             per_vm_overhead_mib: 128,
+            unused_memory_hold_percent: 0,
             reclaim_timeout_ms: 5000,
             hysteresis_mib: 512,
             workspace_disk_cap_bytes: 10737418240,

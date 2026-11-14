@@ -307,6 +307,7 @@ out of memory.
 | `host_reserve_mib` | MiB | Available-memory floor at both the host and job-VM slice limits for admission and pressure reclamation. |
 | `boot_reserve_mib` | MiB | Added to each job's stated memory debit until its runner answers hello, including queued jobs. |
 | `per_vm_overhead_mib` | MiB | Added to stated memory when computing a VM's positive resident-RAM overage. |
+| `unused_memory_hold_percent` | percent (0–100) | Share of each running job's unused stated memory that admission keeps back. |
 | `reclaim_timeout_ms` | milliseconds | Wait after balloon inflation before rechecking pressure and possibly stopping that VM. |
 | `hysteresis_mib` | MiB | Available memory above the reserve at both limits needed to deflate balloons. |
 | `workspace_disk_cap_bytes` | bytes | Sparse workspace-disk size cap, enforced by the helper. Raising it grows each existing checkout disk to the new cap the next time a job claims it (the helper extends the file, the guest grows its filesystem at boot); lowering it never shrinks a disk. A helper older than this rule refuses a grown disk, so roll the helper back only with the cap unchanged. |

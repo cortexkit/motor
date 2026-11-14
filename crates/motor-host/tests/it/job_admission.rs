@@ -5,6 +5,7 @@ use motor_host::store::SqliteJournal;
 mod fill_sources;
 mod fills;
 mod heartbeats;
+mod residency;
 mod storage;
 
 const AT: u64 = NOW * 1000;

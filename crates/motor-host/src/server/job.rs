@@ -736,6 +736,23 @@ impl Runtime {
         Ok(())
     }
 
+    /// Runs one sampling pass. Helper reads may block behind VM startup, so
+    /// callers must run this off the host's maintenance tick.
+    pub fn sample_job_residents(&self, now_ms: u64) {
+        let due = self
+            .host
+            .lock()
+            .expect("host lock")
+            .resident_samples_due(now_ms);
+        for job in due {
+            let result = self.control.job_memory(&job);
+            self.host
+                .lock()
+                .expect("host lock")
+                .record_job_resident(&job, now_ms, result);
+        }
+    }
+
     fn collect_job_exits(&self, now_ms: u64) -> Result<()> {
         self.collect_job_exits_at(now_ms, true)
     }

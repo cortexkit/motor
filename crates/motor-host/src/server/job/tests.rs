@@ -12,6 +12,7 @@ mod deadline_tests;
 mod fill_source_tests;
 mod heartbeat_tests;
 mod recovery_tests;
+mod residency_tests;
 mod scale_tests;
 mod seed_tests;
 mod startup_tests;
@@ -102,6 +103,8 @@ struct Fake {
     acknowledgements: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
     balloon_supported: AtomicBool,
     resident: Mutex<BTreeMap<String, u64>>,
+    resident_reads: Mutex<Vec<String>>,
+    resident_host: Mutex<Option<std::sync::Weak<Mutex<Host>>>>,
     balloons: Mutex<Vec<(String, u64)>>,
     scripted: Mutex<std::collections::VecDeque<UnixStream>>,
     recovery_reply: Mutex<Option<Value>>,
@@ -243,6 +246,12 @@ impl Control for Fake {
         Ok(())
     }
     fn job_memory(&self, job: &str) -> Result<u64> {
+        self.resident_reads.lock().unwrap().push(job.into());
+        if let Some(host) = self.resident_host.lock().unwrap().as_ref() {
+            let host = host.upgrade().unwrap();
+            let _guard = host.try_lock().expect("resident helper holds no host lock");
+        }
+        self.wait("job-memory");
         ensure!(
             self.balloon_supported.load(Ordering::Acquire),
             crate::helper::BalloonUnavailable
@@ -639,6 +648,7 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
         host_reserve_mib: 50,
         boot_reserve_mib: 20,
         per_vm_overhead_mib: 10,
+        unused_memory_hold_percent: 0,
         reclaim_timeout_ms: 100,
         hysteresis_mib: 10,
         workspace_disk_cap_bytes: 1024,
