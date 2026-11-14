@@ -671,8 +671,10 @@ a test.
 ## 5. Environment from the caller
 
 5.1. Only build variables cross from the caller: names starting with `RUST_`,
-`CARGO_` or `NEXTEST_`, plus `RUSTFLAGS`, `RUSTDOCFLAGS`, `CI`, `NO_COLOR`,
-`CLICOLOR` and `CLICOLOR_FORCE`. `CARGO_HOME`, `CARGO_INSTALL_ROOT`,
+`CARGO_` or `NEXTEST_`, plus `RUSTFLAGS`, `RUSTDOCFLAGS`, `RUSTUP_TOOLCHAIN`,
+`CI`, `NO_COLOR`, `CLICOLOR` and `CLICOLOR_FORCE`. `RUSTUP_TOOLCHAIN` selects an
+installed Rust toolchain; no other `RUSTUP_*` name is admitted, including
+`RUSTUP_HOME` and `RUSTUP_DIST_SERVER`. `CARGO_HOME`, `CARGO_INSTALL_ROOT`,
 `CARGO_TARGET_DIR` and `CARGO_BUILD_*` other than `CARGO_BUILD_JOBS` are
 dropped, as is any name containing `TOKEN`, `SECRET`, `PASSWORD`, `KEY` or
 `CREDENTIAL`. The client and the runner apply the same predicate
@@ -714,8 +716,14 @@ costs one rebuild of every warm workspace and one round of cache refills because
 Cargo's environment is part of the cache key. Test:
 `isolated_fill_and_job_have_identical_hashed_cargo_inputs`.
 
-5.2. The `accepted` record lists the names that were dropped, never their
-values. Test: `accepted_reports_dropped_env_names_without_env_values`
+5.2. Explicit `ck motor run --env NAME=VALUE` flags are refused before submission
+or upload if the name would not be forwarded; set the variable inside the
+command instead. Agent callers through `exec.run` still have non-admitted names
+dropped without refusing the job. The `accepted` stream record that confirms
+job acceptance lists the names that ck-motor dropped, never their values. Tests:
+`refused_explicit_env_fails_before_request_or_upload`
+(`crates/motor-module/src/cli.rs`),
+`accepted_reports_dropped_env_names_without_env_values`
 (`crates/motor-module/tests/it/recovery.rs`).
 
 ## 6. Network

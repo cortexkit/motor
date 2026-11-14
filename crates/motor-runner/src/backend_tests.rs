@@ -7,6 +7,53 @@ use std::{
 
 #[cfg(target_os = "linux")]
 #[test]
+fn job_environment_forwards_only_rustup_toolchain_and_refuses_secret_names() {
+    let scratch = ScratchDir::new("job-environment-filter");
+    fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let mut config = Config::new(scratch.join("state"), "main");
+    config.isolate_jobs = true;
+    let mut setup = setup(&scratch);
+    setup.request.base_commit = Some("source".into());
+    let denied = [
+        "RUSTUP_HOME",
+        "RUSTUP_DIST_SERVER",
+        "RUSTUP_UPDATE_ROOT",
+        "RUSTUP_TOOLCHAIN_PATH",
+        "RUST_TOKEN",
+        "CARGO_SECRET",
+        "NEXTEST_PASSWORD",
+        "RUST_API_KEY",
+        "RUST_CREDENTIAL",
+        "RUSTUP_TOOLCHAIN_TOKEN",
+        "RUSTUP_TOOLCHAIN_SECRET",
+        "RUSTUP_TOOLCHAIN_PASSWORD",
+        "RUSTUP_TOOLCHAIN_KEY",
+        "RUSTUP_TOOLCHAIN_CREDENTIAL",
+    ];
+    setup.request.env = denied
+        .iter()
+        .map(|name| ((*name).into(), "private-value".into()))
+        .chain([("RUSTUP_TOOLCHAIN".into(), "1.100.0".into())])
+        .collect();
+    let target = scratch.join("target");
+    let inputs = EnvironmentInputs::before_setup(&config, &setup, &scratch, &target, None).unwrap();
+    let env = job_environment(&config, &trees(&config), &setup, &inputs, 2).unwrap();
+    assert_eq!(env["RUSTUP_TOOLCHAIN"], "1.100.0");
+    // RUSTUP_HOME belongs to the runner's base environment, not the request.
+    assert_eq!(
+        env.get("RUSTUP_HOME"),
+        std::env::var("RUSTUP_HOME").ok().as_ref()
+    );
+    for name in denied {
+        if name != "RUSTUP_HOME" {
+            assert!(!env.contains_key(name), "forwarded {name}");
+        }
+    }
+    assert!(!env.values().any(|value| value == "private-value"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn stored_job_grant_selects_write_environment_only_for_its_keyed_account() {
     use crate::remote_cache::{gateway::Tool, transport::Forwarder};
     let scratch = ScratchDir::new("cache-write-environment");

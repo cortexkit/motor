@@ -98,7 +98,11 @@ and stderr here as they arrive.
   --env NAME=VALUE    set an environment variable for the job (repeatable).
                       Nothing is inherited from this shell; ck-motor forwards
                       only build variables (RUST_*, CARGO_*, NEXTEST_*, CI,
-                      NO_COLOR, ...) and reports any it drops.
+                      NO_COLOR, ...), plus RUSTUP_TOOLCHAIN (no other RUSTUP_*).
+                      Names containing TOKEN, SECRET, PASSWORD, KEY or CREDENTIAL
+                      are not forwarded. A name that would be dropped refuses
+                      the run before submission or upload; set it inside the
+                      command instead.
   --timeout SECONDS   stop the command after this long (default 3600, at most
                       7200; ck-motor may be configured with a lower cap)
   --cwd PATH          directory to run in; its git checkout is the workspace
@@ -705,6 +709,13 @@ fn supplied_wsl_refusal(args: &RunArgs, wsl: &crate::wsl::Checks) -> Option<Stri
 }
 
 fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<RunRequest, String> {
+    // Explicit CLI flags are intentional overrides, unlike an agent's full
+    // environment. Refuse ignored overrides before reading or submitting sources.
+    if let Some(name) = args.env.keys().find(|name| !crate::allowed_env(name)) {
+        return Err(format!(
+            "{name} is not forwarded to remote jobs; set it inside the command instead"
+        ));
+    }
     if let Some(message) = supplied_wsl_refusal(args, wsl) {
         return Err(message);
     }
@@ -2952,6 +2963,72 @@ mod tests {
             .with_timeout(DEFAULT_TIMEOUT_SECS)
             .with_return_max_bytes(motor_protocol::RETURN_MAX_BYTES);
         assert_eq!(bytes, serde_json::to_vec(&legacy).unwrap());
+    }
+
+    #[test]
+    fn rustup_toolchain_flag_reaches_the_run_request() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-rustup-toolchain");
+        crate::snapshot::git(scratch.path(), &["init", "--quiet"]).unwrap();
+        let Ok(Invocation::Run(args)) = parse_args(&[
+            "--cwd".into(),
+            scratch.path().display().to_string(),
+            "--env".into(),
+            "RUSTUP_TOOLCHAIN=1.100.0".into(),
+            "--".into(),
+            "true".into(),
+        ]) else {
+            panic!("expected a run")
+        };
+        assert_eq!(
+            build_request(&args).unwrap().env["RUSTUP_TOOLCHAIN"],
+            "1.100.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_explicit_env_fails_before_request_or_upload() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-env-refusal");
+        for name in [
+            "RUSTUP_HOME",
+            "RUSTUP_DIST_SERVER",
+            "RUST_TOKEN",
+            "CARGO_SECRET",
+            "NEXTEST_PASSWORD",
+            "RUST_API_KEY",
+            "RUST_CREDENTIAL",
+        ] {
+            let secret_file = scratch.path().join(format!("{name}.secret"));
+            let record_file = scratch.path().join(format!("{name}.jsonl"));
+            // No checkout exists: an env refusal must precede even reading sources,
+            // and therefore cannot reach the connection, submission or upload path.
+            let input = vec![
+                "--env".into(),
+                format!("{name}=private-value"),
+                "--cwd".into(),
+                scratch.path().join("missing").display().to_string(),
+                "--secret-file".into(),
+                secret_file.display().to_string(),
+                "--record-file".into(),
+                record_file.display().to_string(),
+                "--".into(),
+                "true".into(),
+            ];
+            let Ok(Invocation::Run(args)) = parse_args(&input) else {
+                panic!("expected a run")
+            };
+            assert_eq!(
+                build_request(&args).unwrap_err(),
+                format!(
+                    "{name} is not forwarded to remote jobs; set it inside the command instead"
+                )
+            );
+            assert_eq!(
+                main_checked(&input, &crate::wsl::Checks::default()).await,
+                EXIT_REFUSED
+            );
+            assert!(!secret_file.exists());
+            assert!(!record_file.exists());
+        }
     }
 
     #[tokio::test]

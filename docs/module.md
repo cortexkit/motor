@@ -756,6 +756,14 @@ is `true` in the configuration file ([Configuration](#configuration)).
 `--memory N`: The job's memory limit in GiB (Linux only). Without --memory,
 the server's default applies; a job that exceeds its limit is stopped.
 
+`--env NAME=VALUE` sets a build variable explicitly; nothing is inherited from
+the local shell. A name outside the [forwarded-variable rules](job-isolation.md#5-environment-from-the-caller)
+refuses the run before submission or upload (exit 200), rather than silently
+ignoring the override. Set such a variable inside the command instead.
+`RUSTUP_TOOLCHAIN` is forwarded to select an installed Rust toolchain; no other
+`RUSTUP_*` name is forwarded. Names containing `TOKEN`, `SECRET`, `PASSWORD`,
+`KEY` or `CREDENTIAL` remain refused.
+
 The words after `--` follow two rules:
 
 - **One word** is passed verbatim as the runner's `bash -c` command string.

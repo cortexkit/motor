@@ -2,7 +2,7 @@
 /// Runner-owned paths and credentials must not be overridden by a request.
 pub fn allowed_env(name: &str) -> bool {
     (name.starts_with("RUST_")
-        || matches!(name, "RUSTFLAGS" | "RUSTDOCFLAGS")
+        || matches!(name, "RUSTFLAGS" | "RUSTDOCFLAGS" | "RUSTUP_TOOLCHAIN")
         || name.starts_with("CARGO_")
         || name.starts_with("NEXTEST_")
         || matches!(
