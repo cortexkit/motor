@@ -139,8 +139,8 @@ if os.environ.get('EXECUTE_REMOTE'):
         sizes = {Path(c[c.index("--cwd") + 1]).name: c[4] for c in self.commands("ck")}
         for command in self.commands("ck"):
             self.assertEqual(command[1:4], ["motor", "run", "--vcpus"])
-        # Only the long-pole test lane holds 16 slots; the rest are right-sized.
-        self.assertEqual(sizes, {"linux-tests": "16", "linux-lint": "8", "mixed-version": "8",
+        # No parallel lane holds 16 slots; the script tests need only 4.
+        self.assertEqual(sizes, {"linux-tests": "8", "linux-lint": "8", "mixed-version": "8",
                                  "musl": "8", "windows-clippy": "8", "script-tests": "4"})
         # Only the old-client check downloads; every other lane stays offline.
         online = [c for c in self.commands("ck") if "--net" in c]

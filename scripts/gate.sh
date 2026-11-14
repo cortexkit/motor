@@ -285,13 +285,15 @@ echo \"gate $lane \$result exit=\$code (\$((SECONDS - start))s)\""
   $native && lanes+=(macos-clippy)
 fi
 
-# Size each remote lane to what it uses. The test lane is the gate's long pole
-# and keeps 16 vCPUs; lint and single-target builds finish within its time on
-# 8, and the script tests are mostly single-threaded Python. Oversized lanes
-# hold server slots that other seats' jobs wait for.
+# Size each remote lane to what it uses. Measured on 14 Nov 2026, the test lane
+# kept on average 5.3 of 16 vCPUs busy while building and 7.4 while running
+# tests, and never more than 14; on 8 it takes about 8% longer, at half the
+# slots. Lint and single-target builds finish within its time on 8, and the
+# script tests are mostly single-threaded Python. Oversized lanes hold server
+# slots that other seats' jobs wait for.
 lane_vcpus() {
   case "$1" in
-    remote-serial | linux-tests) echo 16 ;;
+    remote-serial) echo 16 ;;
     script-tests) echo 4 ;;
     *) echo 8 ;;
   esac
