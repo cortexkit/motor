@@ -626,7 +626,7 @@
       }
     }
   },
-  "rust_default": "1.99.0-x86_64-unknown-linux-gnu",
+  "rust_default": "1.100.0-x86_64-unknown-linux-gnu",
   "rust_profile": "minimal",
   "rust_toolchains": {
     "1.100.0-x86_64-unknown-linux-gnu": {

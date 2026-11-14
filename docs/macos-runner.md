@@ -282,7 +282,10 @@ missing. A path written with `..` is
 resolved on the shared folder and finds only files the agent copied there.
 
 The image recipe installs Rust 1.91.0, 1.92.0, 1.96.0, 1.99.0 and 1.100.0, plus
-an independent stable copy of 1.99.0. The default remains 1.99.0. Rust 1.100.0
+an independent stable copy of 1.99.0. The current macOS job image still defaults
+to 1.99.0 until rebuilt; Linux jobs default to 1.100.0. Parity allows a macOS
+default that is also installed on the build server, while still checking the
+job's observed default against the sealed macOS manifest. Rust 1.100.0
 has the same components and `aarch64-apple-darwin` target as 1.99.0, including
 `llvm-tools` and `rust-analyzer`. Bun is 1.4.4. CMake 4.2.3 uses Kitware's
 SHA-256-pinned official macOS universal archive; its CLI binaries and module tree

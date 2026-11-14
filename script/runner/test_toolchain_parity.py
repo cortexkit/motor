@@ -835,6 +835,19 @@ class ParityTests(unittest.TestCase):
         actual['rust_toolchains']['stable-x86_64-unknown-linux-gnu']['components'].append('clippy-x86_64-unknown-linux-gnu')
         self.assertFalse(self.report(actual)['passed'])
 
+    def test_rust_1_100_is_default_and_previous_installed_default_is_rejected(self):
+        self.assertEqual(self.manifest['rust_default'], '1.100.0-x86_64-unknown-linux-gnu')
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role):
+                actual = self.observed(role=role, job=True)
+                self.assertIn('1.96.0-x86_64-unknown-linux-gnu', actual['rust_toolchains'])
+                self.assertIn('1.99.0-x86_64-unknown-linux-gnu', actual['rust_toolchains'])
+                actual['rust_default'] = '1.99.0-x86_64-unknown-linux-gnu'
+                report = self.report(actual, role=role, job=True)
+                self.assertFalse(report['passed'])
+                self.assertEqual(len(report['errors']), 1)
+                self.assertIn('rust_default:', report['errors'][0])
+
     def test_missing_rust_analyzer_component_fails_for_every_role(self):
         toolchain = '1.99.0-x86_64-unknown-linux-gnu'
         for role in ('build-server', 'boat', 'tenant'):
@@ -1486,7 +1499,8 @@ class JournalRetentionHostFileTests(unittest.TestCase):
 class InstallerTests(unittest.TestCase):
     def test_default_toolchain_lists_and_installs_rust_analyzer_for_all_roles(self):
         manifest = json.loads(parity.MANIFEST.read_text())
-        toolchain = '1.99.0-x86_64-unknown-linux-gnu'
+        toolchain = '1.100.0-x86_64-unknown-linux-gnu'
+        self.assertEqual(manifest['rust_default'], toolchain)
         self.assertIn('rust-analyzer-x86_64-unknown-linux-gnu',
                       manifest['rust_toolchains'][toolchain]['components'])
         with tempfile.TemporaryDirectory() as tmp:

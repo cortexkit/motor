@@ -56,6 +56,7 @@ def ready(rebuild=None):
     manifest = pending()
     if not rebuild:
         # Keep the existing parity tests exercising the measured live-image shape.
+        manifest["rust_default"] = "1.99.0-aarch64-apple-darwin"
         manifest["rust_toolchains"] = {name: manifest["rust_toolchains"][name]
                                        for name in parity.rust_toolchains(SERVER) if name != parity.REBUILD_RUST}
         del manifest["sources"]["cmake"]
@@ -119,6 +120,28 @@ class ParityTests(unittest.TestCase):
     def test_real_manifest_validates_against_real_server_manifest(self):
         manifest = json.loads((HERE / "toolchain.json").read_text())
         parity.validate(manifest, SERVER)
+
+    def test_live_macos_default_remains_valid_after_linux_default_promotion(self):
+        manifest = json.loads((HERE / "toolchain.json").read_text())
+        self.assertEqual(SERVER["rust_default"], "1.100.0-x86_64-unknown-linux-gnu")
+        self.assertEqual(manifest["rust_default"], "1.99.0-aarch64-apple-darwin")
+        parity.validate(manifest, SERVER)
+
+    def test_default_not_installed_on_server_is_rejected(self):
+        self.manifest["rust_default"] = "1.98.0-aarch64-apple-darwin"
+        with self.assertRaisesRegex(ValueError, "not a shared installed toolchain"):
+            parity.validate(self.manifest, SERVER)
+
+    def test_linux_default_not_installed_in_macos_image_is_rejected(self):
+        self.manifest["rust_default"] = "1.100.0-aarch64-apple-darwin"
+        with self.assertRaisesRegex(ValueError, "not a shared installed toolchain"):
+            parity.validate(self.manifest, SERVER)
+
+    def test_observed_default_must_still_match_sealed_macos_default(self):
+        self.actual["rust_default"] = "1.100.0-aarch64-apple-darwin"
+        errors = parity.differences(self.manifest, self.actual, job=True)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("rust_default:", errors[0])
 
     def test_linux_rust_1_100_waits_for_the_next_macos_image(self):
         manifest = json.loads((HERE / "toolchain.json").read_text())
@@ -273,14 +296,14 @@ class RebuildRecipeTests(unittest.TestCase):
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name)
 
-    def test_seed_includes_rust_1_100_with_exact_versions_and_unchanged_default(self):
+    def test_seed_includes_rust_1_100_with_exact_versions_and_server_default(self):
         with patch.object(parity, "PENDING_MACOS_TOOLCHAINS", {"1.92.0", "1.100.0"}), \
                 patch.object(parity, "PENDING_MACOS_COMPONENTS", {"llvm-tools", "rust-analyzer"}):
             manifest = pending()
         chains = manifest["rust_toolchains"]
         new = chains["1.100.0-aarch64-apple-darwin"]
         old = chains["1.99.0-aarch64-apple-darwin"]
-        self.assertEqual(manifest["rust_default"], "1.99.0-aarch64-apple-darwin")
+        self.assertEqual(manifest["rust_default"], "1.100.0-aarch64-apple-darwin")
         self.assertEqual(manifest["stable_copy_from"], "1.99.0-aarch64-apple-darwin")
         self.assertEqual(new["rustc"], "rustc 1.100.0 (0ef1bc386 2026-11-09)")
         self.assertEqual(new["cargo"], "cargo 1.100.0 (3acc79c0c 2026-11-05)")
@@ -290,6 +313,11 @@ class RebuildRecipeTests(unittest.TestCase):
         self.assertIn("rust-analyzer-aarch64-apple-darwin", new["components"])
         self.assertIn("1.92.0-aarch64-apple-darwin", chains)
         self.assertEqual(new["sha256"], pinlock.PENDING)
+
+    def test_seed_preserves_an_older_explicit_server_default(self):
+        server = copy.deepcopy(SERVER)
+        server["rust_default"] = "1.99.0-x86_64-unknown-linux-gnu"
+        self.assertEqual(pinlock.seed(server)["rust_default"], "1.99.0-aarch64-apple-darwin")
 
     def test_seed_pins_official_universal_cmake_at_linux_version(self):
         manifest = pending()

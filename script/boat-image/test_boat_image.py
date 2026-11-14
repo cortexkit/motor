@@ -56,9 +56,9 @@ class RecipeTests(unittest.TestCase):
             name + "-x86_64-unknown-linux-gnu"
             for name in ("1.91.0", "1.92.0", "1.96.0", "1.99.0", "1.100.0", "stable")})
 
-    def test_rust_1_100_is_preinstalled_without_changing_default(self):
+    def test_rust_1_100_is_default_with_previous_toolchains_still_installed(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
-        self.assertEqual(manifest['rust_default'], '1.99.0-x86_64-unknown-linux-gnu')
+        self.assertEqual(manifest['rust_default'], '1.100.0-x86_64-unknown-linux-gnu')
         previous = manifest['rust_toolchains']['1.99.0-x86_64-unknown-linux-gnu']
         added = manifest['rust_toolchains']['1.100.0-x86_64-unknown-linux-gnu']
         self.assertEqual(added['components'], previous['components'])
@@ -67,6 +67,10 @@ class RecipeTests(unittest.TestCase):
         with patch.object(install, 'run', return_value='') as run:
             install.install_rust(manifest, '/rustup-init')
         self.assertEqual(run.call_args.args, ('rustup', 'default', manifest['rust_default']))
+        installed = {call.args[3] for call in run.call_args_list
+                     if call.args[:3] == ('rustup', 'toolchain', 'install')}
+        self.assertTrue({'1.96.0-x86_64-unknown-linux-gnu',
+                         '1.99.0-x86_64-unknown-linux-gnu'} <= installed)
 
     def test_accounts_use_boats_system_assigned_rule(self):
         with patch.object(install.job_account, 'ensure') as ensure, \
