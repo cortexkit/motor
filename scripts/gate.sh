@@ -285,6 +285,18 @@ echo \"gate $lane \$result exit=\$code (\$((SECONDS - start))s)\""
   $native && lanes+=(macos-clippy)
 fi
 
+# Size each remote lane to what it uses. The test lane is the gate's long pole
+# and keeps 16 vCPUs; lint and single-target builds finish within its time on
+# 8, and the script tests are mostly single-threaded Python. Oversized lanes
+# hold server slots that other seats' jobs wait for.
+lane_vcpus() {
+  case "$1" in
+    remote-serial | linux-tests) echo 16 ;;
+    script-tests) echo 4 ;;
+    *) echo 8 ;;
+  esac
+}
+
 echo "gate logs: $logs"
 for lane in "${lanes[@]}"; do
   (
@@ -294,13 +306,13 @@ for lane in "${lanes[@]}"; do
     if [ "$lane" = macos-clippy ]; then
       bash -c "$body" >"$logs/$lane.log" 2>&1 || code=$?
     elif [ "$lane" = remote-serial ]; then
-      ck motor run --vcpus 16 --cwd "$root" -- "$serial_body" >"$logs/$lane.log" 2>&1 || code=$?
+      ck motor run --vcpus "$(lane_vcpus "$lane")" --cwd "$root" -- "$serial_body" >"$logs/$lane.log" 2>&1 || code=$?
     elif [ "$lane" = mixed-version ]; then
       # Serial mode makes no lane clones, so lane_root is unset there.
       if $serial; then cwd=$root; else cwd="$lane_root/$lane"; fi
-      ck motor run --vcpus 16 --net --cwd "$cwd" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?
+      ck motor run --vcpus "$(lane_vcpus "$lane")" --net --cwd "$cwd" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?
     else
-      ck motor run --vcpus 16 --cwd "$lane_root/$lane" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?
+      ck motor run --vcpus "$(lane_vcpus "$lane")" --cwd "$lane_root/$lane" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?
     fi
     echo "$code $((SECONDS - start))" >"$logs/$lane.result"
   ) &

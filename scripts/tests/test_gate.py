@@ -136,8 +136,12 @@ if os.environ.get('EXECUTE_REMOTE'):
             self.assertIn(f"gate {lane} PASS", result.stdout)
         self.assertIn("gate windows-clippy FAIL exit=8", result.stdout)
         self.assertEqual(len(self.commands("ck")), 6)
+        sizes = {Path(c[c.index("--cwd") + 1]).name: c[4] for c in self.commands("ck")}
         for command in self.commands("ck"):
-            self.assertEqual(command[1:5], ["motor", "run", "--vcpus", "16"])
+            self.assertEqual(command[1:4], ["motor", "run", "--vcpus"])
+        # Only the long-pole test lane holds 16 slots; the rest are right-sized.
+        self.assertEqual(sizes, {"linux-tests": "16", "linux-lint": "8", "mixed-version": "8",
+                                 "musl": "8", "windows-clippy": "8", "script-tests": "4"})
         # Only the old-client check downloads; every other lane stays offline.
         online = [c for c in self.commands("ck") if "--net" in c]
         self.assertEqual([Path(c[c.index("--cwd") + 1]).name for c in online], ["mixed-version"])
