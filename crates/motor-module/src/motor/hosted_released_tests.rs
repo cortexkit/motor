@@ -272,6 +272,140 @@ async fn unknown_status_during_release_before_its_reply_is_never_started() {
     observe_release_before_its_reply(false, true).await;
 }
 
+async fn broker_ended_reply_during_live_submission_is_not_final(unknown: bool, status_probe: bool) {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let (scratch, repo) = committed_repo();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let placing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let http = crate::hosted::test_http::Http::with_concurrent_reply({
+        let entered = entered.clone();
+        let resume = resume.clone();
+        let placing = placing.clone();
+        let broker = h.route.broker_url.clone();
+        move |path, body| {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            let placing = placing.clone();
+            let broker = broker.clone();
+            async move {
+                if path == "/v1/leases" {
+                    entered.notify_one();
+                    resume.notified().await;
+                } else if path.ends_with("/reattach") && placing.load(Ordering::SeqCst) {
+                    return (
+                        if unknown { 404 } else { 409 },
+                        serde_json::to_vec(&serde_json::json!({
+                            "error": if unknown { "job_unknown" } else { "job_released" }
+                        }))
+                        .unwrap(),
+                    );
+                }
+                let response = reqwest::Client::new()
+                    .post(format!("{broker}{path}"))
+                    .bearer_auth("hosted-test-bearer")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                (
+                    response.status().as_u16(),
+                    response.bytes().await.unwrap().to_vec(),
+                )
+            }
+        }
+    })
+    .await;
+    let mut config = h.config();
+    config.broker_url = Some(http.url.clone());
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let mut stream = motor.run(Harness::request(&repo)).unwrap();
+    let id = stream.job_id;
+    tokio::time::timeout(Duration::from_secs(30), entered.notified())
+        .await
+        .unwrap();
+    assert!(motor.submissions.lock().unwrap().contains_key(&id));
+    assert!(!motor.hosted_state(id).unwrap().run_sent);
+    let mut attached = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    if status_probe {
+        // Remove only the result-owner reservation so status probes the broker.
+        // The live submission stays registered and run_sent is unchanged.
+        let owner = motor.hosted_results.lock().unwrap().remove(&id).unwrap();
+        let status = motor.job_status(id).await;
+        motor.hosted_results.lock().unwrap().insert(id, owner);
+        let error = status.unwrap_err();
+        assert!(error.to_string().contains("Provisioning(1000)"), "{error}");
+    } else {
+        assert_eq!(
+            motor.open_job_channel(id).await.err(),
+            Some(if unknown {
+                crate::hosted::Error::ReattachUnknown
+            } else {
+                crate::hosted::Error::Provisioning(1000)
+            })
+        );
+    }
+    let job = motor.storage.job(id).unwrap();
+    assert!(job.local_terminal.is_none());
+    let state = job.hosted.unwrap();
+    assert!(state.terminal.is_none());
+    assert!(!state.finish_done);
+    assert_eq!(
+        http.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.ends_with("/reattach"))
+            .count(),
+        1
+    );
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+
+    placing.store(false, Ordering::SeqCst);
+    resume.notify_one();
+    for stream in [&mut stream, &mut attached] {
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let StreamRecord::Terminal(terminal) =
+                    stream.records.recv().await.unwrap().unwrap()
+                {
+                    break terminal;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+        assert_ne!(terminal.ran, Some(Ran::None));
+    }
+    let job = motor.storage.job(id).unwrap();
+    assert!(job.local_terminal.is_none());
+    let state = job.hosted.unwrap();
+    assert!(state.run_sent);
+    assert_eq!(state.terminal.unwrap().outcome, Outcome::Exit { code: 23 });
+    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    drop(stream);
+    drop(attached);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn unknown_reattach_during_live_submission_does_not_finalize_before_run() {
+    broker_ended_reply_during_live_submission_is_not_final(true, false).await;
+}
+
+#[tokio::test]
+async fn released_reattach_during_live_submission_does_not_finalize_before_run() {
+    broker_ended_reply_during_live_submission_is_not_final(false, false).await;
+}
+
+#[tokio::test]
+async fn released_status_during_live_submission_does_not_finalize_before_run() {
+    broker_ended_reply_during_live_submission_is_not_final(false, true).await;
+}
+
 async fn unknown_cleanup_is_never_started(stored: Option<Outcome>, boat: bool) {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = cortexkit_test_support::ScratchDir::new("hosted-unknown-cleanup");

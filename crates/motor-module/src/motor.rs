@@ -2275,15 +2275,35 @@ impl Motor {
             if matches!(
                 opened,
                 Err(crate::hosted::Error::Released | crate::hosted::Error::ReattachUnknown)
-            ) && self
-                .storage
-                .confirm_hosted_ended_before_run(id)
-                .map_err(|_| crate::hosted::Error::Broker)?
-            {
-                // The broker can end or forget a booking before cleanup gets
-                // its reply. An unset durable run_sent flag proves no Run left
-                // ck-motor, so status and attach can use the retained terminal.
-                opened = Err(crate::hosted::Error::Released);
+            ) {
+                let confirmed = {
+                    // A live placement owner can still send Run. Serialize its
+                    // ownership check and durable confirmation with the gate
+                    // held when Run is journaled, before its frame is sent.
+                    let _booking_open = self.hosted_cleanup.booking_open.lock().unwrap();
+                    let submissions = self.submissions.lock().unwrap();
+                    if submissions.contains_key(&id)
+                        && self.hosted_state(id).is_some_and(|state| !state.run_sent)
+                    {
+                        // Released must not reach terminal synthesis while the
+                        // submission can still obtain a lease and send Run.
+                        return match opened {
+                            Err(crate::hosted::Error::Released) => {
+                                Err(crate::hosted::Error::Provisioning(1_000))
+                            }
+                            other => other,
+                        };
+                    }
+                    self.storage
+                        .confirm_hosted_ended_before_run(id)
+                        .map_err(|_| crate::hosted::Error::Broker)?
+                };
+                if confirmed {
+                    // The broker can end or forget a booking before cleanup
+                    // gets its reply. With no submission owner and no Run in
+                    // the journal, status and attach can use the retained terminal.
+                    opened = Err(crate::hosted::Error::Released);
+                }
             }
             let cause = match &opened {
                 Err(crate::hosted::Error::Finished) => Some(
