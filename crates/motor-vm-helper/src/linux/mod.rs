@@ -53,6 +53,9 @@ impl LinuxMachine {
         let tenants =
             crate::tenant::Controller(tenant::LinuxTenants::new(&config, cgroups.root.clone()));
         let jobs = job::LinuxJobs::new(&config);
+        if let Some(settings) = &config.job_vms {
+            cgroup::prepare_job_slice(settings.memory_max_bytes)?;
+        }
         let cache_write_grants = jobs.cache_write_grants.clone();
         Ok(Self {
             config,
@@ -200,6 +203,12 @@ impl Machine for LinuxMachine {
     }
     fn job_vms_configured(&self) -> bool {
         self.config.job_vms.is_some()
+    }
+    fn job_slice_memory_max_bytes(&self) -> Option<u64> {
+        self.config
+            .job_vms
+            .as_ref()
+            .map(|settings| settings.memory_max_bytes)
     }
     fn workspace_disk_max_bytes(&self) -> Option<u64> {
         self.config

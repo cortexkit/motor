@@ -141,6 +141,12 @@ pub struct HostResources {
     pub permit_budget: u32,
 }
 
+#[derive(PartialEq, Eq)]
+pub(super) enum HostResourcesFailure {
+    MissingOrStale,
+    Unavailable(String),
+}
+
 // A caller may capture its clock, then wait on I/O or a lock while another
 // thread publishes a newer sample. Such a sample is newer than the caller's
 // view, not stale; allow the same window ahead as behind.
@@ -233,13 +239,15 @@ impl Host {
     pub fn record_host_resources(&mut self, resources: HostResources) {
         self.host_resources = Some(resources);
         self.job_vm_file_mib = None;
-        self.host_resources_failed.set(false);
+        *self.host_resources_failed.get_mut() = None;
     }
 
     pub(crate) fn host_resources_unavailable(&mut self, detail: &str) {
         self.host_resources = None;
         self.job_vm_file_mib = None;
-        if !self.host_resources_failed.replace(true) {
+        let failure = HostResourcesFailure::Unavailable(detail.to_owned());
+        if self.host_resources_failed.get_mut().as_ref() != Some(&failure) {
+            *self.host_resources_failed.get_mut() = Some(failure);
             tracing::warn!(detail, "host_resources_unavailable");
         }
     }
@@ -352,7 +360,8 @@ impl Host {
             sample.at_ms.saturating_sub(now_ms) <= HOST_SAMPLE_AHEAD_MS
                 && now_ms.saturating_sub(sample.at_ms) <= super::MEMORY_FRESH_MS
         });
-        if fresh.is_none() && !self.host_resources_failed.replace(true) {
+        if fresh.is_none() && self.host_resources_failed.borrow().is_none() {
+            *self.host_resources_failed.borrow_mut() = Some(HostResourcesFailure::MissingOrStale);
             tracing::warn!(
                 now_ms,
                 sample_at_ms = self.host_resources.map(|s| s.at_ms),

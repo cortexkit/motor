@@ -35,6 +35,9 @@ impl Machine for Fake {
     fn job_vms_configured(&self) -> bool {
         self.job_vms_configured
     }
+    fn job_slice_memory_max_bytes(&self) -> Option<u64> {
+        self.job_vms_configured.then_some(8192)
+    }
     fn workspace_disk_max_bytes(&self) -> Option<u64> {
         self.job_vms_configured.then_some(4096)
     }
@@ -42,8 +45,10 @@ impl Machine for Fake {
         match op {
             images::Operation::Readiness {
                 job_vms_configured,
+                memory_max_bytes,
                 workspace_disk_max_bytes,
             } => {
+                assert_eq!(memory_max_bytes, job_vms_configured.then_some(8192));
                 self.calls.push("per_job_readiness");
                 Ok(Response::new(Reply::PerJobReadiness {
                     job_vms_configured,

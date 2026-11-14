@@ -88,6 +88,7 @@ impl Manifest {
 pub enum Operation {
     Readiness {
         job_vms_configured: bool,
+        memory_max_bytes: Option<u64>,
         workspace_disk_max_bytes: Option<u64>,
     },
     Inspect(String),
