@@ -5,6 +5,8 @@ mod journal_tests;
 #[cfg(test)]
 pub(crate) mod legacy_fixtures;
 #[cfg(test)]
+mod settlement_tests;
+#[cfg(test)]
 mod submission_tests;
 #[cfg(test)]
 pub(crate) use journal::durable_value;
@@ -205,6 +207,70 @@ impl Job {
                 .is_some_and(|detail| detail.starts_with("health_retired: "))
         })
     }
+    fn settled_before_run(&self) -> bool {
+        self.build_server_job_id.is_none()
+            && self
+                .hosted
+                .as_ref()
+                .is_some_and(|hosted| hosted.finish_done && !hosted.run_sent)
+    }
+    fn needs_settlement_terminal(&self) -> bool {
+        self.settled_before_run()
+            && [
+                self.local_terminal.as_ref(),
+                self.remote_terminal.as_ref(),
+                self.hosted.as_ref().and_then(|s| s.terminal.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|terminal| {
+                matches!(
+                    terminal.outcome,
+                    Outcome::OutcomeUnknown | Outcome::HistoryExpired
+                )
+            })
+    }
+    fn record_unstarted_hosted_terminal(&mut self, id: Uuid, now: u64) {
+        if !self.needs_settlement_terminal() {
+            return;
+        }
+        // Run is journaled before sending its frame. Once the submission ends,
+        // an unset flag proves nothing ran, even if broker settlement fails.
+        let terminal = TerminalRecord::new(
+            id,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::LostToRestart,
+            },
+            0,
+            0,
+            0,
+        )
+        .with_ran(Ran::None)
+        .with_refusal_detail("never started: the hosted submission ended before Run was sent");
+        let hosted = self.hosted.as_mut().unwrap();
+        hosted.terminal = Some(terminal.clone());
+        hosted.hosted_no_fallback = true;
+        if self.remote_terminal.is_some() {
+            self.remote_terminal = Some(terminal.clone());
+        }
+        self.local_terminal = Some(terminal);
+        self.terminal_observed_at_ms.get_or_insert(now);
+        self.retain_until_ms = Some(
+            self.retain_until_ms
+                .unwrap_or_default()
+                .max(now.saturating_add(RETENTION_MS)),
+        );
+    }
+    fn settlement_retired(&self) -> bool {
+        self.settled_before_run()
+            && self.local_terminal.as_ref().is_some_and(|terminal| {
+                terminal.outcome
+                    == (Outcome::RefusedBeforeStart {
+                        reason: RefusalReason::LostToRestart,
+                    })
+                    && terminal.ran == Some(Ran::None)
+            })
+    }
     /// For a job sent to the build server because the broker answered
     /// `no_host_fits`, the `max_vcpus` that answer named (inner None when it
     /// named none). Outer None for every other job.
@@ -368,7 +434,9 @@ impl State {
                 || job.hosted.as_ref().is_some_and(|s| s.needs_cleanup())
                 || (!job.legacy_expired(*id, now)
                     && (job.terminal_observed_at_ms.is_none()
-                        || (job.terminal_delivered_at_ms.is_none() && !job.health_retired())
+                        || (job.terminal_delivered_at_ms.is_none()
+                            && !job.health_retired()
+                            && !job.settlement_retired())
                         || job.retain_until_ms.is_none_or(|until| until > now)))
         });
         // Legacy cache entries get a full horizon on first load. Snapshot entries
@@ -536,6 +604,50 @@ impl Storage {
             }
         })
     }
+    /// Publish completed settlement and its never-started outcome together.
+    /// Placement retries leave `retire_unstarted` false because they can still send Run.
+    pub(crate) fn hosted_settlement_update(
+        &self,
+        id: Uuid,
+        retire_unstarted: bool,
+        f: impl FnOnce(&mut crate::hosted::HostedJobState),
+    ) -> io::Result<()> {
+        self.update(|s| {
+            if let Some(job) = s.jobs.get_mut(&id) {
+                if let Some(hosted) = job.hosted.as_mut() {
+                    f(hosted);
+                }
+                if retire_unstarted && job.needs_settlement_terminal() {
+                    job.record_unstarted_hosted_terminal(id, now_ms());
+                }
+            }
+        })
+    }
+    pub(crate) fn record_hosted_settlement_terminal(&self, id: Uuid) -> io::Result<()> {
+        self.update_when(
+            |s| s.jobs.get(&id).is_some_and(Job::needs_settlement_terminal),
+            |s| {
+                if let Some(job) = s.jobs.get_mut(&id) {
+                    job.record_unstarted_hosted_terminal(id, now_ms());
+                }
+            },
+        )
+    }
+    pub(crate) fn confirm_hosted_release_before_run(&self, id: Uuid) -> io::Result<()> {
+        self.update_when(
+            |s| {
+                s.jobs.get(&id).is_some_and(|job| {
+                    job.build_server_job_id.is_none()
+                        && job.hosted.as_ref().is_some_and(|s| !s.run_sent)
+                })
+            },
+            |s| {
+                let job = s.jobs.get_mut(&id).unwrap();
+                job.hosted.as_mut().unwrap().finish_done = true;
+                job.record_unstarted_hosted_terminal(id, now_ms());
+            },
+        )
+    }
     /// Resolve the destination ID without changing the caller's stored job.
     /// A bounced spill uses its build-server mapping; a hosted retry uses the
     /// current lease body. Windows retries use the same mapping so status,
@@ -646,6 +758,20 @@ impl Storage {
             #[cfg(test)]
             write_count: std::sync::atomic::AtomicUsize::new(0),
         };
+        // Older daemons could omit a never-started terminal or synthesize an
+        // unknown one from a released booking. Restore the no-Run evidence
+        // before pruning or broker reattach, without replacing real outcomes.
+        storage.update_when(
+            |s| s.jobs.values().any(Job::needs_settlement_terminal),
+            |s| {
+                let now = now_ms();
+                for (id, job) in &mut s.jobs {
+                    if job.needs_settlement_terminal() {
+                        job.record_unstarted_hosted_terminal(*id, now);
+                    }
+                }
+            },
+        )?;
         // Pruning belongs inside the transaction so its deletions enter the log.
         let needs_pruning = storage.state.lock().unwrap().clone().prune(now_ms());
         if needs_pruning {

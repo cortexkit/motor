@@ -39,12 +39,31 @@ impl Http {
         F: Fn(String, Value) -> R + Send + Sync + 'static,
         R: std::future::Future<Output = (u16, Vec<u8>)> + Send,
     {
+        Self::with_reply_mode(reply, false).await
+    }
+    pub async fn with_concurrent_reply<F, R>(reply: F) -> Self
+    where
+        F: Fn(String, Value) -> R + Send + Sync + 'static,
+        R: std::future::Future<Output = (u16, Vec<u8>)> + Send,
+    {
+        Self::with_reply_mode(reply, true).await
+    }
+    async fn with_reply_mode<F, R>(reply: F, concurrent: bool) -> Self
+    where
+        F: Fn(String, Value) -> R + Send + Sync + 'static,
+        R: std::future::Future<Output = (u16, Vec<u8>)> + Send,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Requests::default();
         let captured = requests.clone();
+        let reply = Arc::new(reply);
         let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             while let Ok((mut socket, _)) = listener.accept().await {
+                let captured = captured.clone();
+                let reply = reply.clone();
+                connections.spawn(async move {
                 let mut head = Vec::new();
                 loop {
                     let mut byte = [0];
@@ -63,7 +82,7 @@ impl Http {
                     .next()
                     .and_then(|line| line.split_whitespace().nth(1))
                 else {
-                    continue;
+                    return;
                 };
                 let len = text
                     .lines()
@@ -84,6 +103,14 @@ impl Http {
                 let head = format!("HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 let _ = socket.write_all(head.as_bytes()).await;
                 let _ = socket.write_all(&body).await;
+                });
+                if !concurrent {
+                    connections.join_next().await.unwrap().unwrap();
+                } else {
+                    while let Some(result) = connections.try_join_next() {
+                        result.unwrap();
+                    }
+                }
             }
         });
         Self {

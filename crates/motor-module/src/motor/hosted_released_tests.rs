@@ -1,0 +1,289 @@
+use super::*;
+use crate::hosted::{
+    boat_tests::committed_repo,
+    tests::harness::{Behavior, Harness, NoSsh},
+    Client,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+async fn terminal(mut stream: JobStream) -> TerminalRecord {
+    let record = tokio::time::timeout(Duration::from_secs(30), stream.records.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match record {
+        StreamRecord::Terminal(terminal) => terminal,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+async fn released_placement_wait_survives_restart(settle_at_shutdown: bool) {
+    let h = Harness::new(Behavior::Refuse("host_full")).await;
+    h.replace_replies.lock().unwrap().push_back((
+        503,
+        serde_json::json!({"error": "no_capacity"}),
+        "15",
+    ));
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let mut request = Harness::request(&repo);
+    request.queue_wait_limit_s = Some(300);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while h.replace_answers.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("submission must be waiting for replacement capacity");
+    assert!(!motor.hosted_state(id).unwrap().run_sent);
+    if settle_at_shutdown {
+        motor.shutdown_hosted().await;
+        assert!(motor.hosted_state(id).unwrap().finish_done);
+    }
+    drop(stream);
+    motor.close().await;
+    if !settle_at_shutdown {
+        assert!(h
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| !p.ends_with("/release")));
+    }
+
+    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    motor.resume_finishes().await;
+    motor.wait_hosted_cleanup(id).await;
+    let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(
+        result.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::LostToRestart
+        }
+    );
+    assert_eq!(result.ran, Some(Ran::None));
+    assert_eq!(
+        motor.job_status(id).await.unwrap().terminal,
+        Some(result.clone())
+    );
+    motor.close().await;
+
+    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    assert_eq!(
+        motor.job_status(id).await.unwrap().terminal,
+        Some(result.clone())
+    );
+    assert_eq!(
+        terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await,
+        result
+    );
+    let requests = h.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.iter().filter(|p| p.ends_with("/release")).count(),
+        1
+    );
+    assert!(requests.iter().all(|p| !p.ends_with("/reattach")));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn placement_wait_shutdown_release_restart_attach_is_never_started() {
+    released_placement_wait_survives_restart(true).await;
+}
+
+#[tokio::test]
+async fn placement_wait_restart_recovery_release_attach_is_never_started() {
+    released_placement_wait_survives_restart(false).await;
+}
+
+#[tokio::test]
+async fn restart_repairs_synthetic_no_run_outcomes_but_preserves_runner_full_refusal() {
+    let h = Harness::new(Behavior::Normal).await;
+    let refused = Outcome::RefusedBeforeStart {
+        reason: RefusalReason::RunnerFull,
+    };
+    let never_started = Outcome::RefusedBeforeStart {
+        reason: RefusalReason::LostToRestart,
+    };
+    for (stored, expected) in [
+        (Outcome::OutcomeUnknown, never_started.clone()),
+        (Outcome::HistoryExpired, never_started),
+        (refused.clone(), refused),
+    ] {
+        let scratch = cortexkit_test_support::ScratchDir::new("hosted-stored-synthetic-terminal");
+        let storage = Storage::open(&scratch).unwrap();
+        let id = Uuid::now_v7();
+        storage.create(id, 60, None, None, false).unwrap();
+        storage.hosted_route(id, h.route.clone()).unwrap();
+        let is_refusal = matches!(stored, Outcome::RefusedBeforeStart { .. });
+        let original = TerminalRecord::new(id, stored, 0, 0, 0).with_ran(if is_refusal {
+            Ran::None
+        } else {
+            Ran::Unknown("maybe".into())
+        });
+        storage
+            .hosted_update(id, |s| {
+                s.finish_done = true;
+                s.terminal = Some(original.clone());
+            })
+            .unwrap();
+        if is_refusal {
+            storage.local_terminal(original.clone()).unwrap();
+        }
+        drop(storage);
+
+        let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+        let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+        let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+        assert_eq!(result.outcome, expected);
+        if is_refusal {
+            assert_eq!(result, original);
+        }
+        if matches!(
+            result.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::LostToRestart
+            }
+        ) {
+            assert_eq!(result.ran, Some(Ran::None));
+        }
+        assert_eq!(motor.job_status(id).await.unwrap().terminal, Some(result));
+        assert!(h.requests.lock().unwrap().is_empty());
+        assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+        motor.close().await;
+    }
+}
+
+async fn observe_release_before_its_reply(attach_first: bool) {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-release-in-flight");
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    let id = Uuid::now_v7();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let http = crate::hosted::test_http::Http::with_concurrent_reply({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |path, _| {
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                if path.ends_with("/release") {
+                    entered.notify_one();
+                    release.notified().await;
+                    (
+                        202,
+                        serde_json::to_vec(&serde_json::json!({"job_id": id, "release_at_ms": 0}))
+                            .unwrap(),
+                    )
+                } else {
+                    assert_eq!(path, format!("/v1/leases/{id}/reattach"));
+                    (
+                        409,
+                        serde_json::to_vec(&serde_json::json!({"error": "job_released"})).unwrap(),
+                    )
+                }
+            }
+        }
+    })
+    .await;
+    motor.storage.create(id, 60, None, None, false).unwrap();
+    motor.storage.hosted_route(id, h.route.clone()).unwrap();
+    motor
+        .storage
+        .hosted_update(id, |state| {
+            state.broker_url = http.url.clone();
+            state.lease_attempted = true;
+        })
+        .unwrap();
+    motor.recover_hosted(id);
+    tokio::time::timeout(Duration::from_secs(30), entered.notified())
+        .await
+        .unwrap();
+    let job = motor.storage.job(id).unwrap();
+    assert!(job.local_terminal.is_none());
+    assert!(!job.hosted.unwrap().finish_done);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        if attach_first {
+            terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await
+        } else {
+            motor.job_status(id).await.unwrap().terminal.unwrap()
+        }
+    })
+    .await
+    .expect("never-started result must not wait for the release reply");
+    assert_eq!(
+        result.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::LostToRestart
+        }
+    );
+    assert_eq!(result.ran, Some(Ran::None));
+    assert_eq!(motor.job_status(id).await.unwrap().terminal, Some(result));
+    release.notify_one();
+    motor.wait_hosted_cleanup(id).await;
+    assert!(motor.storage.job(id).unwrap().hosted.unwrap().finish_done);
+    assert_eq!(http.requests.lock().unwrap().len(), 2);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn attach_during_release_before_its_reply_is_never_started() {
+    observe_release_before_its_reply(true).await;
+}
+
+#[tokio::test]
+async fn status_during_release_before_its_reply_is_never_started() {
+    observe_release_before_its_reply(false).await;
+}
+
+#[tokio::test]
+async fn released_booking_with_run_sent_remains_may_have_run() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.run_gate.send_replace(false);
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let stream = motor.run(Harness::request(&repo)).unwrap();
+    let id = stream.job_id;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while h.runs.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("host must receive Run");
+    assert!(motor.hosted_state(id).unwrap().run_sent);
+    drop(stream);
+    motor.close().await;
+    h.requests.lock().unwrap().clear();
+    Client::new(h.route.clone()).release(id).await.unwrap();
+
+    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    assert_eq!(result.ran, Some(Ran::Unknown("maybe".into())));
+    // The existing unknown-outcome path also probes cancellation on its own attach.
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("/reattach"))
+            .count(),
+        2
+    );
+    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    motor.close().await;
+}

@@ -1519,7 +1519,8 @@ async fn pump_direct_secret(
 /// request is cancelled. A cancelled request is a detach, never a job cancel:
 /// the request is cancelled when the caller drops its stream (AFT does this on
 /// Esc, a tool timeout or its own restart, then reattaches with exec.attach) and
-/// when ck-motor itself shuts down. Only exec.cancel stops a job.
+/// when ck-motor itself shuts down. A hosted submission that has not sent Run
+/// ends before start; an already submitted job continues unless exec.cancel stops it.
 pub(crate) async fn forward<F, E>(
     cancelled: impl std::future::Future<Output = ()>,
     mut stream: JobStream,
@@ -1536,7 +1537,7 @@ where
             // wins so the detached caller does not keep draining the job stream.
             biased;
             _ = &mut cancelled => {
-                eprintln!("ck-motor: caller_detached job_id={} job keeps running; attach to resume", stream.job_id);
+                log_caller_detached(&stream);
                 return Ok(());
             },
             record = stream.records.recv() => match record {
@@ -1548,14 +1549,14 @@ where
                     let result = tokio::select! {
                         biased;
                         _ = &mut cancelled => {
-                            eprintln!("ck-motor: caller_detached job_id={} job keeps running; attach to resume", stream.job_id);
+                            log_caller_detached(&stream);
                             return Ok(());
                         }
                         result = emit(record) => result,
                     };
                     if let Err(error) = result {
                         if error.kind() == io::ErrorKind::NotConnected {
-                            eprintln!("ck-motor: caller_detached job_id={} job keeps running; attach to resume", stream.job_id);
+                            log_caller_detached(&stream);
                             return Ok(());
                         }
                         return Err(error);
@@ -1568,6 +1569,45 @@ where
                 None => return Err(io::Error::other("stream ended without terminal record")),
             }
         }
+    }
+}
+
+fn caller_detached_message(hosted: Option<&crate::HostedJobState>) -> &'static str {
+    if hosted.is_some_and(|state| !state.run_sent) {
+        "submission ended before start; attach for the never-started outcome"
+    } else {
+        "job keeps running; attach to resume"
+    }
+}
+
+fn log_caller_detached(stream: &JobStream) {
+    eprintln!(
+        "ck-motor: caller_detached job_id={} {}",
+        stream.job_id,
+        caller_detached_message(stream.hosted_state().as_ref())
+    );
+}
+
+#[cfg(test)]
+mod detach_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_detach_only_claims_running_after_run_was_sent() {
+        let mut hosted = crate::HostedJobState::default();
+        assert_eq!(
+            caller_detached_message(Some(&hosted)),
+            "submission ended before start; attach for the never-started outcome"
+        );
+        hosted.run_sent = true;
+        assert_eq!(
+            caller_detached_message(Some(&hosted)),
+            "job keeps running; attach to resume"
+        );
+        assert_eq!(
+            caller_detached_message(None),
+            "job keeps running; attach to resume"
+        );
     }
 }
 
