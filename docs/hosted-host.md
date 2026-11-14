@@ -302,6 +302,7 @@ out of memory.
 
 | Setting | Unit | Meaning |
 | --- | --- | --- |
+| `fork_checkouts` | boolean | Copy a new worktree's checkout disk from the repository's most recent warm disk; requires a job image whose runner adopts forked disks. |
 | `vcpu_ceiling` | vCPUs | Maximum job size; 1 through the helper's online CPU count. |
 | `permit_budget` | vCPU permits | Host admission budget with CPU overcommit; at least `vcpu_ceiling`, at most four times online CPUs. |
 | `host_reserve_mib` | MiB | Available-memory floor at both the host and job-VM slice limits for admission and pressure reclamation. |

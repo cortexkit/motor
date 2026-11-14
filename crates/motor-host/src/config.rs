@@ -18,10 +18,11 @@ impl HostMode {
     }
 }
 
-/// Operator-selected bounds. None of these values has a compiled-in default.
+/// Operator-selected per-job settings. None of these values has a compiled-in default.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PerJobSettings {
+    pub fork_checkouts: bool,
     pub vcpu_ceiling: u32,
     pub permit_budget: u32,
     pub host_reserve_mib: u64,

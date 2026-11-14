@@ -95,6 +95,7 @@ fn host_settings() -> [motor_host::config::HostSettings; 2] {
     [
         HostSettings::Tenant,
         HostSettings::PerJob(PerJobSettings {
+            fork_checkouts: false,
             vcpu_ceiling: 2,
             permit_budget: 4,
             host_reserve_mib: 1024,

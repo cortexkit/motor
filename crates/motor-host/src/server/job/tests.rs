@@ -684,6 +684,7 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>) {
     let (journal, snapshot) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
     let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
     host.settings = crate::config::HostSettings::PerJob(crate::config::PerJobSettings {
+        fork_checkouts: true,
         vcpu_ceiling: 2,
         permit_budget: 4,
         host_reserve_mib: 50,
