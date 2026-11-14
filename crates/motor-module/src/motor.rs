@@ -76,7 +76,7 @@ pub struct Motor {
         Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Arc<hosted_result::Owner>>>>,
     #[cfg(test)]
     hosted_connector: Option<Arc<dyn Connector>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "operator-direct-probe"))]
     test_fixture_direct_route: bool,
     keyed_admissions: Arc<std::sync::Mutex<()>>,
     health_progress:
@@ -176,7 +176,7 @@ impl Motor {
             hosted_results: Arc::default(),
             #[cfg(test)]
             hosted_connector: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "operator-direct-probe"))]
             test_fixture_direct_route: false,
             keyed_admissions: Arc::default(),
             health_probes: Arc::default(),
@@ -184,19 +184,33 @@ impl Motor {
             wsl: crate::wsl::Checks::default(),
         })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "operator-direct-probe"))]
     pub(crate) fn test_fixture_direct_route(mut self) -> Self {
-        // Keep coverage of the shared direct protocol after removal of the Linux direct runner.
+        // The shared direct protocol serves test fixtures and operator-pinned probes only.
         self.test_fixture_direct_route = true;
         self
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "operator-direct-probe"))]
     pub(crate) fn with_test_fixture_direct_route(
         config: Config,
         storage_root: &Path,
         connector: Arc<dyn Connector>,
     ) -> io::Result<Self> {
         Self::with_connector(config, storage_root, connector).map(Self::test_fixture_direct_route)
+    }
+
+    /// Open an operator-only direct probe through the operator's own pinned SSH forward.
+    ///
+    /// This constructor lets the Boat image qualification probe talk to a runner
+    /// without a hosted lease.
+    /// It must never be used by the daemon or CLI.
+    #[cfg(feature = "operator-direct-probe")]
+    pub fn with_operator_direct_probe(
+        config: Config,
+        storage_root: &Path,
+        connector: Arc<dyn Connector>,
+    ) -> io::Result<Self> {
+        Self::with_test_fixture_direct_route(config, storage_root, connector)
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
         self.account_tokens = Some(tokens);
@@ -419,7 +433,7 @@ impl Motor {
             .or((request.memory_mib.is_some() && !self.config.memory_sizes)
                 .then_some("memory_mib requires exec-remote-memory/v1; memory_sizes is disabled"));
         let linux = matches!(request.platform, None | Some(Platform::Linux));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "operator-direct-probe"))]
         let linux = linux && !self.test_fixture_direct_route;
         let wsl_refusal = self.wsl.refusal(
             [
@@ -483,7 +497,7 @@ impl Motor {
                     .map(|t| t.instance)
             })
             .flatten();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "operator-direct-probe"))]
         let instance = instance.or_else(|| {
             self.test_fixture_direct_route
                 .then(|| self.config.runner_instance.clone())
@@ -3613,7 +3627,7 @@ impl Motor {
         platform: Option<&Platform>,
     ) -> io::Result<RunnerStatusReply> {
         let hosted = matches!(platform, None | Some(Platform::Linux));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "operator-direct-probe"))]
         let hosted = hosted && !self.test_fixture_direct_route;
         if hosted {
             // This is the aggregate exec.status view, not a direct-runner probe.
@@ -3632,7 +3646,7 @@ impl Motor {
         platform: Option<&Platform>,
     ) -> io::Result<RunnerStatusReply> {
         let target = self.config.target(platform);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "operator-direct-probe"))]
         let target =
             if self.test_fixture_direct_route && matches!(platform, None | Some(Platform::Linux)) {
                 self.config.stored_target(None)

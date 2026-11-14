@@ -44,7 +44,7 @@ async fn main() -> io::Result<()> {
     if !address.ip().is_loopback() {
         return Err(io::Error::other("probe requires a loopback SSH forward"));
     }
-    let motor = Motor::with_connector(
+    let motor = Motor::with_operator_direct_probe(
         Config::default(),
         Path::new(&args[2]),
         Arc::new(Forward(address)),

@@ -2322,7 +2322,8 @@ class RunnerHost:
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT, check=True, stdout=sys.stderr)
         build = process(["env", "-u", "GIT_CONFIG_COUNT", "-u", "GIT_CONFIG_KEY_0", "-u", "GIT_CONFIG_VALUE_0",
-                         "cargo", "build", "--locked", "-p", "motor-module", "--example", "boat_probe"], timeout=600)
+                         "cargo", "build", "--locked", "-p", "motor-module", "--example", "boat_probe",
+                         "--features", "operator-direct-probe"], timeout=600)
         self.data["client_build"] = build
         if build.get("exit_code") != 0:
             raise ValueError("local operator client build failed")
