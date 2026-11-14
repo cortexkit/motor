@@ -958,6 +958,7 @@ pub trait RecordStream: Send {
 /// ck-motor answers these before it creates a job, so seeing one before any
 /// record proves nothing ran.
 const REFUSED_BEFORE_JOB: &[&str] = &[
+    "boat_only_ineligible",
     "motor_route_not_admitted",
     "motor_op_not_permitted_for_principal",
 ];
@@ -1654,11 +1655,11 @@ async fn consume<C: ExecClient + ?Sized>(
                     let placement = state
                         .placement
                         .as_ref()
-                        .map(|p| p.host.as_str())
-                        .unwrap_or("unknown");
+                        .map(crate::hosted::placement::terminal_placement)
+                        .unwrap_or_else(|| "first_party/unknown".to_owned());
                     let _ = writeln!(
                         err,
-                        "ck motor {name}: placement: first_party/{placement}, max runtime: {} s",
+                        "ck motor {name}: placement: {placement}, max runtime: {} s",
                         state.max_runtime_s.unwrap_or_default()
                     );
                 }
@@ -2067,6 +2068,12 @@ fn direct_envelope(op: &str, params: impl serde::Serialize, secret: Option<&str>
 fn submit_error(error: CallError, module_id: &str) -> SubmitError {
     match error {
         CallError::NotSent(_) | CallError::StaleRouteHandle(_) => {
+            SubmitError::NotSent(error.to_string())
+        }
+        _ if error
+            .code()
+            .is_some_and(|code| REFUSED_BEFORE_JOB.contains(&code)) =>
+        {
             SubmitError::NotSent(error.to_string())
         }
         _ if error.code() == Some("motor_job_not_found") => {
@@ -2518,6 +2525,35 @@ fn interrupt_signals() -> std::io::Result<mpsc::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn submit_classifies_pre_job_module_refusals_as_not_sent() {
+        use super::*;
+
+        for code in [
+            "boat_only_ineligible",
+            "motor_route_not_admitted",
+            "motor_op_not_permitted_for_principal",
+        ] {
+            let body: subc_protocol::ErrorBody =
+                serde_json::from_value(json!({"code": code, "message": "refused"})).unwrap();
+            assert!(
+                matches!(
+                    submit_error(CallError::Module(body), "motor"),
+                    SubmitError::NotSent(_)
+                ),
+                "{code} must be refused before start"
+            );
+        }
+        for code in ["motor_hosted_test_unavailable", "some_other_error"] {
+            let body: subc_protocol::ErrorBody =
+                serde_json::from_value(json!({"code": code, "message": "failure"})).unwrap();
+            assert!(matches!(
+                submit_error(CallError::Module(body), "motor"),
+                SubmitError::Unknown(_)
+            ));
+        }
+    }
+
     #[test]
     fn daemon_errors_preserve_only_missing_claimants_as_retryable() {
         use super::*;
@@ -3525,6 +3561,69 @@ mod hosted_cli_tests {
         }
         async fn cancel(&self, _: Uuid, _: Option<&str>) -> Result<(), String> {
             unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_hosted_placement_uses_provider_and_preserves_first_party_output() {
+        for (placement, expected) in [
+            (
+                Some(("boat:allocation", Some("bx_63zeabdp"))),
+                "boat/bx_63zeabdp",
+            ),
+            (Some(("test-host", None)), "first_party/test-host"),
+            (None, "first_party/unknown"),
+        ] {
+            let id = Uuid::now_v7();
+            let accepted = motor_protocol::Accepted::new(id, 0);
+            let mut record = serde_json::to_value(StreamRecord::Accepted(accepted)).unwrap();
+            record["hosted"] = serde_json::to_value(crate::HostedJobState {
+                placement: placement.map(|(host, vm)| motor_lease::Placement {
+                    host: host.into(),
+                    vm: vm.map(str::to_owned),
+                }),
+                max_runtime_s: Some(60),
+                ..crate::HostedJobState::default()
+            })
+            .unwrap();
+            let terminal =
+                StreamRecord::Terminal(TerminalRecord::new(id, Outcome::Exit { code: 0 }, 0, 0, 0));
+            let records = Records(VecDeque::from([
+                serde_json::to_vec(&record).unwrap(),
+                serde_json::to_vec(&terminal).unwrap(),
+            ]));
+            let (_, mut interrupts) = mpsc::channel(1);
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = consume(
+                &UnusedClient,
+                Box::new(records),
+                Session {
+                    records: None,
+                    returns: returned_files::Returns::new(
+                        None,
+                        None,
+                        cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP,
+                    ),
+                    job_id: None,
+                    secret: None,
+                    secret_file: None,
+                    secret_for_attach: None,
+                    default_secret_directory: None,
+                    default_secret_file: None,
+                },
+                &mut out,
+                &mut err,
+                &mut interrupts,
+            )
+            .await;
+            assert_eq!(code, 0);
+            let err = String::from_utf8(err).unwrap();
+            assert!(
+                err.lines().any(|line| line
+                    == format!("ck motor run: placement: {expected}, max runtime: 60 s")),
+                "{err}"
+            );
         }
     }
 
