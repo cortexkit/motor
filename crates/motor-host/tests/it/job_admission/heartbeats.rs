@@ -23,6 +23,7 @@ fn disk(h: &mut Host, id: &str, used: u64) {
         WorkspaceDisk {
             repository_key: None,
             forked_from: None,
+            forked: false,
             storage: Some(motor_host::state::jobs::storage::Disk::new(1024, used)),
             sub: TENANT.into(),
             workspace_key_hash: HASH.into(),

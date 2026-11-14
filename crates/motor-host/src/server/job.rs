@@ -1305,8 +1305,10 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                         candidate_count = plan.request.donor_ids.len(), ?selected_position,
                         size_rule = "size rule applied by the helper",
                         clone_elapsed_ms = elapsed_ms, committed = committed.is_ok(),
+                        forked = true,
                         error = ?committed.err(), "workspace_forked");
-                    // A synced clone remains usable cold even if recording the fork in host state fails.
+                    // The durable forked flag still requires guest history cleanup
+                    // if saving the donor's have records or forked_from id fails.
                     return;
                 }
                 Err(error) => {
@@ -1318,7 +1320,7 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                     tracing::info!(jti = %job, donor_ids = ?plan.request.donor_ids,
                         candidate_count = plan.request.donor_ids.len(),
                         size_rule = "size rule applied by the helper", clone_elapsed_ms = elapsed_ms,
-                        committed = false, %error, "workspace_fork_failed; falling back to base or empty");
+                        committed = false, forked = true, %error, "workspace_fork_failed; falling back to base or empty");
                 }
             }
         }
@@ -1454,8 +1456,7 @@ async fn boot(
         .snapshot
         .per_job
         .disks[&execution.disk_id]
-        .forked_from
-        .is_some()
+        .forked
     {
         request["forked"] = serde_json::json!(true);
     }

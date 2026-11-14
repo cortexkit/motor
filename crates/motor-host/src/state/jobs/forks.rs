@@ -108,20 +108,31 @@ impl Host {
             donor_ids: donors.iter().map(|(id, _)| (*id).clone()).collect(),
             cache_write_job_id: Some(job.into()),
         };
-        let donors = donors
+        let mut donors: BTreeMap<_, _> = donors
             .into_iter()
             .map(|(id, disk)| {
-                let hold = self.fork_holds.entry(id.clone()).or_default();
-                hold.users += 1;
                 (
                     id.clone(),
                     Donor {
                         have: disk.have.clone(),
-                        revision: hold.revision,
+                        revision: 0,
                     },
                 )
             })
             .collect();
+        // The helper can publish a clone even if its reply or the later host
+        // commit is lost. Persist guest history cleanup before cloning starts.
+        let mut next = self.snapshot.clone();
+        let disk = next.per_job.disks.get_mut(&request.disk_id).unwrap();
+        disk.forked = true;
+        disk.forked_from = None;
+        disk.have.clear();
+        self.save(next)?;
+        for (id, donor) in &mut donors {
+            let hold = self.fork_holds.entry(id.clone()).or_default();
+            hold.users += 1;
+            donor.revision = hold.revision;
+        }
         Ok(Some(Plan { request, donors }))
     }
 
@@ -171,6 +182,7 @@ impl Host {
             anyhow::ensure!(
                 execution.disk_id == plan.request.disk_id
                     && disk.sub == plan.request.account
+                    && disk.forked
                     && !disk.deleted
                     && !disk.quarantined
                     && disk.recovery.is_none()

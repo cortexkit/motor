@@ -82,6 +82,8 @@ pub struct WorkspaceDisk {
     pub repository_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<storage::Disk>,
     pub sub: String,
@@ -508,6 +510,7 @@ impl Host {
                 .or_insert_with(|| WorkspaceDisk {
                     repository_key: None,
                     forked_from: None,
+                    forked: false,
                     storage: Some(storage::Disk::new(
                         settings.workspace_disk_cap_bytes,
                         now_ms,
@@ -674,6 +677,7 @@ impl Host {
         let disk = next.per_job.disks.get_mut(&execution.disk_id).unwrap();
         if execution.runner_hello {
             disk.forked_from = None;
+            disk.forked = false;
         }
         disk.queue.retain(|queued| queued != job);
         if disk.attached_job.as_deref() == Some(job) {

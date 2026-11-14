@@ -89,6 +89,7 @@ fn full() -> Snapshot {
         motor_host::state::jobs::WorkspaceDisk {
             repository_key: Some("repository-key".into()),
             forked_from: Some("ws-donor".into()),
+            forked: true,
             storage: Some(motor_host::state::jobs::storage::Disk::new(1024, 123)),
             sub: claims(JOB).sub,
             workspace_key_hash: claims(JOB).workspace_key_hash.unwrap(),

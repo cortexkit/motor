@@ -366,7 +366,69 @@ fn older_disk_state_round_trips_without_new_fields() {
     let disk: crate::state::jobs::WorkspaceDisk = serde_json::from_value(old.clone()).unwrap();
     assert!(disk.repository_key.is_none());
     assert!(disk.forked_from.is_none());
+    assert!(!disk.forked);
     assert_eq!(serde_json::to_value(disk).unwrap(), old);
+}
+
+struct FailOneSave(AtomicBool);
+
+impl crate::journal::Journal for FailOneSave {
+    fn store(&mut self, _: &Snapshot) -> std::io::Result<()> {
+        if self.0.swap(false, Ordering::SeqCst) {
+            Err(std::io::Error::other("injected journal write failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn failed_preclone_mark_save_does_not_fork_and_still_seeds_from_base() {
+    let (runtime, fake, _storage, c, _) = setup();
+    let (execution, base_have) = {
+        let mut host = runtime.host.lock().unwrap();
+        donor(&mut host, "donor", 1);
+        let have = host.snapshot.per_job.disks["donor"].have.clone();
+        host.snapshot.per_job.bases.insert(
+            "base".into(),
+            crate::state::jobs::storage::Base {
+                sub: c.sub,
+                repository_key: Some(crate::jobs::fill_source::repository_key(ROOT)),
+                have: have.clone(),
+                last_used_ms: 1,
+                evicting: false,
+            },
+        );
+        host.replace_journal(Box::new(FailOneSave(AtomicBool::new(true))));
+        (host.snapshot.per_job.executions[JOB].clone(), have)
+    };
+    seed_workspace(&runtime, &execution, ROOT);
+    assert!(fake.forks.lock().unwrap().is_empty());
+    assert_eq!(fake.seeds.lock().unwrap().len(), 1);
+    let host = runtime.host.lock().unwrap();
+    let disk = &host.snapshot.per_job.disks[&execution.disk_id];
+    assert_eq!(disk.have, base_have);
+    assert!(!disk.forked);
+    assert!(disk.forked_from.is_none());
+}
+
+#[test]
+fn failed_fork_commit_save_keeps_durable_history_cleanup_without_donor_have() {
+    let (runtime, _, storage, _, _) = setup();
+    let mut host = runtime.host.lock().unwrap();
+    donor(&mut host, "donor", 1);
+    let plan = host.job_fork_plan(JOB, ROOT).unwrap().unwrap();
+    host.replace_journal(Box::new(FailOneSave(AtomicBool::new(true))));
+    assert!(host.job_forked(JOB, &plan, "donor").is_err());
+    let disk = &host.snapshot.per_job.disks[&plan.request.disk_id];
+    assert!(disk.forked);
+    assert!(disk.have.is_empty());
+    assert!(disk.forked_from.is_none());
+    let (_, saved) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+    let disk = &saved.per_job.disks[&plan.request.disk_id];
+    assert!(disk.forked);
+    assert!(disk.have.is_empty());
+    assert!(disk.forked_from.is_none());
 }
 
 #[test]
@@ -381,6 +443,12 @@ fn fork_marker_survives_preboot_cancel_and_failed_boot_but_not_a_booted_end() {
             .get_mut(&disk_id)
             .unwrap()
             .forked_from = Some("donor".into());
+        host.snapshot
+            .per_job
+            .disks
+            .get_mut(&disk_id)
+            .unwrap()
+            .forked = true;
         if phase != "cancel" {
             boot_at(&mut host, JOB, unix_ms());
         }
@@ -392,6 +460,10 @@ fn fork_marker_survives_preboot_cancel_and_failed_boot_but_not_a_booted_end() {
         host.job_stopped_at(JOB, false, unix_ms()).unwrap();
         assert_eq!(
             host.snapshot.per_job.disks[&disk_id].forked_from.is_some(),
+            phase != "booted"
+        );
+        assert_eq!(
+            host.snapshot.per_job.disks[&disk_id].forked,
             phase != "booted"
         );
     }
@@ -477,6 +549,7 @@ async fn helper_forks_unlocked_and_attach_carries_marker_until_booted_job_ends()
             .forked_from
             .is_none()
     );
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.disks[&disk_id].forked);
 }
 
 async fn assert_fork_fallback(error: &str, use_base: bool, fail_seed: bool) {
@@ -530,7 +603,7 @@ async fn assert_fork_fallback(error: &str, use_base: bool, fail_seed: bool) {
         assert!(!disk.quarantined);
         assert!(host.snapshot.leases[JOB].delivered);
     }
-    assert_ne!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
+    assert_eq!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
     drop(client);
     task.await.unwrap().unwrap();
     runtime.stop_job(JOB, true, false).unwrap();
@@ -544,10 +617,98 @@ async fn fork_errors_and_unknown_operation_without_a_base_leave_empty_have_and_j
 }
 
 #[tokio::test]
-async fn fork_refused_then_base_seed_succeeds_records_base_have_and_last_used() {
+async fn fork_refused_then_base_seed_records_have_last_used_and_attach_forked() {
     for error in ["clone failed", "unknown variant `fork_workspace`"] {
         assert_fork_fallback(error, true, false).await;
     }
+}
+
+#[tokio::test]
+async fn donor_have_changed_during_clone_still_attaches_forked_with_empty_have() {
+    let (runtime, fake, _storage, c, id) = setup();
+    hold_boot(&runtime, &fake, "fork");
+    donor(&mut runtime.host.lock().unwrap(), "donor", 1);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    let mut request = run(JOB);
+    request["repository_root"] = json!(ROOT);
+    write_frame(&mut client, &request).await.unwrap();
+    next_type(&mut client, "accepted").await;
+    fake.entered.notified().await;
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let mut next = host.snapshot.clone();
+        next.per_job.disks.get_mut("donor").unwrap().have.clear();
+        host.save(next).unwrap();
+    }
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    next_type(&mut client, "output").await;
+    assert_eq!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
+    {
+        let host = runtime.host.lock().unwrap();
+        let disk = &host.snapshot.per_job.disks[&host.snapshot.per_job.executions[JOB].disk_id];
+        assert!(disk.have.is_empty());
+        assert!(disk.forked_from.is_none());
+        assert!(!disk.quarantined);
+    }
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB, true, false).unwrap();
+}
+
+#[tokio::test]
+async fn lost_fork_reply_reloads_durable_mark_and_next_boot_attaches_forked() {
+    let (runtime, fake, storage, c, _) = setup();
+    let execution = {
+        let mut host = runtime.host.lock().unwrap();
+        donor(&mut host, "donor", 1);
+        boot_at(&mut host, JOB, unix_ms());
+        host.snapshot.per_job.executions[JOB].clone()
+    };
+    *fake.fork_journal.lock().unwrap() = Some(storage.root.path().join("journal.json"));
+    fake.fork_reply_lost.store(true, Ordering::SeqCst);
+    seed_workspace(&runtime, &execution, ROOT);
+    assert_eq!(
+        fake.workspace_contents.lock().unwrap()[&execution.disk_id],
+        Some("donor".into())
+    );
+    let settings = runtime.host.lock().unwrap().settings.clone();
+    drop(runtime);
+    let (journal, snapshot) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+    let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
+    host.settings = settings;
+    host.record_host_resources(HostResources {
+        at_ms: unix_ms(),
+        job_vm_headroom_mib: u64::MAX,
+        available_mem_mib: 1000,
+        vcpu_ceiling: 2,
+        permit_budget: 4,
+    });
+    host.job_stopped_at(JOB, false, unix_ms()).unwrap();
+    let runtime = Runtime::with_job_resources("host".into(), host, fake.clone(), storage);
+    runtime
+        .configure_job_resolvers(vec!["1.1.1.1".into()])
+        .unwrap();
+    let mut next_claim = c;
+    next_claim.jti = JOB2.into();
+    let id = claim(&runtime, &next_claim);
+    let (mut client, task) = start(runtime.clone(), next_claim, id).await;
+    queued(&mut client, JOB2).await;
+    next_type(&mut client, "output").await;
+    assert_eq!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
+    assert_eq!(*fake.fork_marks_on_entry.lock().unwrap(), [true]);
+    {
+        let host = runtime.host.lock().unwrap();
+        let disk = &host.snapshot.per_job.disks[&execution.disk_id];
+        assert!(disk.have.is_empty());
+        assert!(disk.forked_from.is_none());
+    }
+    drop(client);
+    task.await.unwrap().unwrap();
+    runtime.stop_job(JOB2, true, false).unwrap();
 }
 
 #[tokio::test]
@@ -571,6 +732,12 @@ async fn preboot_cancel_preserves_marker_for_next_attach() {
             .get_mut(&disk_id)
             .unwrap()
             .forked_from = Some("donor".into());
+        host.snapshot
+            .per_job
+            .disks
+            .get_mut(&disk_id)
+            .unwrap()
+            .forked = true;
         host.job_stopped_at(JOB, false, unix_ms()).unwrap();
         host.claim(next_claim.clone(), unix_ms()).unwrap().0
     };
