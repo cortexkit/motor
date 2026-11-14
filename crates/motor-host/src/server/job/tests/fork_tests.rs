@@ -262,6 +262,24 @@ fn invalidated_or_changed_then_restored_have_is_never_copied() {
 }
 
 #[test]
+fn repeated_invalidation_of_empty_have_still_refuses_fork_commit() {
+    let (runtime, _, _storage, _, _) = setup();
+    let mut host = runtime.host.lock().unwrap();
+    donor(&mut host, "donor", 1);
+    let mut next = host.snapshot.clone();
+    crate::state::jobs::have::invalidate(&mut next, "history-donor");
+    host.save(next).unwrap();
+    let plan = host.job_fork_plan(JOB, ROOT).unwrap().unwrap();
+    let mut next = host.snapshot.clone();
+    crate::state::jobs::have::invalidate(&mut next, "history-donor");
+    host.save(next).unwrap();
+    assert!(host.job_forked(JOB, &plan, "donor").is_err());
+    assert!(host.snapshot.per_job.disks[&plan.request.disk_id]
+        .forked_from
+        .is_none());
+}
+
+#[test]
 fn unlisted_reply_and_lost_holds_do_not_commit_possession() {
     for restart in [false, true] {
         let (runtime, _, _storage, _, _) = setup();

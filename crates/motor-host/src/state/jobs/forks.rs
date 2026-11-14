@@ -215,18 +215,14 @@ impl Host {
                 }
                 _ => true,
             };
+            // A saved write of an invalidated execution rejects the donor even
+            // when its have list is already empty and its invalidation flag is unchanged.
             if changed
                 || next.per_job.executions.changed_keys().any(|job| {
-                    next.per_job.executions.get(job).is_some_and(|e| {
-                        e.disk_id == *id
-                            && e.have_invalidated
-                            && !self
-                                .snapshot
-                                .per_job
-                                .executions
-                                .get(job)
-                                .is_some_and(|old| old.have_invalidated)
-                    })
+                    next.per_job
+                        .executions
+                        .get(job)
+                        .is_some_and(|e| e.disk_id == *id && e.have_invalidated)
                 })
             {
                 hold.revision += 1;
