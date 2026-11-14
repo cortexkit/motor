@@ -76,11 +76,7 @@ pub(crate) fn checkout_path(roots: &Path, caller: &str) -> io::Result<PathBuf> {
     {
         return Err(refusal("path outside /tenant/roots"));
     }
-    // A path already spelled on the checkout disk needs no bind-root prefix.
-    if Path::new(caller).starts_with(roots) {
-        return Ok(PathBuf::from(caller));
-    }
-    if !matches!(caller.split('/').nth(1), Some("home" | "Users")) {
+    if !caller.starts_with("/home/") && !caller.starts_with("/Users/") {
         return Err(refusal("path outside /tenant/roots"));
     }
     Ok(roots.join(&caller[1..]))
@@ -134,6 +130,10 @@ fn components(roots: &Path, path: &Path, device: u64) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn confined(roots: &Path, path: &Path) -> io::Result<()> {
+    components(roots, path, fs::symlink_metadata(roots)?.dev())
+}
+
 /// After staging the source, the destination may contain only one empty chain.
 /// Validate the entire chain before deleting any directory, so a refusal can
 /// restore the source with a single rename.
@@ -150,20 +150,31 @@ fn empty_chain(destination: &Path, device: u64, source: Option<&Path>) -> io::Re
             Ok(_) => directory(&current, device)?,
         }
         chain.push(current.clone());
-        let children = fs::read_dir(&current)?
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .map_or(true, |entry| Some(entry.path().as_path()) != source)
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+        let children = destination_children(
+            fs::read_dir(&current)?.map(|entry| entry.map(|entry| entry.path())),
+            source,
+        )?;
         match children.as_slice() {
             [] => break,
-            [child] => current = child.path(),
+            [child] => current = child.clone(),
             _ => return Err(refusal("non-empty destination")),
         }
     }
     Ok(chain)
+}
+
+fn destination_children(
+    entries: impl Iterator<Item = io::Result<PathBuf>>,
+    source: Option<&Path>,
+) -> io::Result<Vec<PathBuf>> {
+    entries
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .map_or(true, |path| Some(path.as_path()) != source)
+        })
+        .take(2)
+        .collect()
 }
 
 pub(crate) fn clean_staging(roots: &Path) -> io::Result<()> {
@@ -209,15 +220,9 @@ pub(crate) fn move_checkout(
     empty_chain(destination, device, Some(source))?;
     repair()?;
     let staging = roots.join(format!(".adopt-{}", uuid::Uuid::now_v7()));
-    let missing_parents: Vec<_> = destination
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .take_while(|path| !path.exists())
-        .map(Path::to_path_buf)
-        .collect();
     fs::rename(source, &staging)?;
     let mut removed = Vec::new();
+    let mut created = Vec::new();
     let result = (|| {
         let chain = empty_chain(destination, device, None)?;
         for path in chain.iter().rev() {
@@ -227,7 +232,17 @@ pub(crate) fn move_checkout(
         }
         // This is the same parent creation used by Trees::sync_workspace for
         // a new clone, including the daemon's ownership and umask.
-        fs::create_dir_all(destination.parent().unwrap())?;
+        let missing: Vec<_> = destination
+            .parent()
+            .unwrap()
+            .ancestors()
+            .take_while(|path| !path.exists())
+            .map(Path::to_path_buf)
+            .collect();
+        for path in missing.into_iter().rev() {
+            fs::create_dir(&path)?;
+            created.push(path);
+        }
         fs::rename(&staging, destination)?;
         crate::filesystem::sync_directory(destination.parent().unwrap())?;
         crate::filesystem::sync_directory(roots)?;
@@ -240,11 +255,11 @@ pub(crate) fn move_checkout(
             }
             // Empty parents created for a nested destination must not obstruct
             // putting the donor back. Never remove a directory containing data.
-            for path in &missing_parents {
+            for path in created.iter().rev() {
                 match fs::remove_dir(path) {
                     Ok(()) => (),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                    Err(_) => break,
+                    Err(error) => return Err(error),
                 }
             }
             for (path, metadata) in removed.iter().rev() {
@@ -272,6 +287,21 @@ mod tests {
 
     fn move_to(roots: &Path, source: &Path, destination: &Path) -> Result<(), MoveError> {
         move_checkout(roots, source, destination, || Ok(()), || Ok(()))
+    }
+
+    #[test]
+    fn destination_listing_stops_after_two_non_source_children() {
+        let source = Path::new("source");
+        let entries = ["source", "one", "two"]
+            .into_iter()
+            .map(|path| Ok(PathBuf::from(path)))
+            .chain(std::iter::once_with(|| {
+                panic!("enumerated beyond two non-source children")
+            }));
+        assert_eq!(
+            destination_children(entries, Some(source)).unwrap(),
+            [PathBuf::from("one"), PathBuf::from("two")]
+        );
     }
 
     #[test]
@@ -415,6 +445,34 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".adopt-")));
         }
+    }
+
+    #[test]
+    fn nested_rollback_restores_an_existing_donor_worktrees_directory() {
+        let roots = ScratchDir::new("adopt-existing-parent-rollback");
+        let source = roots.join("r");
+        let destination = source.join(".worktrees/y");
+        fs::create_dir_all(source.join(".worktrees")).unwrap();
+        fs::write(source.join("artifact"), b"built").unwrap();
+        let source_inode = fs::metadata(&source).unwrap().ino();
+        let parent_inode = fs::metadata(source.join(".worktrees")).unwrap().ino();
+        let error = move_checkout(
+            &roots,
+            &source,
+            &destination,
+            || Ok(()),
+            || Err(refusal("catalog full")),
+        )
+        .unwrap_err();
+        assert!(matches!(error, MoveError::Refused(_)), "{error}");
+        assert_eq!(fs::metadata(&source).unwrap().ino(), source_inode);
+        assert_eq!(
+            fs::metadata(source.join(".worktrees")).unwrap().ino(),
+            parent_inode
+        );
+        assert_eq!(fs::read(source.join("artifact")).unwrap(), b"built");
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&roots).unwrap().count(), 1);
     }
 
     #[test]

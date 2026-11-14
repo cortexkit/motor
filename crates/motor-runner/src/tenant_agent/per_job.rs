@@ -243,7 +243,10 @@ fn workspace_steps(
         None => run("mkfs.xfs", &["/dev/vdb"])?,
         Some(_) => return Err(io::Error::other("workspace disk is not XFS")),
     }
-    run("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
+    run(
+        "mount",
+        &["-t", "xfs", "-o", "nosuid,nodev", "/dev/vdb", "/tenant"],
+    )?;
     // The host grows a checkout's disk file when its size cap rises, so an
     // existing filesystem can be smaller than its disk. A failed grow leaves
     // the job its old space, which is no reason to refuse it.
@@ -463,7 +466,10 @@ mod tests {
                 },
             );
             let calls = calls.into_inner();
-            let mount = ("mount".to_owned(), "-t xfs /dev/vdb /tenant".to_owned());
+            let mount = (
+                "mount".to_owned(),
+                "-t xfs -o nosuid,nodev /dev/vdb /tenant".to_owned(),
+            );
             let grow = ("grow".to_owned(), String::new());
             match kind {
                 None => assert_eq!(calls, [("mkfs.xfs".into(), "/dev/vdb".into()), mount, grow]),
@@ -491,6 +497,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls, ["mount"]);
+    }
+
+    #[test]
+    fn workspace_mount_disables_suid_and_devices_without_disabling_execution() {
+        for kind in [None, Some("xfs")] {
+            workspace_steps(
+                kind,
+                |program, args| {
+                    if program == "mount" {
+                        let options = args
+                            .windows(2)
+                            .find(|pair| pair[0] == "-o")
+                            .expect("workspace mount options missing")[1];
+                        let options: Vec<_> = options.split(',').collect();
+                        assert!(options.contains(&"nosuid"));
+                        assert!(options.contains(&"nodev"));
+                        assert!(!options.contains(&"noexec"));
+                    }
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
