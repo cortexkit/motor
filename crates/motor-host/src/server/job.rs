@@ -694,13 +694,7 @@ impl Runtime {
             }
             let expire = {
                 let host = self.host.lock().expect("host lock");
-                host.snapshot
-                    .leases
-                    .get(&job)
-                    .and_then(|lease| lease.ended_at_ms)
-                    .is_some_and(|end| {
-                        now_ms.saturating_sub(end) >= crate::billing::RECORD_RETENTION_MS
-                    })
+                crate::billing::chunk_retention_over(&host.snapshot, &job, now_ms)
                     && host.snapshot.per_job.executions[&job].replay_completion
                         == Some(crate::state::jobs::storage::ReplayCompletion::Terminal)
             };

@@ -733,7 +733,10 @@ impl Store {
         self.clean_files()
     }
     pub(crate) fn expire_chunks(&mut self) -> Result<()> {
-        if self.index.chunks_expired == Some(true) {
+        // Chunks expire only after the terminal: before it, more chunks can
+        // still arrive, and dropping the stored ones would leave a sequence
+        // gap in front of them that no manifest outcome explains.
+        if self.index.chunks_expired == Some(true) || !self.index.terminal {
             return Ok(());
         }
         let mut next = self.index.clone();
@@ -913,10 +916,16 @@ impl Store {
         let mut decoded = Vec::new();
         let mut replacement = Vec::new();
         if chunk {
-            if next
-                .entries
-                .iter()
-                .any(|entry| entry.kind.as_deref() == Some("return_manifest"))
+            // An index written by an older host can have expired its chunks
+            // before the terminal. Storing later chunks again would publish
+            // the tail of a file whose start is gone; leaving them out gives
+            // the same shape as an expiry after the terminal, which the
+            // manifest reports as expired.
+            if next.chunks_expired == Some(true)
+                || next
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind.as_deref() == Some("return_manifest"))
             {
                 return Ok(false);
             }
