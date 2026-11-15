@@ -50,6 +50,7 @@
 # whether, and how long after mounting, the build mount or target stopped
 # reaching the volume. The script exits 0 only when, with the attachment job
 # VMs now use (USB), target/ reached the volume at every step in both VMs, the
+# agent reported the build disk released ("agent: build disk released: true"), the
 # returns directory held only the returned file, target was still the link,
 # and VM B mounted VM A's volume. The full log is kept beside the work
 # directory as <work directory>.log. The work directory is deleted afterwards
@@ -111,6 +112,6 @@ status=0
 "$helper" build-disk-probe "$image_real" "$work" 2>&1 | tee "$work.log" || status=$?
 echo
 echo "summary:"
-grep -E '^(RESULT|stdout: (mount|diskutil|target|cargo-target-dir|check [a-z-]+|cargo):|stderr: motor:|returns:|target link:)' "$work.log" || true
+grep -E '^(RESULT|stdout: (mount|diskutil|target|cargo-target-dir|check [a-z-]+|cargo):|stderr: motor:|agent: build disk released|returns:|target link:)' "$work.log" || true
 echo "full log: $work.log"
 exit "$status"
