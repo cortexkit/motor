@@ -172,6 +172,80 @@ fn far_over_replay_bytes_maximum_returns_restart_and_expiry_stay_reserved() {
 }
 
 #[test]
+fn chunks_expire_only_after_the_terminal_so_replay_stays_contiguous() {
+    let root = scratch();
+    let mut store = Store::open(root.path(), JOB).unwrap();
+    store
+        .append(&frame(json!({"type":"started","seq":0})))
+        .unwrap();
+    store
+        .append(&frame(
+            json!({"type":"output","seq":1,"stream":"stdout","bytes":"eA=="}),
+        ))
+        .unwrap();
+    assert!(store.append(&chunk(2, 0, b"ab".to_vec())).unwrap());
+    // An expiry check while chunks are still arriving must keep the stored
+    // ones; dropping them would leave seq 2 missing in front of seq 3.
+    store.expire_chunks().unwrap();
+    assert!(store.append(&chunk(3, 0, b"cd".to_vec())).unwrap());
+    store.append(&manifest(4, &[4])).unwrap();
+    store
+        .append(&frame(json!({"type":"terminal","job_id":JOB})))
+        .unwrap();
+    let frames = drain(&store, 0, 0);
+    let seqs: Vec<_> = frames.iter().filter_map(|f| f["seq"].as_u64()).collect();
+    assert_eq!(seqs, [0, 1, 2, 3, 4]);
+    let returned: motor_protocol::ReturnManifest =
+        serde_json::from_value(frames[4].clone()).unwrap();
+    assert!(matches!(
+        returned.files[0].outcome,
+        motor_protocol::ReturnManifestOutcome::Returned { size: 4, .. }
+    ));
+    store.expire_chunks().unwrap();
+    let frames = drain(&store, 0, 0);
+    assert!(!frames.iter().any(|f| f["type"] == "return_chunk"));
+    let expired: motor_protocol::ReturnManifest =
+        serde_json::from_value(frames[2].clone()).unwrap();
+    assert!(matches!(
+        expired.files[0].outcome,
+        motor_protocol::ReturnManifestOutcome::Failed {
+            cause: motor_protocol::ReturnPathsFailureCause::Expired,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn an_index_expired_before_its_terminal_stores_no_later_chunks() {
+    let root = scratch();
+    let mut store = Store::open(root.path(), JOB).unwrap();
+    store
+        .append(&frame(json!({"type":"started","seq":0})))
+        .unwrap();
+    // Older hosts could expire chunks while the stream was still open.
+    store.index.chunks_expired = Some(true);
+    assert!(!store.append(&chunk(1, 0, b"ab".to_vec())).unwrap());
+    assert_eq!(store.last_seq(), Some(0));
+    store.append(&manifest(2, &[2])).unwrap();
+    store
+        .append(&frame(json!({"type":"terminal","job_id":JOB})))
+        .unwrap();
+    drop(store);
+    let store = Store::open(root.path(), JOB).unwrap();
+    let frames = drain(&store, 0, 0);
+    assert!(!frames.iter().any(|f| f["type"] == "return_chunk"));
+    let manifest: motor_protocol::ReturnManifest =
+        serde_json::from_value(frames[1].clone()).unwrap();
+    assert!(matches!(
+        manifest.files[0].outcome,
+        motor_protocol::ReturnManifestOutcome::Failed {
+            cause: motor_protocol::ReturnPathsFailureCause::Expired,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn excessive_return_frames_fail_only_excess_paths_and_keep_terminal() {
     let root = scratch();
     let mut store = Store::open(root.path(), JOB).unwrap();

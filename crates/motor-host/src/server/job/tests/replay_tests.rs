@@ -1346,6 +1346,126 @@ async fn relayed_run_alone_sets_return_reservation_and_runner_hints_cannot_chang
     }
 }
 
+/// A lifecycle terminal that reaches the host as replayed backlog records the
+/// previous host process's last-alive time as the lease end, which can be hours
+/// old. Return chunks still streaming at that moment once lost their stored
+/// prefix to an expiry check, leaving a sequence gap no caller can accept.
+#[tokio::test]
+async fn backlog_terminal_event_with_an_old_lease_end_keeps_streaming_chunks_contiguous() {
+    use crate::billing::RECORD_RETENTION_MS;
+    use motor_protocol::{ReturnManifestEntry, ReturnManifestOutcome};
+    let (runtime, fake, _) = fixture();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    let chunk = |seq: u64, data: &str| json!({"type":"return_chunk","seq":seq,"job_id":JOB,"path_index":0,"offset":0,"data":data});
+    for value in [
+        json!({"type":"started","seq":0,"job_id":JOB}),
+        json!({"type":"output","seq":1,"stream":"stdout","bytes":"eA=="}),
+        chunk(2, "YWJj"),
+        chunk(3, "ZGVm"),
+    ] {
+        write_frame(&mut guest, &value).await.unwrap();
+    }
+    let stream = runtime.job_stream(JOB).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stream.with_store(|s| Ok(s.last_seq())).unwrap() != Some(3) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first chunks must be stored");
+    let now = unix_ms();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        // The host process started long after its predecessor was last alive.
+        host.prior_alive_ms = now - 2 * RECORD_RETENTION_MS;
+        let terminal: motor_protocol::TenantEvent = serde_json::from_value(
+            json!({"type":"event","event_seq":1,"event":"terminal","jti":JOB}),
+        )
+        .unwrap();
+        host.event_observed(JOB, &terminal, now, false).unwrap();
+        assert_eq!(
+            host.snapshot.leases[JOB].ended_at_ms,
+            Some(now - 2 * RECORD_RETENTION_MS)
+        );
+    }
+    // The host tick and every attach run this check.
+    stream.expire_chunks(now).unwrap();
+    let mut manifest = json!({"type":"return_manifest","seq":5,"job_id":JOB,"cap_bytes":134217728,"total_bytes":9});
+    manifest["files"] = serde_json::to_value(vec![ReturnManifestEntry::returned(
+        "/out",
+        9,
+        "0".repeat(64),
+    )
+    .with_chunks(3)])
+    .unwrap();
+    write_frame(&mut guest, &chunk(4, "Z2hp")).await.unwrap();
+    write_frame(&mut guest, &manifest).await.unwrap();
+    write_frame(
+        &mut guest,
+        &json!({"type":"terminal","job_id":JOB,"outcome":{"type":"exit","code":0},"wall_ms":100,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null,"last_seq":5}),
+    )
+    .await
+    .unwrap();
+    while next_record(&mut client).await.value["type"] != "terminal" {}
+    assert_eq!(guest_frame(&mut guest).await["type"], "terminal_stored");
+    drop(client);
+    task.await.unwrap().unwrap();
+    let frames: Vec<Value> = replayed(&runtime)
+        .await
+        .iter()
+        .map(|f| crate::replay::decode(f).unwrap())
+        .collect();
+    let seqs: Vec<_> = frames.iter().filter_map(|f| f["seq"].as_u64()).collect();
+    assert_eq!(seqs, [0, 1, 2, 3, 4, 5], "replay must stay contiguous");
+    let manifest: motor_protocol::ReturnManifest = frames
+        .iter()
+        .find(|f| f["type"] == "return_manifest")
+        .map(|f| serde_json::from_value(f.clone()).unwrap())
+        .unwrap();
+    assert!(matches!(
+        manifest.files[0].outcome,
+        ReturnManifestOutcome::Returned { size: 9, .. }
+    ));
+    // Retention runs from when the host saw the job end, not from the
+    // backlog lower bound, even if the lease end had stayed that old.
+    let observed = runtime.host.lock().unwrap().snapshot.billing[JOB]
+        .ended_observed_ms
+        .unwrap();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .leases
+        .get_mut(JOB)
+        .unwrap()
+        .ended_at_ms = Some(now - 2 * RECORD_RETENTION_MS);
+    stream
+        .expire_chunks(observed + RECORD_RETENTION_MS - 1)
+        .unwrap();
+    assert_eq!(
+        stream
+            .with_store(|s| {
+                Ok((0..s.len())
+                    .filter(|&i| {
+                        crate::replay::decode(&s.raw_frame(i).unwrap().unwrap()).unwrap()["type"]
+                            == "return_chunk"
+                    })
+                    .count())
+            })
+            .unwrap(),
+        3
+    );
+    stream
+        .expire_chunks(observed + RECORD_RETENTION_MS)
+        .unwrap();
+    assert!(!replayed_at(&runtime, observed + RECORD_RETENTION_MS)
+        .await
+        .iter()
+        .any(|f| crate::replay::decode(f).unwrap()["type"] == "return_chunk"));
+    power_off(&runtime, &fake);
+}
+
 #[tokio::test]
 async fn fake_clock_chunk_expiry_and_delayed_usage_acceptance_survive_restart_without_rebilling_attach(
 ) {

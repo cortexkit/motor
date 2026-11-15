@@ -54,22 +54,27 @@ impl Stream {
         *self.export_limit.lock().unwrap() = Some(limit);
     }
     pub(super) fn expire_chunks(&self, now_ms: u64) -> Result<()> {
-        let end = self
-            .host
-            .lock()
-            .expect("host lock")
-            .snapshot
-            .leases
-            .get(&self.job)
-            .and_then(|lease| lease.ended_at_ms);
-        if end.is_some_and(|end| now_ms.saturating_sub(end) >= crate::billing::RECORD_RETENTION_MS)
-        {
+        let due = {
+            let store = self.store.lock().expect("replay store");
             // A quarantined replay keeps its files as evidence and has no
             // open store to expire. Reporting that as an error would fail
             // every host tick for as long as the stream stays loaded.
-            if self.store.lock().expect("replay store").is_err() {
-                return Ok(());
-            }
+            //
+            // Retention starts only once the replay holds its terminal: until
+            // then return chunks may still be arriving, and discarding the ones
+            // already stored would leave a sequence gap in front of the later
+            // ones. A stored terminal is final, and the host records the job's
+            // end before it appends that terminal, so the end read here,
+            // under the store lock and after the check, is the settled one.
+            // The lock order, store then host, is the one appends use.
+            store.as_ref().is_ok_and(Store::ended)
+                && crate::billing::chunk_retention_over(
+                    &self.host.lock().expect("host lock").snapshot,
+                    &self.job,
+                    now_ms,
+                )
+        };
+        if due {
             self.with_store(Store::expire_chunks)?;
         }
         Ok(())
