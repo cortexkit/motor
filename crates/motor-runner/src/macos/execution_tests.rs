@@ -65,6 +65,7 @@ fn signal_is_preserved_and_output_precedes_terminal_status() {
         let (stderr_tx, stderr_rx) = mpsc::sync_channel(4);
         let outcome = run_output(&mut transport, &stdout_tx, &stderr_tx)
             .unwrap()
+            .0
             .wire();
         drop(stdout_tx);
         drop(stderr_tx);
@@ -156,6 +157,52 @@ fn only_a_last_motor_line_counts_as_the_agent_reason() {
     );
     assert_eq!(agent_reason(b"motor: earlier\njob output\n"), None);
     assert_eq!(agent_reason(b""), None);
+}
+
+/// The agent reports the command's real exit even when it could not release
+/// the build disk, with its release-failure line last on standard error. The
+/// host keeps the exit and learns that the disk was not released.
+#[test]
+fn exit_after_a_release_failure_keeps_the_code_and_reports_the_disk_unreleased() {
+    for (stderr, released) in [
+        (
+            vec![
+                b"job output\nmotor: build-volume diagnostic before-detach: x\nmotor: the build disk could not be rel".to_vec(),
+                b"eased: target no longer names the build volume's root\n".to_vec(),
+            ],
+            false,
+        ),
+        (vec![b"motor: the build disk could not be released: x\n\n".to_vec()], false),
+        (vec![b"job output\n".to_vec()], true),
+        // Only the last line counts, and a job's unfinished line ends a claim.
+        (
+            vec![b"motor: the build disk could not be released: x\njob output\n".to_vec()],
+            true,
+        ),
+        (
+            vec![b"motor: the build disk could not be released: x\npartial".to_vec()],
+            true,
+        ),
+        (Vec::new(), true),
+    ] {
+        let scratch = ScratchDir::new("macos-release-failure");
+        let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+        for bytes in stderr {
+            motor_winagent::write_frame(
+                &mut peer,
+                &Frame::Output {
+                    stream: Stream::Stderr,
+                    bytes,
+                },
+            )
+            .unwrap();
+        }
+        motor_winagent::write_frame(&mut peer, &Frame::Exit { code: 3 }).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let (outcome, disk_released) = run_output(&mut transport, &tx, &tx).unwrap();
+        assert_eq!(outcome.wire(), motor_protocol::Outcome::Exit { code: 3 });
+        assert_eq!(disk_released, released);
+    }
 }
 
 #[test]

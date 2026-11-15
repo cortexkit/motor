@@ -197,7 +197,7 @@ pub(crate) fn capture_finished_workspace_after_stop(
         source_files: vec![],
     };
     execution::capture_changes(runtime, trees, &entry, request, &staged);
-    execution::capture_returns(runtime, trees, &entry, request, &staged);
+    execution::capture_returns(runtime, trees, &entry, request, &staged, true);
     runtime.finish(&config.state_root, &entry);
     assert!(!staged.tree.exists());
 }

@@ -301,6 +301,7 @@ pub(super) fn capture_returns(
     entry: &Entry,
     request: &motor_protocol::Run,
     staged: &Staged,
+    build_disk_released: bool,
 ) {
     if crate::caller_path::run(request)
         .caller_return_paths
@@ -316,19 +317,33 @@ pub(super) fn capture_returns(
             .lock()
             .unwrap()
             .push((request.job_id, "returns"));
-        crate::return_paths::collect_staged(request, &staged.workspace, &job_directory)
+        if build_disk_released {
+            crate::return_paths::collect_staged(request, &staged.workspace, &job_directory)
+        } else {
+            // Only an agent that released the build volume copied the files
+            // under target/ out of it. Anything at the share's target/ was
+            // written there by the guest some other way, so it is not read.
+            crate::return_paths::collect_staged_withholding_target(
+                request,
+                &staged.workspace,
+                &job_directory,
+            )
+        }
     } else {
         crate::return_paths::unread(request, &job_directory)
     };
     runtime.record_returns(request.job_id, returns);
 }
 
+/// `build_disk_released` says whether the agent reported the command's exit
+/// after releasing the build volume cleanly (see `forward_output`).
 pub(super) fn capture_completion(
     config: &Config,
     trees: &Trees,
     entry: &Entry,
     request: &motor_protocol::Run,
     staged: &Staged,
+    build_disk_released: bool,
 ) {
     if let Err(error) = config.macos_runtime.stop(&config.state_root, entry) {
         entry.failed.store(true, Ordering::Release);
@@ -337,7 +352,14 @@ pub(super) fn capture_completion(
     // Maintenance must retain staging and workspace ownership until both the
     // change scan and the durable returned-file spool have finished.
     capture_changes(&config.macos_runtime, trees, entry, request, staged);
-    capture_returns(&config.macos_runtime, trees, entry, request, staged);
+    capture_returns(
+        &config.macos_runtime,
+        trees,
+        entry,
+        request,
+        staged,
+        build_disk_released,
+    );
 }
 
 /// Leaves the staged checkout's `target/` an empty directory. The guest agent
@@ -435,12 +457,13 @@ fn timestamp_paths(config: &Config, entry: &Entry) -> (std::path::PathBuf, std::
 }
 
 /// Whether a finished job's build disk may become its checkout's kept disk.
-/// Only an agent that unmounted the build volume sends the terminal status,
-/// so a job without one (an agent failure, a crash or a lost session) left
-/// the volume mounted. A cancelled job publishes nothing either, and nothing
-/// is published before the VM is proven stopped.
-fn publishable(cancelled: bool, stop_proven: bool, terminal_received: bool) -> bool {
-    !cancelled && stop_proven && terminal_received
+/// Only an agent that unmounted the build volume reports the command's exit
+/// without its release-failure line, so a job without such an exit (a release
+/// failure, an agent failure, a crash or a lost session) may have left the
+/// volume mounted. A cancelled job publishes nothing either, and nothing is
+/// published before the VM is proven stopped.
+fn publishable(cancelled: bool, stop_proven: bool, build_disk_released: bool) -> bool {
+    !cancelled && stop_proven && build_disk_released
 }
 
 /// Renames the stopped job's build disk over its checkout's kept disk, then
@@ -675,17 +698,20 @@ fn start_io(
             if let Err(error) = &result {
                 let _ = ready_tx.try_send(Err(invalid(error.to_string())));
             }
+            let build_disk_released = matches!(result, Ok((_, true)));
+            let result = result.map(|(outcome, _)| outcome);
             capture_completion(
                 &config,
                 &staging.trees,
                 &thread_entry,
                 &scan_request,
                 &staged,
+                build_disk_released,
             );
             if publishable(
                 thread_entry.cancel.0.load(Ordering::Acquire),
                 thread_entry.owned.lock().unwrap().record.stop_proven,
-                result.is_ok(),
+                build_disk_released,
             ) {
                 let published = target_out(&config, &thread_entry).and_then(|()| {
                     let (store, history) = timestamp_paths(&config, &thread_entry);
@@ -745,17 +771,21 @@ fn start_io(
 fn staged_target(workspace: &str) -> std::path::PathBuf {
     Path::new(workspace).join("target")
 }
+/// The command's outcome, and whether the agent released the build disk
+/// before reporting it.
+type Finished = (ExecutionOutcome, bool);
+
 fn run_output(
     transport: &mut Transport,
     stdout: &SyncSender<Vec<u8>>,
     stderr: &SyncSender<Vec<u8>>,
-) -> io::Result<ExecutionOutcome> {
+) -> io::Result<Finished> {
     let mut tail = Vec::new();
     let result = forward_output(transport, stdout, stderr, &mut tail);
+    let job_id = transport.entry.owned.lock().unwrap().record.id;
     // A cancelled job's session ends on purpose; any other failure is logged
     // with the agent's own reason when it sent one.
     if let (Err(error), Ok(())) = (&result, transport.entry.check()) {
-        let job_id = transport.entry.owned.lock().unwrap().record.id;
         let reason = agent_reason(&tail).unwrap_or_else(|| "none".into());
         tracing::warn!(
             %job_id,
@@ -764,12 +794,59 @@ fn run_output(
             "macOS agent ended the session without Exit or Signal"
         );
     }
+    if let Ok((_, false)) = &result {
+        let reason = agent_reason(&tail).unwrap_or_else(|| "none".into());
+        tracing::warn!(
+            %job_id,
+            agent_reason = %reason,
+            "macOS agent reported the command's exit but could not release the build disk; the disk is not published and returned files under target/ are not read"
+        );
+    }
     result
 }
 /// Bytes of the job's standard error kept to find the agent's last line.
 const STDERR_TAIL_BYTES: usize = 4096;
 const BUILD_DIAGNOSTIC_PREFIX: &[u8] = b"motor: build-volume diagnostic ";
 const BUILD_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
+/// How the agent's line starts when it reports the command's exit but could
+/// not release the build disk.
+const RELEASE_FAILURE_PREFIX: &[u8] = b"motor: the build disk could not be released: ";
+
+/// Whether standard error ended with the agent's release-failure line. The
+/// agent writes that line last, on a line of its own, after every job process
+/// is gone, so only the last non-empty line counts: a job cannot hide it, and
+/// a job that prints it itself only keeps its own disk from being published.
+/// Keeps no more than the prefix's length of any line.
+#[derive(Default)]
+struct ReleaseFailure {
+    start: Vec<u8>,
+    /// Bytes in the line being read, which has no newline yet.
+    length: usize,
+    /// Whether the last complete non-empty line was the agent's.
+    last: bool,
+}
+impl ReleaseFailure {
+    fn push(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                if self.length > 0 {
+                    self.last = self.start == RELEASE_FAILURE_PREFIX;
+                }
+                self.start.clear();
+                self.length = 0;
+            } else {
+                if self.start.len() < RELEASE_FAILURE_PREFIX.len() {
+                    self.start.push(byte);
+                }
+                self.length += 1;
+            }
+        }
+    }
+    /// An unfinished last line is the job's, so it ends any earlier claim.
+    fn reported(&self) -> bool {
+        self.length == 0 && self.last
+    }
+}
 
 /// Output frames may split a diagnostic anywhere. Retain only one bounded line
 /// and never copy ordinary job stderr into the runner log.
@@ -803,14 +880,18 @@ fn agent_reason(tail: &[u8]) -> Option<String> {
     let last = text.lines().rev().find(|line| !line.trim().is_empty())?;
     last.starts_with("motor: ").then(|| last.to_owned())
 }
+/// Forwards the command's output until its exit. The exit's flag says whether
+/// the build disk was released: false when the agent's last standard-error
+/// line said it could not be (see `ReleaseFailure`).
 fn forward_output(
     transport: &mut Transport,
     stdout: &SyncSender<Vec<u8>>,
     stderr: &SyncSender<Vec<u8>>,
     tail: &mut Vec<u8>,
-) -> io::Result<ExecutionOutcome> {
+) -> io::Result<Finished> {
     let job_id = transport.entry.owned.lock().unwrap().record.id;
     let mut diagnostics = DiagnosticLines::default();
+    let mut release = ReleaseFailure::default();
     loop {
         match transport
             .receive()
@@ -821,6 +902,7 @@ fn forward_output(
                     diagnostics.push(&bytes, |diagnostic| {
                         tracing::info!(%job_id, %diagnostic, "macOS agent build-volume metadata");
                     });
+                    release.push(&bytes);
                     tail.extend_from_slice(&bytes);
                     let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
                     tail.drain(..excess);
@@ -835,8 +917,15 @@ fn forward_output(
                     &transport.entry,
                 )?
             }
-            Frame::Exit { code } => return Ok(ExecutionOutcome::Unix(exit_status(code)?)),
-            Frame::Signal { signal } => return Ok(ExecutionOutcome::Signal { signal }),
+            Frame::Exit { code } => {
+                return Ok((
+                    ExecutionOutcome::Unix(exit_status(code)?),
+                    !release.reported(),
+                ))
+            }
+            Frame::Signal { signal } => {
+                return Ok((ExecutionOutcome::Signal { signal }, !release.reported()))
+            }
             _ => return Err(invalid("unexpected macOS agent frame")),
         }
     }

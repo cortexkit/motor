@@ -560,14 +560,33 @@ mod execution {
 
     /// The one stderr line that tells the caller why the build disk could not
     /// be `action` (mounted or released). Tool output in the error may span
-    /// lines; it is folded onto one.
+    /// lines; it is folded onto one and cut short, so that the host, which
+    /// keeps only the end of a job's standard error, still sees how it starts.
     fn build_disk_failure(action: &str, error: &io::Error) -> String {
-        let reason = error
+        const MAX_REASON_CHARS: usize = 1024;
+        let mut reason = error
             .to_string()
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        if let Some((cut, _)) = reason.char_indices().nth(MAX_REASON_CHARS) {
+            reason.truncate(cut);
+            reason.push_str(" [truncated]");
+        }
         format!("motor: the build disk could not be {action}: {reason}\n")
+    }
+
+    /// Whether the spooled output at `path` is empty or ends with a newline.
+    fn ends_line(path: &Path) -> io::Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        if file.metadata()?.len() == 0 {
+            return Ok(true);
+        }
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8];
+        file.read_exact(&mut last)?;
+        Ok(last[0] == b'\n')
     }
 
     async fn serve<S>(stream: S, nonce: String, mut settings: Settings) -> io::Result<()>
@@ -672,6 +691,9 @@ mod execution {
         // The hook calls only libc limit functions and constructs OS errors.
         unsafe { process.pre_exec(set_job_nofile_limit) };
         let mut child = process.spawn()?;
+        if let Some(volume) = settings.build.as_mut() {
+            volume.command_started();
+        }
         #[cfg(test)]
         if let KillScope::ProcessGroup { pid, .. } = &*settings.scope {
             pid.store(
@@ -740,18 +762,26 @@ mod execution {
             }
         }
         let terminal = termination(status.unwrap())?;
-        // Every job process is gone. The exit is reported only once the build
-        // volume is unmounted; without it the host publishes nothing. A failed
-        // unmount still sends its reason as the last stderr line, then closes
-        // the session without Exit.
-        if let Some(diagnostic) = settings
+        // Every job process is gone. The exit is reported once the build
+        // volume is released. A failed release still reports the command's
+        // exit, after one last stderr line giving the reason; that line tells
+        // the host not to publish the disk or read the shared target/.
+        let watch = settings
+            .build
+            .as_mut()
+            .and_then(|volume| volume.watch_report());
+        let before = settings
             .build
             .as_ref()
-            .and_then(|volume| volume.diagnostics("before-detach"))
-        {
+            .and_then(|volume| volume.diagnostics("before-detach"));
+        if watch.is_some() || before.is_some() {
             // The command may leave stderr without a newline. Keep the
             // metadata on its own line so the host can retain it reliably.
-            let diagnostic = format!("\n{diagnostic}");
+            let diagnostic = format!(
+                "\n{}{}",
+                watch.unwrap_or_default(),
+                before.unwrap_or_default()
+            );
             stderr_append.write_all(diagnostic.as_bytes()).await?;
             stderr_append.flush().await?;
             output_tx
@@ -771,18 +801,25 @@ mod execution {
                     .send(Output::Chunk(Stream::Stderr, diagnostic.len()))
                     .map_err(|_| io::Error::other("output closed"))?;
             }
-            let line = build_disk_failure("released", &error);
+            // The host recognizes the reason only as a line of its own.
+            let mut line = build_disk_failure("released", &error);
+            if !ends_line(stderr.path())? {
+                line.insert(0, '\n');
+            }
             stderr_append.write_all(line.as_bytes()).await?;
             stderr_append.flush().await?;
             output_tx
                 .send(Output::Chunk(Stream::Stderr, line.len()))
                 .map_err(|_| io::Error::other("output closed"))?;
-            // With the channel closed, forwarding sends what is queued and
-            // ends without a terminal status.
-            drop(output_tx);
+            output_tx
+                .send(Output::Terminal(terminal))
+                .map_err(|_| io::Error::other("output closed"))?;
             loop {
                 tokio::select! {
-                    _ = &mut forwarding.0 => return Err(error),
+                    result = &mut forwarding.0 => {
+                        result.map_err(io::Error::other)??;
+                        return Err(error);
+                    }
                     message = control_rx.recv() => { handle_control(message, &settings.scope)?; }
                 }
             }
@@ -1195,6 +1232,10 @@ mod execution {
             notice: Option<String>,
             fail_attach: bool,
             fail_detach: bool,
+            /// Whether it returns diagnostic lines.
+            diagnose: bool,
+            /// Whether it watches `target/` and reports on it.
+            watch: bool,
         }
         impl crate::build_volume::BuildVolume for FakeVolume {
             fn attach(&mut self) -> io::Result<Option<String>> {
@@ -1215,6 +1256,9 @@ mod execution {
                 Ok(())
             }
             fn diagnostics(&self, phase: &str) -> Option<String> {
+                if !self.diagnose {
+                    return None;
+                }
                 let phase = match phase {
                     "after-attach" => "after-attach",
                     "before-detach" => "before-detach",
@@ -1226,12 +1270,34 @@ mod execution {
                     "motor: build-volume diagnostic {phase}: metadata\n"
                 ))
             }
+            fn command_started(&mut self) {
+                if self.watch {
+                    // The command runs from now: the agent spawned it.
+                    self.events.lock().unwrap().push("command-started");
+                }
+            }
+            fn watch_report(&mut self) -> Option<String> {
+                self.watch.then(|| {
+                    self.events.lock().unwrap().push("watch-report");
+                    "motor: build-volume diagnostic watch: steady\n".to_owned()
+                })
+            }
         }
         async fn launch_with_volume(
             command: &str,
             notice: Option<&str>,
             fail_attach: bool,
             fail_detach: bool,
+        ) -> (Fixture, Arc<Mutex<Vec<&'static str>>>) {
+            launch_with_fake(command, notice, fail_attach, fail_detach, true, false).await
+        }
+        async fn launch_with_fake(
+            command: &str,
+            notice: Option<&str>,
+            fail_attach: bool,
+            fail_detach: bool,
+            diagnose: bool,
+            watch: bool,
         ) -> (Fixture, Arc<Mutex<Vec<&'static str>>>) {
             let events = Arc::new(Mutex::new(Vec::new()));
             let recorded = events.clone();
@@ -1242,11 +1308,40 @@ mod execution {
                     notice: notice.map(str::to_owned),
                     fail_attach,
                     fail_detach,
+                    diagnose,
+                    watch,
                 })
                     as Box<dyn crate::build_volume::BuildVolume>)
             })
             .await;
             (fixture, events)
+        }
+        /// Reads frames until the session ends: stdout, stderr and the
+        /// terminal frame, if one came.
+        async fn collect_session(fixture: &mut Fixture) -> (Vec<u8>, Vec<u8>, Option<Frame>) {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut terminal = None;
+            loop {
+                match host_receive(&mut fixture.host).await.unwrap() {
+                    Some(Frame::Started {}) => {}
+                    Some(Frame::Output {
+                        stream: Stream::Stdout,
+                        bytes,
+                    }) => stdout.extend(bytes),
+                    Some(Frame::Output {
+                        stream: Stream::Stderr,
+                        bytes,
+                    }) => stderr.extend(bytes),
+                    Some(frame @ (Frame::Exit { .. } | Frame::Signal { .. })) => {
+                        assert!(terminal.is_none(), "second terminal frame {frame:?}");
+                        terminal = Some(frame);
+                    }
+                    None => break,
+                    Some(frame) => panic!("unexpected frame {frame:?}"),
+                }
+            }
+            (stdout, stderr, terminal)
         }
 
         #[tokio::test]
@@ -1310,27 +1405,20 @@ mod execution {
             assert!(!fixture._directory.path().join("ran").exists());
         }
 
+        /// A failed release still reports the command's real exit, after one
+        /// last stderr line giving the reason, which is how the host learns not
+        /// to publish the disk.
         #[tokio::test]
-        async fn failed_build_volume_detach_says_why_and_reports_no_exit() {
-            let (mut fixture, events) =
-                launch_with_volume("echo ran; printf job-err >&2", None, false, true).await;
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            loop {
-                match host_receive(&mut fixture.host).await.unwrap() {
-                    Some(Frame::Started {}) => {}
-                    Some(Frame::Output {
-                        stream: Stream::Stdout,
-                        bytes,
-                    }) => stdout.extend(bytes),
-                    Some(Frame::Output {
-                        stream: Stream::Stderr,
-                        bytes,
-                    }) => stderr.extend(bytes),
-                    None => break,
-                    Some(frame) => panic!("unexpected frame {frame:?}"),
-                }
-            }
+        async fn failed_build_volume_detach_says_why_and_still_reports_the_exit() {
+            let (mut fixture, events) = launch_with_volume(
+                "echo ran; printf job-err >&2; exit 3",
+                None,
+                false,
+                true,
+            )
+            .await;
+            let (stdout, stderr, terminal) = collect_session(&mut fixture).await;
+            assert_eq!(terminal, Some(Frame::Exit { code: 3 }));
             assert!((&mut fixture.agent.0).await.unwrap().is_err());
             assert_eq!(
                 *events.lock().unwrap(),
@@ -1350,6 +1438,52 @@ mod execution {
             );
         }
 
+        /// Without diagnostics in between, the reason still starts a line of
+        /// its own after a command that left stderr without a newline.
+        #[tokio::test]
+        async fn release_failure_line_starts_its_own_line_after_unterminated_stderr() {
+            let (mut fixture, _) = launch_with_fake(
+                "printf job-err >&2; exit 4",
+                None,
+                false,
+                true,
+                false,
+                false,
+            )
+            .await;
+            let (_, stderr, terminal) = collect_session(&mut fixture).await;
+            assert_eq!(terminal, Some(Frame::Exit { code: 4 }));
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                "job-err\nmotor: the build disk could not be released: volume busy\n"
+            );
+        }
+
+        /// The watch starts with the command and its one line comes before
+        /// the volume is released, ahead of the before-detach metadata.
+        #[tokio::test]
+        async fn watch_report_comes_once_before_release() {
+            let (mut fixture, events) =
+                launch_with_fake("echo ran", None, false, false, true, true).await;
+            let (_, stderr, terminal) = collect_session(&mut fixture).await;
+            assert_eq!(terminal, Some(Frame::Exit { code: 0 }));
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "attach",
+                    "after-attach",
+                    "command-started",
+                    "watch-report",
+                    "before-detach",
+                    "detach"
+                ]
+            );
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                "motor: build-volume diagnostic after-attach: metadata\n\nmotor: build-volume diagnostic watch: steady\nmotor: build-volume diagnostic before-detach: metadata\n"
+            );
+        }
+
         #[test]
         fn build_disk_failure_is_one_line() {
             let error = io::Error::other("diskutil failed:\n  Error: busy\n");
@@ -1357,6 +1491,12 @@ mod execution {
                 build_disk_failure("released", &error),
                 "motor: the build disk could not be released: diskutil failed: Error: busy\n"
             );
+            // A long reason is cut short, so the line's start stays within
+            // the stderr tail the host keeps (4096 bytes).
+            let long = build_disk_failure("released", &io::Error::other("x".repeat(10_000)));
+            assert!(long.starts_with("motor: the build disk could not be released: xxx"));
+            assert!(long.ends_with(" [truncated]\n"));
+            assert!(long.len() < 1200, "{}", long.len());
         }
     }
 }
