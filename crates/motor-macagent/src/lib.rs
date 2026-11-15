@@ -252,6 +252,33 @@ mod execution {
         }
     }
 
+    impl KillScope {
+        /// Fails if any job process is alive. Called after the build volume
+        /// is unmounted and again after the returned files are placed: a
+        /// process that appeared after the kill sweep, such as one a system
+        /// scheduler started for the job account, may have written them.
+        fn require_none(&self) -> io::Result<()> {
+            match self {
+                Self::User(user) => match uid_processes(user.uid)? {
+                    0 => Ok(()),
+                    count => Err(io::Error::other(format!(
+                        "{count} motorjob processes were running after the job ended"
+                    ))),
+                },
+                #[cfg(test)]
+                Self::ProcessGroup { pid, .. } => {
+                    let pid = pid.load(std::sync::atomic::Ordering::SeqCst);
+                    if pid > 0 && unsafe { libc::kill(-pid, 0) } == 0 {
+                        return Err(io::Error::other(
+                            "job processes were running after the job ended",
+                        ));
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+
     const KILL_SWEEPS: usize = 10;
 
     /// Fork a child that drops to the job uid and sends a non-root kill(-1),
@@ -382,6 +409,9 @@ mod execution {
         /// Mounted at `BUILD_MOUNT` before the command and unmounted before its
         /// exit is reported. Only tests run without one.
         build: Option<Box<dyn crate::build_volume::BuildVolume>>,
+        /// Tests make the agent's own stderr appends fail.
+        #[cfg(test)]
+        fail_stderr_notes: bool,
     }
 
     /// Only the root launch daemon calls this entry point. Tests use a private
@@ -455,6 +485,8 @@ mod execution {
                 temporary_root: "/var/tmp".into(),
                 scope: Arc::new(KillScope::User(user)),
                 build: Some(volume),
+                #[cfg(test)]
+                fail_stderr_notes: false,
             },
         )
         .await
@@ -497,7 +529,60 @@ mod execution {
 
     enum Output {
         Chunk(Stream, usize),
+        /// A frame the agent sends from memory, before the terminal status.
+        Frame(Frame),
         Terminal(Frame),
+    }
+
+    /// Lines the agent adds to the job's standard error after the command's
+    /// own output: diagnostics and the reason a release failed. Best effort:
+    /// a failed write, such as on a full /var/tmp, loses only these lines,
+    /// never the build disk's release report or the command's status, which
+    /// are sent from memory. After a failure nothing more is appended, so a
+    /// partly written line is never announced to the reader.
+    struct StderrNotes {
+        file: tokio::fs::File,
+        path: PathBuf,
+        working: bool,
+        /// Tests make every append fail, as a full disk would.
+        #[cfg(test)]
+        fail: bool,
+    }
+    impl StderrNotes {
+        async fn append(&mut self, output: &mpsc::UnboundedSender<Output>, text: &str) {
+            if !self.working {
+                return;
+            }
+            #[cfg(test)]
+            let fail = self.fail;
+            #[cfg(not(test))]
+            let fail = false;
+            let result = if fail {
+                Err(io::Error::other("injected stderr spool failure"))
+            } else {
+                match self.file.write_all(text.as_bytes()).await {
+                    Ok(()) => self.file.flush().await,
+                    Err(error) => Err(error),
+                }
+            };
+            match result {
+                Ok(()) => {
+                    let _ = output.send(Output::Chunk(Stream::Stderr, text.len()));
+                }
+                Err(error) => {
+                    self.working = false;
+                    eprintln!(
+                        "motor-macagent: the job's standard error could not be appended: {error}"
+                    );
+                }
+            }
+        }
+
+        /// Whether the spooled standard error is empty or ends with a newline;
+        /// false when it cannot be read.
+        fn ends_line(&self) -> bool {
+            ends_line(&self.path).unwrap_or(false)
+        }
     }
 
     async fn drain<R: AsyncRead + Unpin>(
@@ -540,6 +625,7 @@ mod execution {
                     file.read_exact(&mut bytes).await?;
                     send(&mut writer, &protocol, Frame::Output { stream, bytes }).await?;
                 }
+                Output::Frame(frame) => send(&mut writer, &protocol, frame).await?,
                 Output::Terminal(frame) => {
                     send(&mut writer, &protocol, frame).await?;
                     return writer.shutdown().await;
@@ -577,6 +663,22 @@ mod execution {
             reason.push_str(" [truncated]");
         }
         format!("motor: the build disk could not be {action}: {reason}\n")
+    }
+
+    /// The reason sent in `BuildRelease`: folded onto one line and cut to
+    /// `MAX_RELEASE_REASON_BYTES` on a character boundary.
+    fn release_reason(error: &io::Error) -> String {
+        let mut reason = error
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut end = reason.len().min(motor_winagent::MAX_RELEASE_REASON_BYTES);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+        reason
     }
 
     /// Whether the spooled output at `path` is empty or ends with a newline.
@@ -654,11 +756,17 @@ mod execution {
         let stderr_read = tokio::fs::File::from_std(stderr.reopen()?);
         // Appends after everything the pipe readers wrote, for a line the agent
         // adds once the command's own output has ended.
-        let mut stderr_append = tokio::fs::File::from_std(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(stderr.path())?,
-        );
+        let mut notes = StderrNotes {
+            file: tokio::fs::File::from_std(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(stderr.path())?,
+            ),
+            path: stderr.path().to_owned(),
+            working: true,
+            #[cfg(test)]
+            fail: settings.fail_stderr_notes,
+        };
         let mut process = tokio::process::Command::new(&settings.shell);
         process
             .arg("-c")
@@ -765,10 +873,11 @@ mod execution {
             }
         }
         let terminal = termination(status.unwrap())?;
-        // Every job process is gone. The exit is reported once the build
-        // volume is released. A failed release still reports the command's
-        // exit, after one last stderr line giving the reason; that line tells
-        // the host not to publish the disk or read returned files under target/.
+        // Every job process is gone. The agent releases the build volume and
+        // reports the result in a BuildRelease frame, then the command's
+        // status, both from memory: the host publishes the disk and reads the
+        // returned files under target/ only after `released: true`. The
+        // lines on standard error are for the caller and best effort.
         let watch = settings
             .build
             .as_mut()
@@ -779,60 +888,49 @@ mod execution {
             .and_then(|volume| volume.diagnostics("before-detach"));
         if watch.is_some() || before.is_some() {
             // The command may leave stderr without a newline. Keep the
-            // metadata on its own line so the host can retain it reliably.
+            // metadata on its own line.
             let diagnostic = format!(
                 "\n{}{}",
                 watch.unwrap_or_default(),
                 before.unwrap_or_default()
             );
-            stderr_append.write_all(diagnostic.as_bytes()).await?;
-            stderr_append.flush().await?;
-            output_tx
-                .send(Output::Chunk(Stream::Stderr, diagnostic.len()))
-                .map_err(|_| io::Error::other("output closed"))?;
+            notes.append(&output_tx, &diagnostic).await;
         }
-        if let Some(Err(error)) = settings.build.as_mut().map(|volume| volume.detach()) {
-            eprintln!("motor-macagent: the build disk could not be released: {error}");
-            if let Some(diagnostic) = settings
-                .build
-                .as_ref()
-                .and_then(|volume| volume.diagnostics("detach-failed"))
-            {
-                stderr_append.write_all(diagnostic.as_bytes()).await?;
-                stderr_append.flush().await?;
-                output_tx
-                    .send(Output::Chunk(Stream::Stderr, diagnostic.len()))
-                    .map_err(|_| io::Error::other("output closed"))?;
-            }
-            // The host recognizes the reason only as a line of its own.
-            let mut line = build_disk_failure("released", &error);
-            if !ends_line(stderr.path())? {
-                line.insert(0, '\n');
-            }
-            stderr_append.write_all(line.as_bytes()).await?;
-            stderr_append.flush().await?;
-            output_tx
-                .send(Output::Chunk(Stream::Stderr, line.len()))
-                .map_err(|_| io::Error::other("output closed"))?;
-            output_tx
-                .send(Output::Terminal(terminal))
-                .map_err(|_| io::Error::other("output closed"))?;
-            loop {
-                tokio::select! {
-                    result = &mut forwarding.0 => {
-                        result.map_err(io::Error::other)??;
-                        return Err(error);
+        let mut failure = None;
+        if let Some(volume) = settings.build.as_mut() {
+            let scope = settings.scope.clone();
+            let release = match volume.detach(&|| scope.require_none()) {
+                Ok(()) => Frame::BuildRelease {
+                    released: true,
+                    reason: String::new(),
+                },
+                Err(error) => {
+                    eprintln!("motor-macagent: the build disk could not be released: {error}");
+                    if let Some(diagnostic) = volume.diagnostics("detach-failed") {
+                        notes.append(&output_tx, &diagnostic).await;
                     }
-                    message = control_rx.recv() => { handle_control(message, &settings.scope)?; }
+                    let mut line = build_disk_failure("released", &error);
+                    if !notes.ends_line() {
+                        line.insert(0, '\n');
+                    }
+                    notes.append(&output_tx, &line).await;
+                    let reason = release_reason(&error);
+                    failure = Some(error);
+                    Frame::BuildRelease {
+                        released: false,
+                        reason,
+                    }
                 }
-            }
+            };
+            let _ = output_tx.send(Output::Frame(release));
         }
-        output_tx
-            .send(Output::Terminal(terminal))
-            .map_err(|_| io::Error::other("output closed"))?;
+        let _ = output_tx.send(Output::Terminal(terminal));
         loop {
             tokio::select! {
-                result = &mut forwarding.0 => { return result.map_err(io::Error::other)?; }
+                result = &mut forwarding.0 => {
+                    result.map_err(io::Error::other)??;
+                    return failure.map_or(Ok(()), Err);
+                }
                 message = control_rx.recv() => { handle_control(message, &settings.scope)?; }
             }
         }
@@ -996,6 +1094,17 @@ mod execution {
             suppress_kill: bool,
             build: impl FnOnce(&Path) -> Option<Box<dyn crate::build_volume::BuildVolume>>,
         ) -> Fixture {
+            launch_full(command, suppress_kill, false, build).await
+        }
+
+        /// As `launch`; with `fail_notes`, every line the agent appends to the
+        /// job's standard error fails to be written, as on a full disk.
+        async fn launch_full(
+            command: &str,
+            suppress_kill: bool,
+            fail_notes: bool,
+            build: impl FnOnce(&Path) -> Option<Box<dyn crate::build_volume::BuildVolume>>,
+        ) -> Fixture {
             let root = cortexkit_test_support::scratch_root();
             std::fs::create_dir_all(&root).unwrap();
             let directory = tempfile::tempdir_in(root).unwrap();
@@ -1010,6 +1119,7 @@ mod execution {
                 temporary_root: directory.path().into(),
                 scope: scope.clone(),
                 build: build(directory.path()),
+                fail_stderr_notes: fail_notes,
             };
             let (mut host, guest) = tokio::io::duplex(1024);
             let agent = Task(tokio::spawn(serve(guest, NONCE.into(), settings)));
@@ -1234,34 +1344,42 @@ mod execution {
         struct FakeVolume {
             directory: PathBuf,
             events: Arc<Mutex<Vec<&'static str>>>,
+            options: FakeOptions,
+        }
+        #[derive(Clone, Default)]
+        struct FakeOptions {
             notice: Option<String>,
             fail_attach: bool,
             fail_detach: bool,
-            /// Whether it returns diagnostic lines.
-            diagnose: bool,
+            /// Whether it returns no diagnostic lines.
+            quiet: bool,
             /// Whether it watches `target/` and reports on it.
             watch: bool,
+            /// Whether the agent's own stderr appends fail.
+            fail_notes: bool,
+            /// Whether the job's processes survive the kill sweep.
+            suppress_kill: bool,
         }
         impl crate::build_volume::BuildVolume for FakeVolume {
             fn attach(&mut self) -> io::Result<Option<String>> {
                 self.events.lock().unwrap().push("attach");
-                if self.fail_attach {
+                if self.options.fail_attach {
                     return Err(io::Error::other("no build disk"));
                 }
                 std::fs::write(self.directory.join("mounted"), "").unwrap();
-                Ok(self.notice.clone())
+                Ok(self.options.notice.clone())
             }
-            fn detach(&mut self) -> io::Result<()> {
+            fn detach(&mut self, no_job_processes: &dyn Fn() -> io::Result<()>) -> io::Result<()> {
                 // A slow unmount: the exit must still wait for it.
                 std::thread::sleep(Duration::from_millis(300));
                 self.events.lock().unwrap().push("detach");
-                if self.fail_detach {
+                if self.options.fail_detach {
                     return Err(io::Error::other("volume busy"));
                 }
-                Ok(())
+                no_job_processes()
             }
             fn diagnostics(&self, phase: &str) -> Option<String> {
-                if !self.diagnose {
+                if self.options.quiet {
                     return None;
                 }
                 let phase = match phase {
@@ -1276,13 +1394,13 @@ mod execution {
                 ))
             }
             fn command_started(&mut self) {
-                if self.watch {
+                if self.options.watch {
                     // The command runs from now: the agent spawned it.
                     self.events.lock().unwrap().push("command-started");
                 }
             }
             fn watch_report(&mut self) -> Option<String> {
-                self.watch.then(|| {
+                self.options.watch.then(|| {
                     self.events.lock().unwrap().push("watch-report");
                     "motor: build-volume diagnostic watch: steady\n".to_owned()
                 })
@@ -1294,59 +1412,89 @@ mod execution {
             fail_attach: bool,
             fail_detach: bool,
         ) -> (Fixture, Arc<Mutex<Vec<&'static str>>>) {
-            launch_with_fake(command, notice, fail_attach, fail_detach, true, false).await
-        }
-        async fn launch_with_fake(
-            command: &str,
-            notice: Option<&str>,
-            fail_attach: bool,
-            fail_detach: bool,
-            diagnose: bool,
-            watch: bool,
-        ) -> (Fixture, Arc<Mutex<Vec<&'static str>>>) {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let recorded = events.clone();
-            let fixture = launch(command, false, move |directory| {
-                Some(Box::new(FakeVolume {
-                    directory: directory.into(),
-                    events: recorded,
+            launch_fake(
+                command,
+                FakeOptions {
                     notice: notice.map(str::to_owned),
                     fail_attach,
                     fail_detach,
-                    diagnose,
-                    watch,
+                    ..FakeOptions::default()
+                },
+            )
+            .await
+        }
+        async fn launch_fake(
+            command: &str,
+            options: FakeOptions,
+        ) -> (Fixture, Arc<Mutex<Vec<&'static str>>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let recorded = events.clone();
+            let (suppress, fail_notes) = (options.suppress_kill, options.fail_notes);
+            let fixture = launch_full(command, suppress, fail_notes, move |directory| {
+                Some(Box::new(FakeVolume {
+                    directory: directory.into(),
+                    events: recorded,
+                    options,
                 })
                     as Box<dyn crate::build_volume::BuildVolume>)
             })
             .await;
             (fixture, events)
         }
-        /// Reads frames until the session ends: stdout, stderr and the
-        /// terminal frame, if one came.
-        async fn collect_session(fixture: &mut Fixture) -> (Vec<u8>, Vec<u8>, Option<Frame>) {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let mut terminal = None;
+        /// What one session sent after Started.
+        struct Seen {
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
+            release: Option<Frame>,
+            terminal: Option<Frame>,
+        }
+        /// Reads frames until the session ends.
+        async fn collect_session(fixture: &mut Fixture) -> Seen {
+            let mut session = Seen {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                release: None,
+                terminal: None,
+            };
             loop {
                 match host_receive(&mut fixture.host).await.unwrap() {
                     Some(Frame::Started {}) => {}
                     Some(Frame::Output {
                         stream: Stream::Stdout,
                         bytes,
-                    }) => stdout.extend(bytes),
+                    }) => session.stdout.extend(bytes),
                     Some(Frame::Output {
                         stream: Stream::Stderr,
                         bytes,
-                    }) => stderr.extend(bytes),
+                    }) => session.stderr.extend(bytes),
+                    Some(frame @ Frame::BuildRelease { .. }) => {
+                        assert!(session.release.is_none() && session.terminal.is_none());
+                        session.release = Some(frame);
+                    }
                     Some(frame @ (Frame::Exit { .. } | Frame::Signal { .. })) => {
-                        assert!(terminal.is_none(), "second terminal frame {frame:?}");
-                        terminal = Some(frame);
+                        assert!(
+                            session.terminal.is_none(),
+                            "second terminal frame {frame:?}"
+                        );
+                        session.terminal = Some(frame);
                     }
                     None => break,
                     Some(frame) => panic!("unexpected frame {frame:?}"),
                 }
             }
-            (stdout, stderr, terminal)
+            session
+        }
+        fn released() -> Option<Frame> {
+            Some(Frame::BuildRelease {
+                released: true,
+                reason: String::new(),
+            })
+        }
+        fn not_released(reason: &str) -> Option<Frame> {
+            Some(Frame::BuildRelease {
+                released: false,
+                reason: reason.into(),
+            })
         }
 
         #[tokio::test]
@@ -1364,7 +1512,7 @@ mod execution {
             );
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let terminal = loop {
+            let release = loop {
                 match host_receive(&mut fixture.host).await.unwrap().unwrap() {
                     Frame::Output {
                         stream: Stream::Stdout,
@@ -1374,15 +1522,19 @@ mod execution {
                         stream: Stream::Stderr,
                         bytes,
                     } => stderr.extend(bytes),
-                    terminal => break terminal,
+                    release => break release,
                 }
             };
-            // Checked when the exit arrives, not after the agent ends.
+            // Checked when the release report arrives, not after the agent ends.
             assert_eq!(
                 *events.lock().unwrap(),
                 ["attach", "after-attach", "before-detach", "detach"]
             );
-            assert_eq!(terminal, Frame::Exit { code: 0 });
+            assert_eq!(Some(release), released());
+            assert_eq!(
+                host_receive(&mut fixture.host).await.unwrap(),
+                Some(Frame::Exit { code: 0 })
+            );
             assert_eq!(stdout, b"ran\n");
             assert_eq!(stderr, b"motor: cold\nmotor: build-volume diagnostic after-attach: metadata\n\nmotor: build-volume diagnostic before-detach: metadata\n");
             (&mut fixture.agent.0).await.unwrap().unwrap();
@@ -1410,15 +1562,16 @@ mod execution {
             assert!(!fixture._directory.path().join("ran").exists());
         }
 
-        /// A failed release still reports the command's real exit, after one
-        /// last stderr line giving the reason, which is how the host learns not
-        /// to publish the disk.
+        /// A failed release is reported as `BuildRelease { released: false }`
+        /// with its reason, then the command's real exit; the caller also
+        /// gets the reason as the last line of standard error.
         #[tokio::test]
         async fn failed_build_volume_detach_says_why_and_still_reports_the_exit() {
             let (mut fixture, events) =
                 launch_with_volume("echo ran; printf job-err >&2; exit 3", None, false, true).await;
-            let (stdout, stderr, terminal) = collect_session(&mut fixture).await;
-            assert_eq!(terminal, Some(Frame::Exit { code: 3 }));
+            let session = collect_session(&mut fixture).await;
+            assert_eq!(session.release, not_released("volume busy"));
+            assert_eq!(session.terminal, Some(Frame::Exit { code: 3 }));
             assert!((&mut fixture.agent.0).await.unwrap().is_err());
             assert_eq!(
                 *events.lock().unwrap(),
@@ -1430,10 +1583,10 @@ mod execution {
                     "detach-failed"
                 ]
             );
-            assert_eq!(stdout, b"ran\n");
+            assert_eq!(session.stdout, b"ran\n");
             // The reason is the last line, after all of the command's output.
             assert_eq!(
-                String::from_utf8(stderr).unwrap(),
+                String::from_utf8(session.stderr).unwrap(),
                 "motor: build-volume diagnostic after-attach: metadata\njob-err\nmotor: build-volume diagnostic before-detach: metadata\nmotor: build-volume diagnostic detach-failed: metadata\nmotor: the build disk could not be released: volume busy\n"
             );
         }
@@ -1442,31 +1595,98 @@ mod execution {
         /// its own after a command that left stderr without a newline.
         #[tokio::test]
         async fn release_failure_line_starts_its_own_line_after_unterminated_stderr() {
-            let (mut fixture, _) = launch_with_fake(
+            let (mut fixture, _) = launch_fake(
                 "printf job-err >&2; exit 4",
-                None,
-                false,
-                true,
-                false,
-                false,
+                FakeOptions {
+                    fail_detach: true,
+                    quiet: true,
+                    ..FakeOptions::default()
+                },
             )
             .await;
-            let (_, stderr, terminal) = collect_session(&mut fixture).await;
-            assert_eq!(terminal, Some(Frame::Exit { code: 4 }));
+            let session = collect_session(&mut fixture).await;
+            assert_eq!(session.terminal, Some(Frame::Exit { code: 4 }));
             assert_eq!(
-                String::from_utf8(stderr).unwrap(),
+                String::from_utf8(session.stderr).unwrap(),
                 "job-err\nmotor: the build disk could not be released: volume busy\n"
             );
+        }
+
+        /// The release report and the command's status come from memory: when
+        /// the agent cannot write its own lines to the job's standard error
+        /// (a full /var/tmp), the real Exit or Signal still arrives, after a
+        /// release report that says whether the disk was released.
+        #[tokio::test]
+        async fn real_outcome_and_release_survive_failed_stderr_appends() {
+            for (command, terminal) in [
+                ("exit 7", Frame::Exit { code: 7 }),
+                ("ulimit -c 0; kill -SEGV $$", Frame::Signal { signal: 11 }),
+            ] {
+                for fail_detach in [false, true] {
+                    let (mut fixture, _) = launch_fake(
+                        command,
+                        FakeOptions {
+                            fail_detach,
+                            fail_notes: true,
+                            ..FakeOptions::default()
+                        },
+                    )
+                    .await;
+                    let session = collect_session(&mut fixture).await;
+                    assert_eq!(session.terminal, Some(terminal.clone()), "{command}");
+                    let expected = if fail_detach {
+                        not_released("volume busy")
+                    } else {
+                        released()
+                    };
+                    assert_eq!(session.release, expected, "{command} {fail_detach}");
+                    // Only the notice written before the command reached the
+                    // job's standard error; none of the agent's later lines.
+                    assert_eq!(
+                        String::from_utf8(session.stderr).unwrap(),
+                        "motor: build-volume diagnostic after-attach: metadata\n"
+                    );
+                }
+            }
+        }
+
+        /// A job process still alive after the kill sweep (here, one that
+        /// escaped it) fails the release, which is reported with the real exit.
+        #[tokio::test]
+        async fn a_job_process_alive_after_the_job_fails_the_release() {
+            let (mut fixture, _) = launch_fake(
+                "(sleep 30 </dev/null >/dev/null 2>&1 &); exit 0",
+                FakeOptions {
+                    suppress_kill: true,
+                    quiet: true,
+                    ..FakeOptions::default()
+                },
+            )
+            .await;
+            let session = collect_session(&mut fixture).await;
+            assert_eq!(session.terminal, Some(Frame::Exit { code: 0 }));
+            let Some(Frame::BuildRelease { released, reason }) = session.release else {
+                panic!("no release report");
+            };
+            assert!(!released);
+            assert!(reason.contains("running after the job ended"), "{reason}");
         }
 
         /// The watch starts with the command and its one line comes before
         /// the volume is released, ahead of the before-detach metadata.
         #[tokio::test]
         async fn watch_report_comes_once_before_release() {
-            let (mut fixture, events) =
-                launch_with_fake("echo ran", None, false, false, true, true).await;
-            let (_, stderr, terminal) = collect_session(&mut fixture).await;
-            assert_eq!(terminal, Some(Frame::Exit { code: 0 }));
+            let (mut fixture, events) = launch_fake(
+                "echo ran",
+                FakeOptions {
+                    watch: true,
+                    ..FakeOptions::default()
+                },
+            )
+            .await;
+            let session = collect_session(&mut fixture).await;
+            assert_eq!(session.release, released());
+            assert_eq!(session.terminal, Some(Frame::Exit { code: 0 }));
             assert_eq!(
                 *events.lock().unwrap(),
                 [
@@ -1479,9 +1699,17 @@ mod execution {
                 ]
             );
             assert_eq!(
-                String::from_utf8(stderr).unwrap(),
+                String::from_utf8(session.stderr).unwrap(),
                 "motor: build-volume diagnostic after-attach: metadata\n\nmotor: build-volume diagnostic watch: steady\nmotor: build-volume diagnostic before-detach: metadata\n"
             );
+        }
+
+        #[test]
+        fn release_reason_is_one_line_within_the_frame_bound() {
+            let reason = release_reason(&io::Error::other(format!("a\n b {}", "é".repeat(2000))));
+            assert!(reason.starts_with("a b é"));
+            assert!(reason.len() <= motor_winagent::MAX_RELEASE_REASON_BYTES);
+            assert!(reason.len() > motor_winagent::MAX_RELEASE_REASON_BYTES - 2);
         }
 
         #[test]

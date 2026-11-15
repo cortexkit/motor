@@ -124,6 +124,8 @@ pub struct Run {
     pub stderr: String,
     /// The agent's Exit or Signal; `None` when the session ended without one.
     pub terminal: Option<Frame>,
+    /// What the agent's `BuildRelease` said; `None` when it sent none.
+    pub released: Option<bool>,
     /// Why the session failed, if it did.
     pub failure: Option<String>,
     /// What the host found in the agent's returns directory in the
@@ -153,6 +155,12 @@ pub fn verdict(marker: &str, first: &Run, second: &Run) -> Result<(), String> {
         }
         if run.terminal != Some(Frame::Exit { code: 0 }) {
             return Err(format!("{which} VM ended with {:?}", run.terminal));
+        }
+        if run.released != Some(true) {
+            return Err(format!(
+                "{which} VM: the agent reported the build disk released: {:?}",
+                run.released
+            ));
         }
         if let Some(line) = run
             .stdout
@@ -466,6 +474,10 @@ fn converse(
                 }
                 collected.push_str(&text);
             }
+            Frame::BuildRelease { released, reason } => {
+                println!("agent: build disk released: {released} {reason:?}");
+                run.released = Some(released);
+            }
             terminal @ (Frame::Exit { .. } | Frame::Signal { .. }) => {
                 run.terminal = Some(terminal);
                 return Ok(());
@@ -486,6 +498,7 @@ mod tests {
             stdout: format!("check start: volume\ncargo: exit 0\n{stdout}check end: volume\n"),
             stderr: stderr.into(),
             terminal: Some(Frame::Exit { code: 0 }),
+            released: Some(true),
             failure: None,
             returns: vec!["debug/".into(), RETURNED.into()],
             target_link: Some(crate::BUILD_MOUNT.into()),
@@ -556,6 +569,14 @@ mod tests {
         };
         let error = verdict("m1", &replaced, &second).unwrap_err();
         assert!(error.contains("not the link"), "{error}");
+        for released in [None, Some(false)] {
+            let unreported = Run {
+                released,
+                ..exited("wrote: m1\n", "")
+            };
+            let error = verdict("m1", &unreported, &second).unwrap_err();
+            assert!(error.contains("build disk released"), "{error}");
+        }
         let unbuilt = Run {
             stdout: "check start: volume\ncargo: exit 101\nwrote: m1\ncheck end: volume\n".into(),
             ..exited("", "")

@@ -437,20 +437,27 @@ fn windows_rejects_signal_in_every_phase() {
         (Peer::Host, Frame::Dismount {}),
         (Peer::Agent, Frame::Dismounted { clean: true }),
     ];
-    for step in 0..=windows.len() {
-        for sender in [Peer::Host, Peer::Agent] {
-            let mut protocol = Protocol::new(NONCE).unwrap();
-            for (peer, frame) in &windows[..step] {
-                protocol.accept(*peer, frame).unwrap();
+    let macos_only = [
+        Frame::Signal { signal: 11 },
+        Frame::BuildRelease {
+            released: true,
+            reason: String::new(),
+        },
+    ];
+    for refused in &macos_only {
+        for step in 0..=windows.len() {
+            for sender in [Peer::Host, Peer::Agent] {
+                let mut protocol = Protocol::new(NONCE).unwrap();
+                for (peer, frame) in &windows[..step] {
+                    protocol.accept(*peer, frame).unwrap();
+                }
+                let before = protocol.state();
+                assert!(
+                    protocol.accept(sender, refused).is_err(),
+                    "Windows profile accepted {refused:?} from {sender:?} in {before:?}"
+                );
+                assert_eq!(protocol.state(), State::Failed);
             }
-            let before = protocol.state();
-            assert!(
-                protocol
-                    .accept(sender, &Frame::Signal { signal: 11 })
-                    .is_err(),
-                "Windows profile accepted Signal from {sender:?} in {before:?}"
-            );
-            assert_eq!(protocol.state(), State::Failed);
         }
     }
 }
@@ -512,4 +519,80 @@ fn windows_session_rejects_a_received_signal() {
             .send(&mut Vec::new(), &Frame::Signal { signal: 11 })
             .is_err()
     );
+}
+
+fn release(released: bool) -> Frame {
+    Frame::BuildRelease {
+        released,
+        reason: if released {
+            String::new()
+        } else {
+            "volume busy".into()
+        },
+    }
+}
+
+/// The agent reports the build disk's release once, after the command's
+/// output and before its Exit or Signal; a Cancel may still arrive.
+#[test]
+fn build_release_comes_once_between_output_and_termination() {
+    for last in [Frame::Exit { code: 7 }, Frame::Signal { signal: 11 }] {
+        for released in [true, false] {
+            let mut protocol = advanced(TRANSCRIPT_LEN - 1);
+            protocol.accept(Peer::Agent, &release(released)).unwrap();
+            assert_eq!(protocol.state(), State::ReleaseReported);
+            protocol.accept(Peer::Host, &Frame::Cancel {}).unwrap();
+            protocol.accept(Peer::Agent, &last).unwrap();
+            assert_eq!(protocol.state(), State::Complete);
+        }
+    }
+    // A terminal status without it is still accepted; the host then treats
+    // the disk as not released.
+    let mut protocol = advanced(TRANSCRIPT_LEN - 1);
+    protocol
+        .accept(Peer::Agent, &Frame::Exit { code: 0 })
+        .unwrap();
+    assert_eq!(protocol.state(), State::Complete);
+}
+
+#[test]
+fn build_release_out_of_place_or_oversized_is_rejected() {
+    let refused = |protocol: &mut Protocol, sender: Peer, frame: &Frame| {
+        assert!(protocol.accept(sender, frame).is_err(), "{frame:?}");
+        assert_eq!(protocol.state(), State::Failed);
+    };
+    // Before Started, from the host, twice, followed by output, or after Exit.
+    refused(&mut advanced(2), Peer::Agent, &release(true));
+    refused(&mut advanced(4), Peer::Host, &release(true));
+    let mut twice = advanced(4);
+    twice.accept(Peer::Agent, &release(true)).unwrap();
+    refused(&mut twice, Peer::Agent, &release(false));
+    let mut output_after = advanced(4);
+    output_after.accept(Peer::Agent, &release(true)).unwrap();
+    refused(&mut output_after, Peer::Agent, &output(Stream::Stderr));
+    refused(&mut advanced(TRANSCRIPT_LEN), Peer::Agent, &release(true));
+    let long = Frame::BuildRelease {
+        released: false,
+        reason: "x".repeat(MAX_RELEASE_REASON_BYTES + 1),
+    };
+    refused(&mut advanced(4), Peer::Agent, &long);
+    let mut longest = advanced(4);
+    longest
+        .accept(
+            Peer::Agent,
+            &Frame::BuildRelease {
+                released: false,
+                reason: "x".repeat(MAX_RELEASE_REASON_BYTES),
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn build_release_frame_roundtrips_through_shared_framing() {
+    let frame = release(false);
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &frame).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("\"kind\":\"build_release\""));
+    assert_eq!(read_frame(&mut &bytes[..]).unwrap(), Some(frame));
 }

@@ -172,9 +172,11 @@ pub(super) fn plan(
         if returns.contains(&path) {
             continue;
         }
+        // `target` is compared ignoring ASCII case, as below_target and the
+        // returned-file rules do, because the host volume ignores case.
         if path.components().any(|c| {
             c == Component::Normal("node_modules".as_ref())
-                || c == Component::Normal("target".as_ref())
+                || matches!(c, Component::Normal(name) if name.eq_ignore_ascii_case("target"))
         }) {
             unprotected.insert(path);
             continue;

@@ -42,7 +42,7 @@ use std::{
     collections::BTreeSet,
     ffi::CString,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read},
     os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
 };
@@ -61,7 +61,9 @@ pub trait BuildVolume: Send {
     fn attach(&mut self) -> io::Result<Option<String>>;
     /// Call only once every job process is gone. Copies the returned files
     /// out, unmounts the volume and puts the copies in the cargo-home share.
-    fn detach(&mut self) -> io::Result<()>;
+    /// `no_job_processes` fails if a job process is alive; it is called
+    /// after the unmount and again after the copies are placed.
+    fn detach(&mut self, no_job_processes: &dyn Fn() -> io::Result<()>) -> io::Result<()>;
     /// Metadata only, sent on the existing stderr channel at lifecycle boundaries.
     fn diagnostics(&self, _phase: &str) -> Option<String> {
         None
@@ -344,6 +346,70 @@ fn job_writable(metadata: &std::fs::Metadata, uid: libc::uid_t, gid: libc::gid_t
     metadata.uid() == uid
         || metadata.mode() & 0o002 != 0
         || (metadata.gid() == gid && metadata.mode() & 0o020 != 0)
+}
+
+/// What names a mounted file system's directory: the file system ID from
+/// `fstatfs` and the directory's inode number.
+pub type Identity = ([i32; 2], u64);
+
+/// The identity of an open directory (see `Identity`).
+pub fn identity(directory: &File) -> io::Result<Identity> {
+    use std::os::unix::fs::MetadataExt;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstatfs(directory.as_raw_fd(), &mut stat) })?;
+    Ok((fsid(stat.f_fsid), directory.metadata()?.ino()))
+}
+
+/// The two words of a file system ID.
+pub(crate) fn fsid(fsid: libc::fsid_t) -> [i32; 2] {
+    // libc keeps fsid_t's two words private; it is exactly that array.
+    unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(fsid) }
+}
+
+/// The checkout's `target` as the agent sees it, read without following it:
+/// whether it is the runner's link to the build mount, another link, or
+/// something else. Never resolves the link, so the answer does not depend on
+/// where a link the job made points.
+pub fn target_state(target: &Path) -> &'static str {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_symlink() => match std::fs::read_link(target) {
+            Ok(link) if link == Path::new(motor_macvm::BUILD_MOUNT) => "link-to-build-mount",
+            Ok(_) => "link-elsewhere",
+            Err(_) => "unreadable-link",
+        },
+        Ok(metadata) if metadata.is_dir() => "directory",
+        Ok(_) => "other",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "missing",
+        Err(_) => "unreadable",
+    }
+}
+
+/// Opens a share's directory before any job code runs, refusing one below a
+/// directory the job account could change (as `open_workspace` does), and
+/// records its identity, which `reopen_recorded` requires later.
+pub fn open_share(
+    root: &File,
+    path: &Path,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> io::Result<(File, Identity)> {
+    let share = walk(root, &components(path)?, Some((uid, gid)))?;
+    let recorded = identity(&share)?;
+    Ok((share, recorded))
+}
+
+/// Reopens a share's directory from `root` without following links and
+/// requires the identity recorded before the job: the same file system and
+/// the same directory, not one the job put in its place.
+pub fn reopen_recorded(root: &File, path: &Path, recorded: Identity) -> io::Result<File> {
+    let share = reopen(root, path)?;
+    if identity(&share)? != recorded {
+        return Err(invalid(format!(
+            "{} is no longer the share recorded before the job",
+            path.display()
+        )));
+    }
+    Ok(share)
 }
 
 /// Opens a directory by walking from `root` one component at a time, never
@@ -694,18 +760,60 @@ pub fn stage_returns(
     Ok(staged)
 }
 
+/// How `place_returns` fills one placed file; tests inject failures.
+trait PlaceWrites {
+    fn copy(&mut self, from: &mut File, to: &mut File) -> io::Result<()>;
+    fn set_len(&mut self, file: &File, size: u64) -> io::Result<()>;
+}
+struct RealWrites;
+impl PlaceWrites for RealWrites {
+    fn copy(&mut self, from: &mut File, to: &mut File) -> io::Result<()> {
+        io::copy(from, to).map(drop)
+    }
+    fn set_len(&mut self, file: &File, size: u64) -> io::Result<()> {
+        file.set_len(size)
+    }
+}
+
+/// Flushes a file or directory to its file system. A file system that does
+/// not support it (EINVAL, ENOTSUP) is accepted: there is nothing more to do.
+fn sync(file: &File) -> io::Result<()> {
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EINVAL) | Some(libc::ENOTSUP) => Ok(()),
+        _ => Err(error),
+    }
+}
+
 /// Writes the staged files into `target`, the returns directory, at their
 /// requested paths, creating directories as needed and never following or
-/// replacing anything already there. A file that cannot be placed is left out
-/// and reported missing by the host; the job itself is not failed for it.
+/// replacing anything already there. Each file is flushed, then the
+/// directory holding it, before the next. A file that cannot be written whole
+/// is removed through its directory, so the host reports it missing rather
+/// than returning part of it; if it cannot be removed, placing fails, and so
+/// does the release.
 pub fn place_returns(target: &File, staged: &[Staged], staging: &Path) -> io::Result<()> {
+    place_returns_with(target, staged, staging, &mut RealWrites)
+}
+
+fn place_returns_with(
+    target: &File,
+    staged: &[Staged],
+    staging: &Path,
+    writes: &mut impl PlaceWrites,
+) -> io::Result<()> {
     for entry in staged {
         let path = match entry {
             Staged::Copied { path, .. } | Staged::OverCap { path, .. } => path,
         };
-        let result = (|| -> io::Result<()> {
-            let mut components: Vec<&str> = path.split('/').collect();
-            let name = components.pop().ok_or_else(|| invalid("empty path"))?;
+        let mut components: Vec<&str> = path.split('/').collect();
+        let Some(name) = components.pop() else {
+            continue;
+        };
+        let opened = (|| -> io::Result<(Option<File>, File)> {
             let mut directory = None;
             for component in components {
                 let parent: &File = directory.as_ref().unwrap_or(target);
@@ -720,23 +828,42 @@ pub fn place_returns(target: &File, staged: &[Staged], staging: &Path) -> io::Re
                 directory = Some(opened);
             }
             let parent = directory.as_ref().unwrap_or(target);
-            let mut output = open_at(parent, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
-            match entry {
-                Staged::Copied { index, .. } => {
-                    io::copy(
-                        &mut File::open(staging.join(index.to_string()))?,
-                        &mut output,
-                    )?;
-                }
-                Staged::OverCap { size, .. } => output.set_len(*size)?,
-            }
-            output.flush()
+            let output = open_at(parent, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
+            Ok((directory, output))
         })();
-        if let Err(error) = result {
+        // Nothing was created under the file's name when this fails.
+        let (directory, mut output) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                eprintln!("motor-macagent: returned file {path} not placed: {error}");
+                continue;
+            }
+        };
+        let parent = directory.as_ref().unwrap_or(target);
+        let written = (|| -> io::Result<()> {
+            match entry {
+                Staged::Copied { index, .. } => writes.copy(
+                    &mut File::open(staging.join(index.to_string()))?,
+                    &mut output,
+                )?,
+                Staged::OverCap { size, .. } => writes.set_len(&output, *size)?,
+            }
+            sync(&output)?;
+            sync(parent)
+        })();
+        drop(output);
+        if let Err(error) = written {
+            let c = c_name(name)?;
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+                return Err(invalid(format!(
+                    "returned file {path} was not written whole ({error}) and could not be removed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
             eprintln!("motor-macagent: returned file {path} not placed: {error}");
         }
     }
-    Ok(())
+    sync(target)
 }
 
 #[cfg(target_os = "macos")]
@@ -751,7 +878,7 @@ impl BuildVolume for Unsupported {
     fn attach(&mut self) -> io::Result<Option<String>> {
         Err(invalid("the build volume requires a macOS guest"))
     }
-    fn detach(&mut self) -> io::Result<()> {
+    fn detach(&mut self, _: &dyn Fn() -> io::Result<()>) -> io::Result<()> {
         Err(invalid("the build volume requires a macOS guest"))
     }
 }
@@ -762,6 +889,7 @@ impl BuildVolume for Unsupported {
 #[cfg(target_os = "macos")]
 mod native {
     use super::*;
+    use std::io::Write;
     use std::os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
@@ -795,21 +923,10 @@ mod native {
         root: Option<Identity>,
         /// Watches the mount and `target` from mounting until release.
         watcher: Option<Watcher>,
+        /// The cargo-home share's identity, recorded before the job ran.
+        cargo_home_identity: Option<Identity>,
     }
 
-    /// What names the mounted build volume's root: the file system ID and the
-    /// root directory's inode number.
-    type Identity = ([i32; 2], u64);
-
-    fn identity(directory: &File) -> io::Result<Identity> {
-        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-        check(unsafe { libc::fstatfs(directory.as_raw_fd(), &mut stat) })?;
-        Ok((fsid(stat.f_fsid), directory.metadata()?.ino()))
-    }
-    fn fsid(fsid: libc::fsid_t) -> [i32; 2] {
-        // libc keeps fsid_t's two words private; it is exactly that array.
-        unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(fsid) }
-    }
     fn open_root() -> io::Result<File> {
         std::fs::OpenOptions::new()
             .read(true)
@@ -860,36 +977,30 @@ mod native {
                 parent: None,
                 root: None,
                 watcher: None,
+                cargo_home_identity: None,
             })
         }
 
-        /// One look for `Watcher`: on the volume while both the mount and the
-        /// checkout's `target`, followed through its link, resolve to the
-        /// recorded file system and root inode.
+        /// One look for `Watcher`: on the volume while the mount resolves to
+        /// the recorded file system and root inode and the checkout's `target`
+        /// is still the runner's link. The agent is root, so it never resolves
+        /// `target` itself: that would follow wherever the job pointed it.
         fn look(mount: &Path, target: &Path, recorded: Identity) -> Look {
             use std::fmt::Write;
-            let mut detail = String::new();
-            let kind = match std::fs::symlink_metadata(target) {
-                Ok(metadata) if metadata.is_symlink() => "symlink".to_owned(),
-                Ok(metadata) if metadata.is_dir() => "directory".to_owned(),
-                Ok(_) => "other".to_owned(),
-                Err(error) => format!("error {error}"),
-            };
-            let _ = write!(detail, "target lstat(type={kind})");
-            let mut on_volume = true;
-            for (name, path) in [("mount", mount), ("target", target)] {
-                match resolve(path) {
-                    Ok((on, id, inode)) => {
-                        on_volume &= id == recorded.0 && inode == recorded.1;
-                        let _ = write!(
-                            detail,
-                            " {name}(f_mntonname={on:?},f_fsid={id:?},inode={inode})"
-                        );
-                    }
-                    Err(error) => {
-                        on_volume = false;
-                        let _ = write!(detail, " {name}_error={error}");
-                    }
+            let state = target_state(target);
+            let mut detail = format!("target={state}");
+            let mut on_volume = state == "link-to-build-mount";
+            match resolve(mount) {
+                Ok((on, id, inode)) => {
+                    on_volume &= id == recorded.0 && inode == recorded.1;
+                    let _ = write!(
+                        detail,
+                        " mount(f_mntonname={on:?},f_fsid={id:?},inode={inode})"
+                    );
+                }
+                Err(error) => {
+                    on_volume = false;
+                    let _ = write!(detail, " mount_error={error}");
                 }
             }
             Look { on_volume, detail }
@@ -897,39 +1008,13 @@ mod native {
 
         fn snapshot(&self, phase: &str) -> String {
             use std::fmt::Write;
-            let mut detail = format!("target={:?} recorded={:?}", self.target, self.root);
-            match std::fs::symlink_metadata(&self.target) {
-                Ok(metadata) => {
-                    let kind = if metadata.is_symlink() {
-                        "symlink"
-                    } else if metadata.is_dir() {
-                        "directory"
-                    } else {
-                        "other"
-                    };
-                    let _ = write!(
-                        detail,
-                        " lstat(type={kind},inode={},dev={},mode={:#o})",
-                        metadata.ino(),
-                        metadata.dev(),
-                        metadata.mode()
-                    );
-                }
-                Err(error) => {
-                    let _ = write!(detail, " lstat_error={error}");
-                }
-            }
-            let resolved = (|| -> io::Result<_> {
-                let path = CString::new(self.target.as_os_str().as_bytes()).map_err(invalid)?;
-                let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-                check(unsafe { libc::statfs(path.as_ptr(), &mut stat) })?;
-                Ok((
-                    text(&stat.f_mntonname),
-                    fsid(stat.f_fsid),
-                    std::fs::metadata(&self.target)?.ino(),
-                ))
-            })();
-            match resolved {
+            let mut detail = format!(
+                "target={} mount={:?} recorded={:?}",
+                target_state(&self.target),
+                self.mount,
+                self.root
+            );
+            match resolve(&self.mount) {
                 Ok((on, id, inode)) => {
                     let _ = write!(
                         detail,
@@ -1121,6 +1206,8 @@ mod native {
                 self.gid,
             )?;
             check_target_link(&workspace)?;
+            let (_, cargo_home) =
+                open_share(&root_directory, &self.cargo_home, self.uid, self.gid)?;
             let parent = mount_point(&root_directory, &self.mount, self.uid, self.gid)?;
             let (disk, raw) = find_disk(self.gid)?;
             let mut steps = Steps {
@@ -1134,6 +1221,7 @@ mod native {
             let root = identity(&steps.root()?)?;
             self.root = Some(root);
             self.parent = Some(parent);
+            self.cargo_home_identity = Some(cargo_home);
             let (mount, target) = (self.mount.clone(), self.target.clone());
             self.watcher = Some(Watcher::start(WATCH_INTERVAL, move || {
                 Self::look(&mount, &target, root)
@@ -1151,10 +1239,12 @@ mod native {
             self.watcher.take().map(|mut watcher| watcher.finish())
         }
 
-        fn detach(&mut self) -> io::Result<()> {
+        fn detach(&mut self, no_job_processes: &dyn Fn() -> io::Result<()>) -> io::Result<()> {
             // Dropping the watcher stops it if no report was taken.
             self.watcher = None;
-            let (Some(parent), Some(recorded)) = (self.parent.take(), self.root) else {
+            let (Some(parent), Some(recorded), Some(cargo_home)) =
+                (self.parent.take(), self.root, self.cargo_home_identity)
+            else {
                 return Err(invalid("build volume is not attached"));
             };
             // Job code has run: reach the mount again from / without following
@@ -1189,11 +1279,13 @@ mod native {
             if point.metadata()?.dev() != parent.metadata()?.dev() {
                 return Err(invalid("the build mount is still mounted after unmounting"));
             }
+            no_job_processes()?;
             // The host reads returned files under target/ only from a
             // directory created here, now that no job process is left.
             if !self.build.returns.is_empty() {
-                let share = reopen(&open_root()?, &self.cargo_home)?;
+                let share = reopen_recorded(&open_root()?, &self.cargo_home, cargo_home)?;
                 place_returns(&returns_directory(&share)?, &staged, staging.path())?;
+                no_job_processes()?;
             }
             self.root = None;
             Ok(())
@@ -1391,16 +1483,18 @@ mod native {
         use super::*;
 
         #[test]
-        fn snapshot_reports_target_metadata_and_mounts_without_reading_files() {
+        fn snapshot_reports_the_mount_and_targets_state_without_resolving_target() {
             let scratch = tempfile::Builder::new()
                 .prefix("motor-volume-diagnostic-")
                 .tempdir_in(cortexkit_test_support::scratch_root())
                 .unwrap();
             let target = scratch.path().join("target");
+            let mount = scratch.path().join("mount");
             std::fs::create_dir(&target).unwrap();
-            let inode = std::fs::metadata(&target).unwrap().ino();
+            std::fs::create_dir(&mount).unwrap();
+            let inode = std::fs::metadata(&mount).unwrap().ino();
             let volume = Native {
-                mount: scratch.path().join("mount"),
+                mount: mount.clone(),
                 target: target.clone(),
                 cargo_home: scratch.path().join("cargo-home"),
                 build: BuildConfig {
@@ -1412,10 +1506,11 @@ mod native {
                 parent: None,
                 root: None,
                 watcher: None,
+                cargo_home_identity: None,
             };
             let snapshot = volume.snapshot("before-detach");
             for field in [
-                "lstat(type=directory",
+                "target=directory",
                 "statfs(f_mntonname=",
                 "f_fsid=",
                 "getfsstat=[",
@@ -1427,13 +1522,14 @@ mod native {
             assert!(snapshot.contains(&format!("inode={inode}")), "{snapshot}");
             assert!(snapshot.len() <= DIAGNOSTIC_MAX_BYTES);
             std::fs::remove_dir(&target).unwrap();
-            std::os::unix::fs::symlink("missing", &target).unwrap();
+            std::os::unix::fs::symlink(&mount, &target).unwrap();
             let snapshot = volume.snapshot("detach-failed");
-            assert!(snapshot.contains("lstat(type=symlink"), "{snapshot}");
-            assert!(snapshot.contains("statfs_error="), "{snapshot}");
+            assert!(snapshot.contains("target=link-elsewhere"), "{snapshot}");
             std::fs::remove_file(&target).unwrap();
+            std::fs::remove_dir(&mount).unwrap();
             let snapshot = volume.snapshot("detach-failed");
-            assert!(snapshot.contains("lstat_error="), "{snapshot}");
+            assert!(snapshot.contains("target=missing"), "{snapshot}");
+            assert!(snapshot.contains("statfs_error="), "{snapshot}");
         }
     }
 }
@@ -1441,6 +1537,7 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -1667,6 +1764,131 @@ mod tests {
         std::fs::write(&name, "x").unwrap();
         assert!(returns_directory(&open()).is_err());
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// The watcher and diagnostics read `target` without following it, so
+    /// their report is the same whether a job's link points at something
+    /// that exists or not, even under a directory only root can read.
+    #[test]
+    fn target_state_never_depends_on_where_a_job_link_points() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = cortexkit_test_support::ScratchDir::new("build-target-state");
+        let private = scratch.join("root-only");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(private.join("exists"), "x").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = scratch.join("target");
+        let mut states = Vec::new();
+        for pointed in ["exists", "missing"] {
+            symlink(private.join(pointed), &target).unwrap();
+            states.push(target_state(&target));
+            std::fs::remove_file(&target).unwrap();
+        }
+        assert_eq!(states, ["link-elsewhere", "link-elsewhere"]);
+        symlink(motor_macvm::BUILD_MOUNT, &target).unwrap();
+        assert_eq!(target_state(&target), "link-to-build-mount");
+        std::fs::remove_file(&target).unwrap();
+        assert_eq!(target_state(&target), "missing");
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(target_state(&target), "directory");
+    }
+
+    /// The cargo-home share is opened before the job only when no directory
+    /// above it is the job's to change, and is required to be the same share
+    /// before the returns directory is made in it.
+    #[test]
+    fn cargo_home_share_is_out_of_the_jobs_reach_and_must_stay_the_same() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let scratch = cortexkit_test_support::ScratchDir::new("build-cargo-home-share");
+        let root = scratch.join("root");
+        let share = root.join("opt/motor/job/cargo-home");
+        std::fs::create_dir_all(&share).unwrap();
+        for path in [
+            root.clone(),
+            root.join("opt"),
+            root.join("opt/motor"),
+            root.join("opt/motor/job"),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The share itself is the job's to write.
+        std::fs::set_permissions(&share, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let me = std::fs::metadata(&root).unwrap();
+        let (uid, gid) = (me.uid() + 1, me.gid() + 1);
+        let path = Path::new("/opt/motor/job/cargo-home");
+        let open = || File::open(&root).unwrap();
+        let (_, recorded) = open_share(&open(), path, uid, gid).unwrap();
+        reopen_recorded(&open(), path, recorded).unwrap();
+        let job = root.join("opt/motor/job");
+        std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_share(&open(), path, uid, gid).is_err());
+        std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(open_share(&open(), path, me.uid(), gid).is_err());
+        // Another directory put in the share's place is refused.
+        std::fs::rename(&share, job.join("moved")).unwrap();
+        std::fs::create_dir(&share).unwrap();
+        let error = reopen_recorded(&open(), path, recorded).unwrap_err();
+        assert!(error.to_string().contains("no longer the share"), "{error}");
+        std::fs::remove_dir(&share).unwrap();
+        symlink(job.join("moved"), &share).unwrap();
+        assert!(reopen_recorded(&open(), path, recorded).is_err());
+    }
+
+    /// Fails one placed file's writing the way a full or failing disk does.
+    struct FailingWrites {
+        /// Bytes `copy` writes before failing with EIO.
+        partial: usize,
+        fail_set_len: bool,
+    }
+    impl PlaceWrites for FailingWrites {
+        fn copy(&mut self, from: &mut File, to: &mut File) -> io::Result<()> {
+            let mut bytes = vec![0; self.partial];
+            from.read_exact(&mut bytes)?;
+            to.write_all(&bytes)?;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        }
+        fn set_len(&mut self, file: &File, size: u64) -> io::Result<()> {
+            if self.fail_set_len {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            file.set_len(size)
+        }
+    }
+
+    /// A copy that fails partway and a placeholder whose size cannot be set
+    /// both leave nothing under the file's name, so the host reports them
+    /// missing instead of returning a torn or empty file.
+    #[test]
+    fn a_returned_file_that_fails_to_be_written_is_removed() {
+        let v = volume();
+        std::fs::create_dir(v.volume.join("debug")).unwrap();
+        std::fs::write(v.volume.join("debug/app"), vec![7; 64]).unwrap();
+        std::fs::write(v.volume.join("large"), vec![8; 40]).unwrap();
+        let build = BuildConfig {
+            returns: vec!["debug/app".into(), "large".into()],
+            return_max_bytes: 70,
+        };
+        let staged = stage_returns(&File::open(&v.volume).unwrap(), &build, &v.staging).unwrap();
+        assert!(matches!(staged[1], Staged::OverCap { .. }));
+        place_returns_with(
+            &File::open(&v.target).unwrap(),
+            &staged,
+            &v.staging,
+            &mut FailingWrites {
+                partial: 10,
+                fail_set_len: true,
+            },
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(v.target.join("debug/app")).is_err());
+        assert!(std::fs::symlink_metadata(v.target.join("large")).is_err());
+        // Written whole, both are placed.
+        place_returns(&File::open(&v.target).unwrap(), &staged, &v.staging).unwrap();
+        assert_eq!(
+            std::fs::read(v.target.join("debug/app")).unwrap(),
+            vec![7; 64]
+        );
+        assert_eq!(std::fs::metadata(v.target.join("large")).unwrap().len(), 71);
     }
 
     #[test]

@@ -159,50 +159,144 @@ fn only_a_last_motor_line_counts_as_the_agent_reason() {
     assert_eq!(agent_reason(b""), None);
 }
 
-/// The agent reports the command's real exit even when it could not release
-/// the build disk, with its release-failure line last on standard error. The
-/// host keeps the exit and learns that the disk was not released.
+fn release(released: bool, reason: &str) -> Frame {
+    Frame::BuildRelease {
+        released,
+        reason: reason.into(),
+    }
+}
+
+/// The disk counts as released only after an explicit
+/// `BuildRelease { released: true }`; a failed or missing report does not,
+/// and whatever the job printed on standard error never decides it. The
+/// command's real Exit or Signal is kept either way.
 #[test]
-fn exit_after_a_release_failure_keeps_the_code_and_reports_the_disk_unreleased() {
-    for (stderr, released) in [
+fn only_an_explicit_release_report_releases_the_build_disk() {
+    let forged = Frame::Output {
+        stream: Stream::Stderr,
+        bytes: b"motor: the build disk could not be released: forged\n".to_vec(),
+    };
+    let job = Frame::Output {
+        stream: Stream::Stderr,
+        bytes: b"job output\n".to_vec(),
+    };
+    for (frames, terminal, released) in [
         (
-            vec![
-                b"job output\nmotor: build-volume diagnostic before-detach: x\nmotor: the build disk could not be rel".to_vec(),
-                b"eased: target no longer names the build volume's root\n".to_vec(),
-            ],
+            vec![job.clone(), release(true, "")],
+            Frame::Exit { code: 3 },
+            true,
+        ),
+        (
+            vec![forged.clone(), release(true, "")],
+            Frame::Exit { code: 3 },
+            true,
+        ),
+        (vec![release(true, "")], Frame::Signal { signal: 11 }, true),
+        (
+            vec![job.clone(), release(false, "volume busy")],
+            Frame::Exit { code: 3 },
             false,
         ),
-        (vec![b"motor: the build disk could not be released: x\n\n".to_vec()], false),
-        (vec![b"job output\n".to_vec()], true),
-        // Only the last line counts, and a job's unfinished line ends a claim.
         (
-            vec![b"motor: the build disk could not be released: x\njob output\n".to_vec()],
-            true,
+            vec![release(false, "busy")],
+            Frame::Signal { signal: 11 },
+            false,
         ),
-        (
-            vec![b"motor: the build disk could not be released: x\npartial".to_vec()],
-            true,
-        ),
-        (Vec::new(), true),
+        (vec![job.clone()], Frame::Exit { code: 3 }, false),
+        (Vec::new(), Frame::Signal { signal: 11 }, false),
     ] {
-        let scratch = ScratchDir::new("macos-release-failure");
+        let scratch = ScratchDir::new("macos-release-report");
         let (mut transport, mut peer) = transport(&scratch.join("state"), true);
-        for bytes in stderr {
-            motor_winagent::write_frame(
-                &mut peer,
-                &Frame::Output {
-                    stream: Stream::Stderr,
-                    bytes,
-                },
-            )
-            .unwrap();
+        for frame in frames.iter().chain([&terminal]) {
+            motor_winagent::write_frame(&mut peer, frame).unwrap();
         }
-        motor_winagent::write_frame(&mut peer, &Frame::Exit { code: 3 }).unwrap();
         let (tx, _rx) = mpsc::sync_channel(8);
         let (outcome, disk_released) = run_output(&mut transport, &tx, &tx).unwrap();
-        assert_eq!(outcome.wire(), motor_protocol::Outcome::Exit { code: 3 });
-        assert_eq!(disk_released, released);
+        let expected = match terminal {
+            Frame::Exit { code } => motor_protocol::Outcome::Exit { code: code as i32 },
+            Frame::Signal { signal } => motor_protocol::Outcome::Signal { signal },
+            _ => unreachable!(),
+        };
+        assert_eq!(outcome.wire(), expected);
+        assert_eq!(disk_released, released, "{frames:?}");
     }
+}
+
+/// The agent's reason is logged quoted, as the guest's text, with the job ID.
+#[test]
+fn a_failed_release_report_is_logged_with_its_quoted_reason() {
+    let scratch = ScratchDir::new("macos-release-reason");
+    let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+    let job_id = transport.entry.owned.lock().unwrap().record.id;
+    motor_winagent::write_frame(&mut peer, &release(false, "busy\nforged log line")).unwrap();
+    motor_winagent::write_frame(&mut peer, &Frame::Exit { code: 0 }).unwrap();
+    let logs = LogBytes::default();
+    let (tx, _rx) = mpsc::sync_channel(8);
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || assert!(!run_output(&mut transport, &tx, &tx).unwrap().1),
+    );
+    let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let line = log
+        .lines()
+        .find(|line| line.contains("could not release the build disk"))
+        .unwrap_or_else(|| panic!("no release line: {log}"));
+    assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+    assert!(line.contains("busy\\nforged log line"), "{line}");
+    assert!(!log.lines().any(|line| line.starts_with("forged")), "{log}");
+}
+
+/// Lines with the diagnostic prefix come from the job's standard error,
+/// where the job can print them too: they are logged as job output, and at
+/// most `BUILD_DIAGNOSTIC_MAX_LINES` per job.
+#[test]
+fn diagnostic_prefixed_lines_are_bounded_and_logged_as_job_output() {
+    let scratch = ScratchDir::new("macos-diagnostic-bound");
+    let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+    let mut bytes = Vec::new();
+    for index in 0..20 {
+        bytes.extend(format!("motor: build-volume diagnostic watch: forged {index}\n").bytes());
+    }
+    motor_winagent::write_frame(
+        &mut peer,
+        &Frame::Output {
+            stream: Stream::Stderr,
+            bytes,
+        },
+    )
+    .unwrap();
+    motor_winagent::write_frame(&mut peer, &Frame::Exit { code: 0 }).unwrap();
+    let logs = LogBytes::default();
+    let (tx, rx) = mpsc::sync_channel(8);
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || run_output(&mut transport, &tx, &tx).unwrap(),
+    );
+    drop(tx);
+    // The caller still gets every line.
+    assert_eq!(
+        String::from_utf8(rx.into_iter().flatten().collect())
+            .unwrap()
+            .lines()
+            .count(),
+        20
+    );
+    let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let logged: Vec<_> = log.lines().filter(|line| line.contains("forged")).collect();
+    assert_eq!(logged.len(), BUILD_DIAGNOSTIC_MAX_LINES, "{log}");
+    assert!(
+        logged
+            .iter()
+            .all(|line| line.contains("job standard error")),
+        "{log}"
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("are not logged"))
+            .count(),
+        1,
+        "{log}"
+    );
 }
 
 #[test]
@@ -253,7 +347,7 @@ fn diagnostic_line_buffer_is_bounded_and_recovers_after_overlong_job_output() {
     assert_eq!(lines.line.len(), BUILD_DIAGNOSTIC_MAX_BYTES);
     lines.push(
         b"\nmotor: build-volume diagnostic before-detach: ok\n",
-        |line| reported.push(line.to_owned()),
+        |line| reported.push(line.unwrap().to_owned()),
     );
     assert_eq!(
         reported,

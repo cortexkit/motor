@@ -491,9 +491,10 @@ fn timestamp_paths(config: &Config, entry: &Entry) -> (std::path::PathBuf, std::
 }
 
 /// Whether a finished job's build disk may become its checkout's kept disk.
-/// `build_disk_released` comes from `capture_completion`: the agent reported
-/// the command's exit without its release-failure line, so it unmounted the
-/// volume, and the checkout's `target` is still the runner's link. Without
+/// `build_disk_released` comes from `capture_completion`: the agent sent
+/// `BuildRelease { released: true }` before the command's exit, so it
+/// unmounted the volume, and the checkout's `target` is still the runner's
+/// link. Without
 /// that (a release failure, a replaced link, an agent failure, a crash or a
 /// lost session) nothing is published. A cancelled job publishes nothing
 /// either, and nothing is published before the VM is proven stopped.
@@ -806,8 +807,8 @@ fn start_io(
 fn staged_target(workspace: &str) -> std::path::PathBuf {
     Path::new(workspace).join("target")
 }
-/// The command's outcome, and whether the agent released the build disk
-/// before reporting it.
+/// The command's outcome, and whether the agent reported, in a `BuildRelease`
+/// frame before it, that it released the build disk.
 type Finished = (ExecutionOutcome, bool);
 
 fn run_output(
@@ -829,73 +830,38 @@ fn run_output(
             "macOS agent ended the session without Exit or Signal"
         );
     }
-    if let Ok((_, false)) = &result {
-        let reason = agent_reason(&tail).unwrap_or_else(|| "none".into());
-        tracing::warn!(
-            %job_id,
-            agent_reason = %reason,
-            "macOS agent reported the command's exit but could not release the build disk; the disk is not published and returned files under target/ are not read"
-        );
-    }
     result
 }
 /// Bytes of the job's standard error kept to find the agent's last line.
 const STDERR_TAIL_BYTES: usize = 4096;
 const BUILD_DIAGNOSTIC_PREFIX: &[u8] = b"motor: build-volume diagnostic ";
 const BUILD_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
-/// How the agent's line starts when it reports the command's exit but could
-/// not release the build disk.
-const RELEASE_FAILURE_PREFIX: &[u8] = b"motor: the build disk could not be released: ";
-
-/// Whether standard error ended with the agent's release-failure line. The
-/// agent writes that line last, on a line of its own, after every job process
-/// is gone, so only the last non-empty line counts: a job cannot hide it, and
-/// a job that prints it itself only keeps its own disk from being published.
-/// Keeps no more than the prefix's length of any line.
-#[derive(Default)]
-struct ReleaseFailure {
-    start: Vec<u8>,
-    /// Bytes in the line being read, which has no newline yet.
-    length: usize,
-    /// Whether the last complete non-empty line was the agent's.
-    last: bool,
-}
-impl ReleaseFailure {
-    fn push(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if byte == b'\n' {
-                if self.length > 0 {
-                    self.last = self.start == RELEASE_FAILURE_PREFIX;
-                }
-                self.start.clear();
-                self.length = 0;
-            } else {
-                if self.start.len() < RELEASE_FAILURE_PREFIX.len() {
-                    self.start.push(byte);
-                }
-                self.length += 1;
-            }
-        }
-    }
-    /// An unfinished last line is the job's, so it ends any earlier claim.
-    fn reported(&self) -> bool {
-        self.length == 0 && self.last
-    }
-}
+/// How many build-volume diagnostic lines one job's output may put in the
+/// runner log. The agent writes four at most; the rest of the budget is for
+/// a job that prints the prefix itself.
+const BUILD_DIAGNOSTIC_MAX_LINES: usize = 8;
 
 /// Output frames may split a diagnostic anywhere. Retain only one bounded line
-/// and never copy ordinary job stderr into the runner log.
+/// and never copy ordinary job stderr into the runner log. The lines arrive on
+/// the job's standard error, where the job can write the same prefix, so they
+/// are logged as job output, at most `BUILD_DIAGNOSTIC_MAX_LINES` per job.
 #[derive(Default)]
 struct DiagnosticLines {
     line: Vec<u8>,
     overflow: bool,
+    reported: usize,
 }
 impl DiagnosticLines {
-    fn push(&mut self, bytes: &[u8], mut report: impl FnMut(&str)) {
+    fn push(&mut self, bytes: &[u8], mut report: impl FnMut(Option<&str>)) {
         for &byte in bytes {
             if byte == b'\n' {
                 if !self.overflow && self.line.starts_with(BUILD_DIAGNOSTIC_PREFIX) {
-                    report(&String::from_utf8_lossy(&self.line));
+                    if self.reported < BUILD_DIAGNOSTIC_MAX_LINES {
+                        report(Some(&String::from_utf8_lossy(&self.line)));
+                    } else if self.reported == BUILD_DIAGNOSTIC_MAX_LINES {
+                        report(None);
+                    }
+                    self.reported += 1;
                 }
                 self.line.clear();
                 self.overflow = false;
@@ -915,9 +881,9 @@ fn agent_reason(tail: &[u8]) -> Option<String> {
     let last = text.lines().rev().find(|line| !line.trim().is_empty())?;
     last.starts_with("motor: ").then(|| last.to_owned())
 }
-/// Forwards the command's output until its exit. The exit's flag says whether
-/// the build disk was released: false when the agent's last standard-error
-/// line said it could not be (see `ReleaseFailure`).
+/// Forwards the command's output until its exit. The exit's flag is true only
+/// when the agent sent `BuildRelease { released: true }` before it; a failed
+/// or missing report means the build disk was not released.
 fn forward_output(
     transport: &mut Transport,
     stdout: &SyncSender<Vec<u8>>,
@@ -926,7 +892,7 @@ fn forward_output(
 ) -> io::Result<Finished> {
     let job_id = transport.entry.owned.lock().unwrap().record.id;
     let mut diagnostics = DiagnosticLines::default();
-    let mut release = ReleaseFailure::default();
+    let mut released = false;
     loop {
         match transport
             .receive()
@@ -934,10 +900,17 @@ fn forward_output(
         {
             Frame::Output { stream, bytes } => {
                 if stream == Stream::Stderr {
-                    diagnostics.push(&bytes, |diagnostic| {
-                        tracing::info!(%job_id, %diagnostic, "macOS agent build-volume metadata");
+                    diagnostics.push(&bytes, |line| match line {
+                        Some(line) => tracing::info!(
+                            %job_id,
+                            job_output = %line,
+                            "macOS job standard error line with the build-volume diagnostic prefix"
+                        ),
+                        None => tracing::info!(
+                            %job_id,
+                            "further macOS build-volume diagnostic lines from this job are not logged"
+                        ),
                     });
-                    release.push(&bytes);
                     tail.extend_from_slice(&bytes);
                     let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
                     tail.drain(..excess);
@@ -952,15 +925,25 @@ fn forward_output(
                     &transport.entry,
                 )?
             }
+            Frame::BuildRelease {
+                released: reported,
+                reason,
+            } => {
+                // The protocol accepts this frame once, with a bounded reason;
+                // the reason is the guest's text, logged quoted.
+                released = reported;
+                if !reported {
+                    tracing::warn!(
+                        %job_id,
+                        reason = ?reason,
+                        "macOS agent could not release the build disk; it is not published and returned files under target/ are not read"
+                    );
+                }
+            }
             Frame::Exit { code } => {
-                return Ok((
-                    ExecutionOutcome::Unix(exit_status(code)?),
-                    !release.reported(),
-                ))
+                return Ok((ExecutionOutcome::Unix(exit_status(code)?), released))
             }
-            Frame::Signal { signal } => {
-                return Ok((ExecutionOutcome::Signal { signal }, !release.reported()))
-            }
+            Frame::Signal { signal } => return Ok((ExecutionOutcome::Signal { signal }, released)),
             _ => return Err(invalid("unexpected macOS agent frame")),
         }
     }
