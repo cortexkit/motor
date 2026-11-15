@@ -66,6 +66,7 @@ async fn full_spool_with_buffered_heartbeat_replays_when_vm_becomes_ready() {
 #[derive(Clone, Copy)]
 enum Cut {
     Read(ErrorKind),
+    AbruptEof,
     Write(&'static str),
 }
 
@@ -111,6 +112,7 @@ impl AsyncRead for CutClient {
             return Poll::Ready(Ok(()));
         }
         match self.cut {
+            Cut::AbruptEof => Poll::Ready(Err(ErrorKind::UnexpectedEof.into())),
             Cut::Read(kind) => {
                 self.hit = true;
                 if kind == ErrorKind::UnexpectedEof {
@@ -300,4 +302,153 @@ async fn replay_disconnect_before_delivery_is_returned_to_session_settlement() {
         .expect_err("an upload owner disconnect is returned for settlement");
     assert!(error.downcast_ref::<std::io::Error>().is_some());
     assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+}
+
+async fn interrupted_before_boot() -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>, Claims) {
+    interrupted_before_boot_with(Cut::Write("heartbeat")).await
+}
+
+async fn interrupted_before_boot_with(cut: Cut) -> (Arc<Runtime>, Arc<Fake>, Arc<Storage>, Claims) {
+    let (runtime, fake, storage) = fixture();
+    claim(&runtime, &claims(JOB));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    let c = claims(JOB2);
+    let id = claim(&runtime, &c);
+    let mut client = CutClient::new(&[hello(), run(JOB2)], cut);
+    assert!(serve(runtime.clone(), &c, id, &mut client).await.is_err());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !runtime.host.lock().unwrap().snapshot.per_job.executions[JOB2].ended {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB2].boot_started);
+    (runtime, fake, storage, c)
+}
+
+async fn cancel_and_attach(runtime: &Arc<Runtime>, c: &Claims) -> Value {
+    let mut client = CutClient::new(
+        &[
+            hello(),
+            json!({"type":"cancel","job_id":JOB2}),
+            json!({"type":"attach","job_id":JOB2,"from_seq":0}),
+        ],
+        Cut::Read(ErrorKind::UnexpectedEof),
+    );
+    live(runtime, c, &mut client).await.unwrap();
+    assert!(client
+        .sent
+        .iter()
+        .any(|frame| frame["type"] == "cancel_reply"));
+    client
+        .sent
+        .into_iter()
+        .find(|frame| frame["type"] == "terminal")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn interrupted_upload_cancel_before_replay_is_cancelled_and_never_boots() {
+    let (runtime, fake, _storage, c) = interrupted_before_boot().await;
+    let terminal = cancel_and_attach(&runtime, &c).await;
+    assert_eq!(terminal["outcome"], json!({"type":"cancelled"}));
+    assert_eq!(terminal["ran"], "none");
+    runtime.stop_job(JOB, true, false).unwrap();
+    let mut host = runtime.host.lock().unwrap();
+    assert!(host.begin_job_boot(JOB2).unwrap().is_none());
+    assert!(host.snapshot.per_job.executions[JOB2].ended);
+    assert!(!host.snapshot.per_job.executions[JOB2].boot_started);
+    assert!(!host.snapshot.leases[JOB2].delivered);
+    assert!(fake.job_starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn interrupted_upload_cancel_preserves_already_delivered_terminal() {
+    let (runtime, _fake, _storage, c) = interrupted_before_boot().await;
+    let mut client = CutClient::new(
+        &[hello(), json!({"type":"attach","job_id":JOB2,"from_seq":0})],
+        Cut::Read(ErrorKind::UnexpectedEof),
+    );
+    live(&runtime, &c, &mut client).await.unwrap();
+    assert!(runtime.host.lock().unwrap().snapshot.billing[JOB2].delivered);
+    let original = runtime.host.lock().unwrap().snapshot.billing[JOB2]
+        .terminal
+        .clone()
+        .unwrap();
+    assert_eq!(cancel_and_attach(&runtime, &c).await, original);
+}
+
+#[tokio::test]
+async fn interrupted_upload_cancel_preserves_usage_already_reported() {
+    let (runtime, _fake, _storage, c) = interrupted_before_boot().await;
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let mut next = host.snapshot.clone();
+        next.billing.get_mut(JOB2).unwrap().enqueued = true;
+        host.save(next).unwrap();
+    }
+    let original = runtime.host.lock().unwrap().snapshot.billing[JOB2]
+        .terminal
+        .clone()
+        .unwrap();
+    assert_eq!(cancel_and_attach(&runtime, &c).await, original);
+}
+
+#[tokio::test]
+async fn interrupted_upload_cancel_reconciles_journal_before_replay_commit() {
+    let (runtime, _fake, _storage, c) = interrupted_before_boot().await;
+    assert!(runtime
+        .host
+        .lock()
+        .unwrap()
+        .cancel_interrupted_upload(JOB2)
+        .unwrap());
+    // Reopen the old replay index after cancellation was saved in host state,
+    // as on recovery from a crash before the replacement replay record committed.
+    runtime.job_streams.lock().unwrap().remove(JOB2);
+    let mut client = CutClient::new(
+        &[hello(), json!({"type":"attach","job_id":JOB2,"from_seq":0})],
+        Cut::Read(ErrorKind::UnexpectedEof),
+    );
+    live(&runtime, &c, &mut client).await.unwrap();
+    let terminal = client
+        .sent
+        .iter()
+        .find(|frame| frame["type"] == "terminal")
+        .unwrap();
+    assert_eq!(terminal["outcome"], json!({"type":"cancelled"}));
+    assert_eq!(terminal["ran"], "none");
+}
+
+#[tokio::test]
+async fn interrupted_upload_abrupt_eof_keeps_result_unobserved_until_attach() {
+    let (runtime, _fake, _storage, c) = interrupted_before_boot_with(Cut::AbruptEof).await;
+    assert!(!runtime.host.lock().unwrap().snapshot.billing[JOB2].delivered);
+    let mut client = CutClient::new(
+        &[hello(), json!({"type":"attach","job_id":JOB2,"from_seq":0})],
+        Cut::Read(ErrorKind::UnexpectedEof),
+    );
+    live(&runtime, &c, &mut client).await.unwrap();
+    let terminal = client
+        .sent
+        .iter()
+        .find(|frame| frame["type"] == "terminal")
+        .unwrap();
+    assert_eq!(
+        terminal["outcome"],
+        json!({"type":"refused_before_start","reason":"transfer_interrupted"})
+    );
+    assert_eq!(terminal["ran"], "none");
+    assert!(client
+        .sent
+        .iter()
+        .any(|frame| frame["type"] == "hosted_terminal"));
+    assert!(runtime.host.lock().unwrap().snapshot.billing[JOB2].delivered);
 }

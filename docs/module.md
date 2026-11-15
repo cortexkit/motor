@@ -118,6 +118,8 @@ Run may have reached a runner, cancellation follows the runner's terminal
 instead of claiming the job never ran. Detaching a stream still leaves the job
 running.
 
+For a hosted upload blocked before VM boot, cancellation closes the upload before its sole owner reconnects, and the host returns `cancelled` with `ran: none` only while its interrupted-upload result remains unobserved and unreported (tests: `queued_full_spool_cancel_detach_uses_one_connection_and_replays_no_start`, `interrupted_upload_cancel_preserves_already_delivered_terminal`, and `interrupted_upload_cancel_preserves_usage_already_reported`).
+
 AFT, the agent tool, currently uses one connection and one route per remote job
 (at most two or three calls in flight). Its live cancellation sends a Cancel
 frame on the run subscription and immediately follows with attach, or status

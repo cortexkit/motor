@@ -1121,6 +1121,48 @@ impl Store {
         self.clean_files()?;
         Ok(true)
     }
+    /// Reconcile the host's authorized cancellation of an unobserved interrupted upload.
+    /// A fresh record and an atomic index commit preserve crash-safe replay.
+    pub(crate) fn cancel_interrupted_upload(&mut self, terminal: &Value) -> Result<()> {
+        if terminal["ran"] != "none" || terminal["outcome"]["type"] != "cancelled" {
+            return Ok(());
+        }
+        let Some(position) = self
+            .index
+            .entries
+            .iter()
+            .position(|entry| entry.kind.as_deref() == Some("terminal"))
+        else {
+            return Ok(());
+        };
+        let stored = decode(&self.frame(position)?.context("stored terminal")?)?;
+        if stored["ran"] != "none"
+            || stored["outcome"]["type"] != "refused_before_start"
+            || stored["outcome"]["reason"] != "transfer_interrupted"
+        {
+            return Ok(());
+        }
+        let bytes = encode(terminal)?;
+        let id = self.next_id();
+        let piece = Piece {
+            chunk: false,
+            number: id,
+            offset: 0,
+            len: bytes.len() as u64,
+            record: Some(true),
+        };
+        self.write_piece(&piece, &bytes)?;
+        let mut next = self.index.clone();
+        next.entries[position].pieces = vec![piece];
+        next.entries[position].id = Some(id);
+        next.next_id = Some(id + 1);
+        next.terminal_delivery = None;
+        self.commit(&next)?;
+        self.index = next;
+        self.clean_files()?;
+        Ok(())
+    }
+
     fn evict_output(&self, next: &mut Index) {
         use crate::state::jobs::storage::REPLAY_BYTES;
         loop {
