@@ -991,8 +991,19 @@ These capacity waits don't count
 against the three placement attempts. If only capacity answers exhaust the
 queue budget, including a replacement fence after a capacity refusal, the job
 gets `runner_full` with cause `hosted_capacity` and `ran: none`, so it is safe to
-resubmit. The unused reservation is released. Real connection failures remain
-`unreachable`. When answers were mixed, the refusal uses the last definite
+resubmit. The unused reservation is released. Broker connection failures and
+timeouts on lease creation and replacement retry with backoff for up to 60 seconds,
+capped by the remaining queue-wait budget, while reporting placement-wait progress.
+An exhausted transport retry window gives `hosted_broker_unreachable`
+(`unreachable`). Cancellation ends the retry wait at once; a request already in
+flight is awaited first so any grant can be released. These cases are covered by
+`broker_connect_outage_recovers_and_runs_with_placement_progress`,
+`broker_connect_outage_exhausts_sixty_second_bound`,
+`broker_connect_outage_is_capped_by_queue_budget`,
+`broker_connect_outage_cancel_interrupts_backoff`,
+`lease_timeout_retries_the_exact_stored_body`, and
+`replacement_timeout_retries_without_rerequesting_the_lease`.
+When answers were mixed, the refusal uses the last definite
 answer and says so in its detail, which includes the final cause. A replacement
 fence is not a new definite answer. A broker that has not answered
 the job's first lease request when the deadline passes gives
