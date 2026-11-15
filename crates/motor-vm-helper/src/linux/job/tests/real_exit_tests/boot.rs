@@ -142,8 +142,10 @@ pub(super) fn boot(jobs: &LinuxJobs, artifacts: &Artifacts, mut start: Start) ->
 }
 
 pub(super) fn guest_ready(jobs: &LinuxJobs, id: &str) {
-    let root = File::open(jobs.root(id)).unwrap();
-    let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+    // Pass the real jail root, as production's relay does. connect_job_relay
+    // opens it with O_NOFOLLOW, so a /proc/self/fd/N alias fails with ENOTDIR,
+    // and it connects through a descriptor path, so a long root is fine.
+    let path = jobs.root(id);
     let uid = jobs.view(id).unwrap().record.uid;
     // A successful real guest vsock handshake proves more than InstanceStart:
     // the production agent has booted. No guest job or live host is contacted.
