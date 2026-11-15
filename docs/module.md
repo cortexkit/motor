@@ -800,7 +800,7 @@ Tests: `command_line_one_word_is_verbatim`,
 | 201 | Outcome unknown, or the connection was lost. The job ID is printed. |
 | 202 | The runner stopped the command at its timeout. |
 | 203 | The job was cancelled. |
-| 204 | Bad arguments; nothing was submitted. |
+| 204 | The request could not be built locally, because of bad arguments or a local problem such as the checkout or git; nothing was submitted. Retrying without a change will not help. |
 
 Every direct run has a timeout (default 3600 seconds), because a disconnected
 caller may never reconnect. Direct runs get
