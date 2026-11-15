@@ -547,7 +547,11 @@ async fn collect(
                     Ok(Ok(())) => false,
                     Ok(Err(error)) => {
                         tracing::warn!(jti=claims.jti, %error, "fill_export_failed");
-                        false
+                        // The export gives up at the same deadline as this
+                        // timer and can return first, under load. A failure at
+                        // the deadline is a timeout: the guest may still be
+                        // stuck exporting, so it is stopped, not acknowledged.
+                        std::time::Instant::now() >= deadline
                     }
                     Err(_) => {
                         tracing::warn!(jti = claims.jti, "fill_export_timed_out");
