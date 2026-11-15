@@ -121,6 +121,13 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
             .unwrap();
         assert_eq!(terminal["ran"], "none");
         assert_eq!(terminal["outcome"]["type"], "refused_before_start");
+        assert_eq!(terminal["outcome"]["reason"], "queue_wait_exceeded");
+        assert!(terminal["refusal_detail"]
+            .as_str()
+            .unwrap()
+            .contains("queue-wait budget expired"));
+        let usage = &host.snapshot.zero_usage[JOB];
+        assert_eq!(usage.started_at_ms, usage.ended_at_ms);
     }
     assert!(!storage.held.lock().unwrap().contains(JOB));
     assert!(!storage.spool(JOB).exists());
@@ -141,7 +148,7 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
     assert_eq!(
         terminal.value["outcome"],
         json!({
-            "type":"refused_before_start", "reason":"internal_failure"
+            "type":"refused_before_start", "reason":"queue_wait_exceeded"
         })
     );
     let stored = runtime
@@ -151,6 +158,33 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
         .unwrap();
     assert_eq!(terminal.bytes, stored);
     task.await.unwrap().unwrap();
+}
+
+#[test]
+fn boot_failure_before_delivery_still_reports_internal_failure() {
+    let (runtime, _, _) = fixture();
+    claim(&runtime, &claims(JOB));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    runtime.stop_job(JOB, true, true).unwrap();
+    let host = runtime.host.lock().unwrap();
+    let frames = host.host_settled_frames(JOB, 0).unwrap();
+    let terminal = frames
+        .iter()
+        .find(|frame| frame["type"] == "terminal")
+        .unwrap();
+    assert_eq!(terminal["ran"], "none");
+    assert_eq!(
+        terminal["outcome"],
+        json!({"type":"refused_before_start", "reason":"internal_failure"})
+    );
+    let usage = &host.snapshot.zero_usage[JOB];
+    assert_eq!(usage.started_at_ms, usage.ended_at_ms);
 }
 
 #[tokio::test]

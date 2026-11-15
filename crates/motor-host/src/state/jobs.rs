@@ -261,6 +261,10 @@ impl Host {
     }
 
     pub fn job_free_mem_mib(&self, now_ms: u64) -> u64 {
+        self.job_free_mem_mib_except(now_ms, None)
+    }
+
+    pub(crate) fn job_free_mem_mib_except(&self, now_ms: u64, booting_job: Option<&str>) -> u64 {
         let HostSettings::PerJob(settings) = &self.settings else {
             return 0;
         };
@@ -272,7 +276,13 @@ impl Host {
             .per_job
             .executions
             .values()
-            .filter(|job| job.boot_started && !job.ended && !job.runner_hello)
+            .filter(|job| {
+                !job.ended
+                    && !job.runner_hello
+                    && (job.boot_started
+                        || (booting_job != Some(job.claims.jti.as_str())
+                            && self.job_memory_reservations.contains(&job.claims.jti)))
+            })
             .fold(
                 sample.free_mem_mib(settings.host_reserve_mib),
                 |free, job| free.saturating_sub(job.memory_debit_mib),
@@ -317,6 +327,7 @@ impl Host {
         self.job_memory_logged.set(Some((now_ms, free_mem_mib)));
         let sample = self.fresh_host_resources(now_ms);
         let mut booting_memory_debit_mib = 0u64;
+        let mut reserved_memory_debit_mib = 0u64;
         let mut running_memory_debit_mib = 0u64;
         let mut disk_waiters = 0u64;
         for job in self
@@ -327,6 +338,10 @@ impl Host {
             .filter(|e| !e.ended)
         {
             if !job.boot_started {
+                if self.job_memory_reservations.contains(&job.claims.jti) {
+                    reserved_memory_debit_mib =
+                        reserved_memory_debit_mib.saturating_add(job.memory_debit_mib);
+                }
                 if !self.job_boot_disk_ready(&job.claims.jti) {
                     disk_waiters += 1;
                 }
@@ -365,6 +380,7 @@ impl Host {
             job_vm_file_mib = sample.and(self.job_vm_file_mib),
             host_reserve_mib = settings.host_reserve_mib,
             booting_memory_debit_mib,
+            reserved_memory_debit_mib,
             running_memory_debit_mib,
             running_subtracted_mib = 0u64,
             recovery_memory_debit_mib,
@@ -480,9 +496,8 @@ impl Host {
                 .ok_or(RefusalCause::Memory)?;
             // A disk-queued job has no VM yet. Recheck memory when it can
             // actually boot instead of refusing or reserving memory now.
-            if !existing.is_some_and(|(_, disk)| disk.holds_job_disk_slot())
-                && self.job_free_mem_mib(now_ms) < debit
-            {
+            let reserve_memory = !existing.is_some_and(|(_, disk)| disk.holds_job_disk_slot());
+            if reserve_memory && self.job_free_mem_mib(now_ms) < debit {
                 return Err(RefusalCause::Memory.into());
             }
             // A host has one disk per account/workspace pair. Cold or foreign
@@ -560,6 +575,9 @@ impl Host {
             // Identity, queue position, permits and storage debits become visible together,
             // before admission returns and before any launch authorization is returned.
             self.save(next)?;
+            if reserve_memory {
+                self.job_memory_reservations.insert(claims.jti.clone());
+            }
             if let Some(hinted_vm) = &claims.placement.vm {
                 if hinted_vm != &disk_id {
                     tracing::info!(
@@ -623,9 +641,9 @@ impl Host {
         if !self.job_boot_disk_ready(job) {
             return Ok(None);
         }
-        // Persist the debit with the launch authorization, under the host lock.
-        // A job that cannot fit keeps its queue position without owning a VM.
-        if self.job_free_mem_mib(now_ms) < execution.memory_debit_mib {
+        // Replace this claim's reservation with the boot debit under the host lock.
+        // Other claims' reservations still count, including those not booting yet.
+        if self.job_free_mem_mib_except(now_ms, Some(job)) < execution.memory_debit_mib {
             return Ok(None);
         }
         let mut next = self.snapshot.clone();

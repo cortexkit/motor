@@ -101,7 +101,8 @@ fn booting_and_ended_jobs_do_not_get_a_running_hold() {
     let mut host = hold_host(25);
     host.claim(job(JOB), AT).unwrap();
     assert!(host.resident_samples_due(AT).is_empty());
-    assert_eq!(host.job_free_mem_mib(AT), 950);
+    // The claim reserves 120 MiB before boot, without creating a running hold.
+    assert_eq!(host.job_free_mem_mib(AT), 830);
     host.begin_job_boot_at(JOB, AT).unwrap().unwrap();
     assert!(host.resident_samples_due(AT).is_empty());
     assert_eq!(host.job_free_mem_mib(AT), 830);
