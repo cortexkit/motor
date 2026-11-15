@@ -1,6 +1,135 @@
 use super::*;
 
 #[test]
+fn back_to_back_unbooted_claims_reserve_memory_before_later_admission() {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    let mut host = runtime.host.lock().unwrap();
+    let crate::config::HostSettings::PerJob(settings) = &mut host.settings else {
+        unreachable!()
+    };
+    settings.boot_reserve_mib = 512;
+    host.record_host_resources(HostResources {
+        at_ms: now,
+        available_mem_mib: 55_196,
+        job_vm_headroom_mib: u64::MAX,
+        vcpu_ceiling: 16,
+        permit_budget: 100,
+    });
+    for n in 1..=3 {
+        let mut c = claims(&format!("00000000-0000-7000-8000-{n:012}"));
+        c.workspace_key_hash = Some(motor_lease::base64url(&[n; 32]));
+        c.mem_mib = 16_384;
+        host.claim(c, now).unwrap();
+    }
+    let mut large = claims("00000000-0000-7000-8000-000000000004");
+    large.workspace_key_hash = Some(motor_lease::base64url(&[4; 32]));
+    large.mem_mib = 49_152;
+    large.vcpus = 16;
+    let logs = crate::test_logs::capture(|| {
+        let result = host.claim(large, now);
+        assert!(
+            result.is_err(),
+            "large claim must be refused after three unbooted admissions"
+        );
+        assert_eq!(
+            result.unwrap_err().refusal(),
+            crate::state::Refusal::HostFull
+        );
+    });
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("run_claim ") && line.contains("cause=\"memory\" ")),
+        "{logs:?}"
+    );
+    assert_eq!(host.job_free_mem_mib(now), 4_458);
+    // The broker heartbeat builder reads job_placeable_mem_mib for per-job hosts.
+    assert_eq!(host.job_placeable_mem_mib(now), 3_946);
+    let logs = crate::test_logs::capture(|| {
+        host.log_job_memory(now, host.job_placeable_mem_mib(now));
+    });
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("job_memory_advertised ")
+                && line.contains("reserved_memory_debit_mib=50688 ")
+                && line.contains("booting_memory_debit_mib=0 ")),
+        "{logs:?}"
+    );
+    assert!(host
+        .snapshot
+        .per_job
+        .executions
+        .values()
+        .all(|e| !e.boot_started));
+
+    let mut small = claims("00000000-0000-7000-8000-000000000005");
+    small.workspace_key_hash = Some(motor_lease::base64url(&[5; 32]));
+    small.mem_mib = 3_072;
+    host.claim(small, now).unwrap();
+    assert_eq!(host.job_free_mem_mib(now), 874);
+}
+
+#[test]
+fn reserved_job_can_boot_without_debiting_its_reservation_twice() {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    let mut host = runtime.host.lock().unwrap();
+    host.record_host_resources(HostResources {
+        at_ms: now,
+        available_mem_mib: 170,
+        job_vm_headroom_mib: u64::MAX,
+        vcpu_ceiling: 2,
+        permit_budget: 4,
+    });
+    host.claim(claims(JOB), now).unwrap();
+    assert_eq!(host.job_free_mem_mib(now), 0);
+    drop(host);
+    assert_eq!(
+        queue_status(&runtime, &claims(JOB))
+            .unwrap()
+            .waiting_on
+            .as_deref(),
+        Some("workspace setup")
+    );
+    let mut host = runtime.host.lock().unwrap();
+    assert!(host.begin_job_boot_at(JOB, now).unwrap().is_some());
+    assert_eq!(host.job_free_mem_mib(now), 0);
+    host.job_stopped_at(JOB, false, now).unwrap();
+    assert_eq!(host.job_free_mem_mib(now), 120);
+}
+
+#[test]
+fn disk_waiter_reserves_nothing_even_after_its_checkout_is_released() {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    let mut host = runtime.host.lock().unwrap();
+    host.record_host_resources(HostResources {
+        at_ms: now,
+        available_mem_mib: 170,
+        job_vm_headroom_mib: u64::MAX,
+        vcpu_ceiling: 2,
+        permit_budget: 4,
+    });
+    host.claim(claims(JOB), now).unwrap();
+    host.claim(claims(JOB2), now).unwrap();
+    assert_eq!(host.job_free_mem_mib(now), 0);
+    assert!(host.begin_job_boot_at(JOB2, now).unwrap().is_none());
+    host.job_stopped_at(JOB, false, now).unwrap();
+    assert!(host.job_boot_disk_ready(JOB2));
+    assert_eq!(host.job_free_mem_mib(now), 120);
+
+    let mut other = claims("00000000-0000-7000-8000-000000000003");
+    other.workspace_key_hash = Some(motor_lease::base64url(&[6; 32]));
+    host.claim(other.clone(), now).unwrap();
+    assert_eq!(host.job_free_mem_mib(now), 0);
+    assert!(host.begin_job_boot_at(JOB2, now).unwrap().is_none());
+    host.job_stopped_at(&other.jti, false, now).unwrap();
+    assert_eq!(host.job_free_mem_mib(now), 120);
+    assert!(host.begin_job_boot_at(JOB2, now).unwrap().is_some());
+    assert_eq!(host.job_free_mem_mib(now), 0);
+}
+
+#[test]
 fn advertised_job_memory_leaves_boot_reserve_for_admission() {
     let (runtime, fake, _) = fixture();
     fake.capacity_available.store(true, Ordering::SeqCst);
@@ -326,6 +455,7 @@ fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_wa
         "job_vm_file_mib=512 ",
         "host_reserve_mib=50 ",
         "booting_memory_debit_mib=120 ",
+        "reserved_memory_debit_mib=0 ",
         "running_memory_debit_mib=120 ",
         "running_subtracted_mib=0 ",
         "recovery_memory_debit_mib=600 ",

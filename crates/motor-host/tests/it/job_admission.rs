@@ -143,9 +143,10 @@ fn queued_workspaces_reserve_disk_slots_before_boot() {
         .disks
         .values()
         .all(|disk| disk.attached_job.is_none()));
-    assert_eq!(h.job_free_mem_mib(AT), 99_950);
+    // Each of the 64 fresh claims reserves 100 MiB plus 20 MiB before boot.
+    assert_eq!(h.job_free_mem_mib(AT), 92_270);
     let heartbeat = h.heartbeat(AT, h.job_free_mem_mib(AT), true);
-    assert_eq!(heartbeat.free_mem_mib, 99_950);
+    assert_eq!(heartbeat.free_mem_mib, 92_270);
     assert_eq!(heartbeat.queued, 64);
     assert_eq!(heartbeat.running.len(), 64);
     assert_eq!(heartbeat.warm.len(), 64);
@@ -325,7 +326,8 @@ fn cancelled_lease_cannot_boot_before_execution_cleanup() {
     let cancelled = h.snapshot.clone();
     assert!(h.begin_job_boot_at(JOB, AT).unwrap().is_none());
     assert_eq!(h.snapshot, cancelled);
-    assert_eq!(h.job_free_mem_mib(AT), 950);
+    // The claim's 120 MiB stays reserved until execution cleanup, not lease end.
+    assert_eq!(h.job_free_mem_mib(AT), 830);
 }
 
 #[test]
@@ -411,7 +413,8 @@ fn boot_debits_fixed_sample_durably_before_next_launch() {
     let mut burst = job(JOB);
     burst.mem_burst_mib = Some(50);
     h.claim(burst, AT).unwrap();
-    assert_eq!(h.free_mem_mib(AT), 239);
+    // Claim-time reservation charges the 120 MiB before launch, excluding burst.
+    assert_eq!(h.free_mem_mib(AT), 119);
     h.begin_job_boot(JOB).unwrap().unwrap();
     // 289 available - 50 host - (100 stated + 20 boot) = 119, not 169 or 69.
     assert_eq!(h.free_mem_mib(AT), 119);
@@ -429,7 +432,8 @@ fn boot_debits_fixed_sample_durably_before_next_launch() {
     full(h.claim(other.clone(), AT));
     sample(&mut h, 290);
     h.claim(other, AT).unwrap();
-    assert_eq!(h.free_mem_mib(AT), 120);
+    // The other checkout reserves the remaining 120 MiB as soon as it is claimed.
+    assert_eq!(h.free_mem_mib(AT), 0);
     h.begin_job_boot(JOB3).unwrap().unwrap();
     assert_eq!(h.free_mem_mib(AT), 0);
     assert_eq!(h.snapshot.per_job.disks.len(), 2);
@@ -444,7 +448,8 @@ fn only_booting_debits_end_once_on_hello() {
     let mut h = memory_host(1_000);
     h.claim(job(JOB), AT).unwrap();
     h.claim(job(JOB2), AT).unwrap();
-    assert_eq!(h.free_mem_mib(AT), 950);
+    // Only the first claim reserves 120 MiB; its same-disk waiter reserves none.
+    assert_eq!(h.free_mem_mib(AT), 830);
     assert!(h.job_runner_hello(JOB2).is_err());
     h.begin_job_boot(JOB).unwrap().unwrap();
     assert_eq!(h.free_mem_mib(AT), 830);

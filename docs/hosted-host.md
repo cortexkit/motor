@@ -371,7 +371,13 @@ not real-VM qualification. No server-specific values belong in this document.
 
 Per-job admission reserves each claim before evaluating the next against the
 same sample: permits, stated memory plus boot reserve (never burst), disk growth,
-generation and replay. After runner hello, memory counts through host-measured
+generation and replay. A claim that passes the memory check holds its memory
+debit until boot or execution end; boot replaces that reservation with the
+booting debit. Both reservations and booting debits reduce advertised free
+memory. A job queued behind another job on the same checkout disk skips the
+claim-time memory check and reserves no memory until it can boot, so a job
+waiting for its checkout does not hold memory it cannot use yet.
+After runner hello, memory counts through host-measured
 available memory. The host measures `/proc/meminfo`'s `MemAvailable` and the
 job-VM cgroup's room from
 `/sys/fs/cgroup/motorvm.slice/{memory.max,memory.current,memory.stat}`. In per-job
@@ -409,6 +415,12 @@ heartbeat already delivered to that attachment, or sends `queue_wait_ms: 0`
 until a fresh runner sample arrives, preserving the paused capacity-queue budget
 used during workspace-disk ownership waits and VM setup. After command start,
 the host can send a bare keepalive.
+
+Once the checkout disk is ready, the host also enforces the caller's queue-wait
+budget plus a cancellation grace period. If that bound expires before VM boot
+and Run delivery, the stored terminal is `refused_before_start` /
+`queue_wait_exceeded`, with `ran: none` and zero usage; boot failures before
+delivery still report `internal_failure`.
 
 For an internal failure before Run delivery, once boot has started the
 connection handler answers the live caller with `lease_refused`; before boot,

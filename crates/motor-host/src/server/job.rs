@@ -479,6 +479,29 @@ impl Runtime {
                 .collect()
         };
         for (job, hello) in due {
+            let queue_expiry = {
+                let mut host = self.host.lock().expect("host lock");
+                let execution = &host.snapshot.per_job.executions[&job];
+                if !execution.boot_started && !execution.ended {
+                    // Only a pre-start deadline can expire an unbooted job here.
+                    // Settle before stopping so replay and usage share the refusal.
+                    host.job_refused(
+                        &job,
+                        refusal(
+                            &job,
+                            "queue_wait_exceeded",
+                            "queue-wait budget expired before VM boot and Run delivery",
+                        ),
+                        now_ms,
+                    )
+                } else {
+                    Ok(())
+                }
+            };
+            if queue_expiry.is_err() {
+                tick_step(&mut failure, "settle_queue_expiry", queue_expiry);
+                continue;
+            }
             // If a VM disappeared while the host was down, still allow time
             // for a delayed helper exit report. The execution deadline alone
             // cannot prove how the VM ended.
@@ -1107,7 +1130,9 @@ fn queue_status(runtime: &Runtime, claims: &Claims) -> Option<motor_protocol::Qu
                 .as_ref()
                 .or_else(|| disk.queue.first().filter(|id| **id != claims.jti)),
         )
-    } else if host.job_free_mem_mib(unix_ms()) < execution.memory_debit_mib {
+    } else if host.job_free_mem_mib_except(unix_ms(), Some(&claims.jti))
+        < execution.memory_debit_mib
+    {
         ("memory", None)
     } else {
         ("workspace setup", None)

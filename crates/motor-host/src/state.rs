@@ -284,6 +284,10 @@ pub struct Host {
     job_residents: BTreeMap<String, jobs::residency::ResidentMemory>,
     pub(crate) job_vm_file_mib: Option<u64>,
     job_memory_logged: std::cell::Cell<Option<(u64, u64)>>,
+    /// Claims that passed memory admission but have not booted. Restart recovery
+    /// stops every unbooted execution in Runtime::recover_jobs before accepting
+    /// claims, so this set does not need to be stored.
+    job_memory_reservations: std::collections::BTreeSet<String>,
     fill_capacity_refused_at_ms: Option<u64>,
     host_resources_failed: std::cell::RefCell<Option<jobs::HostResourcesFailure>>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
@@ -332,6 +336,7 @@ impl Host {
             job_residents: BTreeMap::new(),
             job_vm_file_mib: None,
             job_memory_logged: std::cell::Cell::new(None),
+            job_memory_reservations: Default::default(),
             fill_capacity_refused_at_ms: None,
             host_resources_failed: std::cell::RefCell::new(None),
             job_storage: None,
@@ -404,6 +409,12 @@ impl Host {
             crate::billing::mark_overlap(&mut next, &unended);
         }
         self.journal.store(&next)?;
+        self.job_memory_reservations.retain(|job| {
+            next.per_job
+                .executions
+                .get(job)
+                .is_some_and(|execution| !execution.boot_started && !execution.ended)
+        });
         self.update_fork_holds(&next);
         self.snapshot = next;
         // The previous snapshot is gone, so its bases are normally owned by
