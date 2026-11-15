@@ -633,21 +633,16 @@ async fn fleet_unknown_boat_booking_is_finished_without_run_or_reattach() {
 #[tokio::test]
 async fn fleet_capacity_waits_do_not_exhaust_three_placements() {
     let h = Harness::new(Behavior::CompleteRun).await;
-    let next = Harness::with_host(Behavior::CompleteRun, "replacement-host").await;
-    h.host_refusals.lock().unwrap().push_back("host_full");
-    h.lease_replies.lock().unwrap().push_back((
-        503,
-        serde_json::json!({"error":"no_capacity"}),
-        "0",
-    ));
-    h.replace_replies
+    let next = Harness::with_host(Behavior::CompleteRun, "fresh-host").await;
+    h.host_refusals.lock().unwrap().extend(["host_full"; 4]);
+    h.lease_replies
         .lock()
         .unwrap()
         .extend((0..4).map(|_| (503, serde_json::json!({"error":"no_capacity"}), "0")));
-    h.replacement_hosts
+    h.lease_hosts
         .lock()
         .unwrap()
-        .push_back(next.broker.clone());
+        .extend(std::iter::repeat_n(h.broker.clone(), 4).chain([next.broker.clone()]));
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
@@ -655,33 +650,64 @@ async fn fleet_capacity_waits_do_not_exhaust_three_placements() {
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
     assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(terminal.job_id, id);
+    motor.wait_hosted_cleanup(id).await;
     let bodies = lease_bodies(&h);
     assert_eq!(
         bodies.len(),
-        2,
-        "no lease re-request after replacement begins"
+        9,
+        "four broker waits and five distinct bookings"
     );
-    assert!(bodies
+    assert!(bodies.iter().all(|body| body["allow_spill"] == true));
+    for body in &bodies[1..5] {
+        assert_eq!(body, &bodies[0]);
+    }
+    let bookings: std::collections::BTreeSet<_> = bodies
         .iter()
-        .all(|body| body["job_id"] == id.to_string() && body["allow_spill"] == true));
-    assert_eq!(bodies[0], bodies[1]);
-    let replace_answers = h.replace_answers.lock().unwrap();
+        .map(|body| body["job_id"].as_str().unwrap().to_owned())
+        .collect();
     assert_eq!(
-        replace_answers
+        bookings.len(),
+        5,
+        "host-full re-books must also exceed the three-placement limit"
+    );
+    let mut shape = bodies[0].clone();
+    for body in &bodies[5..] {
+        shape["job_id"] = body["job_id"].clone();
+        assert_eq!(&shape, body, "re-booking changes only the lease job ID");
+    }
+    assert_eq!(
+        h.lease_answers
+            .lock()
+            .unwrap()
             .iter()
             .map(|(_, status, _)| *status)
             .collect::<Vec<_>>(),
-        [503, 503, 503, 503, 201]
+        [503, 503, 503, 503, 201, 201, 201, 201, 201]
     );
-    assert!(replace_answers
-        .iter()
-        .all(|(job, _, _)| job == &id.to_string()));
     let state = motor.hosted_state(id).unwrap();
     assert_eq!(state.placement_attempts, 1);
-    assert_eq!(state.placement.unwrap().host, "replacement-host");
+    assert_eq!(state.placement.as_ref().unwrap().host, "fresh-host");
+    assert_ne!(state.runner_id(id), id);
+    let calls = h.requests.lock().unwrap();
+    for old in bookings
+        .iter()
+        .filter(|booking| **booking != state.runner_id(id).to_string())
+    {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|path| **path == format!("/v1/leases/{old}/release"))
+                .count(),
+            1
+        );
+    }
+    assert!(!calls
+        .iter()
+        .any(|path| path.ends_with("/replace") || path.ends_with("/finish")));
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert_eq!(next.runs.load(Ordering::SeqCst), 1);
-    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 4);
     assert_eq!(next.tokens.load(Ordering::SeqCst), 1);
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }

@@ -18,13 +18,9 @@ async fn terminal(mut stream: JobStream) -> TerminalRecord {
     }
 }
 
-async fn released_placement_wait_survives_restart(settle_at_shutdown: bool) {
+async fn rebook_wait_survives_restart(settle_at_shutdown: bool) {
+    let _clock = super::repository_routing_tests::HeldClock::new();
     let h = Harness::new(Behavior::Refuse("host_full")).await;
-    h.replace_replies.lock().unwrap().push_back((
-        503,
-        serde_json::json!({"error": "no_capacity"}),
-        "15",
-    ));
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
@@ -32,28 +28,38 @@ async fn released_placement_wait_survives_restart(settle_at_shutdown: bool) {
     request.queue_wait_limit_s = Some(300);
     let stream = motor.run(request).unwrap();
     let id = stream.job_id;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while h.replace_answers.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
+    super::repository_routing_tests::until("persisted re-book wait", || {
+        motor.hosted_state(id).unwrap().runner_id(id) != id
     })
-    .await
-    .expect("submission must be waiting for replacement capacity");
-    assert!(!motor.hosted_state(id).unwrap().run_sent);
+    .await;
+    let fresh = motor.hosted_state(id).unwrap().runner_id(id);
+    super::repository_routing_tests::until("old booking released during re-book wait", || {
+        motor.hosted_state(id).unwrap().pending_releases.is_empty()
+    })
+    .await;
+    let state = motor.hosted_state(id).unwrap();
+    assert!(!state.run_sent);
+    assert!(
+        !state.lease_attempted,
+        "the fresh lease is still in its pre-send wait"
+    );
+    assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
     if settle_at_shutdown {
         motor.shutdown_hosted().await;
         assert!(motor.hosted_state(id).unwrap().finish_done);
     }
     drop(stream);
     motor.close().await;
-    if !settle_at_shutdown {
-        assert!(h
-            .requests
+    assert_eq!(
+        h.requests
             .lock()
             .unwrap()
             .iter()
-            .all(|p| !p.ends_with("/release")));
-    }
+            .filter(|path| path.ends_with("/release"))
+            .count(),
+        1,
+        "the refused booking is released promptly, not postponed to restart"
+    );
 
     let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     motor.resume_finishes().await;
@@ -83,23 +89,35 @@ async fn released_placement_wait_survives_restart(settle_at_shutdown: bool) {
     );
     let requests = h.requests.lock().unwrap().clone();
     assert_eq!(
-        requests.iter().filter(|p| p.ends_with("/release")).count(),
+        requests
+            .iter()
+            .filter(|path| **path == format!("/v1/leases/{id}/release"))
+            .count(),
         1
     );
-    assert!(requests.iter().all(|p| !p.ends_with("/reattach")));
+    assert!(
+        !requests
+            .iter()
+            .any(|path| *path == format!("/v1/leases/{fresh}/release")),
+        "an unsent fresh lease never owned a booking"
+    );
+    assert!(requests.iter().all(|path| !path.ends_with("/reattach")
+        && !path.ends_with("/replace")
+        && !path.ends_with("/finish")));
+    assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     motor.close().await;
 }
 
-#[tokio::test]
-async fn placement_wait_shutdown_release_restart_attach_is_never_started() {
-    released_placement_wait_survives_restart(true).await;
+#[tokio::test(start_paused = true)]
+async fn rebook_wait_shutdown_restart_attach_is_never_started() {
+    rebook_wait_survives_restart(true).await;
 }
 
-#[tokio::test]
-async fn placement_wait_restart_recovery_release_attach_is_never_started() {
-    released_placement_wait_survives_restart(false).await;
+#[tokio::test(start_paused = true)]
+async fn rebook_wait_restart_recovery_attach_is_never_started() {
+    rebook_wait_survives_restart(false).await;
 }
 
 #[tokio::test]

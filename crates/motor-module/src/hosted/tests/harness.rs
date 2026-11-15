@@ -149,6 +149,8 @@ pub struct Harness {
     pub broker: Arc<Mutex<FakeBroker>>,
     pub requests: Arc<Mutex<Vec<String>>>,
     pub lease_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Lease request job, response status and decision time, including refusals.
+    pub lease_answers: ReplaceAnswers,
     pub lease_replies: LeaseReplies,
     pub replacement_hosts: ReplacementHosts,
     /// Hosts chosen for successive fresh lease IDs; replays keep their host.
@@ -830,6 +832,7 @@ impl Harness {
         let broker_url = format!("http://{}", http.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let lease_bodies = Arc::new(Mutex::new(Vec::new()));
+        let lease_answers = ReplaceAnswers::default();
         let lease_replies = Arc::new(Mutex::new(
             VecDeque::<(u16, serde_json::Value, &'static str)>::new(),
         ));
@@ -849,6 +852,7 @@ impl Harness {
             let capacity = capacity.clone();
             let requests = requests.clone();
             let lease_bodies = lease_bodies.clone();
+            let lease_answers = lease_answers.clone();
             let lease_replies = lease_replies.clone();
             let replacement_hosts = replacement_hosts.clone();
             let lease_hosts = lease_hosts.clone();
@@ -1058,6 +1062,14 @@ impl Harness {
                             tokio::time::Instant::now(),
                         ));
                     }
+                    if path == "/v1/leases" {
+                        let request: LeaseRequest = serde_json::from_slice(&body).unwrap();
+                        lease_answers.lock().unwrap().push((
+                            request.job_id,
+                            reply.status,
+                            tokio::time::Instant::now(),
+                        ));
+                    }
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
                         continue;
                     }
@@ -1086,6 +1098,7 @@ impl Harness {
             broker,
             requests,
             lease_bodies,
+            lease_answers,
             lease_replies,
             replacement_hosts,
             lease_hosts,

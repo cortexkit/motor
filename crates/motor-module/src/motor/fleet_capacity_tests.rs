@@ -32,16 +32,24 @@ fn with_tenant<T>(h: &Harness, f: impl FnOnce(&mut TenantCapacity) -> T) -> T {
     f(tenant(h).as_mut().unwrap())
 }
 
-/// Moves the held clock to one millisecond before `ms` more, shows that no
-/// lease or replacement request was sent, then moves the last millisecond.
+/// Checks that placement waits send no lease requests before their deadline.
+/// Old-booking releases run independently and may proceed during the wait.
 async fn no_request_until(h: &Harness, ms: u64) {
-    let before = h.requests.lock().unwrap().len();
+    let placement_count = || {
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.as_str() == "/v1/leases" || path.ends_with("/replace"))
+            .count()
+    };
+    let before = placement_count();
     tokio::time::advance(Duration::from_millis(ms - 1)).await;
     tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(100)))
         .await
         .unwrap();
     assert_eq!(
-        h.requests.lock().unwrap().len(),
+        placement_count(),
         before,
         "asked again before the wait ended"
     );
@@ -57,13 +65,9 @@ async fn until_retry_wait(waits: &crate::logging::Captured, count: usize) {
     .await;
 }
 
-/// One fleet job meets `hosted_host_full` (from a stale heartbeat) and broker
-/// 503 `no_capacity` (from a heartbeat showing the tenant full), in each
-/// order. Both are the same capacity wait inside one queue budget: the host
-/// refusal starts replacement, whose capacity wait honours Retry-After just
-/// like the initial lease route. Two- and three-second broker waits consume
-/// one queue budget, not placement attempts. The job runs once on a different
-/// host, and nothing is released or recorded as an error.
+/// Broker capacity waits before or after a host refusal share one queue budget.
+/// The host refusal adds a two-second re-book wait, while fresh-lease broker
+/// refusals still honor their exact two- and three-second Retry-After values.
 #[tokio::test(start_paused = true)]
 async fn fleet_capacity_wait_takes_host_full_and_no_capacity_in_either_order() {
     let _clock = HeldClock::new();
@@ -71,7 +75,7 @@ async fn fleet_capacity_wait_takes_host_full_and_no_capacity_in_either_order() {
         let waits = crate::logging::Captured::default();
         let _logs = crate::logging::scoped(waits.clone());
         let h = Harness::new(Behavior::CompleteRun).await;
-        let next = Harness::with_host(Behavior::CompleteRun, "replacement-host").await;
+        let next = Harness::with_host(Behavior::CompleteRun, "fresh-host").await;
         let mut model = TenantCapacity::new(64, TENANT_1_STOPPED_FREE_MEM_MIB);
         model.retry_after = "3";
         *tenant(&h) = Some(model);
@@ -81,25 +85,11 @@ async fn fleet_capacity_wait_takes_host_full_and_no_capacity_in_either_order() {
                 t.heartbeat();
             })
         };
-        // The broker grants from a heartbeat with room, and the host refuses
-        // the token: the queued refusal stands in for a burst that filled it.
         h.host_refusals.lock().unwrap().push_back("host_full");
-        h.replace_replies.lock().unwrap().push_back((
-            503,
-            serde_json::json!({"error":"no_capacity"}),
-            "2",
-        ));
-        if host_full_first {
-            h.replace_replies.lock().unwrap().push_back((
-                503,
-                serde_json::json!({"error":"no_capacity"}),
-                "3",
-            ));
-        }
-        h.replacement_hosts
+        h.lease_hosts
             .lock()
             .unwrap()
-            .push_back(next.broker.clone());
+            .extend([h.broker.clone(), next.broker.clone()]);
         set_full(!host_full_first);
         let (scratch, repo) = committed_repo();
         let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
@@ -109,82 +99,112 @@ async fn fleet_capacity_wait_takes_host_full_and_no_capacity_in_either_order() {
         let stream = motor.run(request(&repo)).unwrap();
         let id = stream.job_id;
         let job = tokio::spawn(records(stream));
-        until_retry_wait(&waits, 1).await;
-        if host_full_first {
-            no_request_until(&h, 2000).await;
-            until_retry_wait(&waits, 2).await;
-            no_request_until(&h, 3000).await;
-        } else {
+        if !host_full_first {
+            until_retry_wait(&waits, 1).await;
             set_full(false);
             no_request_until(&h, 3000).await;
+        }
+        until("persisted capacity re-book", || {
+            motor.hosted_state(id).unwrap().runner_id(id) != id
+        })
+        .await;
+        let fresh = motor.hosted_state(id).unwrap().runner_id(id);
+        h.lease_replies.lock().unwrap().push_back((
+            503,
+            serde_json::json!({"error":"no_capacity"}),
+            "2",
+        ));
+        if host_full_first {
+            h.lease_replies.lock().unwrap().push_back((
+                503,
+                serde_json::json!({"error":"no_capacity"}),
+                "3",
+            ));
+        }
+        no_request_until(&h, 2000).await;
+        until_retry_wait(&waits, if host_full_first { 1 } else { 2 }).await;
+        no_request_until(&h, 2000).await;
+        if host_full_first {
             until_retry_wait(&waits, 2).await;
-            no_request_until(&h, 2000).await;
+            no_request_until(&h, 3000).await;
         }
         let terminal = terminal_without_more_time(job).await;
         assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
-        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(terminal.job_id, id);
+        assert_eq!(started.elapsed(), Duration::from_secs(7));
         let answers: Vec<_> = tenant(&h)
             .as_ref()
             .unwrap()
             .leases
             .iter()
-            .map(|(job, answer, _)| {
-                assert_eq!(job, &id.to_string());
-                answer.clone()
-            })
+            .map(|(job, answer, _)| (job.clone(), answer.clone()))
             .collect();
         let expected = if host_full_first {
-            vec![LeaseAnswer::Selected]
+            vec![
+                (id.to_string(), LeaseAnswer::Selected),
+                (fresh.to_string(), LeaseAnswer::Selected),
+            ]
         } else {
-            vec![LeaseAnswer::NoCapacity, LeaseAnswer::Selected]
+            vec![
+                (id.to_string(), LeaseAnswer::NoCapacity),
+                (id.to_string(), LeaseAnswer::Selected),
+                (fresh.to_string(), LeaseAnswer::Selected),
+            ]
         };
         assert_eq!(answers, expected, "host_full_first={host_full_first}");
-        let replace_answers = h.replace_answers.lock().unwrap();
-        let statuses: Vec<_> = replace_answers
-            .iter()
-            .map(|(_, status, _)| *status)
-            .collect();
+        let answers = h.lease_answers.lock().unwrap().clone();
         assert_eq!(
-            statuses,
+            answers
+                .iter()
+                .map(|(_, status, _)| *status)
+                .collect::<Vec<_>>(),
             if host_full_first {
-                vec![503, 503, 201]
+                vec![201, 503, 503, 201]
             } else {
-                vec![503, 201]
+                vec![503, 201, 503, 201]
             }
         );
-        assert!(replace_answers
-            .iter()
-            .all(|(job, _, _)| job == &id.to_string()));
-        assert_eq!(lease_bodies(&h).len(), expected.len());
+        let bodies = lease_bodies(&h);
+        assert_eq!(bodies.len(), 4);
+        let mut shape = bodies[0].clone();
+        for body in &bodies[1..] {
+            shape["job_id"] = body["job_id"].clone();
+            assert_eq!(&shape, body);
+        }
         let state = motor.hosted_state(id).unwrap();
         assert!(state.fleet_routed && state.run_sent);
         assert_eq!(state.placement_attempts, 1);
         assert_eq!(state.hosted_code, None);
-        assert_eq!(state.placement.unwrap().host, "replacement-host");
+        assert_eq!(state.placement.unwrap().host, "fresh-host");
         assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
         assert_eq!(next.tokens.load(Ordering::SeqCst), 1);
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
         assert_eq!(next.runs.load(Ordering::SeqCst), 1);
-        assert!(lease_settlement_requests(&h).is_empty());
+        motor.wait_hosted_cleanup(id).await;
+        assert_eq!(
+            lease_settlement_requests(&h),
+            vec![format!("/v1/leases/{id}/release")]
+        );
+        assert!(!h
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with("/replace")));
         assert!(!waits.text().contains("hosted job stopped"));
         assert_eq!(peer.0.load(Ordering::SeqCst), 0);
     }
 }
 
-/// Eight 2-vCPU fleet jobs arrive within one heartbeat interval at a tenant
-/// with 8 permits. The broker grants all eight from the last heartbeat; the
-/// host admits four and refuses the other four `hosted_host_full` before any
-/// Run. Replacement initially answers 503 `no_capacity`, each honouring its
-/// one-second Retry-After. When the first four end and a heartbeat exposes
-/// room on another host, the other four are admitted there, never back on
-/// the revoked host. Every job runs exactly once; none is released, finished as
-/// lost, recorded with an error code, or reported as a stopped hosted job.
+/// A stale heartbeat grants eight jobs to a host that can admit only four.
+/// The four refused callers re-book, wait for fresh-lease capacity, and run on
+/// the second host. Each caller runs once, and each refused booking releases once.
 #[tokio::test]
 async fn fleet_burst_over_one_heartbeat_waits_through_host_full_and_no_capacity() {
     let logs = crate::logging::Captured::default();
     let _logs = crate::logging::scoped(logs.clone());
     let h = Harness::new(Behavior::CompleteRun).await;
-    let next = Harness::with_host(Behavior::CompleteRun, "replacement-host").await;
+    let next = Harness::with_host(Behavior::CompleteRun, "fresh-host").await;
     let mut model = TenantCapacity::new(8, TENANT_1_STOPPED_FREE_MEM_MIB);
     model.heartbeat();
     *tenant(&h) = Some(model);
@@ -207,20 +227,22 @@ async fn fleet_burst_over_one_heartbeat_waits_through_host_full_and_no_capacity(
         tenant.running() == 4 && tenant.count(&HostAnswer::HostFull) == 4
     })
     .await;
-    let surplus: Vec<String> = with_tenant(&h, |t| {
+    let surplus: Vec<Uuid> = with_tenant(&h, |t| {
         t.heartbeat();
         t.admissions
             .iter()
             .filter(|(_, answer)| *answer == HostAnswer::HostFull)
-            .map(|(job, _)| job.clone())
+            .map(|(job, _)| Uuid::parse_str(job).unwrap())
             .collect()
     });
-    until("no_capacity for every refused job", || {
-        let answers = h.replace_answers.lock().unwrap();
-        surplus.iter().all(|job| {
-            answers
-                .iter()
-                .any(|(j, status, _)| j == job && *status == 503)
+    until("fresh lease no_capacity for every refused caller", || {
+        let answers = h.lease_answers.lock().unwrap();
+        surplus.iter().all(|id| {
+            let fresh = motor.hosted_state(*id).unwrap().runner_id(*id);
+            fresh != *id
+                && answers
+                    .iter()
+                    .any(|(job, status, _)| *job == fresh.to_string() && *status == 503)
         })
     })
     .await;
@@ -235,96 +257,131 @@ async fn fleet_burst_over_one_heartbeat_waits_through_host_full_and_no_capacity(
         tenant(&h).as_ref().unwrap().running() == 0
     })
     .await;
-    with_tenant(&h, TenantCapacity::heartbeat);
-    let mut replacement_capacity = TenantCapacity::new(8, TENANT_1_STOPPED_FREE_MEM_MIB);
-    replacement_capacity.heartbeat();
-    *tenant(&next) = Some(replacement_capacity);
-    h.replacement_hosts
+    let mut fresh_capacity = TenantCapacity::new(8, TENANT_1_STOPPED_FREE_MEM_MIB);
+    fresh_capacity.heartbeat();
+    *tenant(&next) = Some(fresh_capacity);
+    h.lease_hosts
         .lock()
         .unwrap()
         .extend(std::iter::repeat_n(next.broker.clone(), surplus.len()));
+    with_tenant(&h, TenantCapacity::heartbeat);
     for job in jobs {
         let (_, terminal) = job.await.unwrap();
         assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
     }
-
+    for id in &ids {
+        motor.wait_hosted_cleanup(*id).await;
+    }
     let tenant = tenant(&h);
     let tenant = tenant.as_ref().unwrap();
-    let replacement_tenant = self::tenant(&next);
-    let replacement_tenant = replacement_tenant.as_ref().unwrap();
-    assert!(tenant.count(&HostAnswer::HostFull) >= 4);
+    let fresh_tenant = self::tenant(&next);
+    let fresh_tenant = fresh_tenant.as_ref().unwrap();
+    assert_eq!(tenant.count(&HostAnswer::HostFull), 4);
     assert_eq!(tenant.count(&HostAnswer::Admitted), 4);
-    assert_eq!(replacement_tenant.count(&HostAnswer::Admitted), 4);
-    for job in &surplus {
+    assert_eq!(fresh_tenant.count(&HostAnswer::Admitted), 4);
+    for id in &surplus {
+        let fresh = motor.hosted_state(*id).unwrap().runner_id(*id);
+        assert_ne!(fresh, *id);
         let answers: Vec<_> = tenant
             .admissions
             .iter()
-            .chain(replacement_tenant.admissions.iter())
-            .filter(|(j, _)| j == job)
+            .chain(fresh_tenant.admissions.iter())
+            .filter(|(job, _)| *job == id.to_string() || *job == fresh.to_string())
             .map(|(_, answer)| answer.clone())
             .collect();
-        assert_eq!(answers.first(), Some(&HostAnswer::HostFull));
-        assert_eq!(answers.last(), Some(&HostAnswer::Admitted));
+        assert_eq!(answers, [HostAnswer::HostFull, HostAnswer::Admitted]);
     }
-    let replace_answers = h.replace_answers.lock().unwrap();
-    for (index, (job, status, at)) in replace_answers.iter().enumerate() {
+    let answers = h.lease_answers.lock().unwrap();
+    for (index, (job, status, at)) in answers.iter().enumerate() {
         if *status == 503 {
-            let next = replace_answers[index + 1..]
+            let next_answer = answers[index + 1..]
                 .iter()
-                .find(|(j, _, _)| j == job)
+                .find(|(next_job, _, _)| next_job == job)
                 .expect("a job refused no_capacity asked again");
             assert!(
-                next.2.duration_since(*at) >= Duration::from_secs(1),
-                "Retry-After was not honoured"
+                next_answer.2.duration_since(*at) >= Duration::from_secs(1),
+                "Retry-After was not honored"
             );
         }
     }
     let frames = h.frames.lock().unwrap();
-    let replacement_frames = next.frames.lock().unwrap();
+    let fresh_frames = next.frames.lock().unwrap();
+    let bodies = lease_bodies(&h);
     for id in &ids {
-        let runs = frames
-            .iter()
-            .chain(replacement_frames.iter())
-            .filter(|frame| matches!(frame, Frame::Run(run) if run.job_id == *id))
-            .count();
-        assert_eq!(runs, 1, "{id} ran once");
         let state = motor.hosted_state(*id).unwrap();
+        let fresh = state.runner_id(*id);
+        let runs = frames.iter().chain(fresh_frames.iter()).filter(|frame| matches!(frame, Frame::Run(run) if run.job_id == *id || run.job_id == fresh)).count();
+        assert_eq!(runs, 1, "{id} ran once across all its bookings");
         assert!(state.fleet_routed && state.run_sent);
         assert_eq!(state.placement_attempts, 1);
         assert_eq!(state.hosted_code, None);
         assert_eq!(
             state.placement.unwrap().host,
-            if surplus.contains(&id.to_string()) {
-                "replacement-host"
+            if surplus.contains(id) {
+                "fresh-host"
             } else {
                 "test-host"
             }
         );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body["job_id"] == id.to_string())
+                .count(),
+            1,
+            "each caller's original booking was sent once"
+        );
+        if surplus.contains(id) {
+            assert!(
+                !frames
+                    .iter()
+                    .any(|frame| matches!(frame, Frame::Run(run) if run.job_id == *id)),
+                "the refused booking never received Run"
+            );
+            assert!(
+                bodies
+                    .iter()
+                    .filter(|body| body["job_id"] == fresh.to_string())
+                    .count()
+                    >= 2,
+                "the fresh booking saw both no_capacity and its eventual grant"
+            );
+        }
     }
+    assert_eq!(bodies.len(), answers.len());
     assert_eq!(
-        lease_bodies(&h).len(),
-        8,
-        "one initial lease request per job"
+        bodies
+            .iter()
+            .map(|body| body["job_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        12
     );
     assert_eq!(h.tokens.load(Ordering::SeqCst), 8);
     assert_eq!(next.tokens.load(Ordering::SeqCst), 4);
     assert_eq!(h.runs.load(Ordering::SeqCst), 4);
     assert_eq!(next.runs.load(Ordering::SeqCst), 4);
-    let settlement_requests = lease_settlement_requests(&h);
-    assert!(
-        settlement_requests.is_empty(),
-        "unexpected broker requests: {settlement_requests:?}"
-    );
+    let mut settlements = lease_settlement_requests(&h);
+    settlements.sort();
+    let mut expected: Vec<_> = surplus
+        .iter()
+        .map(|id| format!("/v1/leases/{id}/release"))
+        .collect();
+    expected.sort();
+    assert_eq!(settlements, expected);
+    assert!(!h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|path| path.ends_with("/replace")));
     assert!(!logs.text().contains("hosted job stopped"));
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }
 
-/// With no capacity anywhere, a fleet job keeps waiting past three
-/// attempts: the host refuses a stale grant as full, then replacement keeps
-/// answering 503 `no_capacity` without issuing another token. The job
-/// ends exactly when its ten-second queue budget does, with the typed,
-/// retryable refusal (runner full, retry after the broker's one second), no
-/// Run anywhere and only the unused reservation released.
+/// A stale grant is refused before Run, then a fresh lease waits for capacity.
+/// The two-second re-book delay and eight one-second broker waits must end at
+/// the original ten-second deadline, without exhausting placement attempts.
 #[tokio::test(start_paused = true)]
 async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_placements() {
     let _clock = HeldClock::new();
@@ -333,28 +390,29 @@ async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_plac
     let h = Harness::new(Behavior::CompleteRun).await;
     let mut model = TenantCapacity::new(8, TENANT_1_STOPPED_FREE_MEM_MIB);
     model.heartbeat();
-    // Other callers' jobs take every permit after that heartbeat.
     model.max_weight = 0;
     *tenant(&h) = Some(model);
-    h.replace_replies
-        .lock()
-        .unwrap()
-        .extend((0..10).map(|_| (503, serde_json::json!({"error":"no_capacity"}), "1")));
     let (scratch, repo) = committed_repo();
-    let config = config(&h);
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
     let started = tokio::time::Instant::now();
     let mut run_request = request(&repo);
     run_request.queue_wait_limit_s = Some(10);
     let stream = motor.run(run_request).unwrap();
     let id = stream.job_id;
     let job = tokio::spawn(records(stream));
-    for waits_seen in 1..=10 {
+    until("persisted capacity re-book", || {
+        motor.hosted_state(id).unwrap().runner_id(id) != id
+    })
+    .await;
+    let fresh = motor.hosted_state(id).unwrap().runner_id(id);
+    with_tenant(&h, TenantCapacity::heartbeat);
+    no_request_until(&h, 2000).await;
+    for waits_seen in 1..=8 {
         until_retry_wait(&waits, waits_seen).await;
         assert_eq!(motor.hosted_state(id).unwrap().placement_attempts, 1);
-        if waits_seen < 10 {
-            tokio::time::advance(Duration::from_secs(1)).await;
+        if waits_seen < 8 {
+            no_request_until(&h, 1000).await;
         }
     }
     tokio::time::advance(Duration::from_millis(999)).await;
@@ -380,30 +438,54 @@ async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_plac
         .unwrap()
         .leases
         .iter()
-        .map(|(_, answer, _)| answer.clone())
+        .map(|(job, answer, _)| (job.clone(), answer.clone()))
         .collect();
-    assert_eq!(answers, [LeaseAnswer::Selected]);
-    assert_eq!(
-        lease_bodies(&h).len(),
-        1,
-        "no lease re-request after revocation"
-    );
-    let replace_answers = h.replace_answers.lock().unwrap();
-    assert_eq!(replace_answers.len(), 10);
-    assert!(replace_answers
-        .iter()
-        .all(|(job, status, _)| job == &id.to_string() && *status == 503));
+    let expected = std::iter::once((id.to_string(), LeaseAnswer::Selected))
+        .chain(std::iter::repeat_n(
+            (fresh.to_string(), LeaseAnswer::NoCapacity),
+            8,
+        ))
+        .collect::<Vec<_>>();
+    assert_eq!(answers, expected);
+    let bodies = lease_bodies(&h);
+    assert_eq!(bodies.len(), 9);
+    assert!(bodies[1..].iter().all(|body| body == &bodies[1]));
+    assert_ne!(bodies[0]["job_id"], bodies[1]["job_id"]);
     assert_eq!(
         h.tokens.load(Ordering::SeqCst),
         1,
-        "only the revoked host's token"
+        "only the refused booking received a token"
     );
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert!(!motor.hosted_state(id).unwrap().run_sent);
+    until("queue-expiry booking settlement", || {
+        motor.hosted_state(id).unwrap().finish_done
+    })
+    .await;
+    let settlements = lease_settlement_requests(&h);
     assert_eq!(
-        lease_settlement_requests(&h),
-        vec![format!("/v1/leases/{id}/release")]
+        settlements
+            .iter()
+            .filter(|path| **path == format!("/v1/leases/{id}/release"))
+            .count(),
+        1
     );
+    assert!(
+        settlements
+            .iter()
+            .any(|path| *path == format!("/v1/leases/{fresh}/release")),
+        "the ungranted fresh attempt must also be cleaned up"
+    );
+    assert!(
+        settlements.iter().all(|path| path.ends_with("/release")),
+        "no never-ran finish is needed for first-party bookings"
+    );
+    assert!(!h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|path| path.ends_with("/replace")));
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }
 
