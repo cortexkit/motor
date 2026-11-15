@@ -226,7 +226,8 @@ mod execution {
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     Err(io::Error::other(format!(
-                        "motorjob processes remain after {KILL_SWEEPS} SIGKILL sweeps"
+                        "motorjob processes remain after {KILL_SWEEPS} SIGKILL sweeps: {}",
+                        uid_process_report(user.uid)
                     )))
                 }
                 #[cfg(test)]
@@ -262,7 +263,8 @@ mod execution {
                 Self::User(user) => match uid_processes(user.uid)? {
                     0 => Ok(()),
                     count => Err(io::Error::other(format!(
-                        "{count} motorjob processes were running after the job ended"
+                        "{count} motorjob processes were running after the job ended: {}",
+                        uid_process_report(user.uid)
                     ))),
                 },
                 #[cfg(test)]
@@ -345,6 +347,62 @@ mod execution {
         }
         let count = bytes as usize / std::mem::size_of::<libc::pid_t>();
         Ok(pids[..count].iter().filter(|pid| **pid > 0).count())
+    }
+
+    /// Names the processes `uid_processes` counts, for the release-failure
+    /// reason: pid, parent pid, BSD status (5 is a zombie) and executable
+    /// path, at most eight. The path is the kernel's record of the image, not
+    /// anything the process reports about itself.
+    #[cfg(target_os = "macos")]
+    fn uid_process_report(uid: libc::uid_t) -> String {
+        const PROC_UID_ONLY: u32 = 4;
+        let mut pids = vec![0 as libc::pid_t; 4096];
+        let bytes = unsafe {
+            libc::proc_listpids(
+                PROC_UID_ONLY,
+                uid,
+                pids.as_mut_ptr().cast(),
+                (pids.len() * std::mem::size_of::<libc::pid_t>()) as i32,
+            )
+        };
+        if bytes < 0 {
+            return format!("(listing failed: {})", io::Error::last_os_error());
+        }
+        let count = bytes as usize / std::mem::size_of::<libc::pid_t>();
+        let mut parts = Vec::new();
+        for &pid in pids[..count].iter().filter(|pid| **pid > 0).take(8) {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            let (ppid, status) = if read == size {
+                (info.pbi_ppid.to_string(), info.pbi_status.to_string())
+            } else {
+                ("?".into(), "?".into())
+            };
+            let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            let length =
+                unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+            let path = if length > 0 {
+                String::from_utf8_lossy(&path[..length as usize]).into_owned()
+            } else {
+                "?".into()
+            };
+            parts.push(format!("pid={pid} ppid={ppid} status={status} path={path}"));
+        }
+        parts.join("; ")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn uid_process_report(_uid: libc::uid_t) -> String {
+        String::new()
     }
 
     /// Count live processes owned by `uid` (portable fallback for builds
