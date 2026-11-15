@@ -751,6 +751,45 @@ impl Host {
         }
         Ok(())
     }
+
+    /// A sole owner may cancel an upload it had to close under backpressure.
+    /// Once any result or usage can have escaped the host, keep it immutable.
+    pub(crate) fn cancel_interrupted_upload(&mut self, job: &str) -> Result<bool, Error> {
+        let Some(execution) = self.snapshot.per_job.executions.get(job) else {
+            return Ok(false);
+        };
+        let lease = &self.snapshot.leases[job];
+        let Some(billing) = self.snapshot.billing.get(job) else {
+            return Ok(false);
+        };
+        if lease.state != super::LeaseState::Ended
+            || execution.boot_started
+            || lease.delivered
+            || lease.started_at_ms.is_some()
+            || billing.delivered
+            || billing.enqueued
+            || !self.snapshot.zero_usage.contains_key(job)
+            || !billing.terminal.as_ref().is_some_and(|terminal| {
+                terminal["ran"] == "none"
+                    && terminal["outcome"]["type"] == "refused_before_start"
+                    && terminal["outcome"]["reason"] == "transfer_interrupted"
+            })
+        {
+            return Ok(false);
+        }
+        let mut next = self.snapshot.clone();
+        let terminal = next
+            .billing
+            .get_mut(job)
+            .unwrap()
+            .terminal
+            .as_mut()
+            .unwrap();
+        terminal["outcome"] = serde_json::json!({"type":"cancelled"});
+        terminal.as_object_mut().unwrap().remove("refusal_detail");
+        self.save(next)?;
+        Ok(true)
+    }
 }
 
 fn same_execution(a: &Claims, b: &Claims) -> bool {

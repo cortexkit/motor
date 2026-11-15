@@ -1017,6 +1017,16 @@ fn client_io(error: anyhow::Error) -> anyhow::Error {
 struct Reader {
     buffered: Vec<u8>,
 }
+
+#[derive(Debug)]
+struct CleanClientEof;
+impl std::fmt::Display for CleanClientEof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("client cleanly closed input at a frame boundary")
+    }
+}
+impl std::error::Error for CleanClientEof {}
+
 impl Reader {
     // `read` is cancellation-safe; already consumed bytes stay here when a
     // heartbeat or the boot future wins a select while a frame is fragmented.
@@ -1034,11 +1044,14 @@ impl Reader {
             let mut buffer = [0; 8192];
             let n = stream.read(&mut buffer).await?;
             if n == 0 {
-                return Err(std::io::Error::new(
+                let error = std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "client closed before delivery",
-                )
-                .into());
+                );
+                if self.buffered.is_empty() {
+                    return Err(anyhow::Error::new(error).context(CleanClientEof));
+                }
+                return Err(error.into());
             }
             self.buffered.extend_from_slice(&buffer[..n]);
         }
@@ -1619,8 +1632,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
             let job = claims.jti.clone();
             tokio::task::spawn_blocking(move || r.stop_job(&job, true, false)).await??;
             if reason == "transfer_interrupted" {
-                return stream::serve(&runtime, claims, client, false, Reader::default(), true)
-                    .await;
+                if error.downcast_ref::<CleanClientEof>().is_some() {
+                    return stream::serve(&runtime, claims, client, false, Reader::default(), true)
+                        .await;
+                }
+                // The upload transport is broken. Deliver its durable result
+                // only on a later attach, which records delivery before writing.
+                return Err(error);
             }
             write_frame(client, &frame).await?;
             return Ok(());

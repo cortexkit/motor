@@ -95,6 +95,8 @@ pub(crate) mod submission_key;
 #[cfg(test)]
 #[path = "motor/upload_activity_tests.rs"]
 mod upload_activity_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod upload_cancel_tests;
 
 struct Submission {
     motor: Motor,
@@ -1983,10 +1985,15 @@ impl Motor {
                     .await;
             }
         };
-        let uploaded = self
-            .upload(&mut channel, &snapshots, &upload, Some(id))
+        let (uploaded, channel) = self
+            .upload_submission(id, channel, &snapshots, &upload, &wake)
             .await;
         drop(snapshots);
+        let Some(channel) = channel else {
+            return self
+                .follow_attempt(id, 0, None, tx, wake, spill_after, placement_queue.as_mut())
+                .await;
+        };
         if let Err(error) = &uploaded {
             if hosted {
                 tracing::warn!(job_id = %id, step = "upload", cause = %error, "hosted job stream closed");
@@ -2067,6 +2074,41 @@ impl Motor {
         }
         result
     }
+    async fn upload_submission(
+        &self,
+        id: Uuid,
+        mut channel: Channel,
+        snapshots: &Snapshots,
+        bundles: &[BundleManifest],
+        wake: &watch::Receiver<bool>,
+    ) -> (io::Result<()>, Option<Channel>) {
+        let mut wake = wake.clone();
+        let owned_hosted = self.hosted_results.lock().unwrap().contains_key(&id);
+        let result = tokio::select! {
+            biased;
+            _ = async {
+                loop {
+                    if self.pending(id) { break; }
+                    if wake.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }, if owned_hosted => {
+                // The host may have stopped reading at its bounded pre-boot
+                // spool. Cancel cannot overtake a partial bundle frame there.
+                // Release both transport halves before the owner reconnects.
+                channel.close().await;
+                return (Err(io::Error::other("cancel hosted upload")), None);
+            },
+            result = self.upload(&mut channel, snapshots, bundles, Some(id)) => result,
+        };
+        if owned_hosted && self.pending(id) {
+            channel.close().await;
+            return (Err(io::Error::other("cancel hosted upload")), None);
+        }
+        (result, Some(channel))
+    }
+
     async fn upload(
         &self,
         channel: &mut Channel,
@@ -2081,10 +2123,14 @@ impl Motor {
             let mut offset = 0;
             let mut bytes = vec![0; 65536];
             loop {
-                // Keep an incomplete upload alive until cancel is acknowledged.
-                // Closing first would let the runner retain transfer_interrupted
-                // instead of the cancellation tombstone.
+                // Without a result owner, a separate cancel delivery may
+                // already be in flight; keep the upload connection open to
+                // drain its terminal. Owned hosted uploads yield to their sole
+                // owner's connection takeover instead.
                 if let Some(id) = job.filter(|id| self.pending(*id)) {
+                    if self.hosted_results.lock().unwrap().contains_key(&id) {
+                        return Err(io::Error::other("cancel hosted upload"));
+                    }
                     let mut delay = 1;
                     while self.pending(id) {
                         if self.hosted_state(id).is_some_and(|s| {
@@ -2870,7 +2916,7 @@ impl Motor {
                     {
                         channel = None;
                     }
-                } else {
+                } else if !hosted {
                     tracing::info!(job_id = %id, "job stream sending pending cancel on a new connection");
                     let cancel = tokio::select! {
                         result = self.send_cancel(id) => result,
@@ -3011,6 +3057,10 @@ impl Motor {
                     }
                 }
                 if let Err(error) = &opened {
+                    #[cfg(test)]
+                    if let Some(owner) = &owner {
+                        owner.trace_transport_for_test(error.code());
+                    }
                     self.log_hosted_failure(id, "reattach", error.code());
                 }
                 if let Some(terminal) = self
@@ -3059,6 +3109,12 @@ impl Motor {
                         && (hosted || !self.cancel_in_flight(id))
                         && tokio::time::Instant::now() >= cancel_retry_at
                     {
+                        if hosted {
+                            // Cancel before Attach so an unobserved interrupted
+                            // upload is settled before replay can expose it.
+                            channel = Some(c);
+                            continue;
+                        }
                         drop(c);
                         continue;
                     }
@@ -3539,8 +3595,8 @@ impl Motor {
             tracing::info!(job_id = %id, step = "cancel", cause = "caller requested cancellation", "hosted cancellation requested");
         }
         // The task streaming a hosted job already owns its only allowed attach
-        // connection. It checks pending cancellation on each heartbeat and sends
-        // it there, rather than opening a conflicting second connection.
+        // connection. Its wake interrupts both following and upload, rather
+        // than opening a conflicting second connection from this caller.
         let owner = self.hosted_results.lock().unwrap().get(&id).cloned();
         if let Some(owner) = owner {
             owner.wake.send_replace(true);

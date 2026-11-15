@@ -29,6 +29,7 @@ pub(crate) struct Stream {
     running: AtomicBool,
     upload_detached: AtomicBool,
     terminal_delivered: AtomicBool,
+    terminal_delivery: tokio::sync::Mutex<()>,
     #[cfg(test)]
     crash: AtomicBool,
     #[cfg(test)]
@@ -199,6 +200,7 @@ impl Runtime {
             running: AtomicBool::new(false),
             upload_detached: AtomicBool::new(false),
             terminal_delivered: AtomicBool::new(false),
+            terminal_delivery: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             crash: AtomicBool::new(false),
             #[cfg(test)]
@@ -706,6 +708,19 @@ pub(super) fn publish_settlement(runtime: &Runtime, job: &str, stream: &Stream) 
 
 fn publish_to_store(runtime: &Runtime, job: &str, store: &mut Store) -> Result<()> {
     if store.ended() {
+        // The host saves the cancellation first. Reconcile a replay index
+        // left behind by a crash between that commit and the replay update.
+        if let Some(terminal) = runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .snapshot
+            .billing
+            .get(job)
+            .and_then(|b| b.terminal.clone())
+        {
+            store.cancel_interrupted_upload(&terminal)?;
+        }
         return Ok(());
     }
     let frames = {
@@ -819,6 +834,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // (started, output, returned files) comes after that.
     let mut started = false;
     loop {
+        let delivery = stream.terminal_delivery.lock().await;
         let s = stream.clone();
         let frame = tokio::task::spawn_blocking(move || {
             s.with_store(|s| s.cursor_frame(position, minimum))
@@ -855,6 +871,19 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     // Reconnects still receive the durable terminal unchanged.
                     anyhow::bail!("execution ended before Run delivery");
                 }
+                if value["type"] == "terminal"
+                    && value["ran"] == "none"
+                    && value["outcome"]["type"] == "refused_before_start"
+                    && value["outcome"]["reason"] == "transfer_interrupted"
+                {
+                    // Mark the interrupted terminal as delivered before replay
+                    // can escape, even if the host restarts during the write.
+                    runtime
+                        .host
+                        .lock()
+                        .expect("host lock")
+                        .terminal_delivered(&claims.jti, unix_ms())?;
+                }
                 write
                     .write_all(&bytes)
                     .await
@@ -885,6 +914,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             }
             continue;
         }
+        drop(delivery);
         tokio::select! {
             request = reader.next(&mut read) => {
                 let request = match request {
@@ -908,6 +938,20 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         last_runner_heartbeat = None;
                     }
                     Some("cancel" | "withdraw" | "job_status") => {
+                        if request.value["type"] == "cancel" {
+                            let _delivery = stream.terminal_delivery.lock().await;
+                            if !stream.terminal_delivered.load(Ordering::Acquire) {
+                                stream.with_store(|store| {
+                                    let mut host = runtime.host.lock().expect("host lock");
+                                    if host.cancel_interrupted_upload(&claims.jti)? {
+                                        let terminal = host.snapshot.billing[&claims.jti].terminal.clone().context("cancelled terminal")?;
+                                        drop(host);
+                                        store.cancel_interrupted_upload(&terminal)?;
+                                    }
+                                    Ok(())
+                                })?;
+                            }
+                        }
                         let ended = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.terminal.clone());
                         let kind = request.value["type"].as_str().context("control type")?;
                         if let Some(terminal) = ended {

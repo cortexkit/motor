@@ -1681,6 +1681,15 @@ impl Channel {
             .map_err(|_| io::Error::other("channel detached"))?;
         rx.await.map_err(|_| io::Error::other("channel detached"))?
     }
+    /// Finish dropping both transport halves before another connection takes over.
+    pub async fn close(mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
     /// Drain the bounded inbox while an upload is backpressured. Report live
     /// progress now, but retain every frame for `next_job` in wire order.
     pub async fn send_upload(
