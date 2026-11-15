@@ -59,6 +59,7 @@ pub(crate) struct TargetRoute {
 /// case) and every other component is a plain UTF-8 name. Returns the rest,
 /// joined with `/`. The macOS guest agent copies exactly these paths off the
 /// build volume, and the host reads exactly these from its copies.
+#[cfg(unix)]
 pub(crate) fn target_return(relative: &Path) -> Option<String> {
     use std::path::Component;
     let mut components = relative.components();
