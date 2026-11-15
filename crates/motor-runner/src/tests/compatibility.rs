@@ -213,6 +213,7 @@ async fn users_runner_hello_matches_pre_mapping_bytes() {
             sha256: "0".repeat(64),
         };
         config.macos = Some(Arc::new(crate::macos::VmConfig {
+            hold_window: None,
             image: "/unused-image".into(),
             helper: "/unused-helper".into(),
             tools: crate::macos::Tools {

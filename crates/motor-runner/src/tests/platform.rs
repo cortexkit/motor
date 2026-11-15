@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(unix)]
+#[path = "macos_hold.rs"]
+mod macos_hold;
+
 fn platform_runner(f: &Fixture, kind: BackendKind) -> Runner {
     let config = platform_config(f, kind);
     // Inject only the portable backend: these tests stop at admission, before

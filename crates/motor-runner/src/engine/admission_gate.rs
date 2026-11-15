@@ -17,6 +17,7 @@ impl Runner {
                 (self.config().backend == BackendKind::MacosVm && self.is_draining())
                     .then(|| "runner_draining".into())
             })
+            .or_else(|| self.macos_hold_status())
     }
 
     pub(super) fn qualification_refusal(

@@ -1590,6 +1590,7 @@ fn staging_reads_the_engines_git_dependency_mirrors() {
         helper: "/helper".into(),
         tools: f.staging.tools.clone(),
         toolchain_version: "sealed".into(),
+        hold_window: None,
     }));
     host::create_dir_all(config.state_dir().join("mirrors")).unwrap();
     let engine_trees = crate::workspace::Trees {
@@ -1621,6 +1622,7 @@ fn disk_eviction_uses_canonical_workspace_and_prep_locks() {
         helper: "/helper".into(),
         tools: f.staging.tools.clone(),
         toolchain_version: "sealed".into(),
+        hold_window: None,
     }));
     let control = Control {
         cancel: Cancellation::default(),
