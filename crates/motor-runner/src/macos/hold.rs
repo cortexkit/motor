@@ -5,7 +5,7 @@ use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -221,6 +221,7 @@ impl State {
                 .mode(0o644)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&temporary)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
             file.write_all(&serde_json::to_vec(hold).map_err(super::invalid)?)?;
             file.sync_all()?;
             std::fs::rename(&temporary, self.grant_dir.join("granted.json"))?;

@@ -119,6 +119,14 @@ fn grant_copies_fields_only_when_idle_and_deletion_removes_it() {
         std::fs::read(state.grant_dir.join("granted.json")).unwrap()
     );
     assert!(state.status(now).unwrap().ends_with("(granted: true)"));
+    assert_eq!(
+        std::fs::metadata(state.grant_dir.join("granted.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+    );
     assert_eq!(std::fs::read_dir(&state.grant_dir).unwrap().count(), 1);
     std::fs::remove_file(state.hold_dir.join("hold.json")).unwrap();
     assert!(!state.refresh(now, true));
