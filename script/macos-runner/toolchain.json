@@ -457,8 +457,8 @@
     }
   },
   "agent": {
-    "commit": "da1d16c56b6f0ce8f56b53ca8980edf1b49fb053",
-    "sha256": "a41614e7a102b4207db779a40c3f4e9266c49416dfd697a826c96fda1ce63fde"
+    "commit": "7d37b4e3da07e9184e49a7b833f1a6ed0b6e6863",
+    "sha256": "7f6b8e6b7e22d796c6e4820e604f115cf49cb8a45643ae2d7c565f4490597eb1"
   },
   "prep_tools": {
     "cargo": {
