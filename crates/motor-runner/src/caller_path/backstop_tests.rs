@@ -11,6 +11,8 @@ const ALLOWLIST: &[&str] = &[
     "macos/execution.rs",
     "macos/execution_tests.rs",
     "macos/fs.rs",
+    "macos/hold.rs",
+    "macos/hold_tests.rs",
     "macos/lifecycle.rs",
     "macos/lifecycle_tests.rs",
     "macos/preflight.rs",
