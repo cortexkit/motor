@@ -196,6 +196,8 @@ pub struct Harness {
     /// records but never answers, holding its connection open as a broker
     /// that stopped responding would; 0 answers every request.
     pub unanswered_lease: Arc<AtomicUsize>,
+    /// Hold this 1-based replacement request open without answering it.
+    pub unanswered_replace: Arc<AtomicUsize>,
     /// Hold a parsed lease reply after the broker has decided whether to book it.
     pub lease_reply_gate: Arc<tokio::sync::watch::Sender<bool>>,
     pub tasks: Vec<JoinHandle<()>>,
@@ -840,6 +842,7 @@ impl Harness {
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let unanswered_lease = Arc::new(AtomicUsize::new(0));
+        let unanswered_replace = Arc::new(AtomicUsize::new(0));
         let lease_reply_gate = Arc::new(tokio::sync::watch::Sender::new(true));
         let http_task = tokio::spawn({
             let timeline = timeline.clone();
@@ -856,12 +859,14 @@ impl Harness {
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
             let unanswered_lease = unanswered_lease.clone();
+            let unanswered_replace = unanswered_replace.clone();
             let lease_reply_gate = lease_reply_gate.clone();
             let run_gate = run_gate.clone();
             async move {
                 // Connections of unanswered requests, kept open until the
                 // harness is dropped and aborts this task.
                 let mut unanswered = Vec::new();
+                let mut replace_count = 0;
                 let mut placements = std::collections::BTreeMap::new();
                 let mut reservations =
                     std::collections::BTreeMap::<String, serde_json::Value>::new();
@@ -914,6 +919,13 @@ impl Harness {
                     socket.read_exact(&mut body).await.unwrap();
                     timeline.mark(format!("broker request {path}"));
                     requests.lock().unwrap().push(path.clone());
+                    if path.ends_with("/replace") {
+                        replace_count += 1;
+                        if replace_count == unanswered_replace.load(Ordering::SeqCst) {
+                            unanswered.push(socket);
+                            continue;
+                        }
+                    }
                     if path.ends_with("/reattach") && matches!(behavior, Behavior::RefuseAttach(_))
                     {
                         let mut gate = run_gate.subscribe();
@@ -1096,6 +1108,7 @@ impl Harness {
             attach_history_expired,
             drop_follow,
             unanswered_lease,
+            unanswered_replace,
             lease_reply_gate,
             tasks: vec![host_task, http_task],
         }

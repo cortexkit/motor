@@ -364,6 +364,8 @@ pub(crate) enum Error {
     StorageFull,
     Connect,
     Broker,
+    /// A broker connection failed or timed out, rather than refusing the request.
+    BrokerTransport,
     /// A reattach returned 404 job_unknown, which can also mean provisioning.
     ReattachUnknown,
     NoTimeout,
@@ -417,6 +419,7 @@ impl RequestField {
 const SPILL_PROVISIONING_BUDGET: Duration = Duration::from_secs(180);
 const MIN_PROVISIONING_RETRY_MS: u64 = 1_000;
 const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
+const BROKER_TRANSPORT_BUDGET: Duration = Duration::from_secs(60);
 /// How long a repository-routed job waits before asking again after the
 /// granted host refused it as full. The host sends no Retry-After, and its
 /// slots free as soon as a running job ends, so this is shorter than the
@@ -454,7 +457,9 @@ impl Error {
             Self::InternalFailure => "hosted_internal_failure",
             Self::StorageFull => "hosted_storage_full",
             Self::Connect => "hosted_connect_failed",
-            Self::Broker | Self::ReattachUnknown => "hosted_broker_unreachable",
+            Self::Broker | Self::BrokerTransport | Self::ReattachUnknown => {
+                "hosted_broker_unreachable"
+            }
             Self::NoTimeout => "hosted_no_timeout",
             Self::Short => "hosted_max_s_too_short",
             Self::Path => "hosted_path_outside_roots",
@@ -491,6 +496,7 @@ impl Error {
             | Self::StorageFull => RefusalReason::RunnerFull,
             Self::Connect
             | Self::Broker
+            | Self::BrokerTransport
             | Self::ReattachUnknown
             | Self::AccountTransient(_)
             | Self::ReplacePending(_)
@@ -932,6 +938,7 @@ impl WaitAnswers {
             answer @ (Error::NoCapacity(_)
             | Error::Connect
             | Error::Broker
+            | Error::BrokerTransport
             | Error::ReattachUnknown
             | Error::Provisioning(_)) => answer,
             _ => return,
@@ -1161,7 +1168,11 @@ impl Client {
                     timeout = error.is_timeout(),
                     "hosted broker request failed"
                 );
-                Error::Broker
+                if error.is_connect() || error.is_timeout() {
+                    Error::BrokerTransport
+                } else {
+                    Error::Broker
+                }
             })?;
         tracing::info!(
             path,
@@ -1205,7 +1216,7 @@ impl Client {
     ) -> Result<R, Error> {
         let reply = self.post_with_refresh(path, body, bearer).await?;
         if reply.status().as_u16() == 202 && path == "/v1/leases" {
-            let provisioning: ProvisioningReply = reply.json().await.map_err(|_| Error::Broker)?;
+            let provisioning: ProvisioningReply = reply.json().await.map_err(broker_body_error)?;
             return if provisioning.status == "provisioning" {
                 Err(Error::Provisioning(provisioning.retry_after_ms))
             } else {
@@ -1334,7 +1345,7 @@ impl Client {
         reply.json().await.map_err(|error| {
             *self.broker_failure.lock().unwrap() =
                 Some(format!("invalid broker response: {error}"));
-            Error::Broker
+            broker_body_error(error)
         })
     }
     pub(crate) async fn release(&self, id: Uuid) -> Result<(), Error> {
@@ -1484,9 +1495,6 @@ impl Client {
             warn_lease_body(id, &body, route, None, None, Some(field));
             return Err(Error::RequestInvalid(RequestField::new(field)));
         }
-        storage
-            .hosted_update(id, |state| state.lease_request = Some(body.clone()))
-            .map_err(|_| Error::Broker)?;
         // The refusal returned if the queue-wait deadline passes before the
         // broker answers the next lease request. By default a broker that
         // has not answered in time is treated as unreachable. After the
@@ -1501,6 +1509,9 @@ impl Client {
         // an unsent job is retired as never ran, not placed with a new key.
         let key = requester()?;
         body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
+        storage
+            .hosted_update(id, |state| state.lease_request = Some(body.clone()))
+            .map_err(|_| Error::Broker)?;
         let mut replacing = false;
         let mut previous_lease: Option<Lease> = None;
         'lease_requests: loop {
@@ -1889,7 +1900,8 @@ impl Client {
     /// When the deadline passes first, the request in flight is dropped and
     /// the last definite placement or transport answer is returned. Replacement
     /// fences preserve that answer; before any answer, `cut_off` describes the
-    /// caller's own wait.
+    /// caller's own wait. Connection failures and timeouts retry the same body
+    /// for at most one minute, bounded by the remaining queue wait.
     async fn post_ready_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1899,10 +1911,14 @@ impl Client {
         cut_off: Error,
     ) -> Result<R, Error> {
         let mut pending = cut_off;
+        let mut transport_deadline = None;
+        let mut transport_backoff = Duration::from_secs(1);
         loop {
             if self.cancel_pending() {
                 return Err(Error::Cancelled);
             }
+            let request_started = tokio::time::Instant::now();
+            let request_deadline = transport_deadline.unwrap_or(deadline).min(deadline);
             let request = self.post_authorized(path, body, bearer);
             tokio::pin!(request);
             // Disconnect is not rollback: the broker commits a reservation before
@@ -1913,7 +1929,7 @@ impl Client {
                 biased;
                 reply = &mut request => Some(reply),
                 _ = self.cancelled() => Some(request.await),
-                _ = tokio::time::sleep_until(deadline) => None,
+                _ = tokio::time::sleep_until(request_deadline) => None,
             };
             let reply = match reply {
                 Some(Err(Error::HostFull | Error::Capacity)) if cut_off == Error::BoatHostFull => {
@@ -1928,12 +1944,46 @@ impl Client {
                 return Err(Error::Cancelled);
             }
             match reply {
+                None if request_deadline < deadline => return Err(Error::BrokerTransport),
                 None => return Err(self.wait_expired(pending)),
+                Some(Err(Error::BrokerTransport)) => {
+                    // A lost reply may have booked the lease. Reuse the exact body,
+                    // including job_id and requester key, without spending another
+                    // host-placement attempt or extending the transport window.
+                    let retry_deadline = *transport_deadline
+                        .get_or_insert(request_started + BROKER_TRANSPORT_BUDGET);
+                    let retry_deadline = retry_deadline.min(deadline);
+                    pending = Error::BrokerTransport;
+                    self.progress
+                        .phase(motor_protocol::ProgressPhase::PlacementWait);
+                    let retry_at =
+                        (tokio::time::Instant::now() + transport_backoff).min(retry_deadline);
+                    #[cfg(test)]
+                    tracing::info!(path, "hosted broker transport retry wait");
+                    self.while_placing(tokio::time::sleep_until(retry_at))
+                        .await?;
+                    if tokio::time::Instant::now() >= retry_deadline {
+                        return Err(if retry_deadline == deadline {
+                            self.wait_expired(pending)
+                        } else {
+                            pending
+                        });
+                    }
+                    transport_backoff = (transport_backoff * 2).min(Duration::from_secs(8));
+                    bearer = self
+                        .while_placing(tokio::time::timeout_at(retry_deadline, self.bearer()))
+                        .await?
+                        .map_err(|_| Error::BrokerTransport)??;
+                }
                 Some(Err(
                     error @ (Error::Provisioning(_)
                     | Error::NoCapacity(_)
                     | Error::ReplacePending(_)),
                 )) => {
+                    // A definite broker answer ends the transport outage; capacity
+                    // and provisioning retain their independent queue-wait budget.
+                    transport_deadline = None;
+                    transport_backoff = Duration::from_secs(1);
                     let retry_after_ms = if let Error::ReplacePending(delay) = error {
                         delay.max(MIN_PROVISIONING_RETRY_MS)
                     } else {
@@ -2004,6 +2054,13 @@ impl Client {
         } else {
             tls::connect(id, lease, key, purpose).await
         }
+    }
+}
+fn broker_body_error(error: reqwest::Error) -> Error {
+    if error.is_timeout() {
+        Error::BrokerTransport
+    } else {
+        Error::Broker
     }
 }
 fn requester() -> Result<SigningKey, Error> {

@@ -264,6 +264,7 @@ fn hosted_billing_seconds_keep_three_decimals() {
 }
 
 mod account;
+mod broker_outage;
 pub(crate) mod capacity;
 pub(crate) mod harness;
 mod replacement;
