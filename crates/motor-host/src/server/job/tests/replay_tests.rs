@@ -1350,12 +1350,13 @@ async fn relayed_run_alone_sets_return_reservation_and_runner_hints_cannot_chang
 /// previous host process's last-alive time as the lease end, which can be hours
 /// old. Return chunks still streaming at that moment once lost their stored
 /// prefix to an expiry check, leaving a sequence gap no caller can accept.
-#[tokio::test]
-async fn backlog_terminal_event_with_an_old_lease_end_keeps_streaming_chunks_contiguous() {
+/// The backlog comes either from a lifecycle reconnect inside one long-running
+/// host process, or from the first lifecycle connection after a host restart.
+async fn backlog_terminal_mid_transfer(restart: bool) {
     use crate::billing::RECORD_RETENTION_MS;
     use motor_protocol::{ReturnManifestEntry, ReturnManifestOutcome};
-    let (runtime, fake, _) = fixture();
-    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+    let (runtime, fake, storage) = fixture();
+    let (client, task, mut guest) = launched(&runtime, &fake).await;
     let chunk = |seq: u64, data: &str| json!({"type":"return_chunk","seq":seq,"job_id":JOB,"path_index":0,"offset":0,"data":data});
     for value in [
         json!({"type":"started","seq":0,"job_id":JOB}),
@@ -1373,20 +1374,52 @@ async fn backlog_terminal_event_with_an_old_lease_end_keeps_streaming_chunks_con
     })
     .await
     .expect("the first chunks must be stored");
+    // The caller detaches; the host keeps storing the runner's stream.
+    drop(client);
+    task.await.unwrap().unwrap();
+    let stale = unix_ms() - 2 * RECORD_RETENTION_MS;
+    let (runtime, stream) = if restart {
+        stream.crash_for_test();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stream.running_for_test() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(guest);
+        guest = peer(&fake);
+        let restarted = reopen(&runtime, fake.clone(), storage);
+        restarted.recover().unwrap();
+        {
+            // The previous host process was last alive long before this start.
+            let mut host = restarted.host.lock().unwrap();
+            host.snapshot.last_alive = stale;
+            host.start_billing(unix_ms()).unwrap();
+        }
+        handshake(&mut guest).await;
+        assert_eq!(
+            read_frame(&mut guest).await.unwrap(),
+            json!({"type":"attach","job_id":JOB,"from_seq":3})
+        );
+        // The resumed guest replays from the last stored sequence.
+        write_frame(&mut guest, &chunk(3, "ZGVm")).await.unwrap();
+        let stream = restarted.job_stream(JOB).unwrap();
+        (restarted, stream)
+    } else {
+        // A long-running host keeps its predecessor's last-alive time.
+        runtime.host.lock().unwrap().prior_alive_ms = stale;
+        (runtime, stream)
+    };
     let now = unix_ms();
     {
         let mut host = runtime.host.lock().unwrap();
-        // The host process started long after its predecessor was last alive.
-        host.prior_alive_ms = now - 2 * RECORD_RETENTION_MS;
         let terminal: motor_protocol::TenantEvent = serde_json::from_value(
             json!({"type":"event","event_seq":1,"event":"terminal","jti":JOB}),
         )
         .unwrap();
         host.event_observed(JOB, &terminal, now, false).unwrap();
-        assert_eq!(
-            host.snapshot.leases[JOB].ended_at_ms,
-            Some(now - 2 * RECORD_RETENTION_MS)
-        );
+        assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(stale));
     }
     // The host tick and every attach run this check.
     stream.expire_chunks(now).unwrap();
@@ -1406,10 +1439,7 @@ async fn backlog_terminal_event_with_an_old_lease_end_keeps_streaming_chunks_con
     )
     .await
     .unwrap();
-    while next_record(&mut client).await.value["type"] != "terminal" {}
     assert_eq!(guest_frame(&mut guest).await["type"], "terminal_stored");
-    drop(client);
-    task.await.unwrap().unwrap();
     let frames: Vec<Value> = replayed(&runtime)
         .await
         .iter()
@@ -1426,24 +1456,7 @@ async fn backlog_terminal_event_with_an_old_lease_end_keeps_streaming_chunks_con
         manifest.files[0].outcome,
         ReturnManifestOutcome::Returned { size: 9, .. }
     ));
-    // Retention runs from when the host saw the job end, not from the
-    // backlog lower bound, even if the lease end had stayed that old.
-    let observed = runtime.host.lock().unwrap().snapshot.billing[JOB]
-        .ended_observed_ms
-        .unwrap();
-    runtime
-        .host
-        .lock()
-        .unwrap()
-        .snapshot
-        .leases
-        .get_mut(JOB)
-        .unwrap()
-        .ended_at_ms = Some(now - 2 * RECORD_RETENTION_MS);
-    stream
-        .expire_chunks(observed + RECORD_RETENTION_MS - 1)
-        .unwrap();
-    assert_eq!(
+    let stored_chunks = || {
         stream
             .with_store(|s| {
                 Ok((0..s.len())
@@ -1453,17 +1466,51 @@ async fn backlog_terminal_event_with_an_old_lease_end_keeps_streaming_chunks_con
                     })
                     .count())
             })
-            .unwrap(),
-        3
-    );
+            .unwrap()
+    };
+    // Retention runs from when the host saw the job end, not from the
+    // backlog lower bound, even if the lease end had stayed that old.
+    let (observed, started) = {
+        let mut host = runtime.host.lock().unwrap();
+        let lease = host.snapshot.leases.get_mut(JOB).unwrap();
+        lease.ended_at_ms = Some(stale);
+        let started = lease.started_at_ms.unwrap();
+        (
+            host.snapshot.billing[JOB].ended_observed_ms.unwrap(),
+            started,
+        )
+    };
+    stream
+        .expire_chunks(observed + RECORD_RETENTION_MS - 1)
+        .unwrap();
+    assert_eq!(stored_chunks(), 3);
+    // Without any observation of the end, the period still cannot start
+    // before the job itself started.
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let billing = host.snapshot.billing.get_mut(JOB).unwrap();
+        billing.ended_observed_ms = None;
+        billing.terminal_received_ms = None;
+    }
+    stream
+        .expire_chunks(started + RECORD_RETENTION_MS - 1)
+        .unwrap();
+    assert_eq!(stored_chunks(), 3);
     stream
         .expire_chunks(observed + RECORD_RETENTION_MS)
         .unwrap();
-    assert!(!replayed_at(&runtime, observed + RECORD_RETENTION_MS)
-        .await
-        .iter()
-        .any(|f| crate::replay::decode(f).unwrap()["type"] == "return_chunk"));
+    assert_eq!(stored_chunks(), 0);
     power_off(&runtime, &fake);
+}
+
+#[tokio::test]
+async fn backlog_terminal_on_lifecycle_reconnect_keeps_streaming_chunks_contiguous() {
+    backlog_terminal_mid_transfer(false).await;
+}
+
+#[tokio::test]
+async fn backlog_terminal_after_host_restart_keeps_streaming_chunks_contiguous() {
+    backlog_terminal_mid_transfer(true).await;
 }
 
 #[tokio::test]

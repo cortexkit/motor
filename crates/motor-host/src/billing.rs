@@ -26,15 +26,21 @@ pub const REPLAY_RETENTION_MS: u64 = (24 * 60 * 60 + 300) * 1000;
 /// The lease end alone is not the period's start. A lifecycle terminal that
 /// reaches the host as replayed backlog sets it to a lower bound: the last
 /// moment the previous host process was alive, which can be hours before the
-/// job really ended. The host's own observation times of that terminal bound
-/// it from above, so the period runs from the latest of them, as the record
-/// pruning in `prune_retention` does.
+/// job really ended, and even before it started. The host's own observation
+/// times of that terminal bound it from above, so the period runs from the
+/// latest of them, as the record pruning in `prune_retention` does, and never
+/// from before the job's start (a provider-managed host keeps no observation
+/// times).
 pub(crate) fn chunk_retention_over(snapshot: &Snapshot, job: &str, now_ms: u64) -> bool {
-    let Some(ended) = snapshot.leases.get(job).and_then(|lease| lease.ended_at_ms) else {
+    let Some(lease) = snapshot.leases.get(job) else {
+        return false;
+    };
+    let Some(ended) = lease.ended_at_ms else {
         return false;
     };
     let billing = snapshot.billing.get(job);
     let end = [
+        lease.started_at_ms,
         billing.and_then(|b| b.ended_observed_ms),
         billing.and_then(|b| b.terminal_received_ms),
     ]
