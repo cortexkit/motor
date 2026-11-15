@@ -243,7 +243,27 @@ pub(crate) fn check_untracked_content<'a>(
                     continue;
                 }
                 let relative = Path::new(std::ffi::OsStr::from_bytes(name));
-                let metadata = fs::symlink_metadata(path.join(relative))?;
+                let metadata = fs::symlink_metadata(path.join(relative)).map_err(|error| {
+                    let mut shown: String = relative
+                        .to_string_lossy()
+                        .chars()
+                        .flat_map(char::escape_default)
+                        .collect();
+                    if shown.len() > 160 {
+                        shown.truncate(160);
+                        shown.push_str("...");
+                    }
+                    // Git listed the file a moment ago, so a missing one was
+                    // removed or renamed while the snapshot was being taken.
+                    if error.kind() == io::ErrorKind::NotFound {
+                        io::Error::other(format!(
+                            "untracked {shown} disappeared while the snapshot was taken; \
+                             resubmit once nothing is changing the checkout"
+                        ))
+                    } else {
+                        io::Error::other(format!("untracked {shown}: {error}"))
+                    }
+                })?;
                 if !metadata.is_file() && !metadata.is_symlink() {
                     continue;
                 }
@@ -269,9 +289,9 @@ pub(crate) fn check_untracked_content<'a>(
         }
         Ok((total, largest))
     })()
-    .map_err(|_| Failure {
+    .map_err(|error| Failure {
         tree_hash: None,
-        check: "cannot inspect untracked snapshot files".into(),
+        check: format!("cannot inspect untracked snapshot files: {error}"),
     })?;
     let (total, largest) = inventory;
     if total > UNTRACKED_CONTENT_LIMIT {

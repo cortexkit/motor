@@ -201,6 +201,13 @@ disk, which the job VM formats and mounts as APFS at the fixed guest path
 the checkout's `target` is a link to it, so `target/...` paths reach the same
 volume.
 
+The variable applies to every Cargo build in the job, not only the checkout's.
+A job that builds several source trees (copies of the checkout at other
+commits, for example) must give each tree its own `--target-dir` or
+`CARGO_TARGET_DIR`: in one shared folder Cargo reuses one tree's build-script
+output for another, so a binary can report the wrong tree's commit. Linux jobs
+behave the same way with their `/run/motor/target`.
+
 **Why not mount it at `target/`.** An earlier version mounted the volume over
 the shared `target/` directory itself. In the guest, a path through a
 virtiofs directory stopped crossing a mount on it about 3.5 seconds after
