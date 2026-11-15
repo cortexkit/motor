@@ -43,8 +43,11 @@ impl Host {
         let HostSettings::PerJob(settings) = &self.settings else {
             return Ok(None);
         };
+        // A drain, bounded or full, is emptying the host for an update; a fill
+        // started now would hold it past its last job.
         if self.snapshot.per_job.dax_failed
             || self.snapshot.draining
+            || self.snapshot.accept_until_ms.is_some()
             || self.storage_refusing()
             || !self.snapshot.per_job.fills.is_empty()
             || self

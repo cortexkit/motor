@@ -182,6 +182,37 @@ fn lifecycle_comparison_heartbeats_do_not_log_their_placeholder_memory() {
 }
 
 #[test]
+fn no_fill_starts_while_the_host_drains() {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    let mut host = runtime.host.lock().unwrap();
+    host.record_host_resources(HostResources {
+        at_ms: now,
+        available_mem_mib: 100_000,
+        job_vm_headroom_mib: 80_000,
+        vcpu_ceiling: 4,
+        permit_budget: 100,
+    });
+    let key = "a".repeat(64);
+    host.snapshot.accept_until_ms = Some(now + 3_600_000);
+    assert!(host
+        .reserve_fill(&claims(JOB).sub, &key, 1000, now)
+        .unwrap()
+        .is_none());
+    host.snapshot.accept_until_ms = None;
+    host.snapshot.draining = true;
+    assert!(host
+        .reserve_fill(&claims(JOB).sub, &key, 1000, now)
+        .unwrap()
+        .is_none());
+    host.snapshot.draining = false;
+    assert!(host
+        .reserve_fill(&claims(JOB).sub, &key, 1000, now)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_waiters() {
     let (runtime, _, _) = fixture();
     let now = unix_ms();
