@@ -20,6 +20,10 @@ pub(crate) mod dependencies;
 mod fetch_tests;
 #[cfg(unix)]
 mod guest_scan;
+#[cfg(unix)]
+mod scan_path;
+#[cfg(unix)]
+use scan_path::matches_snapshot;
 mod reset;
 mod transfer;
 pub(crate) use dependencies::validate_dependencies;
@@ -372,6 +376,7 @@ fn change_path(name: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(name).into_owned())
 }
 
+#[cfg(not(unix))]
 fn matches_snapshot(scan: &ChangeScan<'_>, name: &Path, entry: &SnapshotEntry) -> io::Result<bool> {
     let path = scan.path;
     let full = path.join(name);

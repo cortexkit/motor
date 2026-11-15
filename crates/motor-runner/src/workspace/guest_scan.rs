@@ -95,15 +95,14 @@ pub(super) fn changes(
             .splitn(2, |byte| *byte == b'\t')
             .nth(1)
             .ok_or_else(|| invalid("missing submodule index path"))?;
-        let metadata = worktree.join(change_path(name)).join(".git");
-        match fs::symlink_metadata(metadata) {
-            Ok(_) => {
+        let metadata = change_path(name).join(".git");
+        match scan_path::lookup(worktree, &metadata)? {
+            scan_path::Lookup::Entry(_) | scan_path::Lookup::Blocked => {
                 return Err(invalid(
                     "change scan cannot inspect guest submodule metadata",
                 ))
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            scan_path::Lookup::Missing => {}
         }
     }
 
