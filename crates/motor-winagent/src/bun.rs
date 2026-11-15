@@ -213,12 +213,10 @@ impl Refusal {
             .split('/')
             .next()
             .and_then(|scope| registries.get(scope))
+            && let Ok(url) = url::Url::parse(registry)
+            && url.scheme() == "https"
         {
-            if let Ok(url) = url::Url::parse(registry) {
-                if url.scheme() == "https" {
-                    self.registry_origin = url.origin().ascii_serialization().into();
-                }
-            }
+            self.registry_origin = url.origin().ascii_serialization().into();
         }
         self
     }
@@ -586,14 +584,13 @@ pub fn read_lock(project: &str, text: &str) -> Result<Vec<LockedPackage>, Refusa
         }
         let metadata = row.get(2).filter(|v| v.is_object()).ok_or_else(invalid)?;
         for field in ["os", "cpu", "libc"] {
-            if let Some(value) = metadata.get(field) {
-                if !value.is_string()
-                    && !value
-                        .as_array()
-                        .is_some_and(|a| a.iter().all(Value::is_string))
-                {
-                    return Err(invalid());
-                }
+            if let Some(value) = metadata.get(field)
+                && !value.is_string()
+                && !value
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(Value::is_string))
+            {
+                return Err(invalid());
             }
         }
         let sri = row
@@ -1600,10 +1597,10 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         installed: &mut Vec<(Value, std::path::PathBuf)>,
     ) -> Result<(), Containment> {
         root.inside(path)?;
-        if let Ok(bytes) = read_bounded(&path.join("package.json"), MAX_LOCK_BYTES as u64) {
-            if let Ok(value) = serde_json::from_slice(&bytes) {
-                installed.push((value, path.into()));
-            }
+        if let Ok(bytes) = read_bounded(&path.join("package.json"), MAX_LOCK_BYTES as u64)
+            && let Ok(value) = serde_json::from_slice(&bytes)
+        {
+            installed.push((value, path.into()));
         }
         walk_modules(&path.join("node_modules"), root, seen, installed)
     }

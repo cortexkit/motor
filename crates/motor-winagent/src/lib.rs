@@ -926,10 +926,10 @@ fn job_git_rewrite_url_allowed(url: &str) -> bool {
     if authority.is_empty() {
         return false;
     }
-    if let Some((userinfo, host)) = authority.rsplit_once('@') {
-        if userinfo.is_empty() || host.is_empty() || userinfo.contains(':') {
-            return false;
-        }
+    if let Some((userinfo, host)) = authority.rsplit_once('@')
+        && (userinfo.is_empty() || host.is_empty() || userinfo.contains(':'))
+    {
+        return false;
     }
     true
 }

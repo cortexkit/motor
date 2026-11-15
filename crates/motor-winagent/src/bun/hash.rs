@@ -37,9 +37,9 @@ fn mix(bytes: &[u8], seed: u64, offset: usize) -> u64 {
     )
 }
 pub(super) fn wyhash11(bytes: &[u8]) -> u64 {
-    let mut chunks = bytes.chunks_exact(32);
+    let (chunks, tail) = bytes.as_chunks::<32>();
     let mut seed = 0;
-    for b in &mut chunks {
+    for b in chunks {
         seed = mum(
             little(&b[..8]) ^ seed ^ P[0],
             little(&b[8..16]) ^ seed ^ P[1],
@@ -48,7 +48,6 @@ pub(super) fn wyhash11(bytes: &[u8]) -> u64 {
             little(&b[24..]) ^ seed ^ P[3],
         );
     }
-    let tail = chunks.remainder();
     seed = match tail.len() {
         0 => seed,
         1..=16 => mix(tail, seed, 0),

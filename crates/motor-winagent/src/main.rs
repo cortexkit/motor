@@ -1852,7 +1852,7 @@ mod guest {
                     if !plan.matches(&identity, count) {
                         return Err(invalid("source seal plan mismatch"));
                     }
-                    let started = Instant::now();
+                    let _started = Instant::now();
                     {
                         let _identity = user.impersonate()?;
                         motor_winagent::source_seal::refresh(
@@ -1871,7 +1871,7 @@ mod guest {
                     diagnostic!(
                         "source sealed count={} elapsed_ms={}",
                         count,
-                        started.elapsed().as_millis()
+                        _started.elapsed().as_millis()
                     );
                     send(protocol, port, &Frame::SourceSealed { identity, count })?;
                     break;

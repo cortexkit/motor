@@ -182,6 +182,20 @@ if os.environ.get('EXECUTE_REMOTE'):
         self.assertFalse((checkout / "new source").exists())
         self.assertEqual((checkout / "target/warm-cache").read_text(), "keep")
 
+    def test_windows_clippy_checks_runner_and_both_agent_targets(self):
+        result = self.run_gate("--lane", "windows-clippy", EXECUTE_REMOTE="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        clippy = [command for command in self.commands("cargo") if command[1] == "clippy"]
+        self.assertEqual(clippy, [
+            ["cargo", "clippy", "-p", "motor-runner", "--target", "x86_64-pc-windows-gnu",
+             "--lib", "--bins", "--locked", "--", "-D", "warnings"],
+            ["cargo", "clippy", "--manifest-path", "crates/motor-winagent/Cargo.toml",
+             "--locked", "--all-targets", "--", "-D", "warnings"],
+            ["cargo", "clippy", "--manifest-path", "crates/motor-winagent/Cargo.toml",
+             "--locked", "--target", "x86_64-pc-windows-gnu", "--all-targets",
+             "--", "-D", "warnings"],
+        ])
+
     def test_serial_job_continues_after_a_failed_lane(self):
         result = self.run_gate("--serial", "--lane", "linux-lint", "--lane", "windows-clippy",
                                EXECUTE_REMOTE="1", FAIL_CARGO="check --workspace")
