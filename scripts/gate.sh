@@ -168,7 +168,9 @@ command_for() {
       CARGO_NET_OFFLINE=false python3 scripts/mixed-version.py' ;;
     windows-clippy) printf '%s\n' '
       rustup target add x86_64-pc-windows-gnu
-      cargo clippy -p motor-runner --target x86_64-pc-windows-gnu --lib --bins --locked -- -D warnings' ;;
+      cargo clippy -p motor-runner --target x86_64-pc-windows-gnu --lib --bins --locked -- -D warnings
+      cargo clippy --manifest-path crates/motor-winagent/Cargo.toml --locked --all-targets -- -D warnings
+      cargo clippy --manifest-path crates/motor-winagent/Cargo.toml --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings' ;;
     musl) printf '%s\n' '
       command -v musl-gcc >/dev/null || { echo "musl-gcc is required; install musl-tools" >&2; exit 1; }
       rustup target add x86_64-unknown-linux-musl
