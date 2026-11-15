@@ -405,6 +405,22 @@ contiguous; `terminal` comes only after every earlier record. Tests:
 instead of replay silently skipping them. Test:
 `legacy_replay_projects_cursors_and_real_truncation_but_not_terminal`.
 
+7.3a. Returned-file chunks are kept for one hour after the job ends, then
+dropped. After that, a replay sends the last `output`, then the
+`return_manifest` with no `return_chunk` records in between, and every file that
+had been returned now reads `failed` with cause `expired`. This is the one gap
+that replay leaves on purpose. Its size equals the sum of the per-file `chunks`
+counts in that manifest. A reader that checks sequence numbers must accept a
+gap before a manifest only when it matches that sum exactly, and must refuse
+any other gap. The shared types' `ReturnAssembler::finish_expired_replay`
+applies this rule. Chunks never expire before the replay holds its terminal, so
+no gap can open while chunks are still arriving. Tests:
+`return_chunked_replay_after_one_hour_skips_chunks_and_leaves_a_seq_gap`,
+`cli_return_expired_replay_checks_counts_against_gap_with_or_without_output`,
+`chunks_expire_only_after_the_terminal_so_replay_stays_contiguous`,
+`backlog_terminal_on_lifecycle_reconnect_keeps_streaming_chunks_contiguous`,
+`backlog_terminal_after_host_restart_keeps_streaming_chunks_contiguous`.
+
 7.4. Once `ck-motor` has attempted to send `run`, it never resubmits it and
 never invents a before-start outcome. If the acknowledgement is lost, it
 attaches to the same job ID to learn what happened. Tests:
