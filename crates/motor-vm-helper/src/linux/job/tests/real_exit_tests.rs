@@ -144,8 +144,14 @@ fn isolated_job_exit_is_reported_while_another_job_boots() {
     let config: Config =
         serde_json::from_str(include_str!("../../../../fixtures/helper.json")).unwrap();
     let mut jobs = machine_with_config(&base, &config);
-    // The production jail parent is created once at helper startup.
-    std::fs::create_dir_all(&jobs.jail).unwrap();
+    // Production makes these before boot reaches them: the start path's
+    // trusted_directory creates the records and jail directories, and the
+    // workspace root exists before any disk is created in it. The fixture's
+    // boot calls launch_record and create_workspace directly, so it must too.
+    for path in [&jobs.jail, &jobs.records_path, &jobs.workspaces] {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     jobs.groups = Path::new("/sys/fs/cgroup").join(&slice);
     jobs.remove_test_group = None;
     jobs.network = Box::new(fixture::PrivateNetwork {
