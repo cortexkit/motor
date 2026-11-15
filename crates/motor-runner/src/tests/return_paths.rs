@@ -1,6 +1,78 @@
 use super::*;
 
 #[tokio::test]
+async fn return_paths_collects_file_after_cancel() {
+    assert_returns_after_kill(Killed::Cancel, false).await;
+}
+
+#[tokio::test]
+async fn return_paths_collects_file_after_timeout() {
+    assert_returns_after_kill(Killed::Deadline, false).await;
+}
+
+#[tokio::test]
+async fn return_chunked_collects_file_after_cancel() {
+    assert_returns_after_kill(Killed::Cancel, true).await;
+}
+
+#[tokio::test]
+async fn return_chunked_collects_file_after_timeout() {
+    assert_returns_after_kill(Killed::Deadline, true).await;
+}
+
+async fn assert_returns_after_kill(killed: Killed, chunked: bool) {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (mut request, bytes) = f.run("printf x > out.txt; exec sleep 600");
+    request.return_paths = vec![format!("{}/out.txt", f.key)];
+    request.return_max_bytes = 1;
+    request.return_chunked = chunked;
+    if killed == Killed::Deadline {
+        request.timeout = Some(1);
+    }
+    f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
+    // Wait for the completed write, not just dispatch, before stopping the job.
+    until(|| fs::read(Path::new(&f.key).join("out.txt")).is_ok_and(|bytes| bytes == b"x")).await;
+    if killed == Killed::Cancel {
+        runner.cancel(request.job_id).unwrap();
+    } else {
+        f.clock.fetch_add(1000, Ordering::SeqCst);
+        runner.tick().unwrap();
+    }
+    let t = terminal(&runner, request.job_id).await;
+    assert_eq!(t.killed, Some(killed));
+    assert!(matches!(t.outcome, Outcome::Signal { .. }));
+    assert_eq!(t.ran, Some(Ran::Remote));
+    let frames = runner.replay(request.job_id, 0).unwrap();
+    assert_eq!(frames.last(), Some(&Frame::Terminal(t.clone())));
+    if chunked {
+        let (files, manifest, seqs) = assemble(&frames, &request);
+        assert_eq!(files, vec![Some(b"x".to_vec())]);
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].path(), request.return_paths[0]);
+        assert_eq!(seqs.len(), 1);
+        assert!(matches!(
+            &frames[frames.len() - 2],
+            Frame::ReturnManifest(_)
+        ));
+        assert_eq!(t.last_seq(), Some(manifest.seq));
+    } else {
+        let Frame::ReturnResult(result) = &frames[frames.len() - 2] else {
+            panic!("missing return result before terminal: {frames:?}")
+        };
+        assert_eq!(result.return_paths_failed, None);
+        let files = result.returned_files.as_ref().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, request.return_paths[0]);
+        assert_eq!(files[0].data, "eA==");
+        assert_eq!(t.last_seq(), Some(result.seq));
+    }
+}
+
+#[tokio::test]
 async fn return_paths_result_is_sequenced_before_real_terminal_and_durable_on_attach() {
     let f = Fixture::new();
     let config = f.config();
