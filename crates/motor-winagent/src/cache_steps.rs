@@ -259,19 +259,25 @@ mod tests {
         assert_eq!(HYPERV_DISK_INVENTORY_TIMEOUT, Duration::from_secs(5));
     }
 
+    /// `fail`: the layout step fails after 40 ms, well inside its native
+    /// limit, so heartbeats arrive first. Otherwise it outlasts the limit by
+    /// waiting until the watcher has given up, not for a fixed time, which a
+    /// loaded machine could let finish before the watcher ran.
     fn exercise(fail: bool) -> (Result<(), CacheFailure>, usize, usize) {
         let (events_tx, events_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             let reporter = CacheReporter::new(events_tx);
             let value = reporter
                 .step(CacheStep::DiskSerial, || Ok(()))
                 .and_then(|()| {
                     reporter.step(CacheStep::DiskLayout, || {
-                        std::thread::sleep(Duration::from_millis(40));
                         if fail {
+                            std::thread::sleep(Duration::from_millis(40));
                             Err(io::Error::other("layout query failed"))
                         } else {
+                            let _ = release_rx.recv_timeout(Duration::from_secs(10));
                             Ok(())
                         }
                     })
@@ -289,11 +295,12 @@ mod tests {
             },
             || cancelled += 1,
             CacheLimits {
-                native: Duration::from_millis(if fail { 100 } else { 10 }),
-                total: Duration::from_secs(1),
+                native: Duration::from_millis(if fail { 5_000 } else { 10 }),
+                total: Duration::from_secs(10),
                 heartbeat: Duration::from_millis(2),
             },
         );
+        let _ = release_tx.send(());
         worker.join().unwrap();
         (result, progress_count, cancelled)
     }
@@ -321,11 +328,16 @@ mod tests {
         let probe = mutated.clone();
         let (events_tx, events_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
+        // The first step outlasts the native limit by waiting until the
+        // watcher has given up, not for a fixed time: on a loaded machine a
+        // fixed sleep could end before the watcher ran, and the next step
+        // would then mutate legitimately.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             let reporter = CacheReporter::new(events_tx);
             let value = reporter
                 .step(CacheStep::DiskLayout, || {
-                    std::thread::sleep(Duration::from_millis(40));
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
                     Ok(())
                 })
                 .and_then(|()| {
@@ -348,6 +360,7 @@ mod tests {
             },
         );
         assert!(result.is_err());
+        release_tx.send(()).unwrap();
         worker.join().unwrap();
         assert!(!mutated.load(Ordering::SeqCst));
     }
@@ -356,10 +369,13 @@ mod tests {
     fn cache_total_timeout_is_independent_of_heartbeats() {
         let (events_tx, events_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
+        // Released only after the watcher gives up, so the step cannot finish
+        // first on a loaded machine (see the test above).
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             let reporter = CacheReporter::new(events_tx);
             let value = reporter.step(CacheStep::InitializeRaw, || {
-                std::thread::sleep(Duration::from_millis(40));
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
                 Ok(())
             });
             let _ = result_tx.send(value);
@@ -375,11 +391,12 @@ mod tests {
             || {},
             CacheLimits {
                 native: Duration::from_secs(1),
-                total: Duration::from_millis(10),
+                total: Duration::from_millis(100),
                 heartbeat: Duration::from_millis(2),
             },
         )
         .unwrap_err();
+        release_tx.send(()).unwrap();
         worker.join().unwrap();
         assert!(progress > 1);
         assert_eq!(failure.step, CacheStep::InitializeRaw);
