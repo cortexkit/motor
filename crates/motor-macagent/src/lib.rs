@@ -254,13 +254,19 @@ mod execution {
     }
 
     impl KillScope {
-        /// Fails if any job process is alive. Called after the build volume
-        /// is unmounted and again after the returned files are placed: a
-        /// process that appeared after the kill sweep, such as one a system
-        /// scheduler started for the job account, may have written them.
+        /// Sweeps the job account again and fails if any of its processes
+        /// survives. Called after the build volume is unmounted and again
+        /// after the returned files are placed. Processes do appear for the
+        /// job account after the first sweep: launchd starts the per-user
+        /// distnoted on demand around the unmount, and a system scheduler may
+        /// start work the job registered. Each sweep kills them; only one that
+        /// outlives the sweep fails the release. A process killed here may
+        /// already have changed the returned copies, but only the way the job
+        /// itself could have: the build volume is unmounted by then, and the
+        /// copies are the job's own output.
         fn require_none(&self) -> io::Result<()> {
             match self {
-                Self::User(user) => match uid_processes(user.uid)? {
+                Self::User(user) => match self.kill().and_then(|()| uid_processes(user.uid))? {
                     0 => Ok(()),
                     count => Err(io::Error::other(format!(
                         "{count} motorjob processes were running after the job ended: {}",
