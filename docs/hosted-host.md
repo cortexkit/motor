@@ -410,9 +410,9 @@ until a fresh runner sample arrives, preserving the paused capacity-queue budget
 used during workspace-disk ownership waits and VM setup. After command start,
 the host can send a bare keepalive.
 
-For an internal failure before Run delivery, after boot starts the connection
-handler's `failed()` path answers the live caller with `lease_refused`; before
-boot, the stored terminal does. A later reattach still receives the unchanged
+For an internal failure before Run delivery, once boot has started the
+connection handler answers the live caller with `lease_refused`; before boot,
+the stored terminal answers it. A later reattach still receives the unchanged
 durable terminal.
 
 ### Switch a drained host between modes
