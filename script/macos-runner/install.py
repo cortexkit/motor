@@ -40,6 +40,8 @@ END = "# END motor macos runner"
 FLOOR = 20 * 1024 ** 3
 ENTITLEMENT = "com.apple.security.virtualization"
 SSH_ACCESS_GROUP = "com.apple.access_ssh"
+HOLD_DIRECTORY = Path("/Users/Shared/motor-macos-hold")
+GRANT_DIRECTORY = Path("/Users/Shared/motor-macos-grant")
 
 
 def run(*args):
@@ -541,10 +543,19 @@ def tool_errors(tools, manifest):
     return errors
 
 
-def vm_configuration(image, helper, tools, manifest):
+def hold_window_setting(value):
+    if value is not None and (not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]-(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
+                              or value[:5] == value[6:]):
+        raise ValueError("hold_window must be UTC HH:MM-HH:MM with distinct endpoints")
+    return value
+
+
+def vm_configuration(image, helper, tools, manifest, hold_window=None):
     version = manifest["rust_toolchains"][manifest["rust_default"]]["rustc"]
     lines = ["image = " + json.dumps(str(image)), "helper = " + json.dumps(str(helper)),
              "toolchain_version = " + json.dumps(version)]
+    if hold_window_setting(hold_window) is not None:
+        lines.append("hold_window = " + json.dumps(hold_window))
     for name, spec in manifest["prep_tools"].items():
         lines += ["", "[tools." + name + "]", "path = " + json.dumps(str(tools / spec["path"])),
                   "sha256 = " + json.dumps(spec["sha256"])]
@@ -659,7 +670,8 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
         errors.append("LaunchAgent differs from installed configuration")
     if LEGACY_PLIST.exists():
         errors.append("legacy LaunchDaemon plist must be removed; rerun install")
-    if (config / "vm.toml").read_text() != vm_configuration(image, helper, state_root / "tools", manifest):
+    if (config / "vm.toml").read_text() != vm_configuration(image, helper, state_root / "tools", manifest,
+                                                        installed.get("hold_window")):
         errors.append("VM configuration differs from installed pins")
     if connect_link().is_symlink() is False or os.readlink(connect_link()) != str(config / "motor-runner"):
         errors.append("ck-motor's connect path " + str(connect_link()) + " must link to the installed runner; rerun install")
@@ -702,10 +714,25 @@ def create_account():
     return account
 
 
+def configure_hold_directories(runner_account):
+    writer = pwd.getpwnam("ghrunner")
+    for directory, account in ((HOLD_DIRECTORY, writer), (GRANT_DIRECTORY, runner_account)):
+        directory.mkdir(mode=0o755, exist_ok=True)
+        # Pin the directory before changing ownership; never follow a substituted symlink.
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchown(descriptor, account.pw_uid, account.pw_gid)
+            os.fchmod(descriptor, 0o755)
+        finally:
+            os.close(descriptor)
+
+
 def install(args, manifest):
     pinlock.require_ready(manifest)
     require_filevault_off()
     previous = installation_record()
+    args.hold_window = hold_window_setting(getattr(args, "hold_window", None) or
+                                          (previous.get("hold_window") if previous is not None else "03:00-05:00"))
     args.data_volume = data_volume_setting(args.data_volume, previous)
     args.operator_account = operator_setting(args.operator_account, previous)
     args.signing_team = signing_team_setting(args.signing_team, previous)
@@ -731,6 +758,7 @@ def install(args, manifest):
     if len(runner_key.splitlines()) != 1 or len(runner_key.split()) != 2 or not runner_key.startswith("ssh-ed25519 "):
         raise ValueError("runner key must be one bare OpenSSH ed25519 public key line")
     account = create_account()
+    configure_hold_directories(account)
     CONFIG.mkdir(parents=True, exist_ok=True)
     CONFIG.chmod(0o755)
     if args.data_volume:
@@ -770,7 +798,7 @@ def install(args, manifest):
         os.chown(path, 0, 0)
         path.chmod(0o555 if path.is_dir() or os.access(path, os.X_OK) else 0o444)
     shutil.copyfile(args.manifest, CONFIG / "toolchain.json")
-    (CONFIG / "vm.toml").write_text(vm_configuration(args.image, CONFIG / "motor-macvm", tools, manifest))
+    (CONFIG / "vm.toml").write_text(vm_configuration(args.image, CONFIG / "motor-macvm", tools, manifest, args.hold_window))
     SSH_ROOT.mkdir(mode=0o755, exist_ok=True)
     keys = SSH_ROOT / "authorized_keys"
     keys.write_text(runner_key.strip() + "\n")
@@ -788,6 +816,7 @@ def install(args, manifest):
                  "authorized_keys_sha256": parity.digest(SSH_ROOT / "authorized_keys"),
                  "operator_account": args.operator_account, "data_volume": args.data_volume,
                  "automount_managed": bool(args.data_volume)}
+    installed["hold_window"] = args.hold_window
     if args.signing_team:
         installed["signing_team"] = args.signing_team
     for directory in (HOME / "Library", PLIST.parent, HOME / ".cargo", connect_link().parent):
@@ -832,6 +861,7 @@ def main():
     parser.add_argument("--signing-team", metavar="TEAM_ID",
                         help="require the runner and helper to be signed by this team and keep that signature (recorded for updates)")
     parser.add_argument("--instance", default="macos")
+    parser.add_argument("--hold-window", help="UTC HH:MM-HH:MM; first install defaults to 03:00-05:00, updates preserve the installed window")
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--vm-helper", type=Path)
     parser.add_argument("--metrics-endpoint", help="HTTPS origin; requires --metrics-host-id (install preserves existing settings; first install defaults off)")

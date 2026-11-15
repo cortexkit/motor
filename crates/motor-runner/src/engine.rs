@@ -183,6 +183,8 @@ pub struct Config {
     pub(crate) macos: Option<Arc<crate::macos::VmConfig>>,
     #[cfg(unix)]
     pub(crate) macos_runtime: Arc<crate::macos::Runtime>,
+    #[cfg(all(unix, test))]
+    pub(crate) macos_hold_paths: Option<(PathBuf, PathBuf)>,
     /// Host CPUs used by the Windows job VM, in CPU-list syntax. Linux placements
     /// also avoid their SMT siblings while the shared slot lock is held.
     pub windows_cpus: Option<String>,
@@ -636,6 +638,8 @@ impl Config {
             macos: None,
             #[cfg(unix)]
             macos_runtime: Arc::default(),
+            #[cfg(all(unix, test))]
+            macos_hold_paths: None,
             windows_cpus: None,
             windows_slot_lock: None,
             linux_cpus: None,
@@ -1824,6 +1828,8 @@ struct Core {
     #[cfg(test)]
     tenant_fills_off_logs: std::sync::atomic::AtomicUsize,
     draining: std::sync::atomic::AtomicBool,
+    #[cfg(unix)]
+    macos_hold: Mutex<crate::macos::hold::State>,
     service_stop: tokio::sync::watch::Sender<bool>,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
     /// prevent the server from observing its shutdown deadline.
@@ -3056,6 +3062,18 @@ impl Runner {
             config.backend == BackendKind::MacosVm && crate::macos::drain::load(&config.state_root);
         #[cfg(not(unix))]
         let persisted_drain = false;
+        #[cfg(unix)]
+        let macos_hold =
+            crate::macos::hold::State::new(config.macos.as_ref().and_then(|vm| vm.hold_window), {
+                #[cfg(test)]
+                {
+                    config.macos_hold_paths.clone()
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            });
         let runner = Self {
             core: Arc::new(Core {
                 reserve_restore: Mutex::new(()),
@@ -3066,6 +3084,8 @@ impl Runner {
                 #[cfg(test)]
                 tenant_fills_off_logs: std::sync::atomic::AtomicUsize::new(0),
                 draining: std::sync::atomic::AtomicBool::new(persisted_drain),
+                #[cfg(unix)]
+                macos_hold: Mutex::new(macos_hold),
                 service_stop: tokio::sync::watch::channel(false).0,
                 drain_control: Mutex::new(None),
                 background_deletes: config.background_deletes.clone(),
@@ -3179,6 +3199,11 @@ impl Runner {
         };
         #[cfg(test)]
         tests::register_runner(&runner);
+        #[cfg(unix)]
+        {
+            let hold = runner.observe_macos_hold();
+            runner.refresh_macos_hold(&runner.core.inner.lock().unwrap(), hold);
+        }
         if !publishing_switch {
             let snapshot = {
                 let mut inner = runner.core.inner.lock().unwrap();
@@ -3552,6 +3577,47 @@ impl Runner {
     }
     fn admission_closed(&self, inner: &Inner) -> bool {
         inner.drain_deadline.is_some() || *self.core.service_stop.borrow()
+    }
+    #[cfg(unix)]
+    fn observe_macos_hold(&self) -> Option<crate::macos::hold::Snapshot> {
+        self.core
+            .config
+            .macos_instance()
+            .then(|| self.core.macos_hold.lock().unwrap().observe(self.now()))
+    }
+    #[cfg(unix)]
+    fn refresh_macos_hold(&self, inner: &Inner, snapshot: Option<crate::macos::hold::Snapshot>) {
+        if let Some(snapshot) = snapshot {
+            let idle = inner.jobs.values().all(|job| job.terminal.is_some())
+                && inner.starting.is_empty()
+                && inner.reserved.is_empty()
+                && inner.preparing.is_empty()
+                && inner.admitting.is_empty()
+                && inner.admission_saves.is_empty()
+                && inner.terminal_saves.is_empty()
+                && inner.base_finishes.is_empty()
+                && inner.base_settling.is_empty()
+                && inner.finalizing.is_empty()
+                && !self.core.config.macos_runtime.degraded()
+                && self.core.quarantined.is_empty();
+            self.core
+                .macos_hold
+                .lock()
+                .unwrap()
+                .apply(self.now(), idle, snapshot);
+        }
+    }
+    fn macos_hold_status(&self) -> Option<String> {
+        #[cfg(unix)]
+        let _ = self.observe_macos_hold();
+        self.macos_hold_status_cached()
+    }
+    fn macos_hold_status_cached(&self) -> Option<String> {
+        #[cfg(unix)]
+        if self.core.config.macos_instance() {
+            return self.core.macos_hold.lock().unwrap().status(self.now());
+        }
+        None
     }
     pub(crate) fn service_stop_blockers(&self) -> Vec<String> {
         let Ok(inner) = self.core.inner.try_lock() else {
@@ -4761,6 +4827,8 @@ impl Runner {
         // Admission reads only the recorded ceiling: the slice changes when an
         // operator re-renders it, and the maintenance pass re-reads it there,
         // so neither this hot path nor the state lock spawns systemctl.
+        #[cfg(unix)]
+        let _ = self.observe_macos_hold();
         let (_admission, initial_refusal) = {
             let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
@@ -4814,6 +4882,8 @@ impl Runner {
         // ID also waits here, and then finds the job.
         let log = self.job_log(request.job_id);
         let _write = log.lock_write();
+        #[cfg(unix)]
+        let _ = self.observe_macos_hold();
         let mut inner = self.core.inner.lock().unwrap();
         if inner.jobs.contains_key(&request.job_id)
             || inner.pending_replays.contains(&request.job_id)
@@ -5156,6 +5226,8 @@ impl Runner {
             Some(refusal)
         } else if let Some(refusal) = self.slice_memory_refusal() {
             Some(refusal)
+        } else if let Some(detail) = self.macos_hold_status_cached() {
+            Some((RefusalReason::RunnerDraining, detail))
         } else if self.admission_closed(inner) {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))
         } else if (!self.core.config.windows_instance()
@@ -8710,8 +8782,12 @@ impl Runner {
     fn tick(&self) -> io::Result<()> {
         self.expire_memory_accounting();
         self.enforce_kills(std::time::Instant::now())?;
+        #[cfg(unix)]
+        let hold = self.observe_macos_hold();
         let mut inner = self.core.inner.lock().unwrap();
         self.retry_start_refusals(&mut inner);
+        #[cfg(unix)]
+        self.refresh_macos_hold(&inner, hold);
         for id in inner.base_finishes.keys().copied().collect::<Vec<_>>() {
             self.start_base_finish(&mut inner, id)?;
         }

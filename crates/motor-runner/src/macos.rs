@@ -21,6 +21,7 @@ use std::{
 pub(crate) mod drain;
 mod execution;
 mod fs;
+pub(crate) mod hold;
 mod lifecycle;
 mod preflight;
 mod process;

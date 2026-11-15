@@ -27,6 +27,8 @@ pub(crate) struct VmConfig {
     pub helper: PathBuf,
     pub tools: Tools,
     pub toolchain_version: String,
+    #[serde(default)]
+    pub hold_window: Option<super::hold::Window>,
 }
 impl VmConfig {
     pub fn load(path: &Path) -> io::Result<Self> {

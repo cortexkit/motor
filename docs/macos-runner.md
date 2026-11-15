@@ -1,5 +1,42 @@
 # macOS runner
 
+## Exclusive holds
+
+Set the optional `hold_window` in the VM TOML configuration to a UTC
+`HH:MM-HH:MM` window; cross-midnight windows are supported, but equal endpoints
+are rejected. Without a window, holds are ignored. The installer accepts
+`--hold-window`, defaults new installs to `03:00-05:00`, and preserves the
+installed setting on updates.
+
+Write `/Users/Shared/motor-macos-hold/hold.json` with exactly two fields:
+`{"owner":"nightly-check","expires_at":"2026-01-01T04:00:00Z"}`. The owner
+must contain 1–64 lowercase letters, digits or hyphens, and the expiry must be
+RFC 3339 UTC (`Z` or `+00:00`). Holds are honoured only inside the configured
+window, with a future expiry no later than that window occurrence's end.
+Symlinks, non-regular files, files larger than 4 KiB and malformed holds are
+ignored, with invalid content logged once.
+
+While a hold is honoured, new runs receive `RunnerDraining` (callers wait within
+their queue-wait budget); already accepted work finishes normally. Once no job
+is running or queued, the runner atomically publishes the same two fields to
+`/Users/Shared/motor-macos-grant/granted.json`. It removes the grant when the
+hold disappears, expires or ceases to be honoured. The installer creates the
+hold directory owned by `ghrunner` and the grant directory owned by `motor`,
+both mode 0755: each account writes only its own directory and reads the other.
+Operator drain/resume remains independent. Health's `admission_blocked` text
+reports `held for <owner> until <time> (granted: true/false)` unless a
+qualification requirement or operator drain takes precedence.
+
+Portable coverage: `macos::hold::tests` covers window boundaries, midnight,
+malformed files and grant removal. `tests::platform_refusal::macos_hold` includes
+`honoured_hold_refuses_new_run_while_running_job_finishes`,
+`queued_job_accepted_before_hold_runs_before_grant`,
+`deleting_hold_reopens_admission_but_never_clears_operator_drain` and
+`restart_rereads_hold_and_removes_stale_grant_when_hold_ends`.
+The installer's `test_hold_directories_have_separate_writers_and_public_read_modes`
+and `test_hold_window_is_optional_validated_and_passed_to_vm_config` cover the
+folder permissions and setting pass-through.
+
 The macOS host-preparation API stages snapshots and resolves dependencies before
 a job can be admitted to a VM. A preparation refusal is a refusal before start:
 the job command has not run.

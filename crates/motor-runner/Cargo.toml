@@ -46,6 +46,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
 motor-macvm = { path = "../motor-macvm" }
+time = { version = "=0.3.55", features = ["parsing"] }
 
 [target.'cfg(windows)'.dependencies]
 # Schannel uses Windows' TLS implementation without a C compiler. Enabling

@@ -12,6 +12,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -606,7 +607,9 @@ class InstallerTests(unittest.TestCase):
                         patch.object(install, "entitlement", return_value=True),
                         patch.object(install, "tool_errors", return_value=[]),
                         patch.object(install.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100, 50, install.FLOOR)),
-                        patch.object(install.pwd, "getpwnam", return_value=type("Account", (), {"pw_uid": os.getuid()})),
+                        patch.object(install.pwd, "getpwnam", return_value=type("Account", (), {"pw_uid": os.getuid(), "pw_gid": os.getgid()})),
+                        patch.object(install, "HOLD_DIRECTORY", self.root / "hold"),
+                        patch.object(install, "GRANT_DIRECTORY", self.root / "grant"),
                          patch.object(install, "LEGACY_PLIST", self.root / "legacy.plist"),
                          patch.object(image, "mounted_data", return_value=nullcontext(self.image)),
                          patch.object(image, "agent_requirement", return_value=self.requirement),
@@ -632,6 +635,33 @@ class InstallerTests(unittest.TestCase):
 
     def test_valid_installed_fixture_passes(self):
         self.assertEqual(self.check(), [])
+
+    def test_hold_directories_have_separate_writers_and_public_read_modes(self):
+        runner = SimpleNamespace(pw_uid=502, pw_gid=20)
+        writer = SimpleNamespace(pw_uid=503, pw_gid=21)
+        owners = {}
+        def remember_owner(fd, uid, gid):
+            owners[os.fstat(fd).st_ino] = (uid, gid)
+        with patch.object(install.pwd, "getpwnam", return_value=writer) as lookup, \
+                patch.object(install.os, "fchown", side_effect=remember_owner):
+            install.configure_hold_directories(runner)
+        lookup.assert_called_once_with("ghrunner")
+        for directory, expected in ((install.HOLD_DIRECTORY, (503, 21)), (install.GRANT_DIRECTORY, (502, 20))):
+            self.assertEqual(owners[directory.stat().st_ino], expected)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o755)
+        install.HOLD_DIRECTORY.rmdir()
+        install.HOLD_DIRECTORY.symlink_to(self.state, target_is_directory=True)
+        with self.assertRaises(OSError):
+            install.configure_hold_directories(runner)
+
+    def test_hold_window_is_optional_validated_and_passed_to_vm_config(self):
+        args = (self.image, self.config / "motor-macvm", self.state / "tools", self.manifest)
+        self.assertNotIn("hold_window", install.vm_configuration(*args))
+        for window in ("03:00-05:00", "23:00-01:00"):
+            self.assertIn('hold_window = "' + window + '"', install.vm_configuration(*args, window))
+        for invalid in ("3:00-05:00", "24:00-01:00", "03:60-05:00", "01:00-01:00", "03:00-05:00\n"):
+            with self.subTest(window=invalid), self.assertRaises(ValueError):
+                install.vm_configuration(*args, invalid)
 
     def test_check_requires_the_connect_link_to_the_installed_runner(self):
         # ck-motor's SSH session runs ~/.cargo/bin/motor-runner as motor.
@@ -779,6 +809,7 @@ class InstallerTests(unittest.TestCase):
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
                                runner=runner, vm_helper=helper, runner_key=key, instance="macos",
                                data_volume=None, operator_account=None, signing_team=None,
+                               hold_window="03:00-05:00",
                                metrics_endpoint='https://metrics.example', metrics_host_id='monitor-1')
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         install.LEGACY_PLIST.touch()
@@ -794,6 +825,8 @@ class InstallerTests(unittest.TestCase):
             install.install(args, self.manifest)
             install.install(args, self.manifest)
         self.assertFalse(install.LEGACY_PLIST.exists())
+        self.assertIn('hold_window = "03:00-05:00"', (self.config / "vm.toml").read_text())
+        self.assertEqual(json.loads((self.config / "install.json").read_text())["hold_window"], "03:00-05:00")
         self.assertEqual(os.readlink(self.connect), str(self.config / "motor-runner"))
         self.assertEqual(self.plist.stat().st_mode & 0o777, 0o644)
         bootstraps = [call.args for call in run.call_args_list if call.args[:2] == ("/bin/launchctl", "bootstrap")]
