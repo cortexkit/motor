@@ -295,6 +295,16 @@ impl Host {
         free.saturating_sub(self.job_memory_hold(now_ms).held_back_mib)
     }
 
+    pub(crate) fn job_placeable_mem_mib(&self, now_ms: u64) -> u64 {
+        let crate::config::HostSettings::PerJob(settings) = &self.settings else {
+            return 0;
+        };
+        // Admission debits the requested RAM plus boot overhead. Advertise only
+        // the RAM a new request can use, not the overhead it must also leave free.
+        self.job_free_mem_mib(now_ms)
+            .saturating_sub(settings.boot_reserve_mib)
+    }
+
     pub(crate) fn log_job_memory(&self, now_ms: u64, free_mem_mib: u64) {
         let HostSettings::PerJob(settings) = &self.settings else {
             return;

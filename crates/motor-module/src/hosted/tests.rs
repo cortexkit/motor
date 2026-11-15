@@ -368,10 +368,10 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
 }
 
 #[tokio::test]
-async fn hosted_capacity_queues_on_replace_but_auth_and_expiry_never_replace() {
-    for (reason, error, replaces) in [
-        ("host_full", Error::NoCapacity(1000), true),
-        ("capacity", Error::NoCapacity(1000), true),
+async fn hosted_capacity_rebooks_but_auth_and_expiry_never_rebook() {
+    for (reason, error, rebooks) in [
+        ("host_full", Error::NoCapacity(HOST_FULL_RETRY_MS), true),
+        ("capacity", Error::NoCapacity(HOST_FULL_RETRY_MS), true),
         ("auth", Error::Auth, false),
         ("expired", Error::Expired, false),
     ] {
@@ -388,24 +388,25 @@ async fn hosted_capacity_queues_on_replace_but_auth_and_expiry_never_replace() {
                 .err(),
             Some(error)
         );
-        let requests = h.requests.lock().unwrap();
-        // After replace starts revocation, the broker answers lease re-requests
-        // with replace_pending until a move succeeds. Only replace can advance it.
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|p| p.as_str() == "/v1/leases")
-                .count(),
-            1
-        );
-        let replacements = requests.iter().filter(|p| p.ends_with("/replace")).count();
-        if replaces {
-            assert!(replacements > 1, "{reason}: {requests:?}");
-        } else {
-            assert_eq!(replacements, 0, "{reason}");
+        let bodies: Vec<LeaseRequest> = h
+            .lease_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_slice(b).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), if rebooks { 2 } else { 1 });
+        if rebooks {
+            assert_ne!(bodies[0].job_id, bodies[1].job_id);
         }
-        assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
-        assert_eq!(h.iats.lock().unwrap().len(), 1);
+        assert!(!h
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.ends_with("/replace")));
+        assert_eq!(h.tokens.load(Ordering::SeqCst), bodies.len());
+        assert_eq!(h.iats.lock().unwrap().len(), bodies.len());
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
         assert!(!storage.job(id).unwrap().hosted.unwrap().run_sent);
     }

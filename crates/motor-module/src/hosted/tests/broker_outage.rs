@@ -212,15 +212,15 @@ async fn lease_timeout_retries_the_exact_stored_body() {
 }
 
 #[tokio::test]
-async fn replacement_timeout_retries_without_rerequesting_the_lease() {
+async fn rebook_timeout_replays_only_the_fresh_lease_body() {
     let first = Harness::with_host(Behavior::Refuse("host_full"), "first-host").await;
     let second = Harness::with_host(Behavior::Normal, "second-host").await;
-    first.unanswered_replace.store(1, Ordering::SeqCst);
+    first.unanswered_lease.store(2, Ordering::SeqCst);
     first
-        .replacement_hosts
+        .lease_hosts
         .lock()
         .unwrap()
-        .push_back(second.broker.clone());
+        .extend([first.broker.clone(), second.broker.clone()]);
     let scratch = Scratch::new();
     let id = Uuid::now_v7();
     let route = HostedJobState {
@@ -234,15 +234,24 @@ async fn replacement_timeout_retries_without_rerequesting_the_lease() {
         .await
         .unwrap();
     assert_eq!(lease.placement.host, "second-host");
-    assert_eq!(first.lease_bodies.lock().unwrap().len(), 1);
+    let bodies = first.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert_ne!(bodies[0], bodies[1]);
     assert_eq!(
-        *first.requests.lock().unwrap(),
-        vec![
-            "/v1/leases".to_owned(),
-            format!("/v1/leases/{id}/replace"),
-            format!("/v1/leases/{id}/replace"),
-        ]
+        bodies[1], bodies[2],
+        "timeouts replay the exact current body"
     );
+    let fresh: LeaseRequest = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_ne!(fresh.job_id, id.to_string());
+    assert_eq!(lease.job_id, fresh.job_id);
+    assert_eq!(first.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(second.tokens.load(Ordering::SeqCst), 1);
+    assert!(!first
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.ends_with("/replace")));
 }
 
 #[tokio::test]

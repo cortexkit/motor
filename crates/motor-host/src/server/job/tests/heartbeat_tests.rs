@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn advertised_job_memory_leaves_boot_reserve_for_admission() {
+    let (runtime, fake, _) = fixture();
+    fake.capacity_available.store(true, Ordering::SeqCst);
+    let now = unix_ms();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let crate::config::HostSettings::PerJob(settings) = &mut host.settings else {
+            panic!("per-job fixture")
+        };
+        settings.boot_reserve_mib = 123;
+        assert_eq!(host.job_free_mem_mib(now), 950);
+    }
+    let mut heartbeats = crate::broker::Heartbeats::new(runtime.clone());
+    let logs = crate::test_logs::capture(|| heartbeats.step(now).unwrap());
+    let queued_memory = || {
+        let host = runtime.host.lock().unwrap();
+        let request = host
+            .snapshot
+            .outbox
+            .iter()
+            .rev()
+            .find(|r| r.path.ends_with("/heartbeat"))
+            .expect("queued heartbeat");
+        serde_json::from_slice::<motor_lease::Heartbeat>(&request.body)
+            .unwrap()
+            .free_mem_mib
+    };
+    assert_eq!(queued_memory(), 827);
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("job_memory_advertised ")
+                && line.contains("free_mem_mib=827 ")),
+        "{logs:?}"
+    );
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let crate::config::HostSettings::PerJob(settings) = &mut host.settings else {
+            unreachable!()
+        };
+        settings.boot_reserve_mib = 1000;
+    }
+    heartbeats.step(now + 15_000).unwrap();
+    assert_eq!(queued_memory(), 0);
+}
+
+#[test]
 fn pre_vm_queue_diagnostics_do_not_name_a_foreign_account_holder() {
     let (runtime, _, _) = fixture();
     let first = claims(JOB);

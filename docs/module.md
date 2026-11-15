@@ -975,27 +975,23 @@ second) before retrying the identical request, including its job ID. Capacity
 and `202 provisioning` retries share one queue-wait deadline. Exhaustion yields
 a typed retryable refusal, never local execution. The broker can grant a lease
 from a stale view of the host, which then refuses the job as full (`host_full`,
-or `capacity`). Before Run, an unpinned registered-host job requests a replacement
-that keeps the same reservation and excludes every host it was previously placed
-on. A `replace_pending` fence waits for `Retry-After` within the same queue budget.
-Lease bodies stay unchanged: `avoid_host` is part of the lease hash, not a retry
-option. Once replacement begins, every later placement attempt uses the replace
-endpoint, never a lease re-request: only replace can advance the revocation fence.
-Replacement `503 no_capacity` (or `capacity`) waits for `Retry-After` within the
-same queue budget, so a host that frees up later can take the job. A lease
-re-request that discovers `replace_pending` also switches to replace after
-`Retry-After`, keeping the active submission's requester key. After a module
-restart, an unsent job is instead settled and retired with `LostToRestart`
-(`ran: none`), safe to resubmit; placement does not resume with a new key.
-Definite replacement refusals stop placement. A settled replacement after a
-pre-Run host capacity refusal preserves that original host cause.
-These capacity waits don't count
-against the three placement attempts. If only capacity answers exhaust the
-queue budget, including a replacement fence after a capacity refusal, the job
-gets `runner_full` with cause `hosted_capacity` and `ran: none`, so it is safe to
-resubmit. The unused reservation is released. Broker connection failures and
-timeouts on lease creation and replacement retry with backoff for up to 60 seconds,
-capped by the remaining queue-wait budget, while reporting placement-wait progress.
+or `capacity`). When a registered host refuses the job as full before Run,
+ck-motor releases the refused booking and re-books an unpinned job under a fresh
+lease job ID after a short placement wait. A fresh lease job ID is needed because
+the broker never places a job ID again on a host it was moved away from. The
+request is otherwise unchanged, including `allow_spill` and `avoid_host`; normal
+fresh-lease rules may select any eligible host or Boat. Callers keep their original
+job ID for status, attach, secrets and cancel. All re-books share the original
+queue-wait deadline. Old bookings are released durably in the background, including
+after restart; a stalled release does not block the new booking or its terminal.
+Repository-pinned jobs continue waiting on the same server and lease ID. Capacity
+waits do not consume transport-placement attempts. Exhaustion reports `runner_full`
+with the last capacity cause and `ran: none`, so it is safe to resubmit. After a
+module restart, an unsent submission is instead settled and retired with
+`LostToRestart` (`ran: none`), not resumed with a new key.
+Broker connection failures and timeouts on lease creation retry with backoff for
+up to 60 seconds, capped by the remaining queue-wait budget, while reporting
+placement-wait progress.
 An exhausted transport retry window gives `hosted_broker_unreachable`
 (`unreachable`). Cancellation ends the retry wait at once; a request already in
 flight is awaited first so any grant can be released. These cases are covered by
@@ -1004,10 +1000,9 @@ flight is awaited first so any grant can be released. These cases are covered by
 `broker_connect_outage_is_capped_by_queue_budget`,
 `broker_connect_outage_cancel_interrupts_backoff`,
 `lease_timeout_retries_the_exact_stored_body`, and
-`replacement_timeout_retries_without_rerequesting_the_lease`.
+`rebook_timeout_replays_only_the_fresh_lease_body`.
 When answers were mixed, the refusal uses the last definite
-answer and says so in its detail, which includes the final cause. A replacement
-fence is not a new definite answer. A broker that has not answered
+answer and says so in its detail, which includes the final cause. A broker that has not answered
 the job's first lease request when the deadline passes gives
 `hosted_provisioning` (unreachable). Before the durable `run_sent`
 marker, refusals identify repository-selected routing with the exact detail text
