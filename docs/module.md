@@ -671,6 +671,12 @@ build server. The runner's result reaches the caller as a `return_result` record
 immediately before the terminal record, with cwd-relative paths. Collection
 failures (`over_cap`, `missing`, `escape`, `not_regular`, `frame_limit`) do not
 change the job's outcome. A reattach from before the record's `seq` replays it.
+Files are also collected after the job's processes are killed when it is
+cancelled or reaches its time limit (tests:
+`return_paths_collects_file_after_cancel`,
+`return_paths_collects_file_after_timeout`,
+`return_chunked_collects_file_after_cancel`, and
+`return_chunked_collects_file_after_timeout`).
 
 Only a request with non-empty `return_paths` receives the record. This route
 has no per-caller capability handshake: `started` goes to every caller, and
