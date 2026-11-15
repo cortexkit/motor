@@ -32,10 +32,11 @@ caller lifecycle scripts on the host; dependency installation uses
 
 `motor-macagent` runs as root in a single-job macOS VM. Its executable is built
 for `aarch64-apple-darwin`. It uses `motor-winagent`'s shared framing and macOS
-profile, version 2. Version 2 agents mount the job's build disk at `target/`; the
-runner refuses a version 1 agent at Hello with a `guest_agent_version` error that
-names the image, so an older image never builds on the shared folder. The
-Windows profile is versioned separately.
+profile, version 3. Version 3 agents mount the job's build disk at a fixed guest
+path outside the shared folders (see [Build disk and `target/`](#build-disk-and-target));
+the runner refuses any other version at Hello with a `guest_agent_version` error
+that names the image, so a version 2 agent, which mounted the disk over the shared
+`target/` directory, never runs a job. The Windows profile is versioned separately.
 
 ### Nonce disk and connection
 
@@ -80,16 +81,23 @@ devices must not be readable by `motorjob`; the image must give that account an
 unprivileged primary group, with no disk-access groups.
 
 The root agent connects to `VMADDR_CID_HOST` (2), vsock port **5000**, and sends
-`Hello { version: 2, nonce }`. The host must already be listening. It accepts
+`Hello { version: 3, nonce }`. The host must already be listening. It accepts
 one session, authenticates the nonce and refuses further connections. The wire
 sequence is `Hello` → host `TreeEnd { command }` → agent `Started` → zero or more
-`Output` → `Exit { code }` or `Signal { signal }`. There is no `TreeReceived` or
-host `Start`. The host may send `Cancel` after `TreeEnd` until terminal status.
-The agent mounts the build disk between `TreeEnd` and `Started`, and unmounts it
-before `Exit` or `Signal`; the host allows two minutes for `Started`. When the
-build disk cannot be mounted, no command runs: the agent sends `Started`, one
-standard-error `Output` line giving the reason, and closes without terminal
-status.
+`Output` → at most one `BuildRelease { released, reason }` → `Exit { code }` or
+`Signal { signal }`. There is no `TreeReceived` or host `Start`. The host may
+send `Cancel` after `TreeEnd` until terminal status. The agent mounts the build
+disk between `TreeEnd` and `Started`, and releases it after the command's output;
+the host allows two minutes for `Started`. `BuildRelease` says whether the
+release succeeded; `reason` (at most 1 KiB, untrusted text) says why not. The
+agent sends it and the terminal status from memory, so a full guest disk cannot
+lose them, and it sends the command's real `Exit` or `Signal` whether or not the
+release succeeded. The host treats a terminal status without
+`BuildRelease { released: true }` as an unreleased disk. Only the macOS profile
+accepts `BuildRelease`. When the build disk cannot be mounted, no command runs:
+the agent sends `Started`, one standard-error `Output` line giving the reason,
+and closes without terminal status (see
+[Build disk and `target/`](#build-disk-and-target)).
 
 ### Shares and command execution
 
@@ -152,9 +160,9 @@ settings before chdir, not a late pre_exec credential drop; no privileged
 supplementary group can survive std's tolerated EPERM on group clearing.
 It clears the inherited daemon environment, applies the Linux caller-env
 allow-list, then pins `HOME=/Users/motorjob`, a fresh writable job `TMPDIR`,
-`RUSTUP_HOME=/opt/motor/rustup`, `CARGO_HOME=/opt/motor/job/cargo-home`, and
+`RUSTUP_HOME=/opt/motor/rustup`, `CARGO_HOME=/opt/motor/job/cargo-home`,
+`CARGO_TARGET_DIR=/private/var/motor/build` (the build disk's mount), and
 `PATH=/opt/motor/cargo/bin:/opt/motor/bun/bin:/opt/motor/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
-`CARGO_TARGET_DIR` is unset.
 
 ### Background services in job VMs
 
@@ -184,12 +192,24 @@ policy for future build disks or workspace shares.
 
 ### Build disk and `target/`
 
-The job's `target/` is not on the shared folder. On that share, listing a
+The job's build output is not on the shared folder. On that share, listing a
 directory while entries in it are deleted can skip real files, so `cargo clean`
 left files behind and rustc's incremental garbage collection failed with
 "Directory not empty". Each checkout instead keeps its build folder on its own
-disk, which the job VM formats and mounts as APFS. Builds see `target/` exactly
-where they did, and `CARGO_TARGET_DIR` stays unset.
+disk, which the job VM formats and mounts as APFS at the fixed guest path
+**`/private/var/motor/build`**. Jobs get that path as `CARGO_TARGET_DIR`, and
+the checkout's `target` is a link to it, so `target/...` paths reach the same
+volume.
+
+**Why not mount it at `target/`.** An earlier version mounted the volume over
+the shared `target/` directory itself. In the guest, a path through a
+virtiofs directory stopped crossing a mount on it about 3.5 seconds after
+mounting, whatever the job did: the volume stayed mounted, but `target/`
+named the shared directory again and builds wrote to the shared folder. The
+volume is therefore never mounted on a share. `CARGO_TARGET_DIR` is set, as
+Linux jobs set it, so Cargo builds on the volume even if a job removes or
+replaces the `target` link; earlier versions promised it stayed unset, which
+only held while the volume was mounted at `target/` itself.
 
 - **On the host**, the runner keeps one file per checkout, `targets/<key>.img`
   under its state root: a sparse raw disk of exactly **128 GiB**, of which only
@@ -197,7 +217,11 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
   file, a constant-time copy, in the job's clone directory, and attaches it to
   the VM as a writable USB mass storage device, with the boot disk's caching
   and synchronization settings. A checkout's first job gets a new, empty disk.
-  The staged checkout's `target/` is an empty directory.
+  The staged checkout's `target` is replaced by a link to
+  `/private/var/motor/build`. The host never follows that link: on the host
+  its target names an unrelated path. Source timestamps skip snapshot files
+  under `target`, and after the VM has stopped the runner removes any link at
+  `target` before scanning the checkout for changes.
 - **Why USB.** On Apple silicon, macOS protects the key of every APFS volume
   on internal storage with the Secure Enclave. The guest treats a virtio block
   disk as internal storage, and a job VM's Secure Enclave state belongs to its
@@ -209,48 +233,69 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
   `script/macos-runner/build-disk-probe.sh` checks this on a host without a
   runner: for each attachment it boots two job VMs from clones of a sealed
   image and reports whether the second mounts the volume the first formatted.
-- **In the VM**, before the command starts, the root agent finds the disk by
-  its fixed size, the one property the guest cannot change and no other disk
-  shares. It formats the disk as APFS only while it is still blank (all zero,
-  as the host creates it). It then mounts the volume `nosuid,nodev` over the
-  empty `target/` directory and gives the volume's root to `motorjob`,
-  clearing any user flags such as `uchg` an earlier job set on it. The raw
-  and block devices must not be writable by `motorjob`. A `target` that is a
-  file, a link or a non-empty directory refuses the job, and so does a
-  workspace below a directory `motorjob` owns or can write, its home
-  directory included, or below a link: the job could otherwise rename that
-  directory during its run and redirect the agent's later unmount. If an
+  Each VM builds a small Cargo package with a returned file under `target/`
+  and runs for more than 10 seconds, and the probe reports any step at which
+  `target/` or `CARGO_TARGET_DIR` no longer reached the volume.
+- **In the VM**, before the command starts, the root agent requires the
+  checkout's `target` to be exactly the runner's link. It prepares
+  `/private/var/motor/build`: every directory on that path is opened without
+  following links and must not be owned or writable by `motorjob`, missing
+  ones are created as root with mode 0755, and the mount point must be an
+  empty directory with nothing mounted on it. It finds the disk by its fixed
+  size, the one property the guest cannot change and no other disk shares.
+  It formats the disk as APFS only while it is still blank (all zero, as the
+  host creates it). It then mounts the volume `nosuid,nodev` and gives the
+  volume's root to `motorjob`, clearing any user flags such as `uchg` an
+  earlier job set on it. The raw and block devices must not be writable by
+  `motorjob`. A workspace below a directory `motorjob` owns or can write, its
+  home directory included, or below a link also refuses the job. If an
   existing volume is missing, will not mount or cannot be handed to
   `motorjob`, the agent reformats the disk, and the job's standard error
   starts with a line saying so: that build starts cold. The agent never runs
-  the command with the shared folder in the volume's place.
+  the command without the volume mounted.
+- **While the command runs**, the agent looks at the mount every 100 ms, and
+  at `target` without following it (whether it is still the runner's link;
+  as root it never resolves a link the job may have changed). Just before
+  releasing the volume it adds one line to the job's standard error,
+  `motor: build-volume diagnostic watch: ...`, saying whether both held and,
+  if not, when that stopped (milliseconds after mounting and after the
+  command started) with the last good look. Lines with this prefix arrive on
+  the job's standard error, where the job can write them too, so the runner
+  logs them as job output with the job ID, at most eight per job.
 - **After the command**, once every `motorjob` process is gone, the agent
-  reaches `target/` again from `/`, one directory at a time without following
+  reaches the mount again from `/`, one directory at a time without following
   links, and requires the volume root it recorded before the command (the
   same file system ID and inode). It copies the returned files out (below),
   then unmounts the volume, which must have exactly one mount, forcing the
-  unmount if a killed process left it busy. Only then does it send `Exit` or
-  `Signal`. If any of this fails, the command's output is still delivered,
-  followed by one last standard-error line,
-  `motor: the build disk could not be released: <reason>`, and the session
-  closes without either. The runner logs that line with the job ID.
+  unmount if a killed process left it busy. It then counts `motorjob`
+  processes again, after the unmount and after placing the returned files:
+  any process alive then fails the release. It sends
+  `BuildRelease { released: true }`, then `Exit` or `Signal`. If any of this
+  fails, it sends `BuildRelease { released: false, reason }` and the
+  command's own `Exit` or `Signal`, so the caller gets the command's real
+  status; the caller's standard error also ends with
+  `motor: the build disk could not be released: <reason>` when the agent can
+  still write it. The runner logs the reason with the job ID.
 - **Publication.** After the VM has provably stopped, the runner renames the
-  job's disk over `targets/<key>.img` whenever the agent reported `Exit` or
-  `Signal`, because only then was the volume cleanly unmounted. **A failed job
-  publishes its disk too**: a non-zero exit, such as a compile error, or a
-  command killed by a signal keeps its build output for the next job, as a
-  Linux workspace keeps its `target/`. A cancelled job, a session that ended
-  without terminal status, or an unproven stop publishes nothing; the next job
-  uses the previous disk. The rename is the commit point: a cancel that
+  job's disk over `targets/<key>.img` when the agent sent
+  `BuildRelease { released: true }`, because only then was the volume cleanly
+  unmounted, and the checkout's `target` is still exactly the runner's link. **A failed job publishes its
+  disk too**: a non-zero exit, such as a compile error, or a command killed by
+  a signal keeps its build output for the next job, as a Linux workspace keeps
+  its `target/`. A cancelled job, a release failure, a job that removed or
+  replaced the `target` link, a session that ended without terminal status,
+  or an unproven stop publishes nothing; the next job uses the previous disk,
+  and the job's exit stands. The job's standard error never decides it. The
+  rename is the commit point: a cancel that
   arrives first stops it, and one that arrives during it waits until it is
   done and finds the disk published. The host never mounts or reads the disk's contents: it only
   creates, clones, renames, measures and deletes the file.
 - **A full disk.** The volume holds at most 128 GiB. A build that fills it fails
   like one on a full disk, with "No space left on device" (`ENOSPC`) from the
-  compiler or linker. Deleting files under `target/` in a job frees the space
-  for the checkout. `target/` itself is the volume's mount point: removing the
-  directory itself fails with "Resource busy", so a tool that deletes the whole
-  directory, as `cargo clean` does, reports an error after emptying it.
+  compiler or linker. Deleting files in `CARGO_TARGET_DIR` in a job frees the
+  space for the checkout. The mount point itself cannot be removed, so a tool
+  that deletes the whole directory, as `cargo clean` does, reports an error
+  after emptying it.
 - **Eviction.** Below 40 GiB free on the state volume, admission-time cleanup
   deletes build disks least recently used first, measured by the host disk they
   take, not their 128 GiB apparent size; a disk whose checkout has a job in
@@ -263,13 +308,23 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
 #### Returned files under `target/`
 
 The host cannot read the volume, so the agent copies requested returned files
-that name something under `target/` before it unmounts it. In request order, a
-file is copied while its size still fits under the caller's cap, the same rule
-the host applies, into a private root-only folder on the guest's own disk.
-After unmounting, the agent writes the copies into the shared `target/`, now an
-empty directory again, at their requested paths. The host then collects every
-returned file from the stopped share as before, with its usual confinement
-checks; return paths outside `target/` are unchanged. A file over the cap is
+that name something under `target/` before it unmounts it. A return path
+counts as under `target/` when, relative to the checkout, its first component
+is `target` (in any ASCII case) and every other component is a plain name. In
+request order, a file is copied while its size still fits under the caller's
+cap, the same rule the host applies, into a private root-only folder on the
+guest's own disk. After unmounting, the agent creates
+`.motor-target-returns` in the job's cargo-home share, which is never shared
+with another job and is deleted with the job, and writes the copies there at
+their paths relative to `target/`. That directory must not exist yet: the job
+can write the share, so if it does, the agent places nothing and reports a
+release failure. The host reads a path `target/<rest>` from
+`.motor-target-returns/<rest>`, with the same no-follow walk confined to that
+directory as for any other returned file, and only when the build disk was
+released and the checkout's `target` is still the runner's link; otherwise
+those paths are reported unread. Any other path that reaches the checkout's
+`target`, through `..` or a link, is reported unread: the host never follows
+the link. Return paths outside `target/` are unchanged. A file over the cap is
 written as a sparse placeholder with none of its bytes, sized one byte over
 the whole cap (or the file's own size, if larger). The host budgets every
 returned path, the agent only those under `target/`, so a placeholder of the
@@ -278,8 +333,15 @@ zeros; one larger than the cap never fits, and the host reports it over the
 cap. The agent never follows a link on the volume or crosses onto another file
 system mounted below it: a returned path under `target/` must name a regular
 file on the build volume through real directories, or the host reports it
-missing. A path written with `..` is
-resolved on the shared folder and finds only files the agent copied there.
+missing. Each placed file, and the directory holding it, is flushed before the
+release is reported; a file that cannot be written whole is removed, so the
+host reports it missing rather than returning part of it, and if it cannot be
+removed the release fails. Before creating `.motor-target-returns` the agent
+requires the cargo-home share to be the one it opened before the job (the same
+file system ID and directory inode), and it opens that share only when no
+directory above it is `motorjob`'s or writable by `motorjob`. A path whose
+first component is `target` in any ASCII case is the runner's everywhere:
+source sealing and source timestamps leave it alone too.
 
 The image recipe installs Rust 1.91.0, 1.92.0, 1.96.0, 1.99.0 and 1.100.0, plus
 an independent stable copy of 1.99.0. The current macOS job image still defaults

@@ -312,6 +312,16 @@ impl Dir {
     pub(super) fn remove(&self, name: &std::ffi::OsStr) -> io::Result<()> {
         self.remove_with(name, false)
     }
+    /// Creates the link `name` to `target` in this directory. The target is
+    /// stored as given and never resolved here.
+    pub(super) fn symlink(
+        &self,
+        name: &std::ffi::OsStr,
+        target: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        cv(unsafe { libc::symlinkat(c(target)?.as_ptr(), self.0.as_raw_fd(), c(name)?.as_ptr()) })?;
+        Ok(())
+    }
     /// Only for a stopped VM's disposable job trees, never canonical or shared
     /// caches. A crash can persist the immutable flag but lose its earlier clear.
     pub(super) fn remove_job(&self, name: &std::ffi::OsStr) -> io::Result<()> {

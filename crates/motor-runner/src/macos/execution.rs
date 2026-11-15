@@ -285,6 +285,13 @@ pub(super) fn capture_changes(
         .lock()
         .unwrap()
         .push((request.job_id, "changes"));
+    // The checkout's `target` link names a guest path, which on this host
+    // could name an unrelated directory, and the scan reads paths below it.
+    // Remove whatever link is at `target` first, so no path resolves through it.
+    if let Err(error) = remove_target_link(staged) {
+        tracing::warn!(job_id = %request.job_id, %error, "scan_failed: the target link could not be removed");
+        return;
+    }
     match trees.changes_for_guest(
         &staged.workspace,
         &staged.prepared_javascript_directories,
@@ -295,12 +302,16 @@ pub(super) fn capture_changes(
     }
 }
 
+/// `target_released`: the agent released the build volume cleanly and the
+/// checkout's `target` is still the runner's link, so the agent's copies of
+/// the returned files under `target/` can be read.
 pub(super) fn capture_returns(
     runtime: &Runtime,
     trees: &Trees,
     entry: &Entry,
     request: &motor_protocol::Run,
     staged: &Staged,
+    target_released: bool,
 ) {
     if crate::caller_path::run(request)
         .caller_return_paths
@@ -316,38 +327,94 @@ pub(super) fn capture_returns(
             .lock()
             .unwrap()
             .push((request.job_id, "returns"));
-        crate::return_paths::collect_staged(request, &staged.workspace, &job_directory)
+        // Returned files under target/ come only from the directory the agent
+        // created in the cargo-home share after the job; without a clean
+        // release they are reported unread.
+        let copies = target_released.then(|| staged.cargo_home.join(motor_macvm::TARGET_RETURNS));
+        crate::return_paths::collect_staged_with_target(
+            request,
+            &staged.workspace,
+            copies.as_deref(),
+            &job_directory,
+        )
     } else {
         crate::return_paths::unread(request, &job_directory)
     };
     runtime.record_returns(request.job_id, returns);
 }
 
+/// Stops the VM and captures the job's changes and returned files. Returns
+/// whether its build disk was released: the agent said so
+/// (`build_disk_released`, see `forward_output`) and, with the VM proven
+/// stopped, the checkout's `target` is still exactly the runner's link. A job
+/// that replaced the link publishes no disk and returns nothing under
+/// `target/`; its exit stands.
 pub(super) fn capture_completion(
     config: &Config,
     trees: &Trees,
     entry: &Entry,
     request: &motor_protocol::Run,
     staged: &Staged,
-) {
+    build_disk_released: bool,
+) -> bool {
     if let Err(error) = config.macos_runtime.stop(&config.state_root, entry) {
         entry.failed.store(true, Ordering::Release);
         tracing::warn!(%error, "macOS VM stop failed; retaining command outcome and resource ownership");
     }
+    let stop_proven = entry.owned.lock().unwrap().record.stop_proven;
+    let link_kept = stop_proven && target_link_kept(staged);
+    if stop_proven && !link_kept {
+        tracing::warn!(job_id = %request.job_id, "the job replaced the checkout's target link; its build disk is not published and returned files under target/ are not read");
+    }
+    let released = build_disk_released && link_kept;
     // Maintenance must retain staging and workspace ownership until both the
     // change scan and the durable returned-file spool have finished.
     capture_changes(&config.macos_runtime, trees, entry, request, staged);
-    capture_returns(&config.macos_runtime, trees, entry, request, staged);
+    capture_returns(
+        &config.macos_runtime,
+        trees,
+        entry,
+        request,
+        staged,
+        released,
+    );
+    released
 }
 
-/// Leaves the staged checkout's `target/` an empty directory. The guest agent
-/// mounts the job's build disk over it, so builds never write `target/` on the
-/// shared folder, and after unmounting it puts the returned files there.
+/// Makes the staged checkout's `target` a link to the guest's build mount,
+/// replacing whatever the snapshot had there without following it. The guest
+/// agent mounts the job's build disk at that guest path, outside the shared
+/// folder, so `target/...` in the job reaches the build volume. The host never
+/// resolves the link: on the host its target names an unrelated path.
 pub(super) fn target_in(staged: &Staged) -> io::Result<()> {
     let workspace = Dir::open(&staged.workspace, false)?;
     workspace.remove_job("target".as_ref())?;
-    workspace.child("target".as_ref(), true)?;
-    Ok(())
+    workspace.symlink("target".as_ref(), motor_macvm::BUILD_MOUNT.as_ref())
+}
+
+/// Whether the staged checkout's `target` is still exactly the link
+/// `target_in` made, read without following it.
+pub(super) fn target_link_kept(staged: &Staged) -> bool {
+    let read = || -> io::Result<bool> {
+        let workspace = Dir::open(&staged.workspace, false)?;
+        if workspace.kind("target".as_ref())? != libc::S_IFLNK {
+            return Ok(false);
+        }
+        Ok(workspace.link("target".as_ref())? == motor_macvm::BUILD_MOUNT)
+    };
+    read().unwrap_or(false)
+}
+
+/// Removes the staged checkout's `target` if it is a link, whatever it links
+/// to, without following it. Call only after the VM is proven stopped.
+pub(super) fn remove_target_link(staged: &Staged) -> io::Result<()> {
+    let workspace = Dir::open(&staged.workspace, false)?;
+    match workspace.kind("target".as_ref()) {
+        Ok(libc::S_IFLNK) => workspace.remove("target".as_ref()),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn log_staged_target(job_id: Uuid, target: &Path) {
@@ -392,29 +459,18 @@ pub(super) fn build_disk_in(config: &Config, entry: &Entry) -> io::Result<()> {
 }
 
 /// What the guest agent needs to copy returned files out of the build disk:
-/// each requested return path inside the checkout's `target/`, relative to
-/// it. Paths with `.` or `..` are left out: the host's own collection still
-/// resolves them, and finds only what the agent copied to the shared `target/`.
+/// each requested return path written `target/<rest>` with only plain
+/// components, as `<rest>`. The host reads exactly those paths from the
+/// agent's copies (see `return_paths::target_return`); any other path that
+/// reaches `target` is reported unread.
 fn build_config(request: &motor_protocol::Run) -> io::Result<motor_macvm::BuildConfig> {
     let mut returns = Vec::new();
     for path in crate::caller_path::run(request).caller_return_paths {
         let Ok(relative) = crate::return_paths::relative(request, path) else {
             continue;
         };
-        let mut components = relative.components();
-        if !matches!(components.next(),
-            Some(std::path::Component::Normal(first)) if first.eq_ignore_ascii_case("target"))
-        {
-            continue;
-        }
-        let rest: Option<Vec<&str>> = components
-            .map(|c| match c {
-                std::path::Component::Normal(name) => name.to_str(),
-                _ => None,
-            })
-            .collect();
-        if let Some(rest) = rest.filter(|rest| !rest.is_empty()) {
-            returns.push(rest.join("/"));
+        if let Some(rest) = crate::return_paths::target_return(relative) {
+            returns.push(rest);
         }
     }
     let config = motor_macvm::BuildConfig {
@@ -435,12 +491,15 @@ fn timestamp_paths(config: &Config, entry: &Entry) -> (std::path::PathBuf, std::
 }
 
 /// Whether a finished job's build disk may become its checkout's kept disk.
-/// Only an agent that unmounted the build volume sends the terminal status,
-/// so a job without one (an agent failure, a crash or a lost session) left
-/// the volume mounted. A cancelled job publishes nothing either, and nothing
-/// is published before the VM is proven stopped.
-fn publishable(cancelled: bool, stop_proven: bool, terminal_received: bool) -> bool {
-    !cancelled && stop_proven && terminal_received
+/// `build_disk_released` comes from `capture_completion`: the agent sent
+/// `BuildRelease { released: true }` before the command's exit, so it
+/// unmounted the volume, and the checkout's `target` is still the runner's
+/// link. Without
+/// that (a release failure, a replaced link, an agent failure, a crash or a
+/// lost session) nothing is published. A cancelled job publishes nothing
+/// either, and nothing is published before the VM is proven stopped.
+fn publishable(cancelled: bool, stop_proven: bool, build_disk_released: bool) -> bool {
+    !cancelled && stop_proven && build_disk_released
 }
 
 /// Renames the stopped job's build disk over its checkout's kept disk, then
@@ -675,17 +734,20 @@ fn start_io(
             if let Err(error) = &result {
                 let _ = ready_tx.try_send(Err(invalid(error.to_string())));
             }
-            capture_completion(
+            let build_disk_released = matches!(result, Ok((_, true)));
+            let result = result.map(|(outcome, _)| outcome);
+            let released = capture_completion(
                 &config,
                 &staging.trees,
                 &thread_entry,
                 &scan_request,
                 &staged,
+                build_disk_released,
             );
             if publishable(
                 thread_entry.cancel.0.load(Ordering::Acquire),
                 thread_entry.owned.lock().unwrap().record.stop_proven,
-                result.is_ok(),
+                released,
             ) {
                 let published = target_out(&config, &thread_entry).and_then(|()| {
                     let (store, history) = timestamp_paths(&config, &thread_entry);
@@ -745,17 +807,21 @@ fn start_io(
 fn staged_target(workspace: &str) -> std::path::PathBuf {
     Path::new(workspace).join("target")
 }
+/// The command's outcome, and whether the agent reported, in a `BuildRelease`
+/// frame before it, that it released the build disk.
+type Finished = (ExecutionOutcome, bool);
+
 fn run_output(
     transport: &mut Transport,
     stdout: &SyncSender<Vec<u8>>,
     stderr: &SyncSender<Vec<u8>>,
-) -> io::Result<ExecutionOutcome> {
+) -> io::Result<Finished> {
     let mut tail = Vec::new();
     let result = forward_output(transport, stdout, stderr, &mut tail);
+    let job_id = transport.entry.owned.lock().unwrap().record.id;
     // A cancelled job's session ends on purpose; any other failure is logged
     // with the agent's own reason when it sent one.
     if let (Err(error), Ok(())) = (&result, transport.entry.check()) {
-        let job_id = transport.entry.owned.lock().unwrap().record.id;
         let reason = agent_reason(&tail).unwrap_or_else(|| "none".into());
         tracing::warn!(
             %job_id,
@@ -770,20 +836,32 @@ fn run_output(
 const STDERR_TAIL_BYTES: usize = 4096;
 const BUILD_DIAGNOSTIC_PREFIX: &[u8] = b"motor: build-volume diagnostic ";
 const BUILD_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
+/// How many build-volume diagnostic lines one job's output may put in the
+/// runner log. The agent writes four at most; the rest of the budget is for
+/// a job that prints the prefix itself.
+const BUILD_DIAGNOSTIC_MAX_LINES: usize = 8;
 
 /// Output frames may split a diagnostic anywhere. Retain only one bounded line
-/// and never copy ordinary job stderr into the runner log.
+/// and never copy ordinary job stderr into the runner log. The lines arrive on
+/// the job's standard error, where the job can write the same prefix, so they
+/// are logged as job output, at most `BUILD_DIAGNOSTIC_MAX_LINES` per job.
 #[derive(Default)]
 struct DiagnosticLines {
     line: Vec<u8>,
     overflow: bool,
+    reported: usize,
 }
 impl DiagnosticLines {
-    fn push(&mut self, bytes: &[u8], mut report: impl FnMut(&str)) {
+    fn push(&mut self, bytes: &[u8], mut report: impl FnMut(Option<&str>)) {
         for &byte in bytes {
             if byte == b'\n' {
                 if !self.overflow && self.line.starts_with(BUILD_DIAGNOSTIC_PREFIX) {
-                    report(&String::from_utf8_lossy(&self.line));
+                    if self.reported < BUILD_DIAGNOSTIC_MAX_LINES {
+                        report(Some(&String::from_utf8_lossy(&self.line)));
+                    } else if self.reported == BUILD_DIAGNOSTIC_MAX_LINES {
+                        report(None);
+                    }
+                    self.reported += 1;
                 }
                 self.line.clear();
                 self.overflow = false;
@@ -803,14 +881,18 @@ fn agent_reason(tail: &[u8]) -> Option<String> {
     let last = text.lines().rev().find(|line| !line.trim().is_empty())?;
     last.starts_with("motor: ").then(|| last.to_owned())
 }
+/// Forwards the command's output until its exit. The exit's flag is true only
+/// when the agent sent `BuildRelease { released: true }` before it; a failed
+/// or missing report means the build disk was not released.
 fn forward_output(
     transport: &mut Transport,
     stdout: &SyncSender<Vec<u8>>,
     stderr: &SyncSender<Vec<u8>>,
     tail: &mut Vec<u8>,
-) -> io::Result<ExecutionOutcome> {
+) -> io::Result<Finished> {
     let job_id = transport.entry.owned.lock().unwrap().record.id;
     let mut diagnostics = DiagnosticLines::default();
+    let mut released = false;
     loop {
         match transport
             .receive()
@@ -818,8 +900,16 @@ fn forward_output(
         {
             Frame::Output { stream, bytes } => {
                 if stream == Stream::Stderr {
-                    diagnostics.push(&bytes, |diagnostic| {
-                        tracing::info!(%job_id, %diagnostic, "macOS agent build-volume metadata");
+                    diagnostics.push(&bytes, |line| match line {
+                        Some(line) => tracing::info!(
+                            %job_id,
+                            job_output = %line,
+                            "macOS job standard error line with the build-volume diagnostic prefix"
+                        ),
+                        None => tracing::info!(
+                            %job_id,
+                            "further macOS build-volume diagnostic lines from this job are not logged"
+                        ),
                     });
                     tail.extend_from_slice(&bytes);
                     let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
@@ -835,8 +925,25 @@ fn forward_output(
                     &transport.entry,
                 )?
             }
-            Frame::Exit { code } => return Ok(ExecutionOutcome::Unix(exit_status(code)?)),
-            Frame::Signal { signal } => return Ok(ExecutionOutcome::Signal { signal }),
+            Frame::BuildRelease {
+                released: reported,
+                reason,
+            } => {
+                // The protocol accepts this frame once, with a bounded reason;
+                // the reason is the guest's text, logged quoted.
+                released = reported;
+                if !reported {
+                    tracing::warn!(
+                        %job_id,
+                        reason = ?reason,
+                        "macOS agent could not release the build disk; it is not published and returned files under target/ are not read"
+                    );
+                }
+            }
+            Frame::Exit { code } => {
+                return Ok((ExecutionOutcome::Unix(exit_status(code)?), released))
+            }
+            Frame::Signal { signal } => return Ok((ExecutionOutcome::Signal { signal }, released)),
             _ => return Err(invalid("unexpected macOS agent frame")),
         }
     }

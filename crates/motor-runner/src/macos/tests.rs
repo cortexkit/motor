@@ -197,7 +197,7 @@ pub(crate) fn capture_finished_workspace_after_stop(
         source_files: vec![],
     };
     execution::capture_changes(runtime, trees, &entry, request, &staged);
-    execution::capture_returns(runtime, trees, &entry, request, &staged);
+    execution::capture_returns(runtime, trees, &entry, request, &staged, true);
     runtime.finish(&config.state_root, &entry);
     assert!(!staged.tree.exists());
 }
@@ -1638,7 +1638,12 @@ fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
         .prepare(&request, Cancellation::default())
         .unwrap();
     execution::target_in(&second).unwrap();
-    host::write(second.workspace.join("target/whole"), "new job").unwrap();
+    // The guest builds on its own build mount; the share holds only the link,
+    // which cleanup removes without following.
+    assert_eq!(
+        std::fs::read_link(second.workspace.join("target")).unwrap(),
+        Path::new(motor_macvm::BUILD_MOUNT)
+    );
     let clone = entry.owned.lock().unwrap().record.paths.clone.clone();
     host::create_dir_all(&clone).unwrap();
     motor_macvm::create_blank_build_disk(&clone.join(motor_macvm::BUILD_DISK)).unwrap();

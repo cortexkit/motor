@@ -172,9 +172,11 @@ pub(super) fn plan(
         if returns.contains(&path) {
             continue;
         }
+        // `target` is compared ignoring ASCII case, as below_target and the
+        // returned-file rules do, because the host volume ignores case.
         if path.components().any(|c| {
             c == Component::Normal("node_modules".as_ref())
-                || c == Component::Normal("target".as_ref())
+                || matches!(c, Component::Normal(name) if name.eq_ignore_ascii_case("target"))
         }) {
             unprotected.insert(path);
             continue;
@@ -202,6 +204,13 @@ fn open(root: &Path, relative: &Path) -> io::Result<File> {
     Err(invalid("empty source seal path"))
 }
 
+/// Whether a checkout-relative path is the root `target` or below it, with
+/// `target` compared ignoring ASCII case as on a case-insensitive volume.
+fn below_target(path: &Path) -> bool {
+    matches!(path.components().next(),
+        Some(Component::Normal(first)) if first.eq_ignore_ascii_case("target"))
+}
+
 /// Plan against the trusted snapshots, not Git configuration in the staged tree.
 pub(super) fn prepare_times(
     trees: &[crate::source_mtimes::Tree],
@@ -216,6 +225,12 @@ pub(super) fn prepare_times(
     let mut sealed = BTreeSet::new();
     for tree in trees {
         for path in regular_files(&tree.entries)? {
+            // The checkout's root `target` becomes the runner's link to the
+            // guest's build mount (see `execution::target_in`). Leave its
+            // snapshot files out, so no step resolves a path through the link.
+            if tree.destination == workspace && below_target(&path) {
+                continue;
+            }
             let key = tree.prefix.join(&path).to_string_lossy().into_owned();
             exported.insert(key.clone());
             // Sibling shares are read-only; workspace files need the inode seal.

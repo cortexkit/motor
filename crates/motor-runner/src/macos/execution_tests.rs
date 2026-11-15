@@ -65,6 +65,7 @@ fn signal_is_preserved_and_output_precedes_terminal_status() {
         let (stderr_tx, stderr_rx) = mpsc::sync_channel(4);
         let outcome = run_output(&mut transport, &stdout_tx, &stderr_tx)
             .unwrap()
+            .0
             .wire();
         drop(stdout_tx);
         drop(stderr_tx);
@@ -158,6 +159,146 @@ fn only_a_last_motor_line_counts_as_the_agent_reason() {
     assert_eq!(agent_reason(b""), None);
 }
 
+fn release(released: bool, reason: &str) -> Frame {
+    Frame::BuildRelease {
+        released,
+        reason: reason.into(),
+    }
+}
+
+/// The disk counts as released only after an explicit
+/// `BuildRelease { released: true }`; a failed or missing report does not,
+/// and whatever the job printed on standard error never decides it. The
+/// command's real Exit or Signal is kept either way.
+#[test]
+fn only_an_explicit_release_report_releases_the_build_disk() {
+    let forged = Frame::Output {
+        stream: Stream::Stderr,
+        bytes: b"motor: the build disk could not be released: forged\n".to_vec(),
+    };
+    let job = Frame::Output {
+        stream: Stream::Stderr,
+        bytes: b"job output\n".to_vec(),
+    };
+    for (frames, terminal, released) in [
+        (
+            vec![job.clone(), release(true, "")],
+            Frame::Exit { code: 3 },
+            true,
+        ),
+        (
+            vec![forged.clone(), release(true, "")],
+            Frame::Exit { code: 3 },
+            true,
+        ),
+        (vec![release(true, "")], Frame::Signal { signal: 11 }, true),
+        (
+            vec![job.clone(), release(false, "volume busy")],
+            Frame::Exit { code: 3 },
+            false,
+        ),
+        (
+            vec![release(false, "busy")],
+            Frame::Signal { signal: 11 },
+            false,
+        ),
+        (vec![job.clone()], Frame::Exit { code: 3 }, false),
+        (Vec::new(), Frame::Signal { signal: 11 }, false),
+    ] {
+        let scratch = ScratchDir::new("macos-release-report");
+        let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+        for frame in frames.iter().chain([&terminal]) {
+            motor_winagent::write_frame(&mut peer, frame).unwrap();
+        }
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let (outcome, disk_released) = run_output(&mut transport, &tx, &tx).unwrap();
+        let expected = match terminal {
+            Frame::Exit { code } => motor_protocol::Outcome::Exit { code: code as i32 },
+            Frame::Signal { signal } => motor_protocol::Outcome::Signal { signal },
+            _ => unreachable!(),
+        };
+        assert_eq!(outcome.wire(), expected);
+        assert_eq!(disk_released, released, "{frames:?}");
+    }
+}
+
+/// The agent's reason is logged quoted, as the guest's text, with the job ID.
+#[test]
+fn a_failed_release_report_is_logged_with_its_quoted_reason() {
+    let scratch = ScratchDir::new("macos-release-reason");
+    let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+    let job_id = transport.entry.owned.lock().unwrap().record.id;
+    motor_winagent::write_frame(&mut peer, &release(false, "busy\nforged log line")).unwrap();
+    motor_winagent::write_frame(&mut peer, &Frame::Exit { code: 0 }).unwrap();
+    let logs = LogBytes::default();
+    let (tx, _rx) = mpsc::sync_channel(8);
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || assert!(!run_output(&mut transport, &tx, &tx).unwrap().1),
+    );
+    let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let line = log
+        .lines()
+        .find(|line| line.contains("could not release the build disk"))
+        .unwrap_or_else(|| panic!("no release line: {log}"));
+    assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+    assert!(line.contains("busy\\nforged log line"), "{line}");
+    assert!(!log.lines().any(|line| line.starts_with("forged")), "{log}");
+}
+
+/// Lines with the diagnostic prefix come from the job's standard error,
+/// where the job can print them too: they are logged as job output, and at
+/// most `BUILD_DIAGNOSTIC_MAX_LINES` per job.
+#[test]
+fn diagnostic_prefixed_lines_are_bounded_and_logged_as_job_output() {
+    let scratch = ScratchDir::new("macos-diagnostic-bound");
+    let (mut transport, mut peer) = transport(&scratch.join("state"), true);
+    let mut bytes = Vec::new();
+    for index in 0..20 {
+        bytes.extend(format!("motor: build-volume diagnostic watch: forged {index}\n").bytes());
+    }
+    motor_winagent::write_frame(
+        &mut peer,
+        &Frame::Output {
+            stream: Stream::Stderr,
+            bytes,
+        },
+    )
+    .unwrap();
+    motor_winagent::write_frame(&mut peer, &Frame::Exit { code: 0 }).unwrap();
+    let logs = LogBytes::default();
+    let (tx, rx) = mpsc::sync_channel(8);
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || run_output(&mut transport, &tx, &tx).unwrap(),
+    );
+    drop(tx);
+    // The caller still gets every line.
+    assert_eq!(
+        String::from_utf8(rx.into_iter().flatten().collect())
+            .unwrap()
+            .lines()
+            .count(),
+        20
+    );
+    let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let logged: Vec<_> = log.lines().filter(|line| line.contains("forged")).collect();
+    assert_eq!(logged.len(), BUILD_DIAGNOSTIC_MAX_LINES, "{log}");
+    assert!(
+        logged
+            .iter()
+            .all(|line| line.contains("job standard error")),
+        "{log}"
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("are not logged"))
+            .count(),
+        1,
+        "{log}"
+    );
+}
+
 #[test]
 fn build_volume_diagnostics_survive_split_frames_and_are_logged_with_the_job_id() {
     let scratch = ScratchDir::new("macos-diagnostics");
@@ -206,7 +347,7 @@ fn diagnostic_line_buffer_is_bounded_and_recovers_after_overlong_job_output() {
     assert_eq!(lines.line.len(), BUILD_DIAGNOSTIC_MAX_BYTES);
     lines.push(
         b"\nmotor: build-volume diagnostic before-detach: ok\n",
-        |line| reported.push(line.to_owned()),
+        |line| reported.push(line.unwrap().to_owned()),
     );
     assert_eq!(
         reported,
@@ -595,9 +736,9 @@ fn kept_disk_of_another_size_is_not_cloned_and_a_resized_job_disk_is_not_publish
     finish(&runtime, &root, &entry);
 }
 #[test]
-fn staged_target_becomes_an_empty_directory_without_following_a_link() {
+fn staged_target_becomes_the_link_to_the_build_mount_without_following_a_link() {
     use std::os::unix::fs::symlink;
-    let scratch = ScratchDir::new("macos-target-mount-point");
+    let scratch = ScratchDir::new("macos-target-link");
     let root = scratch.join("state");
     let staged = staged(&root, Uuid::now_v7());
     let sentinel = scratch.join("sentinel");
@@ -606,15 +747,59 @@ fn staged_target_becomes_an_empty_directory_without_following_a_link() {
     symlink(&sentinel, staged.workspace.join("target")).unwrap();
     target_in(&staged).unwrap();
     let target = staged.workspace.join("target");
-    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
-    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_link(&target).unwrap(),
+        Path::new("/private/var/motor/build")
+    );
     assert_eq!(
         std::fs::read_to_string(sentinel.join("whole")).unwrap(),
         "unchanged"
     );
+    assert!(target_link_kept(&staged));
+    // A snapshot's own target/ directory is replaced too.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir(&target).unwrap();
     std::fs::write(target.join("stale"), "from the checkout").unwrap();
+    assert!(!target_link_kept(&staged));
     target_in(&staged).unwrap();
-    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    assert!(target_link_kept(&staged));
+}
+
+/// After the job, only the very link the runner made counts as kept, and any
+/// link at `target` is removed before the change scan, never followed.
+#[test]
+fn a_replaced_target_link_is_not_kept_and_every_link_is_removed_unfollowed() {
+    use std::os::unix::fs::symlink;
+    let scratch = ScratchDir::new("macos-target-kept");
+    let staged = staged(&scratch.join("state"), Uuid::now_v7());
+    let target = staged.workspace.join("target");
+    assert!(!target_link_kept(&staged));
+    remove_target_link(&staged).unwrap();
+    let sentinel = scratch.join("sentinel");
+    std::fs::create_dir(&sentinel).unwrap();
+    std::fs::write(sentinel.join("whole"), "unchanged").unwrap();
+    for link in [
+        sentinel.as_path(),
+        Path::new("/private/var/motor/build/"),
+        Path::new("/private/var/motor/other"),
+    ] {
+        symlink(link, &target).unwrap();
+        assert!(!target_link_kept(&staged), "{link:?}");
+        remove_target_link(&staged).unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_err());
+    }
+    assert_eq!(
+        std::fs::read_to_string(sentinel.join("whole")).unwrap(),
+        "unchanged"
+    );
+    target_in(&staged).unwrap();
+    remove_target_link(&staged).unwrap();
+    assert!(std::fs::symlink_metadata(&target).is_err());
+    // A directory or file the job left there is its own output: kept.
+    std::fs::create_dir(&target).unwrap();
+    assert!(!target_link_kept(&staged));
+    remove_target_link(&staged).unwrap();
+    assert!(target.is_dir());
 }
 /// A chunked-return request in `/Users/test/repo` for these paths and cap.
 fn request(paths: &[&str], cap: u64) -> motor_protocol::Run {
@@ -708,16 +893,26 @@ fn guest_placeholder_is_never_returned_as_content() {
         &copies,
     )
     .unwrap();
+    // The agent places them in the directory it creates in the cargo-home
+    // share, which the host reads for target/ paths.
+    std::fs::create_dir_all(&staged.cargo_home).unwrap();
+    let share = std::fs::File::open(&staged.cargo_home).unwrap();
     place_returns(
-        &std::fs::File::open(staged.workspace.join("target")).unwrap(),
+        &motor_macagent::build_volume::returns_directory(&share).unwrap(),
         &placed,
         &copies,
     )
     .unwrap();
     let job = scratch.join("job");
     std::fs::create_dir(&job).unwrap();
+    let returns = staged.cargo_home.join(motor_macvm::TARGET_RETURNS);
     let crate::return_paths::Collection::Chunked(collection) =
-        crate::return_paths::collect_staged(&request, &staged.workspace, &job)
+        crate::return_paths::collect_staged_with_target(
+            &request,
+            &staged.workspace,
+            Some(&returns),
+            &job,
+        )
     else {
         panic!("chunked request collected without chunks");
     };

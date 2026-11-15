@@ -297,7 +297,9 @@ fn returned_files_wait_for_stop_and_saved_proof_then_survive_cleanup() {
                 }
                 _ => {}
             }
-            super::super::execution::capture_completion(&config, &trees, &entry, &request, &staged);
+            super::super::execution::capture_completion(
+                &config, &trees, &entry, &request, &staged, true,
+            );
             assert!(
                 entry.active.load(Ordering::Acquire),
                 "ownership retained through captures"

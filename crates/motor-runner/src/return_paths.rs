@@ -28,6 +28,87 @@ const MAX_RETURN_DIRECTORY_DESCRIPTORS: usize = 64;
 #[cfg(unix)]
 const MAX_RETURN_PATH_COMPONENTS: usize = 4096;
 
+/// The root entry that a macOS collection never reads through: `target`, the
+/// runner's link to the guest's build volume. A path that walks into it
+/// reports `ReadError` (unread). The walk matches the entry by name, ignoring
+/// ASCII case as on a case-insensitive volume, and any directory with the
+/// identity the entry had when collection began, however the path reached it.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Withheld {
+    name: &'static str,
+    /// Device and inode of the entry, when it was a directory.
+    identity: Option<(u64, u64)>,
+}
+
+/// How a macOS collection reads paths under the checkout's `target`. A path
+/// written `target/<rest>` with plain components (see `target_return`) is read
+/// from the guest agent's copies of the build volume's files, when there are
+/// any, and is otherwise unread; every other path that reaches `target` is
+/// withheld.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct TargetRoute {
+    withheld: Withheld,
+    /// The agent's copies, opened without following links, and the caller
+    /// path they stand for (`<workspace>/target`), against which absolute
+    /// links inside them are confined.
+    copies: Option<(File, PathBuf)>,
+}
+
+/// A return path relative to the workspace that names a file under the
+/// checkout's `target/`: its first component is `target` (ignoring ASCII
+/// case) and every other component is a plain UTF-8 name. Returns the rest,
+/// joined with `/`. The macOS guest agent copies exactly these paths off the
+/// build volume, and the host reads exactly these from its copies.
+pub(crate) fn target_return(relative: &Path) -> Option<String> {
+    use std::path::Component;
+    let mut components = relative.components();
+    if !matches!(components.next(),
+        Some(Component::Normal(first)) if first.eq_ignore_ascii_case("target"))
+    {
+        return None;
+    }
+    let rest: Option<Vec<&str>> = components
+        .map(|c| match c {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    rest.filter(|rest| !rest.is_empty())
+        .map(|rest| rest.join("/"))
+}
+
+#[cfg(unix)]
+fn open_returned(
+    root: &Path,
+    directory: &File,
+    relative: &Path,
+    route: Option<&TargetRoute>,
+) -> Result<File, Cause> {
+    let Some(route) = route else {
+        return walk_file_withholding(root, directory, relative, None, |_, _| {});
+    };
+    if let Some(rest) = target_return(relative) {
+        return match &route.copies {
+            // Confined to the copies as to any root: nothing leaves them.
+            Some((copies, copies_root)) => {
+                walk_file_withholding(copies_root, copies, Path::new(&rest), None, |_, _| {})
+            }
+            None => Err(Cause::ReadError),
+        };
+    }
+    walk_file_withholding(root, directory, relative, Some(&route.withheld), |_, _| {})
+}
+
+#[cfg(all(unix, test))]
+fn walk_file(
+    root: &Path,
+    directory: &File,
+    relative: &Path,
+    observe: impl FnMut(usize, usize),
+) -> Result<File, Cause> {
+    walk_file_withholding(root, directory, relative, None, observe)
+}
+
 // Resolve symlinks first for an explicit escape result, then walk the resolved
 // path through directory descriptors without following replacements. No target
 // outside the workspace is opened, even if a command left a racing descendant.
@@ -35,17 +116,14 @@ const MAX_RETURN_PATH_COMPONENTS: usize = 4096;
 // Resolving '..' against the descriptor stack prevents a link from leaving the
 // workspace, including a dangling link whose outside target does not exist.
 #[cfg(unix)]
-fn open_file(root: &Path, directory: &File, relative: &Path) -> Result<File, Cause> {
-    walk_file(root, directory, relative, |_, _| {})
-}
-
-#[cfg(unix)]
-fn walk_file(
+fn walk_file_withholding(
     root: &Path,
     directory: &File,
     relative: &Path,
+    withheld: Option<&Withheld>,
     mut observe: impl FnMut(usize, usize),
 ) -> Result<File, Cause> {
+    use std::os::unix::fs::MetadataExt;
     let mut directories = vec![directory.try_clone().map_err(|_| Cause::Missing)?];
     let mut pending: std::collections::VecDeque<_> = relative
         .components()
@@ -71,6 +149,15 @@ fn walk_file(
             }
             directories.pop();
             continue;
+        }
+        if let Some(withheld) = withheld {
+            if directories.len() == 1
+                && component
+                    .as_bytes()
+                    .eq_ignore_ascii_case(withheld.name.as_bytes())
+            {
+                return Err(Cause::ReadError);
+            }
         }
         let name = CString::new(component.as_bytes()).map_err(|_| Cause::Missing)?;
         let parent = directories.last().unwrap();
@@ -126,6 +213,11 @@ fn walk_file(
         if !metadata.is_dir() {
             return Err(Cause::NotRegular);
         }
+        if withheld
+            .is_some_and(|withheld| withheld.identity == Some((metadata.dev(), metadata.ino())))
+        {
+            return Err(Cause::ReadError);
+        }
         if directories.len() >= MAX_RETURN_DIRECTORY_DESCRIPTORS {
             return Err(Cause::Escape);
         }
@@ -163,7 +255,7 @@ fn open_directory(path: &Path) -> Result<(File, PathBuf), Cause> {
 
 // Windows jobs collect through the guest protocol, never through host paths.
 #[cfg(windows)]
-fn open_file(_: &Path, _: &File, _: &Path) -> Result<File, Cause> {
+fn open_returned(_: &Path, _: &File, _: &Path, _: Option<&TargetRoute>) -> Result<File, Cause> {
     Err(Cause::Escape)
 }
 #[cfg(windows)]
@@ -177,7 +269,13 @@ pub(crate) fn collect(request: &Run, seq: u64) -> ReturnResult {
 }
 
 pub(crate) fn collect_authorized(config: &crate::Config, request: &Run, seq: u64) -> ReturnResult {
-    collect_with_root(request, seq, collection_root(Some(config), request), || {})
+    collect_with_root(
+        request,
+        seq,
+        collection_root(Some(config), request),
+        None,
+        || {},
+    )
 }
 
 /// Collection handed from VM shutdown to the engine's finished job-record save.
@@ -189,15 +287,72 @@ pub(crate) enum Collection {
     Chunked(ChunkedCollection),
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) fn collect_staged(
     request: &Run,
     staged_workspace: &Path,
     job_directory: &Path,
 ) -> Collection {
+    collect_from_root(
+        request,
+        job_directory,
+        staged_root(request, staged_workspace),
+        None,
+    )
+}
+
+/// Collects a macOS job's returned files from its stopped share. Paths written
+/// `target/<rest>` are read from `copies`, the directory the guest agent made
+/// for its copies of the build volume's files, when the build volume was
+/// released and the checkout's `target` is still the runner's link; with no
+/// `copies` they are unread. Every other path that reaches the share's
+/// `target` is unread: the host never follows that link.
+#[cfg(unix)]
+pub(crate) fn collect_staged_with_target(
+    request: &Run,
+    staged_workspace: &Path,
+    copies: Option<&Path>,
+    job_directory: &Path,
+) -> Collection {
+    use std::os::unix::fs::MetadataExt;
+    let root = staged_root(request, staged_workspace);
+    let identity = root.as_ref().ok().and_then(|(directory, _)| {
+        let name = CString::new("target").ok()?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let metadata = unsafe { File::from_raw_fd(fd) }.metadata().ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    });
+    let caller = PathBuf::from(
+        crate::caller_path::request(request)
+            .caller_workspace_key
+            .text(),
+    );
+    let route = TargetRoute {
+        withheld: Withheld {
+            name: "target",
+            identity,
+        },
+        copies: copies
+            .and_then(|path| open_mapped_directory(path).ok())
+            .map(|directory| (directory, caller.join("target"))),
+    };
+    collect_from_root(request, job_directory, root, Some(&route))
+}
+
+#[cfg(unix)]
+fn staged_root(request: &Run, staged_workspace: &Path) -> Result<(File, PathBuf), Cause> {
     // The host descriptor pins the share, while absolute symlinks are interpreted
     // in the guest namespace. Never open a guest absolute pathname on the host.
-    let root = open_mapped_directory(staged_workspace).map(|directory| {
+    open_mapped_directory(staged_workspace).map(|directory| {
         (
             directory,
             PathBuf::from(
@@ -206,28 +361,29 @@ pub(crate) fn collect_staged(
                     .text(),
             ),
         )
-    });
-    collect_from_root(request, job_directory, root)
+    })
 }
 
 pub(crate) fn unread(request: &Run, job_directory: &Path) -> Collection {
-    collect_from_root(request, job_directory, Err(Cause::ReadError))
+    collect_from_root(request, job_directory, Err(Cause::ReadError), None)
 }
 
 fn collect_from_root(
     request: &Run,
     job_directory: &Path,
     root: Result<(File, PathBuf), Cause>,
+    route: Option<&TargetRoute>,
 ) -> Collection {
     if request.return_chunked {
         Collection::Chunked(collect_chunked_with_root(
             request,
             job_directory,
             root,
+            route,
             |_| {},
         ))
     } else {
-        Collection::Legacy(collect_with_root(request, 0, root, || {}))
+        Collection::Legacy(collect_with_root(request, 0, root, route, || {}))
     }
 }
 
@@ -303,7 +459,13 @@ pub(crate) fn set_seq(result: &mut ReturnResult, seq: u64, cap: u64) {
 
 #[cfg(test)]
 fn collect_after_measure(request: &Run, seq: u64, before_read: impl FnOnce()) -> ReturnResult {
-    collect_with_root(request, seq, collection_root(None, request), before_read)
+    collect_with_root(
+        request,
+        seq,
+        collection_root(None, request),
+        None,
+        before_read,
+    )
 }
 
 pub(crate) fn relative<'a>(request: &Run, path: &'a str) -> Result<&'a Path, Cause> {
@@ -320,6 +482,7 @@ fn collect_with_root(
     request: &Run,
     seq: u64,
     root: Result<(File, PathBuf), Cause>,
+    route: Option<&TargetRoute>,
     before_read: impl FnOnce(),
 ) -> ReturnResult {
     let mut result = ReturnResult {
@@ -334,7 +497,7 @@ fn collect_with_root(
         let mut files = Vec::new();
         for path in crate::caller_path::run(request).caller_return_paths {
             let relative = relative(request, path)?;
-            let file = open_file(&root, &directory, relative)?;
+            let file = open_returned(&root, &directory, relative, route)?;
             measured = measured.saturating_add(file.metadata().map_err(|_| Cause::Missing)?.len());
             files.push(file);
         }
@@ -474,6 +637,7 @@ pub(crate) fn collect_chunked_authorized(
         request,
         job_directory,
         collection_root(Some(config), request),
+        None,
         |_| {},
     )
 }
@@ -488,6 +652,7 @@ fn collect_chunked_before_read(
         request,
         job_directory,
         collection_root(None, request),
+        None,
         before_read,
     )
 }
@@ -496,6 +661,7 @@ fn collect_chunked_with_root(
     request: &Run,
     job_directory: &Path,
     root: Result<(File, PathBuf), Cause>,
+    route: Option<&TargetRoute>,
     mut before_read: impl FnMut(usize),
 ) -> ChunkedCollection {
     let cap = request.return_max_bytes;
@@ -518,7 +684,7 @@ fn collect_chunked_with_root(
                 .enumerate()
             {
                 let opened = relative(request, path).and_then(|relative| {
-                    let file = open_file(&root, &root_directory, relative)?;
+                    let file = open_returned(&root, &root_directory, relative, route)?;
                     let size = file.metadata().map_err(|_| Cause::Missing)?.len();
                     Ok((relative.to_owned(), file, size))
                 });
@@ -545,7 +711,10 @@ fn collect_chunked_with_root(
                         read_chunks(file, *size, *index as u32, &chunk_directory, &mut chunks)?;
                     let read = match read {
                         Read::Returned { sha256 }
-                            if same_file(file, open_file(&root, &root_directory, relative)) =>
+                            if same_file(
+                                file,
+                                open_returned(&root, &root_directory, relative, route),
+                            ) =>
                         {
                             Read::Returned { sha256 }
                         }
@@ -1334,6 +1503,215 @@ mod tests {
         );
     }
 
+    /// A macOS staged checkout: `target` is the runner's link to the guest's
+    /// build mount, here an absolute host path holding a decoy, so reading it
+    /// would show. `copies` holds the agent's copy of `target/debug/app`.
+    #[cfg(unix)]
+    struct MacosStage {
+        _scratch: CanonicalScratchDir,
+        canonical: PathBuf,
+        staged: PathBuf,
+        copies: PathBuf,
+        job: PathBuf,
+    }
+    #[cfg(unix)]
+    fn macos_stage() -> MacosStage {
+        use std::os::unix::fs::symlink;
+        let scratch = CanonicalScratchDir::new("staged-return-target");
+        let canonical = scratch.join("canonical");
+        let staged = scratch.join("staged");
+        let copies = scratch.join("cargo-home/.motor-target-returns");
+        let job = scratch.join("job");
+        let decoy = scratch.join("guest-mount");
+        for path in [
+            &canonical,
+            &staged.join("src"),
+            &copies.join("debug"),
+            &decoy.join("debug"),
+            &job,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(decoy.join("debug/app"), b"host decoy").unwrap();
+        fs::write(copies.join("debug/app"), b"copy").unwrap();
+        fs::write(staged.join("src/kept"), b"src").unwrap();
+        symlink(&decoy, staged.join("target")).unwrap();
+        MacosStage {
+            _scratch: scratch,
+            canonical,
+            staged,
+            copies,
+            job,
+        }
+    }
+    #[cfg(unix)]
+    fn macos_collect(s: &MacosStage, paths: &[&str], copies: bool) -> ChunkedCollection {
+        let paths: Vec<PathBuf> = paths.iter().map(|p| s.canonical.join(p)).collect();
+        let mut run = request(
+            &s.canonical,
+            &paths.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+            1000,
+        );
+        run.return_chunked = true;
+        let copies = copies.then_some(s.copies.as_path());
+        let Collection::Chunked(collection) =
+            collect_staged_with_target(&run, &s.staged, copies, &s.job)
+        else {
+            panic!("expected chunked collection")
+        };
+        collection
+    }
+    #[cfg(unix)]
+    fn unread_path(outcome: &motor_protocol::ReturnManifestOutcome) -> bool {
+        matches!(
+            outcome,
+            motor_protocol::ReturnManifestOutcome::Failed {
+                cause: ReturnPathsFailureCause::ReadError,
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn target_returns_are_target_then_plain_utf8_names() {
+        for (path, rest) in [
+            ("target/debug/app", Some("debug/app")),
+            ("Target/doc/index.html", Some("doc/index.html")),
+            ("target/./release/app", Some("release/app")),
+            ("target", None),
+            ("target/../src/lib.rs", None),
+            ("src/../target/app", None),
+            ("targets/x", None),
+            ("src/target/x", None),
+        ] {
+            assert_eq!(target_return(Path::new(path)).as_deref(), rest, "{path}");
+        }
+    }
+
+    /// `target/<rest>` is read from the agent's copies, never through the
+    /// share's `target` link, and other paths are read as before.
+    #[cfg(unix)]
+    #[test]
+    fn target_returns_come_only_from_the_agents_copies() {
+        use motor_protocol::ReturnManifestOutcome;
+        let s = macos_stage();
+        let collection = macos_collect(
+            &s,
+            &["target/debug/app", "TARGET/debug/app", "src/kept"],
+            true,
+        );
+        for file in &collection.files[..2] {
+            assert!(matches!(
+                file.outcome(),
+                ReturnManifestOutcome::Returned { size: 4, .. }
+            ));
+        }
+        assert!(matches!(
+            collection.files[2].outcome(),
+            ReturnManifestOutcome::Returned { size: 3, .. }
+        ));
+        assert_eq!(
+            fs::read(s.job.join(&collection.directory).join("chunk-0")).unwrap(),
+            b"copy"
+        );
+        // The plain collector, which follows nothing either, finds no file
+        // through an absolute link out of the workspace.
+        let mut run = request(&s.canonical, &[&s.canonical.join("target/debug/app")], 1000);
+        run.return_chunked = true;
+        let collection = staged_collection(&run, &s.staged, &s.job);
+        assert!(!matches!(
+            collection.files[0].outcome(),
+            ReturnManifestOutcome::Returned { .. }
+        ));
+    }
+
+    /// Without the agent's copies (no clean release, or the job replaced the
+    /// link), every `target/` path is unread, even when the share now holds
+    /// a real `target/` directory with the file.
+    #[cfg(unix)]
+    #[test]
+    fn target_returns_without_copies_are_unread() {
+        let s = macos_stage();
+        let collection = macos_collect(&s, &["target/debug/app", "src/kept"], false);
+        assert!(unread_path(collection.files[0].outcome()));
+        assert_eq!(collection.total_bytes, 3);
+        fs::remove_file(s.staged.join("target")).unwrap();
+        fs::create_dir_all(s.staged.join("target/debug")).unwrap();
+        fs::write(s.staged.join("target/debug/app"), b"share").unwrap();
+        let collection = macos_collect(&s, &["target/debug/app"], false);
+        assert!(unread_path(collection.files[0].outcome()));
+        // With copies, the replaced share directory is still not read.
+        let collection = macos_collect(&s, &["target/debug/app"], true);
+        assert_eq!(collection.total_bytes, 4);
+    }
+
+    /// A path that reaches `target` any other way is unread: through `..`,
+    /// through a job's link to it, or to `target` itself.
+    #[cfg(unix)]
+    #[test]
+    fn other_paths_reaching_target_are_unread() {
+        use std::os::unix::fs::symlink;
+        let s = macos_stage();
+        symlink("target", s.staged.join("alias")).unwrap();
+        symlink("..", s.staged.join("src/up")).unwrap();
+        let paths = [
+            "alias/debug/app",
+            "src/../target/debug/app",
+            "src/up/target/debug/app",
+            "target/../target/debug/app",
+            "target",
+        ];
+        let collection = macos_collect(&s, &paths, true);
+        for (index, file) in collection.files.iter().enumerate() {
+            assert!(
+                unread_path(file.outcome()),
+                "{}: {:?}",
+                paths[index],
+                file.outcome()
+            );
+        }
+        // A legacy request fails as a whole, reporting the paths unread.
+        let mut run = request(&s.canonical, &[&s.canonical.join("alias/debug/app")], 1000);
+        run.return_chunked = false;
+        let Collection::Legacy(result) =
+            collect_staged_with_target(&run, &s.staged, Some(&s.copies), &s.job)
+        else {
+            panic!("expected legacy collection")
+        };
+        failed(result, Cause::ReadError, 0, 1000);
+    }
+
+    /// The copies are a confined root of their own: a link in them cannot
+    /// lead out of them.
+    #[cfg(unix)]
+    #[test]
+    fn links_in_the_copies_never_lead_out_of_them() {
+        use motor_protocol::ReturnManifestOutcome;
+        use std::os::unix::fs::symlink;
+        let s = macos_stage();
+        fs::write(s.staged.join("secret"), b"workspace file").unwrap();
+        symlink(s.staged.join("secret"), s.copies.join("absolute")).unwrap();
+        symlink("../../staged/secret", s.copies.join("relative")).unwrap();
+        symlink("..", s.copies.join("up")).unwrap();
+        let collection = macos_collect(
+            &s,
+            &[
+                "target/absolute",
+                "target/relative",
+                "target/up/staged/secret",
+            ],
+            true,
+        );
+        for file in &collection.files {
+            assert!(
+                !matches!(file.outcome(), ReturnManifestOutcome::Returned { .. }),
+                "{:?}",
+                file.outcome()
+            );
+        }
+        assert_eq!(collection.total_bytes, 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn staged_returns_hostile_links_never_spool_host_sentinel() {
@@ -1417,7 +1795,7 @@ mod tests {
         fs::rename(&staged, &saved).unwrap();
         symlink(&saved, &staged).unwrap();
         let collection =
-            collect_chunked_with_root(&run, &job, Ok((pinned, logical.into())), |_| {});
+            collect_chunked_with_root(&run, &job, Ok((pinned, logical.into())), None, |_| {});
         assert_eq!(collection.total_bytes, 4);
         let collection = staged_collection(&run, &staged, &job);
         assert_eq!(
@@ -1458,7 +1836,8 @@ mod tests {
         run.return_chunked = true;
         let mut reads = Vec::new();
         let root = open_mapped_directory(&staged).map(|file| (file, logical.into()));
-        let collection = collect_chunked_with_root(&run, &job, root, |index| reads.push(index));
+        let collection =
+            collect_chunked_with_root(&run, &job, root, None, |index| reads.push(index));
         assert_eq!(reads, vec![1]);
         assert_eq!(collection.total_bytes, cap);
         assert_eq!(
@@ -1869,7 +2248,7 @@ mod tests {
         let path = root.join("oversized");
         File::create(&path).unwrap().set_len(cap + 1).unwrap();
         let run = chunked(&root, &[&path], cap);
-        let collection = collect_chunked_with_root(&run, &job, open_directory(&root), |_| {
+        let collection = collect_chunked_with_root(&run, &job, open_directory(&root), None, |_| {
             panic!("over-cap file was read")
         });
         assert!(collection.chunks.is_empty());

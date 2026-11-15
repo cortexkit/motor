@@ -27,11 +27,15 @@ pub mod transport;
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
 pub const PROTOCOL_VERSION: u32 = 10;
 /// Version of the macOS profile, versioned independently of the Windows one.
-/// Version 2 agents mount the job's build disk at the checkout's `target/`
-/// and copy returned files out of it; a version 1 agent would build on the
-/// shared folder instead, so the runner refuses it.
-pub const MACOS_PROTOCOL_VERSION: u32 = 2;
+/// Version 3 agents mount the job's build disk at a fixed guest path outside
+/// the shared folders, give it to jobs as `CARGO_TARGET_DIR`, and copy returned
+/// files under `target/` into the cargo-home share. Version 2 agents mounted it
+/// over the shared `target/` directory, which the guest stopped resolving
+/// through the mount after a few seconds, so the runner refuses them.
+pub const MACOS_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Longest `BuildRelease` reason a macOS agent may send, in bytes.
+pub const MAX_RELEASE_REASON_BYTES: usize = 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Both the checkout's target junction and Cargo's default point at this cache volume.
@@ -144,6 +148,15 @@ pub enum Frame {
     /// accepts it; Windows reports every termination through `Exit`.
     Signal {
         signal: i32,
+    },
+    /// macOS only: whether the agent released the job's build disk after the
+    /// command, sent at most once, after the command's output and before its
+    /// `Exit` or `Signal`. `reason` says why not, in at most
+    /// `MAX_RELEASE_REASON_BYTES`; the host treats it as untrusted text. A
+    /// terminal status without this frame means the disk was not released.
+    BuildRelease {
+        released: bool,
+        reason: String,
     },
     Cancel {},
     Collect {},
@@ -268,6 +281,9 @@ pub enum State {
     SourceProtected,
     AwaitStarted,
     Running,
+    /// macOS only: the agent reported the build disk's release; the command's
+    /// `Exit` or `Signal` follows.
+    ReleaseReported,
     Exited,
     Collecting,
     Returning,
@@ -386,10 +402,18 @@ impl Protocol {
                 AwaitStarted
             }
             (AwaitStarted, Agent, Started {}) => Running,
-            (AwaitStarted | Running, Host, Cancel {}) => self.state,
+            (AwaitStarted | Running | ReleaseReported, Host, Cancel {}) => self.state,
             (Running, Agent, Output { .. }) => Running,
-            (Running, Agent, Exit { .. }) => Complete,
-            (Running, Agent, Signal { signal }) => {
+            (Running, Agent, BuildRelease { reason, .. }) => {
+                if reason.len() > MAX_RELEASE_REASON_BYTES {
+                    return Err(invalid(format!(
+                        "build release reason longer than {MAX_RELEASE_REASON_BYTES} bytes"
+                    )));
+                }
+                ReleaseReported
+            }
+            (Running | ReleaseReported, Agent, Exit { .. }) => Complete,
+            (Running | ReleaseReported, Agent, Signal { signal }) => {
                 if *signal <= 0 {
                     return Err(invalid(format!("invalid termination signal {signal}")));
                 }

@@ -30,8 +30,24 @@ pub use nonce::{
 };
 pub const CARGO_HOME: &str = "/opt/motor/job/cargo-home";
 /// The job's writable build disk, in its clone directory beside the boot disk.
-/// The guest agent mounts it at the checkout's `target/`.
+/// The guest agent mounts it at `BUILD_MOUNT`.
 pub const BUILD_DISK: &str = "build-disk.img";
+/// Where the guest agent mounts the build disk's volume: a fixed directory on
+/// the guest's own disk, outside every shared folder. A volume mounted over a
+/// directory of a virtiofs share stopped being reached through that path a few
+/// seconds after mounting, so the volume is never mounted on a share. The path
+/// is the real one (`/var` is a link to `/private/var`), because the agent
+/// walks it without following links; every directory on it is root's and out
+/// of the job account's reach; and it is the same in every job, so the absolute
+/// paths Cargo records in the kept build disk stay valid for the next job.
+/// Jobs get it as `CARGO_TARGET_DIR`, and the checkout's `target` on the share
+/// is a link the runner makes to it.
+pub const BUILD_MOUNT: &str = "/private/var/motor/build";
+/// The directory the guest agent creates in the job's cargo-home share, after
+/// every job process is gone, for the returned files it copies from the build
+/// volume. The runner reads a returned path `target/<rest>` from
+/// `<cargo-home>/.motor-target-returns/<rest>`.
+pub const TARGET_RETURNS: &str = ".motor-target-returns";
 /// Every build disk has exactly this size. The guest agent identifies the disk
 /// by it: the guest cannot resize a block device, and no other disk the job VM
 /// sees has this size (the boot disk is 96 GiB, the nonce disk under 2 MiB).
