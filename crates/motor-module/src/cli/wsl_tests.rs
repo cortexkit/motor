@@ -18,7 +18,7 @@ async fn wsl_cli_refuses_both_alias_directions_before_request_or_connection() {
             panic!("expected run arguments");
         };
         assert_eq!(build_request_checked(&args, &checks).unwrap_err(), format!("ck-motor: this checkout is on a Windows drive ({path}). Under WSL, move it into the WSL filesystem (for example under ~/) and run ck motor there."));
-        assert_eq!(main_checked(&words, &checks).await, 200);
+        assert_eq!(main_checked(&words, &checks).await, EXIT_USAGE);
     }
 }
 

@@ -51,7 +51,9 @@ pub const EXIT_UNKNOWN: u8 = 201;
 pub const EXIT_TIMEOUT: u8 = 202;
 /// The job was cancelled, by Ctrl-C or SIGTERM here or by another caller.
 pub const EXIT_CANCELLED: u8 = 203;
-/// The arguments were malformed; nothing was submitted.
+/// The request could not be built on this machine (bad arguments or a local
+/// problem such as the checkout or git); nothing was submitted. Retrying without
+/// a change will not help.
 pub const EXIT_USAGE: u8 = 204;
 
 /// The timeout sent when `--timeout` is omitted. Every job from this command
@@ -130,7 +132,9 @@ are left unquoted. Shell syntax inside an argument stays inside that argument:
 
 Exit status: the command's own exit code; 128+N when a signal N killed it;
 200 refused before start (nothing ran); 201 outcome unknown or connection lost
-(the job ID is printed); 202 timeout; 203 cancelled; 204 bad arguments.
+(the job ID is printed); 202 timeout; 203 cancelled; 204 request could not be
+built locally (bad arguments or a local problem such as the checkout or git),
+nothing submitted; retrying without a change will not help.
 
 Ctrl-C or SIGTERM cancels the job and waits for its outcome; a second one stops
 waiting. If the route closes, run tries to reattach for up to 60 seconds without
@@ -2194,14 +2198,14 @@ async fn main_checked(args: &[String], wsl: &crate::wsl::Checks) -> u8 {
     if let Some(message) =
         direct_timeout_refusal(Some(args.timeout), DEFAULT_DIRECT_EXEC_MAX_TIMEOUT_SECS)
     {
-        eprintln!("ck motor run: refused before start: {message}");
-        return EXIT_REFUSED;
+        eprintln!("ck motor run: {message}");
+        return EXIT_USAGE;
     }
     let request = match build_request_checked(&args, wsl) {
         Ok(request) => request,
         Err(message) => {
-            eprintln!("ck motor run: refused before start: {message}");
-            return EXIT_REFUSED;
+            eprintln!("ck motor run: {message}");
+            return EXIT_USAGE;
         }
     };
     let secret_file = match args
@@ -3102,6 +3106,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_request_error_subprocess() {
+        let Ok(case) = std::env::var("MOTOR_TEST_LOCAL_REQUEST_ERROR") else {
+            return;
+        };
+        let input = match case.as_str() {
+            "env" => words("--env CKE2E_CHAOS_FOUNDATION_LINUX=required -- true"),
+            "timeout" => words("--timeout 7201 -- true"),
+            _ => panic!("unknown local error case"),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        std::process::exit(i32::from(
+            runtime.block_on(main_checked(&input, &crate::wsl::Checks::default())),
+        ));
+    }
+
+    fn assert_local_request_error(case: &str, detail: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::tests::local_request_error_subprocess",
+                "--nocapture",
+            ])
+            .env("MOTOR_TEST_LOCAL_REQUEST_ERROR", case)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(i32::from(EXIT_USAGE)));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.starts_with("ck motor run: "), "{stderr}");
+        assert!(stderr.contains(detail), "{stderr}");
+        assert!(!stderr.contains("refused before start"), "{stderr}");
+    }
+
+    #[test]
+    fn disallowed_env_is_a_local_usage_error() {
+        assert_local_request_error("env", "CKE2E_CHAOS_FOUNDATION_LINUX is not forwarded");
+    }
+
+    #[test]
+    fn excessive_timeout_is_a_local_usage_error() {
+        assert_local_request_error("timeout", "7200");
+    }
+
     #[tokio::test]
     async fn runner_owned_cargo_offline_is_refused_before_submission() {
         let scratch = cortexkit_test_support::ScratchDir::new("cli-cargo-offline-refusal");
@@ -3127,7 +3174,7 @@ mod tests {
         );
         assert_eq!(
             main_checked(&input, &crate::wsl::Checks::default()).await,
-            EXIT_REFUSED
+            EXIT_USAGE
         );
         assert!(!record_file.exists());
     }
@@ -3180,7 +3227,7 @@ mod tests {
             );
             assert_eq!(
                 main_checked(&input, &crate::wsl::Checks::default()).await,
-                EXIT_REFUSED
+                EXIT_USAGE
             );
             assert!(!secret_file.exists());
             assert!(!record_file.exists());
@@ -3212,7 +3259,7 @@ mod tests {
             );
             assert_eq!(
                 main_checked(&input, &crate::wsl::Checks::default()).await,
-                EXIT_REFUSED
+                EXIT_USAGE
             );
             assert!(!secret_file.exists());
         }
