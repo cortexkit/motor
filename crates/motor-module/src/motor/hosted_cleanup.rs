@@ -5,6 +5,7 @@ use tokio::task::JoinHandle;
 
 pub(super) struct Cleanup {
     tasks: Mutex<Option<HashMap<Uuid, JoinHandle<()>>>>,
+    release_tasks: Mutex<Option<HashMap<Uuid, JoinHandle<()>>>>,
     pub(super) shutdown: watch::Sender<bool>,
     pub(super) booking_open: Arc<Mutex<bool>>,
 }
@@ -13,6 +14,7 @@ impl Default for Cleanup {
     fn default() -> Self {
         Self {
             tasks: Mutex::new(Some(HashMap::new())),
+            release_tasks: Mutex::new(Some(HashMap::new())),
             shutdown: watch::channel(false).0,
             booking_open: Arc::new(Mutex::new(true)),
         }
@@ -89,6 +91,17 @@ impl Motor {
             task.abort();
             let _ = task.await;
         }
+        let tasks = self
+            .hosted_cleanup
+            .release_tasks
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default();
+        for (_, task) in tasks {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     #[cfg(test)]
@@ -96,6 +109,16 @@ impl Motor {
         let task = self
             .hosted_cleanup
             .tasks
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|tasks| tasks.remove(&id));
+        if let Some(task) = task {
+            task.await.unwrap();
+        }
+        let task = self
+            .hosted_cleanup
+            .release_tasks
             .lock()
             .unwrap()
             .as_mut()
@@ -112,6 +135,7 @@ impl Motor {
     /// Own settlement independently of the caller's stream. In particular, an
     /// error delivering a pre-Run cancel must not abandon a granted booking.
     pub(super) fn recover_hosted(&self, id: Uuid) {
+        self.recover_hosted_releases(id);
         let Some(job) = self.storage.job(id) else {
             return;
         };
@@ -124,11 +148,8 @@ impl Motor {
         };
         if !state.booked_or_attempted()
             && state.pending_finish.is_none()
-            && !(state.terminal.is_some()
-                && state
-                    .placement
-                    .as_ref()
-                    .is_some_and(|p| p.host.starts_with("boat:")))
+            && state.terminal.is_none()
+            && state.lease_request.is_none()
         {
             return;
         }
@@ -175,6 +196,93 @@ impl Motor {
             id,
             tokio::spawn(async move { motor.cleanup_hosted(id).await }),
         );
+    }
+
+    pub(super) fn recover_hosted_releases(&self, id: Uuid) {
+        if !self
+            .storage
+            .job(id)
+            .and_then(|j| j.hosted)
+            .is_some_and(|s| !s.pending_releases.is_empty())
+        {
+            return;
+        }
+        let mut tasks = self.hosted_cleanup.release_tasks.lock().unwrap();
+        let Some(tasks) = tasks.as_mut() else { return };
+        tasks.retain(|_, task| !task.is_finished());
+        if tasks.contains_key(&id) {
+            return;
+        }
+        let motor = self.clone();
+        tasks.insert(
+            id,
+            tokio::spawn(async move {
+                let mut shutdown = motor.hosted_cleanup.shutdown.subscribe();
+                let mut backoff = 1;
+                loop {
+                    let stopping = *shutdown.borrow();
+                    match motor.release_hosted_pending(id).await {
+                        Ok(true) => {
+                            let mut tasks = motor.hosted_cleanup.release_tasks.lock().unwrap();
+                            if motor
+                                .storage
+                                .job(id)
+                                .and_then(|j| j.hosted)
+                                .is_none_or(|s| s.pending_releases.is_empty())
+                            {
+                                if let Some(tasks) = tasks.as_mut() {
+                                    tasks.remove(&id);
+                                }
+                                return;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => motor.log_hosted_failure(id, "release_recovery", error),
+                    }
+                    if stopping {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(backoff)) => {},
+                        _ = shutdown.changed() => {},
+                    }
+                    backoff = (backoff * 2).min(30);
+                }
+            }),
+        );
+    }
+
+    async fn release_hosted_pending(&self, id: Uuid) -> io::Result<bool> {
+        // Old releases have their own lane: a slow broker must not delay the
+        // active booking's finish or the caller's terminal.
+        let _release = self.storage.lock_pending_releases(id).await;
+        loop {
+            let Some(state) = self.storage.job(id).and_then(|j| j.hosted) else {
+                return Ok(true);
+            };
+            let Some(old_id) = state.pending_releases.first().copied() else {
+                return Ok(true);
+            };
+            match self.hosted_client(state).release_booking(old_id).await {
+                Ok(())
+                | Err(
+                    crate::hosted::Error::NotGranted
+                    | crate::hosted::Error::Released
+                    | crate::hosted::Error::Finished,
+                ) => {}
+                Err(error) => return Err(io::Error::other(error.code())),
+            }
+            self.storage.hosted_update(id, |s| {
+                s.pending_releases.retain(|pending| *pending != old_id)
+            })?;
+            if *self.hosted_cleanup.shutdown.borrow() {
+                return Ok(self
+                    .storage
+                    .job(id)
+                    .and_then(|j| j.hosted)
+                    .is_none_or(|s| s.pending_releases.is_empty()));
+            }
+        }
     }
 
     async fn cleanup_hosted(&self, id: Uuid) {
@@ -272,7 +380,16 @@ impl Motor {
             return Ok(true);
         }
         let client = self.hosted_client(state.clone());
-        if !state.run_sent {
+        if !state.run_sent
+            && !state.lease_attempted
+            && state.placement.is_none()
+            && state.retry_iat.is_none()
+        {
+            // A re-book can be cancelled or interrupted before its first HTTP
+            // request. Its refused predecessor belongs to the release lane.
+            self.storage
+                .hosted_settlement_update(id, true, |s| s.finish_done = true)?;
+        } else if !state.run_sent {
             tracing::info!(job_id = %id, step = "settlement_recovery", cause = "submission ended before Run", "settling unused hosted booking");
             if boat || state.pending_finish.is_some() {
                 client.finish_unused(id, &self.storage).await?;
@@ -388,6 +505,18 @@ impl Motor {
         for (_, task) in tasks {
             if let Err(error) = task.await {
                 tracing::warn!(%error, "hosted settlement task failed during shutdown");
+            }
+        }
+        let tasks = self
+            .hosted_cleanup
+            .release_tasks
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default();
+        for (_, task) in tasks {
+            if let Err(error) = task.await {
+                tracing::warn!(%error, "hosted release task failed during shutdown");
             }
         }
     }

@@ -123,32 +123,65 @@ async fn cancel_with_provisioning_request_in_flight_does_not_retry() {
     cancel_in_flight(false).await;
 }
 
-async fn cancel_after_grant(replacement_retry: bool) {
+async fn cancel_after_grant(fresh_request_retry: bool) {
     let _clock = HeldClock::new();
     let logs = crate::logging::Captured::default();
     let _logs = crate::logging::scoped(logs.clone());
     let h = Harness::new(Behavior::CompleteRun).await;
     h.host_refusals.lock().unwrap().push_back("host_full");
-    h.replace_replies.lock().unwrap().push_back((
-        503,
-        serde_json::json!({"error": if replacement_retry { "replace_pending" } else { "no_capacity" }}),
-        "30",
-    ));
     let (scratch, repo) = committed_repo();
     let motor = motor(&h, &scratch.0.join("state"), &repo);
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
-    until("replacement retry with a booked lease", || {
-        logs.text().contains("hosted broker retry wait")
+    until("durable fresh booking", || {
+        motor.hosted_state(id).unwrap().runner_id(id) != id
     })
     .await;
-    assert!(motor.hosted_state(id).unwrap().placement.is_some());
-    assert_eq!(
-        h.requests.lock().unwrap().as_slice(),
-        ["/v1/leases", &format!("/v1/leases/{id}/replace")]
-    );
+    let fresh = motor.hosted_state(id).unwrap().runner_id(id);
+    assert!(motor.hosted_state(id).unwrap().placement.is_none());
+    if fresh_request_retry {
+        h.lease_replies.lock().unwrap().push_back((
+            503,
+            serde_json::json!({"error":"no_capacity"}),
+            "30",
+        ));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        until("fresh booking capacity wait", || {
+            logs.text().contains("hosted broker retry wait")
+        })
+        .await;
+    }
     motor.cancel(CancelRequest::new(id)).await.unwrap();
-    assert_cancelled(&motor, &h, id, stream).await;
+    let task = tokio::spawn(terminal(stream));
+    until("re-book cancellation terminal", || task.is_finished()).await;
+    let terminal = task.await.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Cancelled);
+    assert_eq!(terminal.ran, Some(Ran::None));
+    until("old release acknowledged", || {
+        motor.hosted_state(id).unwrap().pending_releases.is_empty()
+    })
+    .await;
+    until("fresh booking settlement", || {
+        motor.hosted_state(id).unwrap().finish_done
+    })
+    .await;
+    let requests = h.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|p| **p == format!("/v1/leases/{id}/release"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|p| **p == format!("/v1/leases/{fresh}/release"))
+            .count(),
+        usize::from(fresh_request_retry)
+    );
+    assert!(!requests.iter().any(|p| p.ends_with("/replace")));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     motor.close().await;
 }
 
@@ -158,6 +191,6 @@ async fn cancel_after_grant_before_run_releases_the_booked_lease() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancel_during_replacement_retry_releases_the_booked_lease() {
+async fn cancel_during_fresh_booking_retry_releases_both_attempted_bookings() {
     cancel_after_grant(true).await;
 }

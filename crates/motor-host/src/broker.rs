@@ -520,7 +520,11 @@ impl Heartbeats {
         }
         self.probe_memory(&tenants, now_ms, due || changed)?;
         let mut host = self.runtime.host.lock().expect("host lock");
-        let memory = host.free_mem_mib(now_ms);
+        let memory = if matches!(host.settings, crate::config::HostSettings::PerJob(_)) {
+            host.job_placeable_mem_mib(now_ms)
+        } else {
+            host.free_mem_mib(now_ms)
+        };
         let heartbeat = host.heartbeat(now_ms, memory, healthy);
         let state = lifecycle_state(heartbeat.clone());
         if due || self.last_state.as_ref() != Some(&state) {

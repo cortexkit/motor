@@ -238,9 +238,11 @@ impl Motor {
         }
     }
     fn hosted_client(&self, state: crate::HostedJobState) -> crate::hosted::Client {
+        let motor = self.clone();
         let client = crate::hosted::Client::new(state)
             .with_account_tokens(self.account_tokens.clone())
-            .with_booking_gate(self.hosted_cleanup.booking_open.clone());
+            .with_booking_gate(self.hosted_cleanup.booking_open.clone())
+            .with_release_recovery(Arc::new(move |id| motor.recover_hosted_releases(id)));
         #[cfg(test)]
         let client = client.with_connector(self.hosted_connector.clone());
         client
@@ -952,6 +954,18 @@ impl Motor {
         };
         if let Some(detail) = detail {
             terminal = terminal.with_refusal_detail(bounded_detail(detail));
+        }
+        if self.hosted_state(id).is_some_and(|s| {
+            !s.run_sent && !s.lease_attempted && s.placement.is_none() && s.retry_iat.is_none()
+        }) {
+            // A re-book may exhaust the queue before its first HTTP request.
+            // There is no active booking to settle; retired IDs have their own
+            // durable release owner and must not keep this terminal pending.
+            self.storage.hosted_update(id, |s| {
+                s.finish_done = true;
+                s.billing = crate::BillingStatus::Unavailable;
+                s.terminal = Some(terminal.clone());
+            })?;
         }
         self.storage.local_terminal(terminal.clone())?;
         emit(tx, StreamRecord::Terminal(terminal)).await

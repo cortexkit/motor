@@ -466,6 +466,8 @@ impl State {
     }
 }
 
+type SettlementLocks = Mutex<BTreeMap<(Uuid, bool), Weak<tokio::sync::Mutex<()>>>>;
+
 /// Atomic, fsynced module storage next to the daemon's delivered store path.
 /// One process owns the lease; cancel intent is durable before a network attempt.
 pub(crate) struct Storage {
@@ -475,7 +477,7 @@ pub(crate) struct Storage {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
-    finish_locks: Mutex<BTreeMap<Uuid, Weak<tokio::sync::Mutex<()>>>>,
+    finish_locks: SettlementLocks,
     // Fields drop after `Drop for Storage` returns, so the lease is released
     // only once the compactor is joined and the final checkpoint is written.
     _lease: StoreLease,
@@ -526,11 +528,20 @@ impl Drop for JobLease {
 
 impl Storage {
     pub(crate) async fn lock_finish(&self, id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_settlement(id, false).await
+    }
+
+    pub(crate) async fn lock_pending_releases(&self, id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_settlement(id, true).await
+    }
+
+    async fn lock_settlement(&self, id: Uuid, releases: bool) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.finish_locks.lock().unwrap();
             locks.retain(|_, lock| lock.strong_count() > 0);
-            let lock = locks.get(&id).and_then(Weak::upgrade).unwrap_or_default();
-            locks.insert(id, Arc::downgrade(&lock));
+            let key = (id, releases);
+            let lock = locks.get(&key).and_then(Weak::upgrade).unwrap_or_default();
+            locks.insert(key, Arc::downgrade(&lock));
             lock
         };
         lock.lock_owned().await
@@ -545,7 +556,11 @@ impl Storage {
             .filter_map(|(id, job)| {
                 job.hosted
                     .as_ref()
-                    .filter(|s| s.booked_or_attempted() && !job.hosted_booking_complete())
+                    .filter(|s| {
+                        !s.pending_releases.is_empty()
+                            || (s.booked_or_attempted() || s.lease_request.is_some())
+                                && !job.hosted_booking_complete()
+                    })
                     .map(|_| *id)
             })
             .collect()

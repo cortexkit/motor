@@ -149,10 +149,13 @@ pub struct Harness {
     pub broker: Arc<Mutex<FakeBroker>>,
     pub requests: Arc<Mutex<Vec<String>>>,
     pub lease_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Lease request job, response status and decision time, including refusals.
+    pub lease_answers: ReplaceAnswers,
     pub lease_replies: LeaseReplies,
-    /// Model a revocation discovered by a lease re-request, not by this client.
-    pub lease_rerequest_pending: Arc<std::sync::atomic::AtomicBool>,
     pub replacement_hosts: ReplacementHosts,
+    /// Hosts chosen for successive fresh lease IDs; replays keep their host.
+    pub lease_hosts: ReplacementHosts,
+    pub release_replies: LeaseReplies,
     pub replace_replies: LeaseReplies,
     /// Replacement job, response status and answer time, including default replies.
     pub replace_answers: ReplaceAnswers,
@@ -196,8 +199,6 @@ pub struct Harness {
     /// records but never answers, holding its connection open as a broker
     /// that stopped responding would; 0 answers every request.
     pub unanswered_lease: Arc<AtomicUsize>,
-    /// Hold this 1-based replacement request open without answering it.
-    pub unanswered_replace: Arc<AtomicUsize>,
     /// Hold a parsed lease reply after the broker has decided whether to book it.
     pub lease_reply_gate: Arc<tokio::sync::watch::Sender<bool>>,
     pub tasks: Vec<JoinHandle<()>>,
@@ -831,18 +832,19 @@ impl Harness {
         let broker_url = format!("http://{}", http.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let lease_bodies = Arc::new(Mutex::new(Vec::new()));
+        let lease_answers = ReplaceAnswers::default();
         let lease_replies = Arc::new(Mutex::new(
             VecDeque::<(u16, serde_json::Value, &'static str)>::new(),
         ));
         let replacement_hosts = ReplacementHosts::default();
-        let lease_rerequest_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease_hosts = ReplacementHosts::default();
+        let release_replies = LeaseReplies::default();
         let replace_replies = LeaseReplies::default();
         let replace_answers = ReplaceAnswers::default();
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let unanswered_lease = Arc::new(AtomicUsize::new(0));
-        let unanswered_replace = Arc::new(AtomicUsize::new(0));
         let lease_reply_gate = Arc::new(tokio::sync::watch::Sender::new(true));
         let http_task = tokio::spawn({
             let timeline = timeline.clone();
@@ -850,23 +852,23 @@ impl Harness {
             let capacity = capacity.clone();
             let requests = requests.clone();
             let lease_bodies = lease_bodies.clone();
+            let lease_answers = lease_answers.clone();
             let lease_replies = lease_replies.clone();
-            let lease_rerequest_pending = lease_rerequest_pending.clone();
             let replacement_hosts = replacement_hosts.clone();
+            let lease_hosts = lease_hosts.clone();
+            let release_replies = release_replies.clone();
             let replace_replies = replace_replies.clone();
             let replace_answers = replace_answers.clone();
             let finished = finished.clone();
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
             let unanswered_lease = unanswered_lease.clone();
-            let unanswered_replace = unanswered_replace.clone();
             let lease_reply_gate = lease_reply_gate.clone();
             let run_gate = run_gate.clone();
             async move {
                 // Connections of unanswered requests, kept open until the
                 // harness is dropped and aborts this task.
                 let mut unanswered = Vec::new();
-                let mut replace_count = 0;
                 let mut placements = std::collections::BTreeMap::new();
                 let mut reservations =
                     std::collections::BTreeMap::<String, serde_json::Value>::new();
@@ -919,13 +921,6 @@ impl Harness {
                     socket.read_exact(&mut body).await.unwrap();
                     timeline.mark(format!("broker request {path}"));
                     requests.lock().unwrap().push(path.clone());
-                    if path.ends_with("/replace") {
-                        replace_count += 1;
-                        if replace_count == unanswered_replace.load(Ordering::SeqCst) {
-                            unanswered.push(socket);
-                            continue;
-                        }
-                    }
                     if path.ends_with("/reattach") && matches!(behavior, Behavior::RefuseAttach(_))
                     {
                         let mut gate = run_gate.subscribe();
@@ -942,9 +937,14 @@ impl Harness {
                             continue;
                         }
                         let job: LeaseRequest = serde_json::from_slice(&body).unwrap();
-                        if revoking.contains(&job.job_id)
-                            || (number > 1 && lease_rerequest_pending.load(Ordering::SeqCst))
+                        if !lease_requests.contains_key(&job.job_id)
+                            && !placements.contains_key(&job.job_id)
                         {
+                            if let Some(next) = lease_hosts.lock().unwrap().pop_front() {
+                                placements.insert(job.job_id.clone(), next);
+                            }
+                        }
+                        if revoking.contains(&job.job_id) {
                             Some((503, serde_json::json!({"error":"replace_pending"}), "1"))
                         } else {
                             lease_replies.lock().unwrap().pop_front().or_else(|| {
@@ -969,6 +969,8 @@ impl Harness {
                                     .broker_answer(lease["job_id"].as_str()?, vcpus)
                             })
                         }
+                    } else if path.ends_with("/release") {
+                        release_replies.lock().unwrap().pop_front()
                     } else {
                         None
                     };
@@ -1015,7 +1017,10 @@ impl Harness {
                     } else {
                         let job = path
                             .strip_prefix("/v1/leases/")
-                            .and_then(|path| path.strip_suffix("/release"))
+                            .and_then(|path| {
+                                path.strip_suffix("/release")
+                                    .or_else(|| path.strip_suffix("/finish"))
+                            })
                             .map(str::to_owned)
                             .or_else(|| {
                                 serde_json::from_slice::<serde_json::Value>(&body)
@@ -1057,6 +1062,14 @@ impl Harness {
                             tokio::time::Instant::now(),
                         ));
                     }
+                    if path == "/v1/leases" {
+                        let request: LeaseRequest = serde_json::from_slice(&body).unwrap();
+                        lease_answers.lock().unwrap().push((
+                            request.job_id,
+                            reply.status,
+                            tokio::time::Instant::now(),
+                        ));
+                    }
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
                         continue;
                     }
@@ -1085,9 +1098,11 @@ impl Harness {
             broker,
             requests,
             lease_bodies,
+            lease_answers,
             lease_replies,
-            lease_rerequest_pending,
             replacement_hosts,
+            lease_hosts,
+            release_replies,
             replace_replies,
             replace_answers,
             tokens,
@@ -1108,7 +1123,6 @@ impl Harness {
             attach_history_expired,
             drop_follow,
             unanswered_lease,
-            unanswered_replace,
             lease_reply_gate,
             tasks: vec![host_task, http_task],
         }
