@@ -229,6 +229,48 @@ fn workspace_changes_compare_snapshot_modes_symlinks_and_clean_filters() {
     assert_eq!(changes, ["executable", "link"]);
 }
 
+#[cfg(unix)]
+#[test]
+fn workspace_changes_report_oversized_snapshot_file_changed() {
+    let scratch = ScratchDir::new("motor-workspace-changes-size-cap");
+    let repo = committed_repo(&scratch, "size-cap");
+    let file = fs::File::create(repo.join("oversized")).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+    let entry = SnapshotEntry {
+        mode: "100644".into(),
+        blob: git(&repo, &["hash-object", "oversized"]).unwrap(),
+    };
+    assert!(
+        !matches_snapshot(&ChangeScan::trusted(&repo), Path::new("oversized"), &entry).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_changes_confine_snapshot_symlink_leaf_parents() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = ScratchDir::new("motor-workspace-changes-link-parent");
+    let repo = committed_repo(&scratch, "link-parent");
+    fs::create_dir(repo.join("src")).unwrap();
+    symlink("missing-target", repo.join("src/link")).unwrap();
+    let mut hash = git_command(&repo);
+    hash.args(["hash-object", "--stdin"]);
+    let output = git_input(hash, b"missing-target").unwrap();
+    assert!(output.status.success());
+    let entry = SnapshotEntry {
+        mode: "120000".into(),
+        blob: String::from_utf8(output.stdout).unwrap().trim().into(),
+    };
+    let scan = || matches_snapshot(&ChangeScan::trusted(&repo), Path::new("src/link"), &entry);
+    assert!(scan().unwrap());
+    fs::rename(repo.join("src"), scratch.join("sentinel")).unwrap();
+    symlink("../sentinel", repo.join("src")).unwrap();
+    assert!(!scan().unwrap());
+    fs::remove_dir_all(scratch.join("sentinel")).unwrap();
+    assert!(!scan().unwrap());
+}
+
 /// A repository with one committed file, `source`.
 fn committed_repo(root: &Path, name: &str) -> PathBuf {
     let repo = root.join(name);

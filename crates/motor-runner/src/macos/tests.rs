@@ -563,6 +563,91 @@ fn workspace_changes_do_not_enter_guest_submodule_metadata() {
     assert!(!marker.exists());
 }
 
+fn linked_snapshot_ancestor(relative: bool, nested: bool) {
+    let f = Fixture::new();
+    let directory = if nested { "target/sub" } else { "src" };
+    let name = format!("{directory}/file");
+    write(&f.source.join(&name), "committed\n");
+    let mut request = f.request();
+    write(&f.source.join(&name), "caller edit\n");
+    (request.snapshot_commit, request.tree_hash) = commit(&f.source);
+    let mirror = f.staging.trees.mirror(&request.repository_root);
+    git(&mirror, &["fetch", f.source.to_str().unwrap(), "HEAD"]);
+
+    let sentinel = f.scratch.join("sentinel");
+    write(&sentinel.join("file"), "caller edit\n");
+    host::rename(f.source.join(directory), f.source.join("moved")).unwrap();
+    let target = if relative {
+        PathBuf::from(if nested {
+            "../../sentinel"
+        } else {
+            "../sentinel"
+        })
+    } else {
+        sentinel.clone()
+    };
+    symlink(target, f.source.join(directory)).unwrap();
+    let scan = || {
+        let mut changes = f
+            .staging
+            .trees
+            .changes_for_guest(&f.source, &[], &request)
+            .unwrap();
+        changes.sort();
+        changes
+    };
+    let expected = scan();
+    assert!(expected.contains(&name), "{expected:?}");
+    write(&sentinel.join("file"), "different\n");
+    assert_eq!(scan(), expected);
+    // A dangling ancestor link must not reveal whether its target exists.
+    host::remove_dir_all(&sentinel).unwrap();
+    assert_eq!(scan(), expected);
+}
+
+#[test]
+fn workspace_changes_do_not_follow_absolute_snapshot_ancestors() {
+    linked_snapshot_ancestor(false, false);
+}
+
+#[test]
+fn workspace_changes_do_not_follow_relative_snapshot_ancestors() {
+    linked_snapshot_ancestor(true, false);
+}
+
+#[test]
+fn workspace_changes_do_not_follow_nested_snapshot_ancestors() {
+    linked_snapshot_ancestor(true, true);
+}
+
+#[test]
+fn workspace_changes_gitlink_probe_does_not_follow_ancestors() {
+    let f = Fixture::new();
+    let module = f.source.join("src/module");
+    host::create_dir_all(&module).unwrap();
+    git(&module, &["init"]);
+    write(&module.join("file"), "module\n");
+    commit(&module);
+    let request = f.request();
+    let sentinel = f.scratch.join("sentinel");
+    host::create_dir_all(sentinel.join("module")).unwrap();
+    host::rename(f.source.join("src"), f.source.join("moved")).unwrap();
+    symlink(&sentinel, f.source.join("src")).unwrap();
+    let scan = || {
+        f.staging
+            .trees
+            .changes_for_guest(&f.source, &[], &request)
+            .unwrap_err()
+            .to_string()
+    };
+    let expected = scan();
+    assert!(expected.contains("guest submodule metadata"), "{expected}");
+    write(&sentinel.join("module/.git"), "host metadata\n");
+    assert_eq!(scan(), expected);
+    host::remove_dir_all(&sentinel).unwrap();
+    assert_eq!(scan(), expected);
+}
+
 #[test]
 fn workspace_changes_prune_only_results_without_a_live_job() {
     let runtime = lifecycle::Runtime::default();
