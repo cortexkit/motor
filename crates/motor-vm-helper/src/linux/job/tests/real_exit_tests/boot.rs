@@ -123,17 +123,19 @@ pub(super) fn boot(jobs: &LinuxJobs, artifacts: &Artifacts, mut start: Start) ->
         let pid = child.id();
         state.child = Some(child);
         state.pidfd = Some(Arc::new(memory::pin_pidfd(pid)?));
-        set_job_oom_score(
-            pid,
-            read_oom_score(std::process::id())?,
-            read_oom_score(std::process::id())?,
-        )?;
         let root_fd = File::open(&root)?;
         let short_root = PathBuf::from(format!("/proc/self/fd/{}", root_fd.as_raw_fd()));
         drop(crate::linux::wait_socket(
             &short_root.join("api.sock"),
             Duration::from_secs(10),
         )?);
+        // As in production: the spawned pid runs the jailer until it execs
+        // Firecracker, so its name is checked only once the API socket exists.
+        set_job_oom_score(
+            pid,
+            read_oom_score(std::process::id())?,
+            read_oom_score(std::process::id())?,
+        )?;
         jobs.boot_api_requests(&short_root, requests)?;
         Ok(())
     })
