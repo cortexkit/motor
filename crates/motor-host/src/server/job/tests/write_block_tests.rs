@@ -142,3 +142,91 @@ async fn block_set_during_boot_retries_failed_resync_and_stops_unacknowledged_vm
         runtime.stop_job(JOB, true, false).unwrap();
     }
 }
+
+#[tokio::test]
+async fn undelivered_live_refusal_owns_reply_when_replay_publishes_before_boot_error() {
+    let (runtime, fake, _storage) = fixture();
+    hold_boot(&runtime, &fake, "runner");
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, id).await;
+    queued(&mut client, JOB).await;
+    tokio::time::timeout(Duration::from_secs(2), fake.entered.notified())
+        .await
+        .unwrap();
+    let gate = Arc::new(RelayResultGate::default());
+    *runtime.job_launches.lock().unwrap()[JOB]
+        .relay_result_gate
+        .lock()
+        .unwrap() = Some(gate.clone());
+    *fake.write_block_errors.lock().unwrap() = 4;
+    let blocked = runtime
+        .host_admin(&json!({"op":"set_remote_cache_write_block","blocked":true}))
+        .unwrap();
+    assert_eq!(blocked["not_acknowledged"], json!([JOB]));
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+
+    // The replay terminal is committed, but boot cannot return its error yet.
+    // Wake the session to force its ended-job replay path.
+    let stream = runtime.job_stream(JOB).unwrap();
+    let stored = stream
+        .with_store(|store| {
+            assert!(store.ended());
+            crate::replay::decode(&store.frame(0)?.unwrap())
+        })
+        .unwrap();
+    assert_eq!(stored["type"], "terminal");
+    assert_eq!(stored["ran"], "none");
+    assert_eq!(stored["outcome"]["reason"], "internal_failure");
+    assert_eq!(
+        stored["refusal_detail"],
+        "execution ended before Run delivery"
+    );
+    assert!(!runtime.host.lock().unwrap().snapshot.leases[JOB].delivered);
+    assert!(fake.inputs.lock().unwrap().is_empty());
+    write_frame(&mut client, &json!({"type":"heartbeat"}))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        next_type(&mut client, "lease_refused"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reply,
+        json!({"type":"lease_refused","reason":"internal_failure"})
+    );
+    task.await.unwrap().unwrap();
+    assert!(
+        read_frame(&mut client).await.is_err(),
+        "one live reply only"
+    );
+    runtime.host.lock().unwrap().close(id).unwrap();
+
+    let mut attach = claims(JOB);
+    attach.purpose = Purpose::Attach;
+    let attach_id = runtime
+        .host
+        .lock()
+        .unwrap()
+        .claim(attach.clone(), unix_ms())
+        .unwrap()
+        .0;
+    let (mut client, task) = start(runtime.clone(), attach, attach_id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(
+        &mut client,
+        &json!({"type":"attach","job_id":JOB,"from_seq":0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next_type(&mut client, "terminal").await, stored);
+    task.await.unwrap().unwrap();
+}

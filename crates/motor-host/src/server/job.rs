@@ -16,6 +16,15 @@ pub(super) struct Launch {
     pending: AtomicBool,
     prestart_limit_ms: Mutex<Option<u64>>,
     boot_ready_at_ms: Mutex<Option<u64>>,
+    #[cfg(test)]
+    relay_result_gate: Mutex<Option<Arc<RelayResultGate>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RelayResultGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 struct LaunchSession(Arc<Launch>);
@@ -1059,6 +1068,12 @@ fn refusal(job: &str, reason: &str, detail: &str) -> Value {
         "workspace_changes":null,"refusal_detail":detail})
 }
 
+fn is_internal_failure_refusal(frame: &Value) -> bool {
+    frame["type"] == "terminal"
+        && frame["ran"] == "none"
+        && frame["outcome"]["reason"] == "internal_failure"
+}
+
 struct QueueClock {
     at: tokio::time::Instant,
     elapsed_ms: u64,
@@ -1181,11 +1196,7 @@ async fn failed<S: AsyncWrite + Unpin>(
         .filter(|frames| {
             // Keep the live pre-delivery error reply as lease_refused; the
             // replay terminal still records the durable refusal for reattach.
-            !frames.iter().any(|frame| {
-                frame["type"] == "terminal"
-                    && frame["ran"] == "none"
-                    && frame["outcome"]["reason"] == "internal_failure"
-            })
+            !frames.iter().any(is_internal_failure_refusal)
         });
     if let Some(frames) = frames {
         for frame in frames {
@@ -1487,11 +1498,30 @@ async fn boot(
     let control = runtime.control.clone();
     let job = execution.claims.jti.clone();
     let r = runtime.clone();
+    #[cfg(test)]
+    let relay_result_gate = runtime.job_launches.lock().unwrap()[&job]
+        .relay_result_gate
+        .lock()
+        .unwrap()
+        .clone();
+    #[cfg(test)]
+    let notify_relay_result = relay_result_gate.clone();
     let stream = tokio::task::spawn_blocking(move || {
-        r.sync_remote_cache_write_block(&job, true)?;
-        control.job_relay(&job, 52)
+        let result = r
+            .sync_remote_cache_write_block(&job, true)
+            .and_then(|()| control.job_relay(&job, 52));
+        #[cfg(test)]
+        if let Some(gate) = notify_relay_result {
+            gate.entered.notify_one();
+        }
+        result
     })
-    .await??;
+    .await?;
+    #[cfg(test)]
+    if let Some(gate) = relay_result_gate {
+        gate.release.notified().await;
+    }
+    let stream = stream?;
     stream.set_nonblocking(true)?;
     let mut stream = tokio::net::UnixStream::from_std(stream)?;
     let mut lease = verified_lease(&execution.claims, true);
