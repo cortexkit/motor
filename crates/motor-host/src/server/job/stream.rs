@@ -839,6 +839,17 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 && !is_reply(&value)
                 && value["seq"].as_u64().is_none_or(|seq| seq >= minimum)
             {
+                if !hello && is_internal_failure_refusal(&value) && {
+                    let host = runtime.host.lock().expect("host lock");
+                    host.snapshot.per_job.executions[&claims.jti].boot_started
+                        && !host.snapshot.leases[&claims.jti].delivered
+                } {
+                    // Replay may commit a boot failure before boot returns its
+                    // error. After boot starts, failed() owns the live internal
+                    // failure reply; before boot, the stored terminal does.
+                    // Reconnects still receive the durable terminal unchanged.
+                    anyhow::bail!("execution ended before Run delivery");
+                }
                 write
                     .write_all(&bytes)
                     .await
