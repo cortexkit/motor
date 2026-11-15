@@ -7,7 +7,7 @@
 #
 # <motor-macvm> is the VM helper built from this checkout and signed with
 # virtualization.entitlements, as for image building. <sealed-image> is a sealed
-# image directory whose guest agent speaks macOS protocol version 2; it is only
+# image directory whose guest agent speaks macOS protocol version 3; it is only
 # cloned, never written. The work directory must not exist yet; everything the
 # probe creates goes there, never in a runner's state root.
 #
@@ -17,38 +17,43 @@
 # fresh APFS clone of the image, through the same job helper the runner starts:
 #
 # 1. In VM A the image's guest agent finds the blank build disk, formats it,
-#    mounts it at the checkout's target/ and runs a command that prints the
+#    mounts it at /private/var/motor/build and runs a command that prints the
 #    mount line (with its flags), what diskutil says about the device (internal
-#    or removable, encrypted or not), writes a file into the checkout root,
-#    pauses, builds a small Cargo package and writes a marker file.
+#    or removable, encrypted or not), the checkout's target link and
+#    CARGO_TARGET_DIR, writes a file into the checkout root, pauses 3 s, builds
+#    a small Cargo package, waits 11 s and writes a marker file.
 # 2. After VM A has stopped, VM B gets VM A's disk, as the runner hands a
 #    checkout's kept disk to its next job. Its agent mounts the existing volume,
 #    or prints "the build disk could not be used (<mount error>)" and reformats.
 #    The command prints the mount line, does the same steps and reads the marker.
 #
 # Each VM is set up as the runner sets up a job: workspace and cargo-home
-# shares, a checkout whose directories (target/ included) have mode 0700, and
-# a returned file under target/ (debug/buildcheck) that the agent copies out
-# of the volume. After every step the command prints "check <step>: volume" or
-# "check <step>: share (...)" when target/ no longer reaches the build volume,
-# as happened in a runner job during its Cargo build. After each VM stops, the
-# probe lists the shared target/ ("share target:" lines); it must hold only
-# the returned file. The probe does not reproduce the runner's Git checkout,
-# read-only sealing of source files, source timestamps or caller environment.
+# shares, a checkout whose directories have mode 0700 and whose target is a
+# link to /private/var/motor/build, and a returned file under target/
+# (debug/buildcheck) that the agent copies out of the volume into the
+# cargo-home share. After every step the command prints "check <step>: volume"
+# or "check <step>: share (...)" when target/ or CARGO_TARGET_DIR no longer
+# reaches the build volume; a volume mounted over the shared target/ directory
+# stopped being reached about 3.5 s after mounting. After each VM stops, the
+# probe lists the agent's returns directory ("returns:" lines), which must hold
+# only the returned file, and reads the checkout's target link ("target link:").
+# The probe does not reproduce the runner's Git checkout, read-only sealing of
+# source files, source timestamps or caller environment.
 #
 # Each build disk is a sparse file of 128 GiB, the exact size by which the agent
 # recognizes it; it allocates only what the guests write.
 #
 # Output lines: "stdout:"/"stderr:" are the guest command's, "helper:" the job
-# helper's status reports, "share target:" what the host found in the shared
-# target/, and "RESULT <bus>:" the verdict for each attachment. An agent with
-# the build-volume watch also prints one "motor: build-volume diagnostic
-# watch:" line saying whether, and how long after mounting, target/ stopped
+# helper's status reports, "returns:" and "target link:" what the host found
+# after the VM stopped, and "RESULT <bus>:" the verdict for each attachment.
+# The agent also prints one "motor: build-volume diagnostic watch:" line saying
+# whether, and how long after mounting, the build mount or target stopped
 # reaching the volume. The script exits 0 only when, with the attachment job
 # VMs now use (USB), target/ reached the volume at every step in both VMs, the
-# shared target/ held only the returned file, and VM B mounted VM A's volume. The full log is kept beside the work directory as
-# <work directory>.log. The work directory is deleted afterwards unless
-# MOTOR_PROBE_KEEP=1 is set.
+# returns directory held only the returned file, target was still the link,
+# and VM B mounted VM A's volume. The full log is kept beside the work
+# directory as <work directory>.log. The work directory is deleted afterwards
+# unless MOTOR_PROBE_KEEP=1 is set.
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
@@ -106,6 +111,6 @@ status=0
 "$helper" build-disk-probe "$image_real" "$work" 2>&1 | tee "$work.log" || status=$?
 echo
 echo "summary:"
-grep -E '^(RESULT|stdout: (mount|diskutil|check [a-z-]+|cargo):|stderr: motor:|share target:)' "$work.log" || true
+grep -E '^(RESULT|stdout: (mount|diskutil|target|cargo-target-dir|check [a-z-]+|cargo):|stderr: motor:|returns:|target link:)' "$work.log" || true
 echo "full log: $work.log"
 exit "$status"

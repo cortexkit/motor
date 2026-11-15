@@ -212,10 +212,11 @@ There is no full-copy fallback.
 3. Re-run installed-daemon qualification before deploying the new image. Portable
    tests cannot prove APFS cloning, code-signing/TCC behavior, or guest startup.
 
-Agents speaking macOS protocol version 2 format and mount each job's build disk
-at `target/` (see `docs/macos-runner.md`). The runner refuses an image whose agent
-reports version 1, so install the runner and an image carrying a version 2 agent
-together. The offline agent update above is enough: nothing else in the
+Agents speaking macOS protocol version 3 format and mount each job's build disk
+at `/private/var/motor/build`, give it to jobs as `CARGO_TARGET_DIR` and reach it
+from the checkout's `target` link (see `docs/macos-runner.md`). The runner refuses
+an image whose agent reports any other version, so install the runner and an
+image carrying a version 3 agent together. The offline agent update above is enough: nothing else in the
 sealed image changes, so the image need not be rebuilt and resealed. The agent
 uses only tools every macOS guest has: `/usr/sbin/diskutil`, `/usr/bin/plutil` and
 `/sbin/mount_apfs`. After installing, run

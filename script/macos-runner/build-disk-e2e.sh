@@ -1,7 +1,7 @@
 #!/bin/bash
 # Operator end-to-end check of macOS build disks. Run it on the macOS VM host,
 # as an account that can submit jobs, after installing a runner and an image
-# whose guest agent speaks macOS protocol version 2:
+# whose guest agent speaks macOS protocol version 3:
 #
 #   script/macos-runner/build-disk-e2e.sh <new checkout under /Users> [<runner state root>]
 #
@@ -9,11 +9,13 @@
 # and runs two jobs on it through `ck motor run --platform macos`
 # (MOTOR_CK names another client binary). It proves:
 #
-# 1. The first job sees target/ as a separate APFS volume, mounted
-#    nosuid,nodev, owned by the job account: the agent found the build disk,
-#    formatted it and mounted it. Cargo compiles the crate there, and a file
-#    returned from target/ is installed in this checkout with the hash the job
-#    printed.
+# 1. The first job sees the build disk as a separate APFS volume mounted
+#    nosuid,nodev at /private/var/motor/build, owned by the job account, with
+#    CARGO_TARGET_DIR set to it and target a link to it: the agent found the
+#    build disk, formatted it and mounted it. Cargo compiles the crate there,
+#    target/ still reaches the volume more than 10 seconds after the build,
+#    and a file returned from target/ is installed in this checkout with the
+#    hash the job printed.
 # 2. The second job finds the first job's marker and Cargo compiles nothing:
 #    the runner published the first job's disk and attached a clone of it.
 #    Neither job printed the "reformatted" notice.
@@ -84,22 +86,27 @@ run_job() {
   [[ $status -eq 0 ]] || fail "$name: job exited with status $status"
 }
 
-# The mount table line for target/ looks like
-# "/dev/disk5s1 on /Users/x/checkout/target (apfs, local, nodev, nosuid, ...)".
+# The mount table line for the build volume looks like
+# "/dev/disk5s1 on /private/var/motor/build (apfs, local, nodev, nosuid, ...)".
 # The job's shell expands these scripts, not this one.
 # shellcheck disable=SC2016
 first_command='set -eu
-line=$(mount | grep -F " on $PWD/target (")
+line=$(mount | grep -F " on /private/var/motor/build (")
 echo "mount: $line"
-case "$line" in *"(apfs,"*) ;; *) echo "target is not an APFS volume" >&2; exit 1 ;; esac
-case "$line" in *nosuid*) ;; *) echo "target is not nosuid" >&2; exit 1 ;; esac
-case "$line" in *nodev*) ;; *) echo "target is not nodev" >&2; exit 1 ;; esac
-test "$(stat -f %d target)" != "$(stat -f %d .)"
-test "$(stat -f %u target)" = "$(id -u)"
+case "$line" in *"(apfs,"*) ;; *) echo "the build mount is not an APFS volume" >&2; exit 1 ;; esac
+case "$line" in *nosuid*) ;; *) echo "the build mount is not nosuid" >&2; exit 1 ;; esac
+case "$line" in *nodev*) ;; *) echo "the build mount is not nodev" >&2; exit 1 ;; esac
+test "$CARGO_TARGET_DIR" = /private/var/motor/build
+test "$(readlink target)" = /private/var/motor/build
+test "$(stat -L -f %d target)" != "$(stat -f %d .)"
+test "$(stat -L -f %u target)" = "$(id -u)"
 test ! -e target/e2e-marker
 cargo build 2>build.log || { cat build.log >&2; exit 1; }
 cat build.log >&2
 grep -q "Compiling buildcheck" build.log
+sleep 11
+test "$(stat -L -f %d target)" = "$(stat -f %d "$CARGO_TARGET_DIR")"
+test "$(stat -L -f %d target)" != "$(stat -f %d .)"
 echo first >target/e2e-marker
 echo "sha256: $(shasum -a 256 target/debug/buildcheck | cut -d" " -f1)"'
 run_job first --return-path "$checkout/target/debug/buildcheck" -- bash -c "$first_command"

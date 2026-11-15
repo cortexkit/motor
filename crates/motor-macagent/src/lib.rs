@@ -146,10 +146,12 @@ mod execution {
             ("PATH", PATH.to_owned()),
             ("RUSTUP_HOME", "/opt/motor/rustup".to_owned()),
             ("CARGO_HOME", cargo_home.to_string_lossy().into_owned()),
+            // The build volume's fixed mount, so Cargo builds there whatever
+            // the job does to the checkout's `target` link.
+            ("CARGO_TARGET_DIR", motor_macvm::BUILD_MOUNT.to_owned()),
         ] {
             env.insert(key.to_owned(), value);
         }
-        env.remove("CARGO_TARGET_DIR");
         env
     }
 
@@ -377,14 +379,15 @@ mod execution {
         cargo_home: PathBuf,
         temporary_root: PathBuf,
         scope: Arc<KillScope>,
-        /// Mounted at `target/` before the command and unmounted before its
+        /// Mounted at `BUILD_MOUNT` before the command and unmounted before its
         /// exit is reported. Only tests run without one.
         build: Option<Box<dyn crate::build_volume::BuildVolume>>,
     }
 
     /// Only the root launch daemon calls this entry point. Tests use a private
     /// process group instead of the real job uid, so they cannot kill other jobs.
-    /// `mounts` is the verified boot map; its workspace share holds `target/`.
+    /// `mounts` is the verified boot map; its workspace share holds the
+    /// checkout's `target` link, and its cargo-home share receives returned files.
     pub async fn serve_guest<S>(
         stream: S,
         nonce: String,
@@ -607,7 +610,7 @@ mod execution {
         let Frame::TreeEnd { command } = receive(&mut reader, &protocol).await? else {
             return Err(io::Error::other("expected command"));
         };
-        // No job code runs until the build volume covers target/. A failure
+        // No job code runs until the build volume is mounted. A failure
         // runs no command: the caller gets the reason as one stderr line, which
         // the protocol only carries after Started, and the session then closes
         // without Exit, so the host publishes nothing.
@@ -765,7 +768,7 @@ mod execution {
         // Every job process is gone. The exit is reported once the build
         // volume is released. A failed release still reports the command's
         // exit, after one last stderr line giving the reason; that line tells
-        // the host not to publish the disk or read the shared target/.
+        // the host not to publish the disk or read returned files under target/.
         let watch = settings
             .build
             .as_mut()
@@ -1108,7 +1111,9 @@ mod execution {
             assert_eq!(env["CARGO_HOME"], "/opt/motor/job/cargo-home");
             assert_eq!(env["RUST_BACKTRACE"], "1");
             assert_eq!(env["CARGO_BUILD_JOBS"], "4");
-            for key in ["CARGO_TARGET_DIR", "CARGO_REGISTRY_TOKEN", "BASH_ENV"] {
+            // Pinned to the build volume's mount, never the caller's value.
+            assert_eq!(env["CARGO_TARGET_DIR"], "/private/var/motor/build");
+            for key in ["CARGO_REGISTRY_TOKEN", "BASH_ENV"] {
                 assert!(!env.contains_key(key));
             }
         }

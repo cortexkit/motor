@@ -642,9 +642,9 @@ fn kept_disk_of_another_size_is_not_cloned_and_a_resized_job_disk_is_not_publish
     finish(&runtime, &root, &entry);
 }
 #[test]
-fn staged_target_becomes_an_empty_directory_without_following_a_link() {
+fn staged_target_becomes_the_link_to_the_build_mount_without_following_a_link() {
     use std::os::unix::fs::symlink;
-    let scratch = ScratchDir::new("macos-target-mount-point");
+    let scratch = ScratchDir::new("macos-target-link");
     let root = scratch.join("state");
     let staged = staged(&root, Uuid::now_v7());
     let sentinel = scratch.join("sentinel");
@@ -653,15 +653,59 @@ fn staged_target_becomes_an_empty_directory_without_following_a_link() {
     symlink(&sentinel, staged.workspace.join("target")).unwrap();
     target_in(&staged).unwrap();
     let target = staged.workspace.join("target");
-    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
-    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_link(&target).unwrap(),
+        Path::new("/private/var/motor/build")
+    );
     assert_eq!(
         std::fs::read_to_string(sentinel.join("whole")).unwrap(),
         "unchanged"
     );
+    assert!(target_link_kept(&staged));
+    // A snapshot's own target/ directory is replaced too.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir(&target).unwrap();
     std::fs::write(target.join("stale"), "from the checkout").unwrap();
+    assert!(!target_link_kept(&staged));
     target_in(&staged).unwrap();
-    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    assert!(target_link_kept(&staged));
+}
+
+/// After the job, only the very link the runner made counts as kept, and any
+/// link at `target` is removed before the change scan, never followed.
+#[test]
+fn a_replaced_target_link_is_not_kept_and_every_link_is_removed_unfollowed() {
+    use std::os::unix::fs::symlink;
+    let scratch = ScratchDir::new("macos-target-kept");
+    let staged = staged(&scratch.join("state"), Uuid::now_v7());
+    let target = staged.workspace.join("target");
+    assert!(!target_link_kept(&staged));
+    remove_target_link(&staged).unwrap();
+    let sentinel = scratch.join("sentinel");
+    std::fs::create_dir(&sentinel).unwrap();
+    std::fs::write(sentinel.join("whole"), "unchanged").unwrap();
+    for link in [
+        sentinel.as_path(),
+        Path::new("/private/var/motor/build/"),
+        Path::new("/private/var/motor/other"),
+    ] {
+        symlink(link, &target).unwrap();
+        assert!(!target_link_kept(&staged), "{link:?}");
+        remove_target_link(&staged).unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_err());
+    }
+    assert_eq!(
+        std::fs::read_to_string(sentinel.join("whole")).unwrap(),
+        "unchanged"
+    );
+    target_in(&staged).unwrap();
+    remove_target_link(&staged).unwrap();
+    assert!(std::fs::symlink_metadata(&target).is_err());
+    // A directory or file the job left there is its own output: kept.
+    std::fs::create_dir(&target).unwrap();
+    assert!(!target_link_kept(&staged));
+    remove_target_link(&staged).unwrap();
+    assert!(target.is_dir());
 }
 /// A chunked-return request in `/Users/test/repo` for these paths and cap.
 fn request(paths: &[&str], cap: u64) -> motor_protocol::Run {
@@ -755,16 +799,26 @@ fn guest_placeholder_is_never_returned_as_content() {
         &copies,
     )
     .unwrap();
+    // The agent places them in the directory it creates in the cargo-home
+    // share, which the host reads for target/ paths.
+    std::fs::create_dir_all(&staged.cargo_home).unwrap();
+    let share = std::fs::File::open(&staged.cargo_home).unwrap();
     place_returns(
-        &std::fs::File::open(staged.workspace.join("target")).unwrap(),
+        &motor_macagent::build_volume::returns_directory(&share).unwrap(),
         &placed,
         &copies,
     )
     .unwrap();
     let job = scratch.join("job");
     std::fs::create_dir(&job).unwrap();
+    let returns = staged.cargo_home.join(motor_macvm::TARGET_RETURNS);
     let crate::return_paths::Collection::Chunked(collection) =
-        crate::return_paths::collect_staged(&request, &staged.workspace, &job)
+        crate::return_paths::collect_staged_with_target(
+            &request,
+            &staged.workspace,
+            Some(&returns),
+            &job,
+        )
     else {
         panic!("chunked request collected without chunks");
     };

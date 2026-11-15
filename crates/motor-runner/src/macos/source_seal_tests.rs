@@ -204,6 +204,47 @@ fn unchanged_file_keeps_time_across_staged_jobs_and_changed_file_advances() {
 }
 
 #[test]
+fn snapshot_files_under_the_root_target_link_get_no_source_time() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let f = Tree::new();
+    let destination = "/Users/motor/repo";
+    // The runner's target link; here it leads to a host directory holding a
+    // file of the same name, which planning would see if it followed it.
+    let outside = f.file("outside/app");
+    let before = std::fs::metadata(&outside).unwrap().modified().unwrap();
+    f.file("staged/repo/src/main.rs");
+    std::os::unix::fs::symlink(f.0.join("outside"), f.0.join("staged/repo/target")).unwrap();
+    let trees = vec![crate::source_mtimes::Tree {
+        destination: destination.into(),
+        prefix: "repo".into(),
+        entries: b"100644 blob aa\tsrc/main.rs\x00100644 blob bb\ttarget/app\x00100644 blob cc\tTarget/app\x00"
+            .to_vec(),
+    }];
+    let selected = plan(
+        ["src/main.rs", "target/app"].map(PathBuf::from),
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    let store = f.0.join("targets/checkout.img");
+    let (_, times) = prepare_times(
+        &trees,
+        &f.0.join("staged"),
+        &store,
+        &store.with_extension("source-mtimes.json"),
+        destination,
+        &selected,
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+    )
+    .unwrap();
+    assert_eq!(times.keys().collect::<Vec<_>>(), ["repo/src/main.rs"]);
+    apply_times(&f.0.join("staged"), &times).unwrap();
+    assert_eq!(
+        std::fs::metadata(&outside).unwrap().modified().unwrap(),
+        before
+    );
+}
+
+#[test]
 fn source_times_never_follow_leaf_or_parent_symlinks() {
     let f = Tree::new();
     let outside = f.file("outside/file");

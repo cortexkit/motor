@@ -27,10 +27,12 @@ pub mod transport;
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
 pub const PROTOCOL_VERSION: u32 = 10;
 /// Version of the macOS profile, versioned independently of the Windows one.
-/// Version 2 agents mount the job's build disk at the checkout's `target/`
-/// and copy returned files out of it; a version 1 agent would build on the
-/// shared folder instead, so the runner refuses it.
-pub const MACOS_PROTOCOL_VERSION: u32 = 2;
+/// Version 3 agents mount the job's build disk at a fixed guest path outside
+/// the shared folders, give it to jobs as `CARGO_TARGET_DIR`, and copy returned
+/// files under `target/` into the cargo-home share. Version 2 agents mounted it
+/// over the shared `target/` directory, which the guest stopped resolving
+/// through the mount after a few seconds, so the runner refuses them.
+pub const MACOS_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
