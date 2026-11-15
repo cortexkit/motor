@@ -164,9 +164,9 @@ fn walk_file_withholding(
         if !metadata.is_dir() {
             return Err(Cause::NotRegular);
         }
-        if withheld.is_some_and(|withheld| {
-            withheld.identity == Some((metadata.dev(), metadata.ino()))
-        }) {
+        if withheld
+            .is_some_and(|withheld| withheld.identity == Some((metadata.dev(), metadata.ino())))
+        {
             return Err(Cause::ReadError);
         }
         if directories.len() >= MAX_RETURN_DIRECTORY_DESCRIPTORS {
@@ -655,12 +655,7 @@ fn collect_chunked_with_root(
                         Read::Returned { sha256 }
                             if same_file(
                                 file,
-                                open_file_withholding(
-                                    &root,
-                                    &root_directory,
-                                    relative,
-                                    withheld,
-                                ),
+                                open_file_withholding(&root, &root_directory, relative, withheld),
                             ) =>
                         {
                             Read::Returned { sha256 }
@@ -1459,7 +1454,12 @@ mod tests {
         let canonical = scratch.join("canonical");
         let staged = scratch.join("staged");
         let job = scratch.join("job");
-        for path in [&canonical, &staged.join("target/debug"), &staged.join("src"), &job] {
+        for path in [
+            &canonical,
+            &staged.join("target/debug"),
+            &staged.join("src"),
+            &job,
+        ] {
             fs::create_dir_all(path).unwrap();
         }
         // Written on the share by the guest, not copied from the build volume.
@@ -1643,7 +1643,8 @@ mod tests {
         run.return_chunked = true;
         let mut reads = Vec::new();
         let root = open_mapped_directory(&staged).map(|file| (file, logical.into()));
-        let collection = collect_chunked_with_root(&run, &job, root, None, |index| reads.push(index));
+        let collection =
+            collect_chunked_with_root(&run, &job, root, None, |index| reads.push(index));
         assert_eq!(reads, vec![1]);
         assert_eq!(collection.total_bytes, cap);
         assert_eq!(

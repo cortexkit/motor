@@ -111,7 +111,10 @@ impl Watcher {
         interval: std::time::Duration,
         mut look: impl FnMut() -> Look + Send + 'static,
     ) -> Self {
-        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
         use std::time::Instant;
         let mounted = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
@@ -445,8 +448,11 @@ pub fn mount_point(workspace: &File) -> io::Result<File> {
 /// from it, so the agent refuses to place them.
 pub fn uncovered(workspace: &File, covered: (u64, u64)) -> io::Result<File> {
     use std::os::unix::fs::MetadataExt;
-    let shared = open_directory_at(workspace, "target")
-        .map_err(|e| invalid(format!("target is not a plain directory after unmounting: {e}")))?;
+    let shared = open_directory_at(workspace, "target").map_err(|e| {
+        invalid(format!(
+            "target is not a plain directory after unmounting: {e}"
+        ))
+    })?;
     let metadata = shared.metadata()?;
     if metadata.dev() != workspace.metadata()?.dev() {
         return Err(invalid("target is still a mount point after unmounting"));
@@ -1457,12 +1463,12 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = std::sync::Arc::new(AtomicUsize::new(0));
         let looks = count.clone();
-        let mut watcher = Watcher::start(std::time::Duration::from_millis(1), move || {
-            match looks.fetch_add(1, Ordering::SeqCst) {
-                0..=2 => look(true, "on the volume"),
-                3 => look(false, "on the share"),
-                _ => look(false, "looked again"),
-            }
+        let mut watcher = Watcher::start(std::time::Duration::from_millis(1), move || match looks
+            .fetch_add(1, Ordering::SeqCst)
+        {
+            0..=2 => look(true, "on the volume"),
+            3 => look(false, "on the share"),
+            _ => look(false, "looked again"),
         });
         watcher.command_started();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1488,7 +1494,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let line = watcher.finish();
         assert!(
-            line.starts_with("motor: build-volume diagnostic watch: target named the build volume root in all "),
+            line.starts_with(
+                "motor: build-volume diagnostic watch: target named the build volume root in all "
+            ),
             "{line}"
         );
         assert_eq!(line.matches('\n').count(), 1);

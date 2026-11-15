@@ -85,11 +85,13 @@ one session, authenticates the nonce and refuses further connections. The wire
 sequence is `Hello` → host `TreeEnd { command }` → agent `Started` → zero or more
 `Output` → `Exit { code }` or `Signal { signal }`. There is no `TreeReceived` or
 host `Start`. The host may send `Cancel` after `TreeEnd` until terminal status.
-The agent mounts the build disk between `TreeEnd` and `Started`, and unmounts it
+The agent mounts the build disk between `TreeEnd` and `Started`, and releases it
 before `Exit` or `Signal`; the host allows two minutes for `Started`. When the
 build disk cannot be mounted, no command runs: the agent sends `Started`, one
 standard-error `Output` line giving the reason, and closes without terminal
-status.
+status. When it cannot be released after the command, the agent still sends
+the command's `Exit` or `Signal`, after a last standard-error line giving the
+reason (see [Build disk and `target/`](#build-disk-and-target)).
 
 ### Shares and command execution
 
@@ -209,6 +211,9 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
   `script/macos-runner/build-disk-probe.sh` checks this on a host without a
   runner: for each attachment it boots two job VMs from clones of a sealed
   image and reports whether the second mounts the volume the first formatted.
+  Each VM builds a small Cargo package with a returned file under `target/`,
+  and the probe reports any step at which `target/` no longer reached the
+  volume and anything other than the returned file in the shared `target/`.
 - **In the VM**, before the command starts, the root agent finds the disk by
   its fixed size, the one property the guest cannot change and no other disk
   shares. It formats the disk as APFS only while it is still blank (all zero,
@@ -224,24 +229,35 @@ where they did, and `CARGO_TARGET_DIR` stays unset.
   `motorjob`, the agent reformats the disk, and the job's standard error
   starts with a line saying so: that build starts cold. The agent never runs
   the command with the shared folder in the volume's place.
+- **While the command runs**, the agent looks at `target/` every 100 ms. Just
+  before releasing the volume it adds one line to the job's standard error,
+  `motor: build-volume diagnostic watch: ...`, saying whether `target/` kept
+  naming the volume's root and, if not, when it stopped (milliseconds after
+  mounting and after the command started) with the last good look. The runner
+  logs that line with the job ID.
 - **After the command**, once every `motorjob` process is gone, the agent
   reaches `target/` again from `/`, one directory at a time without following
   links, and requires the volume root it recorded before the command (the
   same file system ID and inode). It copies the returned files out (below),
   then unmounts the volume, which must have exactly one mount, forcing the
-  unmount if a killed process left it busy. Only then does it send `Exit` or
-  `Signal`. If any of this fails, the command's output is still delivered,
-  followed by one last standard-error line,
-  `motor: the build disk could not be released: <reason>`, and the session
-  closes without either. The runner logs that line with the job ID.
+  unmount if a killed process left it busy. The shared `target/` it uncovers
+  must be the same directory the volume was mounted over, still empty. Then
+  it sends `Exit` or `Signal`. If any of this fails, the command's output is
+  still delivered, followed by one last standard-error line,
+  `motor: the build disk could not be released: <reason>`, and then the
+  command's own `Exit` or `Signal`, so the caller gets the command's real
+  status. The runner logs that line with the job ID.
 - **Publication.** After the VM has provably stopped, the runner renames the
   job's disk over `targets/<key>.img` whenever the agent reported `Exit` or
-  `Signal`, because only then was the volume cleanly unmounted. **A failed job
+  `Signal` without the release-failure line as its last standard-error line,
+  because only then was the volume cleanly unmounted. **A failed job
   publishes its disk too**: a non-zero exit, such as a compile error, or a
   command killed by a signal keeps its build output for the next job, as a
-  Linux workspace keeps its `target/`. A cancelled job, a session that ended
-  without terminal status, or an unproven stop publishes nothing; the next job
-  uses the previous disk. The rename is the commit point: a cancel that
+  Linux workspace keeps its `target/`. A cancelled job, a release failure, a
+  session that ended without terminal status, or an unproven stop publishes
+  nothing; the next job uses the previous disk. A job that prints that line
+  as its own last output only keeps its own disk from being published. The
+  rename is the commit point: a cancel that
   arrives first stops it, and one that arrives during it waits until it is
   done and finds the disk published. The host never mounts or reads the disk's contents: it only
   creates, clones, renames, measures and deletes the file.
@@ -280,6 +296,10 @@ system mounted below it: a returned path under `target/` must name a regular
 file on the build volume through real directories, or the host reports it
 missing. A path written with `..` is
 resolved on the shared folder and finds only files the agent copied there.
+When the build disk was not released, the host reads nothing from the shared
+`target/`: every returned path that reaches it, by name or through a link or
+`..`, is reported unread, because only an agent that released the volume put
+files there.
 
 The image recipe installs Rust 1.91.0, 1.92.0, 1.96.0, 1.99.0 and 1.100.0, plus
 an independent stable copy of 1.99.0. The current macOS job image still defaults

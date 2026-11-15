@@ -19,19 +19,34 @@
 # 1. In VM A the image's guest agent finds the blank build disk, formats it,
 #    mounts it at the checkout's target/ and runs a command that prints the
 #    mount line (with its flags), what diskutil says about the device (internal
-#    or removable, encrypted or not) and writes a marker file.
+#    or removable, encrypted or not), writes a file into the checkout root,
+#    pauses, builds a small Cargo package and writes a marker file.
 # 2. After VM A has stopped, VM B gets VM A's disk, as the runner hands a
 #    checkout's kept disk to its next job. Its agent mounts the existing volume,
 #    or prints "the build disk could not be used (<mount error>)" and reformats.
-#    The command prints the mount line and reads the marker.
+#    The command prints the mount line, does the same steps and reads the marker.
+#
+# Each VM is set up as the runner sets up a job: workspace and cargo-home
+# shares, a checkout whose directories (target/ included) have mode 0700, and
+# a returned file under target/ (debug/buildcheck) that the agent copies out
+# of the volume. After every step the command prints "check <step>: volume" or
+# "check <step>: share (...)" when target/ no longer reaches the build volume,
+# as happened in a runner job during its Cargo build. After each VM stops, the
+# probe lists the shared target/ ("share target:" lines); it must hold only
+# the returned file. The probe does not reproduce the runner's Git checkout,
+# read-only sealing of source files, source timestamps or caller environment.
 #
 # Each build disk is a sparse file of 128 GiB, the exact size by which the agent
 # recognizes it; it allocates only what the guests write.
 #
 # Output lines: "stdout:"/"stderr:" are the guest command's, "helper:" the job
-# helper's status reports, and "RESULT <bus>:" the verdict for each attachment.
-# The script exits 0 only when VM B mounted VM A's volume with the attachment
-# job VMs now use (USB). The full log is kept beside the work directory as
+# helper's status reports, "share target:" what the host found in the shared
+# target/, and "RESULT <bus>:" the verdict for each attachment. An agent with
+# the build-volume watch also prints one "motor: build-volume diagnostic
+# watch:" line saying whether, and how long after mounting, target/ stopped
+# reaching the volume. The script exits 0 only when, with the attachment job
+# VMs now use (USB), target/ reached the volume at every step in both VMs, the
+# shared target/ held only the returned file, and VM B mounted VM A's volume. The full log is kept beside the work directory as
 # <work directory>.log. The work directory is deleted afterwards unless
 # MOTOR_PROBE_KEEP=1 is set.
 set -euo pipefail
@@ -91,6 +106,6 @@ status=0
 "$helper" build-disk-probe "$image_real" "$work" 2>&1 | tee "$work.log" || status=$?
 echo
 echo "summary:"
-grep -E '^(RESULT|stdout: (mount|diskutil):|stderr: motor:)' "$work.log" || true
+grep -E '^(RESULT|stdout: (mount|diskutil|check [a-z-]+|cargo):|stderr: motor:|share target:)' "$work.log" || true
 echo "full log: $work.log"
 exit "$status"

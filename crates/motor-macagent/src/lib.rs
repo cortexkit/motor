@@ -1410,13 +1410,8 @@ mod execution {
         /// to publish the disk.
         #[tokio::test]
         async fn failed_build_volume_detach_says_why_and_still_reports_the_exit() {
-            let (mut fixture, events) = launch_with_volume(
-                "echo ran; printf job-err >&2; exit 3",
-                None,
-                false,
-                true,
-            )
-            .await;
+            let (mut fixture, events) =
+                launch_with_volume("echo ran; printf job-err >&2; exit 3", None, false, true).await;
             let (stdout, stderr, terminal) = collect_session(&mut fixture).await;
             assert_eq!(terminal, Some(Frame::Exit { code: 3 }));
             assert!((&mut fixture.agent.0).await.unwrap().is_err());
