@@ -23,6 +23,7 @@ mod cargo_fetch;
 mod cargo_lock;
 pub(crate) mod cargo_overlay;
 pub(crate) mod cargo_sources;
+mod cross_compilers;
 mod host_inputs;
 mod hosts;
 mod javascript_tools;
@@ -4300,6 +4301,7 @@ impl Sandbox {
         ] {
             env.insert(key.into(), value);
         }
+        cross_compilers::arm64_windows(&mut env, Path::new("/usr/local/lib/motor/llvm-mingw"));
         if pid_init.is_some() {
             pid_init::refuse_loader_environment(env.keys().map(String::as_str))?;
         }

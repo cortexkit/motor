@@ -40,6 +40,12 @@ if 'remote_cache_environment' not in globals():
         raise ImportError('cannot load remote cache environment')
     remote_cache_environment = importlib.util.module_from_spec(remote_cache_spec)
     remote_cache_spec.loader.exec_module(remote_cache_environment)
+if 'llvm_mingw' not in globals():
+    llvm_mingw_spec = importlib.util.spec_from_file_location('llvm_mingw', HERE / 'llvm-mingw.py')
+    if llvm_mingw_spec is None or llvm_mingw_spec.loader is None:
+        raise ImportError('cannot load ARM64 Windows toolchain probe')
+    llvm_mingw = importlib.util.module_from_spec(llvm_mingw_spec)
+    llvm_mingw_spec.loader.exec_module(llvm_mingw)
 
 
 def output(*args, env=None):
@@ -107,7 +113,17 @@ def tool_version(path, env, observed, version_from=None):
 
 def role_manifest(manifest, role, job=False):
     """Select the role's toolchain roots; jobs keep registry caches in /motor-home/cargo."""
-    return {**manifest, **manifest.get('layout_by_role', {}).get(role, {}).get('job' if job else 'host', {})}
+    selected = {**manifest, **manifest.get('layout_by_role', {}).get(role, {}).get('job' if job else 'host', {})}
+    selected['tools'] = {name: spec for name, spec in manifest['tools'].items()
+                         if role in spec.get('roles', ('build-server', 'boat', 'tenant'))}
+    if role == 'build-server':
+        targets = set(manifest.get('image_only_rust_targets', []))
+        components = {'rust-std-' + target for target in targets}
+        selected['rust_toolchains'] = {
+            name: {**spec, 'targets': [target for target in spec['targets'] if target not in targets],
+                   'components': [component for component in spec['components'] if component not in components]}
+            for name, spec in manifest['rust_toolchains'].items()}
+    return selected
 
 
 def ipv6_loopback_capture():
@@ -272,6 +288,9 @@ def capture(manifest=None, job=False, role="build-server", remote_cache_on=False
     specs = paths.get("tools", {})
     for name in sorted(names, key=lambda name: (bool(specs.get(name, {}).get("version_from")), name)):
         path = shutil.which(name, path=env["PATH"])
+        if name == 'llvm-mingw':
+            candidate = tool_path(specs[name], role, job)
+            path = candidate if os.access(candidate, os.X_OK) else None
         if path is None and name in paths.get("gnu_coreutils", {}):
             candidate = paths["gnu_coreutils"][name]
             path = candidate if os.access(candidate, os.X_OK) else None
@@ -340,6 +359,7 @@ def capture(manifest=None, job=False, role="build-server", remote_cache_on=False
         "syscalls": syscall_surface.capture(),
         "job_identity": job_identity(job, role),
         "cargo_registry": seed.capture(os.environ.get('CARGO_HOME', cargo_home) if job else cargo_home, strict=False),
+        "llvm_mingw": llvm_mingw.probe(paths, job) if 'llvm-mingw' in specs else None,
     }
 
 
@@ -362,6 +382,7 @@ def validate(manifest, role="build-server"):
         return
     if manifest["schema"] != 1 or manifest["rust_default"] not in manifest["rust_toolchains"]:
         raise ValueError("invalid parity schema or default toolchain")
+    llvm_mingw.validate(manifest)
     host_files = manifest.get("host_files")
     if not isinstance(host_files, dict) or not host_files:
         raise ValueError("missing host file contract")
@@ -656,6 +677,9 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
                 expected_value = expected_major.group(1) if expected_major else None
                 observed_value = actual_major.group(1) if actual_major else version
                 errors.append(f"wasm-opt major version: expected {expected_value!r}, observed {observed_value!r}")
+        elif name == 'llvm-mingw':
+            if not re.fullmatch(expected['version_pattern'], version):
+                errors.append('llvm-mingw: unexpected compiler version ' + repr(version))
         elif "version" in expected:
             equal(name + " version", expected["version"], version)
         elif not re.fullmatch(expected["version_pattern"], version):
@@ -663,6 +687,8 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         realpath_suffix = expected.get("realpath_suffix_by_role", {}).get(role, expected.get("realpath_suffix"))
         if realpath_suffix and not observed.get("realpath", "").endswith(realpath_suffix):
             errors.append(name + ": wrong resolved executable path")
+    if 'llvm-mingw' in manifest['tools'] and (actual.get('llvm_mingw') or {}).get('passed') is not True:
+        errors.append('llvm-mingw C compile/archive/link probe: ' + repr(actual.get('llvm_mingw')))
     # The remote cache's job variables are exactly the ones its switch state
     # adds, on every host type. A role that keeps one in the other state is not
     # in the state it claims, and the failure names the variable.
@@ -813,8 +839,14 @@ def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_
 def refresh(manifest, actual):
     # Preserve install sources and accepted OS differences; refresh host measurements.
     manifest = json.loads(json.dumps(manifest))
+    image_targets = {name: set(spec['targets']) & set(manifest.get('image_only_rust_targets', []))
+                     for name, spec in manifest['rust_toolchains'].items()}
     for key in ("rust_default", "rust_profile", "rust_toolchains", "cargo_home", "rustup_home"):
-        manifest[key] = actual[key]
+        manifest[key] = json.loads(json.dumps(actual[key]))
+    for name, targets in image_targets.items():
+        spec = manifest['rust_toolchains'][name]
+        spec['targets'] = sorted(set(spec['targets']) | targets)
+        spec['components'] = sorted(set(spec['components']) | {'rust-std-' + target for target in targets})
     manifest["rustup"] = actual["rustup_version"].split()[1]
     manifest["cargo_binaries"] = {}
     for name, row in actual["cargo_binaries"].items():
@@ -833,7 +865,10 @@ def refresh(manifest, actual):
                 if actual["cargo_binaries"][name]["sha256"] != actual["cargo_binaries"][variant]["sha256"]:
                     raise ValueError("default binary does not match pinned revision: " + name)
                 manifest["cargo_binaries"][name]["matches"] = variant
+    server_tools = role_manifest(manifest, 'build-server')['tools']
     for name, expected in manifest["tools"].items():
+        if name not in server_tools:
+            continue
         row = actual["tools"][name]
         if not row or row.get("exit_code") != 0:
             raise ValueError("unmeasured tool: " + name)

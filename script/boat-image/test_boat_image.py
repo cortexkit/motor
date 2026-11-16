@@ -163,6 +163,7 @@ class RecipeTests(unittest.TestCase):
         actual = {call.args[3]: call.args for call in run.call_args_list
                   if call.args[:3] == ('rustup', 'toolchain', 'install') and call.args[3] in names}
         targets = ('--target', 'aarch64-apple-ios', '--target', 'aarch64-apple-ios-sim',
+                   '--target', 'aarch64-pc-windows-gnullvm',
                    '--target', 'aarch64-pc-windows-msvc', '--target', 'wasm32-unknown-unknown',
                    '--target', 'wasm32-wasip1', '--target', 'x86_64-pc-windows-gnu',
                    '--target', 'x86_64-pc-windows-msvc', '--target', 'x86_64-unknown-linux-gnu',
@@ -214,11 +215,15 @@ class RecipeTests(unittest.TestCase):
                 return '\n'.join(state[args[-1]]['components'])
             elif args[:3] == ('rustup', 'component', 'remove'):
                 state[args[4]]['components'].remove(args[5] + '-x86_64-unknown-linux-gnu')
+            elif args[:3] == ('rustup', 'target', 'remove'):
+                state[args[4]]['targets'].remove(args[5])
+                state[args[4]]['components'].remove('rust-std-' + args[5])
             return ''
         with patch.object(install, 'run', side_effect=run) as execute:
             install.install_rust(manifest, '/rustup-init')
         self.assertNotIn('rust-analyzer-x86_64-unknown-linux-gnu', manifest['rust_toolchains'][stable]['components'])
         execute.assert_any_call('rustup', 'component', 'remove', '--toolchain', stable, 'rust-analyzer')
+        execute.assert_any_call('rustup', 'target', 'remove', '--toolchain', stable, 'aarch64-pc-windows-gnullvm')
         self.assertEqual(state[stable], manifest['rust_toolchains'][stable])
         self.assertEqual(state[numbered], manifest['rust_toolchains'][numbered])
 
