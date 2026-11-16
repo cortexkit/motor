@@ -141,6 +141,7 @@ async fn run_polls_live_status_until_started_without_heartbeat_spam() {
     assert!(out.is_empty());
     let err = String::from_utf8(err).unwrap();
     assert_eq!(err.matches("queued:").count(), 2, "{err}");
+    assert!(!err.contains("checkout:"), "{err}");
     assert_eq!(err.matches("ck motor run: started\n").count(), 1, "{err}");
     assert!(!err.contains("private"));
     assert_eq!(client.polls.load(Ordering::SeqCst), 5);

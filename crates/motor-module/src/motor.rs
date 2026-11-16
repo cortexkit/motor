@@ -3926,6 +3926,10 @@ impl Motor {
             ))),
         }
     }
+    pub(crate) fn direct_checkout(&self, id: Uuid) -> Option<String> {
+        self.storage.job(id)?.workspace_key
+    }
+
     pub(crate) fn direct_placement(&self, id: Uuid) -> Option<String> {
         let job = self.storage.job(id)?;
         job.windows_runner
@@ -4390,6 +4394,11 @@ mod delivery_tests {
             .storage
             .set_direct_secret_hash(id, secret.hash())
             .unwrap();
+        let checkout = scratch.path().join("submitting-checkout");
+        motor
+            .storage
+            .retain_job(id, Some(checkout.to_str().unwrap().into()))
+            .unwrap();
         let mut stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
         let record = stream.records.recv().await.unwrap().unwrap();
         assert!(matches!(record, StreamRecord::Terminal(_)));
@@ -4419,7 +4428,38 @@ mod delivery_tests {
         assert_eq!(value["placement"], "linux-runner");
         assert_eq!(value["placement_wait_ms"], 0);
         assert_eq!(value["runner_queue_wait_ms"], 27);
+        assert!(value.get("checkout").is_none(), "agent status is unchanged");
+        let subc_client_rs::HandlerOutcome::Response(bytes) =
+            crate::module::direct_status_reply(&motor, id)
+                .await
+                .unwrap()
+        else {
+            panic!("expected direct status response");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["checkout"], checkout.to_str().unwrap());
         assert_eq!(peer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_status_omits_checkout_when_not_stored() {
+        let scratch = ScratchDir::new("motor-unknown-checkout-status");
+        let motor = Motor::open(Config::default(), &scratch).unwrap();
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        motor
+            .storage
+            .local_terminal(TerminalRecord::new(id, Outcome::Exit { code: 0 }, 0, 0, 0))
+            .unwrap();
+        let subc_client_rs::HandlerOutcome::Response(bytes) =
+            crate::module::direct_status_reply(&motor, id)
+                .await
+                .unwrap()
+        else {
+            panic!("expected direct status response");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("checkout").is_none());
     }
 
     #[tokio::test]

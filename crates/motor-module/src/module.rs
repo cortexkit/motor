@@ -928,7 +928,7 @@ impl Handler {
                 {
                     return Ok(direct_job_not_found(&self.module_id));
                 }
-                status_reply(self.initialized()?, &serde_json::json!({"job_id": id})).await
+                direct_status_reply(self.initialized()?, id).await
             }
         }
     }
@@ -1382,6 +1382,21 @@ pub(crate) fn response(value: impl serde::Serialize) -> io::Result<HandlerOutcom
         serde_json::to_vec(&value).map_err(io::Error::other)?,
     ))
 }
+pub(crate) async fn direct_status_reply(
+    motor: &Motor,
+    id: uuid::Uuid,
+) -> io::Result<HandlerOutcome> {
+    let outcome = status_reply(motor, &json!({"job_id": id})).await?;
+    let HandlerOutcome::Response(bytes) = outcome else {
+        return Ok(outcome);
+    };
+    let mut value: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if let Some(checkout) = motor.direct_checkout(id) {
+        value["checkout"] = checkout.into();
+    }
+    response(value)
+}
+
 pub(crate) async fn status_reply(
     motor: &Motor,
     params: &serde_json::Value,
