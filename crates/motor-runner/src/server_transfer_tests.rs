@@ -159,6 +159,62 @@ async fn upload_stall_bound_ignores_heartbeats_and_empty_chunks() {
     sender.abort();
 }
 
+/// A job VM's logs stay inside the VM, so the stall refusal itself says how
+/// much of the upload arrived and what the runner last read.
+#[tokio::test(start_paused = true)]
+async fn upload_stall_detail_names_received_bytes_and_the_last_frame() {
+    let (_scratch, runner, request, bytes) = fixture();
+    let (tx, mut rx) = mpsc::channel(8);
+    tx.send(Frame::BundleChunk {
+        index: 0,
+        offset: 0,
+        data: BytePayload(bytes[..10].to_vec()),
+    })
+    .await
+    .unwrap();
+    let sender = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            let beat = Frame::Heartbeat {
+                queue_wait_ms: None,
+                queue_status: None,
+            };
+            if tx.send(beat).await.is_err() {
+                return;
+            }
+        }
+    });
+    let (_, error) = upload(&runner, request.job_id, &request.bundles, &mut rx, None)
+        .await
+        .err()
+        .expect("heartbeats alone do not keep an upload alive");
+    sender.abort();
+    assert_eq!(
+        error.to_string(),
+        "transfer_stalled: no bundle data for 60s; received 10 of 21 bytes; last frame heartbeat 4s ago"
+    );
+
+    let (_scratch, runner, request, _) = fixture();
+    let (_tx, mut rx) = mpsc::channel(8);
+    let (_, error) = upload(&runner, request.job_id, &request.bundles, &mut rx, None)
+        .await
+        .err()
+        .expect("an upload with no input stalls");
+    assert_eq!(
+        error.to_string(),
+        "transfer_stalled: no bundle data for 60s; received 0 of 21 bytes; no frame since the upload began"
+    );
+    // The runner keeps a TimedOut detail that already names the stall as is.
+    runner
+        .refuse(request.job_id, RefusalReason::TransferInterrupted, error)
+        .unwrap();
+    let terminal = runner.job_status(request.job_id).unwrap().terminal.unwrap();
+    assert_eq!(
+        terminal.refusal_detail(),
+        Some("transfer_stalled: no bundle data for 60s; received 0 of 21 bytes; no frame since the upload began")
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn upload_rejection_preserves_the_underlying_chunk_error() {
     let (_scratch, runner, request, _) = fixture();

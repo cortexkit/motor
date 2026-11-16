@@ -542,18 +542,23 @@ impl ChannelTrace {
             Frame::Started { seq, .. } => Some(*seq),
             _ => None,
         };
-        self.frame_type = match frame {
-            Frame::Hello { .. } => "hello",
-            Frame::Run(_) => "run",
-            Frame::Attach(_) => "attach",
-            Frame::Heartbeat { .. } => "heartbeat",
-            Frame::BundleChunk { .. } => "bundle_chunk",
-            Frame::Accepted(_) => "accepted",
-            Frame::Started { .. } => "started",
-            Frame::Output(_) => "output",
-            Frame::Terminal(_) => "terminal",
-            _ => "control",
-        };
+        self.frame_type = frame_kind(frame);
+    }
+}
+
+/// A frame's type for logs and diagnostics, without its contents.
+fn frame_kind(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::Hello { .. } => "hello",
+        Frame::Run(_) => "run",
+        Frame::Attach(_) => "attach",
+        Frame::Heartbeat { .. } => "heartbeat",
+        Frame::BundleChunk { .. } => "bundle_chunk",
+        Frame::Accepted(_) => "accepted",
+        Frame::Started { .. } => "started",
+        Frame::Output(_) => "output",
+        Frame::Terminal(_) => "terminal",
+        _ => "control",
     }
 }
 impl Drop for ChannelTrace {
@@ -1206,6 +1211,11 @@ async fn upload(
     let mut upload = Upload::new(runner.spool_dir(id), manifest)
         .map_err(|error| (RefusalReason::BundleRejected, error))?;
     let mut progress_at = tokio::time::Instant::now();
+    // What this loop has seen, named in a stall refusal: a job VM's logs stay
+    // inside the VM, so the caller's terminal is where a stall gets explained.
+    let expected: u64 = manifest.iter().map(|bundle| bundle.length).sum();
+    let mut received = 0u64;
+    let mut last_frame = None;
     while !upload.complete() {
         let active_at = wire_progress
             .as_ref()
@@ -1218,10 +1228,18 @@ async fn upload(
             })
             .unwrap_or(progress_at);
         let frame = tokio::select! {
-            frame = tokio::time::timeout_at(active_at + Duration::from_secs(60), next(rx)) =>
-                frame.map_err(|error| (RefusalReason::TransferInterrupted, io::Error::new(io::ErrorKind::TimedOut, format!("transfer_stalled: {error}"))))?,
+            frame = tokio::time::timeout_at(active_at + Duration::from_secs(60), next_seen(rx, &mut last_frame)) => frame,
             _ = async { if let Some(rx) = wire_progress.as_mut() { let _ = rx.changed().await; } else { std::future::pending::<()>().await; } } => continue,
         };
+        let frame = frame.map_err(|_| {
+            (
+                RefusalReason::TransferInterrupted,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    stall_detail(received, expected, last_frame),
+                ),
+            )
+        })?;
         let Some(frame) = frame else {
             return Err((
                 RefusalReason::TransferInterrupted,
@@ -1237,15 +1255,54 @@ async fn upload(
                 ),
             ));
         };
-        let advanced = matches!(&frame, Frame::BundleChunk { data, .. } if !data.0.is_empty());
+        let size = match &frame {
+            Frame::BundleChunk { data, .. } => data.0.len() as u64,
+            _ => 0,
+        };
         upload
             .chunk(frame)
             .map_err(|error| (RefusalReason::BundleRejected, error))?;
-        if advanced {
+        if size > 0 {
+            received += size;
             progress_at = tokio::time::Instant::now();
         }
     }
     Ok(upload)
+}
+
+/// Like `next`, but records the type and arrival of every frame, heartbeats
+/// included, for the stall refusal.
+async fn next_seen(
+    rx: &mut mpsc::Receiver<Frame>,
+    last: &mut Option<(&'static str, tokio::time::Instant)>,
+) -> Option<Frame> {
+    while let Some(frame) = rx.recv().await {
+        *last = Some((frame_kind(&frame), tokio::time::Instant::now()));
+        if !matches!(frame, Frame::Heartbeat { .. }) {
+            return Some(frame);
+        }
+    }
+    None
+}
+
+/// The refusal detail for an upload that made no progress for 60 seconds. It
+/// says how much arrived and what the runner last read, which tells a sender
+/// that went quiet (only heartbeats) apart from input that stopped altogether.
+fn stall_detail(
+    received: u64,
+    expected: u64,
+    last_frame: Option<(&'static str, tokio::time::Instant)>,
+) -> String {
+    let last = match last_frame {
+        Some((kind, at)) => format!(
+            "last frame {kind} {}s ago",
+            tokio::time::Instant::now().duration_since(at).as_secs()
+        ),
+        None => "no frame since the upload began".into(),
+    };
+    format!(
+        "transfer_stalled: no bundle data for 60s; received {received} of {expected} bytes; {last}"
+    )
 }
 
 async fn cancel_job(

@@ -242,7 +242,11 @@ impl Runtime {
         let (tx, rx) = mpsc::channel(1);
         *stream.input.lock().expect("job input") = Some(tx);
         let runtime = self.clone();
+        // Keep this job's relay logs on the caller's subscriber, as the
+        // other host worker threads do.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::spawn(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
             let result = (|| -> Result<()> {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -325,6 +329,15 @@ async fn collect(
         let default_branch_tip = prelude.as_ref().is_some_and(|(_, p)| p.default_branch_tip);
         let mut upload = Upload::default();
         if let Some((id, p)) = &mut prelude {
+            // These lines, with the live ones below, show where an upload
+            // stopped: before the host spooled it, during this replay, or
+            // while the caller was still sending.
+            let replay_started = std::time::Instant::now();
+            tracing::info!(
+                jti = claims.jti,
+                spooled_bytes = p.spool.bytes,
+                "job_upload_replay_started"
+            );
             p.spool.file.flush().await?;
             p.spool
                 .file
@@ -358,7 +371,18 @@ async fn collect(
                 write.lock().await.write_all(&frame.bytes).await?;
             }
             remove_spool(&p.spool.path)?;
+            let (received, expected) = upload.bytes();
+            tracing::info!(
+                jti = claims.jti,
+                chunk_frames = upload.chunk_frames,
+                received_bytes = received,
+                expected_bytes = expected,
+                elapsed_ms = replay_started.elapsed().as_millis() as u64,
+                "job_upload_replay_finished"
+            );
         }
+        let mut live_chunk_seen = false;
+        let mut forwarded_logged = upload.complete();
         // The guest runner closes its channel after 60 s without a byte from
         // the host ("wire inactivity"). In tenant mode ck-motor's heartbeats
         // pass through; here the host answers client heartbeats itself and the
@@ -391,6 +415,14 @@ async fn collect(
                         }
                     }
                     upload.observe(&frame)?;
+                    if frame["type"] == "bundle_chunk" && !std::mem::replace(&mut live_chunk_seen, true) {
+                        let (received, expected) = upload.bytes();
+                        tracing::info!(jti = claims.jti, received_bytes = received, expected_bytes = expected, "job_upload_first_live_chunk");
+                    }
+                    if !forwarded_logged && upload.complete() {
+                        forwarded_logged = true;
+                        tracing::info!(jti = claims.jti, bytes = upload.bytes().1, "job_upload_forwarded");
+                    }
                     if let Some(reply) = input.reply {
                         let kind = format!("{}_reply", frame["type"].as_str().context("control type")?);
                         pending.lock().expect("pending replies").entry(kind).or_default().push_back(reply);
@@ -921,7 +953,20 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(request) => request,
                     Err(error) if hello && error.downcast_ref::<std::io::Error>()
                         .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) => return Ok(()),
-                    Err(error) => return Err(client_io(error)),
+                    Err(error) => {
+                        if !hello {
+                            // The uploading caller's own connection ended. With
+                            // the replay lines this tells a caller that stopped
+                            // sending apart from one the host stopped reading.
+                            tracing::info!(
+                                jti = claims.jti,
+                                clean = error.downcast_ref::<CleanClientEof>().is_some(),
+                                %error,
+                                "job_caller_input_closed"
+                            );
+                        }
+                        return Err(client_io(error));
+                    }
                 };
                 if request.value["type"] == "heartbeat" { continue; }
                 // Bundle chunks carry no job id: they continue this connection's
@@ -1060,10 +1105,16 @@ impl Drop for UploadOwner {
 struct Upload {
     expected: Vec<u64>,
     received: Vec<u64>,
+    /// Bundle chunk frames seen, for the upload progress log lines.
+    chunk_frames: u64,
 }
 impl Upload {
     fn complete(&self) -> bool {
         self.expected == self.received
+    }
+    /// Contiguous bytes received and bytes the Run declared, over all bundles.
+    fn bytes(&self) -> (u64, u64) {
+        (self.received.iter().sum(), self.expected.iter().sum())
     }
     fn observe(&mut self, frame: &Value) -> Result<()> {
         match frame["type"].as_str() {
@@ -1084,6 +1135,7 @@ impl Upload {
                 self.received = vec![0; self.expected.len()];
             }
             Some("bundle_chunk") => {
+                self.chunk_frames += 1;
                 let motor_protocol::Frame::BundleChunk {
                     index,
                     offset,
