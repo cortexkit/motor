@@ -253,6 +253,8 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
         MetricsReply::BadRequest {
             field: Some("body".into()),
         },
+        // A monitor host's sample with the hosted message hub's `hub` member.
+        MetricsReply::Accepted,
     ];
     assert_eq!(v["cases"].as_array().unwrap().len(), expected.len());
     for (case, reply) in v["cases"].as_array().unwrap().iter().zip(expected) {
@@ -321,6 +323,12 @@ fn cloud_host_metrics_invalid_samples_are_not_signed() {
     .is_err());
     assert!(serde_json::from_str::<metrics::HostMetrics>(
         v["cases"][14]["request"]["body"].as_str().unwrap()
+    )
+    .is_err());
+    // `hub` is for the message hub's own monitor hosts; the broker refuses it
+    // from a placement host, so a motor host's sample can never carry it.
+    assert!(serde_json::from_str::<metrics::HostMetrics>(
+        v["cases"][15]["request"]["body"].as_str().unwrap()
     )
     .is_err());
     assert_eq!(

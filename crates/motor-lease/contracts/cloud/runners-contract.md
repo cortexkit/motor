@@ -695,8 +695,8 @@ failures are 401 `host_auth_failed`. Size is checked before authentication, sche
 The route never updates heartbeat, placement capacity, availability or admission state. Missing
 metrics never prevents a placement host from receiving jobs.
 
-The strict body has these members (nested objects are strict too); the tenant disk pair and
-host/tenant `pressure` objects are optional, additive members:
+The strict body has these members (nested objects are strict too); the tenant disk pair,
+host/tenant `pressure` objects and monitor-only `hub` object are optional, additive members:
 
 ```json
 {
@@ -738,6 +738,17 @@ host/tenant `pressure` objects are optional, additive members:
   pushes omitting them keep the existing wire behavior. Invalid or missing members name their
   path in 400 `bad_request`, for example `pressure.mem_full` or `tenants[0].pressure.io_full`;
   extra members use the existing strict-object `field: "body"` refusal.
+- Optional `hub` is accepted only from a registered `monitor`; a placement host sending it gets
+  400 `bad_request` with `field: "hub"`. Its strict object has all five required members:
+  `{ "meta_leader": true, "streams_total": 12, "streams_under_replicated": 0,
+  "retry_count": 0, "retry_oldest_age_s": null }`. `meta_leader` is boolean; the three counts are
+  non-negative safe integers. `retry_oldest_age_s` is null or a non-negative safe integer.
+  Only `retry_oldest_age_s` may be null. Invalid or missing members name their path,
+  for example `hub.retry_count`; extra members use the existing strict-object `field: "body"`.
+  Omitting `hub` keeps the existing wire behavior. It contains no account ids, stream names or subjects.
+  `meta_leader` means the node's private `/jsz` names a JetStream meta leader. The stream counts
+  cover only streams reported by this node; `streams_under_replicated` counts R3 streams with
+  fewer than three current replicas. Retry figures come from the provisioner's `.status` file.
 - Each array has at most eight entries and may be empty. `mount` is 1..128 UTF-8 bytes with no
   Unicode control characters. `vm` matches `^[A-Za-z0-9._-]{1,64}$`.
 - Tenant `state` is `ready`, `starting`, `recovering` or `stopped`. `recovery` must be null except
@@ -772,6 +783,31 @@ figures: a value wins over NULL and NULL never erases a value; all-omitted bucke
 rows stay NULL. Individual tenant PSI figures, states, per-disk details and tenant guest disk
 figures are available in `last_body`, not separate per-tenant rollup rows.
 
+The nullable `hub_no_meta_leader`, `hub_under_replicated_max` and `hub_retry_age_s_max` columns
+retain whether any hub sample lacked a meta leader (0/1), the maximum under-replicated stream
+count, and the maximum non-null retry age. Omitted samples never erase a figure, and old or
+all-omitted buckets remain NULL. `hosts.hub_metrics_seen_ms` records the first accepted hub push
+on an active host, survives rollup retention, and is cleared when the host retires or re-registers.
+
+`hub_unhealthy` is a live alert for an active monitor host identified by that marker. With the
+two newest buckets both within the last 15 minutes (inclusive), it fires when both contain a
+sample without a meta leader, or both contain under-replicated streams. A retry age strictly
+over 1,800 seconds in the newest bucket fires without a second bucket. An identified host whose
+newest bucket is more than 10 minutes old also fires (`hub_metrics_stale`), including after
+rollups are pruned. A future newest bucket is not used. The first new bucket failing the condition
+clears the live alert; stored diagnostic marks do not latch it. Detail contains only host ids
+and reasons (`no_meta_leader`, `under_replicated`, `retry_age`, `hub_metrics_stale`), never inventory.
+
+The hub agent reports unreadable/malformed NATS monitoring as no meta leader and zero stream
+counts; its HTTP deadline is five seconds. Unreadable CPU/memory become null and unreadable
+mounts are omitted. Provisioner status is valid only with a non-future `updatedAtMs` no more than
+60 seconds old. Missing status during the first 60 seconds before any valid read yields 0/null.
+Otherwise missing, malformed or stale status retains the last valid retry count (zero without
+one) and reports seconds since the last valid update, or agent start without one, taking the
+maximum of that duration and the status file's own oldest retry age. This makes a stopped
+provisioner eventually trip the retry-age alert rather than silently report healthy. Signing
+or push failures log a fixed reason and retry on the next tick with a durably persisted counter.
+
 `test-vectors/runners/host-metrics.json` pins accepted signed pushes with numeric and null load,
 numeric and null tenant guest disks, the 413 boundary, and bad-enum, overlong-detail, stale-clock,
 unpaired guest-disk and free-above-total refusals, produced by the real signer and parser. It also
@@ -780,6 +816,7 @@ includes a `metrics-vector` monitor with null CPU/memory and empty disks (204), 
 The original pushes without PSI remain byte-identical; additive cases cover host and tenant
 `pressure` together (204), malformed tenant `io_full` (400 with
 `field: "tenants[0].pressure.io_full"`) and an extra PSI member (400 with `field: "body"`).
+An additive monitor push with `hub` returns 204; every earlier vector remains byte-identical.
 
 ### POST /v1/hosts/{host_id}/heartbeat
 
