@@ -35,7 +35,7 @@ class GateTests(unittest.TestCase):
         self.put(".gitignore", (ROOT / ".gitignore").read_text())
         self.put("scripts/gate.sh", (ROOT / "scripts/gate.sh").read_text())
         self.put("scripts/check-cortexkit-layout.sh", (ROOT / "scripts/check-cortexkit-layout.sh").read_text())
-        for name in ("no-build-scripts", "test-binary-fold", "unreachable-modules", "test-dev-binaries", "test-scratch", "subc-daemon-env"):
+        for name in ("no-build-scripts", "source-file-size", "test-binary-fold", "unreachable-modules", "test-dev-binaries", "test-scratch", "subc-daemon-env"):
             self.put(f"scripts/{name}.py", "print('safety check')\n")
         self.put("crates/motor-protocol/tests/generate_vectors.py", "print('vectors checked')\n")
         for name in ("script/runner/test_toolchain_parity.py", "script/boat-image/test_boat_image.py",

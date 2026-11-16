@@ -159,6 +159,7 @@ jobs:
           python-version: '3.11'
       - name: Motor safety gates and self-tests
         run: |
+          python3 scripts/source-file-size.py
           python3 scripts/test-binary-fold.py
           python3 scripts/unreachable-modules.py
           python3 scripts/test-dev-binaries.py
