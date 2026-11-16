@@ -118,7 +118,7 @@ def probe(manifest, job=False, install_root=""):
             if environment.get(name) != expected:
                 raise ValueError("missing or incorrect llvm-mingw job variable: " + name)
             commands[name] = install_root + expected
-        with tempfile.TemporaryDirectory(prefix="llvm-mingw-probe-", dir=os.environ["TMPDIR"]) as temporary:
+        with tempfile.TemporaryDirectory(prefix="llvm-mingw-probe-", dir=os.environ.get("TMPDIR")) as temporary:
             work = Path(temporary)
             source, obj, library, exe = (work / name for name in ("probe.c", "probe.o", "probe.a", "probe.exe"))
             source.write_text("#include <assert.h>\nint main(void) { assert(sizeof(void *) == 8); return 0; }\n")
