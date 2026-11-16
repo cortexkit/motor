@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, path::Path};
 
-pub(super) fn arm64_windows(env: &mut BTreeMap<String, String>, root: &Path) {
+/// Where the job image installs llvm-mingw; absent on images built before it.
+pub(crate) const ROOT: &str = "/usr/local/lib/motor/llvm-mingw";
+
+pub(crate) fn arm64_windows(env: &mut BTreeMap<String, String>, root: &Path) {
     if !root.is_dir() {
         return;
     }

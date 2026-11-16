@@ -6670,6 +6670,17 @@ mod base_scheduling {
             if !tenant {
                 expected.insert("CARGO_INCREMENTAL".into(), "1".into());
             }
+            // Job images that carry llvm-mingw also set the ARM64 Windows linker.
+            let mingw = Path::new(crate::isolation::cross_compilers::ROOT);
+            if mingw.is_dir() {
+                expected.insert(
+                    "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER".into(),
+                    mingw
+                        .join("bin/aarch64-w64-mingw32-clang")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             let cargo: BTreeMap<_, _> = launched
                 .iter()
                 .filter(|(key, _)| key.starts_with("CARGO_"))
