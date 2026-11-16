@@ -206,8 +206,13 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
     // the reporter task when the clock stops; keep yielding (without advancing
     // time or releasing the upload) until they arrive, so a loaded machine
     // cannot turn scheduling delay into a false "delayed until after upload".
+    // The upload reads its bundle with tokio::fs, on blocking-pool OS threads,
+    // and reads heartbeats only while it is inside send_upload. So a count of
+    // yields is no time bound: under the parallel gate, 10,000 yields once
+    // ended with 51 of the 65 heartbeats. Bound the wait by wall-clock time.
     let mut waits = Vec::new();
-    for _ in 0..10_000 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         while let Ok(Ok(record)) = caller.try_recv() {
             if let StreamRecord::Progress(progress) = record {
                 if progress.phase() == &ProgressPhase::QueueWait {
@@ -219,7 +224,7 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
             break;
         }
         tokio::task::yield_now().await;
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
     }
     assert!(
         !uploading.is_finished(),
