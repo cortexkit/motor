@@ -16,6 +16,8 @@ mod service_cleanup;
 #[cfg(feature = "linux-service-tests")]
 mod start_service_tests;
 mod start_tests;
+#[cfg(feature = "linux-root-tests")]
+mod stop_mount_tests;
 mod watcher_tests;
 #[cfg(feature = "linux-service-tests")]
 use service_cleanup::ServiceResources;
