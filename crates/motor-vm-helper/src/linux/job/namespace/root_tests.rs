@@ -53,6 +53,68 @@ impl Drop for Fixture {
     }
 }
 
+/// Set only in the child process that `Process::enter` starts for one test.
+const PROCESS_MARKER: &str = "MOTOR_VM_TEST_PRIVATE_PROCESS";
+
+/// Private mount and network namespaces shared by every thread of the test
+/// process. `Fixture` unshares only the test thread, but libtest always runs
+/// a test on a spawned thread, and `/proc/self` names the process leader.
+/// Code under test that reads `/proc/self/mountinfo`, as stop's jail cleanup
+/// does, would then see the host's mount table instead of the binds it made.
+/// In production every helper thread shares one mount namespace.
+pub(in crate::linux::job) struct Process {
+    scratch: PathBuf,
+}
+impl Process {
+    /// In the test process, runs `test` again in a child under
+    /// `unshare --mount --net`, requires it to pass, and returns None: the
+    /// caller must return at once. In that child, returns the fixture.
+    /// `test` is the full libtest name of the calling test.
+    pub(in crate::linux::job) fn enter(test: &str) -> Option<Self> {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        if std::env::var_os(PROCESS_MARKER).is_none() {
+            let status = Command::new("/usr/bin/unshare")
+                .args(["--mount", "--net", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(PROCESS_MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{test} in private namespaces: {status}");
+            return None;
+        }
+        // Never touch host mounts: the leader must be outside PID 1's mount
+        // namespace before anything is mounted.
+        let namespace = |path: &str| std::fs::metadata(path).unwrap().ino();
+        assert_ne!(
+            namespace("/proc/self/ns/mnt"),
+            namespace("/proc/1/ns/mnt"),
+            "{PROCESS_MARKER} set outside a private mount namespace"
+        );
+        assert_ne!(
+            namespace("/proc/self/ns/net"),
+            namespace("/proc/1/ns/net"),
+            "{PROCESS_MARKER} set outside a private network namespace"
+        );
+        command("/usr/bin/mount", &["--make-rprivate", "/"]);
+        let scratch = super::super::tests::scratch();
+        std::fs::create_dir_all(ROOT).unwrap();
+        command(
+            "/usr/bin/mount",
+            &["--bind", scratch.to_str().unwrap(), ROOT],
+        );
+        Some(Self { scratch })
+    }
+}
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Named network namespaces are mounts in this private namespace; the
+        // namespaces themselves end with the process, so nothing is restored.
+        let _ = reconcile(&BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&self.scratch);
+    }
+}
+
 pub(in crate::linux::job) fn command(program: &str, args: &[&str]) {
     let output = Command::new(program).args(args).output().unwrap();
     assert!(
