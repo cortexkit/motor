@@ -1,6 +1,7 @@
 //! Root-only: stop releases a job whose jail root holds the production bind
-//! mounts while a later job is running, inside the private mount namespace
-//! that the isolated job tests use. No KVM, jailer, cgroup or network.
+//! mounts while a later job is running, inside private mount and network
+//! namespaces shared by the whole test process, as the production helper's
+//! threads share one. No KVM, jailer, cgroup or real network.
 use super::*;
 
 /// Mount points at or below `boundary`, as listed by one mountinfo file.
@@ -85,12 +86,19 @@ fn assert_released(jobs: &LinuxJobs, start: &Start) {
     assert_eq!((disk.uid(), disk.mode() & 0o777), (0, 0o600));
 }
 
+const TEST: &str =
+    "linux::job::tests::stop_mount_tests::isolated_stop_releases_jail_binds_while_a_later_job_runs";
+
 /// Run as the root operator outside remote jobs. Needs mount, unshare and a
 /// root-owned shared scratch root; no KVM, Firecracker or jailer.
 #[test]
 fn isolated_stop_releases_jail_binds_while_a_later_job_runs() {
     assert_eq!(unsafe { libc::geteuid() }, 0, "run as the root operator");
-    let _isolation = namespace::root_tests::Fixture::new();
+    // Stop reads /proc/self/mountinfo, so every thread of the process, not
+    // only this test thread, must share the namespace that holds the binds.
+    let Some(_isolation) = namespace::root_tests::Process::enter(TEST) else {
+        return;
+    };
     let base = scratch();
     let jobs = machine(&base);
     for path in [&jobs.jail, &jobs.records_path, &jobs.workspaces] {
@@ -113,8 +121,8 @@ fn isolated_stop_releases_jail_binds_while_a_later_job_runs() {
     kill_child(&jobs, &first.job_id);
     jobs.collect_exit(&first.job_id).unwrap();
     assert_eq!(jobs.view(&first.job_id).unwrap().state, State::Exited);
-    // The binds exist in this thread's mount namespace. Name both views so a
-    // failure shows which mount table the cleanup could have read.
+    // Stop's cleanup reads the process view; the binds are made by this
+    // thread. Print both so a failure shows whether they disagree.
     let boundary = jobs.boundary(&first.job_id);
     eprintln!(
         "stop_mounts pid={} tid={} thread_view={:?} process_view={:?}",

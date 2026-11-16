@@ -85,11 +85,9 @@ fn tap_objects(index: u8) -> BTreeSet<String> {
         .into()
 }
 
-/// Joins the exit watcher before the private-namespace fixture is dropped.
-///
-/// The watcher thread shares the test thread's filesystem state, and
-/// `setns(CLONE_NEWNS)` back to the host mount namespace fails (EINVAL) while
-/// any thread shares it. The watcher exits within 100 ms of the last
+/// Joins the exit watcher before the private-namespace fixture is dropped,
+/// so the watcher cannot still be working while the fixture's drop removes
+/// the named network namespaces. The watcher exits within 100 ms of the last
 /// `LinuxJobs` reference dropping, so declare this guard before every holder
 /// of that reference: locals drop in reverse order, so it runs after them.
 struct WatcherGuard(Option<std::thread::JoinHandle<()>>);
@@ -106,7 +104,7 @@ impl Drop for WatcherGuard {
         if handle.is_finished() {
             let _ = handle.join();
         } else {
-            eprintln!("exit watcher still running after 30 s; namespace restore will fail");
+            eprintln!("exit watcher still running after 30 s");
         }
     }
 }
@@ -137,7 +135,13 @@ fn wait_for(mut ready: impl FnMut() -> bool) {
 #[test]
 fn isolated_job_exit_is_reported_while_another_job_boots() {
     assert_eq!(unsafe { libc::geteuid() }, 0, "run as the root operator");
-    let _isolation = namespace::root_tests::Fixture::new();
+    // Stop reads /proc/self/mountinfo, so every thread of the process, not
+    // only this test thread, must share the namespace that holds the binds.
+    let Some(_isolation) = namespace::root_tests::Process::enter(
+        "linux::job::tests::real_exit_tests::isolated_job_exit_is_reported_while_another_job_boots",
+    ) else {
+        return;
+    };
     let mut watcher = WatcherGuard(None);
     let base = scratch();
     let slice = format!("motorvmexit{}.slice", std::process::id());
