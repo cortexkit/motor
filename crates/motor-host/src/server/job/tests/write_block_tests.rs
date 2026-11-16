@@ -1,6 +1,89 @@
 use super::*;
 
 #[test]
+fn per_job_block_skips_rollback_tenant_binding() {
+    struct ControlWithRollback(Arc<Fake>);
+    impl Control for ControlWithRollback {
+        fn adopt(&self, _: &str) -> Result<bool> {
+            anyhow::bail!("tenant VM unavailable in per-job mode")
+        }
+        fn adopt_job(&self, job: &str) -> Result<bool> {
+            self.0.adopt_job(job)
+        }
+        fn job_admin(&self, job: &str, request: &Value) -> Result<Value> {
+            self.0.job_admin(job, request)
+        }
+        fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
+            self.0
+                .admin_requests
+                .lock()
+                .unwrap()
+                .push((tenant.into(), request.clone()));
+            Ok(json!({"ok":true,"blocked":request["blocked"]}))
+        }
+        fn wake(&self, _: &str, _: Option<u64>) -> Result<u64> {
+            unreachable!()
+        }
+        fn quota(&self, _: &str, _: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn relay(&self, _: &str, _: u32) -> Result<UnixStream> {
+            unreachable!()
+        }
+        fn suspend(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            unreachable!()
+        }
+        fn host_available_mib(&self) -> Result<u64> {
+            unreachable!()
+        }
+        fn online_cpus(&self) -> Result<u32> {
+            unreachable!()
+        }
+    }
+
+    let (mut runtime, fake, _storage) = fixture();
+    Arc::get_mut(&mut runtime).unwrap().control = Arc::new(ControlWithRollback(fake.clone()));
+    let c = claims(JOB);
+    claim(&runtime, &c);
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.tenants.insert(
+            "tenant-1".into(),
+            crate::state::Tenant {
+                tenant: "tenant-1".into(),
+                sub: c.sub.clone(),
+                vcpu_ceiling: 1,
+                max_weight: None,
+                guest_ram_mib: 100,
+                idle_suspend_s: 60,
+                host_floor_bytes: 0,
+            },
+        );
+        host.snapshot
+            .per_job
+            .executions
+            .get_mut(JOB)
+            .unwrap()
+            .boot_started = true;
+    }
+    for blocked in [true, false] {
+        let request = json!({"op":"set_remote_cache_write_block","blocked":blocked});
+        assert_eq!(
+            runtime.host_admin(&request).unwrap()["not_acknowledged"],
+            json!([])
+        );
+        assert_eq!(
+            fake.admin_requests.lock().unwrap().pop(),
+            Some((JOB.into(), request))
+        );
+        assert!(fake.admin_requests.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn block_reaches_each_running_job_vm_and_reports_unknown_runner_controls() {
     let (runtime, fake, _storage) = fixture();
     for job in [JOB, JOB2] {
