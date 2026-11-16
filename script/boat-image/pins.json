@@ -23,6 +23,6 @@
     "script/runner/parity-files.txt": "59f128bd0d6dc515f096bb28296f0abad49548defdc5ed77a005cd71d551a8d8",
     "script/runner/remote-cache-environment.py": "e3f7c421ac59ea4367c0ded451966959d00c1fad7df6eb821f87acf37f04f4b9",
     "script/runner/install-npm-tool.py": "23da6758d196bb2d3474a645ce6c21f61d122905b31867458f3ccac5b71e9845",
-    "script/runner/llvm-mingw.py": "337906fba0acfec66849c19c494b687ec54c387f0080b47b343ab32f2f204c91"
+    "script/runner/llvm-mingw.py": "2f25232fb53f26d0844c5f173e4c26639f53b53465fbd4fd5561f3ff411906b2"
   }
 }
