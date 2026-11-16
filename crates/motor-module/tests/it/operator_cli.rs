@@ -2333,6 +2333,8 @@ async fn drive_cancel_job(
     let args = cli::CancelArgs {
         job_id,
         secret_file: None,
+        // These tests check transport authorization, not matching checkouts.
+        force: true,
     };
     let mut out = Vec::new();
     let mut err = Vec::new();

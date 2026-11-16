@@ -158,11 +158,14 @@ pub enum Invocation {
 }
 
 pub const CANCEL_HELP: &str = "\
-usage: ck motor cancel JOB_ID [--secret-file PATH]
+usage: ck motor cancel JOB_ID [--force] [--secret-file PATH]
 
 Uses the saved default secret for JOB_ID when available, otherwise reads one
 line of stdin; --secret-file PATH selects an explicit secret file. Secrets are
 never accepted as arguments or from environment variables.
+
+Run from the job's submitting checkout, or pass --force to skip the checkout
+check. A different or unknown checkout is refused with exit status 204.
 
 Asks ck-motor to stop the job. Its acknowledgement means the cancel is durable;
 it does not wait for the job to end. The result is printed as one line:
@@ -171,8 +174,9 @@ it does not wait for the job to end. The result is printed as one line:
   refused: REASON
 Exit status: 0 when the job is cancelled or had already ended (including
 refused before start), 201 when the cancel may not have reached ck-motor and the
-job's fate is unknown, 200 when the cancel is refused (an unknown job ID and a
-wrong secret look the same), 204 for bad arguments.
+job's fate is unknown, 200 when ck-motor refuses the cancel (with --force, an
+unknown job ID and a wrong secret look the same), 204 for bad arguments or when
+the checkout cannot be matched.
 
 The job's reattach secret file is kept, so `ck motor attach JOB_ID` can still
 read the job's final output.";
@@ -181,33 +185,38 @@ read the job's final output.";
 pub struct CancelArgs {
     pub job_id: Uuid,
     pub secret_file: Option<PathBuf>,
+    pub force: bool,
 }
 
 pub fn parse_cancel_args(args: &[String]) -> Result<Option<CancelArgs>, String> {
     if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
         return Ok(None);
     }
-    let mut parsed = CancelArgs {
-        job_id: args
-            .first()
-            .and_then(|id| id.parse().ok())
-            .ok_or("cancel needs a job ID")?,
-        secret_file: None,
-    };
-    let mut words = args[1..].iter();
+    let mut job_id = None;
+    let mut secret_file = None;
+    let mut force = false;
+    let mut words = args.iter();
     while let Some(word) = words.next() {
         match word.as_str() {
-            "--secret-file" if parsed.secret_file.is_none() => {
-                parsed.secret_file = Some(words.next().ok_or("--secret-file needs a path")?.into());
+            "--force" if !force => force = true,
+            "--secret-file" if secret_file.is_none() => {
+                secret_file = Some(words.next().ok_or("--secret-file needs a path")?.into());
             }
-            _ if word.starts_with("--secret-file=") && parsed.secret_file.is_none() => {
-                parsed.secret_file = Some(word[14..].into());
+            _ if word.starts_with("--secret-file=") && secret_file.is_none() => {
+                secret_file = Some(word[14..].into());
+            }
+            _ if job_id.is_none() && word.parse::<Uuid>().is_ok() => {
+                job_id = word.parse().ok();
             }
             // Do not echo an unrecognized word: it might be a misplaced secret.
-            _ => return Err("cancel accepts only JOB_ID and --secret-file PATH".into()),
+            _ => return Err("cancel accepts only JOB_ID, --force and --secret-file PATH".into()),
         }
     }
-    Ok(Some(parsed))
+    Ok(Some(CancelArgs {
+        job_id: job_id.ok_or("cancel needs a job ID")?,
+        secret_file,
+        force,
+    }))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -472,7 +481,8 @@ line of stdin; --secret-file PATH selects an explicit secret file.
 Secrets are never accepted as arguments or from environment variables.
 `ck motor cancel JOB_ID` uses the same lookup to stop a job that is still running.
 Replays output from the start, then streams until the job ends. --status prints
-the current state and outcome as JSON without streaming (exit 0 while running).
+the current state and outcome as JSON on stdout without streaming (exit 0 while
+running), and checkout: PATH on stderr (checkout: unknown if not saved).
 Both wait up to 60 seconds for ck-motor if its capability is temporarily absent.
 The terminal exit statuses and interrupt behavior are the same as `ck motor run`.";
 
@@ -797,7 +807,7 @@ fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<Run
                 )
             })
     };
-    let workspace = canonical(&git_path(&cwd, "--show-toplevel")?, "workspace")?;
+    let workspace = workspace_root(Some(&cwd))?;
     let common = canonical(&git_path(&workspace, "--git-common-dir")?, "git common dir")?;
     let repository_root = common
         .parent()
@@ -924,7 +934,8 @@ where
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ExecClient: Send + Sync {
-    /// Fallback checkout for an attachment without saved workspace metadata.
+    /// Current checkout, matched against the job's checkout before cancellation
+    /// and used to resolve returned files when attachment metadata is missing.
     fn local_workspace(&self) -> Option<&Path> {
         None
     }
@@ -1205,6 +1216,11 @@ async fn drive_attach_inner<C: ExecClient + ?Sized>(
                     "{}",
                     serde_json::to_string(&value).expect("serializable status")
                 );
+                let _ = writeln!(
+                    err,
+                    "checkout: {}",
+                    status_checkout(&value).unwrap_or("unknown")
+                );
                 if status.terminal.is_some() {
                     if let Some(path) = &default_secret_file {
                         let _ = retain_terminal_secret(path);
@@ -1263,7 +1279,8 @@ fn attach_failure(failure: SubmitError, name: &str, err: &mut dyn Write) -> u8 {
 /// `ck motor cancel JOB_ID`: ask ck-motor to stop a direct job found through its
 /// reattach secret, then report the job's state as one line on `out`. Only the
 /// caller that started the job, or one holding its secret, is admitted; a wrong
-/// secret is refused exactly like an unknown job ID.
+/// secret is refused exactly like an unknown job ID. Unless `--force` is set,
+/// the current checkout must match the job's saved submitting checkout.
 pub async fn drive_cancel<C: ExecClient + ?Sized>(
     client: &C,
     args: &CancelArgs,
@@ -1272,7 +1289,28 @@ pub async fn drive_cancel<C: ExecClient + ?Sized>(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
+    if !args.force {
+        let status = wait_for_motor(|| client.status_json(args.job_id, secret), err)
+            .await
+            .ok();
+        let checkout = status.as_ref().and_then(status_checkout);
+        if checkout.is_none() || client.local_workspace() != checkout.map(Path::new) {
+            let _ = writeln!(
+                err,
+                "ck motor cancel: job checkout: {}; run the cancel from that checkout or pass --force; no cancel sent",
+                checkout.unwrap_or("unknown")
+            );
+            return EXIT_USAGE;
+        }
+    }
     cancel_before_eof(client, args.job_id, secret, saved_file, true, out, err).await
+}
+
+fn status_checkout(status: &serde_json::Value) -> Option<&str> {
+    status
+        .get("checkout")
+        .and_then(serde_json::Value::as_str)
+        .filter(|checkout| Path::new(checkout).is_absolute())
 }
 
 /// [`drive_cancel`], passing its one line through verbatim. `out` in the CLI is
@@ -2770,7 +2808,12 @@ mod tests {
         let args = parse_cancel_args(&words(&[&id, "--secret-file=key"]))
             .unwrap()
             .unwrap();
+        assert!(!args.force);
         assert_eq!(args.secret_file.unwrap(), Path::new("key"));
+        for values in [vec!["--force", &id], vec![&id, "--force"]] {
+            assert!(parse_cancel_args(&words(&values)).unwrap().unwrap().force);
+        }
+        assert!(parse_cancel_args(&words(&[&id, "--force", "--force"])).is_err());
         // The usage ck prints must list every verb, cancel included.
         for verb in ["run", "attach JOB_ID", "cancel JOB_ID", "hosted-check"] {
             assert!(
@@ -3517,6 +3560,229 @@ mod tests {
 mod hosted_cli_tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CheckoutCancelClient {
+        workspace: Option<PathBuf>,
+        checkout: Option<PathBuf>,
+        cancels: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ExecClient for CheckoutCancelClient {
+        fn local_workspace(&self) -> Option<&Path> {
+            self.workspace.as_deref()
+        }
+        async fn run(&self, _: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+            unreachable!()
+        }
+        async fn attach(&self, _: Uuid, _: &str) -> Result<Box<dyn RecordStream>, SubmitError> {
+            unreachable!()
+        }
+        async fn status(&self, job_id: Uuid, secret: &str) -> Result<JobStatusReply, SubmitError> {
+            assert_eq!(secret, "private");
+            Ok(JobStatusReply {
+                job_id,
+                state: "running".into(),
+                waiting_on: None,
+                blocker: None,
+                terminal: None,
+                unit: None,
+                unit_alive: None,
+                queue_wait_ms: None,
+            })
+        }
+        async fn status_json(
+            &self,
+            job_id: Uuid,
+            secret: &str,
+        ) -> Result<serde_json::Value, SubmitError> {
+            let mut value = serde_json::to_value(self.status(job_id, secret).await?).unwrap();
+            if let Some(checkout) = &self.checkout {
+                value["checkout"] = json!(checkout);
+            }
+            Ok(value)
+        }
+        async fn cancel(&self, _: Uuid, secret: Option<&str>) -> Result<(), String> {
+            assert_eq!(secret, Some("private"));
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn cancel_checkouts() -> (cortexkit_test_support::ScratchDir, PathBuf, PathBuf) {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-cancel-checkout");
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        let main = root.join("main");
+        fs::create_dir(&main).unwrap();
+        let git = |args: &[&str]| crate::snapshot::git(&main, args).unwrap();
+        git(&["init", "--quiet"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let linked = root.join("linked");
+        git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "task",
+            linked.to_str().unwrap(),
+        ]);
+        (scratch, main, linked)
+    }
+
+    #[tokio::test]
+    async fn cancel_from_a_different_checkout_is_refused_without_sending_cancel() {
+        let (_scratch, main, linked) = cancel_checkouts();
+        let client = CheckoutCancelClient {
+            workspace: Some(workspace_root(Some(&linked)).unwrap()),
+            checkout: Some(main.clone()),
+            cancels: AtomicUsize::new(0),
+        };
+        let args = parse_cancel_args(&[Uuid::now_v7().to_string()])
+            .unwrap()
+            .unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = drive_cancel(&client, &args, "private", None, &mut out, &mut err).await;
+        assert_eq!(code, EXIT_USAGE, "different checkout must be refused");
+        assert_eq!(client.cancels.load(Ordering::SeqCst), 0);
+        assert!(out.is_empty());
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains(main.to_str().unwrap()), "{err}");
+        assert!(err.contains("--force"), "{err}");
+        assert!(!err.contains("private"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cancel_from_the_submitting_checkout_goes_through() {
+        let (_scratch, main, _linked) = cancel_checkouts();
+        let nested = main.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let client = CheckoutCancelClient {
+            workspace: Some(workspace_root(Some(&nested)).unwrap()),
+            checkout: Some(main),
+            cancels: AtomicUsize::new(0),
+        };
+        let args = parse_cancel_args(&[Uuid::now_v7().to_string()])
+            .unwrap()
+            .unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            drive_cancel(&client, &args, "private", None, &mut out, &mut err).await,
+            0
+        );
+        assert_eq!(client.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(out, b"cancelled\n");
+        assert!(err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn force_cancel_skips_checkout_affinity() {
+        let (_scratch, main, linked) = cancel_checkouts();
+        for (workspace, checkout) in [(Some(linked), Some(main)), (None, None)] {
+            let client = CheckoutCancelClient {
+                workspace,
+                checkout,
+                cancels: AtomicUsize::new(0),
+            };
+            let args = parse_cancel_args(&["--force".into(), Uuid::now_v7().to_string()])
+                .unwrap()
+                .unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                drive_cancel(&client, &args, "private", None, &mut out, &mut err).await,
+                0
+            );
+            assert_eq!(client.cancels.load(Ordering::SeqCst), 1);
+            assert_eq!(out, b"cancelled\n");
+            assert!(err.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_with_an_unknown_checkout_or_outside_a_checkout_is_refused() {
+        let (_scratch, main, _linked) = cancel_checkouts();
+        for (workspace, checkout) in [
+            (Some(main.clone()), None),
+            (None, Some(main.clone())),
+            (None, None),
+        ] {
+            let client = CheckoutCancelClient {
+                workspace,
+                checkout: checkout.clone(),
+                cancels: AtomicUsize::new(0),
+            };
+            let args = parse_cancel_args(&[Uuid::now_v7().to_string()])
+                .unwrap()
+                .unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                drive_cancel(&client, &args, "private", None, &mut out, &mut err).await,
+                EXIT_USAGE
+            );
+            assert_eq!(client.cancels.load(Ordering::SeqCst), 0);
+            assert!(out.is_empty());
+            let err = String::from_utf8(err).unwrap();
+            assert!(err.contains("--force"), "{err}");
+            if let Some(checkout) = checkout {
+                assert!(err.contains(checkout.to_str().unwrap()), "{err}");
+            } else {
+                assert!(err.contains("checkout: unknown"), "{err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn status_prints_the_checkout_line_and_preserves_json() {
+        let (_scratch, main, _linked) = cancel_checkouts();
+        for checkout in [Some(main), None] {
+            let client = CheckoutCancelClient {
+                workspace: None,
+                checkout: checkout.clone(),
+                cancels: AtomicUsize::new(0),
+            };
+            let args = AttachArgs {
+                job_id: Uuid::now_v7(),
+                secret_file: None,
+                status: true,
+            };
+            let (_, mut interrupts) = mpsc::channel(1);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                drive_attach(
+                    &client,
+                    &args,
+                    "private",
+                    &mut out,
+                    &mut err,
+                    &mut interrupts
+                )
+                .await,
+                0
+            );
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(value["state"], "running");
+            assert_eq!(value["checkout"], json!(checkout));
+            let expected = checkout
+                .as_deref()
+                .and_then(Path::to_str)
+                .unwrap_or("unknown");
+            assert_eq!(
+                String::from_utf8(err).unwrap(),
+                format!("checkout: {expected}\n")
+            );
+            assert_eq!(client.cancels.load(Ordering::SeqCst), 0);
+        }
+    }
 
     struct Records(VecDeque<Vec<u8>>);
     #[async_trait]

@@ -880,27 +880,35 @@ as `attach` does: the default file named by the job ID, an explicit
 `--secret-file`, or one line on stdin. It sends the direct `exec.cancel`, which
 ck-motor admits only for the route that started the job or a caller holding the
 job's secret; there is no other fallback, and the secret is never printed. The
-result is one line on stdout:
+CLI first compares the current Git checkout with the job's saved submitting
+checkout. A different checkout, a command outside a checkout, or an unknown
+submitting checkout is refused with exit status 204; the diagnostic names the
+saved checkout when known. Run the cancel from that checkout, or pass `--force`
+to skip this check. This is an accident guard, not an authentication boundary:
+every `ck motor` command run by the same OS user on one machine counts as one
+caller and can read the same saved secrets. `--force` keeps the existing
+secret-based cancellation behavior. The result is one line on stdout:
 
 - `cancelled` — the cancel is durable and the job had not ended yet.
 - `already finished: OUTCOME (job_id=ID)` — the job had ended; `OUTCOME` is its
   exit code, signal, timeout, cancellation or refusal.
-- Nothing on stdout when the cancel is refused, with the reason on stderr,
-  under the same wording an unknown job produces.
+- Nothing on stdout when the cancel is refused, with the reason on stderr.
 
 The exit status is 0 when the job is cancelled or had already ended, 200 when
-the cancel is refused (an unknown job ID and a wrong secret get the same
-refusal), 201
-when the cancel may not have reached ck-motor, and 204 for bad arguments. The
-command does not wait for the job to end; `attach JOB_ID` then shows its final
-output. A saved default secret file is kept, so `attach` can still read it.
+ck-motor refuses the cancel (with `--force`, an unknown job ID and a wrong secret
+get the same refusal), 201 when the cancel may not have reached ck-motor, and
+204 for bad arguments or when the checkout cannot be matched. The command does
+not wait for the job to end; `attach JOB_ID` then shows its final output. A saved
+default secret file is kept, so `attach` can still read it.
 
 `attach` replays output from the start in order, then follows a still-running
 job to its terminal outcome. It has the same exit-code contract as `run`.
-`--status` instead prints a JSON state/outcome reply without streaming, exiting
-0 while running or with the terminal exit code when complete. Ctrl-C or SIGTERM
-requests cancellation and waits for the terminal (203); a second interrupt
-stops waiting (201). A lost connection does not cancel the job.
+`attach JOB_ID --status` prints the JSON state/outcome reply on stdout without
+streaming, and a `checkout: PATH` line on stderr (`checkout: unknown` for older
+jobs without saved checkout metadata). The JSON includes `checkout` when known.
+It exits 0 while running or with the terminal exit code when complete. Ctrl-C
+or SIGTERM requests cancellation and waits for the terminal (203); a second
+interrupt stops waiting (201). A lost connection does not cancel the job.
 
 The route that submitted the job can still attach, check and cancel without a secret. A new
 direct route sends `direct_secret` beside `op` and `params` in ck-motor's JSON
