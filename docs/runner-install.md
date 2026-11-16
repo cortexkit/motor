@@ -228,6 +228,32 @@ CARGO_HOME=/srv/build/cargo-home sh script/runner/build-sccache.sh
 binary it replaces as `sccache-0.18.0-stock`, and prints both hashes. See
 [compile-cache.md](compile-cache.md).
 
+### ARM64 Windows cross-lint in Linux job images
+
+The Linux job images on our servers include the `aarch64-pc-windows-gnullvm`
+Rust target for Rust 1.100.0 and 1.99.0, alongside the existing
+`x86_64-pc-windows-gnu` cross target. llvm-mingw **20261104** (LLVM 23.1.5,
+Universal C Runtime, or UCRT, Ubuntu 22.04 x86_64 host build) supplies the ARM64
+Windows C compiler, linker and sysroot without a Microsoft SDK. The image retains only ARM64
+support and shared compiler dependencies under `/usr/local/lib/motor/llvm-mingw`;
+its `bin` directory is not on PATH and does not replace the distro LLVM tools.
+
+The runner supplies these target-scoped defaults in every Linux job on an
+image containing that toolchain:
+
+| Variable | Value |
+| --- | --- |
+| `CC_aarch64_pc_windows_gnullvm` | `/usr/local/lib/motor/llvm-mingw/bin/aarch64-w64-mingw32-clang` |
+| `AR_aarch64_pc_windows_gnullvm` | `/usr/local/lib/motor/llvm-mingw/bin/llvm-ar` |
+| `CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER` | `/usr/local/lib/motor/llvm-mingw/bin/aarch64-w64-mingw32-clang` |
+
+In Linux jobs on these images, `cargo clippy --target aarch64-pc-windows-gnullvm`
+works with no setup, including for crates that compile C code. Overflow
+sandboxes (jobs spilled to Boat) gain the same support at their next image
+rebuild: Boat and the per-job tenant image use the shared manifest and installer.
+Older images and the build server do not acquire these defaults or tools through
+a job request.
+
 ## 4. Install the runner binary
 
 Build on the server, or on another x86_64 Linux host with the same Rust version:

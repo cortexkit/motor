@@ -457,6 +457,8 @@ class ParityTests(unittest.TestCase):
                  for name, spec in manifest['tools'].items()}
         if 'musl-gcc' in tools:
             tools['musl-gcc']['version'] = 'x86_64-linux-gnu-gcc (Ubuntu 13.2.0-23ubuntu4) 13.2.0'
+        if 'llvm-mingw' in tools:
+            tools['llvm-mingw']['version'] = 'clang version 23.1.5'
         tools.update({name: {'path': path, 'version': name[3:] + ' (GNU coreutils) 9.7', 'exit_code': 0}
                       for name, path in manifest['gnu_coreutils'].items()})
         for name, row in tools.items():
@@ -495,7 +497,8 @@ class ParityTests(unittest.TestCase):
                 'local_bin_entries': sorted(name for name, spec in manifest['tools'].items()
                                             if spec['path'].startswith('/usr/local/bin/')),
                 'mountinfo': '1 0 0:0 / ' + manifest['rustup_home'] + ' ro - ext4 /dev/example rw',
-                'cargo_registry': self.registry()}
+                'cargo_registry': self.registry(),
+                'llvm_mingw': {'passed': True} if 'llvm-mingw' in tools else None}
 
     def observed_host(self, role):
         actual = self.observed(role)
@@ -824,6 +827,73 @@ class ParityTests(unittest.TestCase):
         self.assertFalse(report['passed'])
         self.assertEqual(len(report['errors']), 1)
         self.assertIn('1.99.0-x86_64-unknown-linux-gnu targets:', report['errors'][0])
+
+    def test_arm64_windows_is_image_only_and_qualifies_compile_and_environment(self):
+        target = 'aarch64-pc-windows-gnullvm'
+        for role in ('build-server', 'boat', 'tenant'):
+            actual = self.observed(role, job=True)
+            report = self.report(actual, role=role, job=True)
+            self.assertTrue(report['passed'], report['errors'])
+            for name in ('1.100.0', '1.99.0'):
+                self.assertEqual(target in actual['rust_toolchains'][name + '-x86_64-unknown-linux-gnu']['targets'],
+                                 role != 'build-server')
+            if role == 'build-server':
+                self.assertNotIn('llvm-mingw', actual['tools'])
+                continue
+            for name in ('1.100.0', '1.99.0'):
+                broken = copy.deepcopy(actual)
+                broken['rust_target_payloads'][name + '-x86_64-unknown-linux-gnu'][target] = False
+                report = self.report(broken, role=role, job=True)
+                self.assertEqual(report['errors'], [name + '-x86_64-unknown-linux-gnu: missing libstd payload for ' + target])
+            for variable in parity.llvm_mingw.ENVIRONMENT:
+                broken = copy.deepcopy(actual)
+                broken['job_environment'].pop(variable)
+                report = self.report(broken, role=role, job=True)
+                self.assertFalse(report['passed'])
+                self.assertTrue(any(variable in error for error in report['errors']))
+            for key, value in (('llvm_mingw', {'passed': False, 'error': 'missing assert.h'}),
+                               ('llvm_mingw', None)):
+                broken = copy.deepcopy(actual)
+                broken[key] = value
+                report = self.report(broken, role=role, job=True)
+                self.assertFalse(report['passed'])
+                self.assertTrue(any('C compile/archive/link probe:' in error for error in report['errors']))
+            actual['tools'].pop('llvm-mingw')
+            report = self.report(actual, role=role, job=True)
+            self.assertFalse(report['passed'])
+            self.assertTrue(any('llvm-mingw path:' in error for error in report['errors']))
+
+    def test_arm64_windows_pins_targets_and_environment_cannot_be_omitted(self):
+        for field in ('sha256', 'url', 'digest_source'):
+            manifest = copy.deepcopy(self.manifest)
+            manifest['tools']['llvm-mingw']['archive'][field] = 'latest'
+            with self.assertRaisesRegex(ValueError, 'pinned llvm-mingw'):
+                parity.validate(manifest)
+        manifest = copy.deepcopy(self.manifest)
+        manifest['tools'].pop('llvm-mingw')
+        with self.assertRaisesRegex(ValueError, 'pinned llvm-mingw'):
+            parity.validate(manifest)
+        for variable in parity.llvm_mingw.ENVIRONMENT:
+            manifest = copy.deepcopy(self.manifest)
+            manifest['job_environment'].pop(variable)
+            with self.assertRaisesRegex(ValueError, variable):
+                parity.validate(manifest)
+        for name in ('1.100.0', '1.99.0'):
+            manifest = copy.deepcopy(self.manifest)
+            spec = manifest['rust_toolchains'][name + '-x86_64-unknown-linux-gnu']
+            spec['targets'].remove('aarch64-pc-windows-gnullvm')
+            spec['components'].remove('rust-std-aarch64-pc-windows-gnullvm')
+            with self.assertRaisesRegex(ValueError, 'missing gnullvm Rust target'):
+                parity.validate(manifest)
+
+    def test_server_refresh_preserves_image_only_arm64_windows_support(self):
+        actual = self.observed()
+        original = copy.deepcopy(actual)
+        refreshed = parity.refresh(self.manifest, actual)
+        self.assertEqual(actual, original)
+        self.assertEqual(refreshed['tools']['llvm-mingw'], self.manifest['tools']['llvm-mingw'])
+        self.assertIn('aarch64-pc-windows-gnullvm',
+                      refreshed['rust_toolchains']['1.99.0-x86_64-unknown-linux-gnu']['targets'])
 
     def test_toolchain_component_and_default_drift_fail(self):
         for key in ('rust_default', 'rust_profile'):
@@ -1477,6 +1547,113 @@ class ParityTests(unittest.TestCase):
                     parity.validate(manifest)
 
 
+class LlvmMingwTests(unittest.TestCase):
+    def tree(self, root):
+        for name in ('bin', 'lib/clang/23/lib/windows', 'generic-w64-mingw32/include',
+                     'aarch64-w64-mingw32/lib', 'i686-w64-mingw32/lib',
+                     'x86_64-w64-mingw32/lib', 'armv7-w64-mingw32/lib', 'share'):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        for name in ('clang-23', 'clang-target-wrapper.sh', 'llvm-ar', 'lld', 'llvm-objdump',
+                     'llvm-rc', 'llvm-cvtres', 'clang-tidy'):
+            path = root / 'bin' / name
+            path.write_text('#!/bin/sh\nexit 0\n')
+            path.chmod(0o755)
+        for name, target in (('clang', 'clang-23'), ('aarch64-w64-mingw32-clang', 'clang-target-wrapper.sh'),
+                             ('aarch64-w64-mingw32-ar', 'llvm-ar'), ('ld.lld', 'lld'),
+                             ('x86_64-w64-mingw32-clang', 'clang-target-wrapper.sh')):
+            (root / 'bin' / name).symlink_to(target)
+        for name in ('libclang_rt.builtins-aarch64.a', 'libclang_rt.builtins-x86_64.a'):
+            (root / 'lib/clang/23/lib/windows' / name).write_bytes(b'runtime')
+        (root / 'generic-w64-mingw32/include/assert.h').write_text('/* CRT header */')
+        (root / 'aarch64-w64-mingw32/include').symlink_to('../generic-w64-mingw32/include')
+
+    def test_shared_installer_checks_digest_prunes_and_keeps_private_wrappers_for_both_images(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tree = root / 'release'
+            self.tree(tree)
+            archive = root / 'release.tar.xz'
+            with tarfile.open(archive, 'w:xz') as bundle:
+                bundle.add(tree, arcname='llvm-mingw-fixture')
+            manifest = json.loads(parity.MANIFEST.read_text())
+            spec = manifest['tools']['llvm-mingw']
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            spec['archive']['sha256'] = digest
+            manifest['tools'] = {'llvm-mingw': spec}
+            (root / 'toolchain.json').write_text(json.dumps(manifest))
+            shutil.copy2(parity.HERE / 'llvm-mingw.py', root)
+            script = root / 'install-tools.sh'
+            script.write_text((parity.HERE / script.name).read_text().replace('/srv/build', str(root)))
+            fake_bin = root / 'fake-bin'
+            fake_bin.mkdir()
+            curl = fake_bin / 'curl'
+            curl.write_text('#!/usr/bin/env python3\nimport os, pathlib, shutil, sys\n'
+                            'args = sys.argv[1:]\n'
+                            'pathlib.Path(os.environ["CURL_LOG"]).write_text("downloaded")\n'
+                            'shutil.copyfile(os.environ["ARCHIVE"], args[args.index("-o") + 1])\n')
+            curl.chmod(0o755)
+            for role in ('boat', 'tenant', 'build-server'):
+                prefix = root / role
+                env = dict(os.environ, ARCHIVE=str(archive), CURL_LOG=str(root / 'curl.log'),
+                           TOOLCHAIN_INSTALL_ROOT=str(prefix), PATH=str(fake_bin) + ':' + os.environ['PATH'])
+                result = subprocess.run(['bash', str(script), role, 'runtime-only'], env=env,
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                destination = prefix / parity.llvm_mingw.ROOT.lstrip('/')
+                if role == 'build-server':
+                    self.assertFalse(destination.exists())
+                    self.assertFalse((root / 'curl.log').exists())
+                    continue
+                self.assertIn('before pruning;', result.stdout)
+                self.assertEqual((destination / '.motor-archive-sha256').read_text().strip(), digest)
+                compiler = destination / 'bin/aarch64-w64-mingw32-clang'
+                self.assertEqual(compiler.resolve(), destination / 'bin/clang-target-wrapper.sh')
+                self.assertTrue((destination / 'bin/clang').resolve().is_file())
+                self.assertTrue((destination / 'aarch64-w64-mingw32/include/assert.h').is_file())
+                for name in ('i686-w64-mingw32', 'x86_64-w64-mingw32', 'armv7-w64-mingw32',
+                             'share', 'bin/clang-tidy', 'bin/x86_64-w64-mingw32-clang',
+                             'lib/clang/23/lib/windows/libclang_rt.builtins-x86_64.a'):
+                    self.assertFalse((destination / name).exists(), name)
+                self.assertFalse((prefix / 'usr/local/bin/clang').exists())
+                (root / 'curl.log').unlink()
+            spec['archive']['sha256'] = '0' * 64
+            (root / 'toolchain.json').write_text(json.dumps(manifest))
+            env['TOOLCHAIN_INSTALL_ROOT'] = str(root / 'bad-digest')
+            result = subprocess.run(['bash', str(script), 'tenant', 'runtime-only'], env=env,
+                                    text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('archive SHA-256 mismatch', result.stderr)
+            self.assertFalse((root / 'bad-digest').exists())
+
+    def test_c_probe_requires_receipt_and_job_variables_and_executes_all_three_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = Path(temporary)
+            root = prefix / parity.llvm_mingw.ROOT.lstrip('/')
+            root.mkdir(parents=True)
+            manifest = json.loads(parity.MANIFEST.read_text())
+            digest = manifest['tools']['llvm-mingw']['archive']['sha256']
+            (root / '.motor-archive-sha256').write_text(digest)
+            def compile(command, **kwargs):
+                if '-c' in command:
+                    source = Path(command[command.index('-c') + 1])
+                    self.assertIn('#include <assert.h>', source.read_text())
+                    Path(command[-1]).write_bytes(b'\x64\xaaobject')
+                elif '-o' in command:
+                    Path(command[-1]).write_bytes(b'MZexecutable')
+            with patch.dict(os.environ, parity.llvm_mingw.ENVIRONMENT), \
+                 patch.object(parity.llvm_mingw.subprocess, 'run', side_effect=compile) as run:
+                self.assertEqual(parity.llvm_mingw.probe(manifest, job=True, install_root=str(prefix)), {'passed': True})
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(Path(run.call_args_list[1].args[0][0]).name, 'llvm-ar')
+                for variable in parity.llvm_mingw.ENVIRONMENT:
+                    with patch.dict(os.environ, {variable: ''}):
+                        result = parity.llvm_mingw.probe(manifest, job=True, install_root=str(prefix))
+                        self.assertFalse(result['passed'])
+                        self.assertIn(variable, result['error'])
+                (root / '.motor-archive-sha256').write_text('unverified')
+                self.assertFalse(parity.llvm_mingw.probe(manifest, install_root=str(prefix))['passed'])
+
+
 class JournalRetentionHostFileTests(unittest.TestCase):
     """The Boat image installs the shared journald retention file under
     zz-motor-retention.conf so it sorts after the drop-in Boat's base image
@@ -1533,6 +1710,8 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = json.loads(parity.MANIFEST.read_text())
+            # llvm-mingw's private archive/pruning path has its own fixture tests.
+            manifest['tools'].pop('llvm-mingw')
             archive_dir = root / 'archive-fixtures'
             archive_dir.mkdir()
             bun_payload = b'#!/bin/sh\necho 1.3.14\n'

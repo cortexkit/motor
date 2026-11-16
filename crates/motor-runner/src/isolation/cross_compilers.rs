@@ -29,7 +29,7 @@ mod tests {
 
     #[test]
     fn image_arm64_windows_defaults_are_runner_owned_and_target_scoped() {
-        let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let scratch = cortexkit_test_support::ScratchDir::new("arm64-windows-defaults");
         let root = scratch.path().join("llvm-mingw");
         std::fs::create_dir(&root).unwrap();
         let mut env = BTreeMap::from([
@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn old_images_without_llvm_mingw_get_no_arm64_windows_defaults() {
-        let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let scratch = cortexkit_test_support::ScratchDir::new("arm64-windows-old-image");
         let mut env = BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
         let original = env.clone();
         arm64_windows(&mut env, &scratch.path().join("not-installed"));

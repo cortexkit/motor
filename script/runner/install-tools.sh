@@ -11,7 +11,7 @@ role="${1:-build-server}"
 mode="${2:-all}"
 case "$role" in build-server|boat|tenant) ;; *) echo "unknown install role: $role" >&2; exit 2 ;; esac
 case "$mode" in all|runtime-only) ;; *) echo "unknown install mode: $mode" >&2; exit 2 ;; esac
-export CARGO_HOME=/srv/build/cargo-home RUSTUP_HOME=/home/ubuntu/.rustup TMPDIR=/srv/build/tmp
+export CARGO_HOME=/srv/build/cargo-home RUSTUP_HOME=/home/ubuntu/.rustup TMPDIR="${TMPDIR:-/srv/build/tmp}"
 export PATH="$CARGO_HOME/bin:$PATH"
 # cargo keeps one install per crate in a root, so each revision of a git tool
 # gets its own root here; its binaries are then copied into CARGO_HOME/bin.
@@ -90,12 +90,12 @@ as_root() {
 }
 
 mkdir -p "$TMPDIR"
-archives=$(python3 - "$here/toolchain.json" <<'PY'
+archives=$(python3 - "$here/toolchain.json" "$role" <<'PY'
 import json, sys
 manifest = json.load(open(sys.argv[1]))
 for name, spec in sorted(manifest["tools"].items()):
     archive = spec.get("archive")
-    if archive:
+    if archive and sys.argv[2] in spec.get("roles", ["build-server", "boat", "tenant"]):
         print("|".join(str(value) for value in (
             name, spec["version"], spec["path"], archive["url"], archive["sha256"],
             archive["format"], archive["install_dir"], archive["install_path"],
@@ -142,6 +142,9 @@ while IFS='|' read -r name version link url sha format install_dir install_path 
         tar --no-same-owner --no-same-permissions -xJf "$tmp/archive" \
           --strip-components="$strip_components" -C "$tmp/extracted")
       [ -x "$tmp/extracted/$install_path" ] || { echo "$name: archive binary is missing" >&2; exit 1; }
+      if [ "$name" = llvm-mingw ]; then
+        python3 "$here/llvm-mingw.py" --prune "$tmp/extracted" --sha256 "$sha"
+      fi
       as_root install -d -m 0755 "$destination"
       as_root cp -a --no-preserve=ownership "$tmp/extracted/." "$destination/"
       ;;
@@ -149,10 +152,14 @@ while IFS='|' read -r name version link url sha format install_dir install_path 
   esac
   link_path="$(rooted "$link")"
   target="$(rooted "$install_dir/$install_path")"
-  as_root install -d -m 0755 "$(dirname "$link_path")"
-  as_root rm -f "$link_path.tmp.$$"
-  as_root ln -s "$target" "$link_path.tmp.$$"
-  as_root mv -Tf "$link_path.tmp.$$" "$link_path"
+  # Private toolchains are already at their declared path; never replace the
+  # compiler wrapper with a symlink to itself or expose its bin directory on PATH.
+  if [ "$link_path" != "$target" ]; then
+    as_root install -d -m 0755 "$(dirname "$link_path")"
+    as_root rm -f "$link_path.tmp.$$"
+    as_root ln -s "$target" "$link_path.tmp.$$"
+    as_root mv -Tf "$link_path.tmp.$$" "$link_path"
+  fi
   rm -rf "$tmp"
   trap - EXIT
   echo "installed $name $version from pinned archive"

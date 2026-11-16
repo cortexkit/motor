@@ -1,5 +1,6 @@
 {
   "accepted_os_differences": [
+    "ARM64 Windows GNU/LLVM cross-lint support is image-only: Boat and tenant install the pinned private llvm-mingw toolchain and the aarch64-pc-windows-gnullvm Rust target on 1.100.0 and 1.99.0. The build server is no longer a job runner; its captured toolchains and environment remain unchanged and do not require these image-only additions.",
     "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04 and tenant uses Debian trixie. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: both images build the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of the distro git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
     "wasm-opt uses apt binaryen (/usr/bin/wasm-opt) on the build server, where its major version is 120. Boat and tenant install the official Binaryen 120 x86_64 Linux release archive pinned by SHA-256 and remove the distro package. Parity checks the same major version and each role's executable path.",
@@ -563,8 +564,14 @@
   "inotify_minimum": {
     "max_user_instances": 8192
   },
+  "image_only_rust_targets": [
+    "aarch64-pc-windows-gnullvm"
+  ],
   "job_environment": {
+    "AR_aarch64_pc_windows_gnullvm": "/usr/local/lib/motor/llvm-mingw/bin/llvm-ar",
     "CARGO_HOME": "/motor-home/cargo",
+    "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER": "/usr/local/lib/motor/llvm-mingw/bin/aarch64-w64-mingw32-clang",
+    "CC_aarch64_pc_windows_gnullvm": "/usr/local/lib/motor/llvm-mingw/bin/aarch64-w64-mingw32-clang",
     "ESBUILD_BIN": null,
     "RUSTUP_HOME": "/home/ubuntu/.rustup",
     "TEMP": "/motor-home/tmp",
@@ -580,6 +587,9 @@
       "SCCACHE_DIR": null
     },
     "build-server": {
+      "AR_aarch64_pc_windows_gnullvm": null,
+      "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER": null,
+      "CC_aarch64_pc_windows_gnullvm": null,
       "PATH": "/motor-tools:/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
       "RUSTC_WRAPPER": "/motor-tools/prefrontal-build-slot",
       "SCCACHE_DIR": "/motor-cache"
@@ -637,6 +647,7 @@
         "rust-analyzer-x86_64-unknown-linux-gnu",
         "rust-std-aarch64-apple-ios",
         "rust-std-aarch64-apple-ios-sim",
+        "rust-std-aarch64-pc-windows-gnullvm",
         "rust-std-aarch64-pc-windows-msvc",
         "rust-std-wasm32-unknown-unknown",
         "rust-std-wasm32-wasip1",
@@ -651,6 +662,7 @@
       "targets": [
         "aarch64-apple-ios",
         "aarch64-apple-ios-sim",
+        "aarch64-pc-windows-gnullvm",
         "aarch64-pc-windows-msvc",
         "wasm32-unknown-unknown",
         "wasm32-wasip1",
@@ -705,6 +717,7 @@
         "rust-analyzer-x86_64-unknown-linux-gnu",
         "rust-std-aarch64-apple-ios",
         "rust-std-aarch64-apple-ios-sim",
+        "rust-std-aarch64-pc-windows-gnullvm",
         "rust-std-aarch64-pc-windows-msvc",
         "rust-std-wasm32-unknown-unknown",
         "rust-std-wasm32-wasip1",
@@ -719,6 +732,7 @@
       "targets": [
         "aarch64-apple-ios",
         "aarch64-apple-ios-sim",
+        "aarch64-pc-windows-gnullvm",
         "aarch64-pc-windows-msvc",
         "wasm32-unknown-unknown",
         "wasm32-wasip1",
@@ -795,6 +809,22 @@
   "schema": 1,
   "source": "Read-only build-server capture; refresh with toolchain-parity.py --capture and --from-capture",
   "tools": {
+    "llvm-mingw": {
+      "archive": {
+        "digest_source": "https://api.github.com/repos/mstorsjo/llvm-mingw/releases/assets/710266760",
+        "format": "tar.xz",
+        "install_dir": "/usr/local/lib/motor/llvm-mingw",
+        "install_path": "bin/aarch64-w64-mingw32-clang",
+        "release": "20261104",
+        "sha256": "919380403de87dca3c581c2053230cd298af5e891286628ba0613b7fed370926",
+        "strip_components": 1,
+        "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64.tar.xz"
+      },
+      "path": "/usr/local/lib/motor/llvm-mingw/bin/aarch64-w64-mingw32-clang",
+      "roles": ["boat", "tenant"],
+      "version": "23.1.5",
+      "version_pattern": "clang version 23\\.1\\.5(?: .*)?"
+    },
     "bun": {
       "job_path": "/home/ubuntu/.bun/bin/bun",
       "path": "/home/ubuntu/.bun/bin/bun",
