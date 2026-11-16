@@ -40,3 +40,31 @@ pub(crate) fn capture(f: impl FnOnce()) -> Vec<String> {
     let lines = logs.0.lock().unwrap();
     lines.clone()
 }
+
+/// Captures events on this thread, and on threads that inherit its
+/// subscriber, until dropped. For async tests whose tasks run on the test's
+/// own current-thread runtime, which `capture` cannot wrap.
+pub(crate) struct Capture {
+    logs: Logs,
+    _spare: tracing::Dispatch,
+    _guard: tracing::dispatcher::DefaultGuard,
+}
+
+impl Capture {
+    pub(crate) fn start() -> Self {
+        let logs = Logs::default();
+        let dispatch = tracing::Dispatch::new(logs.clone());
+        let spare = tracing::Dispatch::new(Logs::default());
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        Self {
+            logs,
+            _spare: spare,
+            _guard: guard,
+        }
+    }
+
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.logs.0.lock().unwrap().clone()
+    }
+}

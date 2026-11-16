@@ -63,6 +63,261 @@ async fn full_spool_with_buffered_heartbeat_replays_when_vm_becomes_ready() {
     assert!(delivered, "the queued Run must reach the guest");
 }
 
+/// A first job in a new workspace uploads the repository's whole history,
+/// often more than the pre-boot spool holds. The host stops reading the caller
+/// once the spool is full; after the VM boots, every byte of the upload must
+/// still reach the guest runner, which gives up on an upload that makes no
+/// progress for 60 seconds.
+#[tokio::test]
+async fn upload_larger_than_spool_reaches_the_guest_after_boot() {
+    let logs = crate::test_logs::Capture::start();
+    let (runtime, fake, storage) = fixture();
+    hold_boot(&runtime, &fake, "runner");
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    // Each chunk carries 525,000 bytes ("YWFh" decodes to "aaa").
+    let chunk_bytes: u64 = 525_000;
+    let chunks: u64 = 140;
+    let length = chunk_bytes * chunks;
+    assert!(length > SPOOL_LIMIT);
+    let mut request = run(JOB);
+    request["bundles"] = json!([{
+        "index": 0,
+        "repository": request["repository_root"],
+        "length": length,
+        "sha256": "0".repeat(64),
+    }]);
+    request["siblings"] = json!([]);
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let writer = tokio::spawn(async move {
+        for (i, frame) in [hello(), request]
+            .into_iter()
+            .chain((0..chunks).map(|i| {
+                json!({"type":"bundle_chunk","index":0,"offset":i * chunk_bytes,"data":"YWFh".repeat(175_000)})
+            }))
+            .enumerate()
+        {
+            let body = serde_json::to_vec(&frame).unwrap();
+            client_write
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .await
+                .map_err(|e| format!("frame {i}: {e}"))?;
+            client_write
+                .write_all(&body)
+                .await
+                .map_err(|e| format!("frame {i}: {e}"))?;
+        }
+        Ok::<_, String>(client_write)
+    });
+    let reader = tokio::spawn(async move {
+        let mut sink = vec![0; 65536];
+        while client_read.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+    });
+    let r = runtime.clone();
+    let session = tokio::spawn(async move { serve(r, &c, id, &mut server).await });
+    let threshold = SPOOL_LIMIT - FRAME_LIMIT as u64 - 4;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !std::fs::metadata(storage.spool(JOB)).is_ok_and(|m| m.len() > threshold) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the spool fills while the VM boot is held");
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    let received = || -> u64 {
+        fake.inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|bytes| crate::replay::decode(bytes).unwrap())
+            .filter(|frame| frame["type"] == "bundle_chunk")
+            .map(|frame| frame["data"].as_str().unwrap().len() as u64 / 4 * 3)
+            .sum()
+    };
+    // Spooling and replaying this upload through a debug build takes several
+    // seconds on a small machine; the bound only catches a stall.
+    let delivered = tokio::time::timeout(Duration::from_secs(60), async {
+        while received() < length {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let got = received();
+    // The caller then closes its input, as after a finished upload.
+    let closed = async {
+        let mut input = writer.await.unwrap().unwrap();
+        input.shutdown().await.unwrap();
+        session.await.unwrap().unwrap();
+    };
+    let closed = tokio::time::timeout(Duration::from_secs(30), closed).await;
+    reader.abort();
+    runtime.stop_job(JOB, true, true).unwrap();
+    assert!(
+        delivered.is_ok(),
+        "the guest received {got} of {length} upload bytes"
+    );
+    closed.expect("the session ends once the caller closes its input");
+    let lines = logs.lines();
+    let line = |message: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(&format!("message={message} ")))
+            .unwrap_or_else(|| panic!("no {message} line in {lines:#?}"))
+            .clone()
+    };
+    assert!(line("job_upload_replay_started").contains("spooled_bytes="));
+    let finished = line("job_upload_replay_finished");
+    assert!(
+        finished.contains(&format!("expected_bytes={length} ")),
+        "{finished}"
+    );
+    assert!(!finished.contains("received_bytes=0 "), "{finished}");
+    assert!(
+        !finished.contains(&format!("received_bytes={length} ")),
+        "{finished}"
+    );
+    assert!(line("job_upload_first_live_chunk").contains(&format!("expected_bytes={length} ")));
+    assert!(line("job_upload_forwarded").contains(&format!("bytes={length} ")));
+    assert!(line("job_caller_input_closed").contains("clean=true "));
+}
+
+/// Uploads `chunks` bundle chunks of 65,535 bytes through the per-job host
+/// relay to the real guest runner's tenant channel. The VM boot is held until
+/// the host's pre-boot spool holds `release_at` bytes, so the runner gets the
+/// spooled part replayed and the rest live. Returns the caller's terminal.
+#[cfg(target_os = "linux")]
+async fn real_guest_upload(chunks: u64, release_at: impl Fn(u64) -> u64) -> Value {
+    use sha2::{Digest, Sha256};
+    let (runtime, fake, storage) = fixture();
+    hold_boot(&runtime, &fake, "runner");
+    let root = storage.root.path().join("guest");
+    let mut config = motor_runner::Config::new(root.join("disk"), "runner");
+    config.tenant_vm = true;
+    config.per_job = true;
+    config.development_allow_host_backend = true;
+    config.free_space_floor_bytes = 0;
+    config.max_weight = 1;
+    config.reserve_daemon_core = false;
+    config.workspace_roots = vec![root.join("remote/worktrees")];
+    config.owned_workspace_roots = vec![root.join("remote")];
+    *storage.pinned_hello.lock().unwrap() =
+        Some(serde_json::to_value(motor_runner::runner_hello(&config, true, true, true)).unwrap());
+    let runner = motor_runner::Runner::open(config).unwrap();
+    let (host_end, guest_end) = UnixStream::pair().unwrap();
+    guest_end.set_nonblocking(true).unwrap();
+    let guest_end = tokio::net::UnixStream::from_std(guest_end).unwrap();
+    let guest = tokio::spawn(motor_runner::serve_tenant_connection(runner, guest_end));
+    fake.scripted.lock().unwrap().push_back(host_end);
+
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let chunk_bytes: u64 = 65_535;
+    let length = chunk_bytes * chunks;
+    let mut digest = Sha256::new();
+    for _ in 0..chunks {
+        digest.update([b'a'; 65_535]);
+    }
+    let workspace = root.join("remote/worktrees/job");
+    let repository = root.join("remote/source/main");
+    let request = json!({"type":"run","job_id":JOB,"workspace_key":workspace,"repository_root":repository,
+        "cwd":workspace,"command":"true","env":{},"weight_hint":1,"timeout":30,"queue_wait_limit_s":1800,
+        "snapshot_commit":"1".repeat(40),"tree_hash":"3".repeat(40),"integration_tip":"2".repeat(40),"siblings":[],
+        "bundles":[{"index":0,"repository":repository,"length":length,"sha256":format!("{:x}", digest.finalize())}]});
+    let client_hello = json!({"type":"hello","protocol_version":1,"started":true,"return_paths":true,
+        "return_chunked":true,"sibling_paths":true,"gate_jobs":true});
+    let frames: Vec<Vec<u8>> = [client_hello, request]
+        .into_iter()
+        .chain((0..chunks).map(|i| {
+            json!({"type":"bundle_chunk","index":0,"offset":i * chunk_bytes,"data":"YWFh".repeat(21_845)})
+        }))
+        .map(|frame| {
+            let body = serde_json::to_vec(&frame).unwrap();
+            [(body.len() as u32).to_be_bytes().as_slice(), &body].concat()
+        })
+        .collect();
+    let total: u64 = frames.iter().map(|f| f.len() as u64).sum();
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let writer = tokio::spawn(async move {
+        for frame in frames {
+            client_write.write_all(&frame).await?;
+        }
+        // Like ck-motor, stay connected after the upload to follow the job.
+        std::future::pending::<()>().await;
+        Ok::<_, std::io::Error>(())
+    });
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        loop {
+            let Ok(frame) = crate::server::read_frame(&mut client_read).await else {
+                return;
+            };
+            if frame["type"] == "terminal" {
+                let _ = terminal_tx.send(frame);
+                return;
+            }
+        }
+    });
+    let r = runtime.clone();
+    let session = tokio::spawn(async move { serve(r, &c, id, &mut server).await });
+    let release = release_at(total);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !std::fs::metadata(storage.spool(JOB)).is_ok_and(|m| m.len() >= release) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the spool reaches the release size while the VM boot is held");
+    *fake.gate.0.lock().unwrap() = true;
+    fake.gate.1.notify_all();
+    // The runner refuses an upload with no progress after 60 seconds, so a
+    // stall shows up as transfer_interrupted within this bound.
+    let terminal = tokio::time::timeout(Duration::from_secs(120), terminal_rx)
+        .await
+        .expect("the caller gets a terminal")
+        .expect("terminal reader");
+    session.abort();
+    writer.abort();
+    reader.abort();
+    guest.abort();
+    let _ = runtime.stop_job(JOB, true, true);
+    terminal
+}
+
+/// The test bundle is not a git bundle, so a runner that received and verified
+/// every byte refuses it at fetch as bundle_rejected. A stalled upload ends as
+/// transfer_interrupted instead.
+#[cfg(target_os = "linux")]
+fn assert_upload_reached_runner(terminal: &Value) {
+    assert_eq!(
+        terminal["outcome"]["reason"], "bundle_rejected",
+        "the runner never got the whole upload: {terminal}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn real_runner_gets_an_upload_spooled_whole_before_attach() {
+    let terminal = real_guest_upload(160, |total| total).await;
+    assert_upload_reached_runner(&terminal);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn real_runner_gets_an_upload_partly_spooled_at_attach() {
+    let terminal = real_guest_upload(400, |total| total / 2).await;
+    assert_upload_reached_runner(&terminal);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn real_runner_gets_an_upload_larger_than_the_spool() {
+    let terminal = real_guest_upload(1200, |_| SPOOL_LIMIT - FRAME_LIMIT as u64 - 4).await;
+    assert_upload_reached_runner(&terminal);
+}
+
 #[derive(Clone, Copy)]
 enum Cut {
     Read(ErrorKind),
