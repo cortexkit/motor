@@ -14,6 +14,10 @@ use std::{
 
 const INDEX_LOCK_WAIT: Duration = Duration::from_secs(10);
 const INDEX_LOCK_POLL: Duration = Duration::from_millis(50);
+/// A snapshot's git steps normally finish well under a second. A much slower
+/// one usually means large untracked, non-ignored files being hashed and
+/// compressed into the caller's repository, so it is logged with its checkout.
+const SLOW_GIT: Duration = Duration::from_secs(2);
 
 pub(crate) fn command(path: &Path) -> Command {
     let mut cmd = Command::new("git");
@@ -33,7 +37,16 @@ pub(crate) fn command(path: &Path) -> Command {
     cmd
 }
 fn output(cmd: &mut Command) -> io::Result<String> {
+    let started = Instant::now();
     let result = cmd.output()?;
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_GIT {
+        tracing::info!(
+            elapsed_ms = elapsed.as_millis() as u64,
+            command = ?cmd.get_args().collect::<Vec<_>>(),
+            "slow git command"
+        );
+    }
     if !result.status.success() {
         return Err(io::Error::other(
             String::from_utf8_lossy(&result.stderr).into_owned(),
