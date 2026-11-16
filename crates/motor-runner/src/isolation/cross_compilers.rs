@@ -5,9 +5,10 @@ pub(super) fn arm64_windows(env: &mut BTreeMap<String, String>, root: &Path) {
         return;
     }
     // cc-rs needs the image's Universal C Runtime headers for ARM64 Windows
-    // GNU/LLVM, not host clang or a Microsoft SDK. Keep these paths runner-owned:
-    // CC_/AR_ request overrides are not admitted, and the linker must use the same
-    // sysroot. Target-scoped names leave every other compiler selection alone.
+    // GNU/LLVM, not host clang or a Microsoft SDK. Callers can't send CC_/AR_
+    // variables, so the runner supplies them; a linker the caller set
+    // explicitly is kept. Target-scoped names leave every other compiler
+    // selection alone.
     for (name, binary) in [
         ("CC_aarch64_pc_windows_gnullvm", "aarch64-w64-mingw32-clang"),
         ("AR_aarch64_pc_windows_gnullvm", "llvm-ar"),
@@ -16,10 +17,8 @@ pub(super) fn arm64_windows(env: &mut BTreeMap<String, String>, root: &Path) {
             "aarch64-w64-mingw32-clang",
         ),
     ] {
-        env.insert(
-            name.into(),
-            root.join("bin").join(binary).to_string_lossy().into_owned(),
-        );
+        env.entry(name.into())
+            .or_insert_with(|| root.join("bin").join(binary).to_string_lossy().into_owned());
     }
 }
 
@@ -49,7 +48,6 @@ mod tests {
         }
         let linker = "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER";
         assert!(crate::allowed_env(linker));
-        env.insert(linker.into(), "caller-linker".into());
         arm64_windows(&mut env, &root);
         for (name, binary) in [
             ("CC_aarch64_pc_windows_gnullvm", "aarch64-w64-mingw32-clang"),
@@ -62,6 +60,11 @@ mod tests {
             );
         }
         assert_eq!(env, original);
+
+        // A linker the caller chose explicitly is kept.
+        env.insert(linker.into(), "caller-linker".into());
+        arm64_windows(&mut env, &root);
+        assert_eq!(env[linker], "caller-linker");
     }
 
     #[test]
