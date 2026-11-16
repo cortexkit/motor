@@ -48,11 +48,15 @@ impl Runtime {
         let (tenants, jobs) = {
             let mut host = self.host.lock().expect("host lock");
             host.set_remote_cache_write_block(blocked)?;
-            let tenants = host
-                .tenants
-                .values()
-                .map(|t| t.tenant.clone())
-                .collect::<BTreeSet<_>>();
+            // Per-job hosts retain tenant bindings for rollback, but run no tenant VMs.
+            let tenants = if host.settings.mode() == crate::config::HostMode::PerJob {
+                BTreeSet::new()
+            } else {
+                host.tenants
+                    .values()
+                    .map(|t| t.tenant.clone())
+                    .collect::<BTreeSet<_>>()
+            };
             let mut jobs = host
                 .snapshot
                 .per_job
