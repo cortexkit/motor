@@ -192,7 +192,7 @@ fn private_copy_preserves_symlinks_and_excludes_build_outputs() {
         Path::new("missing")
     );
     assert!(!copy.workspace.join("target").exists());
-    assert!(!copy.workspace.join("build").exists());
+    assert!(copy.workspace.join("build/marker").is_file());
     assert!(copy.workspace.join("src/target/marker").is_file());
     assert_eq!(fs::metadata(&copy.root).unwrap().mode() & 0o777, 0o700);
     assert_ne!(

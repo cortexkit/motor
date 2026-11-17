@@ -201,7 +201,7 @@ server, tenant VMs and per-job VMs), only a Cargo error saying the lockfile
 needs updating permits one online unlocked fetch. Tenant preparation first
 tries its existing offline locked fallback. The unlocked fetch runs on a
 runner-owned private reflink copy beside the checkout, excluding top-level
-`target/` and `build/`; symlinks are copied as links. It uses the same Cargo
+`target/`; symlinks are copied as links. It uses the same Cargo
 home, Git routes, empty HOME, disabled compiler wrappers, deadlines and helper
 unit as the locked attempt. Snapshot helpers bind the private copy writable
 at the checkout's caller path while keeping siblings read-only. The runner

@@ -236,11 +236,13 @@ impl PrivateCopy {
             workspace: root.clone(),
             root,
         };
-        // Enumerate only the top level: cp preserves symlinks and reflinks every
-        // regular file, including nested source directories named target.
+        // Enumerate only the top level and leave out Cargo's default output
+        // folder: cp preserves symlinks and reflinks every regular file,
+        // including nested source directories named target. A top-level
+        // `build` can be a workspace member, so it is copied.
         for entry in fs::read_dir(source)? {
             let entry = entry?;
-            if entry.file_name() == "target" || entry.file_name() == "build" {
+            if entry.file_name() == "target" {
                 continue;
             }
             let status = Command::new("cp")
