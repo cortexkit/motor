@@ -206,8 +206,13 @@ impl Host {
                 .is_some_and(|billing| billing.terminal.is_some() || billing.host_settled)
         };
         for job in next.billing.changed_keys() {
+            // A retained execution can outlive its evicted disk; look it up
+            // rather than index, so saving never panics on a missing disk.
             if next.per_job.executions.get(job).is_some_and(|execution| {
-                next.per_job.disks[&execution.disk_id].attached_job.as_ref() == Some(job)
+                next.per_job
+                    .disks
+                    .get(&execution.disk_id)
+                    .is_some_and(|disk| disk.attached_job.as_ref() == Some(job))
             }) && has_terminal(next, job)
                 && !has_terminal(&self.snapshot, job)
             {
