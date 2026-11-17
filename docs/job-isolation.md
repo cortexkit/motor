@@ -839,7 +839,8 @@ before a process is killed, so size jobs by the working set: heap, shared memory
 and kernel memory. Results report its peak as `memory_peak_working_mib` and the
 enforced figure as `memory_stated_mib` when known. A job killed at its own limit
 reports `oom_kill` with `cause: job_limit`, so the caller can state a larger size.
-The shared slice's aggregate limit still applies. For jobs whose lease allows
+The aggregate limit of `motor-jobs.slice`, which holds every job on the
+machine, still applies. For jobs whose lease allows
 burst memory, `mem_over_mib_ms` is the memory the job used above its stated size,
 summed over time in MiB-milliseconds. When a job ends and its cgroup is removed,
 the figure covers the job up to its last memory reading; a read that fails while

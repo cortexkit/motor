@@ -868,8 +868,9 @@ ck motor cancel JOB_ID --secret-file /private/job.key
 
 `--secret-file` on `run` creates a new file with mode `0600`, refuses an existing
 file (including a symlink), and prints its path instead of the secret. Default
-files are created exclusively with mode `0600`, removed when a terminal record is
-received, and swept once they exceed the 24-hour job retention. If no default
+files are created exclusively with mode `0600`. A terminal record keeps the file,
+so the finished job stays inspectable, and restarts its clock; every `ck motor`
+command sweeps default files older than the 24-hour job retention. If no default
 file exists, `attach` reads one line from stdin; `--secret-file PATH` selects an
 explicit file. Never place the secret in argv or an environment variable; neither
 is an accepted input channel. Do not enable shell tracing while handling it.
