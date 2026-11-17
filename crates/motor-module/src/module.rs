@@ -700,6 +700,13 @@ pub(crate) const HOSTED_TEST_UNAVAILABLE: &str = "motor_hosted_test_unavailable"
 /// What a direct caller gets for a job its route did not start. The bytes are
 /// the same whether the job belongs to another caller or does not exist, so a
 /// direct caller can't learn which job IDs are live.
+/// The CortexKit core's reserved module id. It is moving from `prefrontal-core`
+/// to `prefrontal`, and the daemon attests whichever name the running core uses,
+/// so both are admitted until the old name is retired everywhere.
+fn is_prefrontal(module_id: &str) -> bool {
+    module_id == "prefrontal" || module_id == "prefrontal-core"
+}
+
 fn direct_job_not_found(module_id: &str) -> HandlerOutcome {
     HandlerOutcome::Error {
         code: "motor_job_not_found".into(),
@@ -1049,7 +1056,7 @@ impl ModuleHandler for Handler {
         }
         match request.principal.as_ref() {
             Some(Principal::Reserved { module_id })
-                if module_id == "aft" || module_id == "prefrontal-core" => {}
+                if module_id == "aft" || is_prefrontal(module_id) => {}
             Some(Principal::Direct) if self.config.admit_direct_exec => {}
             Some(Principal::Direct) => {
                 return BindDecision::reject(
@@ -1155,7 +1162,7 @@ impl ModuleHandler for Handler {
             // the daemon-attested route principal before parsing any op params.
             let permitted = match envelope.op.as_str() {
                 "exec.run" | "exec.attach" | "exec.cancel" | "exec.status" => module_id == "aft",
-                "workspace.prepare" | "workspace.drop" => module_id == "prefrontal-core",
+                "workspace.prepare" | "workspace.drop" => is_prefrontal(&module_id),
                 _ => false,
             };
             if !permitted {

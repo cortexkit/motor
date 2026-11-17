@@ -459,6 +459,10 @@ fn aft() -> Value {
 fn core() -> Value {
     json!({"kind":"reserved", "module_id":"prefrontal-core"})
 }
+/// The core under its new id; both are admitted while the rename rolls out.
+fn renamed_core() -> Value {
+    json!({"kind":"reserved", "module_id":"prefrontal"})
+}
 
 #[tokio::test]
 async fn aft_bind_is_admitted() {
@@ -520,32 +524,35 @@ async fn unverified_and_absent_principals_are_refused() {
 }
 #[tokio::test]
 async fn core_bind_and_workspace_prepare_are_admitted() {
-    let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
-    assert_eq!(
-        rig.bind(core(), Value::Null).await.header.ty,
-        FrameType::Response
-    );
-    let reply = rig
-        .request(
-            "workspace.prepare",
-            json!({"workspace_key":"/not-a-worktree", "repository_root":"/not-a-repository", "base_commit":"base", "siblings":[]}),
-        )
-        .await;
-    assert_eq!(reply.header.ty, FrameType::Response);
-    // A typed hosted-prepare refusal proves dispatch reached prepare,
-    // without requiring a real remote runner for the admission contract.
-    let reply: motor_protocol::PrepareReply = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(
-        reply.outcome,
-        motor_protocol::PrepareOutcome::RefusedBeforeStart {
-            reason: motor_protocol::RefusalReason::RequestRejected
-        }
-    );
-    assert_eq!(
-        reply.refusal_detail(),
-        Some("hosted_prepare_unsupported: hosted_no_fallback")
-    );
-    rig.stop().await;
+    for principal in [core(), renamed_core()] {
+        let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+        assert_eq!(
+            rig.bind(principal.clone(), Value::Null).await.header.ty,
+            FrameType::Response,
+            "{principal}"
+        );
+        let reply = rig
+            .request(
+                "workspace.prepare",
+                json!({"workspace_key":"/not-a-worktree", "repository_root":"/not-a-repository", "base_commit":"base", "siblings":[]}),
+            )
+            .await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{principal}");
+        // A typed hosted-prepare refusal proves dispatch reached prepare,
+        // without requiring a real remote runner for the admission contract.
+        let reply: motor_protocol::PrepareReply = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            reply.outcome,
+            motor_protocol::PrepareOutcome::RefusedBeforeStart {
+                reason: motor_protocol::RefusalReason::RequestRejected
+            }
+        );
+        assert_eq!(
+            reply.refusal_detail(),
+            Some("hosted_prepare_unsupported: hosted_no_fallback")
+        );
+        rig.stop().await;
+    }
 }
 #[tokio::test]
 async fn core_is_refused_exec_run() {

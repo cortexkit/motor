@@ -1365,6 +1365,11 @@ async fn project_free_binds_keep_principal_admission() {
                 None,
             ),
             (
+                AFT_CHANNEL + 2,
+                json!({"kind":"reserved", "module_id":"prefrontal"}),
+                None,
+            ),
+            (
                 DIRECT_CHANNEL,
                 direct(),
                 (!admit_direct_exec).then_some("motor_direct_refused"),

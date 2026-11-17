@@ -253,7 +253,7 @@ operation separately. Binding to the module grants nothing by itself.
 | Caller | Allowed operations |
 | --- | --- |
 | AFT, the agent tool (`reserved:aft`) | `exec.run`, `exec.attach`, `exec.cancel`, `exec.status` |
-| The CortexKit core (`reserved:prefrontal-core`) | `workspace.prepare`, `workspace.drop` |
+| The CortexKit core (`reserved:prefrontal`, or its former id `reserved:prefrontal-core`) | `workspace.prepare`, `workspace.drop` |
 | A direct local caller, when `admit_direct_exec` is on | `exec.run`, and `exec.attach`, `exec.cancel`, `exec.status` for jobs its route started or whose secret it holds |
 | Any other reserved, direct, unverified or absent principal | Nothing; refused by name |
 
