@@ -20,6 +20,7 @@ struct Vm {
     overage_bytes: u64,
     started_ms: u64,
     maximum_target_mib: u64,
+    guest_ram_mib: u64,
 }
 
 impl Runtime {
@@ -98,7 +99,7 @@ impl Runtime {
                     let job = &execution.claims.jti;
                     // Also reset balloons inherited across a motor-host restart.
                     if controller.targets.get(job) != Some(&0) {
-                        self.set_job_balloon(controller, job, 0, now_ms)?;
+                        self.set_job_balloon(controller, job, 0, execution.guest_ram_mib, now_ms)?;
                     }
                 }
             }
@@ -140,7 +141,13 @@ impl Runtime {
                 .saturating_add(victim.overage_bytes.div_ceil(MIB))
                 .min(victim.maximum_target_mib);
             if target != previous {
-                self.set_job_balloon(controller, &victim.job, target, now_ms)?;
+                self.set_job_balloon(
+                    controller,
+                    &victim.job,
+                    target,
+                    victim.guest_ram_mib,
+                    now_ms,
+                )?;
             }
             // At the guest floor there may be nothing more to inflate. The
             // reclaim deadline still bounds how long a positive overage lives.
@@ -159,8 +166,10 @@ impl Runtime {
         controller: &mut Controller,
         job: &str,
         target: u64,
+        guest_ram_mib: u64,
         now_ms: u64,
     ) -> Result<()> {
+        log_balloon_request(job, target, guest_ram_mib);
         if let Err(error) = self.control.balloon_job(job, target) {
             controller.retry_after_ms.insert(
                 job.to_owned(),
@@ -172,6 +181,15 @@ impl Runtime {
         controller.targets.insert(job.to_owned(), target);
         Ok(())
     }
+}
+
+fn log_balloon_request(job: &str, amount_mib: u64, guest_ram_mib: u64) {
+    tracing::info!(
+        job_id = job,
+        amount_mib,
+        guest_ram_mib,
+        "job_balloon_request"
+    );
 }
 
 fn vm(execution: &Execution, resident_bytes: u64, settings: &PerJobSettings) -> Vm {
@@ -189,8 +207,21 @@ fn vm(execution: &Execution, resident_bytes: u64, settings: &PerJobSettings) -> 
                 .saturating_mul(MIB),
         ),
         started_ms: execution.boot_started_at_ms.unwrap_or(0),
+        guest_ram_mib: execution.guest_ram_mib,
         maximum_target_mib: execution
             .guest_ram_mib
             .saturating_sub(stated.saturating_add(floor)),
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    #[test]
+    fn balloon_request_logs_amount_and_guest_ram() {
+        let logs = crate::test_logs::capture(|| super::log_balloon_request("job-1", 37, 512));
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert!(logs[0].contains("job-1"), "{logs:?}");
+        assert!(logs[0].contains("amount_mib=37"), "{logs:?}");
+        assert!(logs[0].contains("guest_ram_mib=512"), "{logs:?}");
     }
 }
