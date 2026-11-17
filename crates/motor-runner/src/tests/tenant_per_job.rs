@@ -90,6 +90,8 @@ pub(super) async fn raw_terminal(client: &mut tokio::io::DuplexStream) -> serde_
 
 #[tokio::test]
 async fn per_job_terminal_stream_carries_accounting_and_only_burst_overage() {
+    use crate::working_memory::WorkingSample::{Gone, Observed};
+
     for burst in [false, true] {
         let f = Fixture::new();
         let runner = job_runner(&f);
@@ -111,8 +113,9 @@ async fn per_job_terminal_stream_carries_accounting_and_only_burst_overage() {
             let working = if burst { 10 } else { 6 };
             job.mem_working_peak_mib = serde_json::from_value(working.into()).unwrap();
             let over = crate::working_memory::OverIntegral::default();
-            over.sample(Some(10 << 20), 8, 0);
-            over.sample(Some(10 << 20), 8, 50);
+            over.sample(Observed(10 << 20), 8, 0);
+            over.sample(Observed(10 << 20), 8, 50);
+            over.sample(Gone, 8, 100);
             // Even a stray measured integral must not escape a no-burst lease.
             job.mem_over_mib_ms = Some(over);
         }
