@@ -2,8 +2,7 @@ use super::*;
 use cortexkit_test_support::ScratchDir;
 use std::collections::BTreeMap;
 
-#[test]
-fn state_clone_cost_for_sixteen_mib_hosted_history() {
+fn hosted_history(retain_until_ms: u64) -> State {
     use crate::hosted::{BillingStatus, HostedJobState};
     use crate::storage::Job;
     use motor_protocol::{Outcome, Ran, TerminalRecord, Uuid};
@@ -32,20 +31,51 @@ fn state_clone_cost_for_sixteen_mib_hosted_history() {
         queue_wait_limit_s: 120,
         terminal_observed_at_ms: Some(1_700_000_000_000),
         terminal_delivered_at_ms: Some(1_700_000_001_000),
-        retain_until_ms: Some(1_700_086_400_000),
+        retain_until_ms: Some(retain_until_ms),
         workspace_key: Some("/work/projects/example".into()),
         ..Default::default()
     };
     let per_job = serde_json::to_vec(&job).unwrap().len() + 40;
     for _ in 0..(16 * 1024 * 1024 / per_job + 1) {
-        state.jobs.insert(Uuid::now_v7(), job.clone());
+        state.jobs.insert(Uuid::now_v7(), Arc::new(job.clone()));
     }
+    state
+}
+
+#[test]
+fn state_clone_cost_for_sixteen_mib_hosted_history() {
+    let state = hosted_history(1_700_086_400_000);
     let serialized_bytes = serde_json::to_vec(&state).unwrap().len();
     let (copy, heap_bytes) = crate::allocation_tests::peak(|| state.clone());
     assert_eq!(copy.jobs.len(), state.jobs.len());
     eprintln!(
         "hosted history: jobs={} serialized_bytes={serialized_bytes} cloned_heap_bytes={heap_bytes}",
         state.jobs.len()
+    );
+}
+
+#[test]
+fn single_job_update_stays_below_eight_mib_for_hosted_history() {
+    let root = ScratchDir::new("single-job-update-memory");
+    let state = hosted_history(u64::MAX);
+    let count = state.jobs.len();
+    let serialized = serde_json::to_vec(&state).unwrap();
+    let id = *state.jobs.keys().next().unwrap();
+    std::fs::write(root.join("state.json"), &serialized).unwrap();
+    drop(state);
+    let storage = crate::storage::Storage::open(&root).unwrap();
+    let (result, peak) = crate::allocation_tests::peak(|| {
+        storage.update(|s| Arc::make_mut(s.jobs.get_mut(&id).unwrap()).queue_wait_limit_s += 1)
+    });
+    result.unwrap();
+    eprintln!(
+        "single-job update: jobs={count} serialized_bytes={} peak_heap_bytes={peak}",
+        serialized.len()
+    );
+    assert_eq!(storage.job(id).unwrap().queue_wait_limit_s, 121);
+    assert!(
+        peak < 8 * 1024 * 1024,
+        "single-job update allocated {peak} bytes"
     );
 }
 

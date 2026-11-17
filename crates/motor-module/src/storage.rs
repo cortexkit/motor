@@ -347,7 +347,7 @@ pub(crate) struct JobAttribution {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
     #[serde(deserialize_with = "deserialize_jobs")]
-    jobs: BTreeMap<Uuid, Job>,
+    jobs: BTreeMap<Uuid, Arc<Job>>,
     snapshots: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     snapshot_used_at_ms: BTreeMap<String, u64>,
@@ -359,7 +359,7 @@ struct State {
 
 fn deserialize_jobs<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<BTreeMap<Uuid, Job>, D::Error> {
+) -> Result<BTreeMap<Uuid, Arc<Job>>, D::Error> {
     // Inspect the stored keys, not just deserialized defaults: a newer field
     // explicitly set to null or false still excludes a record from migration.
     struct StoredJob(Job);
@@ -389,8 +389,11 @@ fn deserialize_jobs<'de, D: serde::Deserializer<'de>>(
             Ok(Self(job))
         }
     }
-    BTreeMap::<Uuid, StoredJob>::deserialize(deserializer)
-        .map(|jobs| jobs.into_iter().map(|(id, job)| (id, job.0)).collect())
+    BTreeMap::<Uuid, StoredJob>::deserialize(deserializer).map(|jobs| {
+        jobs.into_iter()
+            .map(|(id, job)| (id, Arc::new(job.0)))
+            .collect()
+    })
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,23 +597,23 @@ impl Storage {
     pub fn return_result(&self, result: ReturnResult) -> io::Result<()> {
         let id = result.job_id;
         self.update(|state| {
-            state.jobs.entry(id).or_default().return_result = Some(result);
+            Arc::make_mut(state.jobs.entry(id).or_default()).return_result = Some(result);
         })
     }
     pub(crate) fn return_cwd(&self, id: Uuid, cwd: String) -> io::Result<()> {
         self.update(|state| {
-            state.jobs.entry(id).or_default().return_cwd = Some(cwd);
+            Arc::make_mut(state.jobs.entry(id).or_default()).return_cwd = Some(cwd);
         })
     }
     pub(crate) fn return_requested(&self, id: Uuid, paths: Vec<String>) -> io::Result<()> {
         self.update(|state| {
-            state.jobs.entry(id).or_default().return_requested = Some(paths);
+            Arc::make_mut(state.jobs.entry(id).or_default()).return_requested = Some(paths);
         })
     }
 
     pub(crate) fn return_cap(&self, id: Uuid, cap: u64) -> io::Result<()> {
         self.update(|state| {
-            state.jobs.entry(id).or_default().return_cap_bytes = Some(cap);
+            Arc::make_mut(state.jobs.entry(id).or_default()).return_cap_bytes = Some(cap);
         })
     }
     pub(crate) fn hosted_update(
@@ -619,7 +622,11 @@ impl Storage {
         f: impl FnOnce(&mut crate::hosted::HostedJobState),
     ) -> io::Result<()> {
         self.update(|s| {
-            if let Some(state) = s.jobs.get_mut(&id).and_then(|j| j.hosted.as_mut()) {
+            if let Some(state) = s
+                .jobs
+                .get_mut(&id)
+                .and_then(|j| Arc::make_mut(j).hosted.as_mut())
+            {
                 f(state);
             }
         })
@@ -634,6 +641,7 @@ impl Storage {
     ) -> io::Result<()> {
         self.update(|s| {
             if let Some(job) = s.jobs.get_mut(&id) {
+                let job = Arc::make_mut(job);
                 if let Some(hosted) = job.hosted.as_mut() {
                     f(hosted);
                 }
@@ -648,11 +656,11 @@ impl Storage {
             |s| {
                 s.jobs
                     .get(&id)
-                    .is_some_and(Job::needs_unstarted_hosted_terminal)
+                    .is_some_and(|job| job.needs_unstarted_hosted_terminal())
             },
             |s| {
                 if let Some(job) = s.jobs.get_mut(&id) {
-                    job.record_unstarted_hosted_terminal(id, now_ms());
+                    Arc::make_mut(job).record_unstarted_hosted_terminal(id, now_ms());
                 }
             },
         )
@@ -667,7 +675,7 @@ impl Storage {
                 })
             },
             |s| {
-                let job = s.jobs.get_mut(&id).unwrap();
+                let job = Arc::make_mut(s.jobs.get_mut(&id).unwrap());
                 job.hosted.as_mut().unwrap().finish_done = true;
                 job.record_unstarted_hosted_terminal(id, now_ms());
                 confirmed = true;
@@ -706,7 +714,7 @@ impl Storage {
                                 || (!hosted.run_sent && job.build_server_job_id.is_none()))
                     })
             })
-            .map(|(id, job)| (*id, job.clone()))
+            .map(|(id, job)| (*id, job.as_ref().clone()))
             .collect()
     }
     pub(crate) fn hosted_route(
@@ -715,7 +723,7 @@ impl Storage {
         route: crate::hosted::HostedJobState,
     ) -> io::Result<()> {
         self.update(|s| {
-            s.jobs.entry(id).or_default().hosted = Some(route);
+            Arc::make_mut(s.jobs.entry(id).or_default()).hosted = Some(route);
         })
     }
     pub(crate) fn hosted_salt(&self) -> io::Result<[u8; 32]> {
@@ -791,12 +799,16 @@ impl Storage {
         // Unsettled bookings still need broker recovery; a terminal alone does
         // not prove that the broker released the lease.
         storage.update_when(
-            |s| s.jobs.values().any(Job::needs_unstarted_hosted_terminal),
+            |s| {
+                s.jobs
+                    .values()
+                    .any(|job| job.needs_unstarted_hosted_terminal())
+            },
             |s| {
                 let now = now_ms();
                 for (id, job) in &mut s.jobs {
                     if job.needs_unstarted_hosted_terminal() {
-                        job.record_unstarted_hosted_terminal(*id, now);
+                        Arc::make_mut(job).record_unstarted_hosted_terminal(*id, now);
                     }
                 }
             },
@@ -887,7 +899,7 @@ impl Storage {
     }
     pub(crate) fn bind_windows(&self, id: Uuid, runner: crate::WindowsRunner) -> io::Result<()> {
         self.update(|state| {
-            let job = state.jobs.get_mut(&id).expect("job exists before binding");
+            let job = Arc::make_mut(state.jobs.get_mut(&id).expect("job exists before binding"));
             job.runner_instance = Some(runner.instance.clone());
             job.windows_runner = Some(runner);
         })
@@ -901,7 +913,7 @@ impl Storage {
         remaining_s: u64,
     ) -> io::Result<()> {
         self.update(|state| {
-            let job = state.jobs.get_mut(&id).expect("job exists before retry");
+            let job = Arc::make_mut(state.jobs.get_mut(&id).expect("job exists before retry"));
             job.runner_instance = Some(runner.instance.clone());
             job.windows_runner = Some(runner);
             if let Some(destination) = destination {
@@ -912,7 +924,12 @@ impl Storage {
     }
 
     pub fn job(&self, id: Uuid) -> Option<Job> {
-        self.state.lock().unwrap().jobs.get(&id).cloned()
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .map(|job| job.as_ref().clone())
     }
     #[cfg(test)]
     pub(crate) fn job_count(&self) -> usize {
@@ -930,7 +947,7 @@ impl Storage {
                 job.submission
                     .as_ref()
                     .filter(|record| record.principal == principal && record.key == key)
-                    .map(|_| (*id, job.clone()))
+                    .map(|_| (*id, job.as_ref().clone()))
             }))
     }
     pub(crate) fn record_submission(
@@ -938,7 +955,9 @@ impl Storage {
         id: Uuid,
         record: crate::motor::submission_key::KeyRecord,
     ) -> io::Result<()> {
-        self.update(|state| state.jobs.entry(id).or_default().submission = Some(record))
+        self.update(|state| {
+            Arc::make_mut(state.jobs.entry(id).or_default()).submission = Some(record)
+        })
     }
     /// Records that a Run frame is about to be sent. `hosted` says whether it
     /// goes to the job's hosted route: a spilled job that came back to the build
@@ -946,7 +965,7 @@ impl Storage {
     /// hosted settlement treat the build-server run as a hosted one.
     pub(crate) fn run_sent(&self, id: Uuid, hosted: bool) -> io::Result<()> {
         self.update(|state| {
-            let job = state.jobs.entry(id).or_default();
+            let job = Arc::make_mut(state.jobs.entry(id).or_default());
             if let Some(route) = job.hosted.as_mut().filter(|_| hosted) {
                 route.run_sent = true;
             }
@@ -964,7 +983,7 @@ impl Storage {
             if let Some(record) = state
                 .jobs
                 .get_mut(&id)
-                .and_then(|job| job.submission.as_mut())
+                .and_then(|job| Arc::make_mut(job).submission.as_mut())
             {
                 record.accepted = Some(accepted);
             }
@@ -973,7 +992,7 @@ impl Storage {
     #[cfg(test)]
     pub fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {
         self.update(|state| {
-            state.jobs.entry(id).or_default().direct_secret_hash = Some(hash);
+            Arc::make_mut(state.jobs.entry(id).or_default()).direct_secret_hash = Some(hash);
         })
     }
     pub fn direct_authorized(&self, id: Uuid, secret: Option<&str>) -> bool {
@@ -1019,7 +1038,7 @@ impl Storage {
                 })
             },
             |s| {
-                let job = s.jobs.get_mut(&id).unwrap();
+                let job = Arc::make_mut(s.jobs.get_mut(&id).unwrap());
                 job.retain_until_ms = Some(job.retain_until_ms.unwrap_or_default().max(until));
                 if key.is_some() {
                     job.workspace_key = key.clone();
@@ -1029,9 +1048,7 @@ impl Storage {
     }
     pub fn terminal_observed(&self, id: Uuid) -> io::Result<()> {
         self.update(|s| {
-            s.jobs
-                .entry(id)
-                .or_default()
+            Arc::make_mut(s.jobs.entry(id).or_default())
                 .terminal_observed_at_ms
                 .get_or_insert(now_ms());
         })
@@ -1043,6 +1060,7 @@ impl Storage {
                 .get_mut(&id)
                 .filter(|job| job.terminal_observed_at_ms.is_some() || job.local_terminal.is_some())
             {
+                let job = Arc::make_mut(job);
                 let now = now_ms();
                 job.terminal_observed_at_ms.get_or_insert(now);
                 job.terminal_delivered_at_ms = Some(now);
@@ -1075,13 +1093,15 @@ impl Storage {
         direct_secret_hash: Option<[u8; 32]>,
     ) -> io::Result<()> {
         self.update(|s| {
-            s.jobs.entry(id).or_insert(Job {
-                gate_job,
-                queue_wait_limit_s: wait,
-                attribution,
-                runner_instance,
-                direct_secret_hash,
-                ..Job::default()
+            s.jobs.entry(id).or_insert_with(|| {
+                Arc::new(Job {
+                    gate_job,
+                    queue_wait_limit_s: wait,
+                    attribution,
+                    runner_instance,
+                    direct_secret_hash,
+                    ..Job::default()
+                })
             });
         })
     }
@@ -1095,13 +1115,13 @@ impl Storage {
         self.update(|s| {
             s.jobs.insert(
                 terminal.job_id,
-                Job {
+                Arc::new(Job {
                     gate_job: direct_secret_hash.is_some(),
                     direct_secret_hash,
                     local_terminal: Some(terminal),
                     terminal_observed_at_ms: Some(now_ms()),
                     ..Job::default()
-                },
+                }),
             );
         })
     }
@@ -1129,7 +1149,7 @@ impl Storage {
     ) -> io::Result<()> {
         self.update(|s| {
             let streamed = !wait_expired && (owner_live || s.active_jobs.contains_key(&id));
-            let job = s.jobs.entry(id).or_default();
+            let job = Arc::make_mut(s.jobs.entry(id).or_default());
             // A real terminal may win the timeout race. Only the still-unresolved
             // acknowledgment permits settling without an execution result.
             if wait_expired
@@ -1190,7 +1210,7 @@ impl Storage {
 
     pub fn cancel(&self, id: Uuid, pending: bool) -> io::Result<()> {
         self.update(|s| {
-            let job = s.jobs.entry(id).or_default();
+            let job = Arc::make_mut(s.jobs.entry(id).or_default());
             let completed = job.hosted_cancel_complete();
             job.pending_cancel = pending && !completed;
             if job.pending_cancel {
@@ -1221,6 +1241,7 @@ impl Storage {
             if job.hosted_route().is_none() {
                 return;
             }
+            let job = Arc::make_mut(job);
             let Some(hosted) = job.hosted.as_mut() else {
                 return;
             };
@@ -1258,21 +1279,21 @@ impl Storage {
     pub fn local_terminal(&self, t: TerminalRecord) -> io::Result<()> {
         let id = t.job_id;
         self.update(|s| {
-            let job = s.jobs.entry(id).or_default();
+            let job = Arc::make_mut(s.jobs.entry(id).or_default());
             job.local_terminal = Some(t);
             job.terminal_observed_at_ms.get_or_insert(now_ms());
         })
     }
     pub(crate) fn remote_terminal(&self, terminal: TerminalRecord) -> io::Result<()> {
         self.update(|s| {
-            let job = s.jobs.entry(terminal.job_id).or_default();
+            let job = Arc::make_mut(s.jobs.entry(terminal.job_id).or_default());
             job.remote_terminal = Some(terminal);
             job.terminal_observed_at_ms.get_or_insert(now_ms());
         })
     }
     pub(crate) fn health_deadline(&self, id: Uuid, timeout: Option<u64>) -> io::Result<()> {
         self.update(|s| {
-            let job = s.jobs.entry(id).or_default();
+            let job = Arc::make_mut(s.jobs.entry(id).or_default());
             job.health_deadline_ms = Some(timeout.map_or(u64::MAX, |timeout| {
                 now_ms().saturating_add(
                     job.queue_wait_limit_s
@@ -1302,6 +1323,7 @@ impl Storage {
             {
                 return;
             }
+            let job = Arc::make_mut(job);
             let Some(hosted) = job.hosted.as_mut() else {
                 return;
             };
@@ -1373,6 +1395,7 @@ impl Storage {
             {
                 return;
             }
+            let job = Arc::make_mut(job);
             let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
                 .with_ran(Ran::Unknown("maybe".into()))
                 .with_refusal_detail(format!("health_retired: {cause}"));
@@ -1484,14 +1507,8 @@ mod retention_tests {
         assert!(storage.direct_authorized(id, Some(secret.expose())));
         storage.terminal_observed(id).unwrap();
         storage.terminal_delivered(id).unwrap();
-        storage
-            .state
-            .lock()
-            .unwrap()
-            .jobs
-            .get_mut(&id)
-            .unwrap()
-            .retain_until_ms = Some(1);
+        Arc::make_mut(storage.state.lock().unwrap().jobs.get_mut(&id).unwrap()).retain_until_ms =
+            Some(1);
         storage.update(|_| {}).unwrap();
         assert!(storage.job(id).is_none());
         assert!(!storage.direct_authorized(id, Some(secret.expose())));
@@ -1571,11 +1588,11 @@ mod retention_tests {
         state.prune(now);
         assert!(state.jobs.contains_key(&id), "live streams fence migration");
         state.active_jobs.clear();
-        state.jobs.get_mut(&id).unwrap().pending_cancel = true;
+        Arc::make_mut(state.jobs.get_mut(&id).unwrap()).pending_cancel = true;
         state.prune(now);
         assert!(state.jobs.contains_key(&id), "cancel intent must survive");
-        state.jobs.get_mut(&id).unwrap().pending_cancel = false;
-        state.jobs.get_mut(&id).unwrap().retain_until_ms = Some(now + RETENTION_MS);
+        Arc::make_mut(state.jobs.get_mut(&id).unwrap()).pending_cancel = false;
+        Arc::make_mut(state.jobs.get_mut(&id).unwrap()).retain_until_ms = Some(now + RETENTION_MS);
         state.prune(now);
         assert!(
             state.jobs.contains_key(&id),
@@ -1681,14 +1698,8 @@ mod retention_tests {
             .unwrap();
         storage.terminal_observed(id).unwrap();
         storage.terminal_delivered(id).unwrap();
-        storage
-            .state
-            .lock()
-            .unwrap()
-            .jobs
-            .get_mut(&id)
-            .unwrap()
-            .retain_until_ms = Some(1);
+        Arc::make_mut(storage.state.lock().unwrap().jobs.get_mut(&id).unwrap()).retain_until_ms =
+            Some(1);
         storage.retain_job(id, None).unwrap();
         assert!(storage.job(id).unwrap().retain_until_ms.unwrap() > now_ms());
         assert_eq!(
@@ -1697,14 +1708,8 @@ mod retention_tests {
         );
 
         let lease = storage.lease_job(id);
-        storage
-            .state
-            .lock()
-            .unwrap()
-            .jobs
-            .get_mut(&id)
-            .unwrap()
-            .retain_until_ms = Some(1);
+        Arc::make_mut(storage.state.lock().unwrap().jobs.get_mut(&id).unwrap()).retain_until_ms =
+            Some(1);
         storage.update(|_| {}).unwrap();
         assert!(
             storage.job(id).is_some(),
@@ -1745,14 +1750,8 @@ mod retention_tests {
         let job = storage.job(id).unwrap();
         assert!(job.terminal_observed_at_ms.is_some());
         assert!(job.terminal_delivered_at_ms.is_some());
-        storage
-            .state
-            .lock()
-            .unwrap()
-            .jobs
-            .get_mut(&id)
-            .unwrap()
-            .retain_until_ms = Some(u64::MAX);
+        Arc::make_mut(storage.state.lock().unwrap().jobs.get_mut(&id).unwrap()).retain_until_ms =
+            Some(u64::MAX);
         storage.retain_job(id, None).unwrap();
         storage.cancel(id, true).unwrap();
         storage.terminal_delivered(id).unwrap();

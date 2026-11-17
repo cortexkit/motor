@@ -45,7 +45,7 @@ base64 = "0.22"
 fs2 = "0.4"
 getrandom = "0.4"
 libc = "0.2"
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 serde_json_canonicalizer = "0.3"
 sha2 = "0.10"

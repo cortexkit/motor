@@ -172,12 +172,12 @@ fn journal_replays_atomic_upserts_and_deletions_without_shutdown() {
         .update(|s| {
             s.jobs.insert(
                 id,
-                Job {
+                Arc::new(Job {
                     direct_secret_hash: Some([7; 32]),
                     ..Job::default()
-                },
+                }),
             );
-            s.jobs.insert(deleted, Job::default());
+            s.jobs.insert(deleted, Arc::new(Job::default()));
             s.snapshots.insert(
                 "kept".into(),
                 BTreeMap::from([("repo".into(), "commit".into())]),
@@ -196,7 +196,7 @@ fn journal_replays_atomic_upserts_and_deletions_without_shutdown() {
         .unwrap();
     storage
         .update(|s| {
-            s.jobs.get_mut(&id).unwrap().pending_cancel = true;
+            Arc::make_mut(s.jobs.get_mut(&id).unwrap()).pending_cancel = true;
             s.jobs.remove(&deleted);
             s.snapshots.remove("removed");
             s.snapshot_used_at_ms.remove("removed");
@@ -247,11 +247,11 @@ fn journal_replays_legacy_hosted_refusal_without_reclassifying_it() {
             hosted.terminal = Some(refusal.clone());
             state.jobs.insert(
                 id,
-                Job {
+                Arc::new(Job {
                     hosted: Some(hosted),
                     local_terminal: Some(refusal.clone()),
                     ..Job::default()
-                },
+                }),
             );
         })
         .unwrap();
@@ -525,6 +525,47 @@ fn direct_hash_creation_is_atomic_and_append_failure_is_not_published() {
 }
 
 #[test]
+fn append_failure_preserves_shared_jobs_and_all_in_memory_state() {
+    let root = ScratchDir::new("motor-shared-job-rollback");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::now_v7();
+    let untouched = Uuid::now_v7();
+    storage.create(id, 60, None, None, false).unwrap();
+    storage.create(untouched, 30, None, None, false).unwrap();
+    storage.hosted_route(id, Default::default()).unwrap();
+    let before = storage.state.lock().unwrap().clone();
+    let durable_before = durable_value(&root).unwrap();
+    let writes = storage.write_count.load(Ordering::SeqCst);
+    match &mut *storage.persistence.backend.lock().unwrap() {
+        journal::Backend::Journal(j) => j.set_append_readonly(true),
+        journal::Backend::Legacy => panic!("rollback test requires the journal backend"),
+    }
+    assert!(storage
+        .update(|s| {
+            let job = Arc::make_mut(s.jobs.get_mut(&id).unwrap());
+            job.pending_cancel = true;
+            job.hosted.as_mut().unwrap().run_sent = true;
+            job.legacy_shape = true;
+            s.jobs.remove(&untouched);
+            s.snapshots.insert("new".into(), BTreeMap::new());
+            s.active_jobs.insert(id, 1);
+        })
+        .is_err());
+    let after = storage.state.lock().unwrap();
+    assert_eq!(
+        serde_json::to_vec(&*after).unwrap(),
+        serde_json::to_vec(&before).unwrap()
+    );
+    assert_eq!(after.active_jobs, before.active_jobs);
+    for id in [id, untouched] {
+        assert!(Arc::ptr_eq(&after.jobs[&id], &before.jobs[&id]));
+        assert_eq!(after.jobs[&id].legacy_shape, before.jobs[&id].legacy_shape);
+    }
+    assert_eq!(storage.write_count.load(Ordering::SeqCst), writes);
+    assert_eq!(durable_value(&root).unwrap(), durable_before);
+}
+
+#[test]
 fn offline_checkpoint_takes_the_lease_and_fails_closed_on_export_error() {
     let root = ScratchDir::new("motor-offline-checkpoint");
     let storage = Storage::open(&root).unwrap();
@@ -557,7 +598,7 @@ fn seed_state() -> State {
     for n in 0..8000 {
         state.jobs.insert(
             Uuid::now_v7(),
-            Job {
+            Arc::new(Job {
                 queue_wait_limit_s: 900,
                 runner_instance: Some("build-server".into()),
                 direct_secret_hash: Some([7; 32]),
@@ -570,7 +611,7 @@ fn seed_state() -> State {
                     scope_epoch: 1,
                 }),
                 ..Job::default()
-            },
+            }),
         );
     }
     for n in 0..547 {
@@ -680,7 +721,7 @@ fn rollback_fixture(root: &Path) -> (Storage, Uuid, Value) {
         .unwrap();
     storage
         .update(|s| {
-            let job = s.jobs.get_mut(&id).unwrap();
+            let job = Arc::make_mut(s.jobs.get_mut(&id).unwrap());
             // Completed jobs refuse new cancels; seed legacy intent to check older readers preserve it.
             job.pending_cancel = true;
             job.terminal_delivered_at_ms = None;
@@ -701,7 +742,7 @@ fn archived_hosted_replacement(root: &Path) -> (Storage, Uuid) {
     lifecycle(&storage, id);
     storage
         .update(|state| {
-            let job = state.jobs.get_mut(&id).unwrap();
+            let job = Arc::make_mut(state.jobs.get_mut(&id).unwrap());
             job.build_server_job_id = Some(Uuid::now_v7());
             job.local_terminal = None;
             job.remote_terminal = None;
@@ -753,7 +794,7 @@ fn audit_12_stale_hosted_terminal_preserves_replacement_cancel() {
     let root = ScratchDir::new("archived-hosted-terminal");
     let (storage, id) = archived_hosted_replacement(&root);
     storage
-        .update(|state| state.jobs.get_mut(&id).unwrap().pending_cancel = true)
+        .update(|state| Arc::make_mut(state.jobs.get_mut(&id).unwrap()).pending_cancel = true)
         .unwrap();
     storage.hosted_terminal(id, terminal(id)).unwrap();
     let job = storage.job(id).unwrap();
@@ -775,7 +816,7 @@ fn audit_12_settlement_metadata_preserves_unconfirmed_cancel_without_real_termin
             lifecycle(&storage, id);
             storage
                 .update(|state| {
-                    let job = state.jobs.get_mut(&id).unwrap();
+                    let job = Arc::make_mut(state.jobs.get_mut(&id).unwrap());
                     job.pending_cancel = true;
                     let hosted = job.hosted.as_mut().unwrap();
                     hosted.terminal = match terminal_kind {
