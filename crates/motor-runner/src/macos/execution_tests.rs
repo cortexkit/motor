@@ -119,6 +119,8 @@ fn setup_phases_log_one_timed_line_for_success_or_failure_without_paths() {
     let logs = LogBytes::default();
     let phases = [
         "workspace_staging",
+        "vm_slot_wait",
+        "source_seal",
         "disk_preparation",
         "vm_boot_service_report",
         "service_report_to_hello",

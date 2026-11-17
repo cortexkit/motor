@@ -180,17 +180,23 @@ fn prepare(
     entry: Arc<Entry>,
 ) -> io::Result<Prepared> {
     let runtime = &config.macos_runtime;
-    let (staged, staging, mtimes) = SetupPhase::new(setup.id, "workspace_staging").run(|| {
+    let (staged, staging) = SetupPhase::new(setup.id, "workspace_staging").run(|| {
         runtime.workspace(&config.state_root, &entry)?;
         entry.check()?;
         let staging = lifecycle::staging(config, trees.mirrors.clone())?;
         let staged = staging.prepare(&setup.request, entry.cancel.clone())?;
+        Ok((staged, staging))
+    })?;
+    SetupPhase::new(setup.id, "vm_slot_wait").run(|| {
         // Prep never owns a VM slot. Both capacity observations and taking a slot
         // happen under the admission lock, after publication of the job's inputs.
         while !runtime.admit(&config.state_root, &entry)? {
             entry.check()?;
             std::thread::park_timeout(Duration::from_millis(10));
         }
+        Ok(())
+    })?;
+    let mtimes = SetupPhase::new(setup.id, "source_seal").run(|| {
         target_in(&staged)?;
         log_staged_target(setup.id, &staged.workspace.join("target"));
         entry.check()?;
@@ -237,7 +243,7 @@ fn prepare(
             &selected.files,
         )?;
         runtime.record_sealed(&config.state_root, &entry, &selected)?;
-        Ok((staged, staging, mtimes))
+        Ok(mtimes)
     })?;
     let (nonce, job) = SetupPhase::new(setup.id, "disk_preparation").run(|| {
         let vm = config
