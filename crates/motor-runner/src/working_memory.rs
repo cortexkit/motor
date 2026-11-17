@@ -13,12 +13,21 @@ use std::{
 const UNKNOWN: u64 = u64::MAX;
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
+pub(crate) enum WorkingSample {
+    Observed(u64),
+    Gone,
+    Unreadable,
+}
+
 #[derive(Default)]
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 struct IntegralState {
     byte_ms: Option<u128>,
     previous: Option<(u64, u64)>,
     incomplete: bool,
+    ended: bool,
 }
 
 /// Present only for burst leases. Null is distinct from a measured zero.
@@ -41,20 +50,30 @@ impl OverIntegral {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    pub(crate) fn sample(&self, bytes: Option<u64>, stated_mib: u64, elapsed_ms: u64) {
+    pub(crate) fn sample(&self, sample: WorkingSample, stated_mib: u64, elapsed_ms: u64) {
         let mut state = self.0.lock().unwrap();
-        let Some(bytes) = bytes else {
-            // A missing cgroup before the first read is normal during launch.
-            // A later gap cannot be integrated without inventing usage.
-            if state.previous.is_some() {
-                state.incomplete = true;
-                state.byte_ms = None;
-            }
-            return;
-        };
-        if state.incomplete {
+        if state.incomplete || state.ended {
             return;
         }
+        let bytes = match sample {
+            WorkingSample::Observed(bytes) => bytes,
+            WorkingSample::Gone => {
+                // Missing before launch is normal. After a read, removal ends
+                // attribution at that read, without charging an unseen interval
+                // or letting a reused cgroup path restart the integral.
+                state.ended = state.previous.is_some();
+                return;
+            }
+            WorkingSample::Unreadable => {
+                // A gap while the cgroup exists cannot be integrated without
+                // inventing usage, even if a later read succeeds.
+                if state.previous.is_some() {
+                    state.incomplete = true;
+                    state.byte_ms = None;
+                }
+                return;
+            }
+        };
         let over = bytes.saturating_sub(stated_mib.saturating_mul(1 << 20));
         let mut total = state.byte_ms.unwrap_or(0);
         if let Some((previous_ms, previous_over)) = state.previous {
@@ -138,10 +157,22 @@ impl WorkingPeak {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    fn sample(&self, path: &Path) -> Option<u64> {
-        let bytes = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| working_bytes(&text))?;
+    fn sample(&self, path: &Path) -> WorkingSample {
+        use std::io::Read;
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return WorkingSample::Gone;
+            }
+            Err(_) => return WorkingSample::Unreadable,
+        };
+        let mut text = String::new();
+        if file.read_to_string(&mut text).is_err() {
+            return WorkingSample::Unreadable;
+        }
+        let Some(bytes) = working_bytes(&text) else {
+            return WorkingSample::Unreadable;
+        };
         let mib = bytes.div_ceil(1 << 20);
         let _ = self
             .0
@@ -149,7 +180,7 @@ impl WorkingPeak {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(if old == UNKNOWN { mib } else { old.max(mib) })
             });
-        Some(bytes)
+        WorkingSample::Observed(bytes)
     }
 
     #[cfg(target_os = "linux")]
@@ -161,14 +192,26 @@ impl WorkingPeak {
         reclaim_file_cache: bool,
         publish: impl Fn(Option<u64>, Option<Option<u64>>) + Send + 'static,
     ) {
-        if self.0.started.swap(true, Ordering::Relaxed) {
-            return;
-        }
         // All Linux job launchers use JOB_MEMORY_PROPERTIES, whose slice fixes
         // this path. No systemctl subprocess or process walk is needed to sample.
         let path = Path::new("/sys/fs/cgroup/motor.slice/motor-jobs.slice")
             .join(unit)
             .join("memory.stat");
+        self.start_at_path(path, stated_mib, over, reclaim_file_cache, publish);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_at_path(
+        &self,
+        path: std::path::PathBuf,
+        stated_mib: Option<u64>,
+        over: Option<OverIntegral>,
+        reclaim_file_cache: bool,
+        publish: impl Fn(Option<u64>, Option<Option<u64>>) + Send + 'static,
+    ) {
+        if self.0.started.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let weak = Arc::downgrade(&self.0);
         let started = std::time::Instant::now();
         let mut cache = reclaim_file_cache.then(FileCacheReclaimer::default);
@@ -182,11 +225,11 @@ impl WorkingPeak {
                 let peak = WorkingPeak(state);
                 // The stop wakeup makes one final cheap read best-effort. Never
                 // join this thread: terminal publication must not wait for it.
-                let bytes = peak.sample(&path);
+                let sample = peak.sample(&path);
                 let stopped = peak.0.stopped.load(Ordering::Relaxed);
-                if let Some(over) = over.as_ref().filter(|_| bytes.is_some() || !stopped) {
+                if let Some(over) = over.as_ref() {
                     over.sample(
-                        bytes,
+                        sample,
                         stated_mib.unwrap_or(0),
                         started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                     );
@@ -313,6 +356,7 @@ fn file_cache_reclaim_bytes(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use WorkingSample::{Gone, Observed, Unreadable};
 
     #[test]
     fn file_cache_reclaim_is_only_for_per_job_linux_guests() {
@@ -459,25 +503,137 @@ mod tests {
     fn overage_distinguishes_unmeasured_zero_gaps_and_saturates_safe_integers() {
         let over = OverIntegral::default();
         assert_eq!(over.get(), None);
-        over.sample(None, 1, 0);
-        over.sample(Some(1 << 20), 1, 100);
+        over.sample(Unreadable, 1, 0);
+        over.sample(Observed(1 << 20), 1, 100);
         assert_eq!(over.get(), Some(0));
-        over.sample(Some(3 << 20), 1, 200);
-        over.sample(Some(1 << 20), 1, 450);
+        over.sample(Observed(3 << 20), 1, 200);
+        over.sample(Observed(1 << 20), 1, 450);
         assert_eq!(over.get(), Some(500));
-        over.sample(None, 1, 500);
+        over.sample(Unreadable, 1, 500);
         assert_eq!(over.get(), None);
-        over.sample(Some(3 << 20), 1, 1000);
+        over.sample(Observed(3 << 20), 1, 1000);
         assert_eq!(
             over.get(),
             None,
             "a later read cannot repair an attribution gap"
         );
         let over = OverIntegral::default();
-        over.sample(Some(u64::MAX), 0, 0);
-        over.sample(Some(u64::MAX), 0, u64::MAX);
+        over.sample(Observed(u64::MAX), 0, 0);
+        over.sample(Observed(u64::MAX), 0, u64::MAX);
         assert_eq!(over.get(), Some(MAX_SAFE_INTEGER));
         assert_eq!(serde_json::to_value(&over).unwrap(), MAX_SAFE_INTEGER);
+    }
+
+    #[test]
+    fn overage_ends_at_last_observation_when_cgroup_is_gone() {
+        let over = OverIntegral::default();
+        over.sample(Observed(3 << 20), 1, 100);
+        over.sample(Observed(5 << 20), 1, 350);
+        assert_eq!(over.get(), Some(500));
+        for (elapsed, sample) in [
+            (500, Gone),
+            (1000, Observed(100 << 20)),
+            (1500, Unreadable),
+            (2000, Gone),
+        ] {
+            over.sample(sample, 1, elapsed);
+            assert_eq!(over.get(), Some(500));
+        }
+    }
+
+    #[test]
+    fn overage_ignores_cgroup_absence_before_first_observation() {
+        let over = OverIntegral::default();
+        over.sample(Gone, 1, 0);
+        over.sample(Gone, 1, 100);
+        assert_eq!(over.get(), None);
+        over.sample(Observed(3 << 20), 1, 200);
+        assert_eq!(over.get(), Some(0));
+        over.sample(Observed(5 << 20), 1, 450);
+        assert_eq!(over.get(), Some(500));
+    }
+
+    #[test]
+    fn memory_stat_seam_distinguishes_gone_from_unreadable() {
+        let scratch = cortexkit_test_support::ScratchDir::new("working-memory-read");
+        let path = scratch.path().join("memory.stat");
+        let peak = WorkingPeak::default();
+        assert_eq!(peak.sample(&path), Gone);
+        assert_eq!(peak.get(), None);
+        std::fs::write(&path, "anon 1048576\nshmem 0\nkernel 0\n").unwrap();
+        assert_eq!(peak.sample(&path), Observed(1 << 20));
+        for bytes in [b"anon broken".as_slice(), &[0xff]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(peak.sample(&path), Unreadable);
+        }
+        assert_eq!(peak.sample(scratch.path()), Unreadable);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(peak.sample(&path), Gone);
+        assert_eq!(peak.get(), Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sampler_publishes_overage_when_cgroup_disappears_before_stop() {
+        let scratch = cortexkit_test_support::ScratchDir::new("working-memory-sampler");
+        let path = scratch.path().join("memory.stat");
+        std::fs::write(&path, "anon 3145728\nshmem 0\nkernel 0\n").unwrap();
+        let peak = WorkingPeak::default();
+        let over = OverIntegral::default();
+        let (published, samples) = std::sync::mpsc::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let jti = motor_protocol::Uuid::now_v7();
+        peak.start_at_path(
+            path.clone(),
+            Some(1),
+            Some(over.clone()),
+            false,
+            move |peak, over| {
+                if published
+                    .send(motor_protocol::MemorySample {
+                        jti,
+                        mem_working_peak_mib: peak,
+                        mem_over_mib_ms: over,
+                    })
+                    .is_ok()
+                {
+                    // Let the test change the file before the next read, even
+                    // when the sampler or the test is delayed by host load.
+                    let _ = paused.recv();
+                }
+            },
+        );
+        let next = || {
+            samples
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("sampler must publish a reading")
+        };
+        let advance = || {
+            peak.0.thread.get().unwrap().unpark();
+            resume.send(()).unwrap();
+        };
+        let first = next();
+        assert_eq!(first.mem_working_peak_mib, Some(3));
+        assert_eq!(first.mem_over_mib_ms, Some(Some(0)));
+        std::fs::write(&path, "anon 5242880\nshmem 0\nkernel 0\n").unwrap();
+        advance();
+        let observed = next();
+        assert_eq!(observed.mem_working_peak_mib, Some(5));
+        let measured = observed.mem_over_mib_ms.unwrap().unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        advance();
+        let gone = next();
+        assert_eq!(gone.mem_working_peak_mib, Some(5));
+        assert_eq!(gone.mem_over_mib_ms, Some(Some(measured)));
+        assert_eq!(over.get(), Some(measured));
+
+        peak.stop();
+        advance();
+        let stopped = next();
+        assert_eq!(stopped.mem_working_peak_mib, Some(5));
+        assert_eq!(stopped.mem_over_mib_ms, Some(Some(measured)));
+        resume.send(()).unwrap();
     }
 
     #[test]

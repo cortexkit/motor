@@ -839,10 +839,18 @@ before a process is killed, so size jobs by the working set: heap, shared memory
 and kernel memory. Results report its peak as `memory_peak_working_mib` and the
 enforced figure as `memory_stated_mib` when known. A job killed at its own limit
 reports `oom_kill` with `cause: job_limit`, so the caller can state a larger size.
-The shared slice's aggregate limit still applies. Tests:
+The shared slice's aggregate limit still applies. For jobs whose lease allows
+burst memory, `mem_over_mib_ms` is the memory the job used above its stated size,
+summed over time in MiB-milliseconds. When a job ends and its cgroup is removed,
+the figure covers the job up to its last memory reading; a read that fails while
+the job is still running makes the figure unknown instead. Tests:
 `systemd_job_command_enforces_recorded_cpu_set_and_memory`,
 `memory_max_scales_per_vcpu_with_a_sixteen_gib_floor`,
-`tenant_unit_uses_host_memory_and_keeps_other_target_limits`, and operator-only
+`tenant_unit_uses_host_memory_and_keeps_other_target_limits`,
+`overage_ends_at_last_observation_when_cgroup_is_gone`,
+`overage_ignores_cgroup_absence_before_first_observation`,
+`overage_distinguishes_unmeasured_zero_gaps_and_saturates_safe_integers`,
+`sampler_publishes_overage_when_cgroup_disappears_before_stop`, and operator-only
 `isolated_tenant_stated_memory_kills_above_limit_and_allows_below`.
 
 7.3. The request's `timeout`, in seconds, runs from the moment the job starts,
