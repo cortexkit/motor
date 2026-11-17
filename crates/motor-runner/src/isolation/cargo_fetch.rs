@@ -1,11 +1,18 @@
 use std::{
     io::{self, Read},
     os::unix::process::CommandExt,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[cfg(test)]
+#[path = "cargo_fetch_tests.rs"]
+mod private_tests;
+
+pub(super) const STALE_LOCK_WARNING: &str = "warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, and the job's Cargo.lock is unchanged. Update it in the job with `cargo update` (offline works) or by building without --locked.\n";
 
 /// A fresh Cargo home prevents a warm tenant cache or the offline fallback from
 /// hiding a broken online preparation path. The caller runs the production helper.
@@ -55,15 +62,233 @@ pub(super) fn check_online_via(
     Ok(())
 }
 
-/// Runs a tenant runner's root fetch: online first, then an offline fallback
-/// that can still use the cache during an outage. `run` runs each attempt
-/// under its limit, as a plain bounded child or in a sibling snapshot helper
-/// unit.
+/// Runs a checkout's trusted fetch, with an offline locked fallback in tenants.
+/// Only a stale-lock failure retries unlocked, on a private copy. `run` receives
+/// that copy's host path so snapshot helpers can bind it at the caller path;
+/// a missing limit adds no timeout, but snapshot helpers retain their deadline.
+/// A true result tells setup to include the fixed stale-lock advisory.
 pub(super) fn prepare_via(
-    command: impl FnMut() -> io::Result<Command>,
-    run: impl FnMut(&mut Command, Duration) -> io::Result<()>,
-) -> io::Result<()> {
-    prepare_with_limits_via(command, ONLINE_TIMEOUT, Duration::from_secs(30), run)
+    workspace: &Path,
+    tenant_vm: bool,
+    mut command: impl FnMut(&Path, bool) -> io::Result<Command>,
+    mut run: impl FnMut(&mut Command, Option<Duration>, Option<&Path>) -> io::Result<()>,
+) -> io::Result<bool> {
+    let locked = if tenant_vm {
+        prepare_with_limits_via(
+            || command(workspace, true),
+            ONLINE_TIMEOUT,
+            Duration::from_secs(30),
+            |command, limit| run(command, Some(limit), None),
+        )
+    } else {
+        command(workspace, true)
+            .and_then(|mut command| run(command.env("CARGO_NET_OFFLINE", "false"), None, None))
+    };
+    let Err(locked_error) = locked else {
+        return Ok(false);
+    };
+    if crate::sibling_snapshots::helper::UnsettledHelper::is(&locked_error)
+        || !lock_needs_update(&locked_error.to_string())
+    {
+        return Err(locked_error);
+    }
+    let unlocked =
+        crate::setup_log::phase("fetch cargo dependencies with private lockfile", || {
+            let copy = PrivateCopy::new(workspace)?;
+            let result = command(&copy.workspace, false).and_then(|mut command| {
+                run(
+                    command.env("CARGO_NET_OFFLINE", "false"),
+                    tenant_vm.then_some(ONLINE_TIMEOUT),
+                    Some(&copy.workspace),
+                )
+            });
+            let cleanup = copy.remove();
+            result.and(cleanup)
+        });
+    match unlocked {
+        Ok(()) => Ok(true),
+        Err(error) if crate::sibling_snapshots::helper::UnsettledHelper::is(&error) => Err(error),
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|error| error.is::<FallbackSkipped>()) =>
+        {
+            Err(io::Error::new(
+                locked_error.kind(),
+                format!(
+                    "{}\nunlocked Cargo fallback skipped: {error}",
+                    diagnostic_prefix(&locked_error.to_string())
+                ),
+            ))
+        }
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "unlocked private Cargo fetch failed: {}; locked fetch failed: {}",
+                diagnostic_prefix(&error.to_string()),
+                diagnostic_prefix(&locked_error.to_string()),
+            ),
+        )),
+    }
+}
+
+fn lock_needs_update(error: &str) -> bool {
+    error.lines().any(|line| {
+        (line.contains("the lock file")
+            && line.contains("needs to be updated but --locked was passed to prevent this"))
+            || (line.contains("cannot update the lock file")
+                && line.contains("because --locked was passed to prevent this"))
+    })
+}
+
+fn diagnostic_prefix(error: &str) -> &str {
+    // Leave room for both attempts before the refusal detail's outer size cap.
+    let mut end = error.len().min(1200);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    &error[..end]
+}
+
+struct PrivateCopy {
+    root: PathBuf,
+    workspace: PathBuf,
+}
+
+#[derive(Debug)]
+struct FallbackSkipped(&'static str);
+
+impl std::fmt::Display for FallbackSkipped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for FallbackSkipped {}
+
+fn check_private_workspace(copy: &Path) -> io::Result<()> {
+    use std::fs;
+    let canonical = fs::canonicalize(copy)?;
+    let copy = canonical.as_path();
+    let skipped = |reason| io::Error::other(FallbackSkipped(reason));
+    for name in ["Cargo.toml", "Cargo.lock"] {
+        if fs::symlink_metadata(copy.join(name))
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(skipped("root Cargo.toml or Cargo.lock is a symlink"));
+        }
+    }
+    let manifest = toml::from_str::<toml::Value>(&fs::read_to_string(copy.join("Cargo.toml"))?)
+        .map_err(|_| skipped("could not determine the private Cargo workspace root"))?;
+    let root = if let Some(workspace) = manifest
+        .get("package")
+        .and_then(|package| package.get("workspace"))
+        .and_then(toml::Value::as_str)
+    {
+        fs::canonicalize(copy.join(workspace))?
+    } else if manifest.get("workspace").is_some() {
+        copy.to_path_buf()
+    } else {
+        // Without an explicit workspace Cargo searches the manifest's parents.
+        // The copy is beside the checkout so relative sibling paths still work;
+        // an ancestor workspace must not receive an unlocked lockfile write.
+        let mut root = copy.to_path_buf();
+        for parent in copy.ancestors().skip(1) {
+            let path = parent.join("Cargo.toml");
+            let text = match fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let manifest = toml::from_str::<toml::Value>(&text)
+                .map_err(|_| skipped("could not determine the private Cargo workspace root"))?;
+            if manifest.get("workspace").is_some() {
+                root = fs::canonicalize(parent)?;
+                break;
+            }
+        }
+        root
+    };
+    if !root.starts_with(copy) {
+        return Err(skipped(
+            "effective Cargo workspace root is outside the private copy",
+        ));
+    }
+    for name in ["Cargo.toml", "Cargo.lock"] {
+        if fs::symlink_metadata(root.join(name))
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(skipped("workspace Cargo.toml or Cargo.lock is a symlink"));
+        }
+    }
+    Ok(())
+}
+
+impl PrivateCopy {
+    fn new(source: &Path) -> io::Result<Self> {
+        use std::{fs, os::unix::fs::DirBuilderExt};
+        let parent = source
+            .parent()
+            .ok_or_else(|| io::Error::other("checkout has no parent"))?;
+        let root = parent.join(format!(".cargo-prefetch-{}", uuid::Uuid::now_v7()));
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        let copy = Self {
+            workspace: root.clone(),
+            root,
+        };
+        // Enumerate only the top level: cp preserves symlinks and reflinks every
+        // regular file, including nested source directories named target.
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            if entry.file_name() == "target" || entry.file_name() == "build" {
+                continue;
+            }
+            let status = Command::new("cp")
+                .args(["--reflink=always", "--recursive", "--no-dereference", "--"])
+                .arg(entry.path())
+                .arg(&copy.workspace)
+                .output()?;
+            if !status.status.success() {
+                return Err(io::Error::other(format!(
+                    "private Cargo checkout copy failed: {}",
+                    String::from_utf8_lossy(&status.stderr)
+                )));
+            }
+        }
+        check_private_workspace(&copy.workspace)?;
+        Ok(copy)
+    }
+
+    fn remove(self) -> io::Result<()> {
+        remove_private_tree(&self.root)
+    }
+}
+
+impl Drop for PrivateCopy {
+    fn drop(&mut self) {
+        let _ = remove_private_tree(&self.root);
+    }
+}
+
+fn remove_private_tree(root: &Path) -> io::Result<()> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    fn writable_directories(path: &Path) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            fs::set_permissions(
+                path,
+                fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
+            )?;
+            for entry in fs::read_dir(path)? {
+                writable_directories(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    // Snapshots can contain read-only directories. Change only the private
+    // directories' modes, never symlink targets, so cleanup can remove them.
+    writable_directories(root)?;
+    fs::remove_dir_all(root)
 }
 
 #[cfg(test)]

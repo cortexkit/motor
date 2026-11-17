@@ -179,6 +179,14 @@ impl View {
         self
     }
 
+    /// Substitute only the private fetch copy at the checkout's caller path.
+    /// Keep the existing sibling bindings, cache visibility and hidden parents.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn private_checkout(mut self, source: &Path, destination: &Path) -> Self {
+        self.read_only.retain(|(_, path)| path != destination);
+        self.read_write(source, destination)
+    }
+
     /// Keeps `path` visible at its own location if a hidden directory covers
     /// it.
     pub(crate) fn keep(mut self, path: &Path, writable: bool) -> Self {

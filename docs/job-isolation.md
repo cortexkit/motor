@@ -191,10 +191,51 @@ is created. Tests: `isolated_job_resolves_localhost_to_loopback`,
 3.6. Only the shared Cargo registry and Git sources, toolchains and system files
 above are visible from the host. Package lifecycle scripts never run as the
 runner: before the job starts, the runner installs JavaScript dependencies from
-a checked-in lockfile without running their scripts, and fetches locked Cargo
-sources. Tests: `isolated_nested_javascript_jobs_resolve_offline_and_reuse_trusted_cache`
+a checked-in lockfile without running their scripts, and prepares Cargo
+sources without running build scripts. Tests: `isolated_nested_javascript_jobs_resolve_offline_and_reuse_trusted_cache`
 (`crates/motor-runner/tests/it/javascript.rs`), and the tests in
 `crates/motor-runner/src/isolation/javascript_tests.rs`.
+
+Cargo preparation starts with `cargo fetch --locked`. On Linux (the build
+server, tenant VMs and per-job VMs), only a Cargo error saying the lockfile
+needs updating permits one online unlocked fetch. Tenant preparation first
+tries its existing offline locked fallback. The unlocked fetch runs on a
+runner-owned private reflink copy beside the checkout, excluding top-level
+`target/` and `build/`; symlinks are copied as links. It uses the same Cargo
+home, Git routes, empty HOME, disabled compiler wrappers, deadlines and helper
+unit as the locked attempt. Snapshot helpers bind the private copy writable
+at the checkout's caller path while keeping siblings read-only. The runner
+removes the copy on success or failure; it never updates the job's lockfile.
+The fallback is skipped when the copy's root manifest or lockfile is a symlink,
+or when Cargo would use a workspace root outside the copy; the refusal retains
+the locked error and explains the skipped fallback. Other symlinks, including
+links to sibling path dependencies, remain links.
+The ancestor check is conservative: a package excluded from an enclosing
+workspace is still treated as external.
+An unlocked failure still refuses setup and reports both fetch errors. Every
+other fetch failure does not trigger the unlocked retry. macOS and Windows keep
+locked-only Cargo preparation.
+
+After a successful unlocked fetch, the job's stderr starts with one advisory:
+
+```text
+warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, and the job's Cargo.lock is unchanged. Update it in the job with `cargo update` (offline works) or by building without --locked.
+```
+
+Tests: `stale_locked_fetch_runs_exactly_one_online_unlocked_fetch_on_a_copy`,
+`other_fetch_failures_and_successful_offline_fallback_never_unlock`,
+`failed_unlocked_fetch_reports_both_errors_and_removes_copy`,
+`real_cargo_stale_lock_populates_cache_without_changing_job_tree`,
+`private_copy_preserves_symlinks_and_excludes_build_outputs`,
+and `unsafe_lockfile_destinations_skip_unlocked_fetch_and_preserve_locked_error`
+(`crates/motor-runner/src/isolation/cargo_fetch_tests.rs`);
+`private_cargo_checkout_replaces_only_the_checkout_bind`
+(`crates/motor-runner/src/sibling_snapshots/helper_tests.rs`). The real-Cargo
+test uses a local file registry without network access and verifies that the
+new version is cached while the job's lockfile bytes remain unchanged.
+`cargo_stale_lock_advisory_precedes_job_stderr_without_shell_interpolation`
+(`crates/motor-runner/src/isolation/javascript_tests.rs`) checks the exact
+warning in both piped and file-backed job output.
 
 On Linux, a failed locked JavaScript install in the workspace or a sibling
 checkout warns on the job's stderr and the job still runs without the failed

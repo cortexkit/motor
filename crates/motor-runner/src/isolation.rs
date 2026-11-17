@@ -2776,7 +2776,7 @@ fn prefetch_cargo_with(
     tree: &str,
     tenant_vm: bool,
     nested_limit: Duration,
-    command: impl FnMut(&Path) -> io::Result<Command>,
+    mut command: impl FnMut(&Path) -> io::Result<Command>,
     skip: impl FnMut(&Path, &str),
 ) -> io::Result<()> {
     prefetch_cargo_in(
@@ -2784,10 +2784,11 @@ fn prefetch_cargo_with(
         tree,
         tenant_vm,
         nested_limit,
-        command,
+        |path, _locked| command(path),
         skip,
-        run_cargo_fetch_on_host,
+        |command, fetch, _copy| run_cargo_fetch_on_host(command, fetch),
     )
+    .map(|_| ())
 }
 
 fn prefetch_cargo_in(
@@ -2795,26 +2796,29 @@ fn prefetch_cargo_in(
     tree: &str,
     tenant_vm: bool,
     nested_limit: Duration,
-    mut command: impl FnMut(&Path) -> io::Result<Command>,
+    mut command: impl FnMut(&Path, bool) -> io::Result<Command>,
     mut skip: impl FnMut(&Path, &str),
-    mut run: impl FnMut(&mut Command, CargoFetch) -> io::Result<()>,
-) -> io::Result<()> {
+    mut run: impl FnMut(&mut Command, CargoFetch, Option<&Path>) -> io::Result<()>,
+) -> io::Result<bool> {
     // Each explicitly requested checkout's root graph is an admission requirement.
     // Experimental nested crates may have stale locks or unavailable dependencies
     // without breaking unrelated jobs in the same repository.
-    if workspace.join("Cargo.toml").is_file() {
-        if tenant_vm {
-            // The daemon alone resolves and downloads sources into persistent
-            // tenant storage. A cache-only fallback can still run a warm job
-            // during an outage; both attempts bound tool and cache-lock waits.
-            cargo_fetch::prepare_via(
-                || command(workspace),
-                |command, limit| run(command, CargoFetch::TenantAttempt(limit)),
-            )?;
-        } else {
-            run(&mut command(workspace)?, CargoFetch::Root)?;
-        }
-    }
+    let advisory = if workspace.join("Cargo.toml").is_file() {
+        cargo_fetch::prepare_via(
+            workspace,
+            tenant_vm,
+            &mut command,
+            |command, limit, copy| {
+                run(
+                    command,
+                    limit.map_or(CargoFetch::Root, CargoFetch::TenantAttempt),
+                    copy,
+                )
+            },
+        )?
+    } else {
+        false
+    };
     let locks = match cargo_lockfiles(workspace, tree, &mut skip) {
         Ok(locks) => locks,
         Err(error) => {
@@ -2822,12 +2826,15 @@ fn prefetch_cargo_in(
                 Path::new("."),
                 &format!("nested lockfile discovery failed: {error}"),
             );
-            return Ok(());
+            return Ok(advisory);
         }
     };
     for lockfile in locks {
-        let fetched = command(&workspace.join(lockfile.parent().unwrap_or(Path::new(""))))
-            .and_then(|mut command| run(&mut command, CargoFetch::Nested(nested_limit)));
+        let fetched = command(
+            &workspace.join(lockfile.parent().unwrap_or(Path::new(""))),
+            true,
+        )
+        .and_then(|mut command| run(&mut command, CargoFetch::Nested(nested_limit), None));
         if let Err(error) = fetched {
             if crate::sibling_snapshots::helper::UnsettledHelper::is(&error) {
                 return Err(error);
@@ -2835,7 +2842,7 @@ fn prefetch_cargo_in(
             skip(&lockfile, &error.to_string());
         }
     }
-    Ok(())
+    Ok(advisory)
 }
 
 fn prepare_cargo_checkouts(
@@ -2896,6 +2903,7 @@ fn known_checkout_git_commits(
 /// With `snapshots`, every fetch runs in a helper unit that shows the job's
 /// sibling snapshots at the siblings' paths.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prefetch_cargo_dependencies<'a>(
     writer: bool,
     tenant_vm: bool,
@@ -2907,6 +2915,39 @@ pub(crate) fn prefetch_cargo_dependencies<'a>(
     cargo: &Path,
     rustup: &Path,
     snapshots: Option<&SnapshotSiblings<'_>>,
+) -> io::Result<bool> {
+    let mut advisory = false;
+    prefetch_cargo_dependencies_with_advisory(
+        writer,
+        tenant_vm,
+        state,
+        job_tree,
+        tree,
+        siblings,
+        dependency_routes,
+        cargo,
+        rustup,
+        snapshots,
+        &mut advisory,
+    )?;
+    Ok(advisory)
+}
+
+/// Keep successful fetch advisories even if a later checkout fails: network
+/// jobs ignore ordinary prefetch failures and still start.
+#[allow(clippy::too_many_arguments)]
+fn prefetch_cargo_dependencies_with_advisory<'a>(
+    writer: bool,
+    tenant_vm: bool,
+    state: &Path,
+    job_tree: impl Into<crate::caller_path::JobTree<'a>>,
+    tree: &str,
+    siblings: &[SiblingSnapshot],
+    dependency_routes: &BTreeMap<String, PathBuf>,
+    cargo: &Path,
+    rustup: &Path,
+    snapshots: Option<&SnapshotSiblings<'_>>,
+    advisory: &mut bool,
 ) -> io::Result<()> {
     let job_tree = job_tree.into();
     let workspace = job_tree.host.as_path();
@@ -2933,26 +2974,29 @@ pub(crate) fn prefetch_cargo_dependencies<'a>(
         .transpose()?;
     crate::setup_log::phase("fetch cargo dependencies", || {
         prepare_cargo_checkouts(job_tree, tree, siblings, snapshots, |job_tree, tree| {
-            prefetch_cargo_in(
+            let warned = prefetch_cargo_in(
                 job_tree.host.as_path(),
                 tree,
                 tenant_vm,
                 NESTED_CARGO_FETCH_TIMEOUT,
-                |directory| {
+                |directory, locked| {
                     // A helper unit sees the workspace only at its caller path, so
                     // its manifest argument names that path; a fetch run directly
                     // on the host reads the host checkout.
-                    let directory = if view.is_some() {
+                    let directory = if view.is_some() && !locked {
+                        job_tree.caller.to_path_buf()
+                    } else if view.is_some() {
                         job_tree.caller_form(directory)
                     } else {
                         directory.to_path_buf()
                     };
-                    let mut command = workspace::dependencies::fetch_command(
+                    let mut command = workspace::dependencies::fetch_command_with_lock(
                         state,
                         &directory,
                         dependency_routes,
                         cargo,
                         rustup,
+                        locked,
                     )?;
                     // The tenant fallback re-runs this builder in offline mode, so
                     // only the build server forces network on here.
@@ -2962,8 +3006,12 @@ pub(crate) fn prefetch_cargo_dependencies<'a>(
                     Ok(command)
                 },
                 crate::setup_log::cargo_skip,
-                |command, fetch| match (snapshots, &view) {
-                    (Some(snapshots), Some(view)) => snapshots.run(view, command, fetch),
+                |command, fetch, copy| match (snapshots, &view) {
+                    (Some(snapshots), Some(view)) => {
+                        let private_view =
+                            copy.map(|copy| view.clone().private_checkout(copy, job_tree.caller));
+                        snapshots.run(private_view.as_ref().unwrap_or(view), command, fetch)
+                    }
                     _ => run_cargo_fetch_on_host(command, fetch),
                 },
             )
@@ -2973,7 +3021,9 @@ pub(crate) fn prefetch_cargo_dependencies<'a>(
                     dependency_routes,
                 );
                 with_fetch_context(error, &context)
-            })
+            })?;
+            *advisory |= warned;
+            Ok(())
         })
     })
     .map_err(|error| {
@@ -3012,8 +3062,8 @@ pub(crate) fn cargo_prefetch_admission(
     }
 }
 
-/// Offline jobs need a matching lockfile before they start. Preparation leaves
-/// the submitted lockfile untouched, even when a network job can update it later.
+/// A failed preparation never repairs the submitted lockfile. Keep Cargo's
+/// diagnostic first and suggest a caller-side update when it reports a stale lock.
 fn fetch_failure(stage: &str, error: &str) -> String {
     // Cargo has worded this both "needs to be updated but --locked was passed to
     // prevent this" and "cannot update the lock file ... because --locked was
@@ -3021,7 +3071,7 @@ fn fetch_failure(stage: &str, error: &str) -> String {
     if error.contains("--locked was passed to prevent this") {
         format!(
             "{stage}: {error}; Cargo.lock doesn't match Cargo.toml: update it in your \
-             own checkout before an offline job, then retry; preparation leaves the \
+             own checkout, then retry; preparation leaves the \
              submitted lockfile unchanged"
         )
     } else {
@@ -3374,6 +3424,7 @@ impl Sandbox {
         // Fetch from a neutral directory: Cargo does not load an uploaded
         // .cargo/config.toml (credential providers/rustc wrappers can execute
         // programs). No build.rs or test runs in this trusted preparation step.
+        let mut cargo_advisory = false;
         {
             // Read-only default ACLs on the shared Cargo registry and Git cache
             // make newly fetched files readable to jobs without rescanning the
@@ -3386,7 +3437,7 @@ impl Sandbox {
             cargo_prefetch_admission(
                 id,
                 network,
-                prefetch_cargo_dependencies(
+                prefetch_cargo_dependencies_with_advisory(
                     writer,
                     tenant_vm,
                     state,
@@ -3397,6 +3448,7 @@ impl Sandbox {
                     &cargo,
                     &rustup,
                     snapshots,
+                    &mut cargo_advisory,
                 ),
             )?;
         }
@@ -3429,6 +3481,11 @@ impl Sandbox {
         } else {
             JavascriptPreparation::default()
         };
+        if cargo_advisory {
+            prepared_javascript
+                .warnings
+                .insert(0, cargo_fetch::STALE_LOCK_WARNING.into());
+        }
         if let Some(snapshots) = snapshots {
             for (directory, _) in &snapshots.siblings {
                 prepared_javascript.warnings.extend(

@@ -449,6 +449,18 @@ pub(crate) fn fetch_command(
     cargo: &Path,
     rustup: &Path,
 ) -> io::Result<Command> {
+    fetch_command_with_lock(state, workspace, routes, cargo, rustup, true)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn fetch_command_with_lock(
+    state: &Path,
+    workspace: &Path,
+    routes: &BTreeMap<String, PathBuf>,
+    cargo: &Path,
+    rustup: &Path,
+    locked: bool,
+) -> io::Result<Command> {
     let empty_home = state.join("fetch-home");
     fs::create_dir_all(&empty_home)?;
     let mut cmd = Command::new("cargo");
@@ -459,7 +471,11 @@ pub(crate) fn fetch_command(
         // entries, including when this command runs outside a snapshot helper.
         cmd.uid(unsafe { libc::geteuid() });
     }
-    cmd.args(["fetch", "--locked", "--manifest-path"])
+    cmd.arg("fetch");
+    if locked {
+        cmd.arg("--locked");
+    }
+    cmd.arg("--manifest-path")
         .arg(workspace.join("Cargo.toml"))
         .current_dir(state);
     if !routes.is_empty() {
