@@ -438,6 +438,11 @@ That directory holds an exclusively locked `lease` file, a compatible
 runtime directories. Its Engram catalog entry remains a **device-local filetree**;
 copying or restoring it to another device can replay stale intents.
 
+The key used to hash hosted workspace and repository identities lives in ck-motor’s
+private space in the credential vault. Losing the key only makes each checkout’s
+next hosted job start in a fresh workspace instead of reusing its previous hosted
+workspace. If the vault is unavailable, hosted jobs are refused as never started.
+
 With the journal backend, each synchronous mutation appends the complete changed
 records and deleted keys
 as one SHA-256-checked transaction and fsyncs it before returning. Cancellation,

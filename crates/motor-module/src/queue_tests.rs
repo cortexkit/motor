@@ -1,4 +1,5 @@
 use super::*;
+use crate::hosted_salt::tests::{direct_motor as test_direct_motor, motor as test_motor};
 use crate::storage::legacy_fixtures::{seed_direct_route, DirectRoute};
 use crate::transport::Duplex;
 use cortexkit_test_support::ScratchDir;
@@ -246,7 +247,7 @@ async fn only_observed_permit_wait_can_withdraw_not_elapsed_acceptance() {
     let scratch = ScratchDir::new("motor-queue-clock");
     let queue = Arc::new(AtomicU64::new(u64::MAX));
     let withdrawn = Arc::new(AtomicBool::new(false));
-    let motor = Motor::with_test_fixture_direct_route(
+    let motor = test_direct_motor(
         Config::default(),
         &scratch,
         Arc::new(ClockPeer {
@@ -302,7 +303,7 @@ async fn queued_then_running_uses_only_the_jobs_existing_channel() {
     let opens = Arc::new(AtomicU64::new(0));
     let finished = Arc::new(AtomicBool::new(false));
     let withdrawn = Arc::new(AtomicBool::new(false));
-    let motor = Motor::with_test_fixture_direct_route(
+    let motor = test_direct_motor(
         Config::default(),
         &scratch,
         Arc::new(ClockPeer {
@@ -356,7 +357,7 @@ async fn queued_then_running_uses_only_the_jobs_existing_channel() {
 async fn streamed_elapsed_queue_time_sets_a_local_deadline() {
     let scratch = ScratchDir::new("motor-stream-deadline");
     let withdrawn = Arc::new(AtomicBool::new(false));
-    let motor = Motor::with_test_fixture_direct_route(
+    let motor = test_direct_motor(
         Config::default(),
         &scratch,
         Arc::new(ClockPeer {
@@ -793,7 +794,7 @@ async fn direct_hosted_run_with_a_resolved_tip(
 ) -> (String, motor_protocol::Run) {
     let scratch = ScratchDir::new("hosted-fill-tip");
     let repo = fixture_repo(scratch.path());
-    let motor = Motor::with_test_fixture_direct_route(
+    let motor = test_direct_motor(
         config,
         &scratch.join("state"),
         Arc::new(crate::hosted::tests::harness::NoSsh(
@@ -986,7 +987,7 @@ async fn hosted_lease_log_names_caller_and_only_repository_folder() {
             }
             let hosted = Harness::new(Behavior::CompleteRun).await;
             let (scratch, repo) = crate::hosted::boat_tests::committed_repo();
-            let motor = Motor::with_connector(
+            let motor = test_motor(
                 Config { ..hosted.config() },
                 &scratch.0.join("state"),
                 Arc::new(ResubmitPeer::new()),
@@ -1050,12 +1051,8 @@ async fn boat_lease_stating_sandbox_memory_runs_on_boat() {
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor = Motor::with_test_fixture_direct_route(
-        boat.config.clone(),
-        &scratch.join("state"),
-        Arc::new(peer),
-    )
-    .unwrap();
+    let motor =
+        test_direct_motor(boat.config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
     let id = Uuid::now_v7();
     let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(60)).await;
     let accepted = records
@@ -1081,7 +1078,7 @@ async fn boat_lease_stating_sandbox_memory_runs_on_boat() {
 async fn spill_attempt_note_keeps_within_the_refusal_detail_limit() {
     let scratch = ScratchDir::new("motor-spill-attempted-limit");
     let config = spill_config("http://127.0.0.1:1");
-    let motor = Motor::with_test_fixture_direct_route(
+    let motor = test_direct_motor(
         config.clone(),
         &scratch.join("state"),
         Arc::new(ResubmitPeer::new()),
@@ -1248,7 +1245,7 @@ async fn follow_queued(
     let config = Config {
         ..Config::default()
     };
-    let motor = Motor::with_test_fixture_direct_route(
+    let motor = test_direct_motor(
         config,
         &scratch,
         Arc::new(QueuedPeer {
@@ -1340,7 +1337,7 @@ async fn spilled_deliberate_refusals_stay_final() {
         let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
         let peer = ResubmitPeer::new();
         let log = peer.log.clone();
-        let motor = Motor::with_connector(
+        let motor = test_motor(
             spill_config(&broker.url),
             &scratch.join("state"),
             Arc::new(peer),
@@ -1404,8 +1401,7 @@ async fn spilled_lost_run_ack_reattaches_without_resubmitting() {
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor =
-        Motor::with_connector(hosted.config(), &scratch.join("state"), Arc::new(peer)).unwrap();
+    let motor = test_motor(hosted.config(), &scratch.join("state"), Arc::new(peer)).unwrap();
     let captured = crate::logging::Captured::default();
     let _log = crate::logging::scoped(captured.clone());
     let id = Uuid::now_v7();
@@ -1443,8 +1439,7 @@ async fn boat_lease_failing_client_checks_refuses_without_direct_fallback() {
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor =
-        Motor::with_connector(boat.config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
+    let motor = test_motor(boat.config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
     let id = Uuid::now_v7();
     let captured = crate::logging::Captured::default();
     let _log = crate::logging::scoped(captured.clone());

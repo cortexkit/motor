@@ -5,6 +5,7 @@
 //! terminal and the host's billed usage, which ck-motor never reports again.
 use super::*;
 use crate::hosted::boat_tests::{committed_repo, records};
+use crate::hosted_salt::tests::motor as test_motor;
 
 #[tokio::test]
 async fn stream_lost_after_host_settled_reattaches_and_replays_the_real_terminal() {
@@ -15,8 +16,7 @@ async fn stream_lost_after_host_settled_reattaches_and_replays_the_real_terminal
         hosted_repositories: vec![repo.to_str().unwrap().into()],
         ..h.config()
     };
-    let motor =
-        crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let args = crate::cli::RunArgs {
         cwd: Some(repo.clone()),
         command: vec!["true".into()],

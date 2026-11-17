@@ -5,6 +5,7 @@
 use super::queue_tests::ResubmitPeer;
 use super::*;
 use crate::hosted::test_http::Requests;
+use crate::hosted_salt::tests::motor as test_motor;
 use cortexkit_test_support::ScratchDir;
 use std::sync::atomic::Ordering;
 
@@ -112,7 +113,7 @@ async fn cancel_without_a_granted_lease_settles_the_never_ran_booking_once() {
     boat.hold_provisioning.store(true, Ordering::SeqCst);
     let scratch = ScratchDir::new("cancel-no-lease");
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         spill_config(boat.config.broker_url.as_ref().unwrap()),
         &scratch.join("state"),
         Arc::new(ResubmitPeer::new()),

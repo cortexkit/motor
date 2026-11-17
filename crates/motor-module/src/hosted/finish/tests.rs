@@ -1,4 +1,5 @@
 use super::*;
+use crate::hosted_salt::tests::storage as test_storage;
 use crate::{
     hosted::{placement::Finish, test_http::Http, HostedJobState},
     BrokerTokenSource, Config,
@@ -51,7 +52,7 @@ async fn unknown_release_settles_unused_booking_before_returning() {
     })
     .await;
     let scratch = ScratchDir::new("unknown-release");
-    let storage = Storage::open(&scratch.join("state")).unwrap();
+    let storage = test_storage(&scratch.join("state")).unwrap();
     let config = Config {
         runner_instance: "test".into(),
         broker_token_source: BrokerTokenSource::Fake,
@@ -103,7 +104,7 @@ async fn boat_finish_nonretry_statuses_and_restart_resume() {
     }).await;
     let scratch = ScratchDir::new("boat-finish");
     let root = scratch.join("state");
-    let storage = Storage::open(&root).unwrap();
+    let storage = test_storage(&root).unwrap();
     let config = Config {
         runner_instance: "test".into(),
         broker_token_source: BrokerTokenSource::Fake,

@@ -2,6 +2,7 @@
 //! serves. The broker double selects the host only from the tenant's last
 //! heartbeat (see `hosted::tests::capacity`), so these tests decide exactly
 //! when the broker's view goes stale.
+use crate::hosted_salt::tests::motor as test_motor;
 
 use super::repository_routing_tests::{
     lease_bodies, lease_settlement_requests, request, terminal_without_more_time, until, HeldClock,
@@ -93,8 +94,7 @@ async fn fleet_capacity_wait_takes_host_full_and_no_capacity_in_either_order() {
         set_full(!host_full_first);
         let (scratch, repo) = committed_repo();
         let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor =
-            Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+        let motor = test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
         let started = tokio::time::Instant::now();
         let stream = motor.run(request(&repo)).unwrap();
         let id = stream.job_id;
@@ -211,7 +211,7 @@ async fn fleet_burst_over_one_heartbeat_waits_through_host_full_and_no_capacity(
     h.run_gate.send_replace(false);
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
     let mut ids = Vec::new();
     let mut jobs = Vec::new();
     for _ in 0..8 {
@@ -394,7 +394,7 @@ async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_plac
     *tenant(&h) = Some(model);
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
     let started = tokio::time::Instant::now();
     let mut run_request = request(&repo);
     run_request.queue_wait_limit_s = Some(10);
@@ -513,7 +513,7 @@ async fn invalid_fleet_timeouts_and_no_host_fits_are_typed_without_a_direct_prob
         let (scratch, repo) = committed_repo();
         let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
         let motor =
-            Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+            test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
         let mut request = request(&repo);
         request.weight_hint = Some(claim);
         request.timeout = Some(timeout);
@@ -590,7 +590,7 @@ async fn twenty_one_vcpu_canary_qualifies_against_the_78_gib_guest_advertisement
     let mut config = config(&h);
     config.hosted_repositories = vec![repo.to_str().unwrap().into()];
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for (free_mem_mib, placed) in [
         (TENANT_1_STOPPED_FREE_MEM_MIB, true),
         (75_264, true),

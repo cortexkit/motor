@@ -3,6 +3,7 @@ use crate::hosted::{
     tests::harness::{Behavior, Harness, NoSsh},
     BillingStatus, Client, HOST_LOST_GRACE_S,
 };
+use crate::hosted_salt::tests::motor as test_motor;
 use motor_protocol::{AttachRequest, Outcome, Ran, StreamRecord};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -10,8 +11,7 @@ use std::sync::{
 };
 
 async fn detached_job(h: &Harness, root: &std::path::Path) -> (Motor, Uuid) {
-    let motor =
-        Motor::with_connector(h.config(), root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     let id = Uuid::now_v7();
     motor.storage.create(id, 60, None, None, false).unwrap();
     motor.storage.hosted_route(id, h.route.clone()).unwrap();
@@ -35,8 +35,7 @@ async fn detached_job(h: &Harness, root: &std::path::Path) -> (Motor, Uuid) {
 async fn detached_never_sent_hosted_job_is_refused_once_without_reattach_or_resubmit() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = cortexkit_test_support::ScratchDir::new("health-hosted-never-sent");
-    let motor =
-        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     let id = Uuid::now_v7();
     motor.storage.create(id, 60, None, None, false).unwrap();
     motor.storage.hosted_route(id, h.route.clone()).unwrap();
@@ -82,8 +81,7 @@ async fn detached_never_sent_hosted_job_is_refused_once_without_reattach_or_resu
     );
     drop(stream);
     drop(motor);
-    let motor =
-        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     motor.resume_finishes().await;
     motor
         .machine_jobs_health_at(now + 2 * STALE_PROBE_INTERVAL_MS)
@@ -102,9 +100,7 @@ async fn detached_never_sent_booking_is_settled_once_without_reattach_or_resubmi
     let h = Harness::new(Behavior::Normal).await;
     for booking in ["first_party", "boat", "lost_grant", "not_granted"] {
         let scratch = cortexkit_test_support::ScratchDir::new("health-hosted-unused-booking");
-        let motor =
-            Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0))))
-                .unwrap();
+        let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
         let id = Uuid::now_v7();
         motor.storage.create(id, 60, None, None, false).unwrap();
         motor.storage.hosted_route(id, h.route.clone()).unwrap();
@@ -185,9 +181,7 @@ async fn detached_never_sent_booking_is_settled_once_without_reattach_or_resubmi
             .machine_jobs_health_at(now + STALE_PROBE_INTERVAL_MS)
             .await;
         drop(motor);
-        let motor =
-            Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0))))
-                .unwrap();
+        let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
         motor.resume_finishes().await;
         motor
             .machine_jobs_health_at(now + LEGACY_JOB_HORIZON_MS)
@@ -226,8 +220,7 @@ async fn detached_never_sent_booking_is_settled_once_without_reattach_or_resubmi
 async fn never_sent_hosted_recovery_after_restart_owns_the_booking_until_settlement() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = cortexkit_test_support::ScratchDir::new("health-hosted-recovering");
-    let motor =
-        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     let id = Uuid::now_v7();
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -260,8 +253,7 @@ async fn never_sent_hosted_recovery_after_restart_owns_the_booking_until_settlem
         })
         .unwrap();
     drop(motor);
-    let motor =
-        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     motor.resume_finishes().await;
     tokio::time::timeout(Duration::from_secs(5), entered.notified())
         .await
@@ -301,9 +293,7 @@ async fn never_sent_hosted_job_with_a_local_owner_is_not_retired_or_probed() {
         "archived_spill",
     ] {
         let scratch = cortexkit_test_support::ScratchDir::new("health-hosted-owned");
-        let motor =
-            Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0))))
-                .unwrap();
+        let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
         let id = Uuid::now_v7();
         motor.storage.create(id, 60, None, None, false).unwrap();
         motor.storage.hosted_route(id, h.route.clone()).unwrap();
@@ -388,8 +378,7 @@ async fn hosted_finished_health_probe_retires_once_across_restart_without_reatta
     drop(stream);
     drop(motor);
 
-    let motor =
-        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     motor.resume_finishes().await;
     motor
         .machine_jobs_health_at(now + 2 * STALE_PROBE_INTERVAL_MS)
@@ -462,8 +451,7 @@ async fn hosted_unknown_past_deadline_retires_once_across_restart_without_reatta
     drop(stream);
     drop(motor);
 
-    let motor =
-        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     motor.resume_finishes().await;
     motor
         .machine_jobs_health_at(now + 2 * STALE_PROBE_INTERVAL_MS)
@@ -490,8 +478,7 @@ async fn hosted_unknown_before_deadline_shares_recovery_and_never_probes_provisi
             detached_job(&h, &scratch).await
         } else {
             let motor =
-                Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0))))
-                    .unwrap();
+                test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
             let id = Uuid::now_v7();
             motor.storage.create(id, 60, None, None, false).unwrap();
             motor.storage.hosted_route(id, h.route.clone()).unwrap();
@@ -1139,8 +1126,7 @@ async fn hosted_restart_collects_terminal_without_replaying_until_subscriber_arr
         .await
         .unwrap()
         .unwrap();
-    let motor =
-        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     motor.resume_finishes().await;
     owner_attach_count(&h, 2).await;
     assert_eq!(owner_replay_cursors(&h), vec![u64::MAX, u64::MAX]);
@@ -1319,8 +1305,7 @@ async fn hosted_finished_late_attach_replays_after_journal_recovery() {
         }
         motor.close().await;
         let motor =
-            Motor::with_connector(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0))))
-                .unwrap();
+            test_motor(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
         assert_eq!(motor.hosted_state(id).unwrap().replay_end_seq, Some(64));
         h.attach_history_expired.store(expired, Ordering::SeqCst);
         if expired {
@@ -1355,8 +1340,7 @@ async fn hosted_finished_old_store_without_replay_end_seq_still_requests_replay(
         .unwrap();
         motor.close().await;
         let motor =
-            Motor::with_connector(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0))))
-                .unwrap();
+            test_motor(h.config(), &recovered, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
         let state = motor.hosted_state(id).unwrap();
         assert_eq!(state.replay_end_seq, None);
         assert!(serde_json::to_value(state)

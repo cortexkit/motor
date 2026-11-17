@@ -1,5 +1,6 @@
 use super::*;
 use crate::hosted::tests::harness::{Behavior, Harness, NoSsh};
+use crate::hosted_salt::tests::motor as test_motor;
 use cortexkit_test_support::ScratchDir;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -56,7 +57,7 @@ async fn hosted_runner_refusals_preserve_typed_code_reason_and_detail() {
         let root = ScratchDir::new("hosted-runner-refusal");
         let repo = queue_tests::fixture_repo(root.path());
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(h.config(), &root.join("state"), ssh.clone()).unwrap();
+        let motor = test_motor(h.config(), &root.join("state"), ssh.clone()).unwrap();
         let id = Uuid::now_v7();
         motor.storage.create(id, 30, None, None, false).unwrap();
         motor.storage.hosted_route(id, h.route.clone()).unwrap();

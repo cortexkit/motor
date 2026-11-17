@@ -1,4 +1,5 @@
 use super::*;
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 use motor_protocol::{ReturnFailureCause, ReturnPathsFailed, ReturnedFile};
 
 fn request() -> RunRequest {
@@ -300,7 +301,7 @@ fn hosted_usage_needs_a_sent_run_and_reports_only_settled_billing() {
 #[test]
 fn memory_result_fields_survive_caller_forwarding_and_hosted_usage() {
     let scratch = crate::hosted::tests::harness::Scratch::new();
-    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    let storage = test_storage(&scratch.0.join("state")).unwrap();
     let id = Uuid::now_v7();
     storage
         .create(id, 30, None, Some("test".into()), false)
@@ -338,7 +339,7 @@ mod hosted {
     /// A hosted job whose Run frame was sent, left for `attach` to follow.
     /// `return_cwd` marks it as an agent job that asked for returned files.
     async fn seed_sent(h: &Harness, scratch: &Scratch, id: Uuid, return_cwd: Option<&str>) {
-        let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+        let storage = Arc::new(test_storage(&scratch.0.join("state")).unwrap());
         storage
             .create(id, 30, None, Some("test".into()), false)
             .unwrap();
@@ -362,7 +363,7 @@ mod hosted {
     /// can hold the storage lease a moment longer, so wait for it.
     async fn motor(h: &Harness, scratch: &Scratch) -> crate::Motor {
         crate::tests::reopen_motor(|| {
-            crate::Motor::with_connector(
+            test_motor(
                 h.config(),
                 &scratch.0.join("state"),
                 Arc::new(NoSsh(AtomicUsize::new(0))),

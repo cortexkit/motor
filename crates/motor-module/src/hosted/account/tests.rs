@@ -1,4 +1,5 @@
 use super::*;
+use crate::hosted_salt::tests::storage as test_storage;
 use std::{collections::VecDeque, sync::Mutex};
 
 pub(crate) struct FakeVault {
@@ -274,7 +275,7 @@ async fn account_check_401_refetches_once_and_stops_on_second_401() {
 
 #[tokio::test]
 async fn account_finish_second_401_stops_retries_and_keeps_settlement_pending() {
-    use crate::{hosted::HostedJobState, storage::Storage};
+    use crate::hosted::HostedJobState;
     use motor_protocol::{Outcome, TerminalRecord, Uuid};
     let http = super::super::test_http::Http::new(|path, _| {
         assert!(path.ends_with("/finish"));
@@ -282,7 +283,7 @@ async fn account_finish_second_401_stops_retries_and_keeps_settlement_pending() 
     })
     .await;
     let scratch = cortexkit_test_support::ScratchDir::new("account-finish");
-    let storage = Storage::open(&scratch.join("state")).unwrap();
+    let storage = test_storage(&scratch.join("state")).unwrap();
     let config = crate::Config {
         broker_url: Some(http.url.clone()),
         ..crate::Config::default()

@@ -1,5 +1,6 @@
 use super::*;
 use crate::hosted::account::tests::{refusal, FakeVault};
+use crate::hosted_salt::tests::motor as test_motor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct NoSsh(AtomicUsize);
@@ -20,7 +21,7 @@ async fn hosted_account_refusals_are_typed_no_run_and_keep_retry_delay() {
     let root =
         cortexkit_test_support::scratch_root().join(format!("hosted-account-{}", Uuid::now_v7()));
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(Config::default(), &root, ssh.clone()).unwrap();
+    let motor = test_motor(Config::default(), &root, ssh.clone()).unwrap();
     for (reply, reason, code, delay, detail) in [
         (
             refusal("not_found"),

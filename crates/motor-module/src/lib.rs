@@ -13,6 +13,7 @@ mod diagnostics;
 mod engram_catalog;
 mod health_cache;
 mod hosted;
+mod hosted_salt;
 pub mod logging;
 pub mod module;
 mod motor;
@@ -21,6 +22,7 @@ mod snapshot;
 mod storage;
 pub use return_paths::ReturnOptions;
 mod transport;
+pub mod vault;
 mod wsl;
 
 pub use config::{BrokerTokenSource, Config, MacosRunner, WindowsRunner};

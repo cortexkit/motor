@@ -2,6 +2,7 @@
 use super::queue_tests::{run_spilled, ResubmitPeer};
 use super::*;
 use crate::hosted::tests::harness::{Behavior, Harness};
+use crate::hosted_salt::tests::motor as test_motor;
 use crate::storage::legacy_fixtures::{seed_direct_route, DirectRoute};
 use cortexkit_test_support::ScratchDir;
 use std::sync::atomic::Ordering;
@@ -128,7 +129,7 @@ async fn attach_during_spill_provisioning_follows_boat_grant() {
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         spill_config(boat.config.broker_url.as_ref().unwrap()),
         &scratch.join("state"),
         Arc::new(peer),
@@ -206,7 +207,7 @@ async fn attach_unknown_outcome_reports_unconfirmed_cancel_and_retries() {
     .await;
     let scratch = ScratchDir::new("spill-unknown-cancel-unacknowledged");
     let config = spill_config(&broker.url);
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config.clone(),
         &scratch.join("state"),
         Arc::new(ResubmitPeer::new()),
@@ -298,8 +299,7 @@ async fn audit_13_restart_unknown_cancel_replay_stops_at_host_expiry() {
     .await;
     let root = ScratchDir::new("unknown-cancel-restart-expiry");
     let config = spill_config(&broker.url);
-    let motor =
-        Motor::with_connector(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let motor = test_motor(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
     let id = Uuid::now_v7();
     motor.storage.create(id, 60, None, None, false).unwrap();
     let mut route = crate::HostedJobState::new(&config);
@@ -325,8 +325,7 @@ async fn audit_13_restart_unknown_cancel_replay_stops_at_host_expiry() {
     assert!(image["jobs"][id.to_string()]["hosted"]
         .get("observed_unknown_terminal")
         .is_none());
-    let motor =
-        Motor::with_connector(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let motor = test_motor(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
     assert!(motor.pending(id));
     assert!(!motor.hosted_state(id).unwrap().has_real_terminal());
     motor.resume_finishes().await;
@@ -357,7 +356,7 @@ async fn audit_13_restart_unknown_cancel_replay_stops_at_host_expiry() {
         "cancel was retried beyond expiry: {delivered}"
     );
     motor.close().await;
-    let motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let motor = test_motor(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
     motor.resume_finishes().await;
     assert!(!motor.hosted_results.lock().unwrap().contains_key(&id));
     assert_eq!(*attempts.borrow(), delivered);
@@ -370,7 +369,7 @@ async fn unknown_outcome_defers_boat_finish_until_cancel_retry_is_acknowledged()
     let scratch = ScratchDir::new("spill-unknown-cancel-retry-boat");
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let config = spill_config(boat.config.broker_url.as_ref().unwrap());
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config.clone(),
         &scratch.join("state"),
         Arc::new(ResubmitPeer::new()),
@@ -437,7 +436,7 @@ async fn restart_retries_unknown_hosted_cancel_before_boat_finish() {
     let scratch = ScratchDir::new("spill-unknown-cancel-restart");
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let config = spill_config(boat.config.broker_url.as_ref().unwrap());
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config.clone(),
         &scratch.join("state"),
         Arc::new(ResubmitPeer::new()),
@@ -472,7 +471,7 @@ async fn restart_retries_unknown_hosted_cancel_before_boat_finish() {
     motor.storage.terminal_observed(id).unwrap();
     motor.close().await;
     boat.reattach_unavailable.store(true, Ordering::SeqCst);
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &scratch.join("state"),
         Arc::new(ResubmitPeer::new()),
@@ -531,8 +530,7 @@ async fn configured_hosted_no_capacity_keeps_typed_refusal() {
     let config = Config {
         ..spill_config(&broker.url)
     };
-    let motor =
-        Motor::with_connector(config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
+    let motor = test_motor(config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
     let id = Uuid::now_v7();
     motor
         .storage
@@ -607,7 +605,7 @@ async fn spill_whose_run_reached_hosted_runner_reattaches_not_resubmits() {
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         spill_config(&h.route.broker_url),
         &scratch.join("state"),
         Arc::new(peer),
@@ -641,8 +639,7 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
     let (before_run, after_run) = (Uuid::now_v7(), Uuid::now_v7());
     let (before_id, after_id) = (Uuid::now_v7(), Uuid::now_v7());
     {
-        let motor =
-            Motor::with_connector(config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
+        let motor = test_motor(config.clone(), &scratch.join("state"), Arc::new(peer)).unwrap();
         for (id, build_server_id) in [(before_id, before_run), (after_id, after_run)] {
             motor
                 .storage
@@ -666,7 +663,7 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
     }
     // The second job's Run frame reached the build server before the restart.
     log.lock().unwrap().completed.insert(after_run);
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &scratch.join("state"),
         Arc::new(ResubmitPeer {
@@ -724,7 +721,7 @@ async fn spilled_account_closed_is_refused_and_never_resubmitted() {
     let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         spill_config(&broker.url),
         &scratch.join("state"),
         Arc::new(peer),

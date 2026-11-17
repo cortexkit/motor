@@ -18,6 +18,19 @@ async fn response(stream: &mut tokio::net::TcpStream, request: &Frame, body: Val
 
 #[tokio::test]
 async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_envelope() {
+    account_roundtrip(true).await;
+}
+
+#[tokio::test]
+async fn account_real_request_uses_sdk_identity_without_a_legacy_override() {
+    assert!(
+        std::env::var_os("SUBC_MODULE_ID").is_none(),
+        "wire fixture runs outside a supervised module"
+    );
+    account_roundtrip(false).await;
+}
+
+async fn account_roundtrip(legacy_nonce: bool) {
     let root = cortexkit_test_support::scratch_root()
         .join(format!("account-wire-{}", motor_protocol::Uuid::now_v7()));
     std::fs::create_dir_all(&root).unwrap();
@@ -55,6 +68,21 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
         )
         .await
         .unwrap();
+        // The SDK negotiates daemon capabilities before opening its first route.
+        let describe = read_frame(&mut stream).await.unwrap().unwrap();
+        assert_eq!(describe.header.channel, 0);
+        assert_eq!(describe.header.ty, FrameType::Request);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&describe.body).unwrap(),
+            json!({"op":"server.describe"})
+        );
+        response(
+            &mut stream,
+            &describe,
+            json!({"op":"server.describe", "protocol_ver":1,
+                "subc_ops":[], "capabilities":[], "connected_clients":1}),
+        )
+        .await;
         let route = read_frame(&mut stream).await.unwrap().unwrap();
         assert_eq!(route.header.channel, 0);
         let body: Value = serde_json::from_slice(&route.body).unwrap();
@@ -67,10 +95,17 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
             body["target"],
             json!({"kind":"management_surface", "module_id":"claustrum"})
         );
-        assert_eq!(
-            body["consumer_identity"],
-            json!({"module_id":"ck-motor", "launch_nonce":"test-launch-nonce"})
-        );
+        if legacy_nonce {
+            assert_eq!(
+                body["consumer_identity"],
+                json!({"module_id":"ck-motor", "launch_nonce":"test-launch-nonce"})
+            );
+        } else {
+            assert!(
+                body.get("consumer_identity").is_none(),
+                "identity belongs to the SDK connection, not a route override: {body}"
+            );
+        }
         response(
             &mut stream,
             &route,
@@ -99,9 +134,21 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
         connection: path,
         module_id: "ck-motor".into(),
     };
-    let reply = tokio::time::timeout(Duration::from_secs(10), vault.request_with_nonce(json!({
-        "method":"credential.account_token", "params":{"audience":"cortexkit-runners", "min_ttl_ms":90000}
-    }), "test-launch-nonce")).await.unwrap().unwrap();
+    let request = json!({"method":"credential.account_token", "params":{"audience":"cortexkit-runners", "min_ttl_ms":90000}});
+    let reply = if legacy_nonce {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vault.request_with_nonce(request, "test-launch-nonce"),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    } else {
+        tokio::time::timeout(Duration::from_secs(10), vault.request(request))
+            .await
+            .unwrap()
+            .unwrap()
+    };
     assert_eq!(decode(reply).unwrap().jwt, "wire.fixture.jwt");
     tokio::time::timeout(Duration::from_secs(2), daemon)
         .await

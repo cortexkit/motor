@@ -93,15 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let connection = connection
         .ok_or_else(|| io::Error::other("usage: ck-motor --subc FILE [--config FILE]"))?;
-    let resolver = Arc::new(
-        cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
-            connection.clone(),
-            id.clone(),
-        ),
-    );
+    let resolver = Arc::new(motor_module::vault::VaultResolver::new(connection.clone()));
     let handler = Handler::new(config)
         .with_module_id(id.clone())
-        .with_credentials(resolver)
+        .with_credentials(resolver.clone())
+        .with_module_secrets(resolver)
         .with_account_tokens(Arc::new(motor_module::AccountTokens::new(
             connection.clone(),
             id.clone(),

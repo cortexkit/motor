@@ -4,6 +4,7 @@ use crate::hosted::{
     tests::harness::{Behavior, Harness, NoSsh},
     Client,
 };
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 async fn terminal(mut stream: JobStream) -> TerminalRecord {
@@ -23,7 +24,7 @@ async fn rebook_wait_survives_restart(settle_at_shutdown: bool) {
     let h = Harness::new(Behavior::Refuse("host_full")).await;
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let mut request = Harness::request(&repo);
     request.queue_wait_limit_s = Some(300);
     let stream = motor.run(request).unwrap();
@@ -61,7 +62,7 @@ async fn rebook_wait_survives_restart(settle_at_shutdown: bool) {
         "the refused booking is released promptly, not postponed to restart"
     );
 
-    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     motor.resume_finishes().await;
     motor.wait_hosted_cleanup(id).await;
     let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
@@ -78,7 +79,7 @@ async fn rebook_wait_survives_restart(settle_at_shutdown: bool) {
     );
     motor.close().await;
 
-    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     assert_eq!(
         motor.job_status(id).await.unwrap().terminal,
         Some(result.clone())
@@ -135,7 +136,7 @@ async fn restart_repairs_synthetic_no_run_outcomes_but_preserves_runner_full_ref
         (refused.clone(), refused),
     ] {
         let scratch = cortexkit_test_support::ScratchDir::new("hosted-stored-synthetic-terminal");
-        let storage = Storage::open(&scratch).unwrap();
+        let storage = test_storage(&scratch).unwrap();
         let id = Uuid::now_v7();
         storage.create(id, 60, None, None, false).unwrap();
         storage.hosted_route(id, h.route.clone()).unwrap();
@@ -157,7 +158,7 @@ async fn restart_repairs_synthetic_no_run_outcomes_but_preserves_runner_full_ref
         drop(storage);
 
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+        let motor = test_motor(h.config(), &scratch, ssh.clone()).unwrap();
         let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
         assert_eq!(result.outcome, expected);
         if is_refusal {
@@ -182,7 +183,7 @@ async fn observe_release_before_its_reply(attach_first: bool, unknown: bool) {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = cortexkit_test_support::ScratchDir::new("hosted-release-in-flight");
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch, ssh.clone()).unwrap();
     let id = Uuid::now_v7();
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -337,7 +338,7 @@ async fn broker_ended_reply_during_live_submission_is_not_final(unknown: bool, s
     let mut config = h.config();
     config.broker_url = Some(http.url.clone());
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let mut stream = motor.run(Harness::request(&repo)).unwrap();
     let id = stream.job_id;
     tokio::time::timeout(Duration::from_secs(30), entered.notified())
@@ -439,7 +440,7 @@ async fn unknown_cleanup_is_never_started(stored: Option<Outcome>, boat: bool) {
         (404, serde_json::json!({"error": "job_unknown"}))
     })
     .await;
-    let storage = Storage::open(&scratch).unwrap();
+    let storage = test_storage(&scratch).unwrap();
     storage.create(id, 60, None, None, false).unwrap();
     storage.hosted_route(id, h.route.clone()).unwrap();
     storage
@@ -465,7 +466,7 @@ async fn unknown_cleanup_is_never_started(stored: Option<Outcome>, boat: bool) {
     drop(storage);
 
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch, ssh.clone()).unwrap();
     assert!(!motor.hosted_state(id).unwrap().finish_done);
     assert_eq!(motor.storage.unsettled_hosted(), vec![id]);
     if stored.is_some() {
@@ -495,7 +496,7 @@ async fn unknown_cleanup_is_never_started(stored: Option<Outcome>, boat: bool) {
     );
     motor.close().await;
 
-    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch, ssh.clone()).unwrap();
     motor.resume_finishes().await;
     assert!(motor.storage.unsettled_hosted().is_empty());
     assert_eq!(
@@ -530,7 +531,7 @@ async fn unknown_booking_with_run_sent_remains_may_have_run() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = cortexkit_test_support::ScratchDir::new("hosted-unknown-run-sent");
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(h.config(), &scratch, ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch, ssh.clone()).unwrap();
     let id = Uuid::now_v7();
     let http = crate::hosted::test_http::Http::new(move |path, _| {
         assert_eq!(path, format!("/v1/leases/{id}/reattach"));
@@ -567,7 +568,7 @@ async fn released_booking_with_run_sent_remains_may_have_run() {
     h.run_gate.send_replace(false);
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let stream = motor.run(Harness::request(&repo)).unwrap();
     let id = stream.job_id;
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -583,7 +584,7 @@ async fn released_booking_with_run_sent_remains_may_have_run() {
     h.requests.lock().unwrap().clear();
     Client::new(h.route.clone()).release(id).await.unwrap();
 
-    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
     assert_eq!(result.outcome, Outcome::OutcomeUnknown);
     assert_eq!(result.ran, Some(Ran::Unknown("maybe".into())));

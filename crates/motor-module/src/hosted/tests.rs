@@ -1,4 +1,5 @@
 use super::*;
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 
 #[test]
 fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
@@ -275,7 +276,7 @@ use motor_protocol::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn stored(scratch: &Scratch, id: Uuid, route: HostedJobState) -> Arc<Storage> {
-    let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.0.join("state")).unwrap());
     storage
         .create(id, 30, None, Some("test".into()), false)
         .unwrap();
@@ -286,7 +287,7 @@ fn stored(scratch: &Scratch, id: Uuid, route: HostedJobState) -> Arc<Storage> {
 #[test]
 fn spill_provisioning_budget_caps_only_spills_and_respects_remaining_wait() {
     let scratch = Scratch::new();
-    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    let storage = test_storage(&scratch.0.join("state")).unwrap();
     for (limit_s, spill_wait_ms, expected_ms) in [
         (300, Some(45_000), 180_000),
         (120, Some(45_000), 75_000),
@@ -378,7 +379,7 @@ async fn hosted_capacity_rebooks_but_auth_and_expiry_never_rebook() {
         let h = Harness::new(Behavior::Refuse(reason)).await;
         let scratch = Scratch::new();
         let id = Uuid::now_v7();
-        let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+        let storage = Arc::new(test_storage(&scratch.0.join("state")).unwrap());
         storage.create(id, 3, None, None, false).unwrap();
         storage.hosted_route(id, h.route.clone()).unwrap();
         assert_eq!(
@@ -466,27 +467,16 @@ async fn hosted_lost_lease_response_rerequests_and_short_cap_stops_before_upload
         .ends_with("/release"));
 }
 
-#[test]
-fn hosted_salt_persists_private_and_domain_separated_hashes() {
-    use std::os::unix::fs::PermissionsExt;
+#[tokio::test]
+async fn hosted_salt_keeps_domain_separated_hashes_without_a_file() {
     let scratch = Scratch::new();
-    let storage = Storage::open(&scratch.0.join("state")).unwrap();
-    let salt = storage.hosted_salt().unwrap();
+    let storage = test_storage(&scratch.0.join("state")).unwrap();
+    let salt = storage.hosted_salt.get().await.unwrap();
     let ws = keyed_hash(&salt, "ck-ws-v1", scratch.0.to_str().unwrap()).unwrap();
     let repo = keyed_hash(&salt, "ck-repo-v1", scratch.0.to_str().unwrap()).unwrap();
     assert_eq!(ws.len(), 43);
     assert_ne!(ws, repo);
-    assert_eq!(
-        std::fs::metadata(scratch.0.join("state/hosted-salt"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    drop(storage);
-    let storage = Storage::open(&scratch.0.join("state")).unwrap();
-    assert_eq!(storage.hosted_salt().unwrap(), salt);
+    assert!(!scratch.0.join("state/hosted-salt").exists());
     assert_eq!(
         keyed_hash(&salt, "ck-ws-v1", &format!("{}/.", scratch.0.display())).unwrap(),
         ws
@@ -530,8 +520,7 @@ async fn hosted_route_survives_switch_flip_restart_cancel_status_and_attach() {
         runner_instance: "other".into(),
         ..Config::default()
     };
-    let motor =
-        crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     motor.cancel(CancelRequest::new(id)).await.unwrap();
     let t = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
     assert_eq!(t.outcome, Outcome::Exit { code: 23 });
@@ -566,13 +555,12 @@ async fn hosted_quiet_detach_joins_owner_and_host_drop_reconnects_without_auth_c
     let scratch = Scratch::new();
     let id = Uuid::now_v7();
     seed_running(&h, &scratch, None, id).await;
-    Storage::open(&scratch.0.join("state"))
+    test_storage(&scratch.0.join("state"))
         .unwrap()
         .hosted_update(id, |s| s.run_sent = true)
         .unwrap();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let mut lifecycle = h.attach_lifecycle.subscribe();
     let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
     tokio::time::timeout(Duration::from_secs(5), lifecycle.wait_for(|s| s.2 == 1))
@@ -640,14 +628,13 @@ async fn hosted_missing_settlement_retries_with_backoff_and_preserves_real_exit_
     let scratch = Scratch::new();
     let id = Uuid::now_v7();
     seed_running(&h, &scratch, None, id).await;
-    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    let storage = test_storage(&scratch.0.join("state")).unwrap();
     storage
         .hosted_update(id, |state| state.run_sent = true)
         .unwrap();
     drop(storage);
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let mut caller = motor.attach(AttachRequest::new(id, 0)).unwrap();
     let mut lifecycle = h.attach_lifecycle.subscribe();
     let began = tokio::time::Instant::now();
@@ -722,7 +709,7 @@ async fn hosted_finished_without_terminal_is_outcome_unknown() {
     let id = Uuid::now_v7();
     seed_running(&h, &scratch, None, id).await;
     h.finished.store(true, Ordering::SeqCst);
-    let motor = crate::Motor::with_connector(
+    let motor = test_motor(
         h.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -745,8 +732,7 @@ async fn hosted_invalid_requests_refuse_before_snapshot_lease_or_ssh() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = Scratch::new();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     for (request, code) in [
         (
             RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true"),
@@ -788,8 +774,7 @@ async fn hosted_invalid_memory_refuses_before_snapshot_lease_or_ssh() {
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let mut config = h.config();
     config.memory_sizes = true;
-    let motor =
-        crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     for memory in [0, 1025, 4097, 263168, 9_007_199_254_740_992] {
         let mut request =
             RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true")
@@ -825,8 +810,7 @@ async fn memory_switch_and_fixed_platforms_refuse_before_any_contact() {
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
         let mut config = h.config();
         config.memory_sizes = enabled;
-        let motor =
-            crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+        let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let mut request =
             RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true")
                 .with_timeout(30)
@@ -873,7 +857,7 @@ async fn hosted_home_requests_refuse_escaping_symlinks_before_snapshot_or_contac
     std::os::unix::fs::symlink("/", &escape).unwrap();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let state = scratch.0.join("state");
-    let motor = crate::Motor::with_connector(h.config(), &state, ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &state, ssh.clone()).unwrap();
     for field in ["workspace_key", "repository_root", "cwd", "sibling"] {
         let mut request = RunRequest::new("/home/u/repo", "/home/u/repo", "/home/u/repo", "true")
             .with_timeout(60);
@@ -911,7 +895,7 @@ async fn hosted_home_requests_refuse_escaping_symlinks_before_snapshot_or_contac
 async fn hosted_home_and_mixed_siblings_preserve_lease_body_and_spill_policy() {
     let h = Harness::new(Behavior::Normal).await;
     let (scratch, repo) = super::boat_tests::committed_repo();
-    let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.0.join("state")).unwrap());
     for policy in ["fleet", "hosted", "gate", "network", "repository"] {
         for timeout in [7200, 7201] {
             let mut baseline = None;
@@ -968,8 +952,7 @@ async fn return_paths_hosted_limits_refuse_before_lease_and_keep_no_fallback() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = Scratch::new();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     for returns in [
         crate::ReturnOptions {
             return_paths: vec!["/home/missing/out".into()],
@@ -1022,8 +1005,7 @@ async fn return_paths_hosted_failure_is_stored_without_changing_remote_terminal(
     let id = Uuid::now_v7();
     seed_running(&h, &scratch, None, id).await;
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let t = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
     assert_eq!(t.outcome, Outcome::Exit { code: 23 });
     assert_eq!(t.ran, Some(Ran::Remote));
@@ -1103,7 +1085,7 @@ async fn hosted_real_snapshot_lost_run_ack_never_resubmits_and_refusals_release(
         }
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
         let root = scratch.0.join(format!("state-{}", Uuid::now_v7()));
-        let motor = crate::Motor::with_connector(h.config(), &root, ssh.clone()).unwrap();
+        let motor = test_motor(h.config(), &root, ssh.clone()).unwrap();
         let stream = motor
             .run(Harness::request(&repo).with_timeout(120))
             .unwrap();
@@ -1312,8 +1294,7 @@ async fn hosted_job_released_stops_reattaching_without_resubmitting() {
     seed_running(&h, &scratch, None, id).await;
     Client::new(h.route.clone()).release(id).await.unwrap();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
     // The seeded lease never sent Run, so the released booking proves the job
     // never started. A release after Run stays may-have-run; that case is in
@@ -1706,7 +1687,7 @@ async fn stored_legacy_cached_hint_is_replayed_without_changing_the_lease_hash()
     let storage = stored(&scratch, id, route.clone());
     drop(storage);
 
-    let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.0.join("state")).unwrap());
     assert!(storage
         .job(id)
         .unwrap()
@@ -1842,7 +1823,7 @@ async fn stored_stated_memory_survives_restart_and_request_changes() {
         drop(stored(&scratch, id, route));
         // A changed caller request after restart cannot alter a saved lease's identity.
         request.memory_mib = Some(32768);
-        let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+        let storage = Arc::new(test_storage(&scratch.0.join("state")).unwrap());
         let route = storage.job(id).unwrap().hosted.unwrap();
         assert_eq!(
             Client::new(route).run(id, &request, &storage).await.err(),
