@@ -16,6 +16,7 @@ pub(crate) mod residency;
 pub mod storage;
 
 pub(super) const WARM_WORKSPACE_LIMIT: usize = 64;
+const TERMINAL_IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
@@ -194,6 +195,47 @@ pub fn guest_ram_mib(claims: &Claims) -> Option<u64> {
 }
 
 impl Host {
+    pub(super) fn update_job_warm_state(&mut self, next: &super::Snapshot) {
+        if !matches!(self.settings, HostSettings::PerJob(_)) {
+            return;
+        }
+        let has_terminal = |snapshot: &super::Snapshot, job: &str| {
+            snapshot
+                .billing
+                .get(job)
+                .is_some_and(|billing| billing.terminal.is_some() || billing.host_settled)
+        };
+        for job in next.billing.changed_keys() {
+            if next.per_job.executions.get(job).is_some_and(|execution| {
+                next.per_job.disks[&execution.disk_id].attached_job.as_ref() == Some(job)
+            }) && has_terminal(next, job)
+                && !has_terminal(&self.snapshot, job)
+            {
+                self.job_terminal_stored_at
+                    .insert(job.clone(), tokio::time::Instant::now());
+            }
+        }
+        for id in next.per_job.disks.changed_keys() {
+            if let Some(job) = self
+                .snapshot
+                .per_job
+                .disks
+                .get(id)
+                .and_then(|disk| disk.attached_job.as_ref())
+            {
+                if next
+                    .per_job
+                    .disks
+                    .get(id)
+                    .and_then(|disk| disk.attached_job.as_ref())
+                    != Some(job)
+                {
+                    self.job_terminal_stored_at.remove(job);
+                }
+            }
+        }
+    }
+
     pub(crate) fn set_dax_failed(&mut self, failed: bool) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
         next.per_job.dax_failed = failed;
@@ -208,9 +250,17 @@ impl Host {
             .iter()
             .filter(|(_, disk)| !disk.deleted)
             .map(|(id, disk)| {
-                let priority = if disk.attached_job.is_some() {
+                let terminal_idle = disk.attached_job.as_ref().is_some_and(|job| {
+                    self.job_terminal_stored_at
+                        .get(job)
+                        .is_some_and(|stored| stored.elapsed() < TERMINAL_IDLE_WINDOW)
+                        // The attached job stays at the queue head until release.
+                        && disk.queue.iter().all(|queued| queued == job)
+                }) && !disk.quarantined
+                    && disk.recovery.is_none();
+                let priority = if disk.attached_job.is_some() && !terminal_idle {
                     3
-                } else if !disk.queue.is_empty() {
+                } else if !disk.queue.is_empty() && !terminal_idle {
                     2
                 } else if disk.quarantined || disk.recovery.is_some() {
                     1

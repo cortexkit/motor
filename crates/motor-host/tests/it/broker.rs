@@ -132,6 +132,69 @@ fn per_job_heartbeats_use_the_step_sample_time_without_five_second_capacity_flap
     assert_eq!(control.adopts.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn heartbeat_step_publishes_terminal_disk_idle_and_expiry_while_attached() {
+    let mut h = host();
+    h.settings = host_settings()[1].clone();
+    h.enforce_storage();
+    let runtime = Runtime::new("host".into(), h, Arc::new(PerJobHost::default()));
+    let now = NOW * 1000;
+    let mut heartbeats = motor_host::broker::Heartbeats::new(runtime.clone());
+    heartbeats.step(now).unwrap();
+    let id = {
+        let mut h = runtime.host.lock().unwrap();
+        let mut c = claims(JOB);
+        c.mem_mib = 100;
+        c.placement.vm = None;
+        h.claim(c, now).unwrap();
+        h.begin_job_boot_at(JOB, now).unwrap().unwrap().disk_id
+    };
+    heartbeats.step(now + 1).unwrap();
+    let published = || {
+        let h = runtime.host.lock().unwrap();
+        let request = h
+            .snapshot
+            .outbox
+            .iter()
+            .find(|r| r.path.ends_with("/heartbeat"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let warm = body["warm"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["vm"] == id)
+            .unwrap();
+        (request.created_ms, warm["busy"].as_bool().unwrap_or(false))
+    };
+    assert_eq!(published(), (now + 1, true));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .receive_terminal(JOB, terminal(JOB, "exit"), now + 250)
+        .unwrap();
+    heartbeats.step(now + 250).unwrap();
+    assert_eq!(published(), (now + 250, false));
+    heartbeats.step(now + 500).unwrap();
+    assert_eq!(published(), (now + 250, false));
+
+    // Refresh the periodic heartbeat just before expiry, so expiry itself must
+    // publish through the lifecycle-change path, not the fifteen-second timer.
+    tokio::time::advance(std::time::Duration::from_millis(59_999)).await;
+    heartbeats.step(now + 60_249).unwrap();
+    assert_eq!(published(), (now + 60_249, false));
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    heartbeats.step(now + 60_250).unwrap();
+    assert_eq!(published(), (now + 60_250, true));
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.per_job.disks[&id]
+            .attached_job
+            .as_deref(),
+        Some(JOB)
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn per_job_metrics_omit_retained_stopped_shared_tenants() {

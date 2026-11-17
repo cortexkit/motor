@@ -404,8 +404,20 @@ simultaneous claims cannot exceed the limit. The 64th disk can be admitted; at
 permits run out. A job for a disk already attached or queued shares its slot and
 can still queue if the other admission checks pass. Idle cached disks take no
 attachment slot until admitted again.
-Warm heartbeat entries describe workspace disks, busy while attached or
-quarantined; `tenant_disk` is omitted. Recovery and fills consume capacity too.
+Warm heartbeat entries describe workspace disks; `tenant_disk` is omitted. In
+per-job mode, a checkout disk with no waiting successor reads idle as soon as
+its attached job has a stored terminal result, even while the VM is tearing
+down. This lets the checkout's next job be placed on the server that holds its
+warm disk instead of building cold elsewhere. It reads busy again if teardown
+still holds it 60 seconds later. A running job, a waiting successor, quarantine,
+or recovery keeps the disk busy. Admission still queues a new job behind the
+attached VM until the disk is released. The change reaches the broker in the
+next heartbeat, sent as soon as the state changes. Recovery and fills consume
+capacity too.
+
+Tests: `stored_terminal_makes_attached_disk_idle_for_at_most_sixty_seconds`,
+`terminal_disk_still_queues_successor_until_vm_release`, and
+`heartbeat_step_publishes_terminal_disk_idle_and_expiry_while_attached`.
 
 Per-job callers read sequenced job records from the host's replay store. Runner
 heartbeats are forwarded live with their queue timing unchanged; they are not
