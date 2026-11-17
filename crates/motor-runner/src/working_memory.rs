@@ -159,16 +159,23 @@ impl WorkingPeak {
     #[cfg(any(target_os = "linux", test))]
     fn sample(&self, path: &Path) -> WorkingSample {
         use std::io::Read;
+        // A removed cgroup's files fail with ENOENT to open, or with ENODEV when
+        // the directory goes away between open and read. Both mean the job's
+        // cgroup is gone, not that a running job's memory went unmeasured.
+        let gone = |error: &std::io::Error| {
+            error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENODEV)
+        };
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return WorkingSample::Gone;
-            }
+            Err(error) if gone(&error) => return WorkingSample::Gone,
             Err(_) => return WorkingSample::Unreadable,
         };
         let mut text = String::new();
-        if file.read_to_string(&mut text).is_err() {
-            return WorkingSample::Unreadable;
+        match file.read_to_string(&mut text) {
+            Ok(_) => {}
+            Err(error) if gone(&error) => return WorkingSample::Gone,
+            Err(_) => return WorkingSample::Unreadable,
         }
         let Some(bytes) = working_bytes(&text) else {
             return WorkingSample::Unreadable;
@@ -227,7 +234,10 @@ impl WorkingPeak {
                 // join this thread: terminal publication must not wait for it.
                 let sample = peak.sample(&path);
                 let stopped = peak.0.stopped.load(Ordering::Relaxed);
-                if let Some(over) = over.as_ref() {
+                // After stop the job is over, so a failed final read must not
+                // discard an integral that already covers the whole run.
+                let final_read_failed = stopped && sample == WorkingSample::Unreadable;
+                if let Some(over) = over.as_ref().filter(|_| !final_read_failed) {
                     over.sample(
                         sample,
                         stated_mib.unwrap_or(0),
@@ -636,6 +646,47 @@ mod tests {
         resume.send(()).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sampler_keeps_overage_when_only_the_final_read_after_stop_fails() {
+        let scratch = cortexkit_test_support::ScratchDir::new("working-memory-final-read");
+        let path = scratch.path().join("memory.stat");
+        std::fs::write(&path, "anon 3145728\nshmem 0\nkernel 0\n").unwrap();
+        let peak = WorkingPeak::default();
+        let over = OverIntegral::default();
+        let (published, samples) = std::sync::mpsc::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        peak.start_at_path(
+            path.clone(),
+            Some(1),
+            Some(over.clone()),
+            false,
+            move |_, over| {
+                if published.send(over).is_ok() {
+                    let _ = paused.recv();
+                }
+            },
+        );
+        let next = || {
+            samples
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("sampler must publish a reading")
+        };
+        assert_eq!(next(), Some(Some(0)));
+        std::fs::write(&path, "anon 5242880\nshmem 0\nkernel 0\n").unwrap();
+        peak.0.thread.get().unwrap().unpark();
+        resume.send(()).unwrap();
+        let measured = next().unwrap().unwrap();
+        // A directory in place of the file makes the final read unreadable,
+        // not gone; after stop that must not void the run's integral.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        peak.stop();
+        resume.send(()).unwrap();
+        assert_eq!(next(), Some(Some(measured)));
+        assert_eq!(over.get(), Some(measured));
+        resume.send(()).unwrap();
+    }
     #[test]
     fn memory_stat_kernel_variants_exclude_file_cache_and_do_not_double_count() {
         let old = "anon 1048576\nshmem 524288\nkernel_stack 16384\npagetables 32768\npercpu 4096\nslab_unreclaimable 8192\nfile 9999999999\nslab_reclaimable 9999999999\n";
