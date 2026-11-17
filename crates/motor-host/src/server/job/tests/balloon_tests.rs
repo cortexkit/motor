@@ -298,3 +298,53 @@ fn older_helper_disables_controller_without_failing_or_stopping_jobs() {
     assert!(balloons(&fake).is_empty());
     assert!(!stopped(&runtime, JOB));
 }
+
+#[test]
+fn booting_vms_are_not_balloon_targets() {
+    for available in [49, 1000] {
+        let (runtime, fake, _) = fixture();
+        claim(&runtime, &claims(JOB));
+        boot_at(&mut runtime.host.lock().unwrap(), JOB, 100);
+        fake.balloon_supported.store(true, Ordering::Release);
+        fake.resident.lock().unwrap().insert(JOB.into(), 140 * MIB);
+
+        tick(&runtime, 1000, available);
+        assert!(balloons(&fake).is_empty(), "booting VM was ballooned");
+        assert!(fake.resident_reads.lock().unwrap().is_empty());
+
+        runtime.host.lock().unwrap().job_runner_hello(JOB).unwrap();
+        tick(&runtime, 1001, available);
+        assert_eq!(
+            balloons(&fake),
+            vec![(JOB.into(), if available == 49 { 30 } else { 0 })]
+        );
+    }
+}
+
+#[test]
+fn failed_balloon_is_paced_per_vm_and_does_not_block_other_vms() {
+    for available in [49, 1000] {
+        let (runtime, fake, _) = fixture();
+        running(&runtime, &fake, JOB, 100, 150);
+        running(&runtime, &fake, JOB2, 200, 140);
+        fake.fail_balloons.lock().unwrap().insert(JOB.into());
+
+        tick(&runtime, 1000, available);
+        for now in 1001..1100 {
+            tick(&runtime, now, available);
+        }
+        let attempts = balloons(&fake);
+        assert_eq!(attempts.iter().filter(|(job, _)| job == JOB).count(), 1);
+        assert_eq!(attempts.iter().filter(|(job, _)| job == JOB2).count(), 1);
+        assert!(!stopped(&runtime, JOB));
+        assert!(!stopped(&runtime, JOB2));
+
+        fake.fail_balloons.lock().unwrap().clear();
+        tick(&runtime, 6000, 1000);
+        assert_eq!(
+            balloons(&fake).iter().filter(|(job, _)| job == JOB).count(),
+            2,
+            "transient failures must not disable the VM's controller"
+        );
+    }
+}

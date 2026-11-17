@@ -199,7 +199,7 @@ impl Runtime {
     }
 
     /// Lease settlement does not release the helper's durable disk ownership.
-    /// Repeat stop after a host restart, but not on every tick in one process.
+    /// Retry unfinished release after a restart, but not on every tick in one process.
     fn release_job_vm(&self, job: &str) -> Result<()> {
         let mut stopped = self
             .helper_stopped_jobs
@@ -846,6 +846,18 @@ impl Runtime {
             .per_job
             .executions
             .values()
+            // Normal receipt settlement commits ended only after helper stop
+            // succeeds. Do not replay that completed cleanup just because the
+            // process-local stop cache is empty after restart. Older hosts could
+            // end an execution while still awaiting its exit receipt, so preserve
+            // release retries when that wait expired.
+            .filter(|e| {
+                !e.ended
+                    || !e
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|e| e.acknowledged && !e.evidence_expired)
+            })
             .filter(|e| {
                 !e.ended
                     || !self
