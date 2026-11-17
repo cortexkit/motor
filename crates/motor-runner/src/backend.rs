@@ -1654,7 +1654,7 @@ pub(crate) fn job_environment_in(
         // records compare must describe the environment the job really gets.
         crate::isolation::cross_compilers::arm64_windows(
             &mut env,
-            Path::new(crate::isolation::cross_compilers::ROOT),
+            &crate::isolation::cross_compilers::root(),
         );
     }
     Ok(env)

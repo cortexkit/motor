@@ -4301,7 +4301,7 @@ impl Sandbox {
         ] {
             env.insert(key.into(), value);
         }
-        cross_compilers::arm64_windows(&mut env, Path::new(cross_compilers::ROOT));
+        cross_compilers::arm64_windows(&mut env, &cross_compilers::root());
         if pid_init.is_some() {
             pid_init::refuse_loader_environment(env.keys().map(String::as_str))?;
         }

@@ -1,7 +1,29 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 /// Where the job image installs llvm-mingw; absent on images built before it.
-pub(crate) const ROOT: &str = "/usr/local/lib/motor/llvm-mingw";
+#[cfg(not(test))]
+const ROOT: &str = "/usr/local/lib/motor/llvm-mingw";
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own llvm-mingw root. Unset, test builds see none, so pinned
+    /// argv and environment tests don't depend on the job image running them.
+    pub(crate) static TEST_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The llvm-mingw root the job environment and the launch both use.
+pub(crate) fn root() -> PathBuf {
+    #[cfg(test)]
+    return TEST_ROOT
+        .with(|root| root.borrow().clone())
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/motor-test-llvm-mingw"));
+    #[cfg(not(test))]
+    PathBuf::from(ROOT)
+}
 
 pub(crate) fn arm64_windows(env: &mut BTreeMap<String, String>, root: &Path) {
     if !root.is_dir() {

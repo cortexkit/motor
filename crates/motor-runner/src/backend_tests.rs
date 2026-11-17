@@ -202,6 +202,15 @@ fn pre_setup_fingerprint_matches_launched_setenv_in_build_server_and_tenant_vm()
                 for supervisor in [false, true] {
                     let scratch = ScratchDir::new("pre-setup-environment");
                     fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+                    // Half the cases install an llvm-mingw root: its ARM64 Windows
+                    // variables must then be in both the planned and launched environment.
+                    let mingw = remote == supervisor;
+                    let mingw_root = scratch.join("llvm-mingw");
+                    if mingw {
+                        fs::create_dir_all(mingw_root.join("bin")).unwrap();
+                    }
+                    crate::isolation::cross_compilers::TEST_ROOT
+                        .with(|root| *root.borrow_mut() = mingw.then(|| mingw_root.clone()));
                     if supervisor {
                         let source = scratch.join("crates/prefrontal-build-slot/src");
                         fs::create_dir_all(&source).unwrap();
@@ -238,6 +247,7 @@ fn pre_setup_fingerprint_matches_launched_setenv_in_build_server_and_tenant_vm()
                     assert_eq!(before["CARGO_NET_OFFLINE"], "true");
                     assert_eq!(before["CARGO_CUSTOM"], "é=value");
                     assert_eq!(before["RUSTDOCFLAGS"], "");
+                    assert_eq!(before.contains_key("CC_aarch64_pc_windows_gnullvm"), mingw);
                     let wrapper = inputs.wrapper.map(Path::to_path_buf);
                     let arguments = Arc::new(Mutex::new(Vec::new()));
                     let prepared = Prepared {
@@ -265,6 +275,10 @@ fn pre_setup_fingerprint_matches_launched_setenv_in_build_server_and_tenant_vm()
                     }
                     assert!(!launched.is_empty());
                     assert_eq!(launched["CARGO_BUILD_JOBS"], "7");
+                    assert_eq!(
+                        launched.contains_key("CC_aarch64_pc_windows_gnullvm"),
+                        mingw
+                    );
                     assert_eq!(
                         environment_fingerprint(&before),
                         environment_fingerprint(&launched),
