@@ -37,7 +37,7 @@ fn reopen_restores_no_run_records_without_replacing_real_terminals() {
         storage.hosted_route(id, Default::default()).unwrap();
         storage
             .update(|s| {
-                let job = s.jobs.get_mut(&id).unwrap();
+                let job = Arc::make_mut(s.jobs.get_mut(&id).unwrap());
                 let hosted = job.hosted.as_mut().unwrap();
                 hosted.finish_done = !case.starts_with("unsettled");
                 hosted.billing = crate::hosted::BillingStatus::Pending;
@@ -118,10 +118,7 @@ fn reopen_restores_no_run_records_without_replacing_real_terminals() {
                     state.jobs.contains_key(&id),
                     "unsettled booking must survive terminal retention expiry"
                 );
-                state
-                    .jobs
-                    .get_mut(&id)
-                    .unwrap()
+                Arc::make_mut(state.jobs.get_mut(&id).unwrap())
                     .hosted
                     .as_mut()
                     .unwrap()
@@ -151,7 +148,7 @@ fn settlement_terminal_preserves_existing_retention_and_is_idempotent() {
     storage.create(id, 60, None, None, false).unwrap();
     storage.hosted_route(id, Default::default()).unwrap();
     storage
-        .update(|s| s.jobs.get_mut(&id).unwrap().retain_until_ms = Some(u64::MAX))
+        .update(|s| Arc::make_mut(s.jobs.get_mut(&id).unwrap()).retain_until_ms = Some(u64::MAX))
         .unwrap();
     assert!(storage.job(id).unwrap().local_terminal.is_none());
     storage
@@ -184,7 +181,7 @@ fn released_confirmation_rechecks_run_flag_and_excludes_archived_spills() {
         storage.hosted_route(id, Default::default()).unwrap();
         storage
             .update(|s| {
-                let job = s.jobs.get_mut(&id).unwrap();
+                let job = Arc::make_mut(s.jobs.get_mut(&id).unwrap());
                 if case == "run_sent" {
                     job.hosted.as_mut().unwrap().run_sent = true;
                 } else if case == "spill" {

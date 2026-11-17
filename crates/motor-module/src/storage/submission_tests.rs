@@ -33,7 +33,7 @@ fn submission_key_retention_matches_job_and_expired_key_is_unknown() {
     let storage = Storage::open(&root).unwrap();
     assert_eq!(storage.job(id).unwrap().submission, Some(key.clone()));
     storage
-        .update(|state| state.jobs.get_mut(&id).unwrap().retain_until_ms = Some(0))
+        .update(|state| Arc::make_mut(state.jobs.get_mut(&id).unwrap()).retain_until_ms = Some(0))
         .unwrap();
     assert!(storage.job(id).is_none());
     assert!(storage

@@ -65,7 +65,7 @@ struct Delta(BTreeMap<String, BTreeMap<String, Option<Value>>>);
 impl Delta {
     fn between(before: &State, after: &State) -> io::Result<Self> {
         let mut delta = BTreeMap::new();
-        Self::map_changes(&mut delta, "jobs", &before.jobs, &after.jobs)?;
+        Self::map_changes_by(&mut delta, "jobs", &before.jobs, &after.jobs, shared_eq)?;
         Self::map_changes(&mut delta, "snapshots", &before.snapshots, &after.snapshots)?;
         Self::map_changes(
             &mut delta,
@@ -88,10 +88,20 @@ impl Delta {
         before: &BTreeMap<K, V>,
         after: &BTreeMap<K, V>,
     ) -> io::Result<()> {
+        Self::map_changes_by(delta, name, before, after, PartialEq::eq)
+    }
+
+    fn map_changes_by<K: Ord + ToString, V: Serialize>(
+        delta: &mut BTreeMap<String, BTreeMap<String, Option<Value>>>,
+        name: &str,
+        before: &BTreeMap<K, V>,
+        after: &BTreeMap<K, V>,
+        equal: impl Fn(&V, &V) -> bool,
+    ) -> io::Result<()> {
         let mut changes = BTreeMap::new();
         // Compare stored records without allocating JSON trees for unchanged entries.
         for (key, value) in after {
-            if before.get(key) != Some(value) {
+            if !before.get(key).is_some_and(|old| equal(old, value)) {
                 changes.insert(
                     key.to_string(),
                     Some(serde_json::to_value(value).map_err(io::Error::other)?),
@@ -132,6 +142,12 @@ impl Delta {
         }
         Ok(())
     }
+}
+
+fn shared_eq<T: PartialEq>(before: &Arc<T>, after: &Arc<T>) -> bool {
+    // Job's serialized equality omits migration bookkeeping and is not Eq, so
+    // Arc's PartialEq implementation does not skip comparisons for shared jobs.
+    Arc::ptr_eq(before, after) || before == after
 }
 
 #[derive(Serialize, Deserialize)]

@@ -5,10 +5,46 @@ use motor_protocol::{Outcome, Ran, RefusalReason, ReturnResult, TerminalRecord};
 use serde_json::json;
 use std::hint::black_box;
 
+// The checkpoint layout before jobs were shared: serialize owned Job records,
+// not Arc values, so this reference also checks serde's transparent Arc encoding.
+fn owned_checkpoint(state: &State, position: Option<&Position>) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct OwnedState<'a> {
+        jobs: BTreeMap<Uuid, Job>,
+        snapshots: &'a BTreeMap<String, BTreeMap<String, String>>,
+        snapshot_used_at_ms: &'a BTreeMap<String, u64>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        verified_tips: &'a BTreeMap<String, VerifiedTip>,
+    }
+    #[derive(Serialize)]
+    struct Checkpoint<'a> {
+        #[serde(flatten)]
+        state: OwnedState<'a>,
+        #[serde(rename = "_journal", skip_serializing_if = "Option::is_none")]
+        position: Option<&'a Position>,
+    }
+    serde_json::to_vec(&Checkpoint {
+        state: OwnedState {
+            jobs: state
+                .jobs
+                .iter()
+                .map(|(id, job)| (*id, job.as_ref().clone()))
+                .collect(),
+            snapshots: &state.snapshots,
+            snapshot_used_at_ms: &state.snapshot_used_at_ms,
+            verified_tips: &state.verified_tips,
+        },
+        position,
+    })
+    .unwrap()
+}
+
 // Retain the whole-state implementation as an independent compatibility oracle.
 fn whole_state_delta(before: &State, after: &State) -> io::Result<Delta> {
-    let before = serde_json::to_value(before).map_err(io::Error::other)?;
-    let after = serde_json::to_value(after).map_err(io::Error::other)?;
+    let before: Value =
+        serde_json::from_slice(&owned_checkpoint(before, None)).map_err(io::Error::other)?;
+    let after: Value =
+        serde_json::from_slice(&owned_checkpoint(after, None)).map_err(io::Error::other)?;
     let mut delta = BTreeMap::new();
     for name in ["jobs", "snapshots", "snapshot_used_at_ms", "verified_tips"] {
         let empty = serde_json::Map::new();
@@ -33,6 +69,21 @@ fn whole_state_delta(before: &State, after: &State) -> io::Result<Delta> {
 }
 
 fn assert_equivalent(label: &str, before: &State, after: &State) {
+    let position = Position {
+        version: 1,
+        epoch: Uuid::from_u128(1),
+        seq: 42,
+        checkpoint_at_ms: 123,
+    };
+    for state in [before, after] {
+        for position in [None, Some(&position)] {
+            assert_eq!(
+                serialize_snapshot(state, position).unwrap(),
+                owned_checkpoint(state, position),
+                "checkpoint bytes: {label}"
+            );
+        }
+    }
     let expected = whole_state_delta(before, after).unwrap();
     let actual = Delta::between(before, after).unwrap();
     assert_eq!(
@@ -99,17 +150,20 @@ fn typed_delta_matches_whole_state_reference() {
     let id = Uuid::now_v7();
     let mut before = State::default();
     let mut after = before.clone();
-    after.jobs.insert(id, job(id, now));
+    after.jobs.insert(id, Arc::new(job(id, now)));
     assert_equivalent("new job", &before, &after);
 
     before = after.clone();
-    let job = after.jobs.get_mut(&id).unwrap();
+    let job = Arc::make_mut(after.jobs.get_mut(&id).unwrap());
     job.pending_cancel = true;
     job.hosted = Some(crate::HostedJobState::new(&crate::Config::default()));
     assert_equivalent("job update", &before, &after);
 
     before = after.clone();
-    let hosted = after.jobs.get_mut(&id).unwrap().hosted.as_mut().unwrap();
+    let hosted = Arc::make_mut(after.jobs.get_mut(&id).unwrap())
+        .hosted
+        .as_mut()
+        .unwrap();
     hosted.run_sent = true;
     hosted.terminal = Some(terminal(id));
     hosted.pending_finish = Some(crate::hosted::placement::Finish {
@@ -166,13 +220,13 @@ fn typed_delta_matches_whole_state_reference() {
     let expired = Uuid::now_v7();
     before.jobs.insert(
         expired,
-        Job {
+        Arc::new(Job {
             local_terminal: Some(terminal(expired)),
             terminal_observed_at_ms: Some(1),
             terminal_delivered_at_ms: Some(2),
             retain_until_ms: Some(now),
             ..Job::default()
-        },
+        }),
     );
     before.snapshots.insert("expired".into(), BTreeMap::new());
     before.snapshot_used_at_ms.insert("expired".into(), 1);
@@ -183,7 +237,7 @@ fn typed_delta_matches_whole_state_reference() {
     assert_equivalent("retention prune", &before, &after);
 
     before = after.clone();
-    after.jobs.get_mut(&id).unwrap().legacy_shape = true;
+    Arc::make_mut(after.jobs.get_mut(&id).unwrap()).legacy_shape = true;
     after.active_jobs.insert(id, 2);
     assert_equivalent("only skipped in-memory fields changed", &before, &after);
     assert!(Delta::between(&before, &after).unwrap().0.is_empty());
@@ -215,7 +269,7 @@ fn typed_delta_compares_every_serialized_job_field() {
     rich.routed_direct_hosted_max_vcpus = Some(21);
     let baseline = serde_json::to_value(Job::default()).unwrap();
     let mut before = State::default();
-    before.jobs.insert(id, Job::default());
+    before.jobs.insert(id, Arc::new(Job::default()));
     for (field, value) in serde_json::to_value(rich).unwrap().as_object().unwrap() {
         assert_ne!(baseline.get(field), Some(value), "fixture field: {field}");
         let mut changed = baseline.clone();
@@ -267,6 +321,45 @@ fn typed_delta_serializes_only_changed_entries() {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn shared_delta_skips_value_comparison_only_for_identical_pointers() {
+    struct Record(u64, Arc<AtomicU64>);
+    impl PartialEq for Record {
+        fn eq(&self, other: &Self) -> bool {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            self.0 == other.0
+        }
+    }
+    impl Serialize for Record {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_u64(self.0)
+        }
+    }
+    let comparisons = Arc::new(AtomicU64::new(0));
+    let record = |n| Arc::new(Record(n, comparisons.clone()));
+    let before = BTreeMap::from([
+        ("shared", record(1)),
+        ("equal", record(2)),
+        ("updated", record(3)),
+        ("deleted", record(4)),
+    ]);
+    let after = BTreeMap::from([
+        ("shared", before["shared"].clone()),
+        ("equal", record(2)),
+        ("updated", record(5)),
+        ("inserted", record(6)),
+    ]);
+    let mut delta = BTreeMap::new();
+    Delta::map_changes_by(&mut delta, "jobs", &before, &after, shared_eq).unwrap();
+    assert_eq!(comparisons.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        serde_json::to_value(Delta(delta)).unwrap(),
+        json!({
+            "jobs": {"updated": 5, "inserted": 6, "deleted": null}
+        })
+    );
+}
+
 fn fleet_state() -> State {
     let now = 2 * RETENTION_MS;
     let mut state = State::default();
@@ -277,7 +370,7 @@ fn fleet_state() -> State {
         if n % 5 == 0 {
             job.hosted = Some(crate::HostedJobState::new(&crate::Config::default()));
         }
-        state.jobs.insert(id, job);
+        state.jobs.insert(id, Arc::new(job));
     }
     for n in 0..607 {
         let key = format!("workspace-{n}");
@@ -307,7 +400,7 @@ fn append_timings_with_8000_jobs() {
     const ITERATIONS: u32 = 40;
     let before = fleet_state();
     let mut after = before.clone();
-    after.jobs.values_mut().next().unwrap().pending_cancel = true;
+    Arc::make_mut(after.jobs.values_mut().next().unwrap()).pending_cancel = true;
     assert_equivalent("fleet single-job update", &before, &after);
     for noop in [false, true] {
         let old_root = ScratchDir::new("motor-delta-old-timing");

@@ -1,4 +1,5 @@
 use super::{io, Storage, Uuid, NO_HOST_FITS};
+use std::sync::Arc;
 
 pub(crate) enum DirectRoute {
     SpillReturn {
@@ -14,7 +15,7 @@ pub(crate) enum DirectRoute {
 /// exercise the shipped compatibility readers, not the retired routing policy.
 pub(crate) fn seed_direct_route(storage: &Storage, id: Uuid, route: DirectRoute) -> io::Result<()> {
     storage.update(|state| {
-        let job = state.jobs.get_mut(&id).expect("legacy fixture job exists");
+        let job = Arc::make_mut(state.jobs.get_mut(&id).expect("legacy fixture job exists"));
         match route {
             DirectRoute::SpillReturn {
                 runner_job_id,
