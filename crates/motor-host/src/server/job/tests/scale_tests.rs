@@ -238,6 +238,49 @@ fn scratch() -> tempfile::TempDir {
     tempfile::tempdir_in(root).unwrap()
 }
 
+#[test]
+fn restart_does_not_stop_a_thousand_settled_executions() {
+    let storage = Storage::new();
+    let mut host = retained_host(storage.root.path(), 1000);
+    let settings = host.settings.clone();
+    let mut snapshot = host.snapshot.clone();
+    snapshot.per_job.executions.remove(LIVE);
+    snapshot.leases.remove(LIVE);
+    snapshot.billing.remove(LIVE);
+    host.save(snapshot).unwrap();
+    drop(host);
+
+    let (journal, snapshot) = crate::store::SqliteJournal::open(storage.root.path()).unwrap();
+    assert_eq!(snapshot.per_job.executions.len(), 1000);
+    assert!(snapshot.per_job.executions.values().all(|e| {
+        e.ended
+            && e.evidence
+                .as_ref()
+                .is_some_and(|v| v.exit.is_some() && v.acknowledged)
+            && e.replay_completion == Some(crate::state::jobs::storage::ReplayCompletion::Terminal)
+            && snapshot.billing[&e.claims.jti].terminal.is_some()
+    }));
+    let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
+    host.settings = settings;
+    let fake = Arc::new(Fake::default());
+    let runtime = Runtime::with_job_resources("host".into(), host, fake.clone(), storage);
+    runtime.recover().unwrap();
+
+    let calls = fake.calls.lock().unwrap().clone();
+    let stops = calls
+        .iter()
+        .filter(|call| call.starts_with("stop:"))
+        .count();
+    let polls = fake.exit_polls.load(Ordering::SeqCst);
+    println!("startup: 1000 settled executions, {stops} stop_job requests, {polls} exit polls");
+    assert_eq!(stops, 0, "settled executions must not cause helper stops");
+    assert!(calls.is_empty(), "unexpected helper requests: {calls:?}");
+    assert_eq!(polls, 1, "startup needs only one global exit poll");
+
+    runtime.tick_jobs(unix_ms()).unwrap();
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
 /// The relay's per-frame save: one lease's highest sequence number.
 fn watermark_cost(host: &mut Host, seq: u64) -> Cost {
     let (result, cost) = measure(|| host.watermark(LIVE, seq));

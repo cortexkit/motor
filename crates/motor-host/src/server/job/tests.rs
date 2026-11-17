@@ -113,6 +113,7 @@ struct Fake {
     resident_reads: Mutex<Vec<String>>,
     resident_host: Mutex<Option<std::sync::Weak<Mutex<Host>>>>,
     balloons: Mutex<Vec<(String, u64)>>,
+    fail_balloons: Mutex<BTreeSet<String>>,
     scripted: Mutex<std::collections::VecDeque<UnixStream>>,
     recovery_reply: Mutex<Option<Value>>,
     init_reply: Mutex<Option<Value>>,
@@ -313,6 +314,10 @@ impl Control for Fake {
             .lock()
             .unwrap()
             .push((job.to_owned(), amount_mib));
+        ensure!(
+            !self.fail_balloons.lock().unwrap().contains(job),
+            "Firecracker balloon PATCH failed"
+        );
         Ok(())
     }
     fn job_exits(&self) -> Result<Vec<motor_vm_helper::job::ExitReport>> {

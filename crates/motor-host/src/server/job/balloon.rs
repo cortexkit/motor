@@ -3,11 +3,13 @@ use crate::config::{HostSettings, PerJobSettings};
 use crate::state::jobs::memory_limit_mib;
 
 const MIB: u64 = 1024 * 1024;
+const RETRY_AFTER_FAILURE_MS: u64 = 5000;
 
 #[derive(Default)]
 pub(crate) struct Controller {
     pending: Option<(String, u64)>,
     targets: BTreeMap<String, u64>,
+    retry_after_ms: BTreeMap<String, u64>,
     disabled: bool,
     warned: bool,
     after_stop_sample_ms: Option<u64>,
@@ -54,6 +56,7 @@ impl Runtime {
                 .values()
                 .filter(|e| {
                     e.boot_started
+                        && e.runner_hello
                         && !e.ended
                         && e.evidence.as_ref().is_none_or(|v| {
                             v.stop.is_none() && v.exit.is_none() && v.gone_at_ms.is_none()
@@ -73,6 +76,20 @@ impl Runtime {
         controller
             .targets
             .retain(|job, _| executions.iter().any(|e| &e.claims.jti == job));
+        controller
+            .retry_after_ms
+            .retain(|job, _| executions.iter().any(|e| &e.claims.jti == job));
+        // A VM can exit between the lifecycle scan and the PATCH. Pace failures
+        // per VM so a stale candidate cannot hammer the helper or starve others.
+        let executions: Vec<_> = executions
+            .into_iter()
+            .filter(|e| {
+                controller
+                    .retry_after_ms
+                    .get(&e.claims.jti)
+                    .is_none_or(|after| now_ms >= *after)
+            })
+            .collect();
         if !sample.memory_pressure(settings.host_reserve_mib) {
             // Ending an episode does not deflate until the hysteresis is crossed.
             controller.pending = None;
@@ -81,8 +98,7 @@ impl Runtime {
                     let job = &execution.claims.jti;
                     // Also reset balloons inherited across a motor-host restart.
                     if controller.targets.get(job) != Some(&0) {
-                        self.control.balloon_job(job, 0)?;
-                        controller.targets.insert(job.clone(), 0);
+                        self.set_job_balloon(controller, job, 0, now_ms)?;
                     }
                 }
             }
@@ -124,8 +140,7 @@ impl Runtime {
                 .saturating_add(victim.overage_bytes.div_ceil(MIB))
                 .min(victim.maximum_target_mib);
             if target != previous {
-                self.control.balloon_job(&victim.job, target)?;
-                controller.targets.insert(victim.job.clone(), target);
+                self.set_job_balloon(controller, &victim.job, target, now_ms)?;
             }
             // At the guest floor there may be nothing more to inflate. The
             // reclaim deadline still bounds how long a positive overage lives.
@@ -136,6 +151,25 @@ impl Runtime {
         }
         // No positive overage is never a reason to stop an innocent VM. While
         // either memory floor is breached, admission already returns 0.
+        Ok(())
+    }
+
+    fn set_job_balloon(
+        &self,
+        controller: &mut Controller,
+        job: &str,
+        target: u64,
+        now_ms: u64,
+    ) -> Result<()> {
+        if let Err(error) = self.control.balloon_job(job, target) {
+            controller.retry_after_ms.insert(
+                job.to_owned(),
+                now_ms.saturating_add(RETRY_AFTER_FAILURE_MS),
+            );
+            return Err(error);
+        }
+        controller.retry_after_ms.remove(job);
+        controller.targets.insert(job.to_owned(), target);
         Ok(())
     }
 }

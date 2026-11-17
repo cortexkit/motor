@@ -278,7 +278,15 @@ impl Helper {
         let routine = boot_retry
             || matches!(
                 request["op"].as_str(),
-                Some("adopt_job" | "job_exits" | "workspace_usage")
+                Some(
+                    "adopt_job"
+                        | "job_exits"
+                        | "workspace_usage"
+                        | "stop_job"
+                        | "job_memory"
+                        | "open_job_relay"
+                        | "balloon_job"
+                )
             );
         if routine {
             tracing::debug!(op = %request["op"], tenant = %request["tenant"], vcpus = %request["vcpus"], port = %request["port"], reply_timeout_ms = deadline.as_millis() as u64, "helper_request");
@@ -1158,9 +1166,20 @@ mod helper_deadline_tests {
             vcpu_ceiling: BTreeMap::new(),
             pressure_cgroups: BTreeMap::new(),
         };
+        let operations = [
+            ("adopt_job", false, "DEBUG"),
+            ("job_exits", false, "DEBUG"),
+            ("workspace_usage", false, "DEBUG"),
+            ("open_job_relay", true, "DEBUG"),
+            ("stop_job", false, "DEBUG"),
+            ("job_memory", false, "DEBUG"),
+            ("open_job_relay", false, "DEBUG"),
+            ("balloon_job", false, "DEBUG"),
+            ("start_job", false, "INFO"),
+        ];
         let listener = std::os::unix::net::UnixListener::bind(&helper.socket).unwrap();
         let worker = std::thread::spawn(move || {
-            for _ in 0..5 {
+            for _ in 0..operations.len() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -1169,13 +1188,7 @@ mod helper_deadline_tests {
                 stream.write_all(REPLY).unwrap();
             }
         });
-        for (op, boot_retry, level) in [
-            ("adopt_job", false, "DEBUG"),
-            ("job_exits", false, "DEBUG"),
-            ("workspace_usage", false, "DEBUG"),
-            ("open_job_relay", true, "DEBUG"),
-            ("stop_job", false, "INFO"),
-        ] {
+        for (op, boot_retry, level) in operations {
             let logs = crate::test_logs::capture(|| {
                 helper.request_logged(json!({"op":op}), boot_retry).unwrap();
             });
