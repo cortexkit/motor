@@ -26,6 +26,60 @@ use std::{
 };
 use uuid::Uuid;
 
+// Boots on a busy host with a USB state disk can take up to about three minutes.
+const BOOT_HELLO_TIMEOUT: Duration = Duration::from_secs(300);
+
+struct SetupPhase {
+    job_id: Uuid,
+    name: &'static str,
+    started: Instant,
+    success: bool,
+}
+
+impl SetupPhase {
+    fn new(job_id: Uuid, name: &'static str) -> Self {
+        Self {
+            job_id,
+            name,
+            started: Instant::now(),
+            success: false,
+        }
+    }
+
+    fn step<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        operation().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "macOS setup phase {} failed after {} ms: {error}",
+                    self.name,
+                    self.started.elapsed().as_millis()
+                ),
+            )
+        })
+    }
+
+    fn run<T>(mut self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let result = self.step(operation);
+        self.success = result.is_ok();
+        result
+    }
+}
+
+impl Drop for SetupPhase {
+    fn drop(&mut self) {
+        tracing::info!(job_id = %self.job_id, phase = self.name,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            success = self.success, "macOS setup phase finished");
+    }
+}
+
+// Carry the boot timer across helper launch and the I/O worker handoff.
+struct VmBoot {
+    nonce: String,
+    phase: SetupPhase,
+}
+
 pub(crate) struct MacosBackend;
 impl Backend for MacosBackend {
     fn validate(&self, _config: &Config) -> io::Result<()> {
@@ -126,97 +180,105 @@ fn prepare(
     entry: Arc<Entry>,
 ) -> io::Result<Prepared> {
     let runtime = &config.macos_runtime;
-    runtime.workspace(&config.state_root, &entry)?;
-    entry.check()?;
-    let staging = lifecycle::staging(config, trees.mirrors.clone())?;
-    let staged = staging.prepare(&setup.request, entry.cancel.clone())?;
-    // Prep never owns a VM slot. Both capacity observations and taking a slot
-    // happen under the admission lock, after publication of the job's inputs.
-    while !runtime.admit(&config.state_root, &entry)? {
+    let (staged, staging, mtimes) = SetupPhase::new(setup.id, "workspace_staging").run(|| {
+        runtime.workspace(&config.state_root, &entry)?;
         entry.check()?;
-        std::thread::park_timeout(Duration::from_millis(10));
-    }
-    target_in(&staged)?;
-    log_staged_target(setup.id, &staged.workspace.join("target"));
-    entry.check()?;
-    let selected = super::source_seal::plan(
-        staged.source_files.clone(),
-        &super::source_seal::returns(&setup.request)?,
-    )?;
-    // Aliases share the canonical host directory, so timestamp each staged tree
-    // only once; both guest mounts observe the same source mtimes.
-    let mut source_trees = Vec::new();
-    for (destination, repository, commit) in std::iter::once((
-        &setup.request.workspace_key,
-        &setup.request.repository_root,
-        &setup.request.snapshot_commit,
-    ))
-    .chain(
-        setup
-            .request
-            .siblings
-            .iter()
-            .map(|s| (&s.canonical_path, &s.canonical_path, &s.commit)),
-    ) {
-        source_trees.push(crate::source_mtimes::Tree {
-            destination: destination.clone(),
-            prefix: super::mapped(destination)?.to_path_buf(),
-            entries: crate::workspace::snapshot_tree(&trees.mirror(repository), commit)?,
-        });
-    }
-    let (store, history) = timestamp_paths(config, &entry);
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    let (mtimes, times) = super::source_seal::prepare_times(
-        &source_trees,
-        &staged.tree,
-        &store,
-        &history,
-        &setup.request.workspace_key,
-        &selected,
-        std::time::SystemTime::now(),
-    )?;
-    super::source_seal::apply_times(&staged.tree, &times)?;
-    super::source_seal::seal(
-        &super::source_seal::path(&config.state_root, setup.id),
-        &staged.workspace,
-        &selected.files,
-    )?;
-    runtime.record_sealed(&config.state_root, &entry, &selected)?;
-    let vm = config
-        .macos
-        .as_ref()
-        .ok_or_else(|| invalid("missing macOS VM config"))?;
-    let paths = entry.owned.lock().unwrap().record.paths.clone();
-    motor_macvm::clone_image(&vm.image, &paths.clone)?;
-    build_disk_in(config, &entry)?;
-    let nonce = Uuid::now_v7().simple().to_string();
-    let share = |host: &Path, tag: String, guest: String| ShareLocation {
-        host: host.to_path_buf(),
-        tag,
-        guest: guest.into(),
-    };
-    let job = JobVmConfig::new(JobVmRequest {
-        clone: paths.clone.clone(),
-        nonce_disk: paths.nonce.clone(),
-        workspace: share(
+        let staging = lifecycle::staging(config, trees.mirrors.clone())?;
+        let staged = staging.prepare(&setup.request, entry.cancel.clone())?;
+        // Prep never owns a VM slot. Both capacity observations and taking a slot
+        // happen under the admission lock, after publication of the job's inputs.
+        while !runtime.admit(&config.state_root, &entry)? {
+            entry.check()?;
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+        target_in(&staged)?;
+        log_staged_target(setup.id, &staged.workspace.join("target"));
+        entry.check()?;
+        let selected = super::source_seal::plan(
+            staged.source_files.clone(),
+            &super::source_seal::returns(&setup.request)?,
+        )?;
+        // Aliases share the canonical host directory, so timestamp each staged tree
+        // only once; both guest mounts observe the same source mtimes.
+        let mut source_trees = Vec::new();
+        for (destination, repository, commit) in std::iter::once((
+            &setup.request.workspace_key,
+            &setup.request.repository_root,
+            &setup.request.snapshot_commit,
+        ))
+        .chain(
+            setup
+                .request
+                .siblings
+                .iter()
+                .map(|s| (&s.canonical_path, &s.canonical_path, &s.commit)),
+        ) {
+            source_trees.push(crate::source_mtimes::Tree {
+                destination: destination.clone(),
+                prefix: super::mapped(destination)?.to_path_buf(),
+                entries: crate::workspace::snapshot_tree(&trees.mirror(repository), commit)?,
+            });
+        }
+        let (store, history) = timestamp_paths(config, &entry);
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        let (mtimes, times) = super::source_seal::prepare_times(
+            &source_trees,
+            &staged.tree,
+            &store,
+            &history,
+            &setup.request.workspace_key,
+            &selected,
+            std::time::SystemTime::now(),
+        )?;
+        super::source_seal::apply_times(&staged.tree, &times)?;
+        super::source_seal::seal(
+            &super::source_seal::path(&config.state_root, setup.id),
             &staged.workspace,
-            "workspace".into(),
-            setup.request.workspace_key.clone(),
-        ),
-        siblings: sibling_shares(&setup.request.workspace_key, &staged)?,
-        cargo_home: share(
-            &staged.cargo_home,
-            "cargo-home".into(),
-            motor_macvm::CARGO_HOME.into(),
-        ),
+            &selected.files,
+        )?;
+        runtime.record_sealed(&config.state_root, &entry, &selected)?;
+        Ok((staged, staging, mtimes))
     })?;
-    motor_macvm::create_job_nonce_disk(
-        &paths.nonce,
-        &nonce,
-        &job.mounts(),
-        &build_config(&setup.request)?,
-    )?;
-    {
+    let (nonce, job) = SetupPhase::new(setup.id, "disk_preparation").run(|| {
+        let vm = config
+            .macos
+            .as_ref()
+            .ok_or_else(|| invalid("missing macOS VM config"))?;
+        let paths = entry.owned.lock().unwrap().record.paths.clone();
+        motor_macvm::clone_image(&vm.image, &paths.clone)?;
+        build_disk_in(config, &entry)?;
+        let nonce = Uuid::now_v7().simple().to_string();
+        let share = |host: &Path, tag: String, guest: String| ShareLocation {
+            host: host.to_path_buf(),
+            tag,
+            guest: guest.into(),
+        };
+        let job = JobVmConfig::new(JobVmRequest {
+            clone: paths.clone.clone(),
+            nonce_disk: paths.nonce.clone(),
+            workspace: share(
+                &staged.workspace,
+                "workspace".into(),
+                setup.request.workspace_key.clone(),
+            ),
+            siblings: sibling_shares(&setup.request.workspace_key, &staged)?,
+            cargo_home: share(
+                &staged.cargo_home,
+                "cargo-home".into(),
+                motor_macvm::CARGO_HOME.into(),
+            ),
+        })?;
+        motor_macvm::create_job_nonce_disk(
+            &paths.nonce,
+            &nonce,
+            &job.mounts(),
+            &build_config(&setup.request)?,
+        )?;
+        Ok((nonce, job))
+    })?;
+    let boot = SetupPhase::new(setup.id, "vm_boot_service_report");
+    boot.step(|| {
+        let vm = config.macos.as_ref().unwrap();
         let mut owned = entry.owned.lock().unwrap();
         let helper = motor_macvm::spawn_job_helper(
             &vm.helper,
@@ -244,9 +306,19 @@ fn prepare(
             Runtime::save(&config.state_root, &owned.record)?;
             owned.helper.as_mut().unwrap().open_gate()?;
         }
-    }
+        #[allow(unreachable_code)]
+        Ok(())
+    })?;
     #[allow(unreachable_code)]
-    start_io(config, setup, entry, nonce, staged, staging, mtimes)
+    start_io(
+        config,
+        setup,
+        entry,
+        VmBoot { nonce, phase: boot },
+        staged,
+        staging,
+        mtimes,
+    )
 }
 
 fn sibling_shares(workspace: &str, staged: &Staged) -> io::Result<Vec<ShareLocation>> {
@@ -643,11 +715,13 @@ fn start_io(
     config: &Config,
     setup: &Setup,
     entry: Arc<Entry>,
-    nonce: String,
+    boot: VmBoot,
     staged: Staged,
     staging: super::Staging,
     mtimes: crate::source_mtimes::Record,
 ) -> io::Result<Prepared> {
+    let VmBoot { nonce, phase: boot } = boot;
+    let job_id = setup.id;
     let config = config.clone();
     let request = setup.request.clone();
     let scan_request = request.clone();
@@ -662,47 +736,36 @@ fn start_io(
         .name(format!("macos-{}", setup.id))
         .spawn(move || {
             let result = (|| {
-                let (socket, mut reports) = {
-                    let owned = thread_entry.owned.lock().unwrap();
-                    let helper = owned
-                        .helper
-                        .as_ref()
-                        .ok_or_else(|| invalid("missing VM helper"))?;
-                    use std::os::fd::FromRawFd;
-                    let fd = unsafe {
-                        libc::fcntl(helper.reports.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5)
+                let (socket, mut reports, deadline) = boot.run(|| {
+                    let (socket, mut reports) = {
+                        let owned = thread_entry.owned.lock().unwrap();
+                        let helper = owned
+                            .helper
+                            .as_ref()
+                            .ok_or_else(|| invalid("missing VM helper"))?;
+                        use std::os::fd::FromRawFd;
+                        let fd = unsafe {
+                            libc::fcntl(helper.reports.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5)
+                        };
+                        if fd < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        (helper.session.try_clone()?, unsafe {
+                            std::fs::File::from_raw_fd(fd)
+                        })
                     };
-                    if fd < 0 {
+                    socket.set_nonblocking(true)?;
+                    let fd = reports.as_raw_fd();
+                    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    (helper.session.try_clone()?, unsafe {
-                        std::fs::File::from_raw_fd(fd)
-                    })
-                };
-                socket.set_nonblocking(true)?;
-                let fd = reports.as_raw_fd();
-                if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let deadline = Instant::now() + Duration::from_secs(120);
-                service_report(&config, &thread_entry, &mut reports, deadline)?;
-                let mut acceptor = motor_macvm::SessionAcceptor::new(
-                    nonce.clone(),
-                    config.macos.as_ref().unwrap().image.display().to_string(),
+                    let deadline = Instant::now() + BOOT_HELLO_TIMEOUT;
+                    service_report(&config, &thread_entry, &mut reports, deadline)?;
+                    Ok((socket, reports, deadline))
+                })?;
+                let mut transport = agent_hello(
+                    &config, &thread_entry, nonce, socket, &mut reports, deadline,
                 )?;
-                acceptor.claim()?;
-                let mut transport = Transport {
-                    socket,
-                    input: Vec::new(),
-                    protocol: Protocol::with_profile(Profile::Macos, nonce)?,
-                    entry: thread_entry.clone(),
-                    deadline: Some(deadline),
-                    acceptor: Some(acceptor),
-                };
-                if let Err(error) = transport.receive() {
-                    return Err(hello_error(&mut reports, &thread_entry, &config, error));
-                }
-                transport.deadline = None;
                 ready_tx
                     .send(Ok(()))
                     .map_err(|_| invalid("macOS setup abandoned"))?;
@@ -711,24 +774,27 @@ fn start_io(
                 }
                 // The agent finds, formats if needed, and mounts the build disk
                 // before it reports Started.
-                transport.deadline = Some(Instant::now() + Duration::from_secs(120));
-                transport.send(&Frame::TreeEnd {
-                    command: motor_winagent::Command {
-                        command: request.command,
-                        cwd: request.cwd,
-                        workspace: request.workspace_key,
-                        source_commit: request.snapshot_commit,
-                        env: request
-                            .env
-                            .into_iter()
-                            .filter(|(key, _)| crate::allowed_env(key))
-                            .collect(),
-                    },
+                SetupPhase::new(job_id, "tree_end_to_started").run(|| {
+                    transport.deadline = Some(Instant::now() + Duration::from_secs(120));
+                    transport.send(&Frame::TreeEnd {
+                        command: motor_winagent::Command {
+                            command: request.command,
+                            cwd: request.cwd,
+                            workspace: request.workspace_key,
+                            source_commit: request.snapshot_commit,
+                            env: request
+                                .env
+                                .into_iter()
+                                .filter(|(key, _)| crate::allowed_env(key))
+                                .collect(),
+                        },
+                    })?;
+                    if !matches!(transport.receive()?, Frame::Started {}) {
+                        return Err(invalid("expected macOS Started"));
+                    }
+                    transport.deadline = None;
+                    Ok(())
                 })?;
-                if !matches!(transport.receive()?, Frame::Started {}) {
-                    return Err(invalid("expected macOS Started"));
-                }
-                transport.deadline = None;
                 run_output(&mut transport, &stdout_tx, &stderr_tx)
             })();
             if let Err(error) = &result {
@@ -954,6 +1020,37 @@ fn exit_status(code: u32) -> io::Result<std::process::ExitStatus> {
         return Err(invalid("invalid POSIX exit status"));
     }
     Ok(std::process::ExitStatus::from_raw((code as i32) << 8))
+}
+
+fn agent_hello(
+    config: &Config,
+    entry: &Arc<Entry>,
+    nonce: String,
+    socket: UnixStream,
+    reports: &mut impl Read,
+    deadline: Instant,
+) -> io::Result<Transport> {
+    let job_id = entry.owned.lock().unwrap().record.id;
+    SetupPhase::new(job_id, "service_report_to_hello").run(|| {
+        let mut acceptor = motor_macvm::SessionAcceptor::new(
+            nonce.clone(),
+            config.macos.as_ref().unwrap().image.display().to_string(),
+        )?;
+        acceptor.claim()?;
+        let mut transport = Transport {
+            socket,
+            input: Vec::new(),
+            protocol: Protocol::with_profile(Profile::Macos, nonce)?,
+            entry: entry.clone(),
+            deadline: Some(deadline),
+            acceptor: Some(acceptor),
+        };
+        if let Err(error) = transport.receive() {
+            return Err(hello_error(reports, entry, config, error));
+        }
+        transport.deadline = None;
+        Ok(transport)
+    })
 }
 
 fn service_report(

@@ -107,6 +107,92 @@ impl Write for LogBytes {
         Ok(())
     }
 }
+
+#[test]
+fn boot_and_hello_share_a_five_minute_deadline() {
+    assert_eq!(BOOT_HELLO_TIMEOUT, Duration::from_secs(300));
+}
+
+#[test]
+fn setup_phases_log_one_timed_line_for_success_or_failure_without_paths() {
+    let job_id = Uuid::now_v7();
+    let logs = LogBytes::default();
+    let phases = [
+        "workspace_staging",
+        "disk_preparation",
+        "vm_boot_service_report",
+        "service_report_to_hello",
+        "tree_end_to_started",
+    ];
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || {
+            for phase in phases {
+                SetupPhase::new(job_id, phase).run(|| Ok(())).unwrap();
+                let error = SetupPhase::new(job_id, phase)
+                    .run(|| Err::<(), _>(io::Error::other("/secret/path")))
+                    .unwrap_err();
+                assert!(error.to_string().contains(phase), "{error}");
+            }
+        },
+    );
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<_> = output.lines().collect();
+    assert_eq!(lines.len(), phases.len() * 2, "{output}");
+    for (pair, phase) in lines.as_chunks::<2>().0.iter().zip(phases) {
+        for line in pair {
+            assert!(line.contains(" INFO "), "{line}");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(line.contains(&format!("phase={phase}")), "{line}");
+            assert!(line.contains("elapsed_ms="), "{line}");
+            assert!(line.contains("macOS setup phase finished"), "{line}");
+        }
+        assert!(pair[0].contains("success=true"), "{}", pair[0]);
+        assert!(pair[1].contains("success=false"), "{}", pair[1]);
+    }
+    assert!(!output.contains("/secret/path"), "{output}");
+}
+
+#[test]
+fn hello_timeout_refusal_names_its_phase_and_elapsed_time() {
+    let scratch = ScratchDir::new("macos-hello-timeout-phase");
+    let (transport, _peer) = transport(&scratch.join("state"), false);
+    let mut config = Config::new(scratch.join("state"), "macos");
+    let tool = super::super::Tool {
+        path: "/unused".into(),
+        sha256: String::new(),
+    };
+    config.macos = Some(Arc::new(lifecycle::VmConfig {
+        image: "/sealed-image".into(),
+        helper: "/unused".into(),
+        tools: super::super::Tools {
+            cargo: tool.clone(),
+            rustc: tool.clone(),
+            bun: tool.clone(),
+            git: tool,
+        },
+        toolchain_version: "sealed".into(),
+        hold_window: None,
+    }));
+    let error = agent_hello(
+        &config,
+        &transport.entry,
+        NONCE.into(),
+        transport.socket,
+        &mut io::empty(),
+        Instant::now(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("service_report_to_hello"), "{error}");
+    assert!(
+        error.contains("failed after ") && error.contains(" ms:"),
+        "{error}"
+    );
+    assert!(error.contains("macOS agent timed out"), "{error}");
+}
+
 #[test]
 fn agent_reason_for_a_missing_exit_is_logged_with_the_job_id() {
     let scratch = ScratchDir::new("macos-agent-reason");
