@@ -117,6 +117,10 @@ header with invalid nonce bytes is an error. The raw and corresponding block
 devices must not be readable by `motorjob`; the image must give that account an
 unprivileged primary group, with no disk-access groups.
 
+VM boot and the agent's first Hello share a 300-second limit; exceeding it
+refuses the job with `workspace_setup_failed` and names the setup phase that
+timed out. The job never ran, so resubmitting it is safe.
+
 The root agent connects to `VMADDR_CID_HOST` (2), vsock port **5000**, and sends
 `Hello { version: 3, nonce }`. The host must already be listening. It accepts
 one session, authenticates the nonce and refuses further connections. The wire
