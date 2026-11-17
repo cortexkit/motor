@@ -400,7 +400,7 @@ async fn vault_refusal_details_distinguish_old_attestation_limit_and_mismatch() 
         (
             "mismatch",
             "hosted_vault_mismatch",
-            "the vault hosted salt did not match",
+            "the placement key read back from the vault did not match",
             RefusalReason::Unreachable,
         ),
     ] {

@@ -537,7 +537,7 @@ impl Error {
                     "the vault didn't accept ck-motor as its own module"
                 }
                 crate::hosted_salt::Failure::Mismatch => {
-                    "the vault hosted salt did not match the stored value"
+                    "the placement key read back from the vault did not match the one written"
                 }
             };
             format!("{}: {detail}", self.code())
