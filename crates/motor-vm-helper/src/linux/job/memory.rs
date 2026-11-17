@@ -92,7 +92,7 @@ impl LinuxJobs {
             return Err(Error("balloon target exceeds guest RAM".into()));
         }
         let process = self.memory_process(record)?;
-        // One absolute deadline covers connect, request and status line, so no
+        // One absolute deadline covers connect, request and response, so no
         // API peer state can hold this request thread without a bound.
         let deadline = std::time::Instant::now() + API_DEADLINE;
         let mut stream = api_socket(&self.root(id), record.uid, deadline)?;
@@ -143,7 +143,8 @@ fn patch_balloon(
     let body = json!({"amount_mib":amount_mib}).to_string();
     stream.set_write_timeout(Some(remaining(deadline)?))?;
     write!(stream, "PATCH /balloon HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
-    let mut reader = BufReader::new(stream);
+    // Do not prefetch body bytes past the limit while reading the status or headers.
+    let mut reader = BufReader::with_capacity(1, stream);
     let mut status = String::new();
     while !status.ends_with('\n') {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -157,10 +158,71 @@ fn patch_balloon(
         reader.read_exact(&mut byte)?;
         status.push(byte[0] as char);
     }
-    if status.split_whitespace().nth(1) != Some("204") {
-        return Err(Error("Firecracker balloon PATCH failed".into()));
+    let code = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
+    if code == Some(204) {
+        return Ok(());
     }
-    Ok(())
+    let status = code.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+    let detail =
+        read_balloon_fault(&mut reader, deadline).unwrap_or_else(|reason| reason.to_owned());
+    Err(Error(format!(
+        "Firecracker balloon PATCH failed: amount_mib={amount_mib} status={status}: {detail}"
+    )))
+}
+
+fn read_balloon_fault(
+    reader: &mut BufReader<&mut UnixStream>,
+    deadline: std::time::Instant,
+) -> std::result::Result<String, &'static str> {
+    // Bound headers separately so an invalid peer cannot consume unbounded memory.
+    let mut headers = b"\r\n".to_vec();
+    while !headers.ends_with(b"\r\n\r\n") {
+        if headers.len() >= 4098 {
+            return Err("could not read response headers");
+        }
+        reader
+            .get_ref()
+            .set_read_timeout(Some(
+                remaining(deadline).map_err(|_| "could not read response headers")?,
+            ))
+            .map_err(|_| "could not read response headers")?;
+        let mut byte = [0];
+        reader
+            .read_exact(&mut byte)
+            .map_err(|_| "could not read response headers")?;
+        headers.push(byte[0]);
+    }
+    let mut body = Vec::new();
+    while body.len() < 4096 {
+        reader
+            .get_ref()
+            .set_read_timeout(Some(
+                remaining(deadline).map_err(|_| "could not read response body")?,
+            ))
+            .map_err(|_| "could not read response body")?;
+        let mut buffer = [0; 4096];
+        let count = reader
+            .read(&mut buffer[..4096 - body.len()])
+            .map_err(|_| "could not read response body")?;
+        if count == 0 {
+            break;
+        }
+        body.extend_from_slice(&buffer[..count]);
+    }
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| "could not parse response body")?;
+    let fault = value
+        .get("fault_message")
+        .and_then(Value::as_str)
+        .ok_or("could not parse response body")?;
+    Ok(fault
+        .chars()
+        .take(200)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect())
 }
 
 #[derive(Default)]

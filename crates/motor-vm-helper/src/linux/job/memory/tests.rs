@@ -116,6 +116,71 @@ fn api_socket_refuses_symlinks_and_wrong_owner_and_patches_only_the_pinned_socke
     assert!(replacement.accept().is_err());
 }
 
+fn patch_with_response(response: Vec<u8>, amount_mib: u64) -> Result<()> {
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let worker = std::thread::spawn(move || {
+        let mut reader = BufReader::new(server.try_clone().unwrap());
+        let mut line = String::new();
+        let mut length = 0;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length:") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut request = vec![0; length];
+        reader.read_exact(&mut request).unwrap();
+        server.write_all(&response).unwrap();
+    });
+    let result = patch_balloon(&mut client, amount_mib, deadline());
+    worker.join().unwrap();
+    result
+}
+
+#[test]
+fn rejected_patch_reports_status_amount_and_fault() {
+    let response = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"fault_message\":\"invalid balloon target\"}".to_vec();
+    let error = patch_with_response(response, 37).unwrap_err().to_string();
+    assert!(error.contains("status=400"), "{error}");
+    assert!(error.contains("amount_mib=37"), "{error}");
+    assert!(error.contains("invalid balloon target"), "{error}");
+}
+
+#[test]
+fn rejected_patch_sanitizes_and_limits_fault_and_rejects_invalid_body() {
+    let fault = format!("start\n{}END", "é".repeat(205));
+    let mut response = b"HTTP/1.1 400 Bad Request\r\n\r\n".to_vec();
+    response.extend_from_slice(
+        serde_json::to_string(&json!({"fault_message": fault}))
+            .unwrap()
+            .as_bytes(),
+    );
+    let error = patch_with_response(response, 8).unwrap_err().to_string();
+    assert!(
+        error.ends_with(&format!("start {}", "é".repeat(194))),
+        "{error}"
+    );
+    assert!(!error.chars().any(char::is_control), "{error:?}");
+
+    let mut response = b"HTTP/1.1 500 Internal Server Error\r\n\r\n".to_vec();
+    response.extend_from_slice(&[0xff; 5000]);
+    let error = patch_with_response(response, 9).unwrap_err().to_string();
+    assert!(error.contains("status=500"), "{error}");
+    assert!(error.contains("could not parse response body"), "{error}");
+}
+
+#[test]
+fn rejected_patch_reports_unreadable_body_with_status() {
+    let response = b"HTTP/1.1 400 Bad Request\r\nX-Incomplete: header".to_vec();
+    let error = patch_with_response(response, 4).unwrap_err().to_string();
+    assert!(error.contains("status=400"), "{error}");
+    assert!(error.contains("could not read response headers"), "{error}");
+}
+
 fn deadline() -> std::time::Instant {
     std::time::Instant::now() + API_DEADLINE
 }
