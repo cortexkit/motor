@@ -1466,15 +1466,30 @@ fn dependency_bundle(
             .arg(&bundle_path)
             .arg(&reference),
     )?;
-    let bytes = fs::read(&bundle_path)?;
+    let mut file = File::open(&bundle_path)?;
+    let mut digest = Sha256::new();
+    let mut length = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
+        length += n as u64;
+    }
     fs::rename(&bundle_path, spool.join(format!("bundle-{index}")))?;
     Ok(BundleManifest {
         index,
         repository: url.into(),
-        length: bytes.len() as u64,
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        length,
+        sha256: format!("{:x}", digest.finalize()),
     })
 }
+
+#[cfg(test)]
+#[path = "snapshot_memory_tests.rs"]
+mod memory_tests;
 
 pub(crate) fn submodule_warning(cache: &Path, url: &str, commit: &str) -> Option<String> {
     git(cache, &["cat-file", "-e", &format!("{commit}:.gitmodules")])

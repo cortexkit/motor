@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -19,6 +19,9 @@ use uuid::Uuid;
 #[cfg(test)]
 #[path = "journal_delta_tests.rs"]
 mod delta_tests;
+#[cfg(test)]
+mod memory_tests;
+mod scan;
 
 pub(super) const SOFT_BYTES: u64 = 1024 * 1024;
 pub(super) const HARD_BYTES: u64 = 8 * SOFT_BYTES;
@@ -242,20 +245,27 @@ pub(super) fn snapshot(
     position: Option<&Position>,
     metrics: &Metrics,
 ) -> io::Result<()> {
-    let mut value = serde_json::to_value(state).map_err(io::Error::other)?;
-    if let Some(position) = position {
-        value.as_object_mut().unwrap().insert(
-            "_journal".into(),
-            serde_json::to_value(position).map_err(io::Error::other)?,
-        );
+    write_snapshot(root, &serialize_snapshot(state, position)?, metrics)
+}
+
+pub(super) fn serialize_snapshot(
+    state: &State,
+    position: Option<&Position>,
+) -> io::Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct Checkpoint<'a> {
+        #[serde(flatten)]
+        state: &'a State,
+        #[serde(rename = "_journal", skip_serializing_if = "Option::is_none")]
+        position: Option<&'a Position>,
     }
+    serde_json::to_vec(&Checkpoint { state, position }).map_err(io::Error::other)
+}
+
+pub(super) fn write_snapshot(root: &Path, bytes: &[u8], metrics: &Metrics) -> io::Result<()> {
     let path = root.join("state.tmp");
     let mut file = File::create(&path)?;
-    write(
-        &mut file,
-        &serde_json::to_vec(&value).map_err(io::Error::other)?,
-        &metrics.checkpoint_bytes,
-    )?;
+    write(&mut file, bytes, &metrics.checkpoint_bytes)?;
     file.sync_all()?;
     fs::rename(path, root.join("state.json"))?;
     File::open(root)?.sync_all()?;
@@ -283,8 +293,10 @@ fn create_segment(root: &Path, epoch: Uuid, first: u64) -> io::Result<(File, Seg
 }
 
 pub(super) fn open(root: &Path, metrics: &Arc<Metrics>) -> io::Result<(State, Backend)> {
-    let mut value = match fs::read(root.join("state.json")) {
-        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map_err(io::Error::other)?,
+    let mut value = match File::open(root.join("state.json")) {
+        Ok(file) => {
+            serde_json::from_reader::<_, Value>(BufReader::new(file)).map_err(io::Error::other)?
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             serde_json::to_value(State::default()).map_err(io::Error::other)?
         }
@@ -385,36 +397,36 @@ fn replay(
         {
             return Err(invalid("gap between journal segments"));
         }
-        let bytes = fs::read(&segment.path)?;
+        let mut reader = BufReader::new(File::open(&segment.path)?);
         let mut valid = 0;
-        for line in bytes.split_inclusive(|b| *b == b'\n') {
-            let last = index + 1 == count && valid + line.len() == bytes.len();
-            let payload = line.get(65..line.len().saturating_sub(1));
-            let valid_checksum = line.last() == Some(&b'\n')
-                && line.get(64) == Some(&b'\t')
-                && payload
-                    .is_some_and(|p| format!("{:x}", Sha256::digest(p)).as_bytes() == &line[..64]);
+        while let Some((length, valid_checksum)) = scan::frame(&mut reader)? {
+            let end = valid + length;
+            let last = index + 1 == count && end == segment.bytes;
             if !valid_checksum {
                 if !last {
                     return Err(invalid("corrupt interior journal frame"));
                 }
                 if repair {
                     let file = OpenOptions::new().write(true).open(&segment.path)?;
-                    file.set_len(valid as u64)?;
+                    file.set_len(valid)?;
                     file.sync_all()?;
                 }
                 break;
             }
-            let frame: Frame =
-                serde_json::from_slice(payload.unwrap()).map_err(io::Error::other)?;
+            // Verify before applying. A second pass parses only this frame,
+            // without allocating bytes for either the frame or the segment.
+            reader.seek(SeekFrom::Start(valid + 65))?;
+            let frame: Frame = serde_json::from_reader(reader.by_ref().take(length - 66))
+                .map_err(io::Error::other)?;
             if frame.epoch != position.epoch || Some(frame.seq) != position.seq.checked_add(1) {
                 return Err(invalid("journal epoch or sequence mismatch"));
             }
             frame.delta.apply(value)?;
             position.seq = frame.seq;
-            valid += line.len();
+            valid = end;
+            reader.seek(SeekFrom::Start(valid))?;
         }
-        segment.bytes = valid as u64;
+        segment.bytes = valid;
     }
     Ok((position, segments))
 }

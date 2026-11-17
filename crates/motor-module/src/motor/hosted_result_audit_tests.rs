@@ -3,6 +3,38 @@ use crate::hosted::tests::harness::{Behavior, Harness, NoSsh};
 use motor_protocol::{BytePayload, Outcome, Output, OutputStream, Ran};
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn detached_return_chunks_retain_only_the_bounded_ring() {
+    let owner = Owner::new(0);
+    let id = Uuid::now_v7();
+    let (_, peak) = crate::allocation_tests::peak(|| {
+        for seq in 0..2048 {
+            owner.publish(Ok(StreamRecord::ReturnChunk(
+                motor_protocol::ReturnChunk::new(
+                    id,
+                    seq,
+                    0,
+                    seq * 65_536,
+                    BytePayload(vec![b'x'; 65_536]),
+                ),
+            )));
+        }
+    });
+    eprintln!("detached 128 MiB return stream: peak_heap_bytes={peak}");
+    let state = owner.state.lock().unwrap();
+    assert!(state.subscribers.is_empty());
+    assert_eq!(state.cursor, 2048);
+    assert!(
+        state.floor > 0,
+        "old chunks must be replayed from the runner"
+    );
+    assert!(state.bytes <= RING_BYTES);
+    assert!(
+        peak < 2 * RING_BYTES,
+        "128 MiB stream allocated {peak} live bytes"
+    );
+}
+
 async fn detached(h: &Harness, root: &std::path::Path) -> (Motor, Uuid) {
     let motor =
         Motor::with_connector(h.config(), root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
