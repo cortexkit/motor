@@ -1,5 +1,6 @@
 use super::*;
 use crate::hosted::tests::harness::{Behavior, Harness, NoSsh};
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 use motor_protocol::{BytePayload, Outcome, Output, OutputStream, Ran};
 use std::sync::atomic::AtomicUsize;
 
@@ -36,8 +37,7 @@ fn detached_return_chunks_retain_only_the_bounded_ring() {
 }
 
 async fn detached(h: &Harness, root: &std::path::Path) -> (Motor, Uuid) {
-    let motor =
-        Motor::with_connector(h.config(), root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(h.config(), root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     let id = Uuid::now_v7();
     motor.storage.create(id, 60, None, None, false).unwrap();
     motor.storage.hosted_route(id, h.route.clone()).unwrap();
@@ -68,7 +68,7 @@ async fn settled(motor: &Motor, id: Uuid) {
 
 fn fixture() -> (cortexkit_test_support::ScratchDir, Motor, Uuid) {
     let root = cortexkit_test_support::ScratchDir::new("hosted-owner-audit");
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         crate::Config::default(),
         &root,
         Arc::new(crate::hosted::tests::harness::NoSsh(
@@ -486,7 +486,7 @@ async fn audit_12_unfinished_cancel_intent_survives_export_and_reopen() {
     let exported: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
     assert_eq!(exported["jobs"][id.to_string()]["pending_cancel"], true);
-    let reopened = crate::storage::Storage::open(&root).unwrap();
+    let reopened = test_storage(&root).unwrap();
     assert!(reopened.job(id).unwrap().pending_cancel);
     assert!(reopened.job(id).unwrap().hosted.unwrap().terminal.is_none());
     reopened.shutdown().unwrap();
@@ -656,7 +656,7 @@ async fn audit_13_legacy_max_or_missing_deadline_unknown_retires_at_mint_horizon
         }
         motor.storage.cancel(id, true).unwrap();
         motor.close().await;
-        let motor = Motor::with_connector(
+        let motor = test_motor(
             config,
             &root,
             Arc::new(crate::hosted::tests::harness::NoSsh(
@@ -710,7 +710,7 @@ async fn audit_13_undated_legacy_unknown_gets_one_durable_recovery_horizon() {
         .unwrap();
     assert_eq!(first, anchor + 48 * 60 * 60 * 1000);
     motor.close().await;
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &root,
         Arc::new(crate::hosted::tests::harness::NoSsh(
@@ -1189,7 +1189,7 @@ async fn late_cancel_terminal_survives_timeout_status_attach_and_journal_reopen(
             .contains(&id.to_string()),
         "recovery must replay the journal rather than a shutdown checkpoint"
     );
-    let recovered = Motor::with_connector(
+    let recovered = test_motor(
         motor.config.clone(),
         &crash,
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -1246,7 +1246,7 @@ impl crate::Connector for SilentStatus {
 #[tokio::test]
 async fn audit_14c_explicit_status_times_out_a_silent_runner() {
     let root = cortexkit_test_support::ScratchDir::new("audit-silent-status");
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         crate::Config {
             runner_instance: "test".into(),
             ..crate::Config::default()

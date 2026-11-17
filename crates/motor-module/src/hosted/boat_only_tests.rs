@@ -1,5 +1,6 @@
 use super::*;
 use crate::hosted::test_http::Http;
+use crate::hosted_salt::tests::storage as test_storage;
 use motor_protocol::{Network, Platform};
 use serde_json::{json, Value};
 
@@ -75,7 +76,7 @@ async fn stored_boat_only_body_replays_identically_and_policy_refusal_is_final()
         serde_json::from_value(vector["granted"]["request"]["body"].clone()).unwrap();
     let id = Uuid::parse_str(&body.job_id).unwrap();
     let original = tests::canonical_lease_bytes(&body);
-    let storage = Arc::new(Storage::open(&scratch).unwrap());
+    let storage = Arc::new(test_storage(&scratch).unwrap());
     storage.create(id, 300, None, None, false).unwrap();
     let mut route = HostedJobState::new(&config);
     route.boat_only = true;
@@ -90,7 +91,7 @@ async fn stored_boat_only_body_replays_identically_and_policy_refusal_is_final()
     let saved = &stored["jobs"][id.to_string()]["hosted"];
     assert_eq!(saved["boat_only"], true);
     assert!(saved["lease_request"].get("placement").is_none());
-    let storage = Arc::new(Storage::open(&scratch).unwrap());
+    let storage = Arc::new(test_storage(&scratch).unwrap());
     let route = storage.job(id).unwrap().hosted.unwrap();
     assert!(route.boat_only && route.hosted_no_fallback);
     let client = Client::new(route);

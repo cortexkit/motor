@@ -2209,7 +2209,10 @@ async fn hosted_switch_keeps_windows_on_its_direct_stored_route() {
     let peer = RoutingPeer::new(&f);
     let mut config = configured(f.config.clone());
     config.broker_url = Some("https://unused.invalid".into());
-    let motor = peer.motor(config.clone());
+    let vault = crate::hosted_salt::tests::FakeVault::new(None);
+    let motor = peer
+        .motor(config.clone())
+        .with_module_secrets(vault.clone());
     let stream = motor
         .run(f.request("true").with_platform(Platform::Windows))
         .unwrap();
@@ -2219,6 +2222,7 @@ async fn hosted_switch_keeps_windows_on_its_direct_stored_route() {
         .iter()
         .any(|r| matches!(r, StreamRecord::Accepted(_))));
     assert!(motor.hosted_state(id).is_none());
+    vault.assert_untouched();
     drop(motor);
     let restarted = super::reopen_motor(|| {
         Motor::with_connector(config.clone(), &peer.module_state, peer.clone())

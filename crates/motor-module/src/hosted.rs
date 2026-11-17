@@ -341,6 +341,7 @@ impl HostedJobState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
+    Vault(crate::hosted_salt::Failure),
     Shutdown,
     Cancelled,
     Auth,
@@ -446,6 +447,10 @@ struct ProvisioningReply {
 impl Error {
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::Vault(crate::hosted_salt::Failure::Unavailable) => "hosted_vault_unavailable",
+            Self::Vault(crate::hosted_salt::Failure::TooOld) => "hosted_vault_too_old",
+            Self::Vault(crate::hosted_salt::Failure::NotAttested) => "hosted_vault_not_attested",
+            Self::Vault(crate::hosted_salt::Failure::Mismatch) => "hosted_vault_mismatch",
             Self::Shutdown => "hosted_shutdown",
             Self::Cancelled => "hosted_cancelled",
             Self::Auth | Self::AttachAuth => "hosted_auth",
@@ -487,6 +492,10 @@ impl Error {
     }
     pub(crate) fn reason(self) -> RefusalReason {
         match self {
+            Self::Vault(
+                crate::hosted_salt::Failure::TooOld | crate::hosted_salt::Failure::NotAttested,
+            ) => RefusalReason::RunnerAuthenticationFailed,
+            Self::Vault(_) => RefusalReason::Unreachable,
             Self::Auth
             | Self::AttachAuth
             | Self::Expired
@@ -516,7 +525,23 @@ impl Error {
         }
     }
     pub(crate) fn detail(self) -> String {
-        if self == Self::AccountAuthRequired {
+        if let Self::Vault(failure) = self {
+            let detail = match failure {
+                crate::hosted_salt::Failure::Unavailable => {
+                    "the vault is unavailable for hosted placement"
+                }
+                crate::hosted_salt::Failure::TooOld => {
+                    "the vault is too old for module secrets; update claustrum"
+                }
+                crate::hosted_salt::Failure::NotAttested => {
+                    "the vault didn't accept ck-motor as its own module"
+                }
+                crate::hosted_salt::Failure::Mismatch => {
+                    "the vault hosted salt did not match the stored value"
+                }
+            };
+            format!("{}: {detail}", self.code())
+        } else if self == Self::AccountAuthRequired {
             format!("{}: a person must run `ck account login`", self.code())
         } else if self == Self::AccountClosed {
             format!("{}: hosted account closed", self.code())
@@ -1452,7 +1477,7 @@ impl Client {
         let placement_started = tokio::time::Instant::now();
         let provisioning_deadline =
             tokio::time::Instant::now() + Duration::from_millis(spill_wait_budget_ms(&job));
-        let salt = storage.hosted_salt().map_err(|_| Error::Auth)?;
+        let salt = storage.hosted_salt.get().await.map_err(Error::Vault)?;
         let avoid_host = job
             .hosted
             .as_ref()

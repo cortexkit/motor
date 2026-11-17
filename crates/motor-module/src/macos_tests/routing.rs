@@ -302,12 +302,14 @@ async fn macos_routes_directly_despite_all_hosted_settings_and_does_not_reserve_
             ..h.config()
         };
         let endpoint = config.macos_runner.clone().unwrap();
+        let vault = crate::hosted_salt::tests::FakeVault::new(None);
         let motor = Motor::with_connector(
             config,
             &scratch.0.join(format!("state-{mode}")),
             peer.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .with_module_secrets(vault.clone());
         // The runner, not ck-motor, owns macOS admission. More than two concurrent
         // submissions must reach it rather than a local capacity refusal.
         let mut streams = Vec::new();
@@ -325,6 +327,7 @@ async fn macos_routes_directly_despite_all_hosted_settings_and_does_not_reserve_
             assert!(motor.hosted_state(id).is_none());
         }
         assert_eq!(peer.starts.load(Ordering::SeqCst), 4);
+        vault.assert_untouched();
         assert!(peer
             .visits
             .lock()

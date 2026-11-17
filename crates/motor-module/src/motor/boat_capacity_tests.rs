@@ -3,6 +3,7 @@ use crate::hosted::{
     boat_tests::*,
     tests::harness::{Harness, NoSsh},
 };
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
@@ -35,7 +36,7 @@ async fn assert_fresh_boat_cancel_result(real_outcome: Option<Outcome>, disconne
     boat.fresh_no_capacity.store(1, Ordering::SeqCst);
     let (scratch, repo) = committed_repo();
     let root = scratch.0.join("state");
-    let storage = Storage::open(&root).unwrap();
+    let storage = test_storage(&root).unwrap();
     let id = Uuid::now_v7();
     storage.create(id, 60, None, None, false).unwrap();
     let route = crate::HostedJobState {
@@ -48,7 +49,7 @@ async fn assert_fresh_boat_cancel_result(real_outcome: Option<Outcome>, disconne
         .await
         .unwrap();
     drop(channel);
-    let storage = Storage::open(&root).unwrap();
+    let storage = test_storage(&root).unwrap();
     let booking = Uuid::parse_str(&lease.job_id).unwrap();
     assert_ne!(booking, id);
     assert_eq!(
@@ -73,7 +74,7 @@ async fn assert_fresh_boat_cancel_result(real_outcome: Option<Outcome>, disconne
     storage.shutdown().unwrap();
     drop(storage);
     let direct = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(boat.config.clone(), &root, direct.clone()).unwrap();
+    let motor = test_motor(boat.config.clone(), &root, direct.clone()).unwrap();
     assert_eq!(motor.storage.runner_id(id), booking);
     assert!(motor.storage.job(id).unwrap().build_server_job_id.is_none());
     assert!(motor.hosted_state(id).is_some());
@@ -165,7 +166,7 @@ async fn boat_host_full_finishes_lost_then_runs_a_fresh_booking_for_the_same_cal
     let boat = Boat::new(0, false).await;
     boat.connect_host_full.store(1, Ordering::SeqCst);
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         Config {
             ..boat.config.clone()
         },
@@ -244,7 +245,7 @@ async fn boat_host_full_stops_after_three_grants_or_the_queue_budget() {
         let boat = Boat::new(0, false).await;
         boat.connect_host_full.store(10, Ordering::SeqCst);
         let (scratch, repo) = committed_repo();
-        let motor = Motor::with_connector(
+        let motor = test_motor(
             Config {
                 ..boat.config.clone()
             },

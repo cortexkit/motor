@@ -144,6 +144,10 @@ mod hosted_cleanup;
 mod hosted_released_tests;
 mod hosted_result;
 impl Motor {
+    pub fn with_module_secrets(self, resolver: Arc<dyn crate::vault::ModuleSecrets>) -> Self {
+        self.storage.hosted_salt.set_resolver(resolver);
+        self
+    }
     pub(crate) fn set_connector(&mut self, connector: Arc<dyn Connector>) {
         self.connector = connector;
     }

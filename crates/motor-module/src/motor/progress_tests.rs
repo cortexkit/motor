@@ -4,6 +4,7 @@ use crate::hosted::{
     boat_tests::committed_repo,
     tests::harness::{Behavior, Harness, NoSsh},
 };
+use crate::hosted_salt::tests::motor as test_motor;
 use std::sync::{atomic::AtomicUsize, Mutex};
 
 fn decoded(record: StreamRecord) -> StreamRecord {
@@ -48,8 +49,7 @@ async fn hosted_wait(opt_in: bool) -> Vec<StreamRecord> {
         ..h.config()
     };
     let root = scratch.0.join("state");
-    let motor =
-        Motor::with_connector(config.clone(), &root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let motor = test_motor(config.clone(), &root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     let mut request = request(&repo).with_progress(opt_in);
     request.timeout = Some(60);
     request.weight_hint = Some(16);
@@ -93,8 +93,7 @@ async fn hosted_wait(opt_in: bool) -> Vec<StreamRecord> {
         .iter()
         .any(|r| matches!(r, StreamRecord::Progress(_))));
     motor.close().await;
-    let reopened =
-        Motor::with_connector(config, &root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    let reopened = test_motor(config, &root, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
     let replay = Arc::new(Mutex::new(Vec::new()));
     collect(
         reopened.attach(AttachRequest::new(id, 0)).unwrap(),
@@ -174,7 +173,7 @@ async fn timed_progress_carries_the_assigned_job_id() {
         "30",
     ));
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         Config {
             hosted_repositories: vec![repo.to_str().unwrap().into()],
             ..h.config()
@@ -212,7 +211,7 @@ async fn fast_hosted_run_reports_id_immediately() {
         hosted_repositories: vec![repo.to_str().unwrap().into()],
         ..h.config()
     };
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -684,7 +683,7 @@ async fn hosted_heartbeats_reach_the_caller_as_queue_wait() {
         hosted_repositories: vec![repo.to_str().unwrap().into()],
         ..h.config()
     };
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),

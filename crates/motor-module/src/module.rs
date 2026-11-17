@@ -320,6 +320,7 @@ pub struct Handler {
     motor: Arc<OnceLock<Motor>>,
     ssh: Arc<OnceLock<Arc<SshConnector>>>,
     resolver: Arc<dyn CredentialResolver>,
+    module_secrets: Option<Arc<dyn crate::vault::ModuleSecrets>>,
     account_tokens: Option<Arc<crate::AccountTokens>>,
     routes: Arc<Mutex<HashMap<RouteHandle, RouteBindRequest>>>,
     /// Jobs started by direct routes, keyed to the route that started them. The
@@ -421,6 +422,7 @@ impl Handler {
             motor: Arc::new(OnceLock::new()),
             ssh: Arc::new(OnceLock::new()),
             resolver: Arc::new(UnavailableCredentialResolver),
+            module_secrets: None,
             account_tokens: None,
             routes: Arc::new(Mutex::new(HashMap::new())),
             direct_jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -477,6 +479,10 @@ impl Handler {
     }
     pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
         self.resolver = resolver;
+        self
+    }
+    pub fn with_module_secrets(mut self, resolver: Arc<dyn crate::vault::ModuleSecrets>) -> Self {
+        self.module_secrets = Some(resolver);
         self
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -561,6 +567,9 @@ impl Handler {
             let opened = tokio::task::spawn_blocking(move || Motor::open(config, &path)).await;
             match opened.unwrap_or_else(|error| Err(io::Error::other(error))) {
                 Ok(mut motor) => {
+                    if let Some(resolver) = &self.module_secrets {
+                        motor = motor.with_module_secrets(resolver.clone());
+                    }
                     #[cfg(test)]
                     if self.test_fixture_direct_route {
                         motor = motor.test_fixture_direct_route();

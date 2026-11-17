@@ -1,5 +1,6 @@
 use super::*;
 use crate::hosted::{ssh::tests::Sshd, test_http::Http};
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 use base64::Engine;
 use motor_lease::{Claims, Confirmation, Purpose};
 use motor_protocol::*;
@@ -415,7 +416,7 @@ async fn send_result_with_outcome<W: tokio::io::AsyncWrite + Unpin>(
 async fn boat_provisioning_retry_and_reattach_refresh_endpoint_and_pin() {
     let boat = Boat::new(2, true).await;
     let scratch = cortexkit_test_support::ScratchDir::new("boat-client");
-    let storage = Arc::new(Storage::open(&scratch.join("state")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.join("state")).unwrap());
     let id = Uuid::now_v7();
     storage.create(id, 300, None, None, false).unwrap();
     let route = HostedJobState::new(&boat.config);
@@ -459,7 +460,7 @@ async fn boat_provisioning_retry_and_reattach_refresh_endpoint_and_pin() {
 async fn boat_loss_409_stops_reattach_and_never_resubmits_or_releases() {
     let boat = Boat::new(0, true).await;
     let scratch = cortexkit_test_support::ScratchDir::new("boat-loss");
-    let storage = Arc::new(Storage::open(&scratch.join("state")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.join("state")).unwrap());
     let id = Uuid::now_v7();
     storage.create(id, 300, None, None, false).unwrap();
     let route = HostedJobState::new(&boat.config);
@@ -681,7 +682,7 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
         ..Config::default()
     };
     let scratch = cortexkit_test_support::ScratchDir::new("boat-vector-finish");
-    let storage = Arc::new(Storage::open(&scratch.join("state")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.join("state")).unwrap());
     storage
         .hosted_route(finish_id, HostedJobState::new(&config))
         .unwrap();
@@ -990,7 +991,7 @@ async fn spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it()
     let config = Config {
         ..ordinary.config.clone()
     };
-    let storage = Arc::new(Storage::open(&scratch.join("ordinary")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.join("ordinary")).unwrap());
     let id = Uuid::now_v7();
     storage.create(id, 300, None, None, false).unwrap();
     let route = HostedJobState::new(&config);
@@ -1007,7 +1008,7 @@ async fn spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it()
     let config = Config {
         ..boat.config.clone()
     };
-    let storage = Arc::new(Storage::open(&scratch.join("spilled")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.join("spilled")).unwrap());
     let id = Uuid::now_v7();
     storage.create(id, 300, None, None, false).unwrap();
     let mut route = HostedJobState::new(&config);
@@ -1023,7 +1024,7 @@ async fn spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it()
     // After a restart the job's stored lease body is sent again, unchanged,
     // whatever the configuration says now.
     drop(storage);
-    let storage = Arc::new(Storage::open(&scratch.join("spilled")).unwrap());
+    let storage = Arc::new(test_storage(&scratch.join("spilled")).unwrap());
     let route = storage.job(id).unwrap().hosted.unwrap();
     Client::new(route)
         .run(id, &request, &storage)
@@ -1167,7 +1168,7 @@ async fn explicit_hosted_test_does_not_disable_fleet_for_other_linux_jobs() {
         .get("hosted_runners")
         .is_none());
     let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
-    let motor = crate::Motor::with_connector(config, &scratch.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.join("state"), ssh.clone()).unwrap();
     // A path outside the hosted roots refuses before any lease or snapshot.
     let request =
         RunRequest::new("/tmp/missing", "/tmp/missing", "/tmp/missing", "true").with_timeout(30);
@@ -1207,7 +1208,7 @@ async fn hosted_test_lease_is_not_retried_for_capacity_and_keeps_the_broker_code
     for hosted_test in [true, false] {
         let http = no_capacity_broker().await;
         let config = broker_config(&http);
-        let storage = Arc::new(Storage::open(&scratch.join(format!("{hosted_test}"))).unwrap());
+        let storage = Arc::new(test_storage(&scratch.join(format!("{hosted_test}"))).unwrap());
         let id = Uuid::now_v7();
         storage.create(id, 300, None, None, true).unwrap();
         let mut route = HostedJobState::new(&config);
@@ -1246,8 +1247,7 @@ async fn direct_hosted_job_runs_on_a_lease_avoiding_no_host_with_hosted_routing_
     // Explicit hosted test leases leave `avoid_host` unset.
     let config = Config { ..h.config() };
     let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let stream = motor
         .run_direct_hosted(
             Harness::request(&repo).with_timeout(120),
@@ -1286,9 +1286,7 @@ async fn hosted_drain_admission_retry_hint_reaches_the_caller() {
     });
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(boat.config.clone(), &scratch.0.join("state"), ssh.clone())
-            .unwrap();
+    let motor = test_motor(boat.config.clone(), &scratch.0.join("state"), ssh.clone()).unwrap();
     let path = repo.to_str().unwrap();
     let (_, terminal) = records(
         motor
@@ -1318,9 +1316,7 @@ async fn direct_hosted_lease_refusal_is_typed_at_once_and_never_falls_back() {
     let http = no_capacity_broker().await;
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
-    let motor =
-        crate::Motor::with_connector(broker_config(&http), &scratch.0.join("state"), ssh.clone())
-            .unwrap();
+    let motor = test_motor(broker_config(&http), &scratch.0.join("state"), ssh.clone()).unwrap();
     let path = repo.to_str().unwrap();
     let stream = motor
         .run_direct_hosted(

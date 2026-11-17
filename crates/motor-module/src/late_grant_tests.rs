@@ -3,6 +3,7 @@
 use super::queue_tests::ResubmitPeer;
 use super::*;
 use crate::hosted::test_http::Http;
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 use cortexkit_test_support::ScratchDir;
 use motor_lease::{Claims, Confirmation, Purpose};
 use motor_protocol::{read_frame_async, write_frame_async, Accepted, CancelReply, Refusal};
@@ -510,7 +511,7 @@ impl Job {
 
             ..Config::default()
         };
-        let mut motor = Motor::with_connector(
+        let mut motor = test_motor(
             config,
             &scratch.join("state"),
             Arc::new(ResubmitPeer::new()),
@@ -592,7 +593,7 @@ fn reopen(h: &Harness, motor: Motor, scratch: &ScratchDir) -> Motor {
     let config = motor.config.clone();
     motor.storage.shutdown().unwrap();
     drop(motor);
-    let mut motor = Motor::with_connector(
+    let mut motor = test_motor(
         config,
         &scratch.join("state"),
         Arc::new(ResubmitPeer::new()),
@@ -1110,7 +1111,7 @@ async fn rollback_oldest_client_reads_optional_started_timestamp() {
     for started in [None, Some(1_730_000_000_000_u64)] {
         let scratch = ScratchDir::new("oldest-hosted-started");
         let root = scratch.join("state");
-        let storage = Storage::open(&root).unwrap();
+        let storage = test_storage(&root).unwrap();
         let id = Uuid::now_v7();
         let config = Config {
             runner_instance: "test".into(),
@@ -1178,7 +1179,7 @@ async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
             broker_url: Some(h.broker.url.clone()),
             ..Config::default()
         };
-        let storage = Storage::open(&root).unwrap();
+        let storage = test_storage(&root).unwrap();
         let id = Uuid::now_v7();
         storage.create(id, 300, None, None, false).unwrap();
         let mut route = crate::HostedJobState::new(&config);
@@ -1268,8 +1269,7 @@ async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
         assert!(actual_job["hosted"].get("cleanup_pending").is_none());
         assert!(actual_job["hosted"].get("host_deadline_s").is_none());
 
-        let mut motor =
-            Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+        let mut motor = test_motor(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
         motor.hosted_connector = Some(h.runner.clone());
         motor.resume_finishes().await;
         if case == "detached" {
@@ -1305,8 +1305,7 @@ async fn caller_detached_before_late_grant_retains_real_terminal_without_new_cal
         broker_url: Some(h.broker.url.clone()),
         ..Config::default()
     };
-    let mut motor =
-        Motor::with_connector(config.clone(), &scratch, Arc::new(ResubmitPeer::new())).unwrap();
+    let mut motor = test_motor(config.clone(), &scratch, Arc::new(ResubmitPeer::new())).unwrap();
     motor.hosted_connector = Some(h.runner.clone());
     let path = repo.to_str().unwrap();
     let caller = motor
@@ -1336,7 +1335,7 @@ async fn caller_detached_before_late_grant_retains_real_terminal_without_new_cal
     assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
     assert_eq!(h.runner.cancels.load(Ordering::SeqCst), 0);
     motor.close().await;
-    let motor = Motor::with_connector(config, &scratch, Arc::new(ResubmitPeer::new())).unwrap();
+    let motor = test_motor(config, &scratch, Arc::new(ResubmitPeer::new())).unwrap();
     assert_eq!(
         motor.job_status(id).await.unwrap().terminal,
         Some(result.clone())
@@ -1362,7 +1361,7 @@ async fn owned_audit_job(h: &Harness) -> (ScratchDir, Motor, JobStream) {
         broker_url: Some(h.broker.url.clone()),
         ..Config::default()
     };
-    let mut motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let mut motor = test_motor(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
     motor.hosted_connector = Some(h.runner.clone());
     let path = repo.to_str().unwrap();
     let caller = motor
@@ -1399,7 +1398,7 @@ async fn audit_01_first_party_collector_exits_without_reelection_or_restart_atta
     assert!(!motor.storage.unsettled_hosted().contains(&id));
     assert_eq!(h.runner.attaches.load(Ordering::SeqCst), 0);
     motor.close().await;
-    let mut motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let mut motor = test_motor(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
     motor.hosted_connector = Some(h.runner.clone());
     motor.resume_finishes().await;
     assert!(!motor.hosted_results.lock().unwrap().contains_key(&id));

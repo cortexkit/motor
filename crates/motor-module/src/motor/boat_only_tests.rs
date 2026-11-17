@@ -4,6 +4,7 @@ use crate::hosted::{
     boat_tests::{committed_repo, records},
     tests::harness::{Behavior, Harness, NoSsh},
 };
+use crate::hosted_salt::tests::{motor as test_motor, storage as test_storage};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
@@ -11,7 +12,7 @@ async fn boat_only_is_one_job_only_and_rejects_ineligible_jobs_without_submissio
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), peer.clone()).unwrap();
     let mut ineligible = Vec::new();
     let mut net = request(&repo);
     net.network = Some(motor_protocol::Network::Outbound);
@@ -86,7 +87,7 @@ async fn boat_only_is_one_job_only_and_rejects_ineligible_jobs_without_submissio
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
     motor.close().await;
 
-    let repository = Motor::with_connector(
+    let repository = test_motor(
         Config {
             hosted_repositories: vec![repo.to_str().unwrap().into()],
             ..h.config()
@@ -110,7 +111,7 @@ async fn broker_boat_only_shape_refusal_names_its_limits_and_never_runs_elsewher
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(h.config(), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(h.config(), &scratch.0.join("state"), peer.clone()).unwrap();
     for (status, body, detail) in [
         (
             422,
@@ -163,7 +164,7 @@ fn rollback_boat_only_journal_and_checkpoint_open_and_refuse_replay() {
     let (scratch, repo) = committed_repo();
     for checkpoint in [false, true] {
         let source = scratch.0.join(format!("source-{checkpoint}"));
-        let storage = crate::storage::Storage::open(&source).unwrap();
+        let storage = test_storage(&source).unwrap();
         let id = Uuid::now_v7();
         storage.create(id, 300, None, None, false).unwrap();
         let mut route = crate::HostedJobState::new(&Config {

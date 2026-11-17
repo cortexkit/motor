@@ -3,6 +3,7 @@ use crate::hosted::{
     boat_tests::{committed_repo, records},
     tests::harness::{Behavior, Harness, NoSsh},
 };
+use crate::hosted_salt::tests::motor as test_motor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn config(h: &Harness, repo: &Path) -> Config {
@@ -228,7 +229,7 @@ async fn repository_placement_hints_override_per_repository_and_fall_back_to_the
     ]
     .into();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     for (index, (repo, expected_hint)) in [
         (&first, Some(first_hint)),
         (&second, Some(second_hint)),
@@ -269,7 +270,7 @@ async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_
     let mut config = config(&h, &repo);
     config.hosted_repositories_placement_hint = Some(control_placement());
     let root = scratch.0.join("state");
-    let motor = Motor::with_connector(config, &root, ssh.clone()).unwrap();
+    let motor = test_motor(config, &root, ssh.clone()).unwrap();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
@@ -285,7 +286,7 @@ async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     motor.close().await;
 
-    let restored = Motor::with_connector(Config { ..h.config() }, &root, ssh.clone()).unwrap();
+    let restored = test_motor(Config { ..h.config() }, &root, ssh.clone()).unwrap();
     let state = restored.hosted_state(id).unwrap();
     assert_eq!(state.repository_placement_hint, Some(control_placement()));
     assert_eq!(
@@ -314,8 +315,7 @@ async fn listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoidin
     )
     .unwrap();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
     for workspace in [&repo, &linked] {
         for direct in [false, true] {
             for net in [false, true] {
@@ -360,7 +360,7 @@ async fn unlisted_linux_uses_fleet_and_windows_keeps_the_direct_path() {
     config.windows_runner_instance = Some("windows-test".into());
     config.windows_runner_state_root = Some("/home/test/windows".into());
     let ssh = Arc::new(DirectPeer(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let (_unlisted_scratch, unlisted) = committed_repo();
     for request in [
         request(&unlisted),
@@ -476,8 +476,7 @@ async fn stage1_pre_run_failures_are_typed_and_never_submit_directly() {
         h.release_admitted.store(true, Ordering::SeqCst);
         let (scratch, repo) = committed_repo();
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone())
-            .unwrap();
+        let motor = test_motor(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
         let stream = motor.run(request(&repo)).unwrap();
         let id = stream.job_id;
         let (_, terminal) = records(stream).await;
@@ -513,8 +512,7 @@ async fn stage1_validation_and_lease_refusals_name_the_route_and_never_fall_back
         }
         let (scratch, repo) = committed_repo();
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone())
-            .unwrap();
+        let motor = test_motor(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
         let mut request = request(&repo);
         if refusal.is_none() {
             request.timeout = None;
@@ -561,8 +559,7 @@ async fn stage1_invalid_lease_bodies_are_typed_refusals_not_lease_mismatch() {
         }
         let (scratch, repo) = committed_repo();
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone())
-            .unwrap();
+        let motor = test_motor(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
         let request = request(&repo).with_timeout(timeout);
         let stream = motor.run(request).unwrap();
         let id = stream.job_id;
@@ -606,7 +603,7 @@ async fn assert_stage1_bad_request(status: u16, body: String, expected_field: Op
     let mut cfg = config(&h, &repo);
     cfg.broker_url = Some(broker.url.clone());
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(cfg, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(cfg, &scratch.0.join("state"), ssh.clone()).unwrap();
     let captured = crate::logging::Captured::default();
     let _log = crate::logging::scoped(captured.clone());
     let stream = motor.run(request(&repo)).unwrap();
@@ -708,8 +705,7 @@ async fn stage1_lost_run_ack_reattaches_without_direct_fallback() {
     let h = Harness::new(Behavior::DropRunAck).await;
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
@@ -734,8 +730,7 @@ async fn stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host() {
     ]);
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
     let started = tokio::time::Instant::now();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
@@ -775,7 +770,7 @@ async fn hinted_no_capacity_retries_the_identical_body_then_runs_without_fallbac
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let mut config = config(&h, &repo);
     config.hosted_repositories_placement_hint = Some(control_placement());
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let started = tokio::time::Instant::now();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
@@ -808,7 +803,7 @@ async fn hinted_no_capacity_exhausts_the_queue_budget_without_fallback() {
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let mut config = config(&h, &repo);
     config.hosted_repositories_placement_hint = Some(control_placement());
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let mut request = request(&repo);
     request.queue_wait_limit_s = Some(3);
     let started = tokio::time::Instant::now();
@@ -860,7 +855,7 @@ async fn hinted_no_host_fits_refuses_without_build_server_correction() {
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let mut config = config(&h, &repo);
     config.hosted_repositories_placement_hint = Some(control_placement());
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let mut request = request(&repo);
     request.weight_hint = Some(16);
     let stream = motor.run(request).unwrap();
@@ -922,7 +917,7 @@ async fn stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline() 
         let (scratch, repo) = committed_repo();
         let config = config(&h, &repo);
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+        let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let started = tokio::time::Instant::now();
         let mut run_request = request(&repo);
         run_request.queue_wait_limit_s = Some(2);
@@ -987,8 +982,7 @@ async fn stage1_cloud_no_spill_reply_honors_retry_after_and_preserves_the_stored
     ]);
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor =
-        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config(&h, &repo), &scratch.0.join("state"), ssh.clone()).unwrap();
     let start = tokio::time::Instant::now();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
@@ -1037,8 +1031,7 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
     let log = peer.log.clone();
     let id = {
         let motor =
-            Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer))
-                .unwrap();
+            test_motor(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer)).unwrap();
         let id = Uuid::now_v7();
         motor
             .storage
@@ -1072,7 +1065,7 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
         motor.close().await;
         id
     };
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config(&h, &repo),
         &scratch.0.join("state"),
         Arc::new(super::queue_tests::ResubmitPeer {
@@ -1180,7 +1173,7 @@ async fn stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job() {
         let (scratch, repo) = committed_repo();
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
         let config = pinned_config(&h, &repo);
-        let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+        let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let started = tokio::time::Instant::now();
         let stream = motor.run(request(&repo)).unwrap();
         let id = stream.job_id;
@@ -1237,7 +1230,7 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
     let (scratch, repo) = committed_repo();
     let config = pinned_config(&h, &repo);
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let started = tokio::time::Instant::now();
     let mut run_request = request(&repo);
     run_request.queue_wait_limit_s = Some(3);
@@ -1313,7 +1306,7 @@ async fn stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_
         let (scratch, repo) = committed_repo();
         let config = pinned_config(&h, &repo);
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+        let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let started = tokio::time::Instant::now();
         let mut run_request = request(&repo);
         run_request.queue_wait_limit_s = Some(3);

@@ -1,5 +1,6 @@
 use super::*;
-use crate::{hosted::boat_tests::committed_repo, Motor};
+use crate::hosted::boat_tests::committed_repo;
+use crate::hosted_salt::tests::motor as test_motor;
 use tokio::{net::TcpSocket, task::JoinSet};
 
 /// Reserve the broker's port without listening, then forward to the real fake
@@ -66,7 +67,7 @@ async fn broker_connect_outage_recovers_and_runs_with_placement_progress() {
     let mut config = h.config();
     config.broker_url = Some(outage.url.clone());
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let started = tokio::time::Instant::now();
     let stream = motor
         .run(Harness::request(&repo).with_progress(true))
@@ -100,7 +101,7 @@ async fn exhaust_outage(queue_wait_s: u64, expected_wait_s: u64) {
     let mut config = h.config();
     config.broker_url = Some(outage.url.clone());
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let mut request = Harness::request(&repo);
     request.queue_wait_limit_s = Some(queue_wait_s);
     let started = tokio::time::Instant::now();
@@ -148,7 +149,7 @@ async fn broker_connect_outage_cancel_interrupts_backoff() {
     let (scratch, repo) = committed_repo();
     let mut config = h.config();
     config.broker_url = Some(outage.url.clone());
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),

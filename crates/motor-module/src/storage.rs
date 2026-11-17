@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -475,6 +475,7 @@ type SettlementLocks = Mutex<BTreeMap<(Uuid, bool), Weak<tokio::sync::Mutex<()>>
 /// One process owns the lease; cancel intent is durable before a network attempt.
 pub(crate) struct Storage {
     root: PathBuf,
+    pub(crate) hosted_salt: crate::hosted_salt::HostedSalt,
     state: Arc<Mutex<State>>,
     persistence: Arc<compaction::Persistence>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -726,37 +727,6 @@ impl Storage {
             Arc::make_mut(s.jobs.entry(id).or_default()).hosted = Some(route);
         })
     }
-    pub(crate) fn hosted_salt(&self) -> io::Result<[u8; 32]> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let _guard = self.state.lock().unwrap();
-        let path = self.root.join("hosted-salt");
-        match fs::read(&path) {
-            Ok(bytes) => {
-                if fs::symlink_metadata(&path)?.file_type().is_symlink()
-                    || fs::metadata(&path)?.permissions().mode() & 0o777 != 0o600
-                {
-                    return Err(io::Error::other("unsafe hosted salt permissions"));
-                }
-                bytes
-                    .try_into()
-                    .map_err(|_| io::Error::other("invalid hosted salt"))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut salt = [0; 32];
-                getrandom::fill(&mut salt).map_err(io::Error::other)?;
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&path)?;
-                file.write_all(&salt)?;
-                file.sync_all()?;
-                File::open(&self.root)?.sync_all()?;
-                Ok(salt)
-            }
-            Err(e) => Err(e),
-        }
-    }
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let lease = OpenOptions::new()
@@ -783,6 +753,7 @@ impl Storage {
         let worker = compaction::start(state.clone(), persistence.clone())?;
         let storage = Self {
             root: root.into(),
+            hosted_salt: crate::hosted_salt::HostedSalt::new(root),
             state,
             persistence,
             worker: Mutex::new(Some(worker)),

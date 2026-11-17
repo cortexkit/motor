@@ -90,27 +90,29 @@ struct Vault {
 }
 impl Target for Vault {
     fn request(&self, request: Value) -> Reply<'_> {
-        Box::pin(async move {
-            let nonce = subc_os::launch_nonce()
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "account route identity unavailable",
-                    )
-                })?
-                .filter(|nonce| !nonce.value().is_empty())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "account route identity unavailable",
-                    )
-                })?;
-            self.request_with_nonce(request, nonce.value()).await
-        })
+        // The SDK binds supervised connections to their module claim and supplies
+        // the environment nonce on legacy launches. A manual route identity would
+        // conflict with a claim-bound connection, which may have no nonce at all.
+        Box::pin(self.request_with_identity(request, None))
     }
 }
 impl Vault {
+    #[cfg(test)]
     async fn request_with_nonce(&self, request: Value, nonce: &str) -> io::Result<Value> {
+        self.request_with_identity(
+            request,
+            Some(ConsumerIdentity {
+                module_id: self.module_id.clone(),
+                launch_nonce: nonce.to_owned(),
+            }),
+        )
+        .await
+    }
+    async fn request_with_identity(
+        &self,
+        request: Value,
+        consumer_identity: Option<ConsumerIdentity>,
+    ) -> io::Result<Value> {
         let consumer = SubcConsumer::connect(
             &self.connection,
             ConsumerOptions {
@@ -129,10 +131,7 @@ impl Vault {
                 serde_json::to_vec(&request).expect("serializable account request"),
                 CallOptions {
                     timeout: Duration::from_secs(10),
-                    consumer_identity: Some(ConsumerIdentity {
-                        module_id: self.module_id.clone(),
-                        launch_nonce: nonce.to_owned(),
-                    }),
+                    consumer_identity,
                     ..CallOptions::default()
                 },
             )

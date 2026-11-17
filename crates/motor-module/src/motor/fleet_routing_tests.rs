@@ -4,6 +4,7 @@ use crate::hosted::{
     boat_tests::{committed_repo, records},
     tests::harness::{Behavior, Harness, NoSsh},
 };
+use crate::hosted_salt::tests::motor as test_motor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn config(h: &Harness) -> Config {
@@ -55,7 +56,7 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill() {
     let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
     let mut config = config(&h);
     config.hosted_repositories_placement_hint = Some(control_placement());
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for (platform, timeout) in [(None, 10), (Some(Platform::Linux), 7200)] {
         let mut request = request(&repo);
         request.platform = platform;
@@ -120,7 +121,7 @@ async fn home_and_users_requests_select_hosted_routes_without_direct_contact() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let scratch = crate::hosted::tests::harness::Scratch::new();
     let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
     for prefix in ["/Users", "/home"] {
         for mixed in [false, true] {
             for entry in ["run", "agent", "gate", "hosted"] {
@@ -173,7 +174,7 @@ async fn fleet_workspace_with_a_recorded_placement_leaves_affinity_to_the_broker
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let root = scratch.0.join("state");
-    let motor = Motor::with_connector(config(&h), &root, ssh.clone()).unwrap();
+    let motor = test_motor(config(&h), &root, ssh.clone()).unwrap();
     let stream = motor.run(request(&repo)).unwrap();
     let first_id = stream.job_id;
     let (_, terminal) = records(stream).await;
@@ -181,7 +182,7 @@ async fn fleet_workspace_with_a_recorded_placement_leaves_affinity_to_the_broker
     let placement = motor.hosted_state(first_id).unwrap().placement.unwrap();
     motor.close().await;
 
-    let restored = Motor::with_connector(config(&h), &root, ssh.clone()).unwrap();
+    let restored = test_motor(config(&h), &root, ssh.clone()).unwrap();
     assert_eq!(
         restored.hosted_state(first_id).unwrap().placement,
         Some(placement)
@@ -206,7 +207,7 @@ async fn fleet_gate_takes_a_host_only_lease_and_sends_the_gate_mark() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
     let mut request = request(&repo);
     request.queue_wait_limit_s = Some(1);
     let stream = motor
@@ -253,7 +254,7 @@ async fn fleet_non_linux_platforms_never_request_a_lease() {
         state_root: "/Users/motor/state".into(),
     });
     let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for (platform, timeout) in [
         (Some(Platform::Windows), Some(600)),
         (Some(Platform::Macos), Some(600)),
@@ -277,7 +278,7 @@ async fn fleet_invalid_linux_requests_are_refused_without_direct_fallback() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
     let mut cases = Vec::new();
     for timeout in [None, Some(0), Some(9), Some(21601)] {
         let mut request = request(&repo);
@@ -347,7 +348,7 @@ async fn absent_fleet_key_preserves_global_hosted_validation_refusals() {
     assert!(wire.get("hosted_fleet_routing").is_none());
     let config = serde_json::from_value(wire).unwrap();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for timeout in [None, Some(9), Some(21601)] {
         let mut request = request(&repo);
         request.timeout = timeout;
@@ -381,7 +382,7 @@ async fn explicit_repository_route_keeps_precedence_over_the_fleet_route() {
     let mut config = config(&h);
     config.hosted_repositories = vec![repo.to_str().unwrap().into()];
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for timeout in [9, 600] {
         let stream = motor.run(request(&repo).with_timeout(timeout)).unwrap();
         let id = stream.job_id;
@@ -421,7 +422,7 @@ async fn fleet_network_keeps_the_opt_in_before_capture_or_contact() {
         // Capture would fail if the disabled network path reached snapshotting.
         config.inject_snapshot_failure = !enabled;
         let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-        let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+        let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
         let mut net_request = request(&repo);
         net_request.network = Some(Network::Outbound);
         let stream = motor.run(net_request).unwrap();
@@ -512,7 +513,9 @@ async fn linux_exec_refusals_and_followups_never_reach_a_direct_runner() {
             let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
             let root = scratch.0.join("state");
             let config = config(&h);
-            let mut motor = Motor::open(config.clone(), &root).unwrap();
+            let mut motor = Motor::open(config.clone(), &root)
+                .unwrap()
+                .with_module_secrets(crate::hosted_salt::tests::FakeVault::new(Some(vec![7; 32])));
             motor.set_connector(peer.clone());
             let mut request = request(&repo);
             request.platform = Some(Platform::Linux);
@@ -599,7 +602,7 @@ async fn fleet_unknown_boat_booking_is_finished_without_run_or_reattach() {
     let mut config = config(&h);
     config.broker_url = Some(broker.url.clone());
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
@@ -645,7 +648,7 @@ async fn fleet_capacity_waits_do_not_exhaust_three_placements() {
         .extend(std::iter::repeat_n(h.broker.clone(), 4).chain([next.broker.clone()]));
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
@@ -723,7 +726,7 @@ async fn fleet_capacity_budget_ends_with_a_retryable_refusal_not_a_lost_job() {
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
     let config = config(&h);
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+    let motor = test_motor(config, &scratch.0.join("state"), peer.clone()).unwrap();
     let mut run_request = request(&repo);
     run_request.queue_wait_limit_s = Some(1);
     let stream = motor.run(run_request).unwrap();

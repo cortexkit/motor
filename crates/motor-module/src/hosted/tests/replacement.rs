@@ -1,4 +1,5 @@
 use super::*;
+use crate::hosted_salt::tests::motor as test_motor;
 use crate::{
     hosted::boat_tests::{committed_repo, records},
     Motor,
@@ -46,7 +47,7 @@ async fn two_hosts_refuse_then_third_booking_runs_with_original_caller_id() {
         first.broker.clone(),
     ]);
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         first.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -95,7 +96,7 @@ async fn two_hosts_refuse_then_third_booking_runs_with_original_caller_id() {
 async fn rebooks_keep_original_queue_deadline_and_capacity_reason() {
     let h = Harness::new(Behavior::Refuse("host_full")).await;
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         h.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -253,7 +254,7 @@ async fn capacity_refusal_rebooks_and_logs_both_ids_and_host() {
         .unwrap()
         .extend([first.broker.clone(), second.broker.clone()]);
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         first.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -294,7 +295,7 @@ async fn lost_pre_run_upload_capacity_refusal_rebooks_without_sending_run_to_old
             .unwrap()
             .extend([h.broker.clone(), ready.broker.clone()]);
         let (scratch, repo) = committed_repo();
-        let motor = Motor::with_connector(
+        let motor = test_motor(
             h.config(),
             &scratch.0.join("state"),
             Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -339,7 +340,7 @@ async fn lost_pre_run_upload_capacity_refusal_rebooks_without_sending_run_to_old
 async fn lost_run_ack_capacity_refusal_stays_unknown_and_never_replaces() {
     let h = Harness::new(Behavior::DropRunAckRefuseAttach("capacity")).await;
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         h.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -374,7 +375,7 @@ async fn lost_run_ack_capacity_refusal_stays_unknown_and_never_replaces() {
 async fn cancel_during_rebook_wait_releases_only_the_refused_booking() {
     let h = Harness::new(Behavior::Refuse("host_full")).await;
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         h.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -400,7 +401,7 @@ async fn cancel_during_rebook_wait_releases_only_the_refused_booking() {
 async fn real_connect_failure_at_queue_expiry_remains_unreachable() {
     let h = Harness::new(Behavior::ConnectFailure).await;
     let (scratch, repo) = committed_repo();
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         h.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -452,7 +453,7 @@ async fn restart_after_persisted_rebook_releases_old_id_once_without_placing() {
         assert!(!state.run_sent);
     }
     assert_eq!(release_count(&h, &id.to_string()), 0);
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         h.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -495,7 +496,7 @@ async fn pending_release_already_gone_answers_are_final_and_failures_retry() {
             (status, serde_json::json!({"error":code}), ""),
         ]);
         let (scratch, repo) = committed_repo();
-        let motor = Motor::with_connector(
+        let motor = test_motor(
             h.config(),
             &scratch.0.join("state"),
             Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -568,7 +569,7 @@ async fn long_hosted_leases_disable_boat_and_queue_on_no_capacity() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let config = Config { ..h.config() };
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -654,7 +655,7 @@ async fn fresh_booking_can_spill_to_boat_and_finish_while_old_release_is_hung() 
         broker_url: Some(proxy.url.clone()),
         ..first.config()
     };
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         config,
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -734,7 +735,7 @@ async fn restart_after_old_release_retires_unsent_fresh_request_without_releasin
             .unwrap();
         fresh = Uuid::parse_str(&body.job_id).unwrap();
     }
-    let motor = Motor::with_connector(
+    let motor = test_motor(
         h.config(),
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),

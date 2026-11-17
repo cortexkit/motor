@@ -1,4 +1,5 @@
 use super::*;
+use crate::hosted_salt::tests::direct_motor as test_direct_motor;
 use crate::{
     hosted::tests::harness::{Behavior, Harness, NoSsh},
     logging,
@@ -29,7 +30,7 @@ async fn post_connect_refusals_and_admission_failure_log_the_cause() {
         let h = Harness::new(behavior).await;
         let scratch = ScratchDir::new("hosted-post-connect-log");
         let repo = queue_tests::fixture_repo(scratch.path());
-        let motor = Motor::with_test_fixture_direct_route(
+        let motor = test_direct_motor(
             h.config(),
             &scratch.join("state"),
             Arc::new(NoSsh(AtomicUsize::new(0))),
@@ -108,7 +109,7 @@ async fn post_connect_refusals_and_admission_failure_log_the_cause() {
 }
 
 fn hosted_motor(scratch: &Path) -> (Motor, Uuid) {
-    let motor = Motor::with_test_fixture_direct_route(
+    let motor = test_direct_motor(
         Config::default(),
         &scratch.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
