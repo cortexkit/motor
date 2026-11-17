@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+mod memory_tests;
+
 #[derive(Default)]
 struct Control {
     stop: bool,
@@ -111,9 +114,11 @@ impl Persistence {
                 }
                 Backend::Legacy => None,
             };
-            (state.clone(), position)
+            let snapshot = journal::serialize_snapshot(&state, position.as_ref())?;
+            (snapshot, position)
         };
-        journal::snapshot(&self.root, &snapshot, position.as_ref(), &self.metrics)?;
+        // Serialize the borrowed state while locked; write the checkpoint after unlocking.
+        journal::write_snapshot(&self.root, &snapshot, &self.metrics)?;
         if let (Backend::Journal(j), Some(position)) =
             (&mut *self.backend.lock().unwrap(), position)
         {

@@ -2,6 +2,8 @@
 //! transport loss after submission is recovered by attach, never by rerunning.
 mod agent;
 mod agent_route;
+#[cfg(test)]
+mod allocation_tests;
 #[cfg(feature = "bench-client")]
 pub mod benchmark;
 pub mod cli;
