@@ -47,9 +47,9 @@ fn unsettled_nested_fetch_is_fatal_instead_of_optional() {
         "HEAD",
         false,
         Duration::from_secs(1),
-        |_| Ok(Command::new("cargo")),
+        |_, _| Ok(Command::new("cargo")),
         |_, _| panic!("unsettled helper was treated as an optional fetch miss"),
-        |_, fetch| {
+        |_, fetch, _| {
             assert!(matches!(fetch, CargoFetch::Nested(_)));
             Err(io::Error::other(
                 crate::sibling_snapshots::helper::UnsettledHelper {
@@ -2949,8 +2949,41 @@ fn stale_nested_lock_does_not_refuse_and_root_still_fetches() {
 }
 
 #[test]
-fn stale_root_lock_still_refuses_before_nested_fetch() {
+fn stale_root_lock_fetches_privately_before_nested_fetch() {
     cargo_stale_lock_fixture(true);
+}
+
+#[test]
+fn cargo_advisory_survives_later_sibling_failure_waived_for_network_job() {
+    let f = Fixture::new();
+    cargo_package_fixture(&f.workspace, "root-probe", true);
+    commit_cargo_fixture(&f.workspace);
+    let sibling = f.scratch.join("broken-sibling");
+    fs::create_dir(&sibling).unwrap();
+    fs::write(sibling.join("Cargo.toml"), "not valid TOML").unwrap();
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
+    let lock = fs::read(f.workspace.join("Cargo.lock")).unwrap();
+    let mut advisory = false;
+    let result = prefetch_cargo_dependencies_with_advisory(
+        false,
+        false,
+        &f.state,
+        &f.workspace,
+        "HEAD",
+        &[cargo_sibling_fixture(&sibling, "HEAD")],
+        &BTreeMap::new(),
+        &f.scratch.join("cargo"),
+        &rustup,
+        None,
+        &mut advisory,
+    );
+    assert!(result.is_err(), "the sibling failure must reach admission");
+    cargo_prefetch_admission(Uuid::now_v7(), true, result).unwrap();
+    assert!(
+        advisory,
+        "a successful private fetch still needs its warning"
+    );
+    assert_eq!(fs::read(f.workspace.join("Cargo.lock")).unwrap(), lock);
 }
 
 fn cargo_package_fixture(path: &Path, name: &str, stale: bool) {
@@ -2984,32 +3017,33 @@ fn cargo_stale_lock_fixture(stale_root: bool) {
     }));
     let mut fetched = Vec::new();
     let mut skipped = Vec::new();
-    let result = prefetch_cargo_with(
+    let result = prefetch_cargo_in(
         &f.workspace,
         "HEAD",
         false,
         NESTED_CARGO_FETCH_TIMEOUT,
-        |directory| {
+        |directory, locked| {
             fetched.push(directory.to_path_buf());
-            let mut command = workspace::dependencies::fetch_command(
+            let mut command = workspace::dependencies::fetch_command_with_lock(
                 &f.state,
                 directory,
                 &BTreeMap::new(),
                 &f.scratch.join("cargo"),
                 &rustup,
+                locked,
             )?;
             command.env("CARGO_NET_OFFLINE", "true");
             Ok(command)
         },
         |path, error| skipped.push((path.to_path_buf(), error.to_owned())),
+        |command, fetch, _| run_cargo_fetch_on_host(command, fetch),
     );
     if stale_root {
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains("--locked was passed to prevent this"),
-            "{error}"
-        );
-        assert_eq!(fetched.as_slice(), std::slice::from_ref(&f.workspace));
+        assert!(result.unwrap(), "a private fetch must produce an advisory");
+        assert_eq!(fetched.len(), 3);
+        assert_eq!(fetched[0], f.workspace);
+        assert!(!fetched[1].exists(), "private checkout was not removed");
+        assert_eq!(fetched[2], nested);
         assert!(skipped.is_empty());
     } else {
         result.unwrap();

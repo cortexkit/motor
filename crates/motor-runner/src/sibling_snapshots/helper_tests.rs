@@ -82,6 +82,29 @@ fn run_prefetch(config: &Config, scratch: &ScratchDir, limit: Duration) -> io::R
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn private_cargo_checkout_replaces_only_the_checkout_bind() {
+    let scratch = ScratchDir::new("private-cargo-view");
+    let source = scratch.join("host/workspace");
+    let caller = scratch.join("caller/workspace");
+    let sibling = scratch.join("caller/sibling");
+    let snapshot = scratch.join("snapshots/sibling");
+    let private = scratch.join("host/.cargo-prefetch-private");
+    let view = View::prefetch_tree(&source, &caller, &[(snapshot.clone(), sibling.clone())])
+        .unwrap()
+        .keep(&scratch.join("cargo-home"), true)
+        .private_checkout(&private, &caller);
+    assert_eq!(view.read_write, [(private.clone(), caller.clone())]);
+    assert_eq!(view.read_only, [(snapshot, sibling)]);
+    assert_eq!(view.kept, [(scratch.join("cargo-home"), true)]);
+    assert_eq!(
+        view.inside(&private.join("Cargo.toml")),
+        caller.join("Cargo.toml")
+    );
+    assert!(!view.bound(&source));
+}
+
+#[test]
 fn snapshot_helper_settlement_failure_is_typed_and_names_the_unit() {
     let scratch = ScratchDir::new("snapshot-unsettled");
     let mut config = ending(&scratch, SUCCEEDED);

@@ -710,7 +710,8 @@ fn stale_locked_mirror(offline: bool) {
         &rustup,
         None,
     );
-    let result = crate::isolation::cargo_prefetch_admission(Uuid::now_v7(), !offline, result);
+    let result =
+        crate::isolation::cargo_prefetch_admission(Uuid::now_v7(), !offline, result.map(|_| ()));
     assert_eq!(
         fs::read_to_string(workspace.join("Cargo.lock")).unwrap(),
         lock,

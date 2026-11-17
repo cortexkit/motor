@@ -2360,6 +2360,18 @@ fn javascript_setup_check_installs_every_lockfile_kind_with_the_configured_tools
     );
 }
 
+#[test]
+fn cargo_stale_lock_advisory_precedes_job_stderr_without_shell_interpolation() {
+    let expected = "warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, and the job's Cargo.lock is unchanged. Update it in the job with `cargo update` (offline works) or by building without --locked.\njob stderr\n";
+    for durable in [false, true] {
+        let f = Fixture::new();
+        assert_eq!(
+            run_warning_job(&f, &[cargo_fetch::STALE_LOCK_WARNING.into()], durable),
+            expected
+        );
+    }
+}
+
 fn run_warning_job(f: &Fixture, warnings: &[String], durable: bool) -> String {
     use std::io::Write;
     let runtime = f.scratch.join("warning-runtime");
