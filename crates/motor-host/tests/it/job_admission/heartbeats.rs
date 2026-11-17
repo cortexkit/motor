@@ -162,6 +162,103 @@ fn unknown_hint_reuses_idle_disk_and_busy_hint_or_unknown_hint_queues() {
     assert_eq!(h.snapshot.per_job.disks.len(), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn stored_terminal_makes_attached_disk_idle_for_at_most_sixty_seconds() {
+    for host_settled in [false, true] {
+        let mut h = memory_host(10_000);
+        let (connection, _) = h.claim(job(JOB), AT).unwrap();
+        let id = h.begin_job_boot(JOB).unwrap().unwrap().disk_id;
+        h.delivered(connection).unwrap();
+        assert!(h.heartbeat(AT, 0, true).warm[0].busy);
+        if host_settled {
+            h.job_boot_failed(JOB, AT).unwrap();
+            assert!(h.snapshot.billing[JOB].host_settled);
+        } else {
+            h.receive_terminal(JOB, super::super::billing::terminal(JOB, "exit"), AT)
+                .unwrap();
+            assert!(h.snapshot.billing[JOB].terminal.is_some());
+        }
+        // The active job remains in the FIFO, but no successor is waiting.
+        assert_eq!(h.snapshot.per_job.disks[&id].queue, [JOB]);
+        assert_eq!(
+            h.snapshot.per_job.disks[&id].attached_job.as_deref(),
+            Some(JOB)
+        );
+        assert!(!h.heartbeat(AT, 0, true).warm[0].busy);
+
+        let mut restarted = Host::new(
+            h.tenants.clone(),
+            h.snapshot.clone(),
+            Box::<MemoryJournal>::default(),
+        );
+        restarted.settings = h.settings.clone();
+        assert!(restarted.heartbeat(AT, 0, true).warm[0].busy);
+
+        h.snapshot.per_job.disks.get_mut(&id).unwrap().quarantined = true;
+        assert!(h.heartbeat(AT, 0, true).warm[0].busy);
+        h.snapshot.per_job.disks.get_mut(&id).unwrap().quarantined = false;
+        h.snapshot.per_job.disks.get_mut(&id).unwrap().recovery = Some(Recovery {
+            id: JOB2.into(),
+            memory_debit_mib: 120,
+            guest_ram_mib: 134,
+            started_at_ms: Some(AT),
+            phase: Phase::Running,
+            retry_after_ms: None,
+        });
+        assert!(h.heartbeat(AT, 0, true).warm[0].busy);
+        h.snapshot.per_job.disks.get_mut(&id).unwrap().recovery = None;
+
+        disk(&mut h, "older", AT - 1);
+        disk(&mut h, "newer", AT + 1);
+        let warm = h.heartbeat(AT, 0, true).warm;
+        assert!(warm.iter().all(|entry| !entry.busy));
+        assert_eq!(
+            warm.iter()
+                .map(|entry| entry.vm.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", id.as_str(), "older"]
+        );
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        h.receive_terminal(
+            JOB,
+            super::super::billing::terminal(JOB, "exit"),
+            AT + 59_000,
+        )
+        .unwrap();
+        assert!(!h.heartbeat(AT + 59_000, 0, true).warm[1].busy);
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let warm = h.heartbeat(AT + 61_000, 0, true).warm;
+        assert_eq!(warm[0].vm, id);
+        assert!(
+            warm[0].busy,
+            "a duplicate terminal must not renew the idle window"
+        );
+    }
+}
+
+#[test]
+fn terminal_disk_still_queues_successor_until_vm_release() {
+    let mut h = memory_host(10_000);
+    h.claim(job(JOB), AT).unwrap();
+    let id = h.begin_job_boot(JOB).unwrap().unwrap().disk_id;
+    h.receive_terminal(JOB, super::super::billing::terminal(JOB, "exit"), AT)
+        .unwrap();
+    assert!(!h.heartbeat(AT, 0, true).warm[0].busy);
+    h.claim(job(JOB2), AT).unwrap();
+    let disk = &h.snapshot.per_job.disks[&id];
+    assert_eq!(disk.queue.iter().position(|job| job == JOB2), Some(1));
+    assert_eq!(h.snapshot.per_job.executions[JOB2].disk_id, id);
+    assert!(h.heartbeat(AT, 0, true).warm[0].busy);
+    assert!(h.begin_job_boot(JOB2).unwrap().is_none());
+    h.job_stopped(JOB, false).unwrap();
+    assert_eq!(h.begin_job_boot(JOB2).unwrap().unwrap().disk_id, id);
+    assert_eq!(
+        h.snapshot.per_job.disks[&id].attached_job.as_deref(),
+        Some(JOB2)
+    );
+    assert!(h.heartbeat(AT, 0, true).warm[0].busy);
+}
+
 #[test]
 fn warm_limit_uses_disk_recency_after_execution_retention_and_busy_priority() {
     let mut h = memory_host(1000);

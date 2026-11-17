@@ -279,6 +279,8 @@ pub struct Host {
     advert: BTreeMap<String, advertise::TenantAdvert>,
     pub(crate) broker_draining: bool,
     pub(crate) broker_heartbeat_at_ms: Option<u64>,
+    // Only terminals committed by this process can make an attached disk idle.
+    job_terminal_stored_at: BTreeMap<String, tokio::time::Instant>,
     pub(crate) lost_checks: BTreeMap<String, crate::billing::LostCheck>,
     host_resources: Option<jobs::HostResources>,
     job_residents: BTreeMap<String, jobs::residency::ResidentMemory>,
@@ -331,6 +333,7 @@ impl Host {
             advert: BTreeMap::new(),
             broker_draining: false,
             broker_heartbeat_at_ms: None,
+            job_terminal_stored_at: BTreeMap::new(),
             lost_checks: BTreeMap::new(),
             host_resources: None,
             job_residents: BTreeMap::new(),
@@ -409,6 +412,7 @@ impl Host {
             crate::billing::mark_overlap(&mut next, &unended);
         }
         self.journal.store(&next)?;
+        self.update_job_warm_state(&next);
         self.job_memory_reservations.retain(|job| {
             next.per_job
                 .executions
