@@ -12,7 +12,7 @@ const ONLINE_TIMEOUT: Duration = Duration::from_secs(120);
 #[path = "cargo_fetch_tests.rs"]
 mod private_tests;
 
-pub(super) const STALE_LOCK_WARNING: &str = "warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, and the job's Cargo.lock is unchanged. Update it in the job with `cargo update` (offline works) or by building without --locked.\n";
+pub(super) const STALE_LOCK_WARNING: &str = "warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, but the job's Cargo.lock is unchanged and read-only, like every tracked file. To let Cargo rewrite it in the job (offline works), name Cargo.lock as a returned file (`ck motor run --return-path`, or return_paths); the updated lock then comes back. Otherwise run `cargo update` before submitting.\n";
 
 /// A fresh Cargo home prevents a warm tenant cache or the offline fallback from
 /// hiding a broken online preparation path. The caller runs the production helper.

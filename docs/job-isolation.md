@@ -219,7 +219,7 @@ locked-only Cargo preparation.
 After a successful unlocked fetch, the job's stderr starts with one advisory:
 
 ```text
-warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, and the job's Cargo.lock is unchanged. Update it in the job with `cargo update` (offline works) or by building without --locked.
+warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, but the job's Cargo.lock is unchanged and read-only, like every tracked file. To let Cargo rewrite it in the job (offline works), name Cargo.lock as a returned file (`ck motor run --return-path`, or return_paths); the updated lock then comes back. Otherwise run `cargo update` before submitting.
 ```
 
 Tests: `stale_locked_fetch_runs_exactly_one_online_unlocked_fetch_on_a_copy`,

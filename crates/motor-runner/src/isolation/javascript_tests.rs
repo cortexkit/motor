@@ -2362,7 +2362,7 @@ fn javascript_setup_check_installs_every_lockfile_kind_with_the_configured_tools
 
 #[test]
 fn cargo_stale_lock_advisory_precedes_job_stderr_without_shell_interpolation() {
-    let expected = "warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, and the job's Cargo.lock is unchanged. Update it in the job with `cargo update` (offline works) or by building without --locked.\njob stderr\n";
+    let expected = "warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, but the job's Cargo.lock is unchanged and read-only, like every tracked file. To let Cargo rewrite it in the job (offline works), name Cargo.lock as a returned file (`ck motor run --return-path`, or return_paths); the updated lock then comes back. Otherwise run `cargo update` before submitting.\njob stderr\n";
     for durable in [false, true] {
         let f = Fixture::new();
         assert_eq!(
