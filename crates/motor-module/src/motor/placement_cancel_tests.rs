@@ -27,6 +27,7 @@ fn motor(h: &Harness, root: &Path, repo: &Path) -> Motor {
         Arc::new(NoSsh(AtomicUsize::new(0))),
     )
     .unwrap()
+    .with_module_secrets(crate::hosted_salt::tests::FakeVault::new(Some(vec![7; 32])))
 }
 
 async fn assert_cancelled(motor: &Motor, h: &Harness, id: Uuid, stream: JobStream) {

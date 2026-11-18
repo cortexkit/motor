@@ -24,7 +24,8 @@ async fn runner_reported_outcome_unknown_logs_its_cause() {
         &scratch.0.join("state"),
         Arc::new(NoSsh(AtomicUsize::new(0))),
     )
-    .unwrap();
+    .unwrap()
+    .with_module_secrets(crate::hosted_salt::tests::FakeVault::new(Some(vec![7; 32])));
     let captured = crate::logging::Captured::default();
     let _logs = crate::logging::scoped(captured.clone());
     let args = crate::cli::RunArgs {

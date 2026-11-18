@@ -556,8 +556,9 @@ async fn keyed_hosted_route_reattaches_without_second_run() {
     let (_checkout, repo) = crate::hosted::boat_tests::committed_repo();
     let root = scratch.join("state");
     let config = boat.config.clone();
-    let motor =
-        Motor::with_connector(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let motor = Motor::with_connector(config.clone(), &root, Arc::new(ResubmitPeer::new()))
+        .unwrap()
+        .with_module_secrets(crate::hosted_salt::tests::FakeVault::new(Some(vec![7; 32])));
     let request = request(&repo);
     let stream = motor
         .submit_agent(request.clone(), None, PRINCIPAL)
@@ -579,7 +580,9 @@ async fn keyed_hosted_route_reattaches_without_second_run() {
     );
     assert!(motor.hosted_state(id).unwrap().run_sent);
     motor.close().await;
-    let motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+    let motor = Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new()))
+        .unwrap()
+        .with_module_secrets(crate::hosted_salt::tests::FakeVault::new(Some(vec![7; 32])));
     let replay = records(motor.submit_agent(request, None, PRINCIPAL).await.unwrap()).await;
     attached(&replay, id);
     let replay_accepted = replay
