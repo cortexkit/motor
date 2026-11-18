@@ -525,7 +525,8 @@ fn stated_token_memory_uses_the_placed_tenants_ram_minus_heartbeat_reserve() {
             (motor_lease::memory_max_mib(vcpus), true),
             (74_752, true),
             (75_776, false),
-            (2048 * u64::from(vcpus) - 1024, false),
+            (motor_lease::first_party_mem_floor_mib(vcpus), true),
+            (motor_lease::first_party_mem_floor_mib(vcpus) - 1024, false),
             (2048 * u64::from(vcpus) + 1, false),
         ] {
             c.mem_mib = memory;

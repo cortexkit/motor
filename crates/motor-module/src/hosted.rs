@@ -789,14 +789,22 @@ fn resource_mismatch(
             format!("{}..={}", range.start(), range.end()),
         )
     } else if let Some(stated) = body.mem_mib {
-        let effective = stated.max(2048 * u64::from(body.vcpus));
-        (claims.mem_mib == effective, effective.to_string())
+        // The broker raises stated memory to the host's default, 2 GiB per
+        // vCPU clamped to that host's per-job ceiling, which the requester
+        // doesn't know. Accept any whole-GiB figure between the clamped and
+        // unclamped raise.
+        let most = stated.max(2048 * u64::from(body.vcpus));
+        let least = stated.max(motor_lease::first_party_mem_floor_mib(body.vcpus));
+        (
+            claims.mem_mib.is_multiple_of(1024) && (least..=most).contains(&claims.mem_mib),
+            format!("{least}..={most}"),
+        )
     } else {
         (
             motor_lease::first_party_mem_mib_accepted(body.vcpus, claims.mem_mib),
             format!(
                 "whole GiB >= {} MiB, or retained {} or {} MiB",
-                2048 * u64::from(body.vcpus),
+                motor_lease::first_party_mem_floor_mib(body.vcpus),
                 motor_lease::job_memory_mib(body.vcpus),
                 motor_lease::memory_max_mib(body.vcpus)
             ),

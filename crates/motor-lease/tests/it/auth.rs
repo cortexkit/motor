@@ -722,20 +722,25 @@ fn refused_tokens_name_their_first_failed_check() {
 }
 
 /// Both retained formulas remain valid, including half-GiB values and values
-/// below the new default. Other memory must be whole GiB at the 2 GiB/vCPU floor.
+/// below the new default. Other memory must be whole GiB at the floor: 2 GiB
+/// per vCPU, at most 16 GiB, because the broker clamps its default to the
+/// placed host's per-job ceiling (20 vCPUs on a 32 GiB host state 32 GiB).
 #[test]
 fn first_party_host_accepts_stated_memory_and_both_retained_formulas() {
     let key = SigningKey::from_bytes(&[1; 32]);
     let host = claims().aud;
-    for vcpus in 1..=16 {
+    for vcpus in 1..=28 {
         let mut c = claims();
         c.vcpus = vcpus;
+        let floor = first_party_mem_floor_mib(vcpus);
         for (mem_mib, accepted) in [
             (2048 * u64::from(vcpus), true),
+            (floor, true),
+            (32768, true),
             (job_memory_mib(vcpus), true),
             (memory_max_mib(vcpus), true),
             (65536, true),
-            (2048 * u64::from(vcpus) - 1024, false),
+            (floor - 1024, false),
             (2048 * u64::from(vcpus) + 1, false),
         ] {
             c.mem_mib = mem_mib;

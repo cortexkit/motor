@@ -38,13 +38,23 @@ pub fn job_memory_mib(vcpus: u32) -> u64 {
     (u64::from(vcpus) * 3584).clamp(4096, 16384)
 }
 
-/// Whether a first-party token carries whole-GiB memory at the 2 GiB/vCPU
-/// floor, or either retained broker formula. Hosts additionally bound stated
-/// memory by the placed tenant's RAM minus its configured reserve.
+/// The smallest memory a first-party token may state for `vcpus` without a
+/// retained formula. The broker's default is 2 GiB per vCPU, clamped to the
+/// placed host's per-job memory ceiling, which only the broker knows. The
+/// floor therefore stops at 16 GiB, the smallest ceiling the broker sets for a
+/// first-party host: a 20-vCPU job on a host capped at 32 GiB is stated as
+/// 32 GiB, not 40 GiB.
+pub fn first_party_mem_floor_mib(vcpus: u32) -> u64 {
+    (2048 * u64::from(vcpus)).min(16384)
+}
+
+/// Whether a first-party token carries whole-GiB memory at the floor, or
+/// either retained broker formula. Hosts additionally bound stated memory by
+/// the placed tenant's RAM minus its configured reserve.
 pub fn first_party_mem_mib_accepted(vcpus: u32, mem_mib: u64) -> bool {
     mem_mib == job_memory_mib(vcpus)
         || mem_mib == memory_max_mib(vcpus)
-        || (mem_mib.is_multiple_of(1024) && mem_mib >= 2048 * u64::from(vcpus))
+        || (mem_mib.is_multiple_of(1024) && mem_mib >= first_party_mem_floor_mib(vcpus))
 }
 
 /// The smallest memory per leased vCPU a Boat token may state. Below 1 GiB per

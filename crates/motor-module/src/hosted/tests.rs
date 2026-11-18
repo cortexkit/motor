@@ -1635,6 +1635,32 @@ fn cloud_stated_memory_lease_body_hash_and_stored_bytes_match_vectors() {
                 resource_mismatch(&claims, &body, false).unwrap().0,
                 "mem_mib"
             );
+            // The broker raises stated memory to a host default it clamps to
+            // that host's per-job ceiling: 20 vCPUs stating 8 GiB on a 32 GiB
+            // host get 32 GiB, not 40 GiB. Both raises are accepted; less than
+            // the 16 GiB floor, or more than the unclamped raise, is not.
+            let mut wide = body.clone();
+            wide.vcpus = 20;
+            wide.mem_mib = Some(8192);
+            claims.vcpus = 20;
+            for (mem_mib, accepted) in [
+                (32768, true),
+                (40960, true),
+                (16384, true),
+                (15360, false),
+                (41984, false),
+                (32769, false),
+            ] {
+                claims.mem_mib = mem_mib;
+                assert_eq!(
+                    resource_mismatch(&claims, &wide, false).map(|m| m.0),
+                    (!accepted).then_some("mem_mib"),
+                    "{name} {mem_mib}"
+                );
+            }
+            wide.mem_mib = None;
+            claims.mem_mib = 32768;
+            assert_eq!(resource_mismatch(&claims, &wide, false), None, "{name}");
         }
     }
 }
