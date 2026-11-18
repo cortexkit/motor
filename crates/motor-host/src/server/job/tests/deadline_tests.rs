@@ -1,4 +1,70 @@
+use super::heartbeat_tests::{hold_disk_waiter_memory, memory_sample};
 use super::*;
+
+#[tokio::test]
+async fn cancelling_a_memory_waiter_releases_its_hold() {
+    let (runtime, _, _) = fixture();
+    let ready = hold_disk_waiter_memory(&mut runtime.host.lock().unwrap());
+    let frame = json!({"type":"cancel", "job_id":JOB2});
+    assert!(cancel(
+        &runtime,
+        &claims(JOB2),
+        &mut tokio::io::sink(),
+        &frame,
+        0,
+        None
+    )
+    .await
+    .unwrap());
+    let host = runtime.host.lock().unwrap();
+    assert!(host.snapshot.per_job.executions[JOB2].ended);
+    assert_eq!(host.job_placeable_mem_mib(ready + 60_000), 70);
+}
+
+#[test]
+fn queue_wait_limit_releases_the_memory_hold_without_extending_the_deadline() {
+    let (runtime, _, _) = fixture();
+    let ready = hold_disk_waiter_memory(&mut runtime.host.lock().unwrap());
+    let launch = Arc::new(Launch::default());
+    *launch.boot_ready_at_ms.lock().unwrap() = Some(ready);
+    *launch.prestart_limit_ms.lock().unwrap() = Some(70_000);
+    runtime
+        .job_launches
+        .lock()
+        .unwrap()
+        .insert(JOB2.into(), launch);
+
+    let deadline = ready + 70_000 + crate::billing::BACKSTOP_CANCEL_GRACE_MS;
+    memory_sample(&mut runtime.host.lock().unwrap(), deadline - 1, 140);
+    runtime.tick_jobs(deadline - 1).unwrap();
+    assert_eq!(
+        runtime
+            .host
+            .lock()
+            .unwrap()
+            .job_placeable_mem_mib(deadline - 1),
+        0
+    );
+    let logs = crate::test_logs::capture(|| runtime.tick_jobs(deadline).unwrap());
+    assert_eq!(
+        logs.iter()
+            .filter(|line| line.contains("job_memory_hold_ended ")
+                && line.contains(JOB2)
+                && line.contains("reason=\"ended\" "))
+            .count(),
+        1,
+        "{logs:?}"
+    );
+    let host = runtime.host.lock().unwrap();
+    assert_eq!(host.job_placeable_mem_mib(deadline), 70);
+    assert!(host.snapshot.per_job.executions[JOB2].ended);
+    assert!(host
+        .host_settled_frames(JOB2, 0)
+        .unwrap()
+        .iter()
+        .any(|frame| frame["type"] == "terminal"
+            && frame["outcome"]["reason"] == "queue_wait_exceeded"));
+}
 
 #[test]
 fn disk_wait_outlives_token_expiry_before_booting() {

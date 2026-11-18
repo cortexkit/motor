@@ -286,10 +286,12 @@ pub struct Host {
     job_residents: BTreeMap<String, jobs::residency::ResidentMemory>,
     pub(crate) job_vm_file_mib: Option<u64>,
     job_memory_logged: std::cell::Cell<Option<(u64, u64)>>,
-    /// Claims that passed memory admission but have not booted. Restart recovery
-    /// stops every unbooted execution in Runtime::recover_jobs before accepting
-    /// claims, so this set does not need to be stored.
+    /// Reservations from admission and from the oldest boot-ready memory waiter.
+    /// Restart recovery stops unbooted executions before accepting claims, so
+    /// reservations and waiter state need not be stored.
     job_memory_reservations: std::collections::BTreeSet<String>,
+    job_memory_waiters: BTreeMap<String, jobs::MemoryWaiter>,
+    job_memory_waiter_hold: Option<jobs::MemoryWaiterHold>,
     fill_capacity_refused_at_ms: Option<u64>,
     host_resources_failed: std::cell::RefCell<Option<jobs::HostResourcesFailure>>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
@@ -340,6 +342,8 @@ impl Host {
             job_vm_file_mib: None,
             job_memory_logged: std::cell::Cell::new(None),
             job_memory_reservations: Default::default(),
+            job_memory_waiters: BTreeMap::new(),
+            job_memory_waiter_hold: None,
             fill_capacity_refused_at_ms: None,
             host_resources_failed: std::cell::RefCell::new(None),
             job_storage: None,
@@ -420,7 +424,19 @@ impl Host {
                 .is_some_and(|execution| !execution.boot_started && !execution.ended)
         });
         self.update_fork_holds(&next);
+        // Broker and replay writes need not revisit disk waiters unless they
+        // changed the records that determine boot readiness.
+        let boot_state_changed = !self.job_memory_waiters.is_empty()
+            && (next.leases.version() != self.snapshot.leases.version()
+                || next.leases.changed_keys().next().is_some()
+                || next.per_job.executions.version() != self.snapshot.per_job.executions.version()
+                || next.per_job.executions.changed_keys().next().is_some()
+                || next.per_job.disks.version() != self.snapshot.per_job.disks.version()
+                || next.per_job.disks.changed_keys().next().is_some());
         self.snapshot = next;
+        if boot_state_changed {
+            self.update_job_memory_waiters();
+        }
         // The previous snapshot is gone, so its bases are normally owned by
         // this snapshot alone and the changes fold in place.
         self.snapshot.commit();

@@ -17,6 +17,17 @@ pub mod storage;
 
 pub(super) const WARM_WORKSPACE_LIMIT: usize = 64;
 const TERMINAL_IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const WAITER_MEMORY_HOLD_AFTER_MS: u64 = 60_000;
+
+pub(super) struct MemoryWaiter {
+    admission_order: u64,
+    ready_since_ms: Option<u64>,
+}
+
+pub(super) struct MemoryWaiterHold {
+    job: String,
+    started_at: std::time::Instant,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
@@ -428,6 +439,9 @@ impl Host {
             .filter(|fill| !fill.runner_hello)
             .fold(0u64, |sum, fill| sum.saturating_add(fill.memory_debit_mib));
         let hold = self.job_memory_hold(now_ms);
+        let held_for_waiter_mib = self.job_memory_waiter_hold.as_ref().map_or(0, |hold| {
+            self.snapshot.per_job.executions[&hold.job].memory_debit_mib
+        });
         tracing::info!(
             free_mem_mib,
             available_mem_mib = sample.map(|s| s.available_mem_mib),
@@ -442,6 +456,7 @@ impl Host {
             fill_memory_debit_mib,
             disk_waiters,
             held_back_mib = hold.held_back_mib,
+            held_for_waiter_mib,
             resident_samples_stale = hold.resident_samples_stale,
             "job_memory_advertised"
         );
@@ -632,6 +647,14 @@ impl Host {
             self.save(next)?;
             if reserve_memory {
                 self.job_memory_reservations.insert(claims.jti.clone());
+            } else {
+                self.job_memory_waiters.insert(
+                    claims.jti.clone(),
+                    MemoryWaiter {
+                        admission_order: self.next_connection,
+                        ready_since_ms: None,
+                    },
+                );
             }
             if let Some(hinted_vm) = &claims.placement.vm {
                 if hinted_vm != &disk_id {
@@ -664,21 +687,78 @@ impl Host {
     }
 
     pub(crate) fn job_boot_disk_ready(&self, job: &str) -> bool {
-        // Cancellation ends the lease before execution cleanup finishes, so
-        // both records must still permit a boot when authorization is issued.
-        self.snapshot
-            .leases
-            .get(job)
-            .is_some_and(|lease| lease.state != super::LeaseState::Ended)
-            && self.snapshot.per_job.executions.get(job).is_some_and(|e| {
-                let disk = &self.snapshot.per_job.disks[&e.disk_id];
-                !e.boot_started
-                    && !e.ended
-                    && !self.fork_holds.contains_key(&e.disk_id)
-                    && !disk.quarantined
-                    && disk.attached_job.is_none()
-                    && disk.queue.first().map(String::as_str) == Some(job)
+        pending_boot(&self.snapshot, job)
+            .is_some_and(|e| boot_disk_ready(&self.snapshot.per_job, &self.fork_holds, e))
+    }
+
+    pub(super) fn update_job_memory_waiters(&mut self) {
+        let snapshot = &self.snapshot;
+        let fork_holds = &self.fork_holds;
+        self.job_memory_waiters.retain(|job, waiter| {
+            let Some(execution) = pending_boot(snapshot, job) else {
+                return false;
+            };
+            // A saved disk change can interrupt readiness between boot attempts.
+            if waiter.ready_since_ms.is_some()
+                && !boot_disk_ready(&snapshot.per_job, fork_holds, execution)
+            {
+                waiter.ready_since_ms = None;
+            }
+            true
+        });
+        if let Some(hold) = &self.job_memory_waiter_hold {
+            let reason = match self.job_memory_waiters.get(&hold.job) {
+                Some(waiter) if waiter.ready_since_ms.is_some() => return,
+                Some(_) => "not_ready",
+                None if snapshot
+                    .per_job
+                    .executions
+                    .get(&hold.job)
+                    .is_some_and(|e| e.boot_started && !e.ended) =>
+                {
+                    "booted"
+                }
+                None => "ended",
+            };
+            self.end_job_memory_waiter_hold(reason);
+        }
+    }
+
+    fn end_job_memory_waiter_hold(&mut self, reason: &str) {
+        let hold = self
+            .job_memory_waiter_hold
+            .take()
+            .expect("active waiter hold");
+        self.job_memory_reservations.remove(&hold.job);
+        tracing::info!(jti = %hold.job, reason, held_ms = hold.started_at.elapsed().as_millis() as u64, "job_memory_hold_ended");
+    }
+
+    fn maybe_hold_job_memory(&mut self, job: &str, now_ms: u64, debit_mib: u64, free_mib: u64) {
+        if self.job_memory_waiter_hold.is_some() {
+            return;
+        }
+        let Some(waiter) = self.job_memory_waiters.get(job) else {
+            return;
+        };
+        let Some(ready_since_ms) = waiter.ready_since_ms else {
+            return;
+        };
+        let waited_ms = now_ms.saturating_sub(ready_since_ms);
+        if waited_ms < WAITER_MEMORY_HOLD_AFTER_MS
+            || self.job_memory_waiters.values().any(|other| {
+                other.ready_since_ms.is_some_and(|since| {
+                    (since, other.admission_order) < (ready_since_ms, waiter.admission_order)
+                })
             })
+        {
+            return;
+        }
+        self.job_memory_reservations.insert(job.to_owned());
+        self.job_memory_waiter_hold = Some(MemoryWaiterHold {
+            job: job.to_owned(),
+            started_at: std::time::Instant::now(),
+        });
+        tracing::info!(jti = %job, debit_mib, waited_ms, free_mib, "job_memory_hold_started");
     }
 
     pub fn begin_job_boot_at(
@@ -686,19 +766,32 @@ impl Host {
         job: &str,
         now_ms: u64,
     ) -> Result<Option<Execution>, Error> {
-        let execution = self
+        let debit_mib = self
             .snapshot
             .per_job
             .executions
             .get(job)
             .ok_or(Refusal::Auth)
-            .map_err(Error::Refused)?;
+            .map_err(Error::Refused)?
+            .memory_debit_mib;
         if !self.job_boot_disk_ready(job) {
+            if self
+                .job_memory_waiters
+                .get(job)
+                .is_some_and(|waiter| waiter.ready_since_ms.is_some())
+            {
+                self.update_job_memory_waiters();
+            }
             return Ok(None);
+        }
+        if let Some(waiter) = self.job_memory_waiters.get_mut(job) {
+            waiter.ready_since_ms.get_or_insert(now_ms);
         }
         // Replace this claim's reservation with the boot debit under the host lock.
         // Other claims' reservations still count, including those not booting yet.
-        if self.job_free_mem_mib_except(now_ms, Some(job)) < execution.memory_debit_mib {
+        let free_mib = self.job_free_mem_mib_except(now_ms, Some(job));
+        if free_mib < debit_mib {
+            self.maybe_hold_job_memory(job, now_ms, debit_mib, free_mib);
             return Ok(None);
         }
         let mut next = self.snapshot.clone();
@@ -873,6 +966,27 @@ impl Host {
         self.save(next)?;
         Ok(true)
     }
+}
+
+fn pending_boot<'a>(snapshot: &'a super::Snapshot, job: &str) -> Option<&'a Execution> {
+    // Cancellation ends the lease before execution cleanup finishes, so both
+    // records must still permit a boot when authorization is issued.
+    let lease = snapshot.leases.get(job)?;
+    let execution = snapshot.per_job.executions.get(job)?;
+    (lease.state != super::LeaseState::Ended && !execution.boot_started && !execution.ended)
+        .then_some(execution)
+}
+
+fn boot_disk_ready(
+    ledger: &Ledger,
+    fork_holds: &std::collections::BTreeMap<String, forks::Hold>,
+    execution: &Execution,
+) -> bool {
+    let disk = &ledger.disks[&execution.disk_id];
+    !fork_holds.contains_key(&execution.disk_id)
+        && !disk.quarantined
+        && disk.attached_job.is_none()
+        && disk.queue.first() == Some(&execution.claims.jti)
 }
 
 fn same_execution(a: &Claims, b: &Claims) -> bool {
