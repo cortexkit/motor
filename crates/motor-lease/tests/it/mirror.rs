@@ -108,7 +108,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "712acb37cbc18f5a685c2940880179c8793cee9f5265e2fa5fc62439b5bd6afc",
+            "7cd3ba5817c8f214cf1025cf418515027d0e178e5d572f63791c44665b01449f",
         ),
         (
             "boat-only-lease.json",
@@ -152,7 +152,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "stated-memory-lease.json",
-            "c82ae45c2974f948605eab5244154be67a84115056c62eda66667f96d57bc288",
+            "147ceaa37d373ed5848edff87e715e1ae410ffb9957e1dac5277ebda96ec6052",
         ),
         (
             "no-spill-lease.json",

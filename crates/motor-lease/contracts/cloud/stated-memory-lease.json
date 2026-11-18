@@ -175,7 +175,7 @@
       "retry_after": null,
       "body": {
         "error": "no_host_fits",
-        "max_vcpus": 0,
+        "max_vcpus": 8,
         "max_mem_mib": 16384
       }
     }

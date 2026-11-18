@@ -9,7 +9,7 @@
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "712acb37cbc18f5a685c2940880179c8793cee9f5265e2fa5fc62439b5bd6afc",
+      "sha256": "7cd3ba5817c8f214cf1025cf418515027d0e178e5d572f63791c44665b01449f",
       "source_repository": "cortexkit-cloud",
       "source_commit": "692ce724db42e653811b72832069a1bff4695459",
       "source_path": "docs/runners-contract.md",
@@ -57,7 +57,7 @@
     },
     {
       "path": "cloud/stated-memory-lease.json",
-      "sha256": "c82ae45c2974f948605eab5244154be67a84115056c62eda66667f96d57bc288",
+      "sha256": "147ceaa37d373ed5848edff87e715e1ae410ffb9957e1dac5277ebda96ec6052",
       "source_repository": "cortexkit-cloud",
       "source_commit": "db284d495f77190f2b3795fb7904e20a07e671dc",
       "source_path": "test-vectors/runners/stated-memory-lease.json",

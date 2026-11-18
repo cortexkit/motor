@@ -37,7 +37,7 @@ Payload keys occur in this order, without whitespace:
 | `jti` | `job_id` |
 | `iat` | `floor(broker_clock_ms / 1000)` at issue |
 | `exp` | `iat + 300` |
-| `vcpus`, `mem_mib`, `platform`, `net` | Leased resources and options |
+| `vcpus`, `mem_mib`, `platform`, `net` | Leased resources and options. `mem_mib` is the effective allocation stored for the current placement (the selected host's allocation or the Boat size's usable memory). |
 | `placement` | `{"host":"<host id>","vm":"<warm VM id>"}` in that key order, or `vm: null` for cold placement |
 | `max_s` | Run limit enforced by the host from job start, not token issue |
 | `cnf` | `{"jkt":"<thumbprint>"}` |
@@ -84,8 +84,8 @@ the broker emits it: leave the switch off until MOTOR (the host owner) confirms 
 verifier accepts it. With the switch off, existing payload and signed token bytes are unchanged. With it on,
 registered-host run and attach tokens append the claim after `cache_write` when present,
 otherwise after `workspace_key_hash` when present, or after `purpose` otherwise. Boat placements
-never carry it. The value stays the same across
-re-request, re-sign, reattach and replace because it is derived from the job's stored `mem_mib`.
+never carry it. Re-requests, re-signs and reattaches use the same stored `mem_mib`; a replacement
+token derives its burst from the allocation on the new host.
 The host may let the working set exceed `mem_mib` by this bounded amount, but may stop a burst
 job first under host memory pressure. File cache never counts towards the working set. Placement,
 host fit and the in-flight ledger reserve only `mem_mib`, never the burst allowance.
@@ -267,11 +267,14 @@ runs only on a registered host (see [Boat placements](#boat-placements)). `net` 
 Optional `mem_mib` is a positive safe integer multiple of 1024 (whole GiB). A wrong type, zero,
 negative or non-multiple is 400 `bad_request` with `field: "mem_mib"`; the common strict JSON
 rules still reject fractional/exponent spellings and unsafe numbers as `field: "body"` before
-schema validation. When stated, effective memory is `max(mem_mib, 2048 × vcpus)` MiB: smaller
-figures are raised to 2 GiB per vCPU, not refused. When absent, the default is `2048 × vcpus` MiB.
-Registered-host placement, the in-flight ledger, the persisted job and the token's `mem_mib` use
-the same effective figure. Hosts enforce the token's figure as the per-job cap. Re-signs, attaches
-and moves retain the job's stored memory, including for jobs created before this default changed.
+schema validation. For a registered host, the default is `min(2048 × vcpus, max_job_mem_mib)` MiB,
+or `2048 × vcpus` if that host's ceiling is unknown (NULL). When `mem_mib` is stated, effective
+memory is the greater of the stated amount and that host's default. A smaller stated amount is
+raised to the default; a stated amount above the host's ceiling is not reduced and cannot fit.
+The fit check, in-flight ledger, persisted job and token's `mem_mib` all use the selected host's
+effective allocation. Hosts enforce the token's figure as the per-job cap. Re-requests, re-signs
+and reattaches keep the stored allocation, including for older jobs. A move computes the allocation
+anew from the original request and the destination host's ceiling. Boat sizing is unchanged.
 `placement_hint` is JSON `null` or exactly `{host, vm}`, both strings following the common name
 grammar, except that `host` may also carry the `boat:` prefix of a Boat placement, so a client can
 send back the placement it was last given. A matching selectable warm placement is preferred; an
@@ -358,10 +361,12 @@ After authentication and schema validation, checks proceed in this order:
    the lease allows spill, Boat is available for its
    platform (enabled, configured, `BOAT_SPILL_ENABLED` `"true"`, with a current image, and
    `timeout_s` at most `BOAT_MAX_TIMEOUT_S`) and a Boat size fits, the lease spills
-   instead. `N` is the largest vCPU count that could be placed: for each candidate, the largest
-   `v` whose `v` and effective memory at `v` both fit its ceilings (0 if none), maximized over
-   candidates, keeping the original stated memory if present. When spill is allowed and Boat is
-   available as above, also maximize over Boat sizes: a size contributes the largest
+   instead. `N` is the largest vCPU count that could be placed across the candidates. For each
+   host, find the largest `v ≤ max_job_vcpus` whose memory fits: use the clamped default at `v`,
+   or the greater of that default and `min(stated mem_mib, max_job_mem_mib)` when memory was stated.
+   This reports the host's CPU ceiling at a memory request it can serve; it does not make the
+   original oversized request fit. When spill is allowed and Boat is available as above, also
+   maximize over Boat sizes: a size contributes the largest
    `v ≤ size.vcpus` for which `max(stated, 2048 × v) ≤ size.mem_mib` (with `stated` taken as 0
    when the lease states no memory), or 0 if none.
    `M` is independently the largest `max_job_mem_mib` among those candidate hosts and, only when
@@ -520,10 +525,11 @@ exactly `{}` with JSON Content-Type. Unknown, claim-only or another tenant's job
    `job_admitted`. A Boat job is admitted at booking, so it is never replaced.
 4. Otherwise the job is placed again, under the rules of
    [Placement, deadlines and metering](#placement-deadlines-and-metering), with the original
-   lease's platform, vCPUs, memory, workspace, `placement_hint` and `avoid_host`, and with every
-   host the job has already been placed on excluded as `avoid_host` is. Only registered hosts are
-   considered: replace never spills to Boat, whatever `allow_spill` said. A binding explicit-only
-   hint stays binding, so such a job has no other host to move to.
+   lease's platform, vCPUs, optional stated memory, workspace, `placement_hint` and `avoid_host`,
+   and with every host the job has already been placed on excluded as `avoid_host` is. The
+   destination host's ceiling determines the effective memory for its hold and token. Only
+   registered hosts are considered: replace never spills to Boat, whatever `allow_spill` said.
+   A binding explicit-only hint stays binding, so such a job has no other host to move to.
 5. If no host is selectable, the answer is **503** `{"error":"no_capacity"}` with
    `Retry-After: 5`, whatever placement's refusal was, and the job stays on its current placement
    unchanged. So is a job recorded before the broker stored what a replace needs (its requester
@@ -1554,7 +1560,8 @@ lease bytes and hash, the account gate's 403, and the 400 for `allow_spill: fals
 
 `test-vectors/runners/stated-memory-lease.json` pins 4-vCPU leases stating 12288 MiB and 2048 MiB
 (tokens carry 12288 and 8192 respectively), their lease hashes, a malformed `mem_mib` refusal and
-a `no_host_fits` reply carrying `max_mem_mib`.
+a `no_host_fits` reply with `max_vcpus: 8` and `max_mem_mib: 16384` for a request above the memory
+ceiling.
 
 `test-vectors/runners/account-closure.json` pins a closed account: its lease refused with the
 final 403 `account_closed` (no `Retry-After`), and a signed heartbeat whose snapshot reports warm
