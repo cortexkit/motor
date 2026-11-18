@@ -99,7 +99,7 @@ fn reserved_job_can_boot_without_debiting_its_reservation_twice() {
 }
 
 #[test]
-fn disk_waiter_reserves_nothing_even_after_its_checkout_is_released() {
+fn disk_waiter_does_not_reserve_memory_immediately_after_its_checkout_is_released() {
     let (runtime, _, _) = fixture();
     let now = unix_ms();
     let mut host = runtime.host.lock().unwrap();
@@ -127,6 +127,262 @@ fn disk_waiter_reserves_nothing_even_after_its_checkout_is_released() {
     assert_eq!(host.job_free_mem_mib(now), 120);
     assert!(host.begin_job_boot_at(JOB2, now).unwrap().is_some());
     assert_eq!(host.job_free_mem_mib(now), 0);
+}
+
+pub(super) fn memory_sample(host: &mut Host, now: u64, available_mem_mib: u64) {
+    host.record_host_resources(HostResources {
+        at_ms: now,
+        available_mem_mib,
+        job_vm_headroom_mib: u64::MAX,
+        vcpu_ceiling: 2,
+        permit_budget: 8,
+    });
+}
+
+fn separate_workspace(job: &str) -> Claims {
+    let mut other = claims(job);
+    other.workspace_key_hash = Some(motor_lease::base64url(&[6; 32]));
+    other
+}
+
+fn assert_waiting(host: &mut Host, job: &str, now: u64) {
+    assert!(host.begin_job_boot_at(job, now).unwrap().is_none());
+}
+
+#[test]
+fn boot_ready_waiter_holds_memory_after_one_minute_and_boots_when_memory_frees() {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    let mut host = runtime.host.lock().unwrap();
+    memory_sample(&mut host, now, 1_000);
+    host.claim(claims(JOB), now).unwrap();
+    host.begin_job_boot_at(JOB, now).unwrap().unwrap();
+    host.job_runner_hello(JOB).unwrap();
+    host.claim(claims(JOB2), now).unwrap();
+
+    let running = separate_workspace("00000000-0000-7000-8000-000000000003");
+    host.claim(running.clone(), now).unwrap();
+    host.begin_job_boot_at(&running.jti, now).unwrap().unwrap();
+    host.job_runner_hello(&running.jti).unwrap();
+
+    assert_waiting(&mut host, JOB2, now);
+    let ready = now + 61_000;
+    host.job_stopped_at(JOB, false, ready).unwrap();
+    assert!(host.job_boot_disk_ready(JOB2));
+    memory_sample(&mut host, ready, 140);
+    assert_waiting(&mut host, JOB2, ready);
+    assert_eq!(host.job_placeable_mem_mib(ready), 70);
+
+    memory_sample(&mut host, ready + 59_999, 140);
+    assert_waiting(&mut host, JOB2, ready + 59_999);
+    assert_eq!(host.job_placeable_mem_mib(ready + 59_999), 70);
+
+    let at = ready + 60_000;
+    memory_sample(&mut host, at, 140);
+    let logs = crate::test_logs::capture(|| {
+        assert_waiting(&mut host, JOB2, at);
+        assert_waiting(&mut host, JOB2, at);
+        host.log_job_memory(at, host.job_placeable_mem_mib(at));
+    });
+    assert_eq!(host.job_placeable_mem_mib(at), 0);
+    let starts: Vec<_> = logs
+        .iter()
+        .filter(|line| line.contains("job_memory_hold_started "))
+        .collect();
+    assert_eq!(starts.len(), 1, "{logs:?}");
+    assert!(starts[0].contains(JOB2));
+    assert!(starts[0].contains("debit_mib=120 "));
+    assert!(starts[0].contains("waited_ms=60000 "));
+    assert!(starts[0].contains("free_mib=90 "));
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("job_memory_advertised ")
+            && line.contains("held_for_waiter_mib=120 ")));
+
+    let mut late = claims("00000000-0000-7000-8000-000000000004");
+    late.workspace_key_hash = Some(motor_lease::base64url(&[7; 32]));
+    late.mem_mib = 60;
+    assert_eq!(
+        host.claim(late, at).unwrap_err().refusal(),
+        crate::state::Refusal::HostFull
+    );
+    assert_waiting(&mut host, JOB2, at);
+
+    host.job_stopped_at(&running.jti, false, at + 1).unwrap();
+    // A Running VM is counted in the host sample until it stops, so the
+    // refreshed sample returns its memory to the host after teardown.
+    memory_sample(&mut host, at + 1, 220);
+    assert_eq!(host.job_free_mem_mib(at + 1), 50);
+    assert_eq!(host.job_placeable_mem_mib(at + 1), 30);
+    let logs = crate::test_logs::capture(|| {
+        assert!(host.begin_job_boot_at(JOB2, at + 1).unwrap().is_some());
+    });
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("job_memory_hold_ended ")
+            && line.contains(JOB2)
+            && line.contains("reason=\"booted\" ")
+            && line.contains("held_ms=")));
+    assert_eq!(host.job_free_mem_mib(at + 1), 50);
+}
+
+#[test]
+fn only_the_longest_boot_ready_waiter_holds_memory() {
+    check_waiter_hold_order(false);
+}
+
+#[test]
+fn simultaneous_boot_ready_waiters_hold_memory_in_admission_order() {
+    check_waiter_hold_order(true);
+}
+
+fn check_waiter_hold_order(tied: bool) {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    let mut host = runtime.host.lock().unwrap();
+    memory_sample(&mut host, now, 1_000);
+    let older = claims("00000000-0000-7000-8000-000000000040");
+    let second_owner = separate_workspace("00000000-0000-7000-8000-000000000003");
+    let mut second = separate_workspace(JOB2);
+    second.mem_mib = 150;
+    host.claim(claims(JOB), now).unwrap();
+    host.claim(second_owner.clone(), now).unwrap();
+    if tied {
+        host.claim(older.clone(), now).unwrap();
+        host.claim(second.clone(), now).unwrap();
+    } else {
+        host.claim(second.clone(), now).unwrap();
+        host.claim(older.clone(), now).unwrap();
+    }
+
+    let ready = now + 1;
+    host.job_stopped_at(JOB, false, ready).unwrap();
+    host.job_stopped_at(&second_owner.jti, false, ready)
+        .unwrap();
+    memory_sample(&mut host, ready, 140);
+    if tied {
+        // Poll in the opposite order from admission, with identical timestamps.
+        assert_waiting(&mut host, &second.jti, ready);
+        assert_waiting(&mut host, &older.jti, ready);
+    } else {
+        assert_waiting(&mut host, &older.jti, ready);
+        assert_waiting(&mut host, &second.jti, ready + 1);
+    }
+
+    let at = ready + 60_001;
+    memory_sample(&mut host, at, 140);
+    assert_waiting(&mut host, &second.jti, at);
+    assert_eq!(
+        host.job_free_mem_mib(at),
+        90,
+        "second waiter must not take the hold"
+    );
+    assert_waiting(&mut host, &older.jti, at);
+    assert_waiting(&mut host, &second.jti, at);
+
+    memory_sample(&mut host, at + 1, 220);
+    assert_eq!(
+        host.job_free_mem_mib(at + 1),
+        50,
+        "only the 120 MiB debit is held"
+    );
+    assert!(host
+        .begin_job_boot_at(&older.jti, at + 1)
+        .unwrap()
+        .is_some());
+    assert_waiting(&mut host, &second.jti, at + 1);
+    memory_sample(&mut host, at + 2, 470);
+    assert_eq!(
+        host.job_free_mem_mib(at + 2),
+        130,
+        "120 MiB booting plus 170 MiB held"
+    );
+    assert!(host
+        .begin_job_boot_at(&second.jti, at + 2)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn losing_disk_readiness_releases_the_hold_and_restarts_the_timer() {
+    let (runtime, _, _) = fixture();
+    let mut host = runtime.host.lock().unwrap();
+    let ready = hold_disk_waiter_memory(&mut host);
+    let at = ready + 60_000;
+    let disk = host.snapshot.per_job.executions[JOB2].disk_id.clone();
+    let logs = crate::test_logs::capture(|| {
+        let mut next = host.snapshot.clone();
+        next.per_job.disks.get_mut(&disk).unwrap().quarantined = true;
+        host.save(next).unwrap();
+        assert_eq!(host.job_free_mem_mib(at), 90);
+        let mut next = host.snapshot.clone();
+        next.per_job.disks.get_mut(&disk).unwrap().quarantined = false;
+        host.save(next).unwrap();
+    });
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("job_memory_hold_ended ")
+            && line.contains(JOB2)
+            && line.contains("reason=\"not_ready\" ")));
+
+    // Readiness was lost and restored without a boot attempt in between.
+    assert_waiting(&mut host, JOB2, at);
+    assert_eq!(host.job_free_mem_mib(at), 90);
+    memory_sample(&mut host, at + 60_000, 140);
+    assert_waiting(&mut host, JOB2, at + 60_000);
+    assert_eq!(host.job_free_mem_mib(at + 60_000), 0);
+}
+
+pub(super) fn hold_disk_waiter_memory(host: &mut Host) -> u64 {
+    let ready = release_disk_for_memory_waiter(host);
+    for now in [ready, ready + 60_000] {
+        memory_sample(host, now, 140);
+        assert_waiting(host, JOB2, now);
+    }
+    assert_eq!(host.job_placeable_mem_mib(ready + 60_000), 0);
+    ready
+}
+
+fn release_disk_for_memory_waiter(host: &mut Host) -> u64 {
+    let now = unix_ms();
+    memory_sample(host, now, 1_000);
+    host.claim(claims(JOB), now).unwrap();
+    host.claim(claims(JOB2), now).unwrap();
+    host.job_stopped_at(JOB, false, now).unwrap();
+    now
+}
+
+#[test]
+fn disk_waiter_that_fits_on_its_first_ready_attempt_boots_without_a_hold() {
+    let (runtime, _, _) = fixture();
+    let mut host = runtime.host.lock().unwrap();
+    let ready = release_disk_for_memory_waiter(&mut host);
+    let at = ready + 60_000;
+    memory_sample(&mut host, at, 170);
+    let logs = crate::test_logs::capture(|| {
+        assert!(host.begin_job_boot_at(JOB2, at).unwrap().is_some());
+    });
+    assert!(!logs
+        .iter()
+        .any(|line| line.contains("job_memory_hold_started ")));
+    assert_eq!(host.job_free_mem_mib(at), 0);
+}
+
+#[test]
+fn claim_with_an_admission_reservation_does_not_start_a_waiter_hold() {
+    let (runtime, _, _) = fixture();
+    let now = unix_ms();
+    let mut host = runtime.host.lock().unwrap();
+    memory_sample(&mut host, now, 1_000);
+    host.claim(claims(JOB), now).unwrap();
+    memory_sample(&mut host, now, 140);
+    assert_waiting(&mut host, JOB, now);
+    let at = now + 60_000;
+    memory_sample(&mut host, at, 140);
+    let logs = crate::test_logs::capture(|| assert_waiting(&mut host, JOB, at));
+    assert!(!logs
+        .iter()
+        .any(|line| line.contains("job_memory_hold_started ")));
 }
 
 #[test]

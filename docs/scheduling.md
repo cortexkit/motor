@@ -209,12 +209,28 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
 - For per-job hosted execution, a claim that passes the host's memory check
   reserves stated memory plus boot overhead before VM boot; the reservation
   reduces admission and advertised free memory. A same-checkout disk waiter
-  holds no memory reservation until it can boot, so a job waiting for its
-  checkout does not hold memory it cannot use yet. The host's pre-start deadline
-  begins once the checkout disk is ready and includes the caller's queue-wait
-  budget plus a cancellation grace period. Expiry before VM boot and Run
-  delivery ends as `refused_before_start` / `queue_wait_exceeded`, with
-  `ran: none` and zero usage.
+  holds no memory reservation while waiting for its checkout. The host's
+  pre-start deadline begins once the checkout disk is ready and includes the
+  caller's queue-wait budget plus a cancellation grace period. Expiry before VM
+  boot and Run delivery ends as `refused_before_start` / `queue_wait_exceeded`,
+  with `ran: none` and zero usage.
+
+  If a job’s checkout disk stays ready for at least one minute but the job still
+  cannot boot for lack of memory, the host reserves that job’s memory and
+  advertises correspondingly less free memory. The host makes at most one such
+  reservation at a time, for the longest-waiting boot-ready job. The reservation
+  ends when the job boots or ends, or if its disk is no longer ready; the usual
+  queue-wait limit still applies. Tests:
+  `boot_ready_waiter_holds_memory_after_one_minute_and_boots_when_memory_frees`,
+  `only_the_longest_boot_ready_waiter_holds_memory`,
+  `simultaneous_boot_ready_waiters_hold_memory_in_admission_order`,
+  `losing_disk_readiness_releases_the_hold_and_restarts_the_timer`,
+  `disk_waiter_that_fits_on_its_first_ready_attempt_boots_without_a_hold`,
+  `claim_with_an_admission_reservation_does_not_start_a_waiter_hold`
+  (`crates/motor-host/src/server/job/tests/heartbeat_tests.rs`),
+  `cancelling_a_memory_waiter_releases_its_hold` and
+  `queue_wait_limit_releases_the_memory_hold_without_extending_the_deadline`
+  (`crates/motor-host/src/server/job/tests/deadline_tests.rs`).
 - An ordinary job's budget is the request's explicit `queue_wait_limit_s`.
   Without one, spill-eligible jobs use `ck-motor`'s `queue_wait_limit_s` setting
   (default 300 seconds); jobs that cannot spill get 30 minutes, capped by their
