@@ -1346,6 +1346,80 @@ async fn relayed_run_alone_sets_return_reservation_and_runner_hints_cannot_chang
     }
 }
 
+#[tokio::test]
+async fn lifecycle_terminal_before_stream_started_keeps_real_result_replayable() {
+    let (runtime, fake, _storage) = fixture();
+    let (host_events, guest_events) = UnixStream::pair().unwrap();
+    *fake.lifecycle.lock().unwrap() = Some(host_events);
+    guest_events.set_nonblocking(true).unwrap();
+    let mut events = tokio::net::UnixStream::from_std(guest_events).unwrap();
+    let (mut client, task, mut guest) = launched(&runtime, &fake).await;
+
+    // The lifecycle channel can deliver the entire job before the job relay
+    // reads its first replay frame. Wait for each state change to be durable.
+    write_frame(&mut events, &json!({"type":"event_replay","through_seq":0}))
+        .await
+        .unwrap();
+    for (seq, event) in [(1, "admitted"), (2, "started"), (3, "terminal")] {
+        write_frame(
+            &mut events,
+            &json!({"type":"event","event_seq":seq,"event":event,"jti":JOB,
+                "mem_working_peak_mib":1,"mem_peak_mib":18}),
+        )
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut events))
+            .await
+            .expect("lifecycle event not acknowledged")
+            .unwrap();
+        assert_eq!(ack, json!({"type":"ack","event_seq":seq}));
+    }
+    let ended_at_ms = {
+        let host = runtime.host.lock().unwrap();
+        let lease = &host.snapshot.leases[JOB];
+        assert_eq!(lease.state, LeaseState::Ended);
+        assert!(lease.started_at_ms.is_some());
+        assert!(host.snapshot.billing[JOB].terminal.is_none());
+        lease.ended_at_ms.unwrap()
+    };
+
+    let records = records();
+    guest.write_all(&records[0]).await.unwrap();
+    let stream = runtime.job_stream(JOB).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stream
+            .with_store(|store| Ok(store.last_seq()))
+            .expect("the delayed Started must not quarantine replay")
+            != Some(0)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the delayed Started must be committed");
+    {
+        let host = runtime.host.lock().unwrap();
+        let lease = &host.snapshot.leases[JOB];
+        assert_eq!(lease.state, LeaseState::Ended);
+        assert_eq!(lease.ended_at_ms, Some(ended_at_ms));
+    }
+    for record in &records[1..] {
+        guest.write_all(record).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for record in &records {
+            assert_eq!(&next_record(&mut client).await.bytes, record);
+        }
+    })
+    .await
+    .expect("the caller must receive the full job stream and real terminal");
+    ack(&runtime, &mut guest).await;
+    drop(client);
+    task.await.unwrap().unwrap();
+    power_off(&runtime, &fake);
+    assert_eq!(replayed(&runtime).await, records);
+}
+
 /// A lifecycle terminal that reaches the host as replayed backlog records the
 /// previous host process's last-alive time as the lease end, which can be hours
 /// old. Return chunks still streaming at that moment once lost their stored

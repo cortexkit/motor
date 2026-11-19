@@ -177,7 +177,7 @@ impl Runtime {
             Ok(store)
         })
         .map_err(|error| {
-            tracing::error!(jti = job, %error, "job_replay_quarantined");
+            tracing::error!(jti = job, error = %format_args!("{error:#}"), "job_replay_quarantined");
             error.to_string()
         });
         let completion = match &store {
@@ -254,7 +254,7 @@ impl Runtime {
                     .block_on(collect(&runtime, &claims, &stream, guest, prelude, rx))
             })();
             if let Err(error) = result {
-                tracing::warn!(jti = claims.jti, %error, "job_runner_channel_failed");
+                tracing::warn!(jti = claims.jti, error = %format_args!("{error:#}"), "job_runner_channel_failed");
                 let timeout = match &runtime.host.lock().expect("host lock").settings {
                     crate::config::HostSettings::PerJob(s) => s.teardown_timeout_ms,
                     _ => unreachable!(),
@@ -290,7 +290,8 @@ async fn collect(
         let runtime = runtime.clone();
         let job = claims.jti.clone();
         tokio::task::spawn_blocking(move || runtime.sync_remote_cache_write_block(&job, true))
-            .await??;
+            .await?
+            .context("sync cache write block before resuming relay")?;
     }
     let guest = match guest {
         Some(guest) => guest,
@@ -357,7 +358,8 @@ async fn collect(
                     };
                     let mut host = runtime.host.lock().expect("host lock");
                     host.note_job_repository(&claims.jti, &run.repository_root)?;
-                    host.job_relayed_run(&claims.jti, !run.return_paths.is_empty())?;
+                    host.job_relayed_run(&claims.jti, !run.return_paths.is_empty())
+                        .context("record relayed Run")?;
                     if let Err(error) = if default_branch_tip {
                         host.note_fill_source(&claims.jti, &run, unix_ms())
                     } else {
@@ -365,7 +367,8 @@ async fn collect(
                     } {
                         tracing::warn!(jti=claims.jti, %error, "fill_export_setup_failed");
                     }
-                    host.delivered(*id)?;
+                    host.delivered(*id)
+                        .context("authorize queued Run delivery")?;
                 }
                 upload.observe(&frame.value)?;
                 write.lock().await.write_all(&frame.bytes).await?;
@@ -467,7 +470,8 @@ async fn collect(
                         .host
                         .lock()
                         .expect("host lock")
-                        .job_run_accepted(&claims.jti)?;
+                        .job_run_accepted(&claims.jti)
+                        .context("record runner Run acceptance")?;
                     store.with_store(|s| s.set_return_limit(limit))?;
                     continue;
                 }
@@ -507,7 +511,8 @@ async fn collect(
                 let seq = frame.value["seq"].as_u64();
                 s.with_store(|s| {
                     let delivery = if frame.value["type"] == "terminal" && !s.ended() {
-                        r.observe_job_frame(&job, &frame.value)?
+                        r.observe_job_frame(&job, &frame.value)
+                            .context("record runner terminal")?
                             .map(|terminal| host_terminal_delivery(terminal, s.last_seq()))
                             .filter(|terminal| *terminal != frame.value)
                             .map(|terminal| -> Result<Vec<u8>> {
@@ -521,7 +526,8 @@ async fn collect(
                     let appended = s.append_delivery(&frame.bytes, delivery.as_deref())?;
                     let mut host = r.host.lock().expect("host lock");
                     if let Some(seq) = seq {
-                        host.watermark(&job, seq)?;
+                        host.watermark(&job, seq)
+                            .context("record replay watermark")?;
                     }
                     drop(host);
                     if appended && frame.value["type"] != "terminal" {
@@ -550,7 +556,9 @@ async fn collect(
                 release_export_tip(runtime, &claims.jti);
                 let runtime = runtime.clone();
                 let job = claims.jti.clone();
-                tokio::task::spawn_blocking(move || runtime.stop_job(&job, false, true)).await??;
+                tokio::task::spawn_blocking(move || runtime.stop_job(&job, false, true))
+                    .await?
+                    .context("stop job VM after runner admission refusal")?;
                 return Ok::<(), anyhow::Error>(());
             }
             if terminal {
@@ -608,7 +616,8 @@ async fn collect(
                         .host
                         .lock()
                         .expect("host lock")
-                        .job_stop_intent(&claims.jti, false)?;
+                        .job_stop_intent(&claims.jti, false)
+                        .context("record clean job VM stop before terminal acknowledgement")?;
                 }
                 let acknowledged = if timed_out {
                     false
@@ -630,7 +639,8 @@ async fn collect(
                     let runtime = runtime.clone();
                     let job = claims.jti.clone();
                     tokio::task::spawn_blocking(move || runtime.stop_job(&job, false, true))
-                        .await??;
+                        .await?
+                        .context("stop job VM after terminal acknowledgement failed")?;
                 }
                 return Ok::<(), anyhow::Error>(());
             }
