@@ -43,6 +43,40 @@ fn body(runtime: &Arc<Runtime>, job: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn delayed_start_still_refuses_never_started_or_revoked_lease() {
+    for started in [false, true] {
+        let (runtime, _, _) = fixture();
+        running(&runtime, JOB, true, started);
+        let mut host = runtime.host.lock().unwrap();
+        host.event_observed(JOB, &event(JOB, 3, TenantEventKind::Terminal), 300, true)
+            .unwrap();
+        if started {
+            assert!(host
+                .finish_request_at(
+                    &crate::billing::Request {
+                        path: "/v1/hosts/test/heartbeat".into(),
+                        body: vec![],
+                        created_ms: 310,
+                        job: None,
+                    },
+                    200,
+                    &json!({"ignored":[JOB]}),
+                    320,
+                )
+                .unwrap());
+            assert_eq!(host.snapshot.leases[JOB].refusal, Some(Refusal::Auth));
+        }
+        let error = host.job_started(JOB, 330).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::state::Error>(),
+            Some(crate::state::Error::Refused(Refusal::Auth))
+        ));
+        assert_eq!(format!("{error:#}"), "job start after lease end: auth");
+        assert_eq!(host.snapshot.leases[JOB].state, LeaseState::Ended);
+    }
+}
+
+#[tokio::test]
 async fn guest_terminal_accounting_reaches_usage_but_not_the_caller_record() {
     for burst in [false, true] {
         for impossible in [false, true] {

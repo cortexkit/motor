@@ -1,5 +1,6 @@
 //! Durable first-writer settlement and helper exit receipts for job VMs.
 use super::{Error, Host, LeaseState, Refusal, Snapshot};
+use anyhow::Context;
 use motor_lease::{OomKill, Usage, UsageOutcome};
 use motor_vm_helper::job::ExitReport;
 use serde::{Deserialize, Serialize};
@@ -105,13 +106,14 @@ impl Receipt {
 }
 
 impl Host {
-    pub fn job_started(&mut self, job: &str, now_ms: u64) -> Result<(), Error> {
+    pub fn job_started(&mut self, job: &str, now_ms: u64) -> anyhow::Result<()> {
         let mut next = self.snapshot.clone();
         let execution = next
             .per_job
             .executions
             .get(job)
-            .ok_or(Error::Refused(Refusal::Auth))?;
+            .ok_or(Error::Refused(Refusal::Auth))
+            .context("job start missing execution")?;
         if execution
             .evidence
             .as_ref()
@@ -122,14 +124,30 @@ impl Host {
         let lease = next
             .leases
             .get_mut(job)
-            .ok_or(Error::Refused(Refusal::Auth))?;
-        if !lease.delivered || lease.state == LeaseState::Ended {
-            return Err(Error::Refused(Refusal::Auth));
+            .ok_or(Error::Refused(Refusal::Auth))
+            .context("job start missing lease")?;
+        if !lease.delivered {
+            return Err(Error::Refused(Refusal::Auth)).context("job start before Run delivery");
+        }
+        if lease.state == LeaseState::Ended {
+            // Lifecycle events and replay frames use separate connections. A
+            // lifecycle terminal can end the lease before replay delivers the
+            // Started we already observed. Keep it in replay without reopening
+            // the lease or changing the lifecycle's billing observation.
+            if lease.refusal.is_none()
+                && lease.started_at_ms.is_some()
+                && next.billing.get(job).is_some_and(|b| {
+                    b.ended_observed_ms.is_some() && b.terminal.is_none() && !b.host_settled
+                })
+            {
+                return Ok(());
+            }
+            return Err(Error::Refused(Refusal::Auth)).context("job start after lease end");
         }
         lease.state = LeaseState::Started;
         lease.started_at_ms.get_or_insert(now_ms);
         next.billing.entry(job.into()).or_default().started_live = true;
-        self.save(next)
+        self.save(next).context("record job start")
     }
     pub fn job_stop_intent(&mut self, job: &str, unclean: bool) -> Result<(), Error> {
         let mut next = self.snapshot.clone();

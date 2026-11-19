@@ -1406,8 +1406,13 @@ async fn lifecycle_terminal_before_stream_started_keeps_real_result_replayable()
     for record in &records[1..] {
         guest.write_all(record).await.unwrap();
     }
-    let terminal = next_type(&mut client, "terminal").await;
-    assert_eq!(terminal["outcome"], json!({"type":"exit","code":0}));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for record in &records {
+            assert_eq!(&next_record(&mut client).await.bytes, record);
+        }
+    })
+    .await
+    .expect("the caller must receive the full job stream and real terminal");
     ack(&runtime, &mut guest).await;
     drop(client);
     task.await.unwrap().unwrap();
