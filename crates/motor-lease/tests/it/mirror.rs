@@ -108,7 +108,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "7cd3ba5817c8f214cf1025cf418515027d0e178e5d572f63791c44665b01449f",
+            "5574d62f7bc4a33a88161e48bcfaec0314d9b87a9028cd903125a90d0f7f915c",
         ),
         (
             "boat-only-lease.json",

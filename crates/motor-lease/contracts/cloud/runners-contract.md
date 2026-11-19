@@ -1205,6 +1205,44 @@ estimates, not a lock: the host's own admission remains the real limit.
 
 Capacity snapshots do not lock hosts or VMs.
 
+**Waiter reservation.** Each request is placed on its own, so when memory frees in small pieces, a
+large request can keep losing to smaller ones. To bound that, the placement object remembers
+requests it had to refuse and reserves a host for the one that has waited longest.
+
+- *Waiter.* A request without a binding hint that is refused 503 `no_capacity` while some host
+  is *eligible* for it becomes a waiter. Eligible means the host passes every selection check
+  except the effective free vCPU and memory fit: role, status, platform, health, generation,
+  `explicit_only`, draining, the drain bound, and the job ceilings `max_job_vcpus` and
+  `max_job_mem_mib`. The placement object stores
+  `{job_id, platform, vcpus, mem_mib, first_refused_ms, last_seen_ms}`. A retry of the same
+  `job_id` refreshes `last_seen_ms` and keeps `first_refused_ms`. The record is removed when the
+  job is placed, or when 90 seconds pass with no retry. At most 256 waiters are kept; when the
+  table is full, the one with the oldest `last_seen_ms` is dropped. A client that books again
+  under a new `job_id` starts a new waiter.
+- *Reservation.* When the oldest waiter of a platform (lowest `first_refused_ms`, then bytewise
+  `job_id`) has waited at least 120,000 ms and that platform has no reservation, it reserves one
+  eligible host. The chosen host has the smallest memory shortfall (`mem_mib` minus effective
+  free memory, floored at 0), then the smallest vCPU shortfall, then the bytewise lowest host id.
+  A platform has at most one reservation at a time. The placement object checks this whenever it
+  answers a placement, in the same transaction.
+- *Effect.* While a host is reserved, only its waiter may be placed there. Every other request
+  skips that host as if it lacked capacity, so it goes to another host, spills to Boat when
+  `allow_spill` permits, or gets 503 `no_capacity` as today. No new refusal code reaches clients.
+  The waiter is placed by the normal rules: on the reserved host once that host's effective free
+  figures cover it, or on any other host that fits it first.
+- *Release.* A reservation ends when its waiter is placed or its waiter record is removed, or
+  15 minutes after it began, whichever comes first. A waiter whose reservation timed out may
+  reserve again at once, but on another eligible host when one exists, so no single host stays
+  reserved for one waiter more than 15 minutes in a row while another could take its turn.
+- *Binding hints.* A request with a binding `placement_hint` never becomes a waiter. It still
+  binds to the hinted host, reserved or not.
+- *Counting.* Each request that skips a reserved host counts once in `host_placement_refusals`
+  under reason `reserved` for that host.
+
+The host's advertised `free_mem_mib` is already net of its own memory holds, so a reserved host
+whose effective figures cover the waiter will admit it. A reservation changes neither host
+admission nor any wire shape.
+
 Every issued registered-host run token, including a lease re-request or replacement, keeps the
 host-lost deadline at least `token_expires_at_ms + max_s × 1000 + 600000`. The deadline is stored
 with the token's expiry before the reply is returned, and the alarm is re-armed: a host can admit
