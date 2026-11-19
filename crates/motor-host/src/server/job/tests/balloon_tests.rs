@@ -123,12 +123,12 @@ fn working_set_heavy_vm_stops_after_timeout_with_durable_host_pressure() {
     let (runtime, fake, _) = fixture();
     running(&runtime, &fake, JOB, 100, 190);
     running(&runtime, &fake, JOB2, 200, 150);
-    tick(&runtime, 1000, 49);
+    tick(&runtime, 1000, 11);
     // Guest RAM is 200: stated 100 plus the sizing floor 50 must survive.
     assert_eq!(balloons(&fake), vec![(JOB.into(), 50)]);
-    tick(&runtime, 1099, 49);
+    tick(&runtime, 1099, 11);
     assert!(!stopped(&runtime, JOB));
-    tick(&runtime, 1100, 49);
+    tick(&runtime, 1100, 11);
     let host = runtime.host.lock().unwrap();
     let e = host.snapshot.per_job.executions[JOB]
         .evidence
@@ -159,6 +159,95 @@ fn working_set_heavy_vm_stops_after_timeout_with_durable_host_pressure() {
 }
 
 #[test]
+fn critical_job_slice_headroom_stops_largest_overage_immediately_with_durable_cause() {
+    let (runtime, fake, storage) = fixture();
+    running(&runtime, &fake, JOB, 100, 190);
+    running(&runtime, &fake, JOB2, 200, 150);
+    fake.capacity_available.store(true, Ordering::SeqCst);
+    *fake.slice_headroom_mib.lock().unwrap() = Some(10);
+    runtime.host.lock().unwrap().enforce_storage();
+    runtime.probe_storage_at(1000);
+
+    runtime.tick_balloon(1000);
+
+    assert!(
+        stopped(&runtime, JOB),
+        "the critical tick must stop the VM without waiting for reclaim"
+    );
+    assert!(!stopped(&runtime, JOB2));
+    assert!(balloons(&fake).is_empty());
+    drop(runtime);
+    let (_, snapshot) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+    let evidence = snapshot.per_job.executions[JOB].evidence.as_ref().unwrap();
+    let stop = evidence.stop.as_ref().unwrap();
+    assert_eq!(stop.cause, StopCause::HostPressure);
+    assert_eq!(stop.at_ms, 1000);
+    assert_eq!(
+        snapshot.billing[JOB].terminal.as_ref().unwrap()["oom_kill"]["cause"],
+        "host_pressure"
+    );
+}
+
+#[test]
+fn critical_stop_waits_for_a_new_sample_before_stopping_another_vm() {
+    let (runtime, fake, _) = fixture();
+    running(&runtime, &fake, JOB, 100, 190);
+    running(&runtime, &fake, JOB2, 200, 150);
+    tick(&runtime, 1000, 10);
+    assert!(stopped(&runtime, JOB));
+    assert!(!stopped(&runtime, JOB2));
+
+    runtime.tick_balloon(1001);
+    assert!(!stopped(&runtime, JOB2));
+    tick(&runtime, 1002, 10);
+    assert!(stopped(&runtime, JOB2));
+}
+
+#[test]
+fn failed_helper_stop_still_consumes_the_critical_sample() {
+    let (runtime, fake, _) = fixture();
+    running(&runtime, &fake, JOB, 100, 190);
+    running(&runtime, &fake, JOB2, 200, 150);
+    fake.fail_stop.store(true, Ordering::Release);
+    tick(&runtime, 1000, 10);
+    {
+        let host = runtime.host.lock().unwrap();
+        let evidence = host.snapshot.per_job.executions[JOB]
+            .evidence
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            evidence.stop.as_ref().unwrap().cause,
+            StopCause::HostPressure
+        );
+    }
+    assert!(!stopped(&runtime, JOB));
+
+    fake.fail_stop.store(false, Ordering::Release);
+    runtime.tick_balloon(1001);
+    assert!(!stopped(&runtime, JOB2));
+    tick(&runtime, 1002, 10);
+    assert!(stopped(&runtime, JOB2));
+}
+
+#[test]
+fn critical_pressure_ignores_balloon_backoff_and_pending_reclaim() {
+    let (runtime, fake, _) = fixture();
+    running(&runtime, &fake, JOB, 100, 150);
+    running(&runtime, &fake, JOB2, 200, 140);
+    fake.fail_balloons.lock().unwrap().insert(JOB.into());
+    tick(&runtime, 1000, 49);
+    tick(&runtime, 1001, 49);
+    let attempts = vec![(JOB.into(), 40), (JOB2.into(), 30)];
+    assert_eq!(balloons(&fake), attempts);
+
+    tick(&runtime, 1002, 9);
+    assert!(stopped(&runtime, JOB));
+    assert!(!stopped(&runtime, JOB2));
+    assert_eq!(balloons(&fake), attempts);
+}
+
+#[test]
 fn pressure_clearing_before_deadline_stops_neither_pending_nor_other_vm() {
     let (runtime, fake, _) = fixture();
     running(&runtime, &fake, JOB, 100, 150);
@@ -177,11 +266,31 @@ fn no_positive_overage_never_touches_vms_and_pressure_advertises_zero() {
     running(&runtime, &fake, JOB, 100, 110);
     running(&runtime, &fake, JOB2, 200, 1);
     tick(&runtime, 1000, 49);
-    tick(&runtime, 100_000, 49);
+    tick(&runtime, 100_000, 0);
     assert!(balloons(&fake).is_empty());
     assert!(!stopped(&runtime, JOB));
     assert!(!stopped(&runtime, JOB2));
     assert_eq!(runtime.host.lock().unwrap().job_free_mem_mib(100_000), 0);
+}
+
+#[test]
+fn stale_critical_sample_cannot_authorize_a_stop() {
+    let (runtime, fake, _) = fixture();
+    running(&runtime, &fake, JOB, 100, 150);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .record_host_resources(HostResources {
+            at_ms: 1000,
+            job_vm_headroom_mib: u64::MAX,
+            available_mem_mib: 10,
+            vcpu_ceiling: 2,
+            permit_budget: 4,
+        });
+    runtime.tick_balloon(1000 + crate::state::MEMORY_FRESH_MS + 1);
+    assert!(!stopped(&runtime, JOB));
+    assert!(balloons(&fake).is_empty());
 }
 
 #[test]

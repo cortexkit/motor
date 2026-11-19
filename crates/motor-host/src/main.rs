@@ -551,7 +551,7 @@ mod config_tests {
         json!({
             "fork_checkouts": false,
             "vcpu_ceiling": 1, "permit_budget": 4,
-            "host_reserve_mib": 1024, "boot_reserve_mib": 256,
+            "host_reserve_mib": 1024, "critical_free_mib": 512, "boot_reserve_mib": 256,
             "per_vm_overhead_mib": 128, "reclaim_timeout_ms": 5000,
             "unused_memory_hold_percent": 25,
             "hysteresis_mib": 512, "workspace_disk_cap_bytes": 10737418240_u64,
@@ -632,6 +632,7 @@ mod config_tests {
             panic!("per-job settings lost")
         };
         assert_eq!(per_job.host_reserve_mib, 1024);
+        assert_eq!(per_job.critical_free_mib, 512);
         assert!(!per_job.fork_checkouts);
         assert_eq!(per_job.boot_deadline_ms, 30000);
         assert_eq!(per_job.workspace_disk_cap_bytes, 10737418240);
@@ -710,6 +711,7 @@ mod config_tests {
             "permit_budget",
             "workspace_growth_reservation_bytes",
             "unused_memory_hold_percent",
+            "critical_free_mib",
         ] {
             let mut missing = value.clone();
             missing["per_job"].as_object_mut().unwrap().remove(field);
@@ -747,6 +749,28 @@ mod config_tests {
             assert!(check_config(&path).unwrap_err().to_string().contains(field));
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn config_check_validates_critical_free_mib() {
+        let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let path = dir.path().join("host.json");
+        let mut value = config();
+        value["mode"] = json!("per_job");
+        value["per_job"] = per_job();
+        for critical in [0, 1024, 1025] {
+            value["per_job"]["critical_free_mib"] = json!(critical);
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let error = check_config(&path).unwrap_err().to_string();
+            assert!(error.contains("per_job.critical_free_mib"), "{error}");
+            assert!(error.contains("greater than 0"), "{error}");
+            assert!(error.contains("less than host_reserve_mib"), "{error}");
+        }
+        for critical in [1, 1023] {
+            value["per_job"]["critical_free_mib"] = json!(critical);
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            check_config(&path).unwrap();
+        }
     }
 
     #[test]

@@ -80,17 +80,14 @@ impl Runtime {
         controller
             .retry_after_ms
             .retain(|job, _| executions.iter().any(|e| &e.claims.jti == job));
-        // A VM can exit between the lifecycle scan and the PATCH. Pace failures
-        // per VM so a stale candidate cannot hammer the helper or starve others.
-        let executions: Vec<_> = executions
-            .into_iter()
-            .filter(|e| {
-                controller
-                    .retry_after_ms
-                    .get(&e.claims.jti)
-                    .is_none_or(|after| now_ms >= *after)
-            })
-            .collect();
+        // A VM can exit between the lifecycle scan and the PATCH. Pace PATCH
+        // failures per VM without letting them hide an overage at critical pressure.
+        let balloon_retry_ready = |job: &str, controller: &Controller| {
+            controller
+                .retry_after_ms
+                .get(job)
+                .is_none_or(|after| now_ms >= *after)
+        };
         if !sample.memory_pressure(settings.host_reserve_mib) {
             // Ending an episode does not deflate until the hysteresis is crossed.
             controller.pending = None;
@@ -98,44 +95,57 @@ impl Runtime {
                 for execution in executions {
                     let job = &execution.claims.jti;
                     // Also reset balloons inherited across a motor-host restart.
-                    if controller.targets.get(job) != Some(&0) {
+                    if balloon_retry_ready(job, controller)
+                        && controller.targets.get(job) != Some(&0)
+                    {
                         self.set_job_balloon(controller, job, 0, execution.guest_ram_mib, now_ms)?;
                     }
                 }
             }
             return Ok(());
         }
+        // Compare the same headroom as the pressure check, before subtracting the reserve.
+        let critical = sample.free_mem_mib(0) <= settings.critical_free_mib;
         let mut vms = Vec::new();
         for execution in executions {
-            let resident = self.control.job_memory(&execution.claims.jti)?;
-            vms.push(vm(&execution, resident, &settings));
-        }
-        if let Some((job, deadline)) = &controller.pending {
-            if now_ms < *deadline || sample.at_ms < *deadline {
-                return Ok(());
+            let job = &execution.claims.jti;
+            if critical || balloon_retry_ready(job, controller) {
+                let resident = self.control.job_memory(job)?;
+                vms.push(vm(&execution, resident, &settings));
             }
-            let victim = vms.iter().find(|v| &v.job == job && v.overage_bytes > 0);
-            if let Some(victim) = victim {
-                self.stop_job_pressure(&victim.job, now_ms)?;
-                controller.pending = None;
-                controller.after_stop_sample_ms = Some(sample.at_ms);
-                // Stop releases RAM asynchronously. Re-measure host memory on the
-                // next tick before selecting another VM, never from this sample.
-                return Ok(());
-            }
-            controller.pending = None;
         }
-        let victim = vms
-            .into_iter()
-            .filter(|v| v.overage_bytes > 0)
-            .max_by(|a, b| {
+        let largest_overage = || {
+            vms.iter().filter(|v| v.overage_bytes > 0).max_by(|a, b| {
                 (a.overage_bytes, a.started_ms, &a.job).cmp(&(
                     b.overage_bytes,
                     b.started_ms,
                     &b.job,
                 ))
-            });
-        if let Some(victim) = victim {
+            })
+        };
+        let stop_victim = if critical {
+            largest_overage()
+        } else if let Some((job, deadline)) = &controller.pending {
+            if now_ms < *deadline || sample.at_ms < *deadline {
+                return Ok(());
+            }
+            vms.iter().find(|v| &v.job == job && v.overage_bytes > 0)
+        } else {
+            None
+        };
+        controller.pending = None;
+        if let Some(victim) = stop_victim {
+            // The stop is recorded before the helper can fail, and releases RAM
+            // asynchronously. Wait for a newer sample before choosing again.
+            controller.after_stop_sample_ms = Some(sample.at_ms);
+            return self.stop_job_pressure(&victim.job, now_ms);
+        }
+        // No positive overage is never a reason to stop an innocent VM. While
+        // either memory floor is breached, admission already returns 0.
+        if critical {
+            return Ok(());
+        }
+        if let Some(victim) = largest_overage() {
             let previous = controller.targets.get(&victim.job).copied().unwrap_or(0);
             let target = previous
                 .saturating_add(victim.overage_bytes.div_ceil(MIB))
@@ -152,12 +162,10 @@ impl Runtime {
             // At the guest floor there may be nothing more to inflate. The
             // reclaim deadline still bounds how long a positive overage lives.
             controller.pending = Some((
-                victim.job,
+                victim.job.clone(),
                 now_ms.saturating_add(settings.reclaim_timeout_ms),
             ));
         }
-        // No positive overage is never a reason to stop an innocent VM. While
-        // either memory floor is breached, admission already returns 0.
         Ok(())
     }
 

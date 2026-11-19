@@ -99,6 +99,7 @@ fn host_settings() -> [motor_host::config::HostSettings; 2] {
             vcpu_ceiling: 2,
             permit_budget: 4,
             host_reserve_mib: 1024,
+            critical_free_mib: 10,
             boot_reserve_mib: 256,
             per_vm_overhead_mib: 128,
             unused_memory_hold_percent: 0,

@@ -306,6 +306,7 @@ out of memory.
 | `vcpu_ceiling` | vCPUs | Maximum job size; 1 through the helper's online CPU count. |
 | `permit_budget` | vCPU permits | Host admission budget with CPU overcommit; at least `vcpu_ceiling`, at most four times online CPUs. |
 | `host_reserve_mib` | MiB | Available-memory floor at both the host and job-VM slice limits for admission and pressure reclamation. |
+| `critical_free_mib` | MiB | Free job-VM memory at or below which a pressure episode stops the running VM furthest above its stated memory plus `per_vm_overhead_mib` at once, instead of waiting `reclaim_timeout_ms` for its balloon to reclaim. A VM within its stated memory is never stopped. It must be greater than 0 and less than `host_reserve_mib`. |
 | `boot_reserve_mib` | MiB | Added to each job's stated memory debit until its runner answers hello, including queued jobs. |
 | `per_vm_overhead_mib` | MiB | Added to stated memory when computing a VM's positive resident-RAM overage. |
 | `unused_memory_hold_percent` | percent (0–100) | Share of each running job's unused stated memory that admission keeps back. |

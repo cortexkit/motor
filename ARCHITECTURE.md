@@ -142,6 +142,7 @@ defaults:
 | `vcpu_ceiling` | Maximum job vCPUs, at most the online CPU count. |
 | `permit_budget` | Host vCPU permits with overcommit, at least the ceiling and at most four times online CPUs. |
 | `host_reserve_mib` | Host available-memory floor in MiB. |
+| `critical_free_mib` | Free job-VM memory in MiB at or below which a pressure episode stops the VM furthest above its stated memory at once, without waiting `reclaim_timeout_ms`. Greater than 0 and less than `host_reserve_mib`. |
 | `boot_reserve_mib` | MiB added to each stated-memory debit until runner hello. |
 | `per_vm_overhead_mib` | MiB added to stated memory before resident guest RAM counts as overage. |
 | `unused_memory_hold_percent` | Share (0–100%) of each running job's unused stated memory that admission keeps back. |

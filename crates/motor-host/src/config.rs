@@ -26,6 +26,7 @@ pub struct PerJobSettings {
     pub vcpu_ceiling: u32,
     pub permit_budget: u32,
     pub host_reserve_mib: u64,
+    pub critical_free_mib: u64,
     pub boot_reserve_mib: u64,
     pub per_vm_overhead_mib: u64,
     #[serde(deserialize_with = "PerJobSettings::deserialize_unused_memory_hold_percent")]
@@ -96,6 +97,11 @@ impl HostSettings {
             HostMode::Tenant => Self::Tenant,
             HostMode::PerJob => {
                 let settings = per_job.context("per_job settings are required")?;
+                ensure!(
+                    settings.critical_free_mib > 0
+                        && settings.critical_free_mib < settings.host_reserve_mib,
+                    "per_job.critical_free_mib must be greater than 0 to leave headroom before exhaustion and less than host_reserve_mib to allow balloon reclaim before an immediate stop"
+                );
                 ensure!(
                     settings.unused_memory_hold_percent <= 100,
                     "per_job.unused_memory_hold_percent must be between 0 and 100"
