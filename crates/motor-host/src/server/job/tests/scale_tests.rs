@@ -210,6 +210,7 @@ fn retained_host(directory: &std::path::Path, finished: usize) -> Host {
         vcpu_ceiling: 2,
         permit_budget: 4,
         host_reserve_mib: 50,
+        critical_free_mib: 10,
         boot_reserve_mib: 20,
         per_vm_overhead_mib: 10,
         unused_memory_hold_percent: 0,

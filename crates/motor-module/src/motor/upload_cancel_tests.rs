@@ -193,6 +193,7 @@ async fn queued_full_spool_cancel_detach_uses_one_connection_and_replays_no_star
         vcpu_ceiling: 8,
         permit_budget: 8,
         host_reserve_mib: 50,
+        critical_free_mib: 10,
         boot_reserve_mib: 20,
         per_vm_overhead_mib: 10,
         unused_memory_hold_percent: 0,
