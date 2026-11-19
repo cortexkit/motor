@@ -80,8 +80,9 @@ impl Runtime {
         controller
             .retry_after_ms
             .retain(|job, _| executions.iter().any(|e| &e.claims.jti == job));
-        // A VM can exit between the lifecycle scan and the PATCH. Pace PATCH
-        // failures per VM without letting them hide an overage at critical pressure.
+        // A VM can exit between the lifecycle scan and its balloon request. Pace
+        // failed balloon requests per VM without letting them hide an overage at
+        // critical pressure.
         let balloon_retry_ready = |job: &str, controller: &Controller| {
             controller
                 .retry_after_ms
