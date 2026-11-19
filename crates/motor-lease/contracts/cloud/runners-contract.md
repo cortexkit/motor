@@ -1236,8 +1236,8 @@ requests it had to refuse and reserves a host for the one that has waited longes
   reserved for one waiter more than 15 minutes in a row while another could take its turn.
 - *Binding hints.* A request with a binding `placement_hint` never becomes a waiter. It still
   binds to the hinted host, reserved or not.
-- *Counting.* Each request that skips a reserved host counts once in `host_placement_refusals`
-  under reason `reserved` for that host.
+- *Counting.* Each request that skips a reserved host counts once in
+  `host_placement_refusals_by_size` under reason `reserved` for that host.
 
 The host's advertised `free_mem_mib` is already net of its own memory holds, so a reserved host
 whose effective figures cover the waiter will admit it. A reservation changes neither host
