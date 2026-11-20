@@ -457,11 +457,11 @@ fn aft() -> Value {
     json!({"kind":"reserved", "module_id":"aft"})
 }
 fn core() -> Value {
-    json!({"kind":"reserved", "module_id":"prefrontal-core"})
-}
-/// The core under its new id; both are admitted while the rename rolls out.
-fn renamed_core() -> Value {
     json!({"kind":"reserved", "module_id":"prefrontal"})
+}
+/// The core's retired id, refused like any other module.
+fn retired_core() -> Value {
+    json!({"kind":"reserved", "module_id":"prefrontal-core"})
 }
 
 #[tokio::test]
@@ -523,36 +523,42 @@ async fn unverified_and_absent_principals_are_refused() {
     }
 }
 #[tokio::test]
+async fn retired_core_id_is_refused_at_bind() {
+    let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+    let reply = rig.bind(retired_core(), Value::Null).await;
+    assert_ne!(reply.header.ty, FrameType::Response);
+    let error: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["code"], "motor_principal_refused");
+    rig.stop().await;
+}
+#[tokio::test]
 async fn core_bind_and_workspace_prepare_are_admitted() {
-    for principal in [core(), renamed_core()] {
-        let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
-        assert_eq!(
-            rig.bind(principal.clone(), Value::Null).await.header.ty,
-            FrameType::Response,
-            "{principal}"
-        );
-        let reply = rig
-            .request(
-                "workspace.prepare",
-                json!({"workspace_key":"/not-a-worktree", "repository_root":"/not-a-repository", "base_commit":"base", "siblings":[]}),
-            )
-            .await;
-        assert_eq!(reply.header.ty, FrameType::Response, "{principal}");
-        // A typed hosted-prepare refusal proves dispatch reached prepare,
-        // without requiring a real remote runner for the admission contract.
-        let reply: motor_protocol::PrepareReply = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(
-            reply.outcome,
-            motor_protocol::PrepareOutcome::RefusedBeforeStart {
-                reason: motor_protocol::RefusalReason::RequestRejected
-            }
-        );
-        assert_eq!(
-            reply.refusal_detail(),
-            Some("hosted_prepare_unsupported: hosted_no_fallback")
-        );
-        rig.stop().await;
-    }
+    let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+    assert_eq!(
+        rig.bind(core(), Value::Null).await.header.ty,
+        FrameType::Response
+    );
+    let reply = rig
+        .request(
+            "workspace.prepare",
+            json!({"workspace_key":"/not-a-worktree", "repository_root":"/not-a-repository", "base_commit":"base", "siblings":[]}),
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    // A typed hosted-prepare refusal proves dispatch reached prepare,
+    // without requiring a real remote runner for the admission contract.
+    let reply: motor_protocol::PrepareReply = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(
+        reply.outcome,
+        motor_protocol::PrepareOutcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(
+        reply.refusal_detail(),
+        Some("hosted_prepare_unsupported: hosted_no_fallback")
+    );
+    rig.stop().await;
 }
 #[tokio::test]
 async fn core_is_refused_exec_run() {
@@ -574,7 +580,7 @@ async fn core_is_refused_exec_run() {
     let reply = rig
         .request("exec.run", serde_json::to_value(request).unwrap())
         .await;
-    assert_op_refused(&reply, "motor", "prefrontal-core", "exec.run");
+    assert_op_refused(&reply, "motor", "prefrontal", "exec.run");
     let stored = crate::storage::durable_value(&rig.root).unwrap();
     assert_eq!(
         stored["jobs"],
@@ -641,7 +647,7 @@ fn basal() -> Value {
 async fn remaining_cross_principal_and_unknown_operations_are_refused_before_params() {
     for (principal, scope, ops) in [
         (
-            "prefrontal-core",
+            "prefrontal",
             Value::Null,
             vec!["exec.attach", "exec.cancel", "exec.status", "unknown"],
         ),
@@ -757,9 +763,9 @@ async fn basal_routes_including_the_retired_health_flow_are_refused_at_bind() {
     // stamp owned by another module all carry the basal principal.
     for scope in [
         Value::Null,
-        flow_scope("some-other-flow", "prefrontal-core", true),
-        flow_scope("motor-build-server-health", "prefrontal-core", true),
-        flow_scope("motor-build-server-health", "prefrontal-core", false),
+        flow_scope("some-other-flow", "prefrontal", true),
+        flow_scope("motor-build-server-health", "prefrontal", true),
+        flow_scope("motor-build-server-health", "prefrontal", false),
         flow_scope("motor-build-server-health", "basal", true),
     ] {
         let mut rig = Rig::with_module_id(
@@ -971,7 +977,7 @@ async fn assert_credential_refusal(class: CredentialErrorClass, reason: &str) {
 #[tokio::test]
 async fn scoped_jobs_persist_session_preset_and_scope_without_preset_policy() {
     let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
-    let scope = json!({"owner":{"kind":"reserved", "module_id":"prefrontal-core"}, "ref":"scope-42", "scope_epoch":9, "kind":"head", "attributes":{}, "owner_authorized":true});
+    let scope = json!({"owner":{"kind":"reserved", "module_id":"prefrontal"}, "ref":"scope-42", "scope_epoch":9, "kind":"head", "attributes":{}, "owner_authorized":true});
     assert_eq!(rig.bind(aft(), scope).await.header.ty, FrameType::Response);
     for preset in ["mason", "unknown-to-motor"] {
         let terminal = rig.run(preset).await;

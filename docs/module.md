@@ -253,9 +253,9 @@ operation separately. Binding to the module grants nothing by itself.
 | Caller | Allowed operations |
 | --- | --- |
 | AFT, the agent tool (`reserved:aft`) | `exec.run`, `exec.attach`, `exec.cancel`, `exec.status` |
-| The CortexKit core (`reserved:prefrontal`, or its former id `reserved:prefrontal-core`) | `workspace.prepare`, `workspace.drop` |
+| The CortexKit core (`reserved:prefrontal`) | `workspace.prepare`, `workspace.drop` |
 | A direct local caller, when `admit_direct_exec` is on | `exec.run`, and `exec.attach`, `exec.cancel`, `exec.status` for jobs its route started or whose secret it holds |
-| Any other reserved, direct, unverified or absent principal | Nothing; refused by name |
+| Any other reserved principal, including the core's retired id `reserved:prefrontal-core`, and any direct, unverified or absent principal | Nothing; refused by name |
 
 Tests (`crates/motor-module/tests/it/placement.rs`): `aft_bind_is_admitted`,
 `direct_bind_is_refused_by_name_even_when_harness_claims_aft`,
@@ -263,7 +263,8 @@ Tests (`crates/motor-module/tests/it/placement.rs`): `aft_bind_is_admitted`,
 `core_bind_and_workspace_prepare_are_admitted`, `core_is_refused_exec_run`,
 `aft_is_refused_workspace_prepare`,
 `removed_runner_health_is_refused_like_an_unknown_operation`,
-`other_reserved_principals_are_refused_at_bind`.
+`other_reserved_principals_are_refused_at_bind`,
+`retired_core_id_is_refused_at_bind`.
 
 The daemon's `health.check` reads an in-memory snapshot; it never connects to a
 runner or broker itself. The background sampler ticks every 15 seconds, with a

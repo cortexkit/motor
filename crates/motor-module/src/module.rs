@@ -709,11 +709,10 @@ pub(crate) const HOSTED_TEST_UNAVAILABLE: &str = "motor_hosted_test_unavailable"
 /// What a direct caller gets for a job its route did not start. The bytes are
 /// the same whether the job belongs to another caller or does not exist, so a
 /// direct caller can't learn which job IDs are live.
-/// The CortexKit core's reserved module id. It is moving from `prefrontal-core`
-/// to `prefrontal`, and the daemon attests whichever name the running core uses,
-/// so both are admitted until the old name is retired everywhere.
+/// The CortexKit core's reserved module id. Its former id, `prefrontal-core`, is
+/// retired and refused like any other module.
 fn is_prefrontal(module_id: &str) -> bool {
-    module_id == "prefrontal" || module_id == "prefrontal-core"
+    module_id == "prefrontal"
 }
 
 fn direct_job_not_found(module_id: &str) -> HandlerOutcome {
@@ -1082,7 +1081,7 @@ impl ModuleHandler for Handler {
             Some(Principal::Reserved { module_id }) => {
                 return BindDecision::reject(
                     "motor_principal_refused",
-                    format!("{} refuses reserved:{module_id}; only reserved:aft and reserved:prefrontal-core may bind", self.module_id),
+                    format!("{} refuses reserved:{module_id}; only reserved:aft and reserved:prefrontal may bind", self.module_id),
                 )
             }
         }
@@ -1161,9 +1160,9 @@ impl ModuleHandler for Handler {
                     return Ok(HandlerOutcome::Error {
                         code: "motor_route_not_admitted".into(),
                         message: format!(
-                        "{} requires an admitted reserved:aft or reserved:prefrontal-core route",
-                        self.module_id
-                    ),
+                            "{} requires an admitted reserved:aft or reserved:prefrontal route",
+                            self.module_id
+                        ),
                     })
                 }
             };

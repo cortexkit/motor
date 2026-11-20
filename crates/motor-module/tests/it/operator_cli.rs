@@ -1362,7 +1362,7 @@ async fn project_free_binds_keep_principal_admission() {
             (
                 AFT_CHANNEL + 1,
                 json!({"kind":"reserved", "module_id":"prefrontal-core"}),
-                None,
+                Some("motor_principal_refused"),
             ),
             (
                 AFT_CHANNEL + 2,
