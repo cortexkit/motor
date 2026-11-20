@@ -189,7 +189,14 @@ fn deploy_drain_waits_for_terminal_fill_settlement() {
         );
         drop(held);
         wait_settlement(&runner, job.id);
-        assert_eq!(runner.drain_reply_for(&waiter), Some((false, 0)));
+        // A drain caller polls: one look answers None while another thread
+        // holds the state lock or the settlement's last step is still running.
+        let mut reply = None;
+        assert!(poll(Duration::from_secs(5), || {
+            reply = runner.drain_reply_for(&waiter);
+            reply.is_some()
+        }));
+        assert_eq!(reply, Some((false, 0)));
     });
 }
 
