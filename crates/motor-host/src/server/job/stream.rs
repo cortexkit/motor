@@ -3,6 +3,7 @@
 use super::*;
 use crate::replay::Store;
 use crate::state::jobs::storage::ReplayCompletion;
+use std::cell::Cell;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -15,9 +16,78 @@ pub(super) const GUEST_HEARTBEAT: Duration = Duration::from_secs(5);
 /// 60-second read inactivity limit. Heartbeats are live-only, not replay records.
 pub(super) const CLIENT_HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// Report a stalled spool handover before the runner's 60-second timeout.
+const LIVE_UPLOAD_NOTICE: Duration = Duration::from_secs(10);
+
+// A liveness frame may wait for the caller without holding up input reads.
+// Once a frame is partly written, finish it before any other frame, and keep
+// only the latest liveness update behind it.
+#[derive(Default)]
+struct LivenessWrite {
+    bytes: Vec<u8>,
+    written: usize,
+    latest: Option<Vec<u8>>,
+}
+impl LivenessWrite {
+    fn queue(&mut self, bytes: Vec<u8>) {
+        if self.written == 0 {
+            self.bytes = bytes;
+        } else {
+            self.latest = Some(bytes);
+        }
+    }
+
+    fn queue_frame(&mut self, frame: &Value) -> Result<()> {
+        let body = serde_json::to_vec(frame)?;
+        ensure!(body.len() <= FRAME_LIMIT, "frame too large");
+        self.queue([(body.len() as u32).to_be_bytes().as_slice(), &body].concat());
+        Ok(())
+    }
+
+    fn pending(&self) -> bool {
+        !self.bytes.is_empty()
+    }
+
+    async fn send(&mut self, write: &mut (impl AsyncWrite + Unpin)) -> std::io::Result<()> {
+        // `write` is cancellation-safe in select; retain its progress so a
+        // read winning the select cannot truncate the frame.
+        while self.written < self.bytes.len() {
+            let n = write.write(&self.bytes[self.written..]).await?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            self.written += n;
+        }
+        write.flush().await?;
+        self.written = 0;
+        self.bytes = self.latest.take().unwrap_or_default();
+        Ok(())
+    }
+
+    async fn before_ordered(&mut self, write: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+        // The caller must get ordered output even if liveness updates were
+        // queued. Only bytes already on the wire need to be completed first.
+        self.latest = None;
+        if self.written != 0 {
+            self.send(write)
+                .await
+                .map_err(anyhow::Error::from)
+                .map_err(client_io)?;
+        }
+        self.bytes.clear();
+        Ok(())
+    }
+}
+
 struct Input {
     bytes: Vec<u8>,
     reply: Option<oneshot::Sender<Vec<u8>>>,
+}
+
+#[derive(Clone, Copy)]
+struct CallerUpload {
+    waiting_on: &'static str,
+    liveness_pending: bool,
 }
 
 pub(crate) struct Stream {
@@ -28,6 +98,7 @@ pub(crate) struct Stream {
     runner_heartbeat: watch::Sender<Option<Vec<u8>>>,
     running: AtomicBool,
     upload_detached: AtomicBool,
+    caller_upload: Mutex<CallerUpload>,
     terminal_delivered: AtomicBool,
     terminal_delivery: tokio::sync::Mutex<()>,
     #[cfg(test)]
@@ -199,6 +270,10 @@ impl Runtime {
             runner_heartbeat: watch::channel(None).0,
             running: AtomicBool::new(false),
             upload_detached: AtomicBool::new(false),
+            caller_upload: Mutex::new(CallerUpload {
+                waiting_on: "handover",
+                liveness_pending: false,
+            }),
             terminal_delivered: AtomicBool::new(false),
             terminal_delivery: tokio::sync::Mutex::new(()),
             #[cfg(test)]
@@ -326,6 +401,9 @@ async fn collect(
         String,
         std::collections::VecDeque<oneshot::Sender<Vec<u8>>>,
     >::new());
+    let (replay_finished, watch_handover) = oneshot::channel();
+    let first_live_forwarded = Cell::new(false);
+    let guest_write_pending = Cell::new(false);
     let upload = async {
         let default_branch_tip = prelude.as_ref().is_some_and(|(_, p)| p.default_branch_tip);
         let mut upload = Upload::default();
@@ -383,8 +461,10 @@ async fn collect(
                 elapsed_ms = replay_started.elapsed().as_millis() as u64,
                 "job_upload_replay_finished"
             );
+            if !upload.complete() {
+                let _ = replay_finished.send((received, expected));
+            }
         }
-        let mut live_chunk_seen = false;
         let mut forwarded_logged = upload.complete();
         // The guest runner closes its channel after 60 s without a byte from
         // the host ("wire inactivity"). In tenant mode ck-motor's heartbeats
@@ -418,7 +498,15 @@ async fn collect(
                         }
                     }
                     upload.observe(&frame)?;
-                    if frame["type"] == "bundle_chunk" && !std::mem::replace(&mut live_chunk_seen, true) {
+                    if let Some(reply) = input.reply {
+                        let kind = format!("{}_reply", frame["type"].as_str().context("control type")?);
+                        pending.lock().expect("pending replies").entry(kind).or_default().push_back(reply);
+                    }
+                    guest_write_pending.set(true);
+                    write.lock().await.write_all(&input.bytes).await?;
+                    guest_write_pending.set(false);
+                    last_write = tokio::time::Instant::now();
+                    if frame["type"] == "bundle_chunk" && !first_live_forwarded.replace(true) {
                         let (received, expected) = upload.bytes();
                         tracing::info!(jti = claims.jti, received_bytes = received, expected_bytes = expected, "job_upload_first_live_chunk");
                     }
@@ -426,18 +514,14 @@ async fn collect(
                         forwarded_logged = true;
                         tracing::info!(jti = claims.jti, bytes = upload.bytes().1, "job_upload_forwarded");
                     }
-                    if let Some(reply) = input.reply {
-                        let kind = format!("{}_reply", frame["type"].as_str().context("control type")?);
-                        pending.lock().expect("pending replies").entry(kind).or_default().push_back(reply);
-                    }
-                    write.lock().await.write_all(&input.bytes).await?;
-                    last_write = tokio::time::Instant::now();
                 }
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
             if heartbeats && last_write.elapsed() >= GUEST_HEARTBEAT {
+                guest_write_pending.set(true);
                 let beat =
                     write_frame(&mut *write.lock().await, &json!({"type":"heartbeat"})).await;
+                guest_write_pending.set(false);
                 if let Err(error) = beat {
                     tracing::info!(jti = claims.jti, %error, "guest_heartbeat_stopped");
                     heartbeats = false;
@@ -445,6 +529,33 @@ async fn collect(
                 last_write = tokio::time::Instant::now();
             }
         }
+    };
+    let handover_notice = async {
+        if let Ok((replayed_bytes, expected_bytes)) = watch_handover.await {
+            tokio::time::sleep(LIVE_UPLOAD_NOTICE).await;
+            if !first_live_forwarded.get() {
+                let caller = *store.caller_upload.lock().expect("caller upload");
+                tracing::info!(
+                    jti = claims.jti,
+                    replayed_bytes,
+                    expected_bytes,
+                    live_bytes = 0,
+                    caller_waiting_on = if store.upload_detached.load(Ordering::Acquire) {
+                        "detached"
+                    } else {
+                        caller.waiting_on
+                    },
+                    caller_liveness_pending = caller.liveness_pending,
+                    collector_waiting_on = if guest_write_pending.get() {
+                        "guest_write"
+                    } else {
+                        "input_mailbox"
+                    },
+                    "job_upload_live_waiting"
+                );
+            }
+        }
+        std::future::pending::<Result<()>>().await
     };
     let receive = async {
         // Whether this connection's runner has answered the Run with
@@ -654,7 +765,12 @@ async fn collect(
     };
     #[cfg(not(test))]
     let crashed = std::future::pending::<()>();
-    tokio::select! { result = upload => result, result = receive => result, _ = crashed => Ok(()) }
+    tokio::select! {
+        result = upload => result,
+        result = receive => result,
+        result = handover_notice => result,
+        _ = crashed => Ok(()),
+    }
 }
 
 // Host settlement can be committed before the collector drains its final
@@ -869,6 +985,15 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
     }
     let (mut read, mut write) = tokio::io::split(client);
+    let mut liveness = LivenessWrite::default();
+    let note_input = |waiting_on, liveness: &LivenessWrite| {
+        if !hello {
+            *stream.caller_upload.lock().expect("caller upload") = CallerUpload {
+                waiting_on,
+                liveness_pending: liveness.pending(),
+            };
+        }
+    };
     let mut last_write = tokio::time::Instant::now();
     let mut last_runner_heartbeat = None;
     // Bare host heartbeats tell ck-motor to stop timing a queue; send those
@@ -876,7 +1001,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // (started, output, returned files) comes after that.
     let mut started = false;
     loop {
+        note_input("terminal_delivery", &liveness);
         let delivery = stream.terminal_delivery.lock().await;
+        note_input("replay_cursor", &liveness);
         let s = stream.clone();
         let frame = tokio::task::spawn_blocking(move || {
             s.with_store(|s| s.cursor_frame(position, minimum))
@@ -886,6 +1013,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(frame) => frame,
             Err(_) if !attached => None,
             Err(_) => {
+                note_input("caller_output", &liveness);
+                liveness.before_ordered(&mut write).await?;
                 write_frame(
                     &mut write,
                     &json!({"type":"terminal","job_id":claims.jti,"outcome":{"type":"outcome_unknown"},"wall_ms":0,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null}),
@@ -926,6 +1055,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         .expect("host lock")
                         .terminal_delivered(&claims.jti, unix_ms())?;
                 }
+                note_input("caller_output", &liveness);
+                liveness.before_ordered(&mut write).await?;
                 write
                     .write_all(&bytes)
                     .await
@@ -957,6 +1088,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             continue;
         }
         drop(delivery);
+        note_input("caller_read", &liveness);
         tokio::select! {
             request = reader.next(&mut read) => {
                 let request = match request {
@@ -993,6 +1125,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         last_runner_heartbeat = None;
                     }
                     Some("cancel" | "withdraw" | "job_status") => {
+                        note_input("caller_control", &liveness);
                         if request.value["type"] == "cancel" {
                             let _delivery = stream.terminal_delivery.lock().await;
                             if !stream.terminal_delivered.load(Ordering::Acquire) {
@@ -1011,6 +1144,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         let kind = request.value["type"].as_str().context("control type")?;
                         if let Some(terminal) = ended {
                             let reply = stored_reply(kind, &claims.jti, terminal)?;
+                            liveness.before_ordered(&mut write).await?;
                             write_frame(&mut write, &reply).await?;
                         } else if kind == "job_status" && stream.input.lock().expect("job input").is_none() {
                             if let Some(status) = queue_status(runtime, claims) {
@@ -1019,13 +1153,16 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                                     waiting_on: status.waiting_on, blocker: status.blocker,
                                     queue_wait_ms: Some(0), terminal: None, unit: None, unit_alive: None,
                                 };
+                                liveness.before_ordered(&mut write).await?;
                                 write_frame(&mut write, &serde_json::to_value(motor_protocol::Frame::JobStatusReply(reply))?).await?;
                             }
                         } else {
                             let tx = stream.input.lock().expect("job input").clone().context("runner disconnected")?;
                             let (reply, response) = oneshot::channel();
                             tx.send(Input { bytes: request.bytes, reply: Some(reply) }).await?;
-                            match response.await {
+                            let response = response.await;
+                            liveness.before_ordered(&mut write).await?;
+                            match response {
                                 Ok(bytes) => write.write_all(&bytes).await?,
                                 Err(_) => {
                                     let terminal = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.terminal.clone()).context("runner disconnected")?;
@@ -1036,6 +1173,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     Some("bundle_chunk") if attached => {
                         let tx = stream.input.lock().expect("job input").clone().context("runner disconnected")?;
+                        note_input("input_mailbox", &liveness);
                         tx.send(Input { bytes: request.bytes, reply: None }).await?;
                     }
                     _ => anyhow::bail!("operation_refused"),
@@ -1044,7 +1182,6 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             _ = heartbeats.changed(), if attached => {
                 let bytes = heartbeats.borrow_and_update().clone();
                 if let Some(bytes) = bytes {
-                    write.write_all(&bytes).await.map_err(anyhow::Error::from).map_err(client_io)?;
                     // Repeated keepalives must not replay a change notification.
                     let mut sample: Value = serde_json::from_slice(&bytes[4..])?;
                     let removed = sample.as_object_mut().context("runner heartbeat object")?.remove("queue_status").is_some();
@@ -1054,16 +1191,21 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         clean.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
                         clean.extend_from_slice(&payload);
                         clean
-                    } else { bytes });
+                    } else { bytes.clone() });
+                    liveness.queue(bytes);
                     last_write = tokio::time::Instant::now();
                 }
+            }
+            result = liveness.send(&mut write), if liveness.pending() => {
+                result.map_err(anyhow::Error::from).map_err(client_io)?;
+                last_write = tokio::time::Instant::now();
             }
             _ = tokio::time::sleep(Duration::from_millis(20)) => {
                 if attached && last_write.elapsed() >= CLIENT_HEARTBEAT {
                     if started {
-                        write_frame(&mut write, &json!({"type":"heartbeat"})).await.map_err(client_io)?;
+                        liveness.queue_frame(&json!({"type":"heartbeat"}))?;
                     } else if let Some(bytes) = &last_runner_heartbeat {
-                        write.write_all(bytes).await.map_err(anyhow::Error::from).map_err(client_io)?;
+                        liveness.queue(bytes.clone());
                     } else {
                         // No live runner queue sample has reached this attachment.
                         // Keep the caller's capacity-queue budget paused rather
@@ -1072,7 +1214,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                         if let Some(status) = queue_updates.update(queue_status(runtime, claims), u64::try_from(status_started.elapsed().as_millis()).unwrap_or(u64::MAX)) {
                             frame["queue_status"] = serde_json::to_value(status)?;
                         }
-                        write_frame(&mut write, &frame).await.map_err(client_io)?;
+                        liveness.queue_frame(&frame)?;
                     }
                     last_write = tokio::time::Instant::now();
                 }
