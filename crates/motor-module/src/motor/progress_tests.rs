@@ -5,7 +5,12 @@ use crate::hosted::{
     tests::harness::{Behavior, Harness, NoSsh},
 };
 use crate::hosted_salt::tests::motor as test_motor;
-use std::sync::{atomic::AtomicUsize, Mutex};
+use std::{
+    future::{poll_fn, Future},
+    pin::Pin,
+    sync::{atomic::AtomicUsize, Mutex},
+    task::Poll,
+};
 
 fn decoded(record: StreamRecord) -> StreamRecord {
     let bytes = serde_json::to_vec(&record).unwrap();
@@ -309,6 +314,80 @@ async fn phase_changes_reset_elapsed_but_not_the_run_rate_limit() {
     task.await.unwrap();
 }
 
+async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+    poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn submission_keeps_polling_with_full_caller_stream() {
+    let reporter = progress::Reporter::new(true, 4);
+    reporter.phase(ProgressPhase::Upload);
+    let (_events, records) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::channel(1);
+    let initial = reporter.initial();
+    tx.try_send(Ok(initial.clone())).unwrap();
+    let (step, mut steps) = mpsc::channel(1);
+    let forward = reporter.forward(
+        async move {
+            for _ in 0..16 {
+                steps.recv().await.unwrap();
+            }
+            Ok(())
+        },
+        records,
+        &tx,
+    );
+    tokio::pin!(forward);
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+
+    for frame in 0..16 {
+        step.try_send(()).unwrap();
+        let state = poll_once(forward.as_mut()).await;
+        assert_eq!(step.capacity(), 1, "submission stalled on frame {frame}");
+        if frame < 15 {
+            assert!(state.is_pending());
+        } else {
+            assert!(matches!(state, Poll::Ready(Ok(()))));
+        }
+    }
+    assert_eq!(rx.try_recv().unwrap().unwrap(), initial);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_caller_stream_keeps_only_the_latest_timer_record() {
+    let reporter = progress::Reporter::new(true, 4);
+    reporter.phase(ProgressPhase::Upload);
+    let (_events, records) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::channel(1);
+    let initial = reporter.initial();
+    tx.try_send(Ok(initial.clone())).unwrap();
+    let forward = reporter.forward(std::future::pending(), records, &tx);
+    tokio::pin!(forward);
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+
+    for seconds in [2, 10, 10, 10, 10, 10] {
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        assert!(poll_once(forward.as_mut()).await.is_pending());
+    }
+
+    assert_eq!(rx.try_recv().unwrap().unwrap(), initial);
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+    let latest = rx.try_recv().unwrap().unwrap();
+    assert!(matches!(latest, StreamRecord::Progress(p)
+        if p.phase() == &ProgressPhase::Upload && p.phase_elapsed_ms() == 52_000));
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn route_close_interrupts_blocked_progress_without_cancelling_submission() {
     let _clock = HeldClock::new();
@@ -405,6 +484,64 @@ fn queue_wait(record: StreamRecord) -> Progress {
         }
         other => panic!("expected queue_wait progress: {other:?}"),
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_caller_gets_ordered_records_before_display_and_on_completion() {
+    let id = Uuid::now_v7();
+    let reporter = progress::Reporter::new(true, 4).with_job_id(id);
+    reporter.phase(ProgressPhase::Upload);
+    let (events, records) = mpsc::channel(3);
+    let (tx, mut rx) = mpsc::channel(1);
+    let initial = reporter.initial();
+    tx.try_send(Ok(initial.clone())).unwrap();
+    let (finish, done) = tokio::sync::oneshot::channel();
+    let forward = reporter.forward(async { done.await.map_err(io::Error::other) }, records, &tx);
+    tokio::pin!(forward);
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+
+    let accepted = StreamRecord::Accepted(Accepted::new(id, 0));
+    events.try_send(Ok(accepted.clone())).unwrap();
+    reporter.queue_status(&queued("permits", None));
+    assert_eq!(rx.try_recv().unwrap().unwrap(), initial);
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+    assert_eq!(rx.try_recv().unwrap().unwrap(), accepted);
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+
+    let ordered = [
+        StreamRecord::Started(Started::new(0, 2_000, 1)),
+        StreamRecord::Output(Output::new(
+            2,
+            OutputStream::Stdout,
+            BytePayload(vec![b'x']),
+        )),
+        StreamRecord::Terminal(TerminalRecord::new(id, Outcome::Exit { code: 0 }, 20, 0, 0)),
+    ];
+    for record in &ordered {
+        events.try_send(Ok(record.clone())).unwrap();
+    }
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+    assert_eq!(events.capacity(), 1, "at most one ordered record in flight");
+    finish.send(()).unwrap();
+    assert!(poll_once(forward.as_mut()).await.is_pending());
+
+    let wait = queue_wait(rx.try_recv().unwrap().unwrap());
+    assert_eq!(wait.waiting_on(), Some(&ProgressWaitingOn::Capacity));
+    for (i, expected) in ordered.into_iter().enumerate() {
+        let state = poll_once(forward.as_mut()).await;
+        if i < 2 {
+            assert!(state.is_pending());
+        } else {
+            assert!(matches!(state, Poll::Ready(Ok(()))));
+        }
+        assert_eq!(rx.try_recv().unwrap().unwrap(), expected);
+    }
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test(start_paused = true)]

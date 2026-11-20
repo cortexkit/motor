@@ -203,19 +203,24 @@ impl Reporter {
     {
         let mut phases = self.phase.subscribe();
         let mut queue = self.queue.subscribe();
-        let mut last_sent = None;
+        // A slow caller can delay ordered output but must not stall the upload.
+        // Leave further ordered records in the submission channel and coalesce
+        // display updates into a single slot.
+        let mut pending_ordered = None;
+        let mut pending_display = None;
+        let mut last_tick = None;
         let mut stopped = false;
         // Queue-wait reporting runs from the first Accepted until Started or
         // the terminal record; `queue_since` holds when it began.
         let mut queue_since: Option<Instant> = None;
         let mut queue_done = false;
-        let mut queue_sent: Option<QueueWait> = None;
+        let mut last_queue_wait: Option<QueueWait> = None;
         tokio::pin!(future);
-        loop {
+        let result = loop {
             let phase = phases.borrow_and_update().clone();
             let deadline = phase.as_ref().filter(|_| !stopped).map(|phase| {
                 let quiet = phase.started + Duration::from_secs(2);
-                last_sent.map_or(quiet, |last: Instant| {
+                last_tick.map_or(quiet, |last: Instant| {
                     quiet.max(last + Duration::from_secs(10))
                 })
             });
@@ -227,60 +232,80 @@ impl Reporter {
             };
             tokio::select! {
                 biased;
-                result = &mut future => {
-                    // A completed submission may still have buffered its final records.
-                    while let Ok(record) = records.try_recv() {
-                        tx.send(record).await.map_err(|_| io::Error::other("caller detached"))?;
-                    }
-                    return result;
-                }
-                record = records.recv() => {
+                result = &mut future => break result,
+                record = records.recv(), if pending_ordered.is_none() => {
                     let Some(record) = record else { return Err(io::Error::other("submission stream closed")); };
-                    // Forward acceptance and progress in one task so a timer cannot race
-                    // an Accepted record or resume reporting when a queued job moves hosts.
-                    stopped |= matches!(&record, Ok(StreamRecord::Accepted(_) | StreamRecord::Terminal(_)));
+                    // Once accepted, a job only reports queue waits, even if its host changes.
+                    if !stopped && matches!(&record, Ok(StreamRecord::Accepted(_) | StreamRecord::Terminal(_))) {
+                        stopped = true;
+                        pending_display = None;
+                    }
                     if matches!(&record, Ok(StreamRecord::Accepted(_))) && !queue_done {
-                        // A heartbeat that arrived before Accepted is reported
-                        // below, once this record has gone out.
+                        // Only deliver a queue wait after the Accepted record.
                         queue_since.get_or_insert_with(Instant::now);
                     }
                     if matches!(&record, Ok(StreamRecord::Started(_) | StreamRecord::Terminal(_))) {
                         queue_done = true;
-                        queue_since = None;
+                        if queue_since.take().is_some() {
+                            pending_display = None;
+                        }
                     }
-                    tx.send(record).await.map_err(|_| io::Error::other("caller detached"))?;
+                    pending_ordered = Some(record);
+                }
+                _ = queue.changed(), if queue_since.is_some() => {},
+                // Reserving can be interrupted without consuming either record.
+                permit = tx.reserve(), if pending_ordered.is_some() || pending_display.is_some() => {
+                    if let Some(record) = pending_ordered.take() {
+                        permit.map_err(|_| io::Error::other("caller detached"))?.send(record);
+                    } else if let Some(record) = pending_display.take() {
+                        match permit {
+                            Ok(permit) => permit.send(Ok(record)),
+                            Err(_) => {
+                                // Losing display progress must not cancel the submission.
+                                stopped = true;
+                                queue_done = true;
+                                queue_since = None;
+                            }
+                        }
+                    }
                 }
                 _ = phases.changed() => {},
-                _ = queue.changed(), if queue_since.is_some() => {},
                 _ = timer => {
-                    // Losing a display-only record must not cancel an in-flight booking.
-                    if tx.send(Ok(self.record(phase.as_ref().unwrap()))).await.is_err() {
-                        stopped = true;
-                    }
-                    last_sent = Some(Instant::now());
+                    pending_display = Some(self.record(phase.as_ref().unwrap()));
+                    last_tick = Some(Instant::now());
                 }
             }
-            // Sent once per change of what the job waits on, never on a timer:
+            // Report once per change of what the job waits on, never on a timer:
             // an unchanged wait repeats nothing.
             if let Some(since) = queue_since {
                 let state = queue.borrow_and_update().clone();
                 match state {
-                    QueueState::Waiting(wait) if queue_sent.as_ref() != Some(&wait) => {
-                        // Losing a display-only record must not cancel the job; stop
-                        // reporting queue waits to a caller that no longer reads them.
-                        if tx.send(Ok(self.queue_record(&wait, since))).await.is_err() {
-                            queue_done = true;
-                            queue_since = None;
-                        }
-                        queue_sent = Some(wait);
+                    QueueState::Waiting(wait) if last_queue_wait.as_ref() != Some(&wait) => {
+                        pending_display = Some(self.queue_record(&wait, since));
+                        last_queue_wait = Some(wait);
                     }
                     QueueState::Started => {
                         queue_done = true;
                         queue_since = None;
+                        pending_display = None;
                     }
                     _ => {}
                 }
             }
+        };
+        drop(pending_display);
+        // The submission no longer needs polling, but its final ordered records
+        // still need to reach the caller.
+        if let Some(record) = pending_ordered {
+            tx.send(record)
+                .await
+                .map_err(|_| io::Error::other("caller detached"))?;
         }
+        while let Ok(record) = records.try_recv() {
+            tx.send(record)
+                .await
+                .map_err(|_| io::Error::other("caller detached"))?;
+        }
+        result
     }
 }
