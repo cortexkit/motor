@@ -343,7 +343,13 @@ only held while the volume was mounted at `target/` itself.
   compiler or linker. Deleting files in `CARGO_TARGET_DIR` in a job frees the
   space for the checkout. The mount point itself cannot be removed, so a tool
   that deletes the whole directory, as `cargo clean` does, reports an error
-  after emptying it.
+  after emptying it. Cargo never deletes old artifacts, so a busy checkout's disk
+  can fill over many jobs. When the kept disk's file has allocated at least 90% of
+  its size on the host, the next job starts on a blank disk and builds cold, and
+  its publication replaces the full one. The host cannot see inside the volume,
+  so this can also happen once after a disk was nearly full and later emptied.
+  Test: `nearly_full_kept_disk_is_set_aside_at_ninety_percent_allocated`
+  (`crates/motor-runner/src/macos/execution_tests.rs`).
 - **Eviction.** Below 40 GiB free on the state volume, admission-time cleanup
   deletes build disks least recently used first, measured by the host disk they
   take, not their 128 GiB apparent size; a disk whose checkout has a job in

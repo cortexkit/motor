@@ -727,6 +727,30 @@ fn kept_build_disk_is_cloned_per_job_and_replaced_only_after_stop_proof() {
     assert_eq!(build_disk_marker(&kept(&root), 3), b"new");
 }
 #[test]
+fn nearly_full_kept_disk_is_set_aside_at_ninety_percent_allocated() {
+    let size = motor_macvm::BUILD_DISK_SIZE;
+    let threshold = size / 100 * 90;
+    for (allocated, full) in [
+        (0, false),
+        (threshold - 1, false),
+        (threshold, true),
+        (size, true),
+    ] {
+        assert_eq!(build_disk_nearly_full(allocated), full, "{allocated}");
+    }
+    // A kept disk well below the threshold is still cloned in.
+    let scratch = ScratchDir::new("macos-build-disk-allocated");
+    let root = scratch.join("state");
+    let config = Config::new(&root, "macos");
+    let runtime = Runtime::default();
+    let entry = job(&root, &runtime);
+    write_build_disk(&kept(&root), b"old");
+    build_disk_in(&config, &entry).unwrap();
+    assert_eq!(build_disk_marker(&job_disk(&entry), 3), b"old");
+    runtime.stop(&root, &entry).unwrap();
+    finish(&runtime, &root, &entry);
+}
+#[test]
 fn first_job_formats_a_blank_disk_and_its_publication_creates_the_kept_disk() {
     let scratch = ScratchDir::new("macos-build-disk-first");
     let root = scratch.join("state");

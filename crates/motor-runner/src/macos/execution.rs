@@ -526,14 +526,34 @@ pub(super) fn build_disk_in(config: &Config, entry: &Entry) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    let length = kept.metadata()?.len();
+    let metadata = kept.metadata()?;
+    let length = metadata.len();
     if length != motor_macvm::BUILD_DISK_SIZE {
         // Not a disk this runner wrote; the job's publication replaces it.
         tracing::warn!(job_id = %record.id, length, "kept macOS build disk has the wrong size; building cold");
         return Ok(());
     }
+    let allocated = std::os::unix::fs::MetadataExt::blocks(&metadata).saturating_mul(512);
+    if build_disk_nearly_full(allocated) {
+        // Cargo never deletes old artifacts, so a busy checkout's disk fills
+        // over many jobs and then fails every build with ENOSPC. Start this
+        // job on the blank disk instead; its publication replaces the full one.
+        tracing::warn!(job_id = %record.id, allocated, "kept macOS build disk is nearly full; building cold");
+        return Ok(());
+    }
     clone.remove(motor_macvm::BUILD_DISK.as_ref())?;
     clone.clone_file(&kept, motor_macvm::BUILD_DISK.as_ref())
+}
+
+/// Share of the build disk's size at which a kept disk is set aside. The host
+/// never mounts the disk, so the bytes its sparse file has allocated are the
+/// only sign of how full the guest's volume has grown. Freed blocks may not be
+/// returned to the host file, so this can trigger after a disk was once nearly
+/// full rather than only while it is; that costs one cold build.
+const NEARLY_FULL_BUILD_DISK_PERCENT: u64 = 90;
+
+fn build_disk_nearly_full(allocated: u64) -> bool {
+    allocated >= motor_macvm::BUILD_DISK_SIZE / 100 * NEARLY_FULL_BUILD_DISK_PERCENT
 }
 
 /// What the guest agent needs to copy returned files out of the build disk:
