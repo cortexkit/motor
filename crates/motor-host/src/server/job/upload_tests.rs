@@ -183,6 +183,106 @@ async fn upload_larger_than_spool_reaches_the_guest_after_boot() {
     assert!(line("job_caller_input_closed").contains("clean=true "));
 }
 
+#[tokio::test]
+async fn live_upload_continues_while_caller_heartbeat_write_is_blocked() {
+    let (runtime, fake, _) = fixture();
+    hold_boot(&runtime, &fake, "runner");
+    let (host, guest) = UnixStream::pair().unwrap();
+    fake.scripted.lock().unwrap().push_back(host);
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+
+    const BUFFER: usize = 4096;
+    const CHUNK_BYTES: usize = 65_535;
+    const CHUNKS: usize = 32;
+    let first_chunk = |i| json!({"type":"bundle_chunk","index":0,"offset":i * CHUNK_BYTES,"data":"YWFh".repeat(CHUNK_BYTES / 3)});
+    let (mut client, mut server) = tokio::io::duplex(BUFFER);
+    let c = claims(JOB);
+    let id = claim(&runtime, &c);
+    let r = runtime.clone();
+    let session = tokio::spawn(async move { serve(r, &c, id, &mut server).await });
+    let setup = tokio::time::timeout(Duration::from_secs(15), async {
+        next_type(&mut client, "lease_ok").await;
+        write_frame(&mut client, &hello()).await.unwrap();
+        next_type(&mut client, "hello").await;
+        let mut request = run(JOB);
+        request["bundles"] = json!([{
+            "index": 0, "repository": request["repository_root"],
+            "length": CHUNKS * CHUNK_BYTES, "sha256": "0".repeat(64),
+        }]);
+        write_frame(&mut client, &request).await.unwrap();
+        next_type(&mut client, "accepted").await;
+        write_frame(&mut client, &first_chunk(0)).await.unwrap();
+        // The withdrawal reply confirms the preceding chunk is in the spool
+        // without waiting on filesystem timing or withdrawing an accepted job.
+        write_frame(&mut client, &json!({"type":"withdraw","job_id":JOB}))
+            .await
+            .unwrap();
+        next_type(&mut client, "withdraw_reply").await;
+        *fake.gate.0.lock().unwrap() = true;
+        fake.gate.1.notify_all();
+        assert_eq!(
+            read_frame(&mut guest).await.unwrap()["type"],
+            "verified_lease"
+        );
+        assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "hello");
+        write_frame(&mut guest, &hello()).await.unwrap();
+        assert_eq!(read_frame(&mut guest).await.unwrap(), request);
+        assert_eq!(read_frame(&mut guest).await.unwrap(), first_chunk(0));
+        assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "withdraw");
+
+        // Use a runner heartbeat too large for the caller's receive buffer.
+        // After reading its prefix, stop draining that direction so the host
+        // cannot finish the heartbeat until the live upload has arrived.
+        let beat = json!({"type":"heartbeat","extension":"a".repeat(2 * BUFFER)});
+        let body = serde_json::to_vec(&beat).unwrap();
+        write_frame(&mut guest, &beat).await.unwrap();
+        loop {
+            let len = client.read_u32().await.unwrap() as usize;
+            if len == body.len() {
+                break;
+            }
+            let mut earlier = vec![0; len];
+            client.read_exact(&mut earlier).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&earlier).unwrap()["type"],
+                "heartbeat"
+            );
+        }
+        body
+    })
+    .await
+    .expect("spool replay and the blocked heartbeat start");
+    let delivered = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            async {
+                for i in 1..CHUNKS {
+                    write_frame(&mut client, &first_chunk(i)).await.unwrap();
+                }
+            },
+            async {
+                for i in 1..CHUNKS {
+                    loop {
+                        let frame = read_frame(&mut guest).await.unwrap();
+                        if frame["type"] != "heartbeat" {
+                            assert_eq!(frame, first_chunk(i));
+                            break;
+                        }
+                    }
+                }
+            }
+        );
+        let mut body = vec![0; setup.len()];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, setup, "the partially written heartbeat stays intact");
+    })
+    .await;
+    session.abort();
+    drop(guest);
+    runtime.stop_job(JOB, true, true).unwrap();
+    delivered.expect("all live upload bytes must reach the guest while caller output is blocked");
+}
+
 /// Uploads `chunks` bundle chunks of 65,535 bytes through the per-job host
 /// relay to the real guest runner's tenant channel. The VM boot is held until
 /// the host's pre-boot spool holds `release_at` bytes, so the runner gets the
