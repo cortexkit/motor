@@ -663,6 +663,13 @@ class InstallerTests(unittest.TestCase):
             with self.subTest(window=invalid), self.assertRaises(ValueError):
                 install.vm_configuration(*args, invalid)
 
+    def test_hold_window_always_is_passed_to_vm_config(self):
+        args = (self.image, self.config / "motor-macvm", self.state / "tools", self.manifest)
+        self.assertIn('hold_window = "always"', install.vm_configuration(*args, "always"))
+        for invalid in ("Always", "always ", "anytime"):
+            with self.subTest(window=invalid), self.assertRaises(ValueError):
+                install.vm_configuration(*args, invalid)
+
     def test_check_requires_the_connect_link_to_the_installed_runner(self):
         # ck-motor's SSH session runs ~/.cargo/bin/motor-runner as motor.
         self.connect.unlink()

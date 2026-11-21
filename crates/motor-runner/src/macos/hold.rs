@@ -1,4 +1,4 @@
-//! A bounded nightly admission hold, independent of the operator's durable drain.
+//! A bounded admission hold that does not change operator drain state.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,11 +14,14 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 #[path = "hold_tests.rs"]
 mod tests;
 
+// Limit how long one hold can block fleet macOS jobs. A longer run writes a new hold.
+const ALWAYS_HOLD_MAX: u64 = 3 * 60 * 60 * 1_000;
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(try_from = "String")]
-pub(crate) struct Window {
-    start: u64,
-    end: u64,
+pub(crate) enum Window {
+    Always,
+    Daily { start: u64, end: u64 },
 }
 
 impl TryFrom<String> for Window {
@@ -39,29 +42,37 @@ impl TryFrom<String> for Window {
             let minute: u64 = value[3..].parse().ok()?;
             (hour < 24 && minute < 60).then_some((hour * 60 + minute) * 60_000)
         }
-        let parsed = value.split_once('-').and_then(|(start, end)| {
-            Some(Self {
-                start: minute(start)?,
-                end: minute(end)?,
+        if value == "always" {
+            return Ok(Self::Always);
+        }
+        value
+            .split_once('-')
+            .and_then(|(start, end)| {
+                let start = minute(start)?;
+                let end = minute(end)?;
+                (start != end).then_some(Self::Daily { start, end })
             })
-        });
-        parsed
-            .filter(|window| window.start != window.end)
-            .ok_or_else(|| "hold_window must be UTC HH:MM-HH:MM with distinct endpoints".into())
+            .ok_or_else(|| {
+                "hold_window must be always or UTC HH:MM-HH:MM with distinct endpoints".into()
+            })
     }
 }
 
 impl Window {
-    fn occurrence_end(self, now: u64) -> Option<u64> {
+    fn expiry_limit(self, now: u64) -> Option<u64> {
+        let (start, end) = match self {
+            Self::Always => return Some(now.saturating_add(ALWAYS_HOLD_MAX)),
+            Self::Daily { start, end } => (start, end),
+        };
         const DAY: u64 = 86_400_000;
         let day = now / DAY * DAY;
         let clock = now % DAY;
-        if self.start < self.end {
-            (clock >= self.start && clock < self.end).then_some(day + self.end)
-        } else if clock >= self.start {
-            Some(day + DAY + self.end)
-        } else if clock < self.end {
-            Some(day + self.end)
+        if start < end {
+            (clock >= start && clock < end).then_some(day + end)
+        } else if clock >= start {
+            Some(day + DAY + end)
+        } else if clock < end {
+            Some(day + end)
         } else {
             None
         }
@@ -179,7 +190,7 @@ impl State {
     pub(crate) fn observe(&mut self, now: u64) -> Snapshot {
         let hold = if self
             .window
-            .and_then(|window| window.occurrence_end(now))
+            .and_then(|window| window.expiry_limit(now))
             .is_some()
         {
             self.read()
@@ -194,10 +205,10 @@ impl State {
     }
 
     fn honoured(&self, now: u64, snapshot: &Snapshot) -> Option<Hold> {
-        let end = self.window?.occurrence_end(now)?;
+        let limit = self.window?.expiry_limit(now)?;
         let hold = snapshot.hold.as_ref()?;
         let expiry = hold.expiry().ok()?.unix_timestamp_nanos();
-        (expiry > i128::from(now) * 1_000_000 && expiry <= i128::from(end) * 1_000_000)
+        (expiry > i128::from(now) * 1_000_000 && expiry <= i128::from(limit) * 1_000_000)
             .then_some(hold.clone())
     }
 
