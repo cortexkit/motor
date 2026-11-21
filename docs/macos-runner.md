@@ -2,17 +2,19 @@
 
 ## Exclusive holds
 
-Set the optional `hold_window` in the VM TOML configuration to a UTC
-`HH:MM-HH:MM` window; cross-midnight windows are supported, but equal endpoints
-are rejected. Without a window, holds are ignored. The installer accepts
-`--hold-window`, defaults new installs to `03:00-05:00`, and preserves the
-installed setting on updates.
+Set the optional `hold_window` in the VM TOML configuration to `always` or a
+UTC `HH:MM-HH:MM` window. A timed window can cross midnight, but its endpoints
+must be distinct. If `hold_window` is unset, holds are ignored. The installer
+accepts `--hold-window`, defaults new installs to `03:00-05:00`, and preserves
+the installed setting on updates.
 
 Write `/Users/Shared/motor-macos-hold/hold.json` with exactly two fields:
 `{"owner":"nightly-check","expires_at":"2026-01-01T04:00:00Z"}`. The owner
 must contain 1–64 lowercase letters, digits or hyphens, and the expiry must be
-RFC 3339 UTC (`Z` or `+00:00`). Holds are honoured only inside the configured
-window, with a future expiry no later than that window occurrence's end.
+RFC 3339 UTC (`Z` or `+00:00`). A hold must expire in the future. With `always`,
+holds are honoured at any time, but the expiry must be no more than 3 hours
+ahead. For a timed window, holds are honoured only during the window and must
+expire no later than the end of that occurrence.
 Symlinks, non-regular files, files larger than 4 KiB and malformed holds are
 ignored, with invalid content logged once.
 

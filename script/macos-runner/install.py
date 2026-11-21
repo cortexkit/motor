@@ -544,9 +544,11 @@ def tool_errors(tools, manifest):
 
 
 def hold_window_setting(value):
-    if value is not None and (not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]-(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
-                              or value[:5] == value[6:]):
-        raise ValueError("hold_window must be UTC HH:MM-HH:MM with distinct endpoints")
+    if value not in (None, "always") and (
+        not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]-(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
+        or value[:5] == value[6:]
+    ):
+        raise ValueError("hold_window must be always or UTC HH:MM-HH:MM with distinct endpoints")
     return value
 
 
@@ -861,7 +863,7 @@ def main():
     parser.add_argument("--signing-team", metavar="TEAM_ID",
                         help="require the runner and helper to be signed by this team and keep that signature (recorded for updates)")
     parser.add_argument("--instance", default="macos")
-    parser.add_argument("--hold-window", help="UTC HH:MM-HH:MM; first install defaults to 03:00-05:00, updates preserve the installed window")
+    parser.add_argument("--hold-window", help="always or UTC HH:MM-HH:MM; first install defaults to 03:00-05:00, updates preserve the installed window")
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--vm-helper", type=Path)
     parser.add_argument("--metrics-endpoint", help="HTTPS origin; requires --metrics-host-id (install preserves existing settings; first install defaults off)")

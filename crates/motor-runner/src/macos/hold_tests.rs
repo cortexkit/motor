@@ -61,6 +61,37 @@ fn overnight_window_uses_the_correct_occurrence_end() {
 }
 
 #[test]
+fn always_honours_holds_at_any_utc_time() {
+    let (_root, mut state) = fixture(Some("always"));
+    for (now, expiry) in [
+        ("2026-01-01T23:59:00Z", "2026-01-02T00:30:00Z"),
+        ("2026-01-02T00:01:00Z", "2026-01-02T03:01:00Z"),
+        ("2026-01-02T04:00:00Z", "2026-01-02T05:30:00Z"),
+        ("2026-01-02T13:00:00Z", "2026-01-02T14:30:00Z"),
+    ] {
+        write(&state, expiry);
+        let now_ms = millis(now);
+        assert!(state.refresh(now_ms, true), "{now} to {expiry}");
+        assert!(state.status(now_ms).unwrap().ends_with("(granted: true)"));
+    }
+}
+
+#[test]
+fn always_rejects_expired_and_more_than_three_hours_ahead() {
+    let (_root, mut state) = fixture(Some("always"));
+    let now = millis("2026-01-01T13:00:00Z");
+    for expiry in [
+        "2026-01-01T12:59:59Z",
+        "2026-01-01T13:00:00Z",
+        "2026-01-01T16:00:00.000000001Z",
+    ] {
+        write(&state, expiry);
+        assert!(!state.refresh(now, true), "{expiry}");
+    }
+    assert!(!state.grant_dir.join("granted.json").exists());
+}
+
+#[test]
 fn malformed_nonregular_oversized_and_symlink_holds_are_ignored_once() {
     let (_root, mut state) = fixture(Some("03:00-05:00"));
     let now = millis("2026-01-01T03:30:00Z");
@@ -151,6 +182,20 @@ fn window_rejects_equal_endpoints_and_invalid_clock_fields_at_load() {
         }
         let error = toml::from_str::<Config>(&text).err().unwrap();
         assert!(error.to_string().contains("distinct endpoints"), "{error}");
+    }
+}
+
+#[test]
+fn window_accepts_only_exact_always_at_load() {
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(rename = "window")]
+        _window: Window,
+    }
+    assert!(toml::from_str::<Config>(r#"window = "always""#).is_ok());
+    for value in ["Always", "always ", "anytime"] {
+        let text = format!("window = {value:?}");
+        assert!(toml::from_str::<Config>(&text).is_err(), "{value:?}");
     }
 }
 
