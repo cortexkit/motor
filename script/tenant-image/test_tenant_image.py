@@ -127,6 +127,7 @@ class ImageTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner", "--build-budget-gib", "1"]), mock.patch.object(image, "build") as build:
             image.main()
         self.assertEqual(build.call_args.args[1], Path("/var/lib/motor-vm/tenant-images").resolve())
+        self.assertEqual(build.call_args.kwargs["free_floor"], 170 * 1024**3)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -485,6 +486,26 @@ class ImageTests(unittest.TestCase):
                             build_budget=1024**3, free_floor=2 * 1024**3, mountinfo_reader=lambda: ROOT_MOUNTINFO)
         builder.assert_not_called()
         self.assertFalse((self.root / "images/space/manifest.json").exists())
+
+    def test_cli_free_floor_controls_preflight_and_disk_meter(self):
+        argv = ["build.py", "build", "space", "--output-root", str(self.root / "images"),
+                "--runner", str(self.runner), "--versions", str(self.versions),
+                "--build-budget-gib", "1", "--free-floor-gib", "2"]
+        build = image.build
+
+        def fixture_build(*args, **kwargs):
+            return build(*args, **kwargs, builder=self.builder, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(image, "build", fixture_build), \
+                mock.patch.object(image.shutil, "disk_usage") as usage:
+            usage.return_value.free = 3 * 1024**3 - 1
+            with self.assertRaisesRegex(ValueError, "floor.*budget"):
+                image.main()
+            self.assertEqual(self.calls, [])
+            usage.return_value.free = 3 * 1024**3
+            image.main()
+        report = json.loads((self.root / "images/space/disk-usage.json").read_text())
+        self.assertEqual(report["free_floor_bytes"], 2 * 1024**3)
 
     def test_cleanup_command_refuses_a_nonstage_root_even_for_root(self):
         with mock.patch.object(sys, "argv", ["build.py", "cleanup-mounts", "/"]), mock.patch.object(sys, "stderr"), mock.patch.object(image.os, "geteuid", return_value=0), mock.patch.object(image, "unmount_tree") as unmount:

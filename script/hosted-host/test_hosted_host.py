@@ -781,6 +781,29 @@ class RunnerLogTests(unittest.TestCase):
         self.assertEqual(reply, {"ok": True, "journal": {"entries": []}})
 
 
+class HostStorageTests(unittest.TestCase):
+    def test_storage_cli_sends_host_requests_and_prints_replies(self):
+        cases = [
+            (["storage-reserve", "--owner", "image-build", "--gib", "64", "--ttl-s", "3600"],
+             {"op": "storage_reserve", "owner": "image-build", "bytes": 64 * 1024**3, "ttl_s": 3600},
+             {"ok": True, "free_bytes": 70 * 1024**3, "threshold_bytes": 6 * 1024**3,
+              "reserved_bytes": 64 * 1024**3}, 0),
+            (["storage-reserve", "--owner", "image-build", "--gib", "65", "--ttl-s", "3600"],
+             {"op": "storage_reserve", "owner": "image-build", "bytes": 65 * 1024**3, "ttl_s": 3600},
+             {"ok": False, "error": "storage_reserve_short", "short_bytes": 1024**3}, 1),
+            (["storage-release", "--owner", "image-build"],
+             {"op": "storage_release", "owner": "image-build"}, {"ok": True}, 0),
+        ]
+        for args, request, reply, status in cases:
+            with self.subTest(args=args), \
+                    mock.patch.object(hosted.sys, "argv", ["hosted_host.py", *args]), \
+                    mock.patch.object(hosted, "admin_exchange", return_value=reply) as exchange, \
+                    mock.patch.object(hosted.sys, "stdout") as output:
+                self.assertEqual(hosted.main(), status)
+                exchange.assert_called_once_with(request)
+                self.assertEqual(json.loads(output.write.call_args.args[0]), reply)
+
+
 class HostDrainTests(unittest.TestCase):
     def test_bounded_start_cancel_and_no_ops_are_host_level(self):
         cases = [

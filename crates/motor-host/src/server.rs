@@ -1579,6 +1579,9 @@ impl Runtime {
             tracing::info!(generation, "job_image_generation_published");
             return Ok(json!({"ok":true,"published":generation}));
         }
+        if matches!(op, "storage_reserve" | "storage_release") {
+            return self.operator_storage_admin(op, request);
+        }
         ensure!(
             matches!(
                 op,
@@ -1636,6 +1639,7 @@ impl Runtime {
             "bounded_drain_started":bounded_drain_started,
             "bounded_drain_cancelled":bounded_drain_cancelled});
         if op == "host_status" && host.settings.mode() == crate::config::HostMode::PerJob {
+            reply["storage_reservations"] = json!(host.operator_storage_reservations(unix_ms()));
             reply["active_fills"] = json!(host.snapshot.per_job.fills.len());
             reply["active_recoveries"] = json!(host
                 .snapshot
@@ -1654,6 +1658,60 @@ impl Runtime {
         }
         Ok(reply)
     }
+
+    fn operator_storage_admin(&self, op: &str, request: &Value) -> Result<Value> {
+        use crate::state::jobs::storage::StorageCheck;
+
+        let owner = request["owner"]
+            .as_str()
+            .filter(|owner| {
+                (1..=64).contains(&owner.len())
+                    && owner
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            })
+            .context("invalid storage reservation owner")?;
+        if op == "storage_release" {
+            ensure!(
+                request == &json!({"op":op,"owner":owner}),
+                "invalid storage release request"
+            );
+            self.host
+                .lock()
+                .expect("host lock")
+                .release_operator_storage(owner, unix_ms());
+            return Ok(json!({"ok":true}));
+        }
+        let bytes = request["bytes"]
+            .as_u64()
+            .context("invalid storage reservation bytes")?;
+        let ttl_s = request["ttl_s"]
+            .as_u64()
+            .filter(|ttl| (1..=21600).contains(ttl))
+            .context("invalid storage reservation TTL")?;
+        ensure!(
+            request == &json!({"op":op,"owner":owner,"bytes":bytes,"ttl_s":ttl_s}),
+            "invalid storage reserve request"
+        );
+        let check = self
+            .host
+            .lock()
+            .expect("host lock")
+            .reserve_operator_storage(owner, bytes, ttl_s, unix_ms)?;
+        Ok(match check {
+            StorageCheck::Available {
+                free_bytes,
+                threshold_bytes,
+                reserved_bytes,
+            } => {
+                json!({"ok":true,"free_bytes":free_bytes,"threshold_bytes":threshold_bytes,"reserved_bytes":reserved_bytes})
+            }
+            StorageCheck::Short(short_bytes) => {
+                json!({"ok":false,"error":"storage_reserve_short","short_bytes":short_bytes})
+            }
+        })
+    }
+
     pub fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         if self.per_job() {
             return self.job_admin(tenant, request);

@@ -1,5 +1,6 @@
 use super::*;
 mod images;
+use motor_host::server::{unix_ms, Runtime};
 use motor_host::state::jobs::storage::{
     Base, ReplayCompletion, REPLAY_RECORD_BYTES, REPLAY_RESERVATION_BYTES, RETURN_BYTES,
 };
@@ -530,6 +531,176 @@ fn idle(h: &mut Host, id: &str, hash: u8, at: u64) -> String {
     h.job_stopped(id, false).unwrap();
     h.job_replay_closed(id, ReplayCompletion::Terminal).unwrap();
     disk(h, id)
+}
+
+fn reserve(runtime: &Runtime, owner: &str, bytes: u64, ttl_s: u64) -> Value {
+    runtime
+        .host_admin(
+            &json!({"op": "storage_reserve", "owner": owner, "bytes": bytes, "ttl_s": ttl_s}),
+        )
+        .unwrap()
+}
+
+fn reservations(runtime: &Runtime) -> Value {
+    runtime.host_admin(&json!({"op": "host_status"})).unwrap()["storage_reservations"].clone()
+}
+
+fn claim_at(runtime: &Runtime, at_ms: u64) -> Result<(u64, Admission), Error> {
+    let mut h = runtime.host.lock().unwrap();
+    h.record_host_resources(HostResources {
+        at_ms,
+        available_mem_mib: 10_000,
+        job_vm_headroom_mib: u64::MAX,
+        vcpu_ceiling: 2,
+        permit_budget: 4,
+    });
+    let mut claims = job(JOB);
+    claims.iat = at_ms / 1000;
+    claims.exp = claims.iat + 300;
+    h.claim(claims, at_ms)
+}
+
+#[test]
+fn operator_reservation_evicts_the_oldest_idle_checkout() {
+    let mut h = memory_host(10_000);
+    let oldest = idle(&mut h, JOB, 1, AT);
+    let newest = idle(&mut h, JOB2, 2, AT + 1);
+    let storage = Storage::new(FLOOR + CAP - 1);
+    enable(&mut h, &storage);
+    let runtime = Runtime::new("host".into(), h, storage.clone());
+
+    let before = unix_ms();
+    assert_eq!(
+        reserve(&runtime, "image.1_build-test", CAP, 600),
+        json!({"ok":true,"free_bytes":FLOOR + 2 * CAP - 1,"threshold_bytes":FLOOR,"reserved_bytes":CAP}),
+    );
+    let after = unix_ms();
+    let listed = reservations(&runtime);
+    let expires = listed[0]["expires_at_ms"].as_u64().unwrap();
+    assert!((before + 600_000..=after + 600_000).contains(&expires));
+    assert_eq!(
+        listed,
+        json!([{"owner":"image.1_build-test","bytes":CAP,"expires_at_ms":expires}])
+    );
+    assert_eq!(*storage.evicted.lock().unwrap(), [oldest]);
+    assert!(!runtime.host.lock().unwrap().snapshot.per_job.disks[&newest].deleted);
+}
+
+#[test]
+fn operator_reservation_is_refused_without_evicting_held_or_queued_checkouts() {
+    let mut h = memory_host(10_000);
+    h.claim(job(JOB), AT).unwrap();
+    h.begin_job_boot(JOB).unwrap().unwrap();
+    h.claim(other(JOB2, 2), AT).unwrap();
+    let before = h.snapshot.clone();
+    let storage = Storage::new(FLOOR + 2 * (CAP + JOB_BYTES) + CAP);
+    enable(&mut h, &storage);
+    let runtime = Runtime::new("host".into(), h, storage.clone());
+
+    assert_eq!(
+        reserve(&runtime, "image", CAP + 1, 600),
+        json!({"ok":false,"error":"storage_reserve_short","short_bytes":1}),
+    );
+    assert_eq!(reservations(&runtime), json!([]));
+    assert_eq!(runtime.host.lock().unwrap().snapshot, before);
+    assert!(storage.evicted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn live_operator_reservation_refuses_job_admission_until_released() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + CAP + JOB_BYTES);
+    enable(&mut h, &storage);
+    let runtime = Runtime::new("host".into(), h, storage);
+
+    assert_eq!(reserve(&runtime, "image", CAP, 600)["ok"], true);
+    let at_ms = unix_ms();
+    full(claim_at(&runtime, at_ms));
+    assert!(runtime
+        .host
+        .lock()
+        .unwrap()
+        .snapshot
+        .per_job
+        .executions
+        .is_empty());
+    for _ in 0..2 {
+        let reply = runtime
+            .host_admin(&json!({"op":"storage_release","owner":"image"}))
+            .unwrap();
+        assert_eq!(reply, json!({"ok":true}));
+    }
+    assert_eq!(reservations(&runtime), json!([]));
+    claim_at(&runtime, at_ms).unwrap();
+}
+
+#[test]
+fn operator_reservation_expires_at_its_deadline() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + CAP + JOB_BYTES);
+    enable(&mut h, &storage);
+    let runtime = Runtime::new("host".into(), h, storage);
+
+    assert_eq!(reserve(&runtime, "image", CAP, 600)["ok"], true);
+    let expires = reservations(&runtime)[0]["expires_at_ms"].as_u64().unwrap();
+    full(claim_at(&runtime, expires - 1));
+    claim_at(&runtime, expires).unwrap();
+    assert_eq!(reservations(&runtime), json!([]));
+}
+
+#[test]
+fn operator_reservation_replaces_one_owner_and_preserves_it_on_refusal() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + CAP);
+    enable(&mut h, &storage);
+    let runtime = Runtime::new("host".into(), h, storage);
+
+    assert_eq!(reserve(&runtime, "other", CAP / 4, 600)["ok"], true);
+    assert_eq!(reserve(&runtime, "image", CAP / 2, 600)["ok"], true);
+    let prior_expiry = reservations(&runtime)[0]["expires_at_ms"].as_u64().unwrap();
+    assert_eq!(
+        reserve(&runtime, "image", 3 * CAP / 4, 1200),
+        json!({"ok":true,"free_bytes":FLOOR + CAP,"threshold_bytes":FLOOR,"reserved_bytes":CAP}),
+    );
+    let listed = reservations(&runtime);
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    assert_eq!(listed[0]["owner"], "image");
+    assert_eq!(listed[0]["bytes"], 3 * CAP / 4);
+    assert!(listed[0]["expires_at_ms"].as_u64().unwrap() >= prior_expiry + 600_000);
+    assert_eq!(listed[1]["owner"], "other");
+    assert_eq!(listed[1]["bytes"], CAP / 4);
+    assert_eq!(
+        reserve(&runtime, "image", CAP, 600),
+        json!({"ok":false,"error":"storage_reserve_short","short_bytes":CAP / 4}),
+    );
+    assert_eq!(reservations(&runtime), listed);
+}
+
+#[test]
+fn operator_reservation_admin_rejects_invalid_requests() {
+    let mut h = memory_host(10_000);
+    let storage = Storage::new(FLOOR + CAP);
+    enable(&mut h, &storage);
+    let runtime = Runtime::new("host".into(), h, storage);
+
+    for owner in ["", "build/one", "buildé", &"x".repeat(65)] {
+        assert!(runtime
+            .host_admin(&json!({"op":"storage_reserve","owner":owner,"bytes":CAP,"ttl_s":1}))
+            .is_err());
+        assert!(runtime
+            .host_admin(&json!({"op":"storage_release","owner":owner}))
+            .is_err());
+    }
+    for request in [
+        json!({"op":"storage_reserve","owner":"image","bytes":CAP,"ttl_s":0}),
+        json!({"op":"storage_reserve","owner":"image","bytes":CAP,"ttl_s":21601}),
+        json!({"op":"storage_reserve","owner":"image","bytes":-1,"ttl_s":1}),
+        json!({"op":"storage_reserve","owner":"image","bytes":CAP,"ttl_s":1,"extra":true}),
+        json!({"op":"storage_release","owner":"image","bytes":CAP}),
+    ] {
+        assert!(runtime.host_admin(&request).is_err(), "{request}");
+    }
+    assert_eq!(reservations(&runtime), json!([]));
 }
 
 #[test]

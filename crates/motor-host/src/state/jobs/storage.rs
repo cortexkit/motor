@@ -54,6 +54,22 @@ pub struct Base {
     pub evicting: bool,
 }
 
+#[derive(Serialize)]
+pub(crate) struct OperatorReservation {
+    owner: String,
+    bytes: u64,
+    expires_at_ms: u64,
+}
+
+pub(crate) enum StorageCheck {
+    Available {
+        free_bytes: u64,
+        threshold_bytes: u64,
+        reserved_bytes: u64,
+    },
+    Short(u64),
+}
+
 impl Host {
     pub(crate) fn job_relayed_run(&mut self, job: &str, has_returns: bool) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
@@ -90,6 +106,53 @@ impl Host {
     }
     pub fn set_job_storage(&mut self, control: Arc<dyn crate::helper::Control>) {
         self.job_storage = Some(control);
+    }
+
+    fn expire_operator_storage(&mut self, now_ms: u64) {
+        self.operator_storage_reservations
+            .retain(|_, reservation| reservation.expires_at_ms > now_ms);
+    }
+
+    pub(crate) fn operator_storage_reservations(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<&OperatorReservation> {
+        self.expire_operator_storage(now_ms);
+        self.operator_storage_reservations.values().collect()
+    }
+
+    pub(crate) fn release_operator_storage(&mut self, owner: &str, now_ms: u64) {
+        self.expire_operator_storage(now_ms);
+        self.operator_storage_reservations.remove(owner);
+    }
+
+    pub(crate) fn reserve_operator_storage(
+        &mut self,
+        owner: &str,
+        bytes: u64,
+        ttl_s: u64,
+        now_ms: impl Fn() -> u64,
+    ) -> Result<StorageCheck, Error> {
+        if !self.storage_enforced() {
+            return Err(Error::Refused(crate::state::Refusal::HostFull));
+        }
+        let mut next = self.snapshot.clone();
+        let check = self
+            .check_storage(&mut next, "", now_ms(), Some((owner, bytes)))
+            .map_err(|e| e.error)?;
+        if matches!(check, StorageCheck::Available { .. }) {
+            // Start the TTL after eviction: a slow helper must not consume
+            // the time the operator asked to reserve for the build.
+            self.operator_storage_reservations.insert(
+                owner.into(),
+                OperatorReservation {
+                    owner: owner.into(),
+                    bytes,
+                    expires_at_ms: now_ms().saturating_add(ttl_s * 1000),
+                },
+            );
+        }
+        Ok(check)
     }
 
     pub(crate) fn quarantine_workspace(&mut self, job: &str) -> Result<(), Error> {
@@ -150,16 +213,39 @@ impl Host {
         protected: &str,
         now_ms: u64,
     ) -> Result<(), ClaimError> {
-        let HostSettings::PerJob(settings) = &self.settings else {
-            unreachable!()
-        };
-        let default_cap = settings.workspace_disk_cap_bytes;
         // Sandboxes without the registered-host storage gate still persist the
         // same promises. Registered hosts never admit without trusted probes.
         if !self.storage_enforced() {
             return Ok(());
         }
+        match self.check_storage(next, protected, now_ms, None)? {
+            StorageCheck::Available { .. } => Ok(()),
+            StorageCheck::Short(_) => Err(RefusalCause::Storage.into()),
+        }
+    }
+
+    fn check_storage(
+        &mut self,
+        next: &mut Snapshot,
+        protected: &str,
+        now_ms: u64,
+        replacement: Option<(&str, u64)>,
+    ) -> Result<StorageCheck, ClaimError> {
+        let HostSettings::PerJob(settings) = &self.settings else {
+            return Err(RefusalCause::Storage.into());
+        };
+        let default_cap = settings.workspace_disk_cap_bytes;
         let growth_bound = settings.workspace_growth_reservation_bytes;
+        self.expire_operator_storage(now_ms);
+        // Count a replacement in place of the owner's old promise without
+        // changing what is held if the new request cannot be admitted.
+        let operator_bytes = self
+            .operator_storage_reservations
+            .iter()
+            .filter(|(owner, _)| replacement.is_none_or(|(key, _)| *owner != key))
+            .map(|(_, reservation)| u128::from(reservation.bytes))
+            .sum::<u128>()
+            + u128::from(replacement.map_or(0, |(_, bytes)| bytes));
         let control = self.job_storage.clone().ok_or(RefusalCause::Storage)?;
         let mut attempted = std::collections::BTreeSet::new();
         loop {
@@ -240,14 +326,22 @@ impl Host {
             let free = control
                 .available_bytes()
                 .map_err(|_| RefusalCause::Storage)?;
-            if free
-                .checked_sub(threshold)
-                .is_some_and(|available| available >= reserved)
-            {
-                return Ok(());
+            let reserved = u128::from(reserved) + operator_bytes;
+            let required = u128::from(threshold) + reserved;
+            if u128::from(free) >= required {
+                return Ok(StorageCheck::Available {
+                    free_bytes: free,
+                    threshold_bytes: threshold,
+                    reserved_bytes: reserved as u64,
+                });
             }
             if !self.evict_job_storage(next, protected, &*control, &mut attempted)? {
-                return Err(RefusalCause::Storage.into());
+                // A request can exceed the size representable by the reply
+                // once the threshold and existing promises are added to it.
+                let short = required - u128::from(free);
+                return Ok(StorageCheck::Short(
+                    u64::try_from(short).unwrap_or(u64::MAX),
+                ));
             }
         }
     }

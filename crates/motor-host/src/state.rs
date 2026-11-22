@@ -295,6 +295,9 @@ pub struct Host {
     fill_capacity_refused_at_ms: Option<u64>,
     host_resources_failed: std::cell::RefCell<Option<jobs::HostResourcesFailure>>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
+    // These operator reservations are lost on restart. The image builder's
+    // own disk meter still stops the build if free space falls below its floor.
+    operator_storage_reservations: BTreeMap<String, jobs::storage::OperatorReservation>,
     fork_holds: BTreeMap<String, jobs::forks::Hold>,
     /// The jobs whose lease has not ended, kept in step with `snapshot` by
     /// [`Host::save`], so a save checks drain completion and overlapping
@@ -347,6 +350,7 @@ impl Host {
             fill_capacity_refused_at_ms: None,
             host_resources_failed: std::cell::RefCell::new(None),
             job_storage: None,
+            operator_storage_reservations: BTreeMap::new(),
             fork_holds: BTreeMap::new(),
             unended: std::collections::BTreeSet::new(),
         }

@@ -284,6 +284,8 @@ def main():
     create.add_argument("--runner", type=Path, required=True)
     create.add_argument("--jobs", type=int, default=4)
     create.add_argument("--job-generation", help="helper generation identity; defaults to version (no dots)")
+    create.add_argument("--free-floor-gib", type=int, default=FREE_FLOOR // GIB,
+                        help="minimum filesystem free space in GiB (default: %(default)s)")
     storage = create.add_mutually_exclusive_group(required=True)
     storage.add_argument("--build-budget-gib", type=int, help="explicit first-build cap, not a measured requirement")
     storage.add_argument("--peak-profile", type=Path, help="matching successful disk-usage.json; adds 25%% plus 4 GiB")
@@ -300,13 +302,15 @@ def main():
     subs.add_parser("check-mounts").add_argument("root", type=Path)
     args = parser.parse_args()
     if args.command == "build":
+        if args.free_floor_gib < 0:
+            create.error("--free-floor-gib must be nonnegative")
         def interrupted(signum, _frame):
             raise RuntimeError(f"image build interrupted by signal {signum}")
         previous = signal.signal(signal.SIGTERM, interrupted)
         try:
             build(args.version, args.output_root.resolve(), args.versions.resolve(), args.runner.resolve(), args.jobs,
                   build_budget=args.build_budget_gib * GIB if args.build_budget_gib is not None else None,
-                  peak_profile=args.peak_profile, job_generation=args.job_generation)
+                  peak_profile=args.peak_profile, free_floor=args.free_floor_gib * GIB, job_generation=args.job_generation)
         finally:
             signal.signal(signal.SIGTERM, previous)
     elif args.command == "inventory":
