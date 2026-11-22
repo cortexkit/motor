@@ -54,6 +54,7 @@ mod disk;
 mod guest_disk;
 #[path = "health.rs"]
 mod health;
+mod macos_hold;
 #[path = "migration.rs"]
 mod migration;
 #[path = "mirror_reports.rs"]
@@ -3578,47 +3579,6 @@ impl Runner {
     fn admission_closed(&self, inner: &Inner) -> bool {
         inner.drain_deadline.is_some() || *self.core.service_stop.borrow()
     }
-    #[cfg(unix)]
-    fn observe_macos_hold(&self) -> Option<crate::macos::hold::Snapshot> {
-        self.core
-            .config
-            .macos_instance()
-            .then(|| self.core.macos_hold.lock().unwrap().observe(self.now()))
-    }
-    #[cfg(unix)]
-    fn refresh_macos_hold(&self, inner: &Inner, snapshot: Option<crate::macos::hold::Snapshot>) {
-        if let Some(snapshot) = snapshot {
-            let idle = inner.jobs.values().all(|job| job.terminal.is_some())
-                && inner.starting.is_empty()
-                && inner.reserved.is_empty()
-                && inner.preparing.is_empty()
-                && inner.admitting.is_empty()
-                && inner.admission_saves.is_empty()
-                && inner.terminal_saves.is_empty()
-                && inner.base_finishes.is_empty()
-                && inner.base_settling.is_empty()
-                && inner.finalizing.is_empty()
-                && !self.core.config.macos_runtime.degraded()
-                && self.core.quarantined.is_empty();
-            self.core
-                .macos_hold
-                .lock()
-                .unwrap()
-                .apply(self.now(), idle, snapshot);
-        }
-    }
-    fn macos_hold_status(&self) -> Option<String> {
-        #[cfg(unix)]
-        let _ = self.observe_macos_hold();
-        self.macos_hold_status_cached()
-    }
-    fn macos_hold_status_cached(&self) -> Option<String> {
-        #[cfg(unix)]
-        if self.core.config.macos_instance() {
-            return self.core.macos_hold.lock().unwrap().status(self.now());
-        }
-        None
-    }
     pub(crate) fn service_stop_blockers(&self) -> Vec<String> {
         let Ok(inner) = self.core.inner.try_lock() else {
             return vec!["engine_state_lock".into()];
@@ -4914,9 +4874,11 @@ impl Runner {
         // the files may be partly gone. Keep that setup refusal even when the
         // deletion has finished and no overlap is visible by this recheck;
         // otherwise the job would start on a half-deleted workspace.
+        // Only the final check records a hold refusal, since the initial
+        // check might have seen a hold that has since ended.
         let ordinary_refusal = self
             .qualification_refusal(qualification)
-            .or_else(|| self.run_refusal(&inner, &request, &access))
+            .or_else(|| self.check_run_refusal(&inner, &request, &access, true))
             .or_else(|| {
                 initial_refusal.filter(|(reason, _)| *reason == RefusalReason::WorkspaceSetupFailed)
             });
@@ -5093,6 +5055,16 @@ impl Runner {
         request: &Run,
         access: &crate::workspace_access::Repairs,
     ) -> Option<(RefusalReason, String)> {
+        self.check_run_refusal(inner, request, access, false)
+    }
+
+    fn check_run_refusal(
+        &self,
+        inner: &Inner,
+        request: &Run,
+        access: &crate::workspace_access::Repairs,
+        record_hold_refusal: bool,
+    ) -> Option<(RefusalReason, String)> {
         #[cfg(target_os = "linux")]
         if self.config().tenant_vm {
             match std::fs::read_to_string("/proc/cmdline") {
@@ -5226,7 +5198,7 @@ impl Runner {
             Some(refusal)
         } else if let Some(refusal) = self.slice_memory_refusal() {
             Some(refusal)
-        } else if let Some(detail) = self.macos_hold_status_cached() {
+        } else if let Some(detail) = self.macos_hold_status_cached(record_hold_refusal) {
             Some((RefusalReason::RunnerDraining, detail))
         } else if self.admission_closed(inner) {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))

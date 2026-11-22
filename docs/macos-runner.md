@@ -29,6 +29,13 @@ Operator drain/resume remains independent. Health's `admission_blocked` text
 reports `held for <owner> until <time> (granted: true/false)` unless a
 qualification requirement or operator drain takes precedence.
 
+If a fleet job is refused while a hold is active, retry it. When that hold ends
+or its owner changes, the runner ignores holds for 60 seconds so retrying fleet
+jobs can start. After those 60 seconds, holds can block new admissions again,
+but a grant waits for running fleet jobs to finish. Refreshing a hold’s
+expiration without changing its owner does not start this turn. If no fleet job
+was refused, there is no turn.
+
 Portable coverage: `macos::hold::tests` covers window boundaries, midnight,
 malformed files and grant removal. `tests::platform_refusal::macos_hold` includes
 `honoured_hold_refuses_new_run_while_running_job_finishes`,

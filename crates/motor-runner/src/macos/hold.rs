@@ -17,6 +17,10 @@ mod tests;
 // Limit how long one hold can block fleet macOS jobs. A longer run writes a new hold.
 const ALWAYS_HOLD_MAX: u64 = 3 * 60 * 60 * 1_000;
 
+// The ck-motor client retries refused fleet jobs about every 9 seconds, so a
+// waiting job can be admitted well before holds resume.
+const FLEET_TURN: u64 = 60 * 1_000;
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(try_from = "String")]
 pub(crate) enum Window {
@@ -113,6 +117,8 @@ pub(crate) struct State {
     granted: Option<Hold>,
     bad: BTreeSet<[u8; 32]>,
     latest: Snapshot,
+    refused_owner: Option<String>,
+    fleet_turn_until: u64,
 }
 
 #[derive(Clone, Default)]
@@ -136,6 +142,8 @@ impl State {
             granted: None,
             bad: BTreeSet::new(),
             latest: Snapshot::default(),
+            refused_owner: None,
+            fleet_turn_until: 0,
         }
     }
 
@@ -201,10 +209,23 @@ impl State {
             revision: self.latest.revision + 1,
             hold,
         };
+        // Remember the owner that blocked admission, not the expiry: the
+        // writer can refresh the same hold or replace it without an observed gap.
+        if self.refused_owner.as_ref().is_some_and(|owner| {
+            self.honoured(now, &self.latest)
+                .is_none_or(|hold| &hold.owner != owner)
+        }) {
+            self.refused_owner = None;
+            self.fleet_turn_until = now.saturating_add(FLEET_TURN);
+            self.remove_grant();
+        }
         self.latest.clone()
     }
 
     fn honoured(&self, now: u64, snapshot: &Snapshot) -> Option<Hold> {
+        if now < self.fleet_turn_until {
+            return None;
+        }
         let limit = self.window?.expiry_limit(now)?;
         let hold = snapshot.hold.as_ref()?;
         let expiry = hold.expiry().ok()?.unix_timestamp_nanos();
@@ -268,11 +289,22 @@ impl State {
     }
 
     pub(crate) fn status(&mut self, now: u64) -> Option<String> {
+        self.status_for(now, false)
+    }
+
+    pub(crate) fn admission_refusal(&mut self, now: u64) -> Option<String> {
+        self.status_for(now, true)
+    }
+
+    fn status_for(&mut self, now: u64, record_refusal: bool) -> Option<String> {
         let hold = self.honoured(now, &self.latest);
         if hold.as_ref() != self.granted.as_ref() {
             self.remove_grant();
         }
         hold.map(|hold| {
+            if record_refusal {
+                self.refused_owner = Some(hold.owner.clone());
+            }
             format!(
                 "held for {} until {} (granted: {})",
                 hold.owner,
