@@ -160,6 +160,53 @@ fn workspace_changes_dirty_snapshot_reports_only_job_edits() {
 }
 
 #[test]
+fn workspace_changes_caller_deleted_folder_is_not_a_job_change() {
+    let scratch = ScratchDir::new("motor-workspace-changes-deleted-folder");
+    let trees = trees(&scratch);
+    fs::create_dir_all(&trees.state).unwrap();
+    let repo = committed_repo(&scratch, "deleted-folder");
+    fs::create_dir_all(repo.join("crate/src")).unwrap();
+    fs::write(repo.join("crate/Cargo.toml"), "[package]").unwrap();
+    fs::write(repo.join("crate/src/lib.rs"), "// lib").unwrap();
+    git(&repo, &["add", "."]).unwrap();
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "with crate",
+        ],
+    )
+    .unwrap();
+    let commit = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    // The caller deletes the whole folder without committing, so the snapshot
+    // lists each of its files as deleted and the job sees no parent directory.
+    fs::remove_dir_all(repo.join("crate")).unwrap();
+    let tree = trees.tree_hash(&repo).unwrap();
+    git(&repo, &["read-tree", "HEAD"]).unwrap();
+    stage_snapshot_ignored(&repo, &tree).unwrap();
+    assert_eq!(
+        trees
+            .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+            .unwrap(),
+        Vec::<String>::new()
+    );
+    // A job that brings one of those files back has changed it.
+    fs::create_dir_all(repo.join("crate/src")).unwrap();
+    fs::write(repo.join("crate/src/lib.rs"), "// lib").unwrap();
+    assert_eq!(
+        trees
+            .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+            .unwrap(),
+        ["crate/src/lib.rs"]
+    );
+}
+
+#[test]
 fn workspace_changes_clean_snapshot_keeps_status_behavior() {
     let scratch = ScratchDir::new("motor-workspace-changes-clean");
     let trees = trees(&scratch);

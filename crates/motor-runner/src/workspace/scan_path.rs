@@ -69,6 +69,10 @@ pub(super) fn lookup(root: &Path, name: &Path) -> io::Result<Lookup> {
             libc::O_RDONLY | libc::O_DIRECTORY,
         ) {
             Ok(directory) => directory,
+            // A missing ancestor means the path doesn't exist either, as when
+            // the caller deleted a whole folder. A symlinked or non-directory
+            // ancestor is never followed, so its path stays unknown (Blocked).
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(Lookup::Missing),
             Err(error) if unavailable(&error) => return Ok(Lookup::Blocked),
             Err(error) => return Err(error),
         };
