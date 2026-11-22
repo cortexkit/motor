@@ -93,10 +93,14 @@ fn config(f: &Fixture) -> Config {
 }
 
 fn write_hold(runner: &Runner) {
+    write_hold_for(runner, "nightly-check");
+}
+
+fn write_hold_for(runner: &Runner, owner: &str) {
     let paths = runner.config().macos_hold_paths.as_ref().unwrap();
     fs::write(
         paths.0.join("hold.json"),
-        r#"{"owner":"nightly-check","expires_at":"2026-01-01T04:00:00Z"}"#,
+        serde_json::json!({"owner": owner, "expires_at": "2026-01-01T04:00:00Z"}).to_string(),
     )
     .unwrap();
 }
@@ -180,6 +184,56 @@ fn honoured_hold_refuses_new_run_while_running_job_finishes() {
             .admission_blocked
             .as_deref(),
         Some("held for nightly-check until 2026-01-01T04:00:00Z (granted: true)")
+    );
+}
+
+#[test]
+fn refused_job_retries_between_holds_and_finishes_before_next_grant() {
+    let f = Fixture::new();
+    let retry = macos_request(&f);
+    let (finish, receive) = mpsc::channel();
+    let backend = HoldBackend(Mutex::new(BTreeMap::from([(retry.job_id, receive)])));
+    let runner = Runner::open_with_backend(config(&f), Box::new(backend)).unwrap();
+    write_hold(&runner);
+    runner.tick().unwrap();
+    assert!(granted(&runner));
+    let mut first_attempt = retry.clone();
+    first_attempt.job_id = Uuid::now_v7();
+    assert!(matches!(
+        runner.accept(first_attempt).unwrap(),
+        Admission::Refused(RefusalReason::RunnerDraining)
+    ));
+
+    write_hold_for(&runner, "next-check");
+    submit(&f, &runner, &retry);
+    assert!(!granted(&runner));
+    wait_for(&runner, || running(&runner, retry.job_id));
+
+    f.clock.fetch_add(60_000, Ordering::SeqCst);
+    runner.tick().unwrap();
+    assert!(!granted(&runner));
+    assert_eq!(
+        runner
+            .runner_status()
+            .health
+            .unwrap()
+            .admission_blocked
+            .as_deref(),
+        Some("held for next-check until 2026-01-01T04:00:00Z (granted: false)")
+    );
+
+    finish.send(()).unwrap();
+    wait_for(&runner, || {
+        finished(&runner, retry.job_id) && granted(&runner)
+    });
+    assert_eq!(
+        runner
+            .runner_status()
+            .health
+            .unwrap()
+            .admission_blocked
+            .as_deref(),
+        Some("held for next-check until 2026-01-01T04:00:00Z (granted: true)")
     );
 }
 

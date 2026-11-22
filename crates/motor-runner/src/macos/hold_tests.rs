@@ -21,10 +21,14 @@ fn fixture(window: Option<&str>) -> (CanonicalScratchDir, State) {
 }
 
 fn write(state: &State, expires_at: &str) {
+    write_for(state, "nightly-check", expires_at);
+}
+
+fn write_for(state: &State, owner: &str, expires_at: &str) {
     std::fs::write(
         state.hold_dir.join("hold.json"),
         serde_json::to_vec(&Hold {
-            owner: "nightly-check".into(),
+            owner: owner.into(),
             expires_at: expires_at.into(),
         })
         .unwrap(),
@@ -162,6 +166,87 @@ fn grant_copies_fields_only_when_idle_and_deletion_removes_it() {
     std::fs::remove_file(state.hold_dir.join("hold.json")).unwrap();
     assert!(!state.refresh(now, true));
     assert!(!state.grant_dir.join("granted.json").exists());
+}
+
+#[test]
+fn replacement_after_refusal_leaves_a_full_fleet_turn_even_without_a_retry() {
+    for observe_gap in [false, true] {
+        let (_root, mut state) = fixture(Some("always"));
+        let now = millis("2026-01-01T03:30:00Z");
+        let grant = state.grant_dir.join("granted.json");
+        write(&state, "2026-01-01T04:00:00Z");
+        assert!(state.refresh(now, true));
+        assert!(state.admission_refusal(now).is_some());
+        assert!(grant.exists());
+
+        let turn_start = now + 9_000;
+        if observe_gap {
+            std::fs::remove_file(state.hold_dir.join("hold.json")).unwrap();
+            assert!(!state.refresh(turn_start, true));
+        }
+        write_for(&state, "next-check", "2026-01-01T04:00:00Z");
+        let replacement_seen = turn_start + if observe_gap { 1_000 } else { 0 };
+        assert!(!state.refresh(replacement_seen, true));
+        assert!(state.status(replacement_seen).is_none());
+        assert!(!grant.exists());
+
+        assert!(!state.refresh(turn_start + 59_999, true));
+        assert!(state.refresh(turn_start + 60_000, true));
+        assert_eq!(
+            state.status(turn_start + 60_000).as_deref(),
+            Some("held for next-check until 2026-01-01T04:00:00Z (granted: true)")
+        );
+        assert!(grant.exists());
+    }
+}
+
+#[test]
+fn replacement_without_refusal_does_not_start_a_fleet_turn() {
+    let (_root, mut state) = fixture(Some("always"));
+    let now = millis("2026-01-01T03:30:00Z");
+    write(&state, "2026-01-01T04:00:00Z");
+    assert!(state.refresh(now, true));
+    assert!(state.status(now).is_some());
+
+    write_for(&state, "next-check", "2026-01-01T04:00:00Z");
+    assert!(state.refresh(now, true));
+    assert_eq!(
+        state.status(now).as_deref(),
+        Some("held for next-check until 2026-01-01T04:00:00Z (granted: true)")
+    );
+}
+
+#[test]
+fn expiry_rewrite_preserves_the_refusal_without_starting_a_turn() {
+    let (_root, mut state) = fixture(Some("always"));
+    let now = millis("2026-01-01T03:30:00Z");
+    write(&state, "2026-01-01T04:00:00Z");
+    assert!(state.refresh(now, true));
+    assert!(state.admission_refusal(now).is_some());
+
+    write(&state, "2026-01-01T04:30:00Z");
+    assert!(state.refresh(now, true));
+    assert_eq!(
+        state.status(now).as_deref(),
+        Some("held for nightly-check until 2026-01-01T04:30:00Z (granted: true)")
+    );
+
+    write_for(&state, "next-check", "2026-01-01T04:30:00Z");
+    assert!(!state.refresh(now, true));
+}
+
+#[test]
+fn expired_hold_leaves_a_fleet_turn_after_refusal() {
+    let (_root, mut state) = fixture(Some("always"));
+    let expires = millis("2026-01-01T04:00:00Z");
+    write(&state, "2026-01-01T04:00:00Z");
+    assert!(state.refresh(expires - 1, true));
+    assert!(state.admission_refusal(expires - 1).is_some());
+    assert!(!state.refresh(expires, true));
+
+    write_for(&state, "next-check", "2026-01-01T04:30:00Z");
+    assert!(!state.refresh(expires + 1, true));
+    assert!(state.refresh(expires + 60_000, true));
 }
 
 #[test]
