@@ -624,14 +624,20 @@ and tool prerequisites. No drain is needed. From the repository root:
 1. Pick an owner name unique to this build. Reserve at least the build budget
    plus 1 GiB to cover rounding the floor up to a whole GiB. For a 64 GiB budget:
    `sudo python3 script/hosted-host/hosted_host.py storage-reserve --owner image-build --gib 65 --ttl-s 14400`.
-   Choose a TTL that covers the build and publication. Do not start if `ok` is
+   Choose a TTL that covers the build. Do not start if `ok` is
    false; `short_bytes` reports the remaining deficit after eviction.
 2. Round `threshold_bytes` from the reserve reply up to GiB:
    `(threshold_bytes + 1073741823) // 1073741824`. Pass that integer as
    `--free-floor-gib` to `script/tenant-image/build.py build` along with the
    64 GiB `--build-budget-gib` (or your chosen budget). Build on the host's
    managed storage filesystem, using the normal operator-host output root.
-3. Publish the completed generation on the running host:
+3. Release the reservation as soon as the build ends, whether it succeeded
+   or failed: `sudo python3 script/hosted-host/hosted_host.py storage-release --owner image-build`.
+   The built files already count in filesystem usage, and publication makes its
+   own storage check, which would also count a reservation still held.
+   `host-status` lists live reservations. A restart drops them; the builder
+   still enforces its own free-space floor.
+4. Publish the completed generation on the running host:
 
    ```sh
    sudo env PYTHONPATH="$PWD/script/hosted-host" python3 - GENERATION <<'EOF'
@@ -643,13 +649,8 @@ and tool prerequisites. No drain is needed. From the repository root:
    EOF
    ```
 
-   Publication has its own storage check, which still counts the live build
-   reservation. Leave unreserved headroom for publication. If space is short
-   after the build completes, release the build reservation before retrying
-   publication; the staged files are already counted in filesystem usage.
-4. Always run `sudo python3 script/hosted-host/hosted_host.py storage-release --owner image-build`,
-   even if the build or publication failed. `host-status` lists live reservations.
-   A restart drops them; the builder still enforces its own free-space floor.
+   If publication is refused for space, it needs more room than the host can
+   free now; retry after running jobs end.
 
 ### Per-job fill sources
 
