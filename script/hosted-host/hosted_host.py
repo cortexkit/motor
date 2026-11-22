@@ -58,6 +58,7 @@ TENANT_FILE = HERE / "tenant-1.json"
 # The host id and the tenant's broker subject are not here: this repository is
 # public, so they are install.sh arguments and live only in the server's configs.
 PORT = 8443
+GIB = 1024**3
 RESOLVERS = ["1.1.1.1", "9.9.9.9"]
 FIRECRACKER = Path("/usr/local/lib/firecracker/1.17.0")
 # docs/linux-microvm.md installs the helper under /usr/local/libexec, and the
@@ -538,9 +539,22 @@ def main() -> int:
     commands.add_parser("undrain-host", help="clear the durable host drain")
     commands.add_parser("bounded-drain-host", help="empty the host while accepting jobs that fit its fixed deadline")
     commands.add_parser("cancel-bounded-drain-host", help="cancel an active bound; full drain requires undrain-host")
-    commands.add_parser("host-status", help="show the bounded/full drain and latest broker echo")
+    commands.add_parser("host-status", help="show host drain, latest broker echo and live storage reservations")
+    reserve = commands.add_parser("storage-reserve", help="reserve GiB on a serving per-job host")
+    reserve.add_argument("--owner", required=True)
+    reserve.add_argument("--gib", type=int, required=True)
+    reserve.add_argument("--ttl-s", type=int, required=True)
+    release = commands.add_parser("storage-release", help="release an owner's storage reservation")
+    release.add_argument("--owner", required=True)
     args = parser.parse_args()
     try:
+        if args.command in {"storage-reserve", "storage-release"}:
+            request = {"op": args.command.replace("-", "_"), "owner": args.owner}
+            if args.command == "storage-reserve":
+                request.update(bytes=args.gib * GIB, ttl_s=args.ttl_s)
+            reply = admin_exchange(request)
+            sys.stdout.write(render_json(reply))
+            return 0 if reply.get("ok") is True else 1
         if args.command in {"drain-host", "undrain-host", "host-status", "bounded-drain-host", "cancel-bounded-drain-host"}:
             if args.command == "drain-host":
                 reply = drain_host(args.timeout)

@@ -616,6 +616,41 @@ test `isolated_readiness_lists_only_published_verified_generations` in
 `motor-vm-helper`. The filesystem test starts no VM or services; it does not
 replace the live canary.
 
+### Build a job image on a serving per-job host
+
+Use the [image build procedure](../script/tenant-image/README.md) for the runner
+and tool prerequisites. No drain is needed. From the repository root:
+
+1. Pick an owner name unique to this build. Reserve at least the build budget
+   plus 1 GiB to cover rounding the floor up to a whole GiB. For a 64 GiB budget:
+   `sudo python3 script/hosted-host/hosted_host.py storage-reserve --owner image-build --gib 65 --ttl-s 14400`.
+   Choose a TTL that covers the build and publication. Do not start if `ok` is
+   false; `short_bytes` reports the remaining deficit after eviction.
+2. Round `threshold_bytes` from the reserve reply up to GiB:
+   `(threshold_bytes + 1073741823) // 1073741824`. Pass that integer as
+   `--free-floor-gib` to `script/tenant-image/build.py build` along with the
+   64 GiB `--build-budget-gib` (or your chosen budget). Build on the host's
+   managed storage filesystem, using the normal operator-host output root.
+3. Publish the completed generation on the running host:
+
+   ```sh
+   sudo env PYTHONPATH="$PWD/script/hosted-host" python3 - GENERATION <<'EOF'
+   import sys
+   from hosted_host import admin_exchange, render_json
+   reply = admin_exchange({"op": "publish_job_images", "generation": sys.argv[1]}, timeout=3600)
+   print(render_json(reply), end="")
+   sys.exit(0 if reply.get("ok") is True else 1)
+   EOF
+   ```
+
+   Publication has its own storage check, which still counts the live build
+   reservation. Leave unreserved headroom for publication. If space is short
+   after the build completes, release the build reservation before retrying
+   publication; the staged files are already counted in filesystem usage.
+4. Always run `sudo python3 script/hosted-host/hosted_host.py storage-release --owner image-build`,
+   even if the build or publication failed. `host-status` lists live reservations.
+   A restart drops them; the builder still enforces its own free-space floor.
+
 ### Per-job fill sources
 
 After a job's terminal result is durably stored, the host may ask its VM to
