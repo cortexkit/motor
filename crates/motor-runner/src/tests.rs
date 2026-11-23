@@ -3491,7 +3491,7 @@ cat "$TMPDIR/serve-write-probe"
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires motor-cache, motor-job, patched sccache, sudo, ACLs and systemd"]
+#[ignore = "requires motor-cache, motor-job, sccache 0.20.0, sudo, ACLs and systemd"]
 async fn isolated_dependency_writer_fills_normal_dev_and_host_graphs_from_tip_only() {
     dependency_writer::isolated_graph_fixture().await;
 }

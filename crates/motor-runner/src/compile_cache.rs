@@ -2,30 +2,35 @@
 //! Matching these inputs between motor-cache fills and motor-job readers is necessary for dependency
 //! hits; otherwise identical sources produce unrelated cache entries.
 //!
-//! sccache 0.18.0's Rust key inputs, in order (src/compiler/rust.rs:1493-1597):
+//! [sccache 0.20.0's Rust key inputs](https://github.com/mozilla/sccache/blob/v0.20.0/src/compiler/rust.rs#L2155-L2280), in order:
 //! 1. Cache format version.
 //! 2. Compiler shared-library digests.
 //! 3. Compiler arguments (cfgs sorted; extern, search paths, check-cfg, out-dir,
-//!    diagnostic width and a JSON target's filename excluded).
+//!    diagnostic width and a JSON target's filename excluded), plus an incremental marker if enabled.
 //! 4. Source-file digests from dep-info.
-//! 5. Extern-file digests.
+//! 5. Extern digests. Proc-macro dylibs use their `.rustc` metadata when available
+//!    ([`hash_all_externs`](https://github.com/mozilla/sccache/blob/v0.20.0/src/util.rs#L469-L503)).
 //! 6. Static-library digests.
 //! 7. Target JSON contents.
-//! 8. Dep-info environment dependencies and CARGO_* variables, except jobserver
-//!    flags, registry settings, build-job count and encoded rustflags.
+//! 8. Dep-info environment dependencies (unset and empty differ) and Cargo variables.
+//!    The blanket Cargo pass excludes `CARGO_MAKEFLAGS`, `CARGO_REGISTRIES_*`,
+//!    `CARGO_TARGET_DIR`, `CARGO_BUILD_*` and `CARGO_ENCODED_RUSTFLAGS`; it does not
+//!    exclude them from the dep-info pass.
 //! 9. Compile cwd, which also winds up in the rlib.
 //! 10. Compiler version.
 //!
-//! Registry/git dependencies compile from their package directory under the
-//! shared CARGO_HOME, not from the workspace. Both accounts must see that same
-//! cwd and Cargo environment. The writer forces Cargo's local crates incremental,
+//! When configured, `SCCACHE_BASEDIRS` strips matching prefixes from key inputs
+//! such as arguments, the cwd and environment values, except dep-info variables
+//! named in `SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS`. Motor does not set these options
+//! for the shared cache. Registry/git dependencies compile from their package
+//! directory under the shared Cargo home, not from the workspace; both accounts
+//! therefore see the same working directory. The writer forces Cargo's local crates incremental,
 //! including release builds. The trusted shim strips CARGO_INCREMENTAL and
 //! CARGO_BUILD_INCREMENTAL after Cargo has emitted per-crate incremental flags:
-//! sccache rejects a literal `1` in either variable even on cacheable dependencies. This also
+//! by default [sccache rejects a literal `1`](https://github.com/mozilla/sccache/blob/v0.20.0/src/commands.rs#L996-L1014)
+//! in either variable even for cacheable dependencies. Stripping them also
 //! matches reader keys when a job explicitly enables incremental compilation.
-//! OUT_DIR matters when dep-info names it
-//! as an environment dependency, not simply because the variable is present.
-//! Source: <https://github.com/mozilla/sccache/blob/v0.18.0/src/compiler/rust.rs>.
+//! `OUT_DIR` is hashed as environment input only when dep-info names it.
 //!
 //! Reader misses are aggregate, not per-unit. They request at most one refill per
 //! repository/default-branch-tip/descriptor, only when the submitted snapshot's
@@ -40,8 +45,9 @@ pub(crate) const TARGET: &str = "/run/motor/target";
 pub(crate) const CACHE: &str = "/motor-cache";
 pub(crate) const CARGO_HOME: &str = "/motor-home/cargo";
 
-/// Format-1 build-base environment key. Frame names as well as values so
-/// swapped values, empty values and missing variables cannot alias one another.
+/// Format-1 build-base environment key for reusing Cargo build artifacts, not
+/// sccache's compile key. Frame names and values to distinguish swapped values,
+/// empty values and missing variables.
 #[cfg(target_os = "linux")]
 pub(crate) fn environment_fingerprint(env: &BTreeMap<String, String>) -> String {
     use sha2::{Digest, Sha256};
@@ -141,7 +147,8 @@ pub(crate) fn target_environment(env: &mut BTreeMap<String, String>) {
     env.insert("CARGO_BUILD_BUILD_DIR".into(), build_directory());
 }
 
-/// Keep profile defaults identical for fills and readers: sccache hashes CARGO_* values.
+/// Keep profile defaults identical for fills and readers: they affect rustc's
+/// arguments and sccache also hashes the Cargo profile environment values.
 /// Explicit job or repository settings win over the space-saving Linux default.
 #[cfg(target_os = "linux")]
 pub(crate) fn profile_environment(
@@ -233,12 +240,12 @@ fn snapshot_profile(repository: &Path, tree: &str, file: &str) -> Option<String>
         .ok()
 }
 
-/// sccache hashes CARGO_HOME, CARGO_TARGET_DIR, CARGO_BUILD_BUILD_DIR and
-/// CARGO_NET_OFFLINE, as well as profile debug defaults, even for non-incremental dependencies.
-/// Changing their presence or value between a fill and a reader loses every hit.
-/// Writers enable incremental in Cargo,
-/// and the trusted compile shim strips incremental environment variables before
-/// sccache sees them, preserving Cargo's per-crate flags.
+/// Use the same Cargo output layout and dependency inputs for readers and fills.
+/// sccache hashes `CARGO_HOME`, `CARGO_NET_OFFLINE` and profile debug defaults
+/// directly. `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` set Cargo's output
+/// layout; they only affect sccache through hashed arguments or dep-info.
+/// Writers enable incremental in Cargo; the compiler shim strips the environment
+/// flags before sccache sees them, preserving Cargo's per-crate flags.
 pub(crate) fn cargo_environment(env: &mut BTreeMap<String, String>, repository: &Path, tree: &str) {
     env.remove("CARGO_INCREMENTAL");
     target_environment(env);
@@ -270,11 +277,9 @@ pub(crate) fn reader_environment(
     }
 }
 
-/// Whether the shared compiler cache at `fleet` may hold compiled entries:
-/// whether any one-hex-digit path exists at its top level. sccache 0.18.0
-/// stores each entry under such a directory (see `writer::cache`), and the
-/// only other directory the runner creates there, `preprocessor/`, holds no
-/// Rust entries, so a cache without one is empty. A missing cache is empty.
+/// Whether any top-level shard may hold compiled entries. sccache 0.20.0
+/// uses one-hex-digit shard directories (see `writer::cache`); neither
+/// `preprocessor/` nor `CACHEDIR.TAG` is a compiled entry. A missing cache is empty.
 /// Only the Linux runner has a shared cache to inspect.
 #[cfg(target_os = "linux")]
 pub(crate) fn holds_entries(fleet: &Path) -> io::Result<bool> {
@@ -328,7 +333,7 @@ mod tests {
     use cortexkit_test_support::ScratchDir;
 
     #[test]
-    fn reader_and_writer_have_identical_hashed_cargo_inputs() {
+    fn reader_and_writer_share_cargo_environment_and_output_layout() {
         let scratch = ScratchDir::new("cargo-input-parity");
         let mut writer = BTreeMap::new();
         cargo_environment(&mut writer, scratch.path(), "");

@@ -215,18 +215,16 @@ plain name. `tools.txt` also lists the prerequisites it does not manage: Rust
 toolchains and targets (install every pinned toolchain with `rustup`), Node,
 pnpm and Bun under `/usr`, and system libraries.
 
-Build the patched sccache. Stock sccache 0.18.0 updates an entry's file times
-on every read, which fails on the read-only cache mount jobs get, so every
-lookup would miss:
+Install the pinned sccache release. Stock 0.20.0 supports hits on the
+read-only cache mount jobs get:
 
 ```sh
 CARGO_HOME=/srv/build/cargo-home sh script/runner/build-sccache.sh
 ```
 
-`build-sccache.sh` builds crates.io sccache 0.18.0 with
-`script/runner/patches/sccache-0.18.0-read-only-hits.patch`, keeps the stock
-binary it replaces as `sccache-0.18.0-stock`, and prints both hashes. See
-[compile-cache.md](compile-cache.md).
+`build-sccache.sh` installs the locked crates.io release specified in
+`script/runner/toolchain.json` and prints the installed binary's SHA-256.
+See [compile-cache.md](compile-cache.md).
 
 ### ARM64 Windows cross-lint in Linux job images
 

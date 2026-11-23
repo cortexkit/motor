@@ -978,7 +978,7 @@ fn tenant_rust_launch_builds_in_fixed_target_without_compile_cache() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn isolated_fill_and_job_have_identical_hashed_cargo_inputs() {
+fn isolated_fill_and_job_share_cargo_environment() {
     for file in [
         None,
         Some("Cargo.toml"),
@@ -1012,12 +1012,13 @@ fn isolated_fill_and_job_have_identical_hashed_cargo_inputs() {
         let mut fill = BTreeMap::new();
         compile_cache_environment(&config, &setup, &prepared.environment_inputs(), &mut fill)
             .unwrap();
-        // The compiler shim strips incremental settings before sccache hashes either role.
-        let hashed_cargo = |env: &mut BTreeMap<String, String>| {
+        // The writer opts into Cargo incremental builds; its compiler shim
+        // strips the environment override before calling sccache.
+        let shared_cargo = |env: &mut BTreeMap<String, String>| {
             env.retain(|key, _| key.starts_with("CARGO_") && key != "CARGO_INCREMENTAL");
         };
-        hashed_cargo(&mut job);
-        hashed_cargo(&mut fill);
+        shared_cargo(&mut job);
+        shared_cargo(&mut fill);
         assert_eq!(job, fill, "{file:?}");
         for key in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
             assert_eq!(

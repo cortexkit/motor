@@ -8,7 +8,7 @@
     "No global esbuild exists on the build server. ENGRAM provides ESBUILD_BIN from engram-worker/node_modules/.bin/esbuild using its repository lockfile install, and sets WASM_BINDGEN_BIN=wasm-bindgen and WASM_OPT_BIN=wasm-opt itself.",
     "rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
     "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt/rust-analyzer. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
-    "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat's patched sccache is identified by the build-input marker, recorded output hashes and a distinct stock binary, without starting a cache process; the build server's two sccache hashes are checked directly.",
+    "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat and tenant sccache installs are checked against the pinned build inputs and each image's recorded output hash without starting a cache process. The build server's sccache binary hash is pinned separately.",
     "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper, which reads the read-only shared compile cache. Boat and tenant jobs get no compile cache: no fill runs there, and an empty read-only cache breaks C builds that cc-rs routes through sccache. Neither image's jobs have RUSTC_WRAPPER, SCCACHE_DIR or /motor-tools on PATH. Tenant's immutable Rustup home is /usr/local/lib/motor/rustup and its mounted Cargo bin is /tenant/cargo-home/bin. Bun precedes Cargo on every role's job PATH. Inotify instance capacity must be at least 8192; watch/event limits are recorded because kernel RAM-based defaults differ."
   ],
   "apt_packages": {
@@ -299,7 +299,6 @@
     },
     "rustup": {},
     "sccache": {},
-    "sccache-0.18.0-stock": {},
     "wasm-bindgen": {
       "version": "wasm-bindgen 0.2.126"
     },
@@ -800,14 +799,13 @@
   },
   "sccache": {
     "build_server_sha256": {
-      "sccache": "d0b240d80a8a9d595bf35ba1341d838bc3f938c81e9359ff9eee66944df0aec4",
-      "sccache-0.18.0-stock": "531dfd1af765cd11e25a06516e9e757ab2c3a4bbc511ee857ee328ba71b477e6"
+      "sccache": "2f34e79d1f50cb577040a8b7bbbb40d52c74f232529dbec3855fb52251ad8f1e"
     },
-    "inputs_sha256": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
-    "version": "0.18.0"
+    "inputs_sha256": "c54ef54f583136fe2fc520eb7374c1c49f9be27c7409eb3dad04cad73c8561ba",
+    "version": "0.20.0"
   },
   "schema": 1,
-  "source": "Read-only build-server capture; refresh with toolchain-parity.py --capture and --from-capture",
+  "source": "Read-only build-server capture with a separately measured sccache binary pin. Refresh capture_sha256 after installing the pinned sccache with toolchain-parity.py --capture and --from-capture.",
   "tools": {
     "llvm-mingw": {
       "archive": {

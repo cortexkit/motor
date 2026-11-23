@@ -41,7 +41,8 @@ impl CacheFill {
             owner: account.uid,
         };
         fill.watch(fleet)?;
-        // sccache 0.18.0 shards hexadecimal keys under <first>/<second>/<key>.
+        // sccache 0.20.0 shards hexadecimal keys under <first>/<second>/<key>.
+        // https://github.com/mozilla/sccache/blob/v0.20.0/src/cache/disk.rs#L87-L90
         // Probe only those 272 directories, never enumerate their old entries.
         // A newly created shard is reported by its already-watched parent and
         // only that new subtree is scanned after the writer has stopped.
@@ -137,9 +138,10 @@ impl CacheFill {
                     "changed cache entry is not owned by the writer",
                 ));
             }
-            // sccache 0.18.0 persists 0600 NamedTempFiles. That creation mode
+            // sccache 0.20.0 persists 0600 NamedTempFiles. That creation mode
             // masks inherited named-user ACLs, so repair the changed entries
             // after unit shutdown, inside the cache fence, before publication.
+            // https://github.com/mozilla/sccache/blob/v0.20.0/src/lru_disk_cache/mod.rs#L365-L405
             repair(&path, metadata.is_dir()).map_err(|e| {
                 io::Error::other(format!("repair cache ACL {}: {e}", path.display()))
             })?;

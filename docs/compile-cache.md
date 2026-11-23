@@ -87,11 +87,11 @@ Test: `materialization_logs_identity_waits_and_failure_without_paths`
 (`crates/motor-runner/src/main.rs`, test
 `sccache_size_defaults_to_200_gib_and_accepts_a_cap`).
 
-Readers and the writer use sccache 0.18.0 built with
-`script/runner/patches/sccache-0.18.0-read-only-hits.patch`. Stock 0.18.0
-updates an entry's file times before every read, which fails on a read-only
-mount and turns every lookup into a miss. `script/runner/build-sccache.sh`
-builds the patched binary; see [runner-install.md](runner-install.md).
+Readers and the writer use stock sccache 0.20.0. It opens entries in
+`READ_ONLY` mode without updating their timestamps, so jobs can read hits on
+the read-only mount ([upstream fix](https://github.com/mozilla/sccache/pull/2901)).
+The upgrade changes Rust cache keys, so the shared cache needs to refill.
+See [runner-install.md](runner-install.md).
 
 ## Reading
 
@@ -121,15 +121,18 @@ its account allows job writes; see
 ### Why readers and the writer must match
 
 sccache keys a Rust compile on, among other things, the compiler arguments, the
-working directory, and Cargo's environment. Registry and Git dependencies
-compile from their directory under the shared `CARGO_HOME`, so the writer and
-every reader must see the same `CARGO_HOME` path and the same Cargo variables.
-These include `CARGO_TARGET_DIR=/run/motor/target` and
-`CARGO_BUILD_BUILD_DIR=/run/motor/target/bd/{workspace-path-hash}`. Cargo expands
-the build-folder template; the variable's literal value is the same in fills
-and jobs.
-Otherwise identical sources produce unrelated entries and every lookup misses.
-Test: `reader_and_writer_have_identical_hashed_cargo_inputs`.
+working directory, and environment inputs. Registry and Git dependencies
+compile from their directory under the shared `CARGO_HOME`, so fills and jobs
+see the same package paths. sccache 0.20.0 hashes `CARGO_HOME` but no longer
+hashes `CARGO_TARGET_DIR` or `CARGO_BUILD_*` as blanket environment inputs;
+rustc arguments and variables reported by rustc's dep-info still count.
+Motor does not set `SCCACHE_BASEDIRS` for the shared cache.
+
+Fills and jobs still share `CARGO_TARGET_DIR=/run/motor/target` and
+`CARGO_BUILD_BUILD_DIR=/run/motor/target/bd/{workspace-path-hash}` for Cargo's
+output layout. Cargo expands the build-folder template. The separate build-base
+fingerprint guards reuse of Cargo build artifacts and is not sccache's key.
+Test: `reader_and_writer_share_cargo_environment_and_output_layout`.
 
 Fills therefore inherit the same nested-Cargo lock trap as jobs: a build script
 starting another Cargo with its own `--target-dir` must remove
@@ -165,14 +168,13 @@ inspected; symlinks and oversized files count as unset. Tests:
 `oversized_cargo_profiles_keep_defaults`.
 
 Fills read those same files at their checked-out tip; they do not inherit a
-job's submitted environment. With the same inputs, fills and readers must get
-byte-identical `CARGO_*` values or sccache loses every hit. Changing this default
-costs one rebuild of every warm workspace and one round of cache refills. Test:
-`isolated_fill_and_job_have_identical_hashed_cargo_inputs`.
+job's submitted environment. With the same inputs, fills and readers get the
+same Cargo profile defaults. Changing the defaults changes cache keys for
+affected crates. Test: `isolated_fill_and_job_share_cargo_environment`.
 
 Incremental compilation: the writer builds local crates incrementally, and the
 wrapper strips `CARGO_INCREMENTAL` and `CARGO_BUILD_INCREMENTAL` before
-sccache sees them, because sccache refuses to cache when either is `1`. Test:
+sccache sees them, because by default it refuses to start when either is `1`. Test:
 `incremental_variables_are_stripped_for_cached_compiles_only`.
 
 ## Job writes to the remote cache

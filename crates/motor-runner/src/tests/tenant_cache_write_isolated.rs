@@ -27,7 +27,7 @@ impl TenantCache {
         assert!(version.status.success(), "sccache --version failed");
         assert_eq!(
             String::from_utf8(version.stdout).unwrap().trim(),
-            "sccache 0.18.0",
+            "sccache 0.20.0",
             "requires the image's pinned sccache"
         );
         let f = Fixture::new();
@@ -194,7 +194,7 @@ impl TenantCache {
 fn compile(name: &str, writable: bool, wait_write: bool) -> String {
     format!(
         r#"set -eu
-test "$(sccache --version)" = 'sccache 0.18.0'
+test "$(sccache --version)" = 'sccache 0.20.0'
 test "$SCCACHE_S3_RW_MODE" = {mode}
 test -z "${{SCCACHE_RECACHE+x}}"
 test -z "${{SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY+x}}"
@@ -246,7 +246,7 @@ PY
 }
 
 #[tokio::test]
-#[ignore = "requires root, systemd, motor-job accounts, reflink scratch and pinned sccache 0.18.0"]
+#[ignore = "requires root, systemd, motor-job accounts, reflink scratch and pinned sccache 0.20.0"]
 async fn isolated_tenant_cache_writes_use_admitted_claims() {
     let h = TenantCache::new();
     let creator = h.queue(&compile("dep", true, true), true, TENANT).await;
@@ -412,7 +412,7 @@ async fn isolated_tenant_cache_writes_use_admitted_claims() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, systemd, motor-job accounts, reflink scratch and pinned sccache 0.18.0"]
+#[ignore = "requires root, systemd, motor-job accounts, reflink scratch and pinned sccache 0.20.0"]
 async fn isolated_tenant_cache_denials_survive_later_credentials_and_attach() {
     let h = TenantCache::new();
     let id = Uuid::now_v7();

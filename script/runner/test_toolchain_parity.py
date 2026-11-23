@@ -362,9 +362,8 @@ class CaptureTests(unittest.TestCase):
 
     def test_sccache_inventory_never_runs_a_cache_process(self):
         with patch.object(parity.subprocess, "run") as run:
-            for name in ("sccache", "sccache-0.18.0-stock"):
-                self.assertEqual(parity.binary_version("/cargo/bin/" + name, {}),
-                                 {"version": None, "error": "not-probed: sccache"})
+            self.assertEqual(parity.binary_version("/cargo/bin/sccache", {}),
+                             {"version": None, "error": "not-probed: sccache"})
             run.assert_not_called()
 
     def test_gnu_test_inventory_never_passes_a_version_flag(self):
@@ -758,6 +757,35 @@ class ParityTests(unittest.TestCase):
             name: actual['cargo_binaries'][name]['sha256'] for name in self.manifest['sccache']['build_server_sha256']}}
         self.assertEqual([], parity.differences(self.manifest, actual, role='boat'))
         self.assertEqual([], self.report(actual, job=True, role='boat')['errors'])
+
+    def test_sccache_images_require_their_own_build_receipt_not_the_server_hash(self):
+        for role in ('boat', 'tenant'):
+            with self.subTest(role=role):
+                actual = self.observed_host(role)
+                actual['cargo_binaries']['sccache']['sha256'] = 'a' * 64
+                actual['sccache_artifacts'] = {
+                    'inputs_sha256': self.manifest['sccache']['inputs_sha256'],
+                    'binaries': {'sccache': 'a' * 64},
+                }
+                self.assertEqual([], parity.differences(self.manifest, actual, role=role))
+                actual['cargo_binaries']['sccache']['sha256'] = 'b' * 64
+                errors = parity.differences(self.manifest, actual, role=role)
+                self.assertTrue(any(error.startswith('sccache built artifact hash:') for error in errors), errors)
+
+    def test_sccache_server_requires_the_pinned_hash_and_one_binary(self):
+        actual = self.observed()
+        self.assertEqual([], parity.differences(self.manifest, actual))
+        actual['cargo_binaries']['sccache']['sha256'] = 'a' * 64
+        actual['cargo_binaries']['sccache-0.18.0-stock'] = {'sha256': 'b' * 64}
+        errors = parity.differences(self.manifest, actual)
+        self.assertTrue(any(error.startswith('sccache SHA-256:') for error in errors), errors)
+        self.assertTrue(any(error.startswith('cargo binary names:') for error in errors), errors)
+
+    def test_sccache_install_receipt_binds_the_version_pin(self):
+        version = self.manifest['sccache']['version']
+        inputs = self.manifest['sccache']['inputs_sha256']
+        self.assertEqual(inputs, parity.sccache_inputs_sha256(version))
+        self.assertNotEqual(inputs, parity.sccache_inputs_sha256('0.0.0'))
 
     def test_boat_host_parity_requires_system_account_properties(self):
         for change, expected in ((None, 'missing non-root job account'),
@@ -1791,37 +1819,34 @@ class InstallerTests(unittest.TestCase):
                 if 'git' in tool:
                     self.assertIn('--rev ' + tool['rev'], (bins / ('ckdev-mutate-' + tool['rev'][:8])).read_text())
 
-    def test_fresh_sccache_build_installs_stock_without_running_either_binary(self):
+    def test_sccache_installs_only_the_pinned_stock_release_and_retires_legacy_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'toolchain.json').write_text(parity.MANIFEST.read_text())
             script = root / 'build-sccache.sh'
             script.write_text((parity.HERE / 'build-sccache.sh').read_text())
-            (root / 'patches').mkdir()
-            (root / 'patches/sccache-0.18.0-read-only-hits.patch').write_text('patch fixture')
             fake_bin = root / 'fake-bin'
             fake_bin.mkdir()
             cargo_home = root / 'cargo'
             (cargo_home / 'bin').mkdir(parents=True)
+            legacy = cargo_home / 'bin/sccache-0.18.0-stock'
+            legacy.write_text('legacy stock comparison binary')
+            unmanaged = cargo_home / 'bin/sccache-custom'
+            unmanaged.write_text('not created by the installer')
             cargo = fake_bin / 'cargo'
             cargo.write_text('#!/usr/bin/env python3\nimport os, pathlib, sys\n'
-                             'args = sys.argv[1:]\n'
-                             'if args[0] == "install":\n'
-                             '    source = pathlib.Path(os.environ["CARGO_HOME"]) / "registry/src/index/sccache-0.18.0"\n'
-                             '    source.mkdir(parents=True)\n'
-                             '    path = pathlib.Path(args[args.index("--root")+1]) / "bin/sccache"\n'
-                             'else: path = pathlib.Path(args[args.index("--target-dir")+1]) / "release/sccache"\n'
-                             'path.parent.mkdir(parents=True, exist_ok=True)\n'
-                             'path.write_text("#!/bin/sh\\nexit 77\\n# " + args[0] + "\\n")\n'
+                             'root = pathlib.Path(os.environ["CARGO_HOME"])\n'
+                             'assert sys.argv[1:] == ["install", "--locked", "--version", "=0.20.0", '
+                             '"--force", "--no-track", "--root", str(root), "sccache"], sys.argv\n'
+                             'path = root / "bin/sccache"\n'
+                             'path.write_text("#!/bin/sh\\nexit 77\\n")\n'
                              'path.chmod(0o755)\n')
             cargo.chmod(0o755)
-            patcher = fake_bin / 'patch'
-            patcher.write_text('#!/bin/sh\nexit 0\n')
-            patcher.chmod(0o755)
             result = subprocess.run(['sh', str(script)], env=dict(os.environ, CARGO_HOME=str(cargo_home), TMPDIR=str(root),
                                     PATH=str(fake_bin) + os.pathsep + os.environ['PATH']), capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotEqual((cargo_home / 'bin/sccache').read_bytes(), (cargo_home / 'bin/sccache-0.18.0-stock').read_bytes())
+            self.assertEqual({'sccache', 'sccache-custom'}, {path.name for path in (cargo_home / 'bin').iterdir()})
+            self.assertEqual('not created by the installer', unmanaged.read_text())
 
 
 FAKE_GIT = '''#!/bin/sh

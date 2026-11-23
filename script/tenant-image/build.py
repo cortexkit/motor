@@ -24,7 +24,6 @@ BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro "
 RUNNER_INPUTS = (
     "script/runner/tools.txt", "script/runner/install-tools.sh", "script/runner/install-npm-tool.py",
     "script/runner/build-sccache.sh", "script/runner/motor-net.nft", "script/runner/motor_network_ready.py",
-    "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
     "script/runner/build-git.sh", "script/runner/install-binaryen.py",
     "script/runner/job-account.py",
     "script/runner/units/system/motor-jobs.slice",

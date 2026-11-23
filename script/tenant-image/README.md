@@ -60,11 +60,11 @@ The other inputs are:
   Node/npm come from the pinned upstream distribution rather than the
   distribution's Node package.
 - SHA-256-pinned copies of the runner's `tools.txt`, `install-tools.sh`,
-  `build-sccache.sh`, read-only-hit patch and `motor-net.nft`. A changed source
+  `build-sccache.sh` and `motor-net.nft`. A changed source
   file fails the build until its pin is deliberately updated. Every Cargo tool
   is installed by the existing installer, which uses locked release versions
-  or full Git revisions. Sccache is built by the patched builder, not replaced
-  by stock `cargo install sccache`.
+  or full Git revisions. `build-sccache.sh` installs the stock crates.io
+  release pinned in `script/runner/toolchain.json`.
 - Git built from the build server's release (`toolchain.json`'s `tools.git`:
   kernel.org source with a pinned SHA-256) by the pinned `build-git.sh`, into
   `/usr/local/lib/git/<version>` and linked from `/usr/local/bin`, ahead of

@@ -376,6 +376,13 @@ def first_line(text):
     return text.splitlines()[0] if text else ""
 
 
+def sccache_inputs_sha256(version):
+    # The installer reads the version from the manifest. Hash both inputs so a
+    # version bump invalidates an image's install receipt even if the script is unchanged.
+    script = (HERE / "build-sccache.sh").read_bytes()
+    return hashlib.sha256(version.encode("ascii") + b"\0" + script).hexdigest()
+
+
 def validate(manifest, role="build-server"):
     if role == "macos":
         macos_parity().validate(manifest, json.loads(MANIFEST.read_text()))
@@ -502,6 +509,13 @@ def validate(manifest, role="build-server"):
                 raise ValueError("Cargo install and binary versions disagree: " + name)
     if not re.fullmatch(r'[a-f0-9]{64}', manifest['compile_wrapper']['sccache_sha256']):
         raise ValueError('invalid trusted compiler cache wrapper hash')
+    sccache = manifest['sccache']
+    if not re.fullmatch(r'\d+\.\d+\.\d+', sccache['version']):
+        raise ValueError('invalid sccache version pin')
+    hashes = sccache['build_server_sha256']
+    if (set(hashes) != {'sccache'} or not re.fullmatch(r'[a-f0-9]{64}', hashes['sccache'])
+            or not re.fullmatch(r'[a-f0-9]{64}', sccache['inputs_sha256'])):
+        raise ValueError('invalid sccache pin hashes')
 
 
 def validate_git(spec):
@@ -656,11 +670,11 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
             other = bins.get(expected["matches"], {})
             if not observed.get("sha256") or observed.get("sha256") != other.get("sha256"):
                 errors.append(name + ": does not match " + expected["matches"])
-    if not bins.get("sccache", {}).get("sha256") or bins.get("sccache", {}).get("sha256") == bins.get("sccache-0.18.0-stock", {}).get("sha256"):
-        errors.append("sccache: missing patched binary or identical to stock")
+    sccache_sha256 = bins.get("sccache", {}).get("sha256")
+    if not sccache_sha256:
+        errors.append("sccache: missing binary hash")
     if role == "build-server":
-        for name, expected in manifest["sccache"]["build_server_sha256"].items():
-            equal(name + " SHA-256", expected, bins.get(name, {}).get("sha256"))
+        equal("sccache SHA-256", manifest["sccache"]["build_server_sha256"]["sccache"], sccache_sha256)
     tools = actual.get("tools", {})
     for name, expected in manifest["tools"].items():
         observed = tools.get(name) or {}
@@ -784,8 +798,7 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
             equal("sccache build inputs", manifest["sccache"]["inputs_sha256"], actual.get("sccache_inputs_sha256"))
             artifacts = actual.get('sccache_artifacts') or {}
             equal('sccache artifact inputs', manifest['sccache']['inputs_sha256'], artifacts.get('inputs_sha256'))
-            for name in manifest['sccache']['build_server_sha256']:
-                equal(name + ' built artifact hash', artifacts.get('binaries', {}).get(name), bins.get(name, {}).get('sha256'))
+            equal('sccache built artifact hash', artifacts.get('binaries', {}).get('sccache'), sccache_sha256)
     return errors
 
 
@@ -855,7 +868,7 @@ def refresh(manifest, actual):
             if row.get("exit_code") != 0:
                 raise ValueError("failed version capture: " + name)
             expected["version"] = first_line(row["version"])
-        elif name not in ("rustup", "sccache", "sccache-0.18.0-stock") and not expected:
+        elif name not in ("rustup", "sccache") and not expected:
             raise ValueError("unmeasured binary: " + name)
         manifest["cargo_binaries"][name] = expected
     for install in manifest["cargo_installs"]:
@@ -881,10 +894,8 @@ def refresh(manifest, actual):
                                  if row and row.get("package", "").startswith("gnu-coreutils:")}
     required = manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["build-server"]
     manifest["apt_packages"]["observed_build_server_versions"] = {name: actual["apt_packages"][name] for name in required}
-    manifest["sccache"]["build_server_sha256"] = {
-        name: actual["cargo_binaries"][name]["sha256"] for name in ("sccache", "sccache-0.18.0-stock")}
-    manifest["sccache"]["inputs_sha256"] = "".join(hashlib.sha256((HERE / name).read_bytes()).hexdigest() for name in (
-        "build-sccache.sh", "patches/sccache-0.18.0-read-only-hits.patch"))
+    manifest["sccache"]["build_server_sha256"] = {"sccache": actual["cargo_binaries"]["sccache"]["sha256"]}
+    manifest["sccache"]["inputs_sha256"] = sccache_inputs_sha256(manifest["sccache"]["version"])
     manifest["capture_sha256"] = hashlib.sha256(json.dumps(actual, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     validate(manifest)
     return manifest
