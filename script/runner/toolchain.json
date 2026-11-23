@@ -442,7 +442,7 @@
   "compile_wrapper": {
     "backend": "/srv/build/cargo-home/bin/sccache",
     "sccache_path": "/motor-tools/sccache",
-    "sccache_sha256": "3f1da40332e28d47887d4ebdf24cf753cbf9e181888c14e9c56520fca94a1570",
+    "sccache_sha256": "a5107577380a658f1c094ebc58e039c102f4dce569803030eadce6bd9c28c877",
     "supervisor_cache_file": "/motor-tools/prefrontal-build-slot.cache"
   },
   "gnu_coreutils": {

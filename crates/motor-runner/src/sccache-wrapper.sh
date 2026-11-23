@@ -10,14 +10,16 @@ if "${BASH_SOURCE[0]}.ready"; then
     # Cargo has already translated these into per-crate incremental flags.
     # sccache rejects a literal 1 even for non-incremental dependencies; remove
     # other values too so writer and reader dependency keys still match.
-    unset CARGO_INCREMENTAL CARGO_BUILD_INCREMENTAL
+    # Cargo has already fetched dependencies. CARGO_NET_OFFLINE does not
+    # affect rustc, but sccache hashes it, splitting network and offline keys.
+    unset CARGO_INCREMENTAL CARGO_BUILD_INCREMENTAL CARGO_NET_OFFLINE
     exec "$backend" "$@"
 fi
 # A concurrent compiler may start the same server; test the endpoint again even
 # if --start-server reports that its address is already in use.
 "$backend" --start-server >/dev/null 2>&1 || true
 if "${BASH_SOURCE[0]}.ready"; then
-    unset CARGO_INCREMENTAL CARGO_BUILD_INCREMENTAL
+    unset CARGO_INCREMENTAL CARGO_BUILD_INCREMENTAL CARGO_NET_OFFLINE
     exec "$backend" "$@"
 fi
 exec "$@"
