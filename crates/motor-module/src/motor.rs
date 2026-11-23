@@ -1390,22 +1390,19 @@ impl Motor {
             Some(self.connector_for_job(id)?)
         };
         let explicit_windows = windows && !self.config.windows_runners.is_empty();
-        let windows_runner_index = if explicit_windows {
-            let runner = self
-                .storage
+        let windows_runner = explicit_windows.then(|| {
+            self.storage
                 .job(id)
                 .and_then(|j| j.windows_runner)
-                .expect("Windows binding exists");
-            Some(
-                self.config
-                    .windows_runners
-                    .iter()
-                    .position(|r| r.name == runner.name)
-                    .expect("configured Windows runner"),
-            )
-        } else {
-            None
-        };
+                .expect("Windows binding exists")
+        });
+        let windows_runner_index = windows_runner.as_ref().map(|runner| {
+            self.config
+                .windows_runners
+                .iter()
+                .position(|r| r.name == runner.name)
+                .expect("configured Windows runner")
+        });
         let probe_windows_capacity =
             windows_runner_index.is_some_and(|index| index + 1 < self.config.windows_runners.len());
         // Reserve earlier runners before probing so callers cannot all observe
@@ -1543,7 +1540,7 @@ impl Motor {
                     }
                     Ok(channel)
                 };
-                if explicit_windows {
+                let opened = if explicit_windows {
                     tokio::time::timeout(WINDOWS_PROBE_TIMEOUT, opened)
                         .await
                         .unwrap_or_else(|_| {
@@ -1555,7 +1552,39 @@ impl Motor {
                         })
                 } else {
                     opened.await
-                }
+                };
+                opened.map_err(|(reason, detail, retry_after_ms)| {
+                    // Only the pre-Run path can promise that retrying cannot
+                    // duplicate a command that may already have started.
+                    let endpoint = if reason != RefusalReason::Unreachable {
+                        None
+                    } else if let Some(runner) = &windows_runner {
+                        Some(("Windows", runner.name.as_str(), WINDOWS_PROBE_TIMEOUT))
+                    } else if windows {
+                        self.config
+                            .windows_runner_instance
+                            .as_deref()
+                            .map(|instance| {
+                                ("Windows", instance, crate::transport::HANDSHAKE_TIMEOUT)
+                            })
+                    } else if request.platform == Some(Platform::Macos) {
+                        self.config.macos_runner.as_ref().map(|runner| {
+                            (
+                                "macOS",
+                                runner.host.as_str(),
+                                crate::transport::HANDSHAKE_TIMEOUT,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    let detail = endpoint
+                        .map(|(platform, endpoint, limit)| {
+                            crate::transport::direct_unreachable_detail(platform, endpoint, limit)
+                        })
+                        .or(detail);
+                    (reason, detail, retry_after_ms)
+                })
             };
             let mut channel = match opened {
                 Ok(c) => c,

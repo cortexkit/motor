@@ -3,9 +3,9 @@
 //! `tracing`, which discards every event until a subscriber is installed, so
 //! each binary's `main` installs this one. It formats INFO and above as one
 //! `<prefix> LEVEL target: message field=value ...` line per event and writes
-//! it to stderr. Whoever captures that stderr adds the timestamp: the subc
-//! daemon for ck-motor (`ck module logs ck-motor`), and the systemd user unit
-//! for motor-runner (the journal).
+//! it to stderr. The caller can supply a timestamp when the sink does not add
+//! one. The SubC daemon adds timestamps for ck-motor (`ck module logs
+//! ck-motor`), and journald adds them for the runner's systemd unit.
 //!
 //! This is deliberately a small `tracing::Subscriber` rather than another
 //! logging framework: both binaries only need leveled single-line events, and
@@ -35,6 +35,16 @@ pub fn init(prefix: &'static str) -> Result<(), tracing::dispatcher::SetGlobalDe
     init_with_writer(prefix, io::stderr())
 }
 
+/// Install the stderr sink with a caller-supplied clock for a plain stderr sink.
+pub fn init_with_timestamp(
+    prefix: &'static str,
+    timestamp: fn() -> String,
+) -> Result<(), tracing::dispatcher::SetGlobalDefaultError> {
+    let mut subscriber = LineSubscriber::new(prefix, io::stderr());
+    subscriber.timestamp = Some(timestamp);
+    tracing::subscriber::set_global_default(subscriber)
+}
+
 /// Install a sink that writes to `writer` instead of stderr. Tests use this to
 /// capture what `init` would have printed.
 pub fn init_with_writer(
@@ -51,6 +61,7 @@ pub struct LineSubscriber {
     prefix: &'static str,
     writer: Mutex<Box<dyn Write + Send>>,
     next_span: AtomicU64,
+    timestamp: Option<fn() -> String>,
 }
 
 impl LineSubscriber {
@@ -59,6 +70,7 @@ impl LineSubscriber {
             prefix,
             writer: Mutex::new(Box::new(writer)),
             next_span: AtomicU64::new(1),
+            timestamp: None,
         }
     }
 }
@@ -80,7 +92,7 @@ impl Subscriber for LineSubscriber {
         let metadata = event.metadata();
         let mut fields = Fields::default();
         event.record(&mut fields);
-        let line = format!(
+        let mut line = format!(
             "{} {} {}: {}{}",
             self.prefix,
             metadata.level(),
@@ -88,6 +100,11 @@ impl Subscriber for LineSubscriber {
             fields.message,
             fields.rest
         );
+        // Append rather than prefix so readers can still recognize the
+        // binary, severity and target at the start of the line.
+        if let Some(timestamp) = self.timestamp {
+            let _ = write!(line, " timestamp={}", timestamp());
+        }
         // One line per event: a field value carrying a newline must not be able
         // to forge a second log line.
         let mut line: String = line
@@ -124,6 +141,46 @@ impl Visit for Fields {
             let _ = write!(self.message, "{value:?}");
         } else {
             let _ = write!(self.rest, " {}={value:?}", field.name());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn timestamp_is_optional_and_leaves_the_event_prefix_intact() {
+        for (clock, suffix) in [
+            (None, ""),
+            (
+                Some((|| "2000-02-29T01:02:03.004Z".to_string()) as fn() -> String),
+                " timestamp=2000-02-29T01:02:03.004Z",
+            ),
+        ] {
+            let capture = Capture::default();
+            let mut subscriber = LineSubscriber::new("[runner]", capture.clone());
+            subscriber.timestamp = clock;
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::info!(target: "test_runner", version = "123", "serving");
+            assert_eq!(
+                *capture.0.lock().unwrap(),
+                format!("[runner] INFO test_runner: serving version=123{suffix}\n").as_bytes()
+            );
         }
     }
 }

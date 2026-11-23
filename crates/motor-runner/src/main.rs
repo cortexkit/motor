@@ -14,6 +14,77 @@ mod native_service;
 #[cfg(any(windows, test))]
 mod service_logging;
 
+fn init_stderr_logging() -> Result<(), tracing::dispatcher::SetGlobalDefaultError> {
+    #[cfg(unix)]
+    if let Some(clock) = stderr_log_clock(std::env::var("JOURNAL_STREAM").ok().as_deref(), || {
+        use std::os::{fd::AsFd, unix::fs::MetadataExt};
+        let fd = io::stderr().as_fd().try_clone_to_owned().ok()?;
+        let metadata = std::fs::File::from(fd).metadata().ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }) {
+        return motor_protocol::logging::init_with_timestamp(LOG_PREFIX, clock);
+    }
+    motor_protocol::logging::init(LOG_PREFIX)
+}
+
+#[cfg(unix)]
+fn stderr_log_clock(
+    journal_stream: Option<&str>,
+    stderr_id: impl FnOnce() -> Option<(u64, u64)>,
+) -> Option<fn() -> String> {
+    // A child can inherit JOURNAL_STREAM even when its own stderr is a file
+    // or an SSH pipe. Trust the variable only if it names this descriptor.
+    let journal_id = journal_stream
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(device, inode)| Some((device.parse().ok()?, inode.parse().ok()?)));
+    if journal_id.is_some() && journal_id == stderr_id() {
+        None
+    } else {
+        Some(|| log_timestamp(time::OffsetDateTime::now_utc()))
+    }
+}
+
+#[cfg(unix)]
+fn log_timestamp(utc: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+        utc.millisecond(),
+    )
+}
+
+#[cfg(all(test, unix))]
+mod stderr_logging_tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_plain_stderr_but_not_the_journal_stream() {
+        let stderr = || Some((11, 22));
+        assert!(stderr_log_clock(Some("11:22"), stderr).is_none());
+        assert!(stderr_log_clock(Some("11:23"), stderr).is_some());
+        assert!(stderr_log_clock(Some("11:22"), || None).is_some());
+        assert!(stderr_log_clock(Some("not a stream"), stderr).is_some());
+        assert!(stderr_log_clock(None, stderr).is_some());
+    }
+
+    #[test]
+    fn renders_rfc3339_in_utc_with_exactly_three_fractional_digits() {
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+        for (input, expected) in [
+            ("2000-02-29T01:02:03Z", "2000-02-29T01:02:03.000Z"),
+            ("2000-02-29T01:02:03.004999Z", "2000-02-29T01:02:03.004Z"),
+        ] {
+            let utc = OffsetDateTime::parse(input, &Rfc3339).unwrap();
+            assert_eq!(log_timestamp(utc), expected);
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     // A Boat job unit execs the runner as its PID namespace init. Dispatch it
     // first: it must fork while the process is still single-threaded, before
@@ -85,7 +156,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         if args.len() != 1 {
             return Err(io::Error::other("tenant-agent takes no arguments"));
         }
-        let _ = motor_protocol::logging::init(LOG_PREFIX);
+        let _ = init_stderr_logging();
         return motor_runner::serve_agent().await;
     }
     #[cfg(unix)]
@@ -116,7 +187,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             Ok(())
         }
         "metrics-push" => {
-            let _ = motor_protocol::logging::init(LOG_PREFIX);
+            let _ = init_stderr_logging();
             tokio::task::spawn_blocking(move || motor_runner::metrics::run(&config))
                 .await.map_err(io::Error::other)?
         }
@@ -209,7 +280,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         }
         #[cfg(unix)]
         "connect" | "forward" => tokio::task::spawn_blocking(move || -> io::Result<()> {
-            let _ = motor_protocol::logging::init(LOG_PREFIX);
+            let _ = init_stderr_logging();
             let started = Instant::now();
             tracing::info!(?job, instance = %config.instance, "runner bridge starting");
             let mut read = std::os::unix::net::UnixStream::connect(config.socket_path())?;
@@ -261,9 +332,9 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         "serve" => {
             // Without a subscriber every tracing event the runner reports (dispatch
             // and persistence failures among them) is silently discarded. Route
-            // them to stderr, which the systemd user unit sends to the journal.
+            // them to stderr, adding a timestamp only if stderr is not the journal.
             #[cfg(unix)]
-            if let Err(error) = motor_protocol::logging::init(LOG_PREFIX) {
+            if let Err(error) = init_stderr_logging() {
                 eprintln!("{LOG_PREFIX} logging unavailable: {error}");
             }
             #[cfg(windows)]
