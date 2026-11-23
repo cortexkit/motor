@@ -799,7 +799,7 @@
   },
   "sccache": {
     "build_server_sha256": {
-      "sccache": "2f34e79d1f50cb577040a8b7bbbb40d52c74f232529dbec3855fb52251ad8f1e"
+      "sccache": "286cf688b04f551ca720470dde5406a679e2b4a628c20bbc205f9fc706a2e9c8"
     },
     "inputs_sha256": "c54ef54f583136fe2fc520eb7374c1c49f9be27c7409eb3dad04cad73c8561ba",
     "version": "0.20.0"
