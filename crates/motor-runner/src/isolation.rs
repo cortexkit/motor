@@ -41,6 +41,17 @@ pub(crate) const WRITER_USER: &str = "motor-cache";
 /// listen on 127.0.0.1 alone.
 const JOB_HOSTS: &str = "127.0.0.1\tlocalhost\n::1\tip6-localhost\tip6-loopback\n";
 
+const CARGO_NET_OFFLINE: &str = "CARGO_NET_OFFLINE";
+
+pub(crate) fn cargo_offline_environment(env: &mut BTreeMap<String, String>, network: bool) {
+    if network {
+        // Leave offline mode to the project's Cargo configuration.
+        env.remove(CARGO_NET_OFFLINE);
+    } else {
+        env.insert(CARGO_NET_OFFLINE.into(), "true".into());
+    }
+}
+
 fn checked(command: &mut Command) -> io::Result<()> {
     let output = crate::systemd::output(command)?;
     if !output.status.success() {
@@ -4176,6 +4187,28 @@ impl Sandbox {
         if self.tenant_vm {
             cmd.args(tenant_unit_properties());
         }
+        let mut unset_environment = if self.boat_profile {
+            crate::systemd::provider_names(
+                "",
+                self.provider_unset_env
+                    .iter()
+                    .cloned()
+                    .chain(env.iter().map(|(key, _)| key.clone())),
+            )?
+        } else {
+            Vec::new()
+        };
+        if self.network {
+            // Removing the input value alone would still leave any value
+            // from the systemd manager's environment in the job.
+            unset_environment.push(CARGO_NET_OFFLINE.into());
+        }
+        if !unset_environment.is_empty() {
+            cmd.arg(format!(
+                "--property=UnsetEnvironment={}",
+                unset_environment.join(" ")
+            ));
+        }
         if self.boat_profile {
             // No ProcSubset=pid: like build-server jobs, Boat jobs see /proc/stat,
             // /proc/meminfo and the other non-process entries, which tools such
@@ -4183,14 +4216,6 @@ impl Sandbox {
             // describe only that job's machine. ProtectProc=invisible below still
             // hides other accounts' processes, and ProtectKernelTunables keeps
             // /proc/sys read-only.
-            let names = crate::systemd::provider_names(
-                "",
-                self.provider_unset_env
-                    .iter()
-                    .cloned()
-                    .chain(env.iter().map(|(key, _)| key.clone())),
-            )?;
-            cmd.arg(format!("--property=UnsetEnvironment={}", names.join(" ")));
             cmd.arg("--property=TasksMax=4096");
             cmd.arg("--property=CPUQuotaPeriodSec=100ms");
             cmd.arg(format!(
@@ -4345,7 +4370,6 @@ impl Sandbox {
             ("HOME", self.home.to_string_lossy().into_owned()),
             ("CARGO_HOME", self.cargo.to_string_lossy().into_owned()),
             ("RUSTUP_HOME", self.rustup.to_string_lossy().into_owned()),
-            ("CARGO_NET_OFFLINE", "true".into()),
             ("USER", user.into()),
             ("LOGNAME", user.into()),
             ("SHELL", "/bin/bash".into()),
@@ -4358,6 +4382,7 @@ impl Sandbox {
         ] {
             env.insert(key.into(), value);
         }
+        cargo_offline_environment(&mut env, self.network);
         cross_compilers::arm64_windows(&mut env, &cross_compilers::root());
         if pid_init.is_some() {
             pid_init::refuse_loader_environment(env.keys().map(String::as_str))?;

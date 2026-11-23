@@ -749,7 +749,7 @@ fn supplied_wsl_refusal(args: &RunArgs, wsl: &crate::wsl::Checks) -> Option<Stri
     )
 }
 
-// Names assigned after caller environment variables in motor-runner/src/isolation.rs.
+// Names controlled by the Linux runner after caller environment variables.
 const RUNNER_OWNED_ENV: &[&str] = &[
     "HOME",
     "CARGO_HOME",
@@ -778,7 +778,7 @@ fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<Run
         .find(|name| RUNNER_OWNED_ENV.contains(&name.as_str()))
     {
         if name == "CARGO_NET_OFFLINE" {
-            return Err("the runner sets CARGO_NET_OFFLINE=true in every Linux job so builds use locked, prefetched dependencies; on a --net job, set it inside the command (CARGO_NET_OFFLINE=false cargo …) or pass cargo --config net.offline=false".into());
+            return Err("the Linux runner controls CARGO_NET_OFFLINE: jobs without --net get true, and --net jobs leave it unset so the project's Cargo configuration applies; set it inside the command to override Cargo's setting".into());
         }
         return Err(format!("{name} is set by the runner"));
     }
@@ -3213,7 +3213,7 @@ mod tests {
         };
         assert_eq!(
             build_request(&args).unwrap_err(),
-            "the runner sets CARGO_NET_OFFLINE=true in every Linux job so builds use locked, prefetched dependencies; on a --net job, set it inside the command (CARGO_NET_OFFLINE=false cargo …) or pass cargo --config net.offline=false"
+            "the Linux runner controls CARGO_NET_OFFLINE: jobs without --net get true, and --net jobs leave it unset so the project's Cargo configuration applies; set it inside the command to override Cargo's setting"
         );
         assert_eq!(
             main_checked(&input, &crate::wsl::Checks::default()).await,

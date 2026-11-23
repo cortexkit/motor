@@ -125,7 +125,7 @@ def environment(abstract_name):
             assert error.errno == errno.ECONNREFUSED, error
         else:
             raise AssertionError('host abstract Unix socket is reachable')
-    assert os.environ['CARGO_NET_OFFLINE'] == 'true'
+    assert 'CARGO_NET_OFFLINE' not in os.environ
     for name in ['registry', 'git']:
         path = pathlib.Path(os.environ['CARGO_HOME']) / name / 'network-write-control'
         assert path.parent.is_dir(), f'missing shared Cargo {name} tree'

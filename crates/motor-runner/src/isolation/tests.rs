@@ -525,6 +525,56 @@ fn test_identity() -> pid_init::JobIdentity {
 }
 
 #[test]
+fn systemd_job_command_sets_cargo_defaults_for_network_access() {
+    let f = Fixture::new();
+    let env = [("CARGO_NET_OFFLINE".into(), "false".into())];
+    for (tenant, boat) in [(false, false), (true, false), (true, true)] {
+        for network in [false, true] {
+            let mut sandbox = f
+                .command_sandbox()
+                .in_tenant_vm(tenant)
+                .with_boat_profile(boat, true, None);
+            sandbox.network = network;
+            let command = sandbox
+                .command("true", &f.workspace, &env, false, &[], 2)
+                .unwrap();
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            let offline: Vec<_> = args
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("--setenv=CARGO_NET_OFFLINE="))
+                .collect();
+            assert_eq!(offline, if network { vec![] } else { vec!["true"] });
+            assert!(!args
+                .iter()
+                .any(|arg| arg.starts_with("--setenv=CARGO_NET_GIT_FETCH_WITH_CLI=")));
+            let unset: Vec<_> = args
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("--property=UnsetEnvironment="))
+                .collect();
+            let mut names = if boat {
+                vec!["ASCII_TOKEN", "BOAT_CURRENT_ID_FILE", "BOAT_ID"]
+            } else {
+                Vec::new()
+            };
+            if network {
+                names.push("CARGO_NET_OFFLINE");
+            }
+            assert_eq!(
+                unset,
+                if names.is_empty() {
+                    vec![]
+                } else {
+                    vec![names.join(" ")]
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn boat_command_preserves_isolation_and_limits_without_private_pids() {
     let f = Fixture::new();
     for (boat, private_pids) in [(false, true), (true, false), (true, true)] {
