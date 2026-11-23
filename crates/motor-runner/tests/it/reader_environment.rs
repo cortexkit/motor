@@ -186,7 +186,7 @@ impl ClientFixture {
 }
 
 #[tokio::test]
-#[ignore = "requires trusted operator, provisioned cache/job accounts, sccache 0.18.0, ACLs, sudo and systemd"]
+#[ignore = "requires trusted operator, provisioned cache/job accounts, sccache 0.20.0, ACLs, sudo and systemd"]
 async fn isolated_public_reader_wrapper_precedence_matrix() {
     for supervisor in [false, true] {
         for configured in [false, true] {
@@ -231,7 +231,7 @@ async fn isolated_public_reader_wrapper_precedence_matrix() {
 }
 
 #[tokio::test]
-#[ignore = "requires trusted operator, provisioned accounts, sccache 0.18.0, ACLs, sudo and systemd"]
+#[ignore = "requires trusted operator, provisioned accounts, sccache 0.20.0, ACLs, sudo and systemd"]
 async fn isolated_public_reader_slot_precedes_sccache_compile() {
     let mut f = ClientFixture::new().await;
     rust_source(&f.source, true, false);
@@ -266,7 +266,7 @@ test -f target/libdep.rlib
 }
 
 #[tokio::test]
-#[ignore = "requires trusted operator, provisioned accounts, sccache 0.18.0, ACLs, sudo and systemd"]
+#[ignore = "requires trusted operator, provisioned accounts, sccache 0.20.0, ACLs, sudo and systemd"]
 async fn isolated_public_reader_missing_cache_eviction_and_server_fallback() {
     let mut f = ClientFixture::new().await;
     rust_source(&f.source, false, false);
@@ -353,7 +353,7 @@ async fn isolated_public_non_rust_job_has_no_sccache_environment() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires motor-cache, motor-job, patched sccache, sudo, ACLs and systemd"]
+#[ignore = "requires motor-cache, motor-job, sccache 0.20.0, sudo, ACLs and systemd"]
 async fn isolated_public_reader_exported_incremental_keeps_dependency_hits() {
     let mut f = ClientFixture::with_warm_command("cargo build --locked && cargo build --release --locked && test \"$CARGO_INCREMENTAL\" = 1 && test -n \"$(find \"$CARGO_TARGET_DIR/bd\" -path '*/release/incremental/*' -print -quit)\" && sccache --show-stats").await;
     write(f.source.join("Cargo.toml"), "[package]\nname='incremental-reader'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nitoa='=1.0.18'\n");

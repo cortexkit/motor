@@ -201,8 +201,8 @@ def prepare(args):
     env = clean_env()
     env['RUSTUP_TOOLCHAIN'] = args.toolchain
     info = versions(env)
-    if not re.search(r'\b0\.18\.0\b', info['sccache']):
-        raise BenchError('sccache 0.18.0 is required')
+    if info['sccache'] != 'sccache 0.20.0':
+        raise BenchError('sccache 0.20.0 is required')
     if command(['git', '-C', str(args.source), 'rev-parse', args.commit + '^{commit}']) != args.commit:
         raise BenchError('commit must resolve exactly to its full pinned SHA')
     archive = ROOT / 'source.tar'

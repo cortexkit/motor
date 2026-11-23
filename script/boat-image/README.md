@@ -22,9 +22,8 @@ per-toolchain targets/components, Cargo binaries and install sources, required
 packages, Node/npm, Bun, pnpm and NATS. Release archives use publishers' SHA-256
 lists; pnpm uses the exact version's published SHA-512 integrity. Rustup and
 Cargo verify distribution/crate checksums; git tools use the full revisions in
-the parity manifest and locked dependencies. The patched sccache is built
-with `script/runner/build-sccache.sh`; its read-only-cache patch is required
-because stock sccache touches cache files even for a hit. Anonymous access to
+the parity manifest and locked dependencies. `script/runner/build-sccache.sh`
+installs the stock crates.io sccache release pinned in the manifest. Anonymous access to
 `github.com/cortexkit/commons` is tested inside Boat before installing its pinned
 `ckdev-mutate` mutation-testing CLI revisions.
 No credential is forwarded if a public fetch fails. The resulting inventory
@@ -38,7 +37,7 @@ before package installation. The guest preflight records those same three offici
 indexes, separately from APT's actual signature verification.
 These are reproducible tool/source pins, not a claim that independently linked Rust
 binaries have identical hashes. Reapplying a successful install reuses the disk,
-accounts, pinned Cargo tools and patched sccache build marker.
+accounts, pinned Cargo tools and sccache install receipt.
 
 ## Checked tool parity
 
@@ -237,10 +236,9 @@ the probe uses a round trip rather than a hand-encoded newer proposal module.
 ENGRAM provides esbuild through its own nested JS lockfile install, not a global
 esbuild. The runner supplies neither `ESBUILD_BIN` nor the `WASM_*_BIN` overrides;
 repositories set those themselves. Native Cargo executable hashes can vary across
-builds; Cargo versions/default aliases are exact, while Boat's patched sccache is
-checked using its build-input marker, recorded output hashes and a distinct stock
-binary. The server's sccache hashes are checked directly. Inventory never starts
-either sccache executable.
+builds; Cargo versions/default aliases are exact, and Boat's sccache is checked
+against the install inputs and its own recorded binary hash. The server's
+sccache hash is pinned separately. Parity inventory does not execute sccache.
 
 Git is not an accepted difference. Ubuntu 24.04's git is 2.43, and git's
 behaviour changes between that and the server's 2.53: from 2.46 an empty

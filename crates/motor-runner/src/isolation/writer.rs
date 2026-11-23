@@ -163,7 +163,7 @@ fn isolated_writer_cache_eviction_repairs_cross_parent_permissions() {
 }
 
 #[test]
-#[ignore = "requires provisioned motor-cache, motor-job, sccache 0.18.0, sudo, ACLs and a real system manager"]
+#[ignore = "requires provisioned motor-cache, motor-job, sccache 0.20.0, sudo, ACLs and a real system manager"]
 fn isolated_writer_cache_is_readable_by_existing_reader_and_never_writable() {
     use crate::writer::CacheFill;
     use std::io::BufRead;
@@ -443,7 +443,8 @@ impl CacheServer {
             uid: account.uid,
         }
     }
-    // sccache 0.18.0 treats -o as non-cacheable. Cargo-style --emit/--out-dir
+    // sccache 0.20.0 rejects -o for Rust cache keys (the parser marks it TooHardPath).
+    // Cargo-style --emit/--out-dir
     // makes this linked rlib exercise a real cache put, not a plain compile.
     fn script() -> &'static str {
         r#"set -eu
@@ -451,7 +452,7 @@ impl CacheServer {
  test "$USER" = motor-cache
  test "$LOGNAME" = motor-cache
  test "$CARGO_HOME" = /motor-home/cargo
- test "$("$MOTOR_TEST_SCCACHE" --version)" = "sccache 0.18.0"
+ test "$("$MOTOR_TEST_SCCACHE" --version)" = "sccache 0.20.0"
  printf 'Writer cache environment: SCCACHE_DIR=%s SCCACHE_LOCAL_RW_MODE=%s SCCACHE_CACHE_SIZE=%s\n' "$SCCACHE_DIR" "$SCCACHE_LOCAL_RW_MODE" "$SCCACHE_CACHE_SIZE"
  stat -c 'Writer cache path: path=%n owner=%u:%g mode=%a device=%d inode=%i' -- "$SCCACHE_DIR"
  printf 'Writer cache mount (target/source/filesystem/options):\n'
@@ -689,13 +690,13 @@ fn stat(output: &str, label: &str) -> u32 {
         .unwrap_or_else(|| panic!("missing {label} in {output}"))
 }
 
-/// Requires sccache 0.18.0 patched to open entries without updating timestamps
-/// in READ_ONLY mode. Stock 0.18.0 updates timestamps on every get: the sandbox's
-/// read-only mount rejects that write with EROFS, so every lookup becomes a miss.
+/// Stock sccache 0.20.0 opens entries without writing timestamps in `READ_ONLY`
+/// mode, so hits work on the sandbox's read-only mount.
+/// See [upstream `open_entry`](https://github.com/mozilla/sccache/blob/v0.20.0/src/cache/disk.rs#L75-L85).
 /// After a hit assertion fails, rerun with MOTOR_TEST_CACHE_TRACE=1 to print
 /// server keys, lookup errors and the cache entry/shard permissions.
 #[test]
-#[ignore = "requires trusted operator, motor-cache, motor-job, patched sccache 0.18.0, sudo, ACLs and systemd"]
+#[ignore = "requires trusted operator, motor-cache, motor-job, sccache 0.20.0, sudo, ACLs and systemd"]
 fn isolated_reader_hits_across_workspaces_and_cannot_poison_cache() {
     let f = Fixture::new();
     struct Reclaim(PathBuf);

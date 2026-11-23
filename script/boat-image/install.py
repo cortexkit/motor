@@ -57,7 +57,7 @@ RUNNER_INPUTS = (
     'script/runner/units/system/motor-jobs.slice',
     'script/runner/sysctl/60-motor-inotify.conf',
     'script/runner/journald/60-motor-retention.conf',
-    'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
+    'script/runner/build-sccache.sh',
     'script/runner/build-git.sh', 'script/runner/install-binaryen.py',
 ) + tuple(f'script/runner/{name}' for name in parity.PARITY_FILES)
 # motor-boat.service sets HOME, RUSTUP_HOME and the first PATH entry beneath it.
@@ -600,17 +600,15 @@ def tools(manifest, role="boat"):
     run("bash", str(ROOT / "script/runner/install-tools.sh"), role)
     marker = BUILD / "sccache-inputs.sha256"
     artifacts_path = BUILD / 'sccache-artifacts.json'
-    inputs = digest(ROOT / "script/runner/build-sccache.sh") + digest(
-        ROOT / "script/runner/patches/sccache-0.18.0-read-only-hits.patch")
+    inputs = parity.sccache_inputs_sha256(manifest['sccache']['version'])
     artifacts = json.loads(artifacts_path.read_text()) if artifacts_path.is_file() else {}
-    binary_hashes = {name: digest(BUILD / 'cargo-home/bin' / name) if (BUILD / 'cargo-home/bin' / name).is_file() else None
-                     for name in manifest['sccache']['build_server_sha256']}
+    binary = BUILD / 'cargo-home/bin/sccache'
     if (not marker.exists() or marker.read_text() != inputs or artifacts.get('inputs_sha256') != inputs
-            or artifacts.get('binaries') != binary_hashes or not all(binary_hashes.values())):
+            or not binary.is_file() or artifacts.get('binaries') != {'sccache': digest(binary)}):
         run("sh", str(ROOT / "script/runner/build-sccache.sh"))
         marker.write_text(inputs)
         artifacts_path.write_text(json.dumps({'inputs_sha256': inputs, 'binaries': {
-            name: digest(BUILD / 'cargo-home/bin' / name) for name in binary_hashes}}, indent=2) + '\n')
+            'sccache': digest(binary)}}, indent=2) + '\n')
 
 
 def target_directories():

@@ -415,11 +415,10 @@ def verify(pins):
     refuse_probe(["image-capability-probe", "--tenant-vm", "--backend", "vm"],
                  "--tenant-vm requires the Linux host backend")
     inventory["sccache"] = run("sccache", "--version", capture=True)
-    if inventory["sccache"] != "sccache 0.18.0":
-        raise ValueError("expected the patched sccache 0.18.0")
+    expected_sccache = f"sccache {manifest['sccache']['version']}"
+    if inventory["sccache"] != expected_sccache:
+        raise ValueError(f"expected {expected_sccache}, found {inventory['sccache']}")
     inventory["sccache_sha256"] = hashlib.sha256((PREFIX / "cargo/bin/sccache").read_bytes()).hexdigest()
-    inventory["sccache_patch_sha256"] = pins["runner_inputs_sha256"][
-        "script/runner/patches/sccache-0.18.0-read-only-hits.patch"]
     inventory["python"] = run("python3", "--version", capture=True)
     inventory["nextest"] = run("cargo", "nextest", "--version", capture=True)
     run("systemd-analyze", "verify", "/etc/systemd/system/motor-tenant-agent.service",

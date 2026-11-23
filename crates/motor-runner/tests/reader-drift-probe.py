@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Probe how environment changes affect sccache 0.18.0 cache keys, without the shared cache.
+"""Probe how environment changes affect sccache 0.20.0 cache keys, without the shared cache.
 
 Run from a repository checkout: python3 crates/motor-runner/tests/reader-drift-probe.py
 The temporary fixture/cache is under this checkout. Each variant starts a fresh
@@ -36,7 +36,10 @@ def main():
         raise SystemExit("MOTOR_READER_DRIFT inputs must not be empty")
     cargo_home = Path(os.environ["CARGO_HOME"])
     sccache = cargo_home / "bin/sccache"
-    checked([str(sccache), "--version"])
+    version = checked([str(sccache), "--version"], capture_output=True).stdout.strip()
+    if version != "sccache 0.20.0":
+        raise SystemExit(f"expected sccache 0.20.0, found {version}")
+    print(version, flush=True)
     sysroot = checked(["rustc", "--print", "sysroot"], capture_output=True).stdout.strip()
     rustc = Path(sysroot) / "bin/rustc"
     checked([str(rustc), "--version"])
@@ -71,14 +74,18 @@ def main():
                     ("minimal-shell", minimal, False, False),
                     ("minimal-systemd", minimal, True, False),
                     ("minimal-systemd-private-tmp", minimal, True, True)]
+        # The fixture has no env-deps for the target/build-dir variables and
+        # keeps rustc arguments fixed, so those two variants should still hit.
+        # https://github.com/mozilla/sccache/blob/v0.20.0/src/compiler/rust.rs#L2255-L2270
         for key, value in [("CARGO_HOME", inputs["CARGO_HOME"]),
                            ("CARGO_TARGET_DIR", inputs["TARGET_DIR"]),
+                           ("CARGO_BUILD_BUILD_DIR", str(Path(inputs["TARGET_DIR"]) / "build")),
                            ("CARGO_NET_OFFLINE", "true")]:
             changed = dict(base)
             changed[key] = value
             variants.append((f"login-changed-{key}", changed, False, False))
-        # A direct sccache invocation with CARGO_INCREMENTAL=1 is refused at
-        # startup; Cargo normally chooses incremental flags for local crates.
+        # Without SCCACHE_ALLOW_INCREMENTAL, sccache refuses to start with
+        # CARGO_INCREMENTAL=1. Cargo normally chooses incremental flags per crate.
         keys = sorted({"TMPDIR", "TMP", "TEMP", "CARGO_MAKEFLAGS", "MAKEFLAGS",
                        "RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"}
                       | {k for k in base if k.startswith("CARGO_")})

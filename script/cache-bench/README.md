@@ -134,7 +134,22 @@ as a perfect causal subtraction. The gateway supports the single-object
 GET/HEAD/PUT pattern used by this pinned sccache/OpenDAL version, capped at 1 GiB
 per object. Unexpected methods/paths/framing fail instead of bypassing metrics.
 
-## Pinned source and provider findings
+## Current cache-key controls
+
+sccache v0.20.0 hashes the compile cwd and `CARGO_HOME`, among [other Rust
+inputs](https://github.com/mozilla/sccache/blob/v0.20.0/src/compiler/rust.rs#L2155-L2280).
+A prepares source at `/srv/cache-bench/motor` and the dependency seed at
+`/srv/cache-bench/cargo-home`; **B extracts A's exact bundle to those paths**.
+Target/TMPDIR/HOME paths are also fixed. Source/lock/driver digests, full commit,
+exact toolchain name, rustc -vV/sysroot, Cargo/sccache version and architecture
+must match. Toolchains must be installed at the same sysroot. The driver hash
+ensures A and B use the same script version; the sccache binary hash is recorded
+separately from its version.
+
+## Provider and historical v0.18.0 source findings
+
+The sccache citations below describe the earlier benchmark baseline, not the
+current runner pin.
 
 * OVH's [Endpoints and Object Storage geoavailability guide, “Mapping from AWS S3
   tiers to OVHcloud Storage tiers”](https://docs.ovhcloud.com/en/guides/storage-and-backup/object-storage/s3-location#mapping-from-aws-s3-tiers-to-ovhcloud-storage-tiers)
@@ -162,19 +177,9 @@ per object. Unexpected methods/paths/framing fail instead of bypassing metrics.
   supports custom endpoint, region and virtual-host opt-in; SSL can override the
   endpoint scheme. OVH documents SigV4/S3 operations in its [compliance table](https://docs.ovhcloud.com/en/guides/storage-and-backup/object-storage/s3-s3-compliancy).
   These are source/doc compatibility findings, **not live handshake evidence**.
-* [`compiler/rust.rs:1554-1597`](https://github.com/mozilla/sccache/blob/v0.18.0/src/compiler/rust.rs#L1554-L1597)
-  hashes compile cwd and `CARGO_` values including `CARGO_HOME` (with explicit
-  exclusions). A prepares source at `/srv/cache-bench/motor` and dependency seed
-  at `/srv/cache-bench/cargo-home`; **B extracts A's exact bundle to those paths**.
-  Target/TMPDIR/HOME paths are also fixed. Source/lock/driver digests, full commit,
-  exact toolchain name, rustc -vV/sysroot, Cargo/sccache version and architecture
-  must match. Toolchains must be installed at the same sysroot. The driver hash
-  ensures A and B are not silently measuring with different script versions.
 * [`server.rs:1673-1700,1809-1858`](https://github.com/mozilla/sccache/blob/v0.18.0/src/server.rs#L1673-L1858):
   stats JSON is ServerInfo.stats; `counts` and `adv_counts` classify the same
   events, so sum only `counts`. sccache has no bucket HTTP byte/request counters.
-  The server's [0.18.0 local read-only-hit patch](../runner/patches/sccache-0.18.0-read-only-hits.patch)
-  does not change S3 behavior; binary SHA is recorded separately from version.
 
 ## 72-hour interleaved OVH comparison
 
@@ -480,7 +485,7 @@ legacy unversioned-bucket warning below still applies.
 
 ## Legacy exact operator sequence: A (direct Linux SSH shell)
 
-Requirements: Python 3.10+, Git/tar, sccache 0.18.0, installed matching toolchain
+Requirements: Python 3.10+, Git/tar, sccache 0.20.0, installed matching toolchain
 and native compiler/linker prerequisites, enough disk for the seed/archive,
 targets and a 50-GiB local-cache ceiling. Reserved `/srv/cache-bench` must be new
 or empty. Create credential files and customize the copied backend manifest first.
