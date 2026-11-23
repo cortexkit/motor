@@ -714,7 +714,10 @@ a test.
 5.1. Only build variables cross from the caller: names starting with `RUST_`,
 `CARGO_` or `NEXTEST_`, plus `RUSTFLAGS`, `RUSTDOCFLAGS`, `RUSTUP_TOOLCHAIN`,
 `CI`, `NO_COLOR`, `CLICOLOR` and `CLICOLOR_FORCE`. `RUSTUP_TOOLCHAIN` selects an
-installed Rust toolchain; no other `RUSTUP_*` name is admitted, including
+installed Rust toolchain. The toolchains are part of the read-only job image
+(listed in `script/runner/toolchain.json`), so a `rust-toolchain.toml` naming one
+that isn't installed fails when rustup tries to install it; select an installed
+one with `cargo +<version>` instead. No other `RUSTUP_*` name is admitted, including
 `RUSTUP_HOME` and `RUSTUP_DIST_SERVER`. `CARGO_HOME`, `CARGO_INSTALL_ROOT`,
 `CARGO_TARGET_DIR` and `CARGO_BUILD_*` other than `CARGO_BUILD_JOBS` are
 dropped, as is any name containing `TOKEN`, `SECRET`, `PASSWORD`, `KEY` or
@@ -812,7 +815,10 @@ IPv4 addresses: private, loopback, link-local, carrier-grade NAT,
 documentation, multicast and reserved ranges are rejected, as are connections
 to the host and its gateway. Inbound connections to the job are dropped. Its
 resolver is a fixed read-only `/etc/resolv.conf` naming public DNS servers.
-Cargo stays offline by default (`CARGO_NET_OFFLINE=true`). Tests (operator-only,
+Cargo stays offline by default (`CARGO_NET_OFFLINE=true`), because the runner
+prefetches only the checkout's own locked dependencies; a command that needs
+Cargo to download sets `CARGO_NET_OFFLINE=false` itself or runs
+`cargo --config net.offline=false`. Tests (operator-only,
 need the table installed; they sample blocked destinations rather than every
 range): `isolated_net_public_https_dns_read_only_resolver`,
 `isolated_net_input_rejects_host_and_gateway`,
