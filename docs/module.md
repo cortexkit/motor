@@ -331,13 +331,13 @@ is replaced. Windows endpoints keep one connection per job. Tests:
 `macos_jobs_share_one_endpoint_master_and_replace_a_dead_one`,
 `macos_endpoint_uses_its_own_pin_vault_identity_and_ten_second_timeout`.
 
-For macOS and Windows endpoints, `ck-motor` keeps the last 2 KiB of ssh's
-stderr. When ssh fails before the runner answers, the `unreachable` refusal
-detail and its warning name ssh's last nonblank line, for example
-`last attempt failed at connect: ssh master exited: Connection timed out during
-banner exchange` or `... hello_recv: ssh exited: Host key verification
-failed.`, so a network timeout can be told from an authentication or host-key
-failure. Test: `explicit_endpoint_refusals_name_the_ssh_error`.
+For direct macOS and Windows runs, an `unreachable` refusal means `ck-motor`
+could not complete the runner handshake. No job command was sent, so it is safe
+to retry. The refusal detail names the endpoint, and `ck motor run` displays it
+on the refusal line. When a handshake attempt fails, `ck-motor` logs the
+handshake step and a bounded, sanitized tail of any SSH stderr it collected.
+That tail may include SSH errors or, on macOS, timing messages from
+`motor-runner connect`.
 
 Keep the storage root path short: the agent socket's absolute path must fit the
 Unix socket limit (103 bytes on macOS), with room for OpenSSH's temporary

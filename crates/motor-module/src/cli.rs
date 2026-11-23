@@ -3494,6 +3494,48 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_direct_runner_names_the_endpoint_and_safe_retry_on_one_line() {
+        let id = Uuid::now_v7();
+        for (platform, endpoint, limit, expected) in [
+            (
+                "macOS",
+                "macos.example.invalid",
+                crate::transport::HANDSHAKE_TIMEOUT,
+                "the macOS runner at macos.example.invalid didn't answer within 15 s; the job never ran, so it is safe to retry",
+            ),
+            (
+                "Windows",
+                "windows-dev",
+                crate::motor::WINDOWS_PROBE_TIMEOUT,
+                "the Windows runner at windows-dev didn't answer within 3 s; the job never ran, so it is safe to retry",
+            ),
+            (
+                "Windows",
+                "windows-legacy",
+                crate::transport::HANDSHAKE_TIMEOUT,
+                "the Windows runner at windows-legacy didn't answer within 15 s; the job never ran, so it is safe to retry",
+            ),
+        ] {
+            let terminal = TerminalRecord::new(
+                id,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::Unreachable,
+                },
+                0,
+                0,
+                0,
+            )
+            .with_refusal_detail(crate::transport::direct_unreachable_detail(platform, endpoint, limit));
+            let mut err = Vec::new();
+            assert_eq!(settle(&terminal, &mut err), EXIT_REFUSED);
+            assert_eq!(
+                String::from_utf8(err).unwrap(),
+                format!("ck motor run: refused before start: unreachable: {expected} (job_id={id})\n")
+            );
+        }
+    }
+
+    #[test]
     fn the_workspace_is_the_checkout_containing_cwd() {
         let scratch = cortexkit_test_support::ScratchDir::new("cli-workspace");
         let main = fs::canonicalize(scratch.path()).unwrap().join("main");

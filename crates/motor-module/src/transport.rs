@@ -3,6 +3,7 @@ use crate::{agent::VaultAgent, Config};
 use cortexkit_claustrum_client::{CredentialErrorClass, CredentialResolver};
 use motor_protocol::*;
 use std::{
+    any::Any,
     collections::VecDeque,
     ffi::OsStr,
     future::Future,
@@ -23,8 +24,17 @@ use tokio::{
     task::JoinHandle,
 };
 
-pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send + Any {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Any> Duplex for T {}
+
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) fn direct_unreachable_detail(platform: &str, endpoint: &str, limit: Duration) -> String {
+    format!(
+        "the {platform} runner at {endpoint} didn't answer within {} s; the job never ran, so it is safe to retry",
+        limit.as_secs()
+    )
+}
 
 #[derive(Debug)]
 pub(crate) struct HostedHelloRefusal(pub(crate) String);
@@ -584,63 +594,76 @@ impl Drop for SshConnector {
 pub(crate) const MACOS_CONTROL_NAME: &str = "d";
 /// How much of an ssh child's stderr is kept for a failure message.
 const STDERR_TAIL_BYTES: usize = 2048;
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_LINE_BYTES: usize = 200;
 /// How long a failed connection waits for ssh to finish writing its error.
 const STDERR_WAIT: Duration = Duration::from_secs(1);
 
-/// The last bytes an ssh child wrote to stderr, published when ssh closes it.
-/// Explicit endpoints use it so a refusal names ssh's own error, telling a
-/// network timeout from an authentication or host-key failure.
+/// The last bytes an ssh child wrote to stderr, readable even while ssh is
+/// still running. The flag lets EOF handling wait for the final bytes.
 #[derive(Clone)]
-struct SshStderr(watch::Receiver<Option<Vec<u8>>>);
+struct SshStderr(watch::Receiver<(Vec<u8>, bool)>);
 impl SshStderr {
     /// Drains `stderr` for the child's whole life, so a chatty remote command
     /// never blocks on a full pipe, keeping only the last bytes.
     fn collect(stderr: tokio::process::ChildStderr) -> Self {
-        let (done, tail) = watch::channel(None);
+        let (update, tail) = watch::channel((Vec::new(), false));
         tokio::spawn(async move {
             let mut stderr = stderr;
-            let mut kept = Vec::new();
             let mut chunk = [0; 1024];
             while let Ok(read @ 1..) = stderr.read(&mut chunk).await {
-                kept.extend_from_slice(&chunk[..read]);
-                if kept.len() > STDERR_TAIL_BYTES {
-                    kept.drain(..kept.len() - STDERR_TAIL_BYTES);
-                }
+                update.send_modify(|(kept, _)| {
+                    kept.extend_from_slice(&chunk[..read]);
+                    if kept.len() > STDERR_TAIL_BYTES {
+                        kept.drain(..kept.len() - STDERR_TAIL_BYTES);
+                    }
+                });
             }
-            let _ = done.send(Some(kept));
+            update.send_modify(|(_, closed)| *closed = true);
         });
         Self(tail)
     }
     /// ssh's last meaningful stderr line, once ssh has closed stderr. `None` if
     /// it wrote nothing useful or is still running after `wait`.
     async fn last_line(mut self, wait: Duration) -> Option<String> {
-        let tail = tokio::time::timeout(wait, self.0.wait_for(Option::is_some))
+        let tail = tokio::time::timeout(wait, self.0.wait_for(|(_, closed)| *closed))
             .await
             .ok()?
             .ok()?;
-        last_meaningful_line(tail.as_deref()?)
+        stderr_lines(&tail.0, 1).pop()
+    }
+    fn lines(&self) -> Vec<String> {
+        stderr_lines(&self.0.borrow().0, STDERR_TAIL_LINES)
     }
 }
 
-/// The last nonblank line, cleaned for a single-line log field. ssh prints no
-/// key material at its default log level. If the kept bytes contain any part
-/// of a PEM block anyway, nothing is returned, since a base64 body line alone
-/// would not look like key material.
-fn last_meaningful_line(tail: &[u8]) -> Option<String> {
+/// ssh prints no key material at its default log level. If the tail contains
+/// a PEM marker anyway, omit the entire tail: a base64 body line alone would
+/// not look like key material.
+fn stderr_lines(tail: &[u8], limit: usize) -> Vec<String> {
     let text = String::from_utf8_lossy(tail);
     if text.contains("-----BEGIN") || text.contains("-----END") || text.contains("PRIVATE KEY") {
-        return None;
+        return Vec::new();
     }
-    text.lines()
+    let mut lines: Vec<_> = text
+        .lines()
         .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| {
-            line.chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .take(200)
-                .collect()
+        .filter_map(|line| {
+            let mut clean = String::new();
+            for c in line.trim().chars().filter(|c| {
+                !c.is_control() && !matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            }) {
+                if clean.len() + c.len_utf8() > STDERR_LINE_BYTES {
+                    break;
+                }
+                clean.push(c);
+            }
+            (!clean.trim().is_empty()).then_some(clean)
         })
+        .take(limit)
+        .collect();
+    lines.reverse();
+    lines
 }
 
 type ExitCause = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
@@ -661,6 +684,13 @@ struct SshPipe {
     read_exit: Option<ExitCause>,
     write_exit: Option<(ExitCause, io::Error)>,
 }
+
+fn pipe_stderr(pipe: &dyn Duplex) -> Option<SshStderr> {
+    // Keep Duplex's blanket impl for ordinary streams; it rules out an SSH-
+    // specific trait override. Only an explicit-endpoint pipe has stderr.
+    (pipe as &dyn Any).downcast_ref::<SshPipe>()?.stderr.clone()
+}
+
 impl SshPipe {
     fn new(mut child: Child, pin: Option<EndpointPin>, stderr: Option<SshStderr>) -> Self {
         Self {
@@ -1346,6 +1376,42 @@ impl Drop for Channel {
     }
 }
 
+struct HandshakeAttempt {
+    id: Uuid,
+    number: usize,
+    step: UnreachableStep,
+    stderr: Option<SshStderr>,
+    in_flight: bool,
+}
+
+impl HandshakeAttempt {
+    fn failed(&mut self, cause: &dyn std::fmt::Display) {
+        self.in_flight = false;
+        let tail = self
+            .stderr
+            .take()
+            .map_or_else(Vec::new, |stderr| stderr.lines());
+        tracing::warn!(
+            job_or_workspace_id = %self.id,
+            attempt = self.number,
+            step = self.step.label(),
+            cause = %cause,
+            ssh_stderr_tail = ?tail,
+            "runner handshake attempt failed"
+        );
+    }
+}
+
+impl Drop for HandshakeAttempt {
+    fn drop(&mut self) {
+        // A caller can impose a shorter deadline than the hello exchange's
+        // own timeout. Its cancellation still needs the active pipe's tail.
+        if self.in_flight {
+            self.failed(&"interrupted before completion");
+        }
+    }
+}
+
 impl Channel {
     /// Exchange hello once on a TLS connection already authenticated by its lease.
     /// Preserve explicit host refusals before starting the generic frame reader;
@@ -1452,29 +1518,33 @@ impl Channel {
             }
             (reason, format!("{}: {cause}", step.label()))
         };
-        // The timeout counter alone cannot say whether SSH never delivered a
-        // pipe or the runner never answered the hello; remember which part of
-        // the handshake was still in flight so the logged cause names it.
-        let waiting = std::sync::atomic::AtomicUsize::new(UnreachableStep::Connect as usize);
-        let last_failure = StdMutex::new(None::<String>);
+        // Keep the current step and live stderr handle after the timeout
+        // cancels the future that owns the pipe.
+        let mut attempt = HandshakeAttempt {
+            id,
+            number: 0,
+            step: UnreachableStep::Connect,
+            stderr: None,
+            in_flight: false,
+        };
+        let mut last_failure = None;
         let started = tokio::time::Instant::now();
-        let advance = |step: UnreachableStep| {
-            waiting.store(step as usize, std::sync::atomic::Ordering::Relaxed);
+        let advance = |attempt: &mut HandshakeAttempt, step: UnreachableStep| {
+            attempt.step = step;
             tracing::info!(job_or_workspace_id = %id, step = step.label(), elapsed_ms = started.elapsed().as_millis() as u64, "runner handshake advanced");
         };
-        tokio::time::timeout(Duration::from_secs(15), async {
-            let mut attempt = 1;
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let mut backoff = Duration::from_millis(250);
             loop {
-                waiting.store(
-                    UnreachableStep::Connect as usize,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                attempt.number += 1;
+                attempt.step = UnreachableStep::Connect;
+                attempt.in_flight = true;
                 let result = async {
                     let pipe = connector.connect(id).await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::Connect, error.to_string())
                     })?;
-                    advance(UnreachableStep::HelloSend);
+                    attempt.stderr = pipe_stderr(pipe.as_ref());
+                    advance(&mut attempt, UnreachableStep::HelloSend);
                     let mut channel = Self::new(pipe);
                     channel
                         .send(Frame::Hello { return_paths: false, return_chunked_max_bytes: None, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION,
@@ -1486,7 +1556,7 @@ impl Channel {
                         .map_err(|error| {
                             AttemptFailure::Step(UnreachableStep::HelloSend, error.to_string())
                         })?;
-                    advance(UnreachableStep::HelloRecv);
+                    advance(&mut attempt, UnreachableStep::HelloRecv);
                     match channel.next().await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::HelloRecv, error.to_string())
                     })? {
@@ -1513,39 +1583,43 @@ impl Channel {
                 .await;
 
                 match result {
-                    Ok(channel) => return Ok(channel),
+                    Ok(channel) => {
+                        attempt.in_flight = false;
+                        return Ok(channel);
+                    }
                     Err(AttemptFailure::VersionMismatch(protocol_version)) => {
+                        let cause = format!(
+                            "runner protocol version {protocol_version}, expected {PROTOCOL_VERSION}"
+                        );
+                        attempt.failed(&cause);
                         return Err((
                             RefusalReason::RunnerVersionMismatch,
-                            format!(
-                                "runner protocol version {protocol_version}, expected {PROTOCOL_VERSION}"
-                            ),
+                            cause,
                         ));
                     }
                     Err(AttemptFailure::UnexpectedFrame) => {
-                        return Err(refuse(
-                            UnreachableStep::UnexpectedFrame,
-                            &"runner sent a non-hello first frame",
-                        ));
+                        let cause = "runner sent a non-hello first frame";
+                        attempt.failed(&cause);
+                        return Err(refuse(UnreachableStep::UnexpectedFrame, &cause));
                     }
                     Err(AttemptFailure::Step(step, cause)) => {
+                        attempt.failed(&cause);
                         if let Some(code) = connector.refusal() {
                             return Err((
                                 RefusalReason::Unknown(code.into()),
                                 format!("{}: {cause}", step.label()),
                             ));
                         }
-                        *last_failure.lock().unwrap() = Some(format!("{}: {cause}", step.label()));
+                        last_failure = Some(format!("{}: {cause}", step.label()));
                         tracing::info!(
                             job_or_workspace_id = %id,
                             step = step.label(),
                             cause = %cause,
-                            attempt,
+                            attempt = attempt.number,
                             backoff_ms = backoff.as_millis() as u64,
                             "retrying runner handshake"
                         );
                         tokio::time::sleep(backoff).await;
-                        attempt += 1;
                         backoff = (backoff * 2).min(Duration::from_secs(2));
                     }
                 }
@@ -1553,13 +1627,15 @@ impl Channel {
         })
         .await
         .unwrap_or_else(|_| {
-            let stage =
-                UnreachableStep::ALL[waiting.load(std::sync::atomic::Ordering::Relaxed)].label();
+            let stage = attempt.step.label();
             let mut cause = format!(
                 "no runner hello within {}s; still waiting in {stage}",
                 started.elapsed().as_secs()
             );
-            if let Some(last_failure) = last_failure.lock().unwrap().as_ref() {
+            if attempt.in_flight {
+                attempt.failed(&cause);
+            }
+            if let Some(last_failure) = last_failure {
                 cause.push_str(&format!("; last attempt failed at {last_failure}"));
             }
             Err(refuse(

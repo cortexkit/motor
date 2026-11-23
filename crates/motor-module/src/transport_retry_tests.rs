@@ -7,6 +7,7 @@ struct HelloConnector {
     closed_connects: usize,
     protocol_version: u32,
     reply_delay: Duration,
+    pipe: StdMutex<Option<Box<dyn Duplex>>>,
 }
 
 impl HelloConnector {
@@ -16,6 +17,7 @@ impl HelloConnector {
             closed_connects,
             protocol_version,
             reply_delay: Duration::ZERO,
+            pipe: StdMutex::new(None),
         }
     }
 
@@ -34,7 +36,11 @@ impl Connector for HelloConnector {
         let closed_connects = self.closed_connects;
         let protocol_version = self.protocol_version;
         let reply_delay = self.reply_delay;
+        let pipe = self.pipe.lock().unwrap().take();
         Box::pin(async move {
+            if let Some(pipe) = pipe {
+                return Ok(pipe);
+            }
             let (client, mut runner) = tokio::io::duplex(4096);
             if attempt >= closed_connects {
                 tokio::spawn(async move {
@@ -77,6 +83,72 @@ impl Connector for HelloConnector {
             Ok(Box::new(client) as Box<dyn Duplex>)
         })
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn timed_out_handshake_logs_the_live_bounded_ssh_stderr_tail() {
+    let mut remote = format!("discarded-marker {}\n", "x".repeat(2300));
+    for index in 0..22 {
+        remote.push_str(&format!("line-{index:02}\n"));
+    }
+    remote.push_str(&format!("{}beyond-limit\n", "é".repeat(100)));
+    remote.push_str("runner bridge starting\x1b\x07\r\u{202e} elapsed_ms=4\n");
+    let mut child = Command::new("sh")
+        // Keep both streams open after stderr is written, but never send a hello.
+        .args([
+            "-c",
+            "printf '%s' \"$1\" >&2; IFS= read -r unused",
+            "sh",
+            &remote,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = SshStderr::collect(child.stderr.take().unwrap());
+    {
+        // Let the OS process write before switching to virtual time for the
+        // handshake, so CPU scheduling cannot make the collector miss its tail.
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(5),
+            stderr
+                .0
+                .wait_for(|(bytes, _)| bytes.ends_with(b"elapsed_ms=4\n")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.0.len(), 2048);
+        assert!(!snapshot.1, "SSH must still have stderr open");
+    }
+    tokio::time::pause();
+    let connector = HelloConnector::new(0, PROTOCOL_VERSION);
+    *connector.pipe.lock().unwrap() = Some(Box::new(SshPipe::new(child, None, Some(stderr))));
+    let log = crate::logging::Captured::default();
+    let _guard = crate::logging::scoped(log.clone());
+    assert!(matches!(
+        Channel::open_with_cause(&connector, Uuid::now_v7()).await,
+        Err((RefusalReason::Unreachable, _))
+    ));
+
+    let text = log.text();
+    let warning = text
+        .lines()
+        .find(|line| line.contains("runner handshake attempt failed"))
+        .expect("the timed-out attempt must warn with the live SSH stderr tail");
+    assert!(warning.contains(" WARN "), "{warning}");
+    assert!(warning.contains("attempt=1 step=hello_recv"), "{warning}");
+    assert_eq!(connector.connects.load(Ordering::SeqCst), 1);
+    let (_, tail) = warning.split_once(" ssh_stderr_tail=").unwrap();
+    let lines: Vec<String> = serde_json::from_str(tail).unwrap();
+    assert_eq!(lines.len(), 20);
+    assert_eq!(lines[0], "line-04");
+    assert_eq!(lines[18], "é".repeat(100));
+    assert_eq!(lines[19], "runner bridge starting elapsed_ms=4");
+    assert!(!text.contains("discarded-marker"));
 }
 
 fn diagnostic_count() -> u64 {
