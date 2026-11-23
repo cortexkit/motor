@@ -241,9 +241,11 @@ fn snapshot_profile(repository: &Path, tree: &str, file: &str) -> Option<String>
 }
 
 /// Use the same Cargo output layout and dependency inputs for readers and fills.
-/// sccache hashes `CARGO_HOME`, `CARGO_NET_OFFLINE` and profile debug defaults
-/// directly. `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` set Cargo's output
-/// layout; they only affect sccache through hashed arguments or dep-info.
+/// sccache hashes `CARGO_HOME` and profile debug defaults directly. The trusted
+/// compiler shim hides `CARGO_NET_OFFLINE` from sccache so network jobs can use
+/// the same Rust cache keys as offline jobs and fills. `CARGO_TARGET_DIR` and
+/// `CARGO_BUILD_BUILD_DIR` set Cargo's output layout; they only affect sccache
+/// through hashed arguments or rustc's dependency-information files.
 /// Writers enable incremental in Cargo; the compiler shim strips the environment
 /// flags before sccache sees them, preserving Cargo's per-crate flags.
 pub(crate) fn cargo_environment(env: &mut BTreeMap<String, String>, repository: &Path, tree: &str) {
@@ -413,6 +415,22 @@ mod wrapper_tests {
         administrative: bool,
         already_running: bool,
     ) -> (i32, String) {
+        run_with_cargo_offline(
+            available,
+            compiler_exit,
+            administrative,
+            already_running,
+            None,
+        )
+    }
+
+    fn run_with_cargo_offline(
+        available: bool,
+        compiler_exit: i32,
+        administrative: bool,
+        already_running: bool,
+        cargo_offline: Option<&str>,
+    ) -> (i32, String) {
         let scratch = ScratchDir::new("sccache-startup-fallback");
         let wrapper = scratch.join("sccache");
         let backend = scratch.join("backend");
@@ -437,7 +455,19 @@ mod wrapper_tests {
             .unwrap();
         crate::test_helpers::write_test_executable(
             &backend,
-            format!("#!/bin/bash\ncase \"$1\" in\n--start-server) echo startup >> \"$EVENTS\"; {}; exit {};;\n--show-stats) echo stats >> \"$EVENTS\"; exit 0;;\n*) if [[ -n ${{CARGO_INCREMENTAL+x}} || -n ${{CARGO_BUILD_INCREMENTAL+x}} ]]; then exit 77; fi; echo cached >> \"$EVENTS\"; exec \"$@\";;\nesac\n", if available {"touch \"$STATE\""} else {":"}, if available {0} else {2}).as_bytes(),
+            format!(
+                "#!/bin/bash\n\
+                 case \"$1\" in\n\
+                 --start-server) echo startup >> \"$EVENTS\"; {}; exit {};;\n\
+                 --show-stats) echo stats >> \"$EVENTS\"; exit 0;;\n\
+                 *) if [[ -n ${{CARGO_INCREMENTAL+x}} || -n ${{CARGO_BUILD_INCREMENTAL+x}} ]]; then exit 77; fi\n\
+                    if [[ -n ${{CARGO_NET_OFFLINE+x}} ]]; then echo offline-variable-leaked >> \"$EVENTS\"; exit 78; fi\n\
+                    echo cached >> \"$EVENTS\"; exec \"$@\";;\n\
+                 esac\n",
+                if available { "touch \"$STATE\"" } else { ":" },
+                if available { 0 } else { 2 }
+            )
+            .as_bytes(),
         )
         .unwrap();
         crate::test_helpers::write_test_executable(
@@ -451,6 +481,11 @@ mod wrapper_tests {
             .env("STATE", &state)
             .env("CARGO_INCREMENTAL", "1")
             .env("CARGO_BUILD_INCREMENTAL", "1");
+        if let Some(value) = cargo_offline {
+            command.env("CARGO_NET_OFFLINE", value);
+        } else {
+            command.env_remove("CARGO_NET_OFFLINE");
+        }
         if administrative {
             command.arg("--show-stats");
         } else {
@@ -499,6 +534,22 @@ mod wrapper_tests {
             run(true, 0, false, false),
             (0, "startup\ncached\ncompiler\n".into())
         );
+    }
+
+    #[test]
+    fn cached_compiler_exec_never_receives_cargo_net_offline() {
+        for cargo_offline in [None, Some("true"), Some("false")] {
+            assert_eq!(
+                run_with_cargo_offline(true, 0, false, true, cargo_offline),
+                (0, "cached\ncompiler\n".into()),
+                "running server, CARGO_NET_OFFLINE={cargo_offline:?}"
+            );
+            assert_eq!(
+                run_with_cargo_offline(true, 0, false, false, cargo_offline),
+                (0, "startup\ncached\ncompiler\n".into()),
+                "started server, CARGO_NET_OFFLINE={cargo_offline:?}"
+            );
+        }
     }
 
     #[test]

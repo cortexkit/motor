@@ -54,6 +54,31 @@ fn job_environment_forwards_only_rustup_toolchain_and_refuses_secret_names() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn job_environment_sets_cargo_defaults_for_network_access() {
+    let scratch = ScratchDir::new("job-environment-cargo-network");
+    let mut config = Config::new(scratch.join("state"), "main");
+    config.isolate_jobs = true;
+    let mut setup = setup(&scratch);
+    setup.request.base_commit = Some("source".into());
+    setup.request.env = BTreeMap::from([("CARGO_NET_OFFLINE".into(), "false".into())]);
+    let trees = trees(&config);
+    let target = scratch.join("target");
+    let inputs = EnvironmentInputs::before_setup(&config, &setup, &scratch, &target, None).unwrap();
+    let offline = job_environment(&config, &trees, &setup, &inputs, 2).unwrap();
+    assert_eq!(offline["CARGO_NET_OFFLINE"], "true");
+
+    setup.request.network = Some(Network::Outbound);
+    setup
+        .request
+        .env
+        .insert("CARGO_NET_OFFLINE".into(), "true".into());
+    let network = job_environment(&config, &trees, &setup, &inputs, 2).unwrap();
+    assert!(!network.contains_key("CARGO_NET_OFFLINE"));
+    assert!(!network.contains_key("CARGO_NET_GIT_FETCH_WITH_CLI"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn stored_job_grant_selects_write_environment_only_for_its_keyed_account() {
     use crate::remote_cache::{gateway::Tool, transport::Forwarder};
     let scratch = ScratchDir::new("cache-write-environment");

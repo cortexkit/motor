@@ -1649,7 +1649,7 @@ pub(crate) fn job_environment_in(
     #[cfg(target_os = "linux")]
     if config.isolate_jobs {
         env.insert("CARGO_HOME".into(), crate::compile_cache::CARGO_HOME.into());
-        env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+        crate::isolation::cargo_offline_environment(&mut env, r.network == Some(Network::Outbound));
         // The launch adds these too; the environment fingerprint that base
         // records compare must describe the environment the job really gets.
         crate::isolation::cross_compilers::arm64_windows(

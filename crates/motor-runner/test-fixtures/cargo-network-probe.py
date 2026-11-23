@@ -49,7 +49,7 @@ class Registry(http.server.BaseHTTPRequestHandler):
 
 home = Path(os.environ["CARGO_HOME"])
 assert str(home) == "/motor-home/cargo"
-assert os.environ["CARGO_NET_OFFLINE"] == "true"
+assert "CARGO_NET_OFFLINE" not in os.environ
 assert os.geteuid() != 0
 status = Path("/proc/self/status").read_text().splitlines()
 for field in ["CapEff", "CapPrm", "CapBnd"]:

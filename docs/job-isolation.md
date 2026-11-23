@@ -704,10 +704,11 @@ job membership and `/proc` OOM scores; it does not exhaust host RAM).
 4.5. The command runs as `bash -c <command>` with the request's working
 directory. Its environment is the request's filtered variables (5.1) with the
 runner's values forced for `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
-`TMPDIR`, `TMP`, `TEMP`, `USER`, `LOGNAME`, `SHELL`, and `CARGO_NET_OFFLINE=true`.
-Test: `systemd_job_command_preserves_shell_source_and_forces_private_tmp`
-(the temporary-directory overrides); the other forced values are not covered by
-a test.
+`TMPDIR`, `TMP`, `TEMP`, `USER`, `LOGNAME`, and `SHELL`. For jobs without network
+access, the runner also sets `CARGO_NET_OFFLINE=true`. Network jobs get no
+`CARGO_NET_OFFLINE`, even if the caller's environment included it.
+Tests: `systemd_job_command_preserves_shell_source_and_forces_private_tmp`
+and `systemd_job_command_sets_cargo_defaults_for_network_access`.
 
 ## 5. Environment from the caller
 
@@ -815,10 +816,8 @@ IPv4 addresses: private, loopback, link-local, carrier-grade NAT,
 documentation, multicast and reserved ranges are rejected, as are connections
 to the host and its gateway. Inbound connections to the job are dropped. Its
 resolver is a fixed read-only `/etc/resolv.conf` naming public DNS servers.
-Cargo stays offline by default (`CARGO_NET_OFFLINE=true`), because the runner
-prefetches only the checkout's own locked dependencies; a command that needs
-Cargo to download sets `CARGO_NET_OFFLINE=false` itself or runs
-`cargo --config net.offline=false`. Tests (operator-only,
+Network jobs leave Cargo's offline setting to the project's Cargo configuration
+(Cargo defaults to online). Tests (operator-only,
 need the table installed; they sample blocked destinations rather than every
 range): `isolated_net_public_https_dns_read_only_resolver`,
 `isolated_net_input_rejects_host_and_gateway`,
