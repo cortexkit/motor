@@ -88,7 +88,11 @@ fn request(sockets: &Sockets, tool: Tool, method: &str, key: &str) -> u16 {
         format!("/{key}")
     };
     let body = if method == "PUT" { "entry" } else { "" };
-    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    // One write for the whole request: `write!` issues a write per formatted
+    // piece, and the gateway may answer a refused PUT from its head and close
+    // before reading the body, so a separate body write could fail with EPIPE.
+    let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    stream.write_all(request.as_bytes()).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response.split_whitespace().nth(1).unwrap().parse().unwrap()
