@@ -57,6 +57,11 @@ checkout, so Cargo can reuse the checkout's build disk (see
 [Build disk and `target/`](#build-disk-and-target)). Reuse applies only to files
 sealed read-only in both jobs; changed files receive newer times.
 
+The runner also fetches Cargo dependencies for up to 16 nested workspaces per
+job that have their own `Cargo.lock` and `Cargo.toml`, so they can build offline
+in the job. This is best effort: a nested fetch that fails adds a warning to the
+job's output naming the folder, and the job still starts.
+
 ### Bun lockfiles
 
 Host preparation supports the text `bun.lock` format. Binary `bun.lockb` files

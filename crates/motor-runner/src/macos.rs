@@ -8,6 +8,7 @@ use motor_protocol::Run;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -39,6 +40,7 @@ pub(crate) use tests::capture_finished_workspace_after_stop;
 
 /// Maximum preparation runtime: ten minutes, including time spent waiting for locks.
 pub const PREP_TIMEOUT: Duration = Duration::from_secs(600);
+const NESTED_CARGO_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Validate identifiers without inspecting or touching the corresponding host paths.
 pub fn validate_paths(request: &Run) -> io::Result<()> {
@@ -282,6 +284,7 @@ pub struct Prepared {
     pub siblings: Vec<(String, PathBuf)>,
     pub cargo_home: PathBuf,
     pub prepared_javascript_directories: Vec<PathBuf>,
+    cargo_warnings: String,
     /// Regular files enumerated from the requested workspace commit in the
     /// trusted mirror, before preparation. Siblings use read-only VM shares.
     pub source_files: Vec<PathBuf>,
@@ -427,7 +430,11 @@ impl Staging {
             Dir::open(&job.join(mapped(logical)?), false)?
                 .copy_inputs(&Dir::open(dest, true)?, &control)?;
         }
-        let routes = preflight::validate(
+        let preflight::Validated {
+            routes,
+            nested_cargo,
+            nested_limit_reached,
+        } = preflight::validate(
             &prep_roots,
             &request.git_dependencies,
             &self.trees,
@@ -442,9 +449,11 @@ impl Staging {
             .iter()
             .map(|lock| control.mutex(lock))
             .collect::<io::Result<_>>()?;
+        let mut root_alias_lock = None;
         for root in &prep_roots {
             if let Ok(lock) = fs::read(&root.join("Cargo.lock")) {
                 self.trees.refresh_dependency_aliases(&lock, &routes)?;
+                root_alias_lock = Some(lock);
             }
         }
         let cargo_home = self.state.join("prep-cargo");
@@ -453,31 +462,86 @@ impl Staging {
         for path in [&cargo_home, &bun_cache, &home] {
             Dir::open(path, true)?;
         }
+        let fetch_cargo = |root: &Path, control: &Control| {
+            let mut cmd = self.command(
+                &self.tools.cargo.path,
+                &prep,
+                &home,
+                &cargo_home,
+                &bun_cache,
+            );
+            cmd.args(["fetch", "--locked", "--manifest-path"])
+                .arg(root.join("Cargo.toml"))
+                .args(["--config", "net.git-fetch-with-cli=true"]);
+            crate::workspace::dependencies::configure_fetch_git(&mut cmd, &home, &routes)?;
+            // Allow file transport for URLs rewritten to imported mirrors, not for
+            // URLs declared in manifests (which preflight requires to be remote).
+            cmd.env(
+                "GIT_ALLOW_PROTOCOL",
+                if routes.is_empty() {
+                    "https"
+                } else {
+                    "file:https"
+                },
+            );
+            process::run(&mut cmd, &prep, control)
+        };
         for root in &prep_roots {
             if Dir::open(root, false)?.contains("Cargo.toml".as_ref())? {
-                let mut cmd = self.command(
-                    &self.tools.cargo.path,
-                    &prep,
-                    &home,
-                    &cargo_home,
-                    &bun_cache,
-                );
-                cmd.args(["fetch", "--locked", "--manifest-path"])
-                    .arg(root.join("Cargo.toml"))
-                    .args(["--config", "net.git-fetch-with-cli=true"]);
-                crate::workspace::dependencies::configure_fetch_git(&mut cmd, &home, &routes)?;
-                // Only generated rewrites may use file transport, never a manifest source.
-                cmd.env(
-                    "GIT_ALLOW_PROTOCOL",
-                    if routes.is_empty() {
-                        "https"
-                    } else {
-                        "file:https"
-                    },
-                );
-                process::run(&mut cmd, &prep, &control)?;
+                fetch_cargo(root, &control)?;
             }
+        }
+        let mut cargo_warnings = String::new();
+        let mut nested_aliases_touched = false;
+        // Fetch all Cargo graphs while the trees still contain only the inputs
+        // preflight validated, before Bun adds packages and links.
+        for directory in nested_cargo {
+            control.check()?;
+            let nested = Control {
+                cancel: control.cancel.clone(),
+                deadline: control
+                    .deadline
+                    .min(Instant::now() + NESTED_CARGO_FETCH_TIMEOUT),
+            };
+            let result = (|| {
+                let lock = fs::read(&directory.join("Cargo.lock"))?;
+                let nested_routes = crate::workspace::dependencies::locked_dependencies(&lock)?
+                    .into_iter()
+                    .filter_map(|dep| routes.get(&dep.url).map(|path| (dep.url, path.clone())))
+                    .collect::<BTreeMap<_, _>>();
+                if !nested_routes.is_empty() {
+                    nested_aliases_touched = true;
+                    self.trees
+                        .refresh_dependency_aliases(&lock, &nested_routes)?;
+                }
+                fetch_cargo(&directory, &nested)
+            })();
+            if result.is_err() {
+                control.check()?;
+                let folder = Path::new("/").join(directory.strip_prefix(&prep).map_err(invalid)?);
+                // Quote untrusted folder names so even embedded newlines stay on one line.
+                writeln!(
+                    cargo_warnings,
+                    "warning: nested Cargo fetch failed in {folder:?}"
+                )
+                .unwrap();
+            }
+        }
+        if nested_limit_reached {
+            writeln!(
+                cargo_warnings,
+                "warning: skipped nested Cargo fetches beyond the limit of {} per job",
+                preflight::MAX_NESTED_CARGO_FETCHES,
+            )
+            .unwrap();
+        }
+        for root in &prep_roots {
             if Dir::open(root, false)?.contains("package.json".as_ref())? {
+                // A nested lock can pin a different commit of the same branch.
+                // Restore the root preparation's aliases before running Bun.
+                if let Some(lock) = root_alias_lock.take().filter(|_| nested_aliases_touched) {
+                    self.trees.refresh_dependency_aliases(&lock, &routes)?;
+                }
                 let mut cmd =
                     self.command(&self.tools.bun.path, root, &home, &cargo_home, &bun_cache);
                 cmd.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
@@ -552,10 +616,12 @@ impl Staging {
                 .collect::<io::Result<_>>()?,
             cargo_home: job_cargo,
             prepared_javascript_directories,
+            cargo_warnings,
             source_files,
             tree: job,
         })
     }
+
     fn command(&self, tool: &Path, cwd: &Path, home: &Path, cargo: &Path, bun: &Path) -> Command {
         let mut cmd = Command::new(tool);
         cmd.env_clear()

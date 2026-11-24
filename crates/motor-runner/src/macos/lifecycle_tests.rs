@@ -275,6 +275,7 @@ fn returned_files_wait_for_stop_and_saved_proof_then_survive_cleanup() {
                 workspace,
                 siblings: vec![],
                 prepared_javascript_directories: vec![],
+                cargo_warnings: String::new(),
                 source_files: vec![],
             };
             let motor_protocol::Frame::Run(mut request) = serde_json::from_str(include_str!(

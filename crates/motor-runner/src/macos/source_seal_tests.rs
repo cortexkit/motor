@@ -218,6 +218,7 @@ fn a_target_in_any_case_is_never_sealed_or_timed() {
         siblings: vec![],
         cargo_home: f.0.join("job/cargo-home"),
         prepared_javascript_directories: vec![],
+        cargo_warnings: String::new(),
         source_files: vec![],
     };
     super::super::execution::target_in(&staged).unwrap();
@@ -354,6 +355,7 @@ fn tracked_cache_paths_make_the_persisted_source_fact_false() {
             cargo_home: record.paths.cargo.clone(),
             siblings: Vec::new(),
             prepared_javascript_directories: Vec::new(),
+            cargo_warnings: String::new(),
             source_files: vec![tracked.into(), "protected".into()],
         };
         // The trusted manifest must still account for a tracked root target

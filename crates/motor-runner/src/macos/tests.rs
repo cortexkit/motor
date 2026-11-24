@@ -194,6 +194,7 @@ pub(crate) fn capture_finished_workspace_after_stop(
         workspace,
         siblings: vec![],
         prepared_javascript_directories: vec![],
+        cargo_warnings: String::new(),
         source_files: vec![],
     };
     execution::capture_changes(runtime, trees, &entry, request, &staged);
@@ -1262,15 +1263,144 @@ fn real_cargo_and_bun_ignore_hostile_config_and_lifecycle_scripts() {
 
 #[test]
 fn bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_refuses() {
-    let Some([cargo, rustc]) = real_tools(
+    check_bundled_private_commit(
+        Path::new(""),
         "bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_refuses",
-        ["cargo", "rustc"],
-    ) else {
+    );
+}
+
+#[test]
+fn nested_workspace_prefetches_bundled_git_dependency_for_offline_check() {
+    check_bundled_private_commit(
+        Path::new("spikes/trial"),
+        "nested_workspace_prefetches_bundled_git_dependency_for_offline_check",
+    );
+}
+
+#[test]
+fn nested_cargo_fetch_failure_warns_and_keeps_staging() {
+    let mut f = Fixture::new();
+    for directory in ["", "fixtures/broken", "fixtures/working", "target/ignored"] {
+        write(
+            &f.source.join(directory).join("Cargo.toml"),
+            "[workspace]\n",
+        );
+        write(&f.source.join(directory).join("Cargo.lock"), "version=4\n");
+    }
+    write(
+        &f.source.join("fixtures/lock-only/Cargo.lock"),
+        "version=4\n",
+    );
+    write(
+        &f.source.join("fixtures/manifest-only/Cargo.toml"),
+        "[workspace]\n",
+    );
+    f.staging.tools.cargo = tool(
+        f.scratch.join("tools/cargo"),
+        r#"#!/bin/sh
+set -eu
+[ "$1 $2 $3" = 'fetch --locked --manifest-path' ]
+mkdir -p "$CARGO_HOME/registry/cache"
+cache="$CARGO_HOME/registry/cache/fetch-order"
+case "$4" in
+    */project/Cargo.toml) echo root >> "$cache" ;;
+    */fixtures/broken/Cargo.toml) echo broken >> "$cache"; exit 1 ;;
+    */fixtures/working/Cargo.toml) echo working >> "$cache" ;;
+    *) exit 1 ;;
+esac
+"#,
+    );
+    let prepared = f
+        .staging
+        .prepare(&f.request(), Cancellation::default())
+        .unwrap();
+    assert_eq!(
+        prepared.cargo_warnings,
+        "warning: nested Cargo fetch failed in \"/Users/motor/project/fixtures/broken\"\n",
+    );
+    assert_eq!(
+        host::read_to_string(prepared.cargo_home.join("registry/cache/fetch-order")).unwrap(),
+        "root\nbroken\nworking\n",
+    );
+}
+
+#[test]
+fn bun_sees_root_git_alias_after_nested_cargo_fetch() {
+    let mut f = Fixture::new();
+    let private = f.scratch.join("private");
+    host::create_dir_all(&private).unwrap();
+    git(&private, &["init"]);
+    let url = "https://127.0.0.1:1/never-contact/private";
+    let [root_oid, nested_oid] = ["", "nested"].map(|directory| {
+        write(&private.join("README"), directory);
+        let (oid, _) = commit(&private);
+        import_private_commit(&f, &private, url, &oid);
+        let workspace = f.source.join(directory);
+        write(&workspace.join("Cargo.toml"), "[workspace]\n");
+        write(
+            &workspace.join("Cargo.lock"),
+            &format!("version=4\n[[package]]\nname='private-pkg'\nversion='0.1.0'\nsource='git+{url}?branch=shared#{oid}'\n"),
+        );
+        oid
+    });
+    let mirror = f.staging.trees.dependency_mirror(url);
+    let branch = format!(
+        "git --git-dir='{}' rev-parse refs/heads/shared",
+        mirror.display()
+    );
+    f.staging.tools.cargo = tool(
+        f.scratch.join("tools/cargo"),
+        &format!(
+            r#"#!/bin/sh
+set -eu
+oid=$({branch})
+case "$4" in
+    */project/Cargo.toml) [ "$oid" = '{root_oid}' ] ;;
+    */nested/Cargo.toml) [ "$oid" = '{nested_oid}' ]; touch "$HOME/nested-fetched" ;;
+    *) exit 1 ;;
+esac
+"#
+        ),
+    );
+    write(&f.source.join("package.json"), "{}");
+    f.staging.tools.bun = tool(
+        f.scratch.join("tools/bun"),
+        &format!("#!/bin/sh\nset -eu\ntest -f \"$HOME/nested-fetched\"\ntest \"$({branch})\" = '{root_oid}'\n"),
+    );
+    let mut request = f.request();
+    request
+        .git_dependencies
+        .push(motor_protocol::GitDependency {
+            url: url.into(),
+            commits: vec![root_oid, nested_oid],
+            bundle: None,
+        });
+    let prepared = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    assert!(prepared.cargo_warnings.is_empty());
+}
+
+fn check_bundled_private_commit(workspace_subdir: &Path, test: &str) {
+    let Some([cargo, rustc]) = real_tools(test, ["cargo", "rustc"]) else {
         return;
     };
     let mut f = Fixture::new();
     f.staging.tools.cargo = cargo;
     f.staging.tools.rustc = rustc;
+    if !workspace_subdir.as_os_str().is_empty() {
+        write(
+            &f.source.join("Cargo.toml"),
+            "[workspace]\nresolver='2'\n[package]\nname='root'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        write(
+            &f.source.join("Cargo.lock"),
+            "version=4\n[[package]]\nname='root'\nversion='0.1.0'\n",
+        );
+        write(&f.source.join("src/lib.rs"), "");
+    }
+    let consumer = f.source.join(workspace_subdir);
     let private = f.scratch.join("private");
     host::create_dir_all(&private).unwrap();
     git(&private, &["init"]);
@@ -1281,19 +1411,18 @@ fn bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_
     write(&private.join("src/lib.rs"), "pub fn dependency() {}\n");
     let (oid, _) = commit(&private);
     let url = "https://127.0.0.1:1/never-contact/private";
-    write(&f.source.join("Cargo.toml"), &format!("[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprivate-pkg={{git='{url}',rev='{oid}'}}\n"));
+    write(&consumer.join("Cargo.toml"), &format!("[workspace]\nresolver='2'\n[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprivate-pkg={{git='{url}',rev='{oid}'}}\n"));
     write(
-        &f.source.join("src/lib.rs"),
+        &consumer.join("src/lib.rs"),
         "pub fn consumer() { private_pkg::dependency(); }\n",
     );
-    write(&f.source.join("Cargo.lock"), &format!("version=4\n[[package]]\nname='consumer'\nversion='0.1.0'\ndependencies=['private-pkg']\n[[package]]\nname='private-pkg'\nversion='0.1.0'\nsource='git+{url}?rev={oid}#{oid}'\n"));
+    write(&consumer.join("Cargo.lock"), &format!("version=4\n[[package]]\nname='consumer'\nversion='0.1.0'\ndependencies=['private-pkg']\n[[package]]\nname='private-pkg'\nversion='0.1.0'\nsource='git+{url}?rev={oid}#{oid}'\n"));
     let mut r = f.request();
-    let dependency = motor_protocol::GitDependency {
+    r.git_dependencies.push(motor_protocol::GitDependency {
         url: url.into(),
         commits: vec![oid.clone()],
         bundle: None,
-    };
-    r.git_dependencies.push(dependency.clone());
+    });
     let error = f
         .staging
         .prepare(&r, Cancellation::default())
@@ -1302,34 +1431,9 @@ fn bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_
         .to_string();
     assert!(error.contains(url) && error.contains(&oid), "{error}");
     assert!(!f.staging.state.join("prep-cargo").exists());
-    let reference = format!("refs/ck-motor/dep/{oid}");
-    git(&private, &["update-ref", &reference, &oid]);
-    let upload = f.scratch.join("upload");
-    host::create_dir_all(&upload).unwrap();
-    let bundle = upload.join("0");
-    git(
-        &private,
-        &["bundle", "create", bundle.to_str().unwrap(), &reference],
-    );
-    let bytes = host::read(&bundle).unwrap();
-    let mut dependency = dependency;
-    dependency.bundle = Some(motor_protocol::BundleManifest {
-        index: 0,
-        repository: url.into(),
-        length: bytes.len() as u64,
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
-    });
-    f.staging
-        .trees
-        .validate_dependency_bundles(&upload, &[dependency.clone()])
-        .unwrap();
-    f.staging
-        .trees
-        .import_dependencies(&upload, &[dependency])
-        .unwrap();
+    import_private_commit(&f, &private, url, &oid);
     r.job_id = uuid::Uuid::now_v7();
     let prepared = f.staging.prepare(&r, Cancellation::default()).unwrap();
-    assert!(prepared.cargo_home.join("git/checkouts").is_dir());
     // The resulting job cache is sufficient even after both host-only caches disappear.
     f.staging.evict_prep(Cancellation::default()).unwrap();
     let mut cmd = Command::new(&f.staging.tools.cargo.path);
@@ -1338,13 +1442,46 @@ fn bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_
         .env("RUSTC_WRAPPER", "")
         .env("CARGO_BUILD_RUSTC_WRAPPER", "")
         .args(["check", "--locked", "--offline"])
-        .current_dir(&prepared.workspace);
+        .current_dir(prepared.workspace.join(workspace_subdir));
     let output = cmd.output().unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(prepared.cargo_home.join("git/checkouts").is_dir());
+}
+
+fn import_private_commit(f: &Fixture, private: &Path, url: &str, oid: &str) {
+    let reference = format!("refs/ck-motor/dep/{oid}");
+    git(private, &["update-ref", &reference, oid]);
+    let upload = f.scratch.join(format!("upload-{oid}"));
+    host::create_dir_all(&upload).unwrap();
+    let bundle = upload.join("0");
+    git(
+        private,
+        &["bundle", "create", bundle.to_str().unwrap(), &reference],
+    );
+    let bytes = host::read(&bundle).unwrap();
+    let dependency = motor_protocol::GitDependency {
+        url: url.into(),
+        commits: vec![oid.into()],
+        bundle: Some(motor_protocol::BundleManifest {
+            index: 0,
+            repository: url.into(),
+            length: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        }),
+    };
+    let dependencies = &[dependency];
+    f.staging
+        .trees
+        .validate_dependency_bundles(&upload, dependencies)
+        .unwrap();
+    f.staging
+        .trees
+        .import_dependencies(&upload, dependencies)
+        .unwrap();
 }
 
 #[test]

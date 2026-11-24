@@ -742,7 +742,7 @@ fn start_io(
     setup: &Setup,
     entry: Arc<Entry>,
     boot: VmBoot,
-    staged: Staged,
+    mut staged: Staged,
     staging: super::Staging,
     mtimes: crate::source_mtimes::Record,
 ) -> io::Result<Prepared> {
@@ -821,6 +821,13 @@ fn start_io(
                     transport.deadline = None;
                     Ok(())
                 })?;
+                if !staged.cargo_warnings.is_empty() {
+                    forward(
+                        &stderr_tx,
+                        std::mem::take(&mut staged.cargo_warnings).into_bytes(),
+                        &transport.entry,
+                    )?;
+                }
                 run_output(&mut transport, &stdout_tx, &stderr_tx)
             })();
             if let Err(error) = &result {

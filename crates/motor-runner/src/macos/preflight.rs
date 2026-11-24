@@ -342,21 +342,33 @@ fn bun(value: &serde_json::Value, base: &Path, roots: &[PathBuf]) -> io::Result<
     }
     Ok(())
 }
+pub(super) const MAX_NESTED_CARGO_FETCHES: usize = 16;
+
+#[derive(Default)]
+pub(super) struct Validated {
+    pub(super) routes: BTreeMap<String, PathBuf>,
+    pub(super) nested_cargo: Vec<PathBuf>,
+    pub(super) nested_limit_reached: bool,
+}
+
 pub(super) fn validate(
     roots: &[PathBuf],
     deps: &[GitDependency],
     trees: &Trees,
     control: &Control,
-) -> io::Result<BTreeMap<String, PathBuf>> {
+) -> io::Result<Validated> {
     fn walk(
         dir: &Dir,
         base: &Path,
         roots: &[PathBuf],
         deps: &[GitDependency],
         trees: &Trees,
-        routes: &mut BTreeMap<String, PathBuf>,
+        validated: &mut Validated,
         control: &Control,
     ) -> io::Result<()> {
+        let mut cargo_manifest = false;
+        let mut cargo_lock = false;
+        // The prep copy already drops target/ and .git/ and bounds tree depth.
         for name in dir.names()? {
             control.check()?;
             let path = base.join(&name);
@@ -367,17 +379,20 @@ pub(super) fn validate(
                     roots,
                     deps,
                     trees,
-                    routes,
+                    validated,
                     control,
                 )?;
                 continue;
             }
             match name.to_str() {
-                Some("Cargo.toml") => cargo(
-                    &toml::from_str::<toml::Value>(&dir.text(&name)?).map_err(invalid)?,
-                    base,
-                    roots,
-                )?,
+                Some("Cargo.toml") => {
+                    cargo(
+                        &toml::from_str::<toml::Value>(&dir.text(&name)?).map_err(invalid)?,
+                        base,
+                        roots,
+                    )?;
+                    cargo_manifest = true;
+                }
                 Some("Cargo.lock") => {
                     let text = dir.text(&name)?;
                     lock(&text)?;
@@ -386,7 +401,8 @@ pub(super) fn validate(
                     if !missing.is_empty() {
                         return Err(invalid(missing.join("; ")));
                     }
-                    routes.extend(found);
+                    validated.routes.extend(found);
+                    cargo_lock = true;
                 }
                 Some("package.json") => package(
                     &serde_json::from_str::<serde_json::Value>(&dir.text(&name)?)
@@ -404,9 +420,16 @@ pub(super) fn validate(
                 _ => {}
             }
         }
+        if cargo_manifest && cargo_lock && !roots.iter().any(|root| root == base) {
+            if validated.nested_cargo.len() < MAX_NESTED_CARGO_FETCHES {
+                validated.nested_cargo.push(base.to_path_buf());
+            } else {
+                validated.nested_limit_reached = true;
+            }
+        }
         Ok(())
     }
-    let mut routes = BTreeMap::new();
+    let mut validated = Validated::default();
     for root in roots {
         walk(
             &Dir::open(root, false)?,
@@ -414,11 +437,11 @@ pub(super) fn validate(
             roots,
             deps,
             trees,
-            &mut routes,
+            &mut validated,
             control,
         )?;
     }
-    Ok(routes)
+    Ok(validated)
 }
 
 pub(super) fn validate_links(root: &Path, roots: &[PathBuf], control: &Control) -> io::Result<()> {
