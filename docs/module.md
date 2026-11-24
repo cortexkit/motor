@@ -436,8 +436,14 @@ SQLite. It uses the descriptor's path to find a sibling directory
 That directory holds an exclusively locked `lease` file, a compatible
 `state.json` checkpoint (published atomically through `state.tmp`), checksummed
 `journal-<epoch>-<sequence>.jsonl` segments, transient `spools/`, and the agent's
-runtime directories. Its Engram catalog entry remains a **device-local filetree**;
-copying or restoring it to another device can replay stale intents.
+runtime directories.
+
+At startup, ck-motor writes `engram-catalog.json` in its data directory. The
+`motor/storage` entry marks the store as device-local, so it isn't backed up: a
+restored copy would hold stale jobs, runner bindings and pending cancels, and
+could replay a cancel. The portable `motor/config` entry appears only when the
+config file used at launch is inside the data directory. Engram backs up settings
+under `~/.config/cortexkit/` separately.
 
 The key used to hash hosted workspace and repository identities lives in ck-motor’s
 private space in the credential vault. Losing the key only makes each checkout’s

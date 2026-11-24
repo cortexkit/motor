@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut args = args.into_iter();
     let mut connection = None;
-    let mut config = std::env::var_os("CK_MOTOR_CONFIG").map(PathBuf::from);
+    let mut config_path = std::env::var_os("CK_MOTOR_CONFIG").map(PathBuf::from);
     let mut print = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }
             "--config" => {
-                config = Some(PathBuf::from(
+                config_path = Some(PathBuf::from(
                     args.next()
                         .ok_or_else(|| io::Error::other("--config needs a path"))?,
                 ))
@@ -82,8 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let id = std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| DEFAULT_MODULE_ID.into());
-    let config = match config {
-        Some(path) => Config::load(&path)?,
+    let config = match config_path.as_deref() {
+        Some(path) => Config::load(path)?,
         None => Config::default(),
     };
     let manifest = manifest_with_config(&id, &config);
@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             connection.clone(),
             id.clone(),
         )))
-        .with_engram_catalog();
+        .with_engram_catalog(config_path);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let result = tokio::select! {

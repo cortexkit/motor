@@ -31,35 +31,58 @@ pub(crate) fn write_best_effort(
     module_id: &str,
     data_dir: io::Result<PathBuf>,
     storage_root: &Path,
+    config_path: Option<&Path>,
 ) {
-    let result = data_dir.and_then(|data_dir| write_catalog(module_id, &data_dir, storage_root));
+    let result = data_dir
+        .and_then(|data_dir| write_catalog(module_id, &data_dir, storage_root, config_path));
     if let Err(error) = result {
         tracing::warn!(%error, "could not write Engram backup catalog");
     }
 }
 
-fn write_catalog(module_id: &str, data_dir: &Path, storage_root: &Path) -> io::Result<()> {
+fn write_catalog(
+    module_id: &str,
+    data_dir: &Path,
+    storage_root: &Path,
+    config_path: Option<&Path>,
+) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
-    let bytes = catalog_bytes(module_id, data_dir, storage_root)?;
+    let bytes = catalog_bytes(module_id, data_dir, storage_root, config_path)?;
     atomic_write(&data_dir.join("engram-catalog.json"), &bytes)
 }
 
-fn catalog_bytes(module_id: &str, data_dir: &Path, storage_root: &Path) -> io::Result<Vec<u8>> {
+fn catalog_bytes(
+    module_id: &str,
+    data_dir: &Path,
+    storage_root: &Path,
+    config_path: Option<&Path>,
+) -> io::Result<Vec<u8>> {
     let data_root = fs::canonicalize(data_dir)?;
     let mut entries = Vec::new();
 
-    let config = data_dir.join("config.jsonc");
-    match fs::symlink_metadata(&config) {
-        Ok(metadata) if metadata.file_type().is_file() => entries.push(Entry {
-            entry_id: format!("{module_id}/config"),
-            class: "portable",
-            reason: CONFIG_REASON,
-            mechanism: FILETREE,
-            path: "config.jsonc".into(),
-        }),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if let Some(config) = config_path {
+        // A symlink inside the data directory may point outside it. Engram must
+        // find the actual config file under the catalog's directory.
+        match fs::canonicalize(config) {
+            Ok(config) if config.is_file() => {
+                if let Some(path) = config
+                    .strip_prefix(&data_root)
+                    .ok()
+                    .and_then(canonical_relative_path)
+                {
+                    entries.push(Entry {
+                        entry_id: format!("{module_id}/config"),
+                        class: "portable",
+                        reason: CONFIG_REASON,
+                        mechanism: FILETREE,
+                        path,
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
 
     let storage = match fs::canonicalize(storage_root) {
@@ -216,12 +239,69 @@ mod tests {
     fn catalog_has_deterministic_exact_engram_v1_bytes() {
         for module_id in ["ck-motor", "motor"] {
             let (_scratch, data_dir, storage_root) = fixture(module_id);
-            let bytes = catalog_bytes(module_id, &data_dir, &storage_root).unwrap();
+            let config = data_dir.join("config.jsonc");
+            write_catalog(module_id, &data_dir, &storage_root, Some(&config)).unwrap();
+            let bytes = fs::read(data_dir.join("engram-catalog.json")).unwrap();
             let expected = format!(
                 r#"{{"schema_version":1,"module_id":"{module_id}","entries":[{{"entry_id":"{module_id}/config","class":"portable","reason":"Operator routing settings can be reused on another machine.","mechanism":"filetree","path":"config.jsonc"}},{{"entry_id":"{module_id}/storage","class":"device-local","reason":"Not backed up on purpose: jobs from the last 24 hours, their runner bindings and pending cancels, plus per-start runtime sockets and the lease; a restored copy would be stale and could replay a cancel.","mechanism":"filetree","path":"store.db.ck-motor"}}]}}"#
             );
             assert_eq!(bytes, expected.as_bytes(), "module id: {module_id}");
         }
+    }
+
+    const STORAGE_ONLY: &str = r#"{"schema_version":1,"module_id":"motor","entries":[{"entry_id":"motor/storage","class":"device-local","reason":"Not backed up on purpose: jobs from the last 24 hours, their runner bindings and pending cancels, plus per-start runtime sockets and the lease; a restored copy would be stale and could replay a cancel.","mechanism":"filetree","path":"store.db.ck-motor"}]}"#;
+
+    #[test]
+    fn launched_config_outside_data_directory_replaces_catalog_with_storage_only() {
+        let (scratch, data_dir, storage_root) = fixture("motor");
+        let old_config = data_dir.join("config.jsonc");
+        let catalog = data_dir.join("engram-catalog.json");
+        write_catalog("motor", &data_dir, &storage_root, Some(&old_config)).unwrap();
+        assert!(fs::read_to_string(&catalog)
+            .unwrap()
+            .contains("motor/config"));
+
+        // Leave the old file behind to ensure the catalog follows the launch path.
+        let new_config = scratch.join("settings/motor.jsonc");
+        fs::create_dir(new_config.parent().unwrap()).unwrap();
+        fs::write(&new_config, "{}\n").unwrap();
+        write_catalog("motor", &data_dir, &storage_root, Some(&new_config)).unwrap();
+        assert_eq!(fs::read_to_string(catalog).unwrap(), STORAGE_ONLY);
+    }
+
+    #[test]
+    fn without_a_config_argument_the_catalog_does_not_guess_a_config_file() {
+        let (_scratch, data_dir, storage_root) = fixture("motor");
+        write_catalog("motor", &data_dir, &storage_root, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(data_dir.join("engram-catalog.json")).unwrap(),
+            STORAGE_ONLY
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_entry_uses_the_resolved_path_relative_to_the_data_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (scratch, data_dir, storage_root) = fixture("motor");
+        let nested_config = data_dir.join("settings/custom.jsonc");
+        fs::create_dir(nested_config.parent().unwrap()).unwrap();
+        fs::write(&nested_config, "{}\n").unwrap();
+        let outside_link = scratch.join("settings-link.jsonc");
+        symlink(&nested_config, &outside_link).unwrap();
+        write_catalog("motor", &data_dir, &storage_root, Some(&outside_link)).unwrap();
+        let catalog = data_dir.join("engram-catalog.json");
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&catalog).unwrap()).unwrap();
+        assert_eq!(json["entries"][0]["entry_id"], "motor/config");
+        assert_eq!(json["entries"][0]["path"], "settings/custom.jsonc");
+
+        let outside_config = scratch.join("outside.jsonc");
+        fs::write(&outside_config, "{}\n").unwrap();
+        let inside_link = data_dir.join("settings-link.jsonc");
+        symlink(&outside_config, &inside_link).unwrap();
+        write_catalog("motor", &data_dir, &storage_root, Some(&inside_link)).unwrap();
+        assert_eq!(fs::read_to_string(catalog).unwrap(), STORAGE_ONLY);
     }
 
     #[test]
@@ -231,9 +311,12 @@ mod tests {
         let storage_root = scratch.join("elsewhere/store.db.ck-motor");
         fs::create_dir_all(&data_dir).unwrap();
         fs::create_dir_all(&storage_root).unwrap();
-        fs::write(data_dir.join("config.jsonc"), "{}\n").unwrap();
-        let json =
-            String::from_utf8(catalog_bytes("motor", &data_dir, &storage_root).unwrap()).unwrap();
+        let config = data_dir.join("config.jsonc");
+        fs::write(&config, "{}\n").unwrap();
+        let json = String::from_utf8(
+            catalog_bytes("motor", &data_dir, &storage_root, Some(&config)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             json,
             r#"{"schema_version":1,"module_id":"motor","entries":[{"entry_id":"motor/config","class":"portable","reason":"Operator routing settings can be reused on another machine.","mechanism":"filetree","path":"config.jsonc"}]}"#
@@ -243,7 +326,8 @@ mod tests {
     #[test]
     fn identical_catalog_keeps_its_modification_time() {
         let (_scratch, data_dir, storage_root) = fixture("ck-motor");
-        write_catalog("ck-motor", &data_dir, &storage_root).unwrap();
+        let config = data_dir.join("config.jsonc");
+        write_catalog("ck-motor", &data_dir, &storage_root, Some(&config)).unwrap();
         let path = data_dir.join("engram-catalog.json");
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         #[cfg(unix)]
@@ -252,7 +336,7 @@ mod tests {
             fs::metadata(&path).unwrap().ino()
         };
         std::thread::sleep(Duration::from_millis(20));
-        write_catalog("ck-motor", &data_dir, &storage_root).unwrap();
+        write_catalog("ck-motor", &data_dir, &storage_root, Some(&config)).unwrap();
         let after_metadata = fs::metadata(&path).unwrap();
         assert_eq!(after_metadata.modified().unwrap(), before);
         #[cfg(unix)]
@@ -299,6 +383,7 @@ mod tests {
             "ck-motor",
             Ok(not_a_directory),
             &scratch.join("unused-root"),
+            None,
         );
         let lines: Vec<_> = captured.text().lines().map(str::to_owned).collect();
         assert_eq!(lines.len(), 1, "unexpected log output: {lines:?}");

@@ -343,6 +343,7 @@ pub struct Handler {
     health_cache: Arc<Mutex<crate::health_cache::HealthCache>>,
     health_sampler: Arc<Mutex<crate::health_cache::Sampler>>,
     write_engram_catalog: bool,
+    engram_config_path: Option<PathBuf>,
 }
 pub(crate) fn module_data_dir(module_id: &str) -> io::Result<PathBuf> {
     module_data_dir_for(
@@ -439,10 +440,12 @@ impl Handler {
             health_cache: Arc::new(Mutex::new(health_cache)),
             health_sampler: Arc::new(Mutex::new(crate::health_cache::Sampler::default())),
             write_engram_catalog: false,
+            engram_config_path: None,
         }
     }
-    pub fn with_engram_catalog(mut self) -> Self {
+    pub fn with_engram_catalog(mut self, config_path: Option<PathBuf>) -> Self {
         self.write_engram_catalog = true;
+        self.engram_config_path = config_path;
         self
     }
     #[cfg(test)]
@@ -593,11 +596,13 @@ impl Handler {
                         let module_id = self.module_id.clone();
                         let data_dir = catalog_data_dir;
                         let catalog_root = root.clone();
+                        let config_path = self.engram_config_path.clone();
                         drop(tokio::task::spawn_blocking(move || {
                             crate::engram_catalog::write_best_effort(
                                 &module_id,
                                 data_dir,
                                 &catalog_root,
+                                config_path.as_deref(),
                             )
                         }));
                     }
@@ -1797,6 +1802,68 @@ mod startup_tests {
         process::{Command, Stdio},
         time::Duration,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_catalog_directory_warns_without_preventing_readiness() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        // The catalog writer runs on a blocking thread. Install the process-wide
+        // log sink in a child so it doesn't affect other tests in this binary.
+        const CHILD: &str = "MOTOR_TEST_UNWRITABLE_CATALOG";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "module::startup_tests::unwritable_catalog_directory_warns_without_preventing_readiness",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{stderr}"
+            );
+            return;
+        }
+
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-startup-catalog");
+        let data_dir = scratch.join("motor");
+        let storage_root = data_dir.join("store.db.ck-motor");
+        fs::create_dir_all(&storage_root).unwrap();
+        // Block replacement even when the test process can bypass directory modes.
+        fs::create_dir(data_dir.join("engram-catalog.json")).unwrap();
+        let permissions = fs::metadata(&data_dir).unwrap().permissions();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let logs = crate::logging::Captured::default();
+        crate::logging::init_with_writer(logs.clone()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ready = runtime.block_on(async {
+            let handler = Handler::new(Config::default()).with_engram_catalog(None);
+            handler
+                .initialize_storage(storage_root, Ok(data_dir.clone()))
+                .await;
+            let ready = handler.ready().await.is_ok();
+            handler.shutdown().await;
+            ready
+        });
+        drop(runtime);
+        fs::set_permissions(&data_dir, permissions).unwrap();
+        assert!(ready);
+        let text = logs.text();
+        assert!(
+            text.lines().any(|line| {
+                line.contains(" WARN ") && line.contains("could not write Engram backup catalog")
+            }),
+            "{text}"
+        );
+    }
 
     #[test]
     fn module_data_directory_uses_the_runtime_module_id() {
