@@ -213,6 +213,9 @@ pub struct LeaseRequest {
     /// Operator-selected Boat placement; absent ordinary leases keep their bytes.
     #[serde(default, deserialize_with = "optional_placement")]
     pub placement: Option<LeasePlacement>,
+    /// Tenant-scoped waiter identity shared by successive bookings of one job.
+    #[serde(default, deserialize_with = "optional_queue_key")]
+    pub queue_key: Option<String>,
 }
 
 impl Serialize for LeaseRequest {
@@ -222,7 +225,8 @@ impl Serialize for LeaseRequest {
             "LeaseRequest",
             10 + usize::from(self.allow_spill.is_some())
                 + usize::from(self.mem_mib.is_some())
-                + usize::from(self.placement.is_some()),
+                + usize::from(self.placement.is_some())
+                + usize::from(self.queue_key.is_some()),
         )?;
         body.serialize_field("job_id", &self.job_id)?;
         body.serialize_field("vcpus", &self.vcpus)?;
@@ -233,15 +237,16 @@ impl Serialize for LeaseRequest {
         body.serialize_field("placement_hint", &self.placement_hint)?;
         body.serialize_field("avoid_host", &self.avoid_host)?;
         body.serialize_field("timeout_s", &self.timeout_s)?;
-        // Keep the historical member order for unstated leases, including
-        // stored requests. Stated leases use the contract's new wire order.
-        if self.mem_mib.is_some() {
+        // Keep the historical member order for unstated, unkeyed leases,
+        // including stored requests. New keyed leases use the wire order.
+        let legacy_order = self.mem_mib.is_none() && self.queue_key.is_none();
+        if !legacy_order {
             body.serialize_field("requester_jwk", &self.requester_jwk)?;
         }
         if let Some(allow_spill) = self.allow_spill {
             body.serialize_field("allow_spill", &allow_spill)?;
         }
-        if self.mem_mib.is_none() {
+        if legacy_order {
             body.serialize_field("requester_jwk", &self.requester_jwk)?;
         }
         if let Some(mem_mib) = self.mem_mib {
@@ -250,8 +255,17 @@ impl Serialize for LeaseRequest {
         if let Some(placement) = self.placement {
             body.serialize_field("placement", &placement)?;
         }
+        if let Some(queue_key) = &self.queue_key {
+            body.serialize_field("queue_key", queue_key)?;
+        }
         body.end()
     }
+}
+
+fn optional_queue_key<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 fn optional_placement<'de, D: serde::Deserializer<'de>>(

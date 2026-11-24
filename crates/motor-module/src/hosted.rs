@@ -94,6 +94,11 @@ pub struct HostedJobState {
         serialize_with = "store_lease_request"
     )]
     pub(crate) lease_request: Option<LeaseRequest>,
+    /// Keep the key beside the strict lease body so older clients can open the store.
+    /// They retire unsent jobs on restart without requesting another lease; release
+    /// only needs the lease job ID, not the queue key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lease_queue_key: Option<String>,
     /// The host the broker must not place this job's lease on. Only a spill
     /// sets it, to the build server's host id; it is fixed when the route is
     /// created and copied into the stored lease body, so every re-request of
@@ -142,8 +147,8 @@ pub struct HostedJobState {
     pub(crate) broker_url: String,
     pub(crate) token_source: BrokerTokenSource,
 }
-/// Store the operator selection on the route only, so older clients can still
-/// decode the strict lease body when opening a journal or checkpoint.
+/// Keep wire-only additions on the route, so older clients can still decode
+/// the strict lease body when opening a journal or checkpoint.
 fn store_lease_request<S: serde::Serializer>(
     request: &Option<LeaseRequest>,
     serializer: S,
@@ -151,6 +156,7 @@ fn store_lease_request<S: serde::Serializer>(
     let mut stored = request.clone();
     if let Some(body) = &mut stored {
         body.placement = None;
+        body.queue_key = None;
     }
     stored.serialize(serializer)
 }
@@ -885,6 +891,12 @@ pub(crate) fn invalid_lease_field(body: &LeaseRequest) -> Option<&'static str> {
         Some("mem_mib")
     } else if body.placement.is_some() && body.allow_spill != Some(true) {
         Some("placement")
+    } else if body
+        .queue_key
+        .as_deref()
+        .is_some_and(|key| !motor_lease::valid_name(key))
+    {
+        Some("queue_key")
     } else {
         None
     }
@@ -949,6 +961,7 @@ fn lease_body(
         allow_spill,
         mem_mib: request.memory_mib,
         placement: None,
+        queue_key: None,
     })
 }
 fn reattach_body(key: &SigningKey) -> ReattachRequest {
@@ -1512,7 +1525,13 @@ impl Client {
             .hosted
             .as_ref()
             .and_then(|state| state.repository_placement_hint.clone());
-        let mut body = match job.hosted.and_then(|state| state.lease_request) {
+        let stored_request = job.hosted.and_then(|state| {
+            state.lease_request.map(|mut body| {
+                body.queue_key = state.lease_queue_key;
+                body
+            })
+        });
+        let mut body = match stored_request {
             // The broker hashes placement_hint. Replay legacy requests unchanged
             // (apart from requester_jwk below), even if they contain a cached hint:
             // clearing it could turn an in-flight lease into job_conflict.
@@ -1521,7 +1540,7 @@ impl Client {
                 // Only configured hints may opt into an explicit-only host.
                 // Workspace affinity belongs to the broker's current warm inventory,
                 // matched by workspace_key_hash, not a previous job's placement.
-                lease_body(
+                let mut body = lease_body(
                     id,
                     request,
                     (
@@ -1534,7 +1553,11 @@ impl Client {
                     avoid_host,
                     RequesterJwk::from_key(&requester()?.verifying_key()),
                     Some(allow_spill),
-                )?
+                )?;
+                // The caller's UUID is 36 ASCII hex digits and hyphens. Unlike
+                // the lease job ID, it does not change on a capacity re-book.
+                body.queue_key = Some(id.to_string());
+                body
             }
         };
         // Older clients cannot decode placement in a stored lease body. Restore
@@ -1563,7 +1586,10 @@ impl Client {
         let key = requester()?;
         body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
         storage
-            .hosted_update(id, |state| state.lease_request = Some(body.clone()))
+            .hosted_update(id, |state| {
+                state.lease_queue_key.clone_from(&body.queue_key);
+                state.lease_request = Some(body.clone());
+            })
             .map_err(|_| Error::Broker)?;
         'lease_requests: loop {
             if self.cancel_pending() {
@@ -1628,7 +1654,8 @@ impl Client {
                 // A prefix of the salted hash the broker already receives: enough to
                 // follow one workspace across hosts in the log, and reveals no path.
                 workspace = %body.workspace_key_hash.get(..8).unwrap_or_default(),
-                spilled, "hosted lease requested");
+                spilled, queue_key = if body.queue_key.is_some() { "yes" } else { "no" },
+                "hosted lease requested");
             let request_cut_off =
                 std::mem::replace(&mut cut_off, Error::Provisioning(MIN_PROVISIONING_RETRY_MS));
             let reply = self

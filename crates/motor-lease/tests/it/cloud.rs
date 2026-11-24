@@ -55,6 +55,41 @@ fn boat_only_request_pins_canonical_bytes_and_strict_final_placement() {
 }
 
 #[test]
+fn queue_key_conflicts_and_bad_values_match_the_wire_contract() {
+    let vector = vector("queue-key-lease.json");
+    let vector_body = &vector["granted"]["request"]["body"];
+    let mut broker = broker();
+    for case in vector["bad_keys"].as_array().unwrap() {
+        let mut bad = vector_body.clone();
+        bad["queue_key"] = case["queue_key"].clone();
+        if bad["queue_key"].is_string() {
+            let reply = post(&mut broker, "/v1/leases", &bad, NOW);
+            assert_eq!(reply.status, 400);
+            assert_eq!(reply.body, case["reply"]["body"]);
+        } else {
+            assert!(serde_json::from_value::<LeaseRequest>(bad).is_err());
+        }
+    }
+
+    assert_eq!(
+        post(&mut broker, "/v1/leases", vector_body, NOW).status,
+        201
+    );
+    let changed = &vector["conflict"]["request"]["body"];
+    let mut absent = vector_body.clone();
+    absent.as_object_mut().unwrap().remove("queue_key");
+    for conflicted in [changed, &absent] {
+        let reply = post(&mut broker, "/v1/leases", conflicted, NOW);
+        assert_eq!(reply.status, 409);
+        assert_eq!(reply.body, vector["conflict"]["reply"]["body"]);
+    }
+    assert_eq!(
+        post(&mut broker, "/v1/leases", vector_body, NOW).status,
+        201
+    );
+}
+
+#[test]
 fn tenant_disk_heartbeats_match_accepted_cloud_vector_bytes() {
     let vector = vector("tenant-disk.json");
     let cases = vector["disk_cases"].as_array().unwrap();

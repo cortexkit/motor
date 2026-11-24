@@ -137,6 +137,7 @@ async fn probe(
         requester_jwk: RequesterJwk::from_key(&key.verifying_key()),
         mem_mib: None,
         placement: None,
+        queue_key: None,
     };
     let mut client = Client::new(HostedJobState::new(&config)).with_account_tokens(tokens);
     client.probe_replies = Some(std::sync::Mutex::new(Replies::default()));

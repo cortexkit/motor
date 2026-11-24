@@ -999,12 +999,14 @@ from a stale view of the host, which then refuses the job as full (`host_full`,
 or `capacity`). When a registered host refuses the job as full before Run,
 ck-motor releases the refused booking and re-books an unpinned job under a fresh
 lease job ID after a short placement wait. A fresh lease job ID is needed because
-the broker never places a job ID again on a host it was moved away from. The
-request is otherwise unchanged, including `allow_spill` and `avoid_host`; normal
-fresh-lease rules may select any eligible host or Boat. Callers keep their original
-job ID for status, attach, secrets and cancel. All re-books share the original
-queue-wait deadline. Old bookings are released durably in the background, including
-after restart; a stalled release does not block the new booking or its terminal.
+the broker never places a job ID again on a host it was moved away from. The new
+lease carries the same queue key as the first, so the job keeps its place in the
+broker's queue. The request is otherwise unchanged, including `allow_spill` and
+`avoid_host`; normal fresh-lease rules may select any eligible host or Boat.
+Callers keep their original job ID for status, attach, secrets and cancel. All
+re-books share the original queue-wait deadline. Old bookings are released durably
+in the background, including after restart; a stalled release does not block the
+new booking or its terminal.
 Repository-pinned jobs continue waiting on the same server and lease ID. Capacity
 waits do not consume transport-placement attempts. Exhaustion reports `runner_full`
 with the last capacity cause and `ran: none`, so it is safe to resubmit. After a

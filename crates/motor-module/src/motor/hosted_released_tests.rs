@@ -121,6 +121,120 @@ async fn rebook_wait_restart_recovery_attach_is_never_started() {
     rebook_wait_survives_restart(false).await;
 }
 
+async fn keyed_booking_retires_without_replay(rollback_probe: Option<&Path>) {
+    for checkpoint in [false, true] {
+        let h = Harness::new(Behavior::Normal).await;
+        let (scratch, repo) = committed_repo();
+        let source = scratch.0.join("state");
+        let storage = Arc::new(test_storage(&source).unwrap());
+        let id = Uuid::now_v7();
+        storage.create(id, 300, None, None, false).unwrap();
+        storage.hosted_route(id, h.route.clone()).unwrap();
+        let (channel, _) = Client::new(h.route.clone())
+            .run(id, &Harness::request(&repo), &storage)
+            .await
+            .unwrap();
+        drop(channel);
+        let hosted = serde_json::to_value(storage.job(id).unwrap()).unwrap();
+        assert_eq!(hosted["hosted"]["lease_queue_key"], id.to_string());
+        assert!(hosted["hosted"]["lease_request"].get("queue_key").is_none());
+        let root = if checkpoint {
+            storage.shutdown().unwrap();
+            source
+        } else {
+            // Copy the live journal before dropping Storage exports a checkpoint.
+            let crash = scratch.0.join("crash");
+            std::fs::create_dir(&crash).unwrap();
+            let mut copied_key = false;
+            for entry in std::fs::read_dir(&source).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    let path = entry.path();
+                    if entry.file_name().to_string_lossy().starts_with("journal-") {
+                        copied_key |= std::fs::read_to_string(&path)
+                            .unwrap()
+                            .contains("\"lease_queue_key\"");
+                    }
+                    std::fs::copy(&path, crash.join(entry.file_name())).unwrap();
+                }
+            }
+            assert!(copied_key, "the copy must exercise journal decoding");
+            crash
+        };
+        drop(storage);
+
+        if let Some(probe) = rollback_probe {
+            let config = scratch.0.join("config.json");
+            std::fs::write(&config, serde_json::to_vec(&h.config()).unwrap()).unwrap();
+            let output = tokio::process::Command::new(probe)
+                .args([
+                    "--exact",
+                    "motor::queue_key_rollback_probe::retire",
+                    "--nocapture",
+                ])
+                .env("MOTOR_QUEUE_KEY_ROLLBACK_ROOT", &root)
+                .env("MOTOR_QUEUE_KEY_ROLLBACK_CONFIG", &config)
+                .env("MOTOR_QUEUE_KEY_ROLLBACK_ID", id.to_string())
+                .env("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer")
+                .kill_on_drop(true)
+                .output();
+            let output = tokio::time::timeout(Duration::from_secs(30), output)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "rollback probe timed out; requests: {:?}",
+                        h.requests.lock().unwrap()
+                    )
+                })
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            println!("rollback opened checkpoint={checkpoint}: {stdout}");
+        } else {
+            let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+            let motor = test_motor(h.config(), &root, ssh).unwrap();
+            motor.resume_finishes().await;
+            motor.wait_hosted_cleanup(id).await;
+            let result = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+            assert_eq!(
+                result.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::LostToRestart
+                }
+            );
+            assert_eq!(result.ran, Some(Ran::None));
+            motor.close().await;
+        }
+
+        assert_eq!(
+            *h.requests.lock().unwrap(),
+            ["/v1/leases".to_owned(), format!("/v1/leases/{id}/release")],
+            "exactly the original booking and its release, checkpoint={checkpoint}"
+        );
+        let bodies = h.lease_bodies.lock().unwrap();
+        let booked: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(booked["queue_key"], id.to_string());
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn keyed_first_party_booking_retires_after_restart() {
+    keyed_booking_retires_without_replay(None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the archived motor-module probe via MOTOR_QUEUE_KEY_ROLLBACK_PROBE"]
+async fn rollback_keyed_first_party_booking_retires_after_restart() {
+    let probe = std::env::var_os("MOTOR_QUEUE_KEY_ROLLBACK_PROBE").expect("archived test binary");
+    keyed_booking_retires_without_replay(Some(Path::new(&probe))).await;
+}
+
 #[tokio::test]
 async fn restart_repairs_synthetic_no_run_outcomes_but_preserves_runner_full_refusal() {
     let h = Harness::new(Behavior::Normal).await;

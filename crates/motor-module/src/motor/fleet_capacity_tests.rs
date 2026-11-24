@@ -166,6 +166,7 @@ async fn fleet_capacity_wait_takes_host_full_and_no_capacity_in_either_order() {
         );
         let bodies = lease_bodies(&h);
         assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies[0]["queue_key"], id.to_string());
         let mut shape = bodies[0].clone();
         for body in &bodies[1..] {
             shape["job_id"] = body["job_id"].clone();

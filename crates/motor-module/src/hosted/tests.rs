@@ -352,6 +352,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
                 allow_spill: Some(true),
                 mem_mib: None,
                 placement: None,
+                queue_key: None,
             },
         )
         .await
@@ -935,6 +936,7 @@ async fn hosted_home_and_mixed_siblings_preserve_lease_body_and_spill_policy() {
                 let fields = body.as_object_mut().unwrap();
                 fields.remove("job_id");
                 fields.remove("requester_jwk");
+                assert_eq!(fields.remove("queue_key"), Some(id.to_string().into()));
                 if let Some(expected) = &baseline {
                     assert_eq!(&body, expected, "{policy}, {timeout}");
                 } else {
@@ -1487,6 +1489,58 @@ fn non_null_hint_keeps_the_pinned_broker_canonical_member_order() {
     );
 }
 
+#[test]
+fn cloud_queue_key_request_serializes_to_the_exact_canonical_bytes_and_hash() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/queue-key-lease.json"
+    ))
+    .unwrap();
+    let expected: LeaseRequest =
+        serde_json::from_value(vector["granted"]["request"]["body"].clone()).unwrap();
+    let mut request = RunRequest::new("/home/test", "/home/test", "/home/test", "true")
+        .with_platform(Platform::Linux)
+        .with_timeout(expected.timeout_s)
+        .with_weight_hint(expected.vcpus);
+    request.network = Some(Network::Outbound);
+    request.memory_mib = expected.mem_mib;
+    let mut body = lease_body(
+        expected.job_id.parse().unwrap(),
+        &request,
+        (
+            expected.workspace_key_hash.clone(),
+            expected.repo_hash.clone(),
+        ),
+        expected.placement_hint.clone(),
+        expected.avoid_host.clone(),
+        expected.requester_jwk.clone(),
+        expected.allow_spill,
+    )
+    .unwrap();
+    body.queue_key.clone_from(&expected.queue_key);
+    assert_eq!(body, expected);
+    assert_eq!(invalid_lease_field(&body), None);
+    let canonical = canonical_lease_bytes(&body);
+    assert_eq!(canonical, vector["canonical_lease_bytes"].as_str().unwrap());
+    assert_eq!(
+        motor_lease::sha256_hex(canonical.as_bytes()),
+        vector["lease_hash"]
+    );
+
+    // The pinned vector has no Boat placement. Add one to check the relative
+    // wire order, and leave memory unstated to exercise that serializer path.
+    body.placement = Some(motor_lease::LeasePlacement::Boat);
+    body.mem_mib = None;
+    let wire = serde_json::to_string(&body).unwrap();
+    let requester = serde_json::to_string(&body.requester_jwk).unwrap();
+    assert!(wire.ends_with(&format!(
+        ",\"requester_jwk\":{requester},\"allow_spill\":true,\"placement\":\"boat\",\"queue_key\":\"build.A_1-\"}}"
+    )));
+    body.queue_key = None;
+    assert!(!serde_json::to_string(&body)
+        .unwrap()
+        .contains("\"queue_key\""));
+}
+
 /// CLOUD's `no-host-fits-lease.json` records a 16-vCPU repository-routed lease
 /// (`allow_spill: false`) and its lease hash; ck-motor's body for the same job
 /// has the same members and the same hash.
@@ -1733,6 +1787,8 @@ async fn stored_legacy_cached_hint_is_replayed_without_changing_the_lease_hash()
     let bodies = h.lease_bodies.lock().unwrap();
     assert_eq!(bodies.len(), 2);
     for bytes in bodies.iter() {
+        let wire: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert!(wire.get("queue_key").is_none());
         let sent: LeaseRequest = serde_json::from_slice(bytes).unwrap();
         assert_eq!(sent.placement_hint, Some(hint.clone()));
         assert_eq!(canonical_lease_bytes(&sent), expected);
@@ -1750,6 +1806,40 @@ async fn stored_legacy_cached_hint_is_replayed_without_changing_the_lease_hash()
         expected
     );
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stored_keyed_lease_replays_the_same_queue_key_after_reopen() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let request = Harness::request(&scratch.0);
+    let storage = stored(&scratch, id, h.route.clone());
+    let client = Client::new(h.route.clone());
+    drop(client.run(id, &request, &storage).await.unwrap().0);
+    drop(storage);
+
+    let storage = Arc::new(test_storage(&scratch.0.join("state")).unwrap());
+    let restored = storage.job(id).unwrap().hosted.unwrap();
+    assert_eq!(restored.lease_queue_key, Some(id.to_string()));
+    assert!(restored.lease_request.as_ref().unwrap().queue_key.is_none());
+    drop(
+        Client::new(restored)
+            .run(id, &request, &storage)
+            .await
+            .unwrap()
+            .0,
+    );
+
+    let bodies = h.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let initial: LeaseRequest = serde_json::from_slice(&bodies[0]).unwrap();
+    let replayed: LeaseRequest = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(initial.queue_key, Some(id.to_string()));
+    assert_eq!(
+        canonical_lease_bytes(&replayed),
+        canonical_lease_bytes(&initial)
+    );
 }
 
 #[tokio::test]

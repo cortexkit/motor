@@ -228,6 +228,13 @@ impl FakeBroker {
         {
             return BrokerReply::json(400, json!({"error": "bad_request", "field": "mem_mib"}));
         }
+        if request
+            .queue_key
+            .as_deref()
+            .is_some_and(|key| !valid_name(key))
+        {
+            return BrokerReply::json(400, json!({"error": "bad_request", "field": "queue_key"}));
+        }
         // The broker requires an explicit spill policy on every lease body and
         // refuses one without it before looking up or claiming the job.
         if request.allow_spill.is_none()
@@ -704,6 +711,9 @@ fn lease_identity(request: &LeaseRequest) -> Value {
     }
     if let Some(placement) = request.placement {
         identity["placement"] = json!(placement);
+    }
+    if let Some(queue_key) = &request.queue_key {
+        identity["queue_key"] = json!(queue_key);
     }
     identity
 }
