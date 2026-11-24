@@ -86,6 +86,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/replace-lease.json",
         "cloud/host-revoke-fence-off.json",
         "cloud/host-revoke-fence-on.json",
+        "cloud/queue-key-lease.json",
     ] {
         let entry = manifest
             .files
@@ -108,7 +109,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "ebd480e05f9f3bfe371d75cfe49817a94e941342f3e9bd92ffd68de4e9a54eb3",
+            "189d24d2d5d8cb7c48530d94253d011272f3f4fb73811fcca892b30d616c011e",
+        ),
+        (
+            "queue-key-lease.json",
+            "3beb185c61fad5c1ce6665998592a60538239b80442459bdb1ad7a7a9e053345",
         ),
         (
             "boat-only-lease.json",

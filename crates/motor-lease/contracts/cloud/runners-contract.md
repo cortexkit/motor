@@ -235,18 +235,19 @@ The exact body fields, in canonical order, are:
 
 ```text
 {job_id, vcpus, platform, net, workspace_key_hash, repo_hash,
- placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill[, mem_mib][, placement]}
+ placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill[, mem_mib][, placement][, queue_key]}
 ```
 
 `allow_spill` is a required boolean, described under "Per-lease spill policy" below. `mem_mib` and
 `placement` are optional; the brackets above denote optional presence, not JSON syntax. `placement`,
 when present, must be exactly the string `"boat"` (see "Boat-only leases" below); any other value,
-including `null`, is 400 `bad_request` with `field: "placement"`. No other members are accepted.
+including `null`, is 400 `bad_request` with `field: "placement"`. Optional `queue_key` is described
+under "Waiter reservation" below. No other members are accepted.
 
 The canonical lease hash uses this exact member order:
 
 ```text
-{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill[, mem_mib][, placement] }
+{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill[, mem_mib][, placement][, queue_key] }
 ```
 
 It omits `requester_jwk`. `allow_spill` goes immediately after `timeout_s` with its exact boolean
@@ -256,7 +257,9 @@ and hashes are unchanged. A re-request must repeat its presence and exact value,
 values would give the same effective memory; otherwise it gets the existing 409 `job_conflict`.
 `placement`, only when present, is appended last, after `mem_mib` if that is present, as
 `"placement":"boat"`; a lease without it hashes exactly as before. A re-request must repeat its
-presence, or it gets 409 `job_conflict`.
+presence, or it gets 409 `job_conflict`. `queue_key`, only when present, is appended last, after
+`placement` if that is present; a lease without it hashes exactly as before. A re-request of the
+same `job_id` must repeat its presence and exact value, or it gets 409 `job_conflict`.
 `test-vectors/runners/no-spill-lease.json` records `canonical_lease_bytes`, the exact canonical
 JSON string hashed, for clients to byte-compare. A re-request must repeat the same `allow_spill`
 value or receive 409 `job_conflict` wherever a differing lease hash conflicts.
@@ -1217,8 +1220,8 @@ requests it had to refuse and reserves a host for the one that has waited longes
   `{job_id, platform, vcpus, mem_mib, first_refused_ms, last_seen_ms}`. A retry of the same
   `job_id` refreshes `last_seen_ms` and keeps `first_refused_ms`. The record is removed when the
   job is placed, or when 90 seconds pass with no retry. At most 256 waiters are kept; when the
-  table is full, the one with the oldest `last_seen_ms` is dropped. A client that books again
-  under a new `job_id` starts a new waiter.
+  table is full, the one with the oldest `last_seen_ms` is dropped. Without a `queue_key`, a
+  client that books again under a new `job_id` starts a new waiter.
 - *Reservation.* When the oldest waiter of a platform (lowest `first_refused_ms`, then bytewise
   `job_id`) has waited at least 120,000 ms and that platform has no reservation, it reserves one
   eligible host. The chosen host has the smallest memory shortfall (`mem_mib` minus effective
@@ -1236,6 +1239,35 @@ requests it had to refuse and reserves a host for the one that has waited longes
   reserved for one waiter more than 15 minutes in a row while another could take its turn.
 - *Binding hints.* A request with a binding `placement_hint` never becomes a waiter. It still
   binds to the hinted host, reserved or not.
+- *Queue key.* A host can refuse a placed job at admission (for example `host_full` when a
+  running job's memory grew after the last heartbeat). The client then books again under a
+  new `job_id`, which on its own would restart the wait at zero and give the reservation away.
+  The optional `queue_key` lets the waiter survive that. It is a string of 1–64 characters from
+  `[A-Za-z0-9._-]`; any other type or value is 400 `bad_request` with `field: "queue_key"`.
+  It is chosen by the client (ck-motor sends its own job id), scoped to the tenant, and has no
+  meaning to the broker beyond this section. With a key:
+  - The waiter is identified by `(tenant, queue_key)`, not `job_id`. Requests under any
+    `job_id` with the same key refresh the same waiter and keep its `first_refused_ms`. The
+    latest request's `job_id`, `vcpus`, `mem_mib` and constraints replace the stored ones:
+    the age carries over and the new size is used.
+  - When the waiter is placed, its record is kept, marked placed, for 30 minutes from that
+    placement. A later request with the same key within those 30 minutes becomes the waiter
+    again with the original `first_refused_ms`. After 30 minutes, or once the record is
+    dropped as the oldest of 256, the key starts a new waiter.
+  - If the waiter held the platform's reservation when it was placed, the reservation is not
+    released at placement. It ends when a heartbeat from the reserved host lists the placed
+    job (any state), when 120 seconds pass after the placement with neither such a heartbeat
+    nor a new request under the key, or at the usual 15-minute limit counted from when the
+    reservation began, whichever comes first. A new request under the key while it lasts is
+    placed by the normal rules: on the reserved host once its effective free figures cover
+    the request, or on any other host that fits it first.
+  - If the reservation had already ended, a waiter returning with its original age competes
+    as the oldest waiter as usual. When it next reserves, the host it was last placed on comes
+    first among eligible hosts, then the usual shortfall order.
+  - The key never binds a placement to a host and never overrides `placement_hint`,
+    `avoid_host` or exclusions. A request with a binding hint still never becomes a waiter.
+    On Boat-only leases (`placement: "boat"`) the key is accepted and hashed and has no effect.
+  - Without a key, nothing in this section changes.
 - *Counting.* Each request that skips a reserved host counts once in
   `host_placement_refusals_by_size` under reason `reserved` for that host.
 

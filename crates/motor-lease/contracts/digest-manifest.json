@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "20b8db1f90868dbd0ebaf11f1697bc7dd9083bbd",
+    "revision": "9e4f500052827ec33aeddc9290fa28314915cca7",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "ebd480e05f9f3bfe371d75cfe49817a94e941342f3e9bd92ffd68de4e9a54eb3",
+      "sha256": "189d24d2d5d8cb7c48530d94253d011272f3f4fb73811fcca892b30d616c011e",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "20b8db1f90868dbd0ebaf11f1697bc7dd9083bbd",
+      "source_commit": "9e4f500052827ec33aeddc9290fa28314915cca7",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },
@@ -197,6 +197,14 @@
       "source_repository": "cortexkit-cloud",
       "source_commit": "db284d495f77190f2b3795fb7904e20a07e671dc",
       "source_path": "test-vectors/runners/mem-burst.json",
+      "canonical": true
+    },
+    {
+      "path": "cloud/queue-key-lease.json",
+      "sha256": "3beb185c61fad5c1ce6665998592a60538239b80442459bdb1ad7a7a9e053345",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "9e4f500052827ec33aeddc9290fa28314915cca7",
+      "source_path": "test-vectors/runners/queue-key-lease.json",
       "canonical": true
     }
   ]

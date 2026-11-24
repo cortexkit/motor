@@ -1,0 +1,211 @@
+{
+  "note": "TEST-ONLY bytes produced by the broker. For each bad key, replace only queue_key in the granted request.",
+  "key_id": "runner_2026_10",
+  "test_only_job_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "clock_ms": 1792195200123,
+  "lease_id": "12345678-1234-4321-8765-123456789abc",
+  "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "host": {
+    "host_id": "host-a",
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "endpoint": "runner.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "allowance_vcpu_ms": 25000,
+  "canonical_lease_bytes": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"allow_spill\":true,\"mem_mib\":4096,\"queue_key\":\"build.A_1-\"}",
+  "lease_hash": "8bd4997c9e08ddecb70c002abfd0e8ee2026b7aa1cc4d86b7d3eea2068888db7",
+  "granted": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/leases",
+      "body": {
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "platform": "linux-x64",
+        "net": true,
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+        "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+        "placement_hint": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "avoid_host": null,
+        "timeout_s": 100,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "allow_spill": true,
+        "mem_mib": 4096,
+        "queue_key": "build.A_1-"
+      }
+    },
+    "reply": {
+      "status": 201,
+      "retry_after": null,
+      "body": {
+        "lease_id": "12345678-1234-4321-8765-123456789abc",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "placement": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "endpoint": "runner.example:7443",
+        "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOiJ3YXJtLXZtLTEifSwibWF4X3MiOjEyLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.r-xkVC_0LEVK1qQcDCpUt7pLP_LxO_NSu9J6W4ieY0uFIsSdXQUCLHdeyJfi_Ie0e_Al352b8yJxcczgRQW-Dg",
+        "token_expires_at_ms": 1792195500000,
+        "max_s": 12,
+        "reserved_vcpu_ms": 24000
+      }
+    }
+  },
+  "conflict": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/leases",
+      "body": {
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "platform": "linux-x64",
+        "net": true,
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+        "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+        "placement_hint": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "avoid_host": null,
+        "timeout_s": 100,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "allow_spill": true,
+        "mem_mib": 4096,
+        "queue_key": "build.A_2-"
+      }
+    },
+    "reply": {
+      "status": 409,
+      "retry_after": null,
+      "body": {
+        "error": "job_conflict"
+      }
+    }
+  },
+  "bad_keys": [
+    {
+      "queue_key": null,
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": 1,
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": false,
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": [],
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": {},
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": "",
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": "a/b",
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": "ñ",
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    },
+    {
+      "queue_key": "a\n",
+      "reply": {
+        "status": 400,
+        "retry_after": null,
+        "body": {
+          "error": "bad_request",
+          "field": "queue_key"
+        }
+      }
+    }
+  ]
+}
