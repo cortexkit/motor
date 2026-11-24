@@ -449,11 +449,11 @@ impl Staging {
             .iter()
             .map(|lock| control.mutex(lock))
             .collect::<io::Result<_>>()?;
-        let mut root_alias_lock = None;
+        let mut root_alias_locks = Vec::new();
         for root in &prep_roots {
             if let Ok(lock) = fs::read(&root.join("Cargo.lock")) {
                 self.trees.refresh_dependency_aliases(&lock, &routes)?;
-                root_alias_lock = Some(lock);
+                root_alias_locks.push(lock);
             }
         }
         let cargo_home = self.state.join("prep-cargo");
@@ -539,8 +539,13 @@ impl Staging {
             if Dir::open(root, false)?.contains("package.json".as_ref())? {
                 // A nested lock can pin a different commit of the same branch.
                 // Restore the root preparation's aliases before running Bun.
-                if let Some(lock) = root_alias_lock.take().filter(|_| nested_aliases_touched) {
-                    self.trees.refresh_dependency_aliases(&lock, &routes)?;
+                // Replay every root lock in the original order, so the aliases
+                // match what the root loop left even when several roots name
+                // the same dependency.
+                if std::mem::take(&mut nested_aliases_touched) {
+                    for lock in &root_alias_locks {
+                        self.trees.refresh_dependency_aliases(lock, &routes)?;
+                    }
                 }
                 let mut cmd =
                     self.command(&self.tools.bun.path, root, &home, &cargo_home, &bun_cache);
