@@ -61,19 +61,26 @@ fn undeclared_git_warning(
     // Cargo names the failing Git source in its cause chain. Match the URL
     // and abbreviated revision against the submitted lockfiles, not the list
     // of planned routes or the progress lines for sources that may have worked.
+    // Cargo releases differ in the cause's capitalization ("Unable to
+    // update" or "unable to update"), so compare that prefix without case.
+    const CAUSE: &str = "  unable to update ";
     let diagnostic = error.to_string();
-    let source = diagnostic
-        .lines()
-        .find_map(|line| line.strip_prefix("  Unable to update "))?;
+    let source = diagnostic.lines().find_map(|line| {
+        line.get(..CAUSE.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(CAUSE))
+            .map(|_| &line[CAUSE.len()..])
+    })?;
     let (fetch, rev) = source.trim_end().rsplit_once('#')?;
     if rev.len() < 7 || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let url = fetch.split('?').next()?;
-    let mut matches = undeclared
-        .get(url)?
+    // Cargo prints the URL in its parsed form, which adds a `/` to a URL with
+    // no path; the lockfile keeps the URL as written. Compare without it.
+    let url = fetch.split('?').next()?.trim_end_matches('/');
+    let (url, commits) = undeclared
         .iter()
-        .filter(|commit| commit.starts_with(rev));
+        .find(|(locked, _)| locked.trim_end_matches('/') == url)?;
+    let mut matches = commits.iter().filter(|commit| commit.starts_with(rev));
     let commit = matches.next()?;
     if matches.next().is_some() {
         return None;
