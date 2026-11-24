@@ -216,6 +216,12 @@ An unlocked failure still refuses setup and reports both fetch errors. Every
 other fetch failure does not trigger the unlocked retry. macOS and Windows keep
 locked-only Cargo preparation.
 
+For a job with network access, a locked Git dependency that neither the runner
+nor the submitting machine can supply is left to the job's own Cargo. If
+preparation cannot fetch that dependency, the job starts and its output carries
+a one-line warning naming the dependency. Jobs without network access are still
+refused before start with the missing dependency named.
+
 After a successful unlocked fetch, the job's stderr starts with one advisory:
 
 ```text

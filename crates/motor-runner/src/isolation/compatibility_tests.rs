@@ -217,6 +217,7 @@ fn identity_prepared_bind_list_case(enabled: bool) {
             &config.build_slot_root,
             1,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &tree,
             plan.caller.text(),
             false,

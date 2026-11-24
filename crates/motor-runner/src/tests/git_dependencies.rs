@@ -596,6 +596,114 @@ impl Drop for GitHttpServer {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn undeclared_locked_git_prefetch_failure_warns_only_for_network_jobs() {
+    use crate::isolation::{cargo_prefetch_admission_with_warning, prefetch_cargo_dependencies};
+    use crate::workspace::dependencies::undeclared_locked_git_commits;
+
+    let f = Fixture::new();
+    let source = f.scratch.join("upstream");
+    fs::create_dir_all(source.join("src")).unwrap();
+    git(&source, &["init"]);
+    fs::write(
+        source.join("Cargo.toml"),
+        "[package]\nname='tiny_dep'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(source.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    let (commit, _) = commit(&source, "dependency");
+    let server = GitHttpServer::new(&source);
+    let url = &server.url;
+    // Remove the upstream's advertised refs to make the prefetch fail
+    // without relying on an unreachable public server or a retry timeout.
+    fs::remove_file(source.join(".git/info/refs")).unwrap();
+
+    let app = f.scratch.join("app");
+    fs::create_dir_all(app.join("src")).unwrap();
+    git(&app, &["init"]);
+    fs::write(app.join("src/lib.rs"), "").unwrap();
+    fs::write(app.join("Cargo.toml"), format!("[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ntiny_dep={{git='{url}',rev='{commit}'}}\n")).unwrap();
+    let lock = format!("version=4\n[[package]]\nname='app'\nversion='0.1.0'\ndependencies=['tiny_dep']\n[[package]]\nname='tiny_dep'\nversion='0.1.0'\nsource='git+{url}?rev={commit}#{commit}'\n");
+    fs::write(app.join("Cargo.lock"), &lock).unwrap();
+    git(&app, &["add", "."]);
+    let tree = git(&app, &["write-tree"]);
+
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let lockfiles = [lock.clone()];
+    let (routes, missing) = runner
+        .core
+        .trees
+        .dependency_fetch_routes_for_lockfiles(&[], &lockfiles)
+        .unwrap();
+    assert!(routes.is_empty() && missing.is_empty());
+    let undeclared = undeclared_locked_git_commits(&lockfiles, &[]);
+    let cargo = f.scratch.join("cargo");
+    fs::create_dir(&cargo).unwrap();
+    fs::write(
+        cargo.join("config.toml"),
+        "[net]\nretry=0\ngit-fetch-with-cli=true\n",
+    )
+    .unwrap();
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
+    let prefetch = |tenant_vm| {
+        prefetch_cargo_dependencies(
+            false,
+            tenant_vm,
+            &runner.core.trees.state,
+            &app,
+            &tree,
+            &[],
+            &routes,
+            &cargo,
+            &rustup,
+            None,
+        )
+        .map(|_| ())
+    };
+    let expected = format!("warning: dependency prefetch could not fetch Git dependency {url} at {commit}; the job's Cargo will fetch it.\n");
+    let id = Uuid::now_v7();
+    for tenant_vm in [false, true] {
+        let offline =
+            cargo_prefetch_admission_with_warning(id, false, prefetch(tenant_vm), &undeclared)
+                .unwrap_err();
+        assert!(offline.to_string().contains(url), "{offline}");
+        let network =
+            cargo_prefetch_admission_with_warning(id, true, prefetch(tenant_vm), &undeclared)
+                .unwrap();
+        assert_eq!(
+            network.as_deref(),
+            Some(expected.as_str()),
+            "Cargo failure: {offline}"
+        );
+    }
+
+    let declared = [GitDependency {
+        url: url.clone(),
+        commits: vec![commit],
+        bundle: None,
+    }];
+    let none = undeclared_locked_git_commits(&lockfiles, &declared);
+    assert_eq!(
+        cargo_prefetch_admission_with_warning(id, true, prefetch(false), &none).unwrap(),
+        None
+    );
+
+    git(&source, &["update-server-info"]);
+    let result = prefetch(false);
+    assert!(
+        result.is_ok(),
+        "undeclared Git source must fetch upstream when available: {result:?}"
+    );
+    assert_eq!(
+        cargo_prefetch_admission_with_warning(id, true, result, &undeclared).unwrap(),
+        None
+    );
+    assert_eq!(fs::read_to_string(app.join("Cargo.lock")).unwrap(), lock);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn stale_locked_mirror_does_not_refuse_network_cargo_update() {
     stale_locked_mirror(false);
 }

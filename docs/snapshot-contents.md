@@ -285,8 +285,11 @@ by Git. Tests: `no_bundle_when_runner_holds_a_snapshot_with_the_tip_behind_it`,
 the runner advertises support; older runners receive none. The client's verified
 default-branch tip also contributes locked Git dependencies when the runner
 already holds them or the local Cargo Git cache can supply a bundle. Unavailable
-tip-only dependencies are omitted without blocking the job; dependencies locked
-by the captured snapshots remain required. A job VM can then hand the tip's
+tip-only dependencies are omitted without blocking the job. For jobs without
+network access, dependencies locked by the captured snapshots remain required.
+For jobs with network access, if neither the runner nor the submitting machine's
+Cargo Git cache can supply a locked Git dependency, it is left to the job's own
+Cargo to fetch. A job VM can then hand the tip's
 dependencies to a trusted cache fill, which builds the base new worktrees start
 from. Tests:
 `run_lockfile_source_is_commit_not_worktree`,

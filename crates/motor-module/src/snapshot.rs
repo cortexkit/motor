@@ -1204,6 +1204,7 @@ impl Snapshots {
         id: Uuid,
         held: &[RepositoryCandidates],
         dependency_capability: Option<&[GitDependencyCandidates]>,
+        network: bool,
     ) -> io::Result<(Vec<BundleManifest>, Vec<GitDependency>, Vec<BundleManifest>)> {
         // Retries reuse the job's spool, but each runner can need different bundles.
         // Discard earlier bundles, dependency repositories and abandoned Git locks.
@@ -1218,6 +1219,7 @@ impl Snapshots {
             &self.spool.0,
             &mut upload,
             id,
+            network,
         )?;
         Ok((workspace, dependencies, upload))
     }
@@ -1367,6 +1369,7 @@ pub(crate) fn cached_commit(home: &Path, url: &str, commit: &str) -> Option<Path
         .find(|p| git(p, &["cat-file", "-t", commit]).is_ok_and(|t| t == "commit"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dependency_bundles(
     sources: &BTreeMap<String, Vec<String>>,
     tip_only: &BTreeSet<(String, String)>,
@@ -1375,6 +1378,7 @@ pub(crate) fn dependency_bundles(
     spool: &Path,
     upload: &mut Vec<BundleManifest>,
     id: Uuid,
+    network: bool,
 ) -> io::Result<Vec<GitDependency>> {
     let Some(held) = capability else {
         return Ok(Vec::new());
@@ -1408,10 +1412,17 @@ pub(crate) fn dependency_bundles(
                             tracing::debug!(job_id = %id, url, commit, %error, "skipping unavailable tip-only git dependency");
                             continue;
                         }
+                        Err(error) if network => {
+                            tracing::info!(job_id = %id, url, commit, %error, "skipping unavailable locked git dependency; the job's Cargo will fetch it");
+                            continue;
+                        }
                         Err(error) => return Err(error),
                     }
                 } else if optional {
                     tracing::debug!(job_id = %id, url, commit, "skipping uncached tip-only git dependency");
+                    continue;
+                } else if network {
+                    tracing::info!(job_id = %id, url, commit, "skipping uncached locked git dependency; the job's Cargo will fetch it");
                     continue;
                 }
             }
@@ -2036,6 +2047,67 @@ mod tests {
     }
 
     #[test]
+    fn uncached_locked_git_dependency_is_left_to_network_jobs_cargo() {
+        let (scratch, checkout, spool, commit) = repository();
+        let url = "https://example.invalid/uncached.git";
+        fs::write(
+            checkout.join("Cargo.lock"),
+            format!("version=4\n[[package]]\nname='dependency'\nversion='0.1.0'\nsource='git+{url}#{commit}'\n"),
+        )
+        .unwrap();
+        let snapshots = build_snapshots(&checkout, &checkout, &spool);
+        assert!(snapshots.tip_only_dependencies.is_empty());
+        let home = scratch.join("empty-cargo-home");
+        let id = Uuid::now_v7();
+        let captured = crate::logging::Captured::default();
+        let _guard = crate::logging::scoped(captured.clone());
+        let declare = |held: &[GitDependencyCandidates], network| {
+            let mut upload = Vec::new();
+            let declarations = dependency_bundles(
+                &snapshots.git_dependencies,
+                &snapshots.tip_only_dependencies,
+                Some(held),
+                &home,
+                &snapshots.spool.0,
+                &mut upload,
+                id,
+                network,
+            )
+            .unwrap();
+            assert!(upload.is_empty());
+            declarations
+        };
+
+        assert!(
+            declare(&[], true).is_empty(),
+            "network job declared uncached locked history"
+        );
+        let offline = declare(&[], false);
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].url, url);
+        assert_eq!(offline[0].commits, std::slice::from_ref(&commit));
+        assert!(offline[0].bundle.is_none());
+        let held = [GitDependencyCandidates {
+            url: url.into(),
+            commits: vec![commit.clone()],
+        }];
+        let network = declare(&held, true);
+        assert_eq!(network, offline, "runner-held history is still declared");
+
+        let output = captured.text();
+        let skips: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("the job's Cargo will fetch it"))
+            .collect();
+        assert_eq!(skips.len(), 1, "{output}");
+        let skip = skips[0];
+        assert!(skip.contains(" INFO "), "{skip}");
+        assert!(skip.contains(&format!("job_id={id}")), "{skip}");
+        assert!(skip.contains(&format!("url={url}")), "{skip}");
+        assert!(skip.contains(&format!("commit={commit}")), "{skip}");
+    }
+
+    #[test]
     fn failed_tip_only_bundle_does_not_block_required_bundle() {
         let (scratch, dependency, spool, commit) = repository();
         let home = scratch.join("cargo-home");
@@ -2069,6 +2141,7 @@ mod tests {
             &spool,
             &mut upload,
             Uuid::now_v7(),
+            false,
         )
         .unwrap();
         assert_eq!(declarations.len(), 1);
@@ -2148,7 +2221,7 @@ mod tests {
         // Only the captured lockfile may select dependencies, not later caller edits.
         fs::write(sibling.join("Cargo.lock"), "invalid later lockfile").unwrap();
         let (_, dependencies, upload) = snapshots
-            .transfer_bundles(Uuid::now_v7(), &[], Some(&[]))
+            .transfer_bundles(Uuid::now_v7(), &[], Some(&[]), false)
             .unwrap();
         assert_eq!(dependencies.len(), 1, "sibling dependency was not declared");
         assert_eq!(dependencies[0].url, url);
@@ -2166,7 +2239,7 @@ mod tests {
             commits: vec![commit],
         }];
         let (_, dependencies, _) = snapshots
-            .transfer_bundles(Uuid::now_v7(), &[], Some(&held))
+            .transfer_bundles(Uuid::now_v7(), &[], Some(&held), false)
             .unwrap();
         assert!(dependencies[0].bundle.is_none());
     }
@@ -2223,6 +2296,7 @@ mod tests {
             &snapshots.spool.0,
             &mut upload,
             Uuid::now_v7(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2292,8 +2366,9 @@ mod tests {
         .unwrap();
         let snapshots = build_snapshots(&checkout, &checkout, &spool);
         let id = Uuid::now_v7();
-        let (workspace, dependencies, upload) =
-            snapshots.transfer_bundles(id, &[], Some(&[])).unwrap();
+        let (workspace, dependencies, upload) = snapshots
+            .transfer_bundles(id, &[], Some(&[]), false)
+            .unwrap();
         assert_eq!(workspace.len(), 1);
         assert_eq!(dependencies.len(), 1);
         assert_eq!(upload.len(), 2);
@@ -2320,7 +2395,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, spool.join("dependency-98.git")).unwrap();
 
         let (workspace, dependencies, upload) = snapshots
-            .transfer_bundles(id, &[], Some(&[]))
+            .transfer_bundles(id, &[], Some(&[]), false)
             .expect("a second transfer must regenerate the job's bundles");
         assert_eq!(workspace.len(), 1);
         assert_eq!(dependencies.len(), 1);

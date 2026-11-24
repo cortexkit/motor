@@ -381,6 +381,7 @@ fn cache_lookup_bundle_is_complete_single_ref_and_cache_byte_identical() {
         &spool,
         &mut upload,
         Uuid::now_v7(),
+        false,
     )
     .unwrap();
     assert_eq!(bytes(&home), before);
@@ -417,7 +418,8 @@ fn cache_lookup_bundle_is_complete_single_ref_and_cache_byte_identical() {
         &home,
         &spool,
         &mut upload,
-        Uuid::now_v7()
+        Uuid::now_v7(),
+        false,
     )
     .unwrap()
     .iter()
@@ -458,7 +460,8 @@ fn old_runner_without_capability_receives_no_dependency_chunks() {
         &home,
         &spool,
         &mut upload,
-        Uuid::now_v7()
+        Uuid::now_v7(),
+        false,
     )
     .unwrap()
     .is_empty());
@@ -471,7 +474,8 @@ fn old_runner_without_capability_receives_no_dependency_chunks() {
             &home,
             &spool,
             &mut upload,
-            Uuid::now_v7()
+            Uuid::now_v7(),
+            false,
         )
         .unwrap()
         .len(),

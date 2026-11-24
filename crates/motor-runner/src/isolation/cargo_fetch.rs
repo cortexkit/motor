@@ -1,10 +1,12 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::{self, Read},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -13,6 +15,73 @@ const ONLINE_TIMEOUT: Duration = Duration::from_secs(120);
 mod private_tests;
 
 pub(super) const STALE_LOCK_WARNING: &str = "warning: Cargo.lock is out of date with Cargo.toml; dependencies were fetched for the new requirements, but the job's Cargo.lock is unchanged and read-only, like every tracked file. To let Cargo rewrite it in the job (offline works), name Cargo.lock as a returned file (`ck motor run --return-path`, or return_paths); the updated lock then comes back. Otherwise run `cargo update` before submitting.\n";
+
+/// Network jobs fetch their own sources without mirror rewrites. A locked
+/// prefetch only warms their cache; it must neither refuse the job nor repair
+/// the submitted lockfile before the job's command runs.
+pub(crate) fn cargo_prefetch_admission(
+    id: Uuid,
+    network: bool,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    match result {
+        Err(error) if network && !crate::sibling_snapshots::helper::UnsettledHelper::is(&error) => {
+            tracing::warn!(job_id = %id, %error, "dependency prefetch skipped; this job fetches what it needs itself");
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+pub(crate) fn cargo_prefetch_admission_with_warning(
+    id: Uuid,
+    network: bool,
+    result: io::Result<()>,
+    undeclared_git: &BTreeMap<String, BTreeSet<String>>,
+) -> io::Result<Option<String>> {
+    let warning = if network {
+        result
+            .as_ref()
+            .err()
+            .and_then(|error| undeclared_git_warning(error, undeclared_git))
+    } else {
+        None
+    };
+    cargo_prefetch_admission(id, network, result)?;
+    Ok(warning)
+}
+
+fn undeclared_git_warning(
+    error: &io::Error,
+    undeclared: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<String> {
+    if undeclared.is_empty() {
+        return None;
+    }
+    // Cargo names the failing Git source in its cause chain. Match the URL
+    // and abbreviated revision against the submitted lockfiles, not the list
+    // of planned routes or the progress lines for sources that may have worked.
+    let diagnostic = error.to_string();
+    let source = diagnostic
+        .lines()
+        .find_map(|line| line.strip_prefix("  Unable to update "))?;
+    let (fetch, rev) = source.trim_end().rsplit_once('#')?;
+    if rev.len() < 7 || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let url = fetch.split('?').next()?;
+    let mut matches = undeclared
+        .get(url)?
+        .iter()
+        .filter(|commit| commit.starts_with(rev));
+    let commit = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(format!(
+        "warning: dependency prefetch could not fetch Git dependency {url} at {commit}; the job's Cargo will fetch it.\n"
+    ))
+}
 
 /// A fresh Cargo home prevents a warm tenant cache or the offline fallback from
 /// hiding a broken online preparation path. The caller runs the production helper.

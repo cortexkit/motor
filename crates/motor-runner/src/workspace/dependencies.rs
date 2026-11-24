@@ -56,6 +56,28 @@ pub(crate) fn dependency_commits(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn undeclared_locked_git_commits(
+    lockfiles: &[String],
+    declarations: &[GitDependency],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let declared = dependency_commits(declarations);
+    let mut undeclared = BTreeMap::<String, BTreeSet<String>>::new();
+    // Warning detection is best effort. Mirror route selection still handles
+    // invalid lockfiles and verifies history independently.
+    for lockfile in lockfiles {
+        for (url, commit, _) in locked_sources(lockfile).unwrap_or_default() {
+            if !declared
+                .get(&url)
+                .is_some_and(|commits| commits.contains(&commit))
+            {
+                undeclared.entry(url).or_default().insert(commit);
+            }
+        }
+    }
+    undeclared
+}
+
+#[cfg(target_os = "linux")]
 fn snapshot_lockfiles(repository: &Path, commit: &str) -> io::Result<Vec<String>> {
     let entries = git(repository, &["ls-tree", "-rz", commit])?;
     let files: BTreeMap<_, _> = entries

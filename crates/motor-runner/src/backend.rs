@@ -1072,6 +1072,15 @@ impl Backend for HostBackend {
                 &r.snapshot_commit,
                 &r.siblings,
             );
+            let network = !s.base && r.network == Some(Network::Outbound);
+            let undeclared_git = if network {
+                workspace::dependencies::undeclared_locked_git_commits(
+                    &lockfiles,
+                    &r.git_dependencies,
+                )
+            } else {
+                BTreeMap::new()
+            };
             let (mut routes, missing) = match trees
                 .dependency_fetch_routes_for_lockfiles(&r.git_dependencies, &lockfiles)
             {
@@ -1147,6 +1156,7 @@ impl Backend for HostBackend {
                             &config.build_slot_root,
                             config.rustc_slots,
                             &routes,
+                            &undeclared_git,
                             &r.tree_hash,
                             paths::request(r).caller_repository_root.text(),
                             config.tenant_vm,
@@ -1154,7 +1164,7 @@ impl Backend for HostBackend {
                             snapshots.as_ref(),
                             &crate::isolation::JavascriptTools::for_config(config),
                             remote.as_ref(),
-                            r.network == Some(Network::Outbound),
+                            network,
                             config.cargo_home.as_deref(),
                         )
                     }

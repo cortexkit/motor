@@ -1764,8 +1764,9 @@ impl Motor {
         };
         let hash = snapshots.main.tree_hash.clone();
         let transfer_snapshots = snapshots.clone();
+        let network = request.network == Some(Network::Outbound);
         let bundles = tokio::task::spawn_blocking(move || {
-            transfer_snapshots.transfer_bundles(id, &held.0, held.1.as_deref())
+            transfer_snapshots.transfer_bundles(id, &held.0, held.1.as_deref(), network)
         })
         .await
         .map_err(io::Error::other)

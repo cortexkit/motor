@@ -116,6 +116,7 @@ fn mapped_job_binds_host_trees_at_caller_paths_and_never_names_h() {
             &f.state.join("slots"),
             1,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &tree,
             CALLER_WORKSPACE,
             false,

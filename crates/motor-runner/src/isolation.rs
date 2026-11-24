@@ -6,7 +6,7 @@ use crate::{platform, workspace};
 use motor_protocol::SiblingSnapshot;
 use sha2::Digest;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::{
@@ -20,6 +20,9 @@ use std::{
 use uuid::Uuid;
 
 mod cargo_fetch;
+#[cfg(test)]
+pub(crate) use cargo_fetch::cargo_prefetch_admission;
+pub(crate) use cargo_fetch::cargo_prefetch_admission_with_warning;
 mod cargo_lock;
 pub(crate) mod cargo_overlay;
 pub(crate) mod cargo_sources;
@@ -3056,23 +3059,6 @@ fn with_fetch_context(error: io::Error, context: &str) -> io::Error {
     io::Error::new(error.kind(), format!("{error}; {context}"))
 }
 
-/// Network jobs fetch their own sources without mirror rewrites. A locked
-/// prefetch only warms their cache; it must neither refuse the job nor repair
-/// the submitted lockfile before the job's command runs.
-pub(crate) fn cargo_prefetch_admission(
-    id: Uuid,
-    network: bool,
-    result: io::Result<()>,
-) -> io::Result<()> {
-    match result {
-        Err(error) if network && !crate::sibling_snapshots::helper::UnsettledHelper::is(&error) => {
-            tracing::warn!(job_id = %id, %error, "dependency prefetch skipped; this job fetches what it needs itself");
-            Ok(())
-        }
-        result => result,
-    }
-}
-
 /// A failed preparation never repairs the submitted lockfile. Keep Cargo's
 /// diagnostic first and suggest a caller-side update when it reports a stale lock.
 fn fetch_failure(stage: &str, error: &str) -> String {
@@ -3289,6 +3275,7 @@ impl Sandbox {
             slots,
             limit,
             &std::collections::BTreeMap::new(),
+            &BTreeMap::new(),
             &tree,
             &workspace.to_string_lossy(),
             false,
@@ -3315,6 +3302,7 @@ impl Sandbox {
         slots: &Path,
         limit: u32,
         dependency_routes: &std::collections::BTreeMap<String, PathBuf>,
+        undeclared_git: &BTreeMap<String, BTreeSet<String>>,
         tree: &str,
         repository: &str,
         tenant_vm: bool,
@@ -3335,6 +3323,7 @@ impl Sandbox {
             slots,
             limit,
             dependency_routes,
+            undeclared_git,
             tree,
             repository,
             false,
@@ -3381,6 +3370,7 @@ impl Sandbox {
             slots,
             limit,
             dependency_routes,
+            &BTreeMap::new(),
             tree,
             &workspace.host.as_path().to_string_lossy(),
             true,
@@ -3406,6 +3396,7 @@ impl Sandbox {
         slots: &Path,
         limit: u32,
         dependency_routes: &BTreeMap<String, PathBuf>,
+        undeclared_git: &BTreeMap<String, BTreeSet<String>>,
         tree: &str,
         repository: &str,
         writer: bool,
@@ -3436,7 +3427,7 @@ impl Sandbox {
         // .cargo/config.toml (credential providers/rustc wrappers can execute
         // programs). No build.rs or test runs in this trusted preparation step.
         let mut cargo_advisory = false;
-        {
+        let cargo_git_warning = {
             // Read-only default ACLs on the shared Cargo registry and Git cache
             // make newly fetched files readable to jobs without rescanning the
             // cache after every trusted dependency fetch.
@@ -3445,7 +3436,7 @@ impl Sandbox {
                 host_inputs::environment("RUSTUP_HOME")
                     .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
             );
-            cargo_prefetch_admission(
+            cargo_prefetch_admission_with_warning(
                 id,
                 network,
                 prefetch_cargo_dependencies_with_advisory(
@@ -3461,8 +3452,9 @@ impl Sandbox {
                     snapshots,
                     &mut cargo_advisory,
                 ),
-            )?;
-        }
+                undeclared_git,
+            )?
+        };
         // A snapshot's JavaScript dependencies were installed and its Git
         // directory made independent when it was created, so in snapshot mode
         // both steps below cover the workspace alone and never touch a
@@ -3492,6 +3484,9 @@ impl Sandbox {
         } else {
             JavascriptPreparation::default()
         };
+        if let Some(warning) = cargo_git_warning {
+            prepared_javascript.warnings.insert(0, warning);
+        }
         if cargo_advisory {
             prepared_javascript
                 .warnings
