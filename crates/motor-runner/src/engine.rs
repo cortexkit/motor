@@ -59,6 +59,7 @@ mod macos_hold;
 mod migration;
 #[path = "mirror_reports.rs"]
 mod mirror_reports;
+mod queue_wait;
 #[path = "remote_cache_engine.rs"]
 mod remote_cache_engine;
 #[path = "retirement.rs"]
@@ -1222,6 +1223,7 @@ struct Inner {
     base_settling: BTreeSet<Uuid>,
     drain_deadline: Option<std::time::Instant>,
     jobs: BTreeMap<Uuid, Job>,
+    queue_wait_history: queue_wait::QueueWaitHistory,
     pending_replays: BTreeSet<Uuid>,
     #[cfg(test)]
     scheduler_visits: std::sync::atomic::AtomicU64,
@@ -3138,6 +3140,7 @@ impl Runner {
                     admitting: BTreeMap::new(),
                     admission_saves: BTreeMap::new(),
                     terminal_saves: BTreeSet::new(),
+                    queue_wait_history: Default::default(),
                     launching: BTreeSet::new(),
                     start_retries: BTreeMap::new(),
                     evicting_dependencies: BTreeSet::new(),
@@ -7156,9 +7159,7 @@ impl Runner {
         let mut inner = self.core.inner.lock().unwrap();
         let now = self.now();
         let index = DispatchIndex::build(&inner);
-        // Refresh the clock first: the refusal below records the job's
-        // queue_wait_ms, and its detail names the holders that were holding it
-        // at the withdrawal.
+        // The refusal records queue wait through this withdrawal.
         self.update_queue_wait_clocks(&inner, now, &index);
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
@@ -7175,30 +7176,20 @@ impl Runner {
                         } else {
                             0
                         };
-                    job.state == JobState::Queued
-                        && job.queued_ms.is_some()
-                        && job.queue_wait_ms(now).saturating_add(setup_wait)
-                            >= job
-                                .request
-                                .as_ref()
-                                .unwrap()
-                                .queue_wait_limit_s
-                                .saturating_mul(1000)
+                    queue_wait::expired(job, now, setup_wait)
                 }
         });
+        let Some(mut job) = inner.jobs.get(&id).filter(|_| eligible).cloned() else {
+            return Ok(WithdrawOutcome::Started);
+        };
         let detail = if stalled {
             "transfer_stalled".into()
         } else {
             self.queue_wait_detail_with_index(&inner, &index, id)
         };
-        if eligible && self.core.config.vm_instance() && inner.starting.contains(&id) {
-            self.core
-                .backend
-                .cancel(&self.core.config, &inner.jobs[&id], true)?;
+        if self.core.config.vm_instance() && inner.starting.contains(&id) {
+            self.core.backend.cancel(&self.core.config, &job, true)?;
         }
-        let Some(mut job) = inner.jobs.get(&id).filter(|_| eligible).cloned() else {
-            return Ok(WithdrawOutcome::Started);
-        };
         // The terminal below stops the queue-wait clock this copy shares
         // with the queued job; kept to restore exactly if the save fails.
         let clock = QueueClock::of(&job);
@@ -7301,6 +7292,18 @@ impl Runner {
         id: Uuid,
         now: u64,
     ) -> (String, Option<(Uuid, bool)>) {
+        self.queue_wait_label_with(inner, index, id, || {
+            self.blocking_head(inner, heads, id, index.weight, now)
+        })
+    }
+
+    fn queue_wait_label_with(
+        &self,
+        inner: &Inner,
+        index: &DispatchIndex,
+        id: Uuid,
+        blocking_head: impl FnOnce() -> Option<(Uuid, bool)>,
+    ) -> (String, Option<(Uuid, bool)>) {
         let phase = self
             .queue_wait_phase(inner, index, id)
             .unwrap_or(QUEUE_ORDER_WAIT);
@@ -7317,7 +7320,7 @@ impl Runner {
             };
             return (reason, None);
         }
-        let blocking = self.blocking_head(inner, heads, id, index.weight, now);
+        let blocking = blocking_head();
         let label = match blocking {
             Some((_, true)) => "gate job ahead",
             Some((head, false)) if inner.jobs[&head].base => {
@@ -7594,95 +7597,7 @@ impl Runner {
                 job.resume_queue_wait(now);
             }
         }
-    }
-
-    /// Include both resource owners and scheduler fences in the refusal itself;
-    /// the client need not have journal access to explain a local fallback.
-    #[cfg(test)]
-    fn queue_wait_detail(&self, inner: &Inner, id: Uuid) -> String {
-        let index = DispatchIndex::build(inner);
-        self.queue_wait_detail_with_index(inner, &index, id)
-    }
-
-    fn queue_wait_detail_with_index(
-        &self,
-        inner: &Inner,
-        index: &DispatchIndex,
-        id: Uuid,
-    ) -> String {
-        let Some(job) = inner.jobs.get(&id) else {
-            return "unknown job".into();
-        };
-        let holders: Vec<_> = inner
-            .jobs
-            .values()
-            .filter(|j| j.state == JobState::Running || inner.starting.contains(&j.id))
-            .map(|j| {
-                format!(
-                    "job={} workspace={} permits={} phase={} since_ms={}",
-                    j.id,
-                    paths::job_key(j),
-                    j.weight,
-                    if inner.starting.contains(&j.id) {
-                        "setup"
-                    } else {
-                        "running"
-                    },
-                    j.started_ms
-                        .or_else(|| inner.reserved.get(paths::job_key(j)).map(|r| r.since_ms))
-                        .unwrap_or(j.accepted_ms)
-                )
-            })
-            .collect();
-        let reservations: Vec<_> = inner
-            .reserved
-            .iter()
-            .map(|(key, r)| format!("workspace={key} since_ms={}", r.since_ms))
-            .collect();
-        let now = self.now();
-        let heads = index.heads(inner, now);
-        let pending_ahead: Vec<_> = heads
-            .iter()
-            .take_while(|head| **head != id)
-            .map(|head| {
-                format!(
-                    "job={} permits={} accepted_ms={}",
-                    head, inner.jobs[head].weight, inner.jobs[head].accepted_ms
-                )
-            })
-            .collect();
-        let (phase, blocking_head) = self.queue_wait_label(inner, &heads, index, id, now);
-        let blocking = blocking_head
-            .map(|(head, _)| {
-                format!(
-                    "; blocked_by=job={head} permits={}",
-                    inner.jobs[&head].weight
-                )
-            })
-            .unwrap_or_default();
-        // The jobs holding this checkout as a sibling run in other workspaces,
-        // so name them: the holders list alone does not say which one it is.
-        let sibling_users = if phase == SIBLING_USER_WAIT {
-            let users: Vec<_> = index
-                .checkout_sibling_users(crate::caller_path::job_key(job))
-                .into_iter()
-                .map(|(user, weight)| {
-                    format!(
-                        "job={user} workspace={} permits={weight}",
-                        inner
-                            .jobs
-                            .get(&user)
-                            .map_or("unknown", |j| paths::job_key(j))
-                    )
-                })
-                .collect();
-            format!("; sibling_users=[{}]", users.join("; "))
-        } else {
-            String::new()
-        };
-        format!("waiting_on={phase}{blocking}{sibling_users}; requested_permits={}; held_permits={}/{}; accepted_ms={}; holders=[{}]; reservations=[{}]; heads_ahead=[{}]",
-            job.weight, index.weight, self.core.config.max_weight, job.accepted_ms,
-            holders.join("; "), reservations.join("; "), pending_ahead.join("; "))
+        self.remember_queue_wait(inner, index, now, &heads, &blockers, blocking_head);
     }
     /// Every step that takes the state lock (and the workspace deletion, which
     /// can take minutes for a large target directory) runs on the blocking
@@ -8870,11 +8785,11 @@ impl Runner {
             _ => Some(self.catalog_snapshot(&inner)?),
         };
         let dispatched = if queued.is_ok() {
-            self.dispatch(&mut inner, now)
+            self.dispatch_pending(inner, now)
         } else {
+            drop(inner);
             Ok(())
         };
-        drop(inner);
         if let Some(catalog) = catalog {
             self.write_catalog(catalog)?;
         }
@@ -9033,18 +8948,18 @@ impl Runner {
             .saturating_add(unwritten)
     }
 
-    fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
+    fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<Option<Uuid>> {
         if inner.restoring_reserve || self.admission_closed(inner) {
-            return Ok(());
+            return Ok(None);
         }
         if self.ensure_admission_ownership().is_err() {
-            return Ok(());
+            return Ok(None);
         }
         let mut index = DispatchIndex::build(inner);
         self.update_queue_wait_clocks(inner, now, &index);
         loop {
             if self.admission_closed(inner) {
-                return Ok(());
+                return Ok(None);
             }
             // A Boat lease owns the entire sandbox, regardless of CPU weight
             // or checkout. Count setup reservations as well as running jobs.
@@ -9059,7 +8974,7 @@ impl Runner {
                     // settled the job may yet stay queued, so it keeps its
                     // place: nothing it would have held back starts, and
                     // neither does it.
-                    return Ok(());
+                    return Ok(None);
                 }
                 let job = &inner.jobs[&id];
                 let request = job.request.as_ref().unwrap();
@@ -9139,7 +9054,7 @@ impl Runner {
                         || now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
                             >= BACKFILL_GRACE_MS
                     {
-                        return Ok(());
+                        return Ok(None);
                     }
                     continue;
                 }
@@ -9147,11 +9062,14 @@ impl Runner {
                 break;
             }
             let Some(id) = next else { break };
+            if queue_wait::expired(&inner.jobs[&id], self.now().max(now), 0) {
+                return Ok(Some(id));
+            }
             self.start(inner, id, &index.claims)?;
             index.started(inner, id);
             self.update_queue_wait_clocks(inner, now, &index);
         }
-        Ok(())
+        Ok(None)
     }
     /// Reserve a queued job's workspace and set it up on its own thread.
     /// Checking out a workspace and cloning a warm target can take minutes;
@@ -12561,6 +12479,7 @@ struct DispatchIndex {
     #[cfg(target_os = "linux")]
     sealed_paths: BTreeSet<String>,
     weight: u32,
+    holder_ids: BTreeSet<Uuid>,
     foreground_pending: usize,
     /// For each repository root, the `order` of its most recently accepted
     /// foreground job, retained records included. The next cache fill is the
@@ -12614,6 +12533,7 @@ impl DispatchIndex {
             }
             if job.state == JobState::Running || inner.starting.contains(&job.id) {
                 index.weight = index.weight.saturating_add(job.weight);
+                index.holder_ids.insert(job.id);
                 index.workspace_owners.insert(
                     crate::caller_path::job_key(job).to_owned(),
                     (job.id, job.weight),
@@ -12877,6 +12797,7 @@ impl DispatchIndex {
         }
         if inner.starting.contains(&id) {
             self.weight = self.weight.saturating_add(job.weight);
+            self.holder_ids.insert(id);
             self.workspace_owners
                 .insert(key.to_owned(), (job.id, job.weight));
             // A job just started is set up by this runner, so it is never a

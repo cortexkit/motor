@@ -1541,13 +1541,35 @@ fn failed_withdrawal_keeps_the_queue_clock_and_the_job_s_place() {
         5000,
         "the failed withdrawal changed the queue wait"
     );
-    f.runner.tick().unwrap();
-    assert_eq!(
-        f.runner.core.inner.lock().unwrap().starting,
-        BTreeSet::from([id]),
-        "the job lost its place to {}",
-        younger.job_id
+    // The first job still gets its turn first, but it has exhausted its
+    // queue budget: dispatch must save its refusal rather than start setup.
+    f.fail_save(id, Saved::Queued);
+    assert!(
+        f.runner.tick().is_err(),
+        "dispatch did not try to save the first job's refusal"
     );
+    assert_eq!(
+        f.job(younger.job_id).unwrap().setup_ms,
+        None,
+        "the younger job started before the first job's refusal was saved"
+    );
+    f.runner.tick().unwrap();
+    let terminal = f
+        .terminal(id)
+        .expect("dispatch saved the first job's refusal");
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded,
+        }
+    );
+    assert_eq!(terminal.queue_wait_ms, 5000);
+    assert_eq!(f.job(id).unwrap().setup_ms, None);
+    assert!(poll(Duration::from_secs(30), || f
+        .terminal(younger.job_id)
+        .is_some_and(
+            |terminal| terminal.outcome == Outcome::Exit { code: 0 }
+        )));
 }
 
 /// A save that unwinds still clears the markers set around it: the
@@ -1603,7 +1625,16 @@ fn unwinding_saves_release_their_markers() {
     assert_eq!(job.state, JobState::Queued);
     assert_eq!(job.queue_wait_ms(f.runner.now()), 5000);
 
-    // Setup: the panic is on the setup thread.
+    // The expired job is now refused instead of reaching setup. Use a new
+    // job with budget left to unwind a save on the setup thread.
+    f.runner.tick().unwrap();
+    assert_eq!(
+        f.terminal(id).unwrap().outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded,
+        }
+    );
+    let id = f.queued("setup", "true").job_id;
     f.panic_save(id, Saved::Queued);
     f.runner.tick().unwrap();
     assert!(

@@ -99,6 +99,8 @@ mod platform_refusal;
 mod publication;
 #[path = "tests/qualification_gate.rs"]
 mod qualification_gate;
+#[path = "tests/queue_wait.rs"]
+mod queue_wait;
 #[path = "tests/refusals.rs"]
 mod refusals;
 #[cfg(target_os = "linux")]
