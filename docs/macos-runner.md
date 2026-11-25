@@ -18,12 +18,17 @@ expire no later than the end of that occurrence.
 Symlinks, non-regular files, files larger than 4 KiB and malformed holds are
 ignored, with invalid content logged once.
 
-While a hold is honoured, new runs receive `RunnerDraining` (callers wait within
-their queue-wait budget); already accepted work finishes normally. Once no job
-is running or queued, the runner atomically publishes the same two fields to
-`/Users/Shared/motor-macos-grant/granted.json`. It removes the grant when the
-hold disappears, expires or ceases to be honoured. The installer creates the
-hold directory owned by `ghrunner` and the grant directory owned by `motor`,
+While an exclusive hold waits for running fleet jobs to finish, a new fleet job
+may use a free VM slot only if it cannot delay the hold: every running job and
+the new job have explicit time limits, and the new job's time limit plus a setup
+allowance ends before the latest time limit of the running jobs. Other new runs
+are refused with `runner_draining` before they start, so they are safe to
+resubmit. A granted hold refuses all new runs. Accepted work finishes normally.
+
+Once no job is running or queued, the runner atomically publishes the same two
+fields to `/Users/Shared/motor-macos-grant/granted.json`. It removes the grant
+when the hold disappears, expires or ceases to be honoured. The installer creates
+the hold directory owned by `ghrunner` and the grant directory owned by `motor`,
 both mode 0755: each account writes only its own directory and reads the other.
 Operator drain/resume remains independent. Health's `admission_blocked` text
 reports `held for <owner> until <time> (granted: true/false)` unless a

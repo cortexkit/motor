@@ -4876,9 +4876,10 @@ impl Runner {
         // otherwise the job would start on a half-deleted workspace.
         // Only the final check records a hold refusal, since the initial
         // check might have seen a hold that has since ended.
+        let mut hold_check = macos_hold::RunHoldCheck::default();
         let ordinary_refusal = self
             .qualification_refusal(qualification)
-            .or_else(|| self.check_run_refusal(&inner, &request, &access, true))
+            .or_else(|| self.check_run_refusal(&inner, &request, &access, Some(&mut hold_check)))
             .or_else(|| {
                 initial_refusal.filter(|(reason, _)| *reason == RefusalReason::WorkspaceSetupFailed)
             });
@@ -4888,24 +4889,8 @@ impl Runner {
                 .as_ref()
                 .map(|full| (RefusalReason::RunnerDiskFull, full.diagnostic()))
         });
-        if let Some((reason, error)) = refusal.as_ref() {
-            let detail = if disk_refused {
-                disk_full.as_ref().map(RunnerDiskFull::diagnostic)
-            } else if *reason == RefusalReason::RunnerDraining {
-                Some("runner_draining".into())
-            } else {
-                Some(self.safe_refusal_detail(error, request.env.values().cloned()))
-            };
-            refuse_before_start(
-                &self.core.health,
-                &mut job,
-                reason.clone(),
-                error,
-                detail,
-                (*reason == RefusalReason::RunnerDraining).then(|| self.drain_retry_after_ms()),
-                self.now(),
-            );
-            job.state = JobState::Tombstone;
+        if let Some(refusal) = refusal.as_ref() {
+            self.refuse_run_admission(&mut job, &request, refusal, disk_refused, &hold_check);
         }
         // Save without the state lock: one record save is two fsyncs, and
         // every other admission, status reply and cancel waits for this lock.
@@ -4935,6 +4920,7 @@ impl Runner {
             tracing::error!(job_id = %job.id, %error, "cannot persist disk refusal");
         }
         if refusal.is_none() {
+            hold_check.log_fit(job.id);
             self.core
                 .health
                 .lock()
@@ -5049,21 +5035,12 @@ impl Runner {
             .store(declared_min, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn run_refusal(
-        &self,
-        inner: &Inner,
-        request: &Run,
-        access: &crate::workspace_access::Repairs,
-    ) -> Option<(RefusalReason, String)> {
-        self.check_run_refusal(inner, request, access, false)
-    }
-
     fn check_run_refusal(
         &self,
         inner: &Inner,
         request: &Run,
         access: &crate::workspace_access::Repairs,
-        record_hold_refusal: bool,
+        hold_check: Option<&mut macos_hold::RunHoldCheck>,
     ) -> Option<(RefusalReason, String)> {
         #[cfg(target_os = "linux")]
         if self.config().tenant_vm {
@@ -5198,7 +5175,7 @@ impl Runner {
             Some(refusal)
         } else if let Some(refusal) = self.slice_memory_refusal() {
             Some(refusal)
-        } else if let Some(detail) = self.macos_hold_status_cached(record_hold_refusal) {
+        } else if let Some(detail) = self.macos_hold_run_refusal(inner, request, hold_check) {
             Some((RefusalReason::RunnerDraining, detail))
         } else if self.admission_closed(inner) {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))

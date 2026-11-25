@@ -176,7 +176,7 @@ fn replacement_after_refusal_leaves_a_full_fleet_turn_even_without_a_retry() {
         let grant = state.grant_dir.join("granted.json");
         write(&state, "2026-01-01T04:00:00Z");
         assert!(state.refresh(now, true));
-        assert!(state.admission_refusal(now).is_some());
+        assert!(state.admission_refusal(now, true, || false).is_some());
         assert!(grant.exists());
 
         let turn_start = now + 9_000;
@@ -222,7 +222,7 @@ fn expiry_rewrite_preserves_the_refusal_without_starting_a_turn() {
     let now = millis("2026-01-01T03:30:00Z");
     write(&state, "2026-01-01T04:00:00Z");
     assert!(state.refresh(now, true));
-    assert!(state.admission_refusal(now).is_some());
+    assert!(state.admission_refusal(now, true, || false).is_some());
 
     write(&state, "2026-01-01T04:30:00Z");
     assert!(state.refresh(now, true));
@@ -241,7 +241,9 @@ fn expired_hold_leaves_a_fleet_turn_after_refusal() {
     let expires = millis("2026-01-01T04:00:00Z");
     write(&state, "2026-01-01T04:00:00Z");
     assert!(state.refresh(expires - 1, true));
-    assert!(state.admission_refusal(expires - 1).is_some());
+    assert!(state
+        .admission_refusal(expires - 1, true, || false)
+        .is_some());
     assert!(!state.refresh(expires, true));
 
     write_for(&state, "next-check", "2026-01-01T04:30:00Z");
