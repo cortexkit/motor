@@ -166,11 +166,11 @@ pub(crate) fn return_record(
                 .map_or(file.path.clone(), |relative| {
                     relative.to_string_lossy().into_owned()
                 });
-            returned.push(shared::ReturnedFile::new(
-                path,
-                file.sha256,
-                BytePayload(data),
-            ));
+            let mut returned_file = shared::ReturnedFile::new(path, file.sha256, BytePayload(data));
+            if let Some(executable) = file.executable {
+                returned_file = returned_file.with_executable(executable);
+            }
+            returned.push(returned_file);
         }
         return Some(shared::ReturnResult::with_files(
             result.job_id,

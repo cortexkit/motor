@@ -214,6 +214,7 @@ impl Connector for Peer {
                                             path: run.return_paths[0].clone(),
                                             sha256: sha256.into(),
                                             data: "eA==".into(),
+                                            executable: None,
                                         }]),
                                         return_paths_failed: None,
                                     }),

@@ -163,6 +163,67 @@ async fn cli_return_v1_and_v2_write_files_and_reattach() {
 }
 
 #[tokio::test]
+async fn cli_return_v1_and_v2_apply_the_reported_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for chunked in [false, true] {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-return-executable");
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        for (relative, executable, expected) in [
+            (
+                "script",
+                true,
+                creation_mode(&root.join("probe-exec"), 0o777),
+            ),
+            (
+                "plain",
+                false,
+                creation_mode(&root.join("probe-plain"), 0o666),
+            ),
+            (".git/hooks/x", true, file_mode(&root.join("probe-plain"))),
+            (".GiT/hooks/y", true, file_mode(&root.join("probe-plain"))),
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"old").unwrap();
+            let old_mode = if expected == 0o700 { 0o600 } else { 0o700 };
+            fs::set_permissions(&path, fs::Permissions::from_mode(old_mode)).unwrap();
+
+            let paths = vec![path.to_str().unwrap().to_owned()];
+            let mut records = stream(Uuid::now_v7(), &paths, chunked, b"new");
+            let result = records.len() - 2;
+            let key = if chunked { "files" } else { "returned_files" };
+            records[result][key][0]["executable"] = json!(executable);
+            let client = FakeRunner {
+                root: root.clone(),
+                records,
+                submissions: AtomicUsize::new(0),
+            };
+            let (code, err) = run(&client, paths, false).await;
+            assert_eq!(code, 23, "{err}");
+            assert_eq!(fs::read(&path).unwrap(), b"new", "{relative}: {err}");
+            assert_eq!(file_mode(&path), expected, "{relative}, chunked={chunked}");
+        }
+    }
+}
+
+fn file_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn creation_mode(path: &Path, mode: u32) -> u32 {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .unwrap();
+    file_mode(path)
+}
+
+#[tokio::test]
 async fn cli_return_each_failure_cause_is_reported_without_changing_exit() {
     for chunked in [false, true] {
         for cause in [
@@ -452,19 +513,15 @@ fn cli_return_install_keeps_an_existing_mode_and_gives_new_files_the_umask_mode(
     let script = root.join("run.sh");
     fs::write(&script, b"old").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
-    super::returned_files::install(&root, &script, &b"new"[..]).unwrap();
+    super::returned_files::install(&root, &script, &b"new"[..], None).unwrap();
     assert_eq!(fs::read(&script).unwrap(), b"new");
     assert_eq!(
         fs::metadata(&script).unwrap().permissions().mode() & 0o7777,
         0o750
     );
 
-    let umask = unsafe { libc::umask(0o022) };
-    unsafe { libc::umask(umask) };
+    let expected = creation_mode(&root.join("probe-plain"), 0o666);
     let fresh = root.join("fresh.txt");
-    super::returned_files::install(&root, &fresh, &b"x"[..]).unwrap();
-    assert_eq!(
-        fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
-        0o666 & !(umask as u32)
-    );
+    super::returned_files::install(&root, &fresh, &b"x"[..], None).unwrap();
+    assert_eq!(file_mode(&fresh), expected);
 }

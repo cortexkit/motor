@@ -523,6 +523,7 @@ fn collect_with_root(
                 path: path.clone(),
                 sha256: format!("{:x}", Sha256::digest(&bytes)),
                 data: STANDARD.encode(bytes),
+                executable: None,
             });
         }
         // Recheck the open files, not their pathnames, to detect growth while
@@ -1084,6 +1085,7 @@ fn legacy_from_chunks(request: &Run, job: &Path, collection: &ChunkedCollection)
                 path: crate::caller_path::run(request).caller_return_paths[index].clone(),
                 sha256,
                 data: STANDARD.encode(bytes),
+                executable: None,
             });
         }
         Ok(files)
@@ -1390,6 +1392,7 @@ mod tests {
                 path: file.to_str().unwrap().into(),
                 sha256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881".into(),
                 data: "eA==".into(),
+                executable: None,
             }]
         );
     }
@@ -1998,7 +2001,8 @@ mod tests {
                 ReturnedFile {
                     path: format!("/workspace/{}", "\u{1}".repeat(3500)),
                     sha256: "a".repeat(64),
-                    data: "eA==".into()
+                    data: "eA==".into(),
+                    executable: None,
                 };
                 64
             ]),

@@ -121,7 +121,9 @@ fn caller_manifest_echoes_requested_paths_by_position() {
         Uuid::nil(),
         7,
         vec![
-            shared::ReturnManifestEntry::returned("/w/key/sub/./out", 1, "digest").with_chunks(1),
+            shared::ReturnManifestEntry::returned("/w/key/sub/./out", 1, "digest")
+                .with_chunks(1)
+                .with_executable(true),
             shared::ReturnManifestEntry::failed(
                 "/w/key/sub/missing",
                 shared::ReturnPathsFailureCause::Missing,
@@ -137,6 +139,7 @@ fn caller_manifest_echoes_requested_paths_by_position() {
     assert_eq!(caller.files[1].path(), "missing");
     assert_eq!(caller.files[0].sha256(), Some("digest"));
     assert_eq!(caller.files[0].chunks(), Some(1));
+    assert_eq!(caller.files[0].executable(), Some(true));
     assert_eq!(caller.files[1].chunks(), Some(0));
     assert_eq!(
         (caller.seq, caller.total_bytes, caller.cap_bytes),
@@ -179,6 +182,7 @@ fn returned_files_become_cwd_relative_decoded_bytes() {
                 path: "/w/key/sub/nested/out".into(),
                 sha256: "digest".into(),
                 data: "eA==".into(),
+                executable: None,
             }]),
             None,
         ),
@@ -199,6 +203,7 @@ fn returned_files_become_cwd_relative_decoded_bytes() {
                     path: "/w/key/sub/out".into(),
                     sha256: "digest".into(),
                     data: "not base64!".into(),
+                    executable: None,
                 }]),
                 None,
             ),
@@ -206,6 +211,31 @@ fn returned_files_become_cwd_relative_decoded_bytes() {
         )
         .is_none(),
         "invalid stored data must not be forwarded"
+    );
+}
+
+#[test]
+fn plain_return_forwarding_preserves_true_false_and_absent_executable_flags() {
+    let modes = [Some(true), Some(false), None];
+    let files = modes
+        .into_iter()
+        .enumerate()
+        .map(|(index, executable)| ReturnedFile {
+            path: format!("/w/key/sub/{index}"),
+            sha256: "digest".into(),
+            data: "eA==".into(),
+            executable,
+        })
+        .collect();
+    let record = return_record(stored(Some(files), None), "/w/key/sub").unwrap();
+    assert_eq!(
+        record
+            .returned_files()
+            .unwrap()
+            .iter()
+            .map(shared::ReturnedFile::executable)
+            .collect::<Vec<_>>(),
+        modes
     );
 }
 

@@ -647,6 +647,9 @@ pub struct ReturnedFile {
     pub sha256: String,
     /// Standard padded base64 of the file's raw bytes.
     pub data: String,
+    /// Whether any execute bit was set on the runner, or `None` if unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -146,6 +146,8 @@ impl Returns {
                                     return Err("read_error (staging digest mismatch)".into());
                                 }
                                 staged.file.rewind().map_err(|e| e.to_string())?;
+                                staged.executable =
+                                    manifest.files[entry.path_index() as usize].executable();
                                 Ok(staged)
                             }
                             shared::ReturnManifestOutcome::Failed { cause, .. } => {
@@ -183,6 +185,7 @@ impl Returns {
                         let mut staged = Staged::new(self.root.as_deref())?;
                         staged.write(file.data())?;
                         staged.file.rewind().map_err(|e| e.to_string())?;
+                        staged.executable = file.executable();
                         Ok(staged)
                     })
                     .collect(),
@@ -209,7 +212,7 @@ impl Returns {
                     .root
                     .as_deref()
                     .ok_or_else(|| "escape (local workspace unavailable)".to_string())?;
-                install(root, Path::new(path), &mut data.file)?;
+                install(root, Path::new(path), &mut data.file, data.executable)?;
                 Ok(data.size)
             });
             match result {
@@ -233,6 +236,7 @@ struct Staged {
     file: File,
     hash: Sha256,
     size: u64,
+    executable: Option<bool>,
 }
 
 impl Staged {
@@ -272,6 +276,7 @@ impl Staged {
             file: create().map_err(|e| format!("read_error ({e})"))?,
             hash: Sha256::new(),
             size: 0,
+            executable: None,
         })
     }
 
@@ -328,8 +333,14 @@ fn open_root(root: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
-pub(super) fn install(root: &Path, path: &Path, mut data: impl io::Read) -> Result<(), String> {
+pub(super) fn install(
+    root: &Path,
+    path: &Path,
+    mut data: impl io::Read,
+    executable: Option<bool>,
+) -> Result<(), String> {
     let relative = relative_path(root, path)?;
+    let reported_mode = shared::returned_file_mode(executable, relative);
     let mut install = || -> io::Result<()> {
         let mut directory = open_root(root)?;
         for component in relative.parent().unwrap().components() {
@@ -362,8 +373,7 @@ pub(super) fn install(root: &Path, path: &Path, mut data: impl io::Read) -> Resu
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         };
-        // Keep an existing file's permission bits; a new file gets the usual
-        // 0666 minus the umask, as if the user had written it themselves.
+        // If the file didn't report an executable bit, keep existing permissions.
         let mut existing_mode = None;
         if result == 0 {
             let stat = unsafe { stat.assume_init() };
@@ -372,7 +382,9 @@ pub(super) fn install(root: &Path, path: &Path, mut data: impl io::Read) -> Resu
                     "destination is not a regular file (symlinks are refused)",
                 ));
             }
-            existing_mode = Some(stat.st_mode & 0o7777);
+            if reported_mode.is_none() {
+                existing_mode = Some(stat.st_mode & 0o7777);
+            }
         } else if io::Error::last_os_error().kind() != io::ErrorKind::NotFound {
             return Err(io::Error::last_os_error());
         }
@@ -386,7 +398,7 @@ pub(super) fn install(root: &Path, path: &Path, mut data: impl io::Read) -> Resu
                 directory.as_raw_fd(),
                 temporary.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o666 as libc::c_uint,
+                reported_mode.unwrap_or(0o666),
             )
         };
         if fd < 0 {
