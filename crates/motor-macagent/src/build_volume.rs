@@ -63,18 +63,23 @@ pub trait BuildVolume: Send {
     /// out, unmounts the volume and puts the copies in the cargo-home share.
     /// `no_job_processes` fails if a job process is alive; it is called
     /// after the unmount and again after the copies are placed.
-    fn detach(&mut self, no_job_processes: &dyn Fn() -> io::Result<()>) -> io::Result<()>;
-    /// Metadata only, sent on the existing stderr channel at lifecycle boundaries.
-    fn diagnostics(&self, _phase: &str) -> Option<String> {
-        None
-    }
+    fn detach(
+        &mut self,
+        no_job_processes: &dyn Fn() -> io::Result<()>,
+    ) -> Result<(), DetachFailure>;
     /// Tells the volume when the job's command started, for its watch report.
     fn command_started(&mut self) {}
-    /// Stops watching `target/` and returns the one line saying whether it
-    /// kept naming the volume's root while the job ran (see `Watcher`).
+    /// Stops watching `target/` and reports the first fault, if any.
     fn watch_report(&mut self) -> Option<String> {
         None
     }
+}
+
+/// The release error and its mount evidence for the job's standard error.
+#[derive(Debug)]
+pub struct DetachFailure {
+    pub error: io::Error,
+    pub diagnostic: Option<String>,
 }
 
 /// How often `Watcher` looks at the build volume while the job runs.
@@ -91,27 +96,33 @@ pub struct Look {
 /// What `Watcher` keeps: counts and at most two looks.
 #[cfg(any(target_os = "macos", test))]
 struct Watch {
-    mounted: std::time::Instant,
     command: Option<std::time::Instant>,
     looks: u64,
     /// Milliseconds after mounting, and the look's metadata.
     last_good: Option<(u128, String)>,
-    /// Milliseconds after mounting and after the command started (if it had),
-    /// and the look's metadata.
-    first_bad: Option<(u128, Option<u128>, String)>,
+    first_bad: Option<BadLook>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct BadLook {
+    since_mount: u128,
+    since_command: Option<u128>,
+    detail: String,
+    mount_table: String,
 }
 
 /// Looks at `target/` every interval from the moment the build volume is
 /// mounted until it is released, and keeps the first look that found it no
 /// longer naming the volume's root, together with the last look before that
 /// which did. It stops looking after the first such look. It writes nothing
-/// per look: `finish` returns one diagnostic line, and the agent's own log
-/// gets one line when the change is seen.
+/// per good look. When a fault is seen, the agent's own log gets one line
+/// and `finish` returns the evidence for the job's standard error.
 #[cfg(any(target_os = "macos", test))]
 pub struct Watcher {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     state: std::sync::Arc<std::sync::Mutex<Watch>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    append_mount_table: fn(&mut String),
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -119,6 +130,7 @@ impl Watcher {
     pub fn start(
         interval: std::time::Duration,
         mut look: impl FnMut() -> Look + Send + 'static,
+        append_mount_table: fn(&mut String),
     ) -> Self {
         use std::sync::{
             Arc, Mutex,
@@ -128,7 +140,6 @@ impl Watcher {
         let mounted = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(Watch {
-            mounted,
             command: None,
             looks: 0,
             last_good: None,
@@ -155,7 +166,15 @@ impl Watcher {
                                 "motor-macagent: target stopped naming the build volume root {since_mount} ms after mounting: {}",
                                 sample.detail
                             );
-                            watch.first_bad = Some((since_mount, since_command, sample.detail));
+                            // Capture the mount table now in case the mount recovers before release.
+                            let mut mount_table = String::new();
+                            append_mount_table(&mut mount_table);
+                            watch.first_bad = Some(BadLook {
+                                since_mount,
+                                since_command,
+                                detail: sample.detail,
+                                mount_table,
+                            });
                             return;
                         }
                     }
@@ -174,6 +193,7 @@ impl Watcher {
             stop,
             state,
             thread,
+            append_mount_table,
         }
     }
 
@@ -190,35 +210,40 @@ impl Watcher {
         }
     }
 
-    /// Stops looking and returns the one diagnostic line.
-    pub fn finish(&mut self) -> String {
+    /// Stops looking and returns one diagnostic line only on a fault.
+    pub fn finish(&mut self) -> Option<String> {
         let running = self.thread.is_some();
         self.stop();
         let watch = self.state.lock().unwrap();
-        let elapsed = watch.mounted.elapsed().as_millis();
-        let last_good = match &watch.last_good {
-            Some((at, detail)) => format!("{at} ms after mounting: {detail}"),
-            None => "none".into(),
-        };
         let detail = match &watch.first_bad {
-            Some((at, since_command, detail)) => format!(
-                "target stopped naming the build volume root at look {} (one every {} ms), {at} ms after mounting, {}: {detail}; last good look {last_good}",
-                watch.looks,
-                WATCH_INTERVAL.as_millis(),
-                match since_command {
-                    Some(ms) => format!("{ms} ms after the command started"),
-                    None => "before the command started".into(),
-                }
-            ),
-            None if !running && watch.looks == 0 => {
-                "target was not watched: the watch thread could not start".into()
+            Some(BadLook {
+                since_mount,
+                since_command,
+                detail,
+                mount_table,
+            }) => {
+                let last_good = match &watch.last_good {
+                    Some((at, detail)) => format!("{at} ms after mounting: {detail}"),
+                    None => "none".into(),
+                };
+                format!(
+                    "target stopped naming the build volume root at look {} (one every {} ms), {since_mount} ms after mounting, {}: {detail}; last good look {last_good}{mount_table}",
+                    watch.looks,
+                    WATCH_INTERVAL.as_millis(),
+                    match since_command {
+                        Some(ms) => format!("{ms} ms after the command started"),
+                        None => "before the command started".into(),
+                    }
+                )
             }
-            None => format!(
-                "target named the build volume root in all {} looks over {elapsed} ms; last good look {last_good}",
-                watch.looks
-            ),
+            None if !running && watch.looks == 0 => {
+                let mut detail = "target was not watched: the watch thread could not start".into();
+                (self.append_mount_table)(&mut detail);
+                detail
+            }
+            None => return None,
         };
-        diagnostic_line("watch", &detail)
+        Some(diagnostic_line("watch", &detail))
     }
 }
 
@@ -878,8 +903,11 @@ impl BuildVolume for Unsupported {
     fn attach(&mut self) -> io::Result<Option<String>> {
         Err(invalid("the build volume requires a macOS guest"))
     }
-    fn detach(&mut self, _: &dyn Fn() -> io::Result<()>) -> io::Result<()> {
-        Err(invalid("the build volume requires a macOS guest"))
+    fn detach(&mut self, _: &dyn Fn() -> io::Result<()>) -> Result<(), DetachFailure> {
+        Err(DetachFailure {
+            error: invalid("the build volume requires a macOS guest"),
+            diagnostic: None,
+        })
     }
 }
 
@@ -1006,7 +1034,7 @@ mod native {
             Look { on_volume, detail }
         }
 
-        fn snapshot(&self, phase: &str) -> String {
+        fn detach_failure(&self, phase: &str, error: io::Error) -> DetachFailure {
             use std::fmt::Write;
             let mut detail = format!(
                 "target={} mount={:?} recorded={:?}",
@@ -1025,6 +1053,15 @@ mod native {
                     let _ = write!(detail, " statfs_error={error}");
                 }
             }
+            Self::append_mount_table(&mut detail);
+            DetachFailure {
+                error,
+                diagnostic: Some(diagnostic_line(phase, &detail)),
+            }
+        }
+
+        fn append_mount_table(detail: &mut String) {
+            use std::fmt::Write;
             // A private fixed-capacity buffer avoids getmntinfo's shared static
             // storage and bounds both allocation and the logged mount table.
             const MOUNTS: usize = 128;
@@ -1056,7 +1093,26 @@ mod native {
                     detail.push_str(" [mount table capacity reached]");
                 }
             }
-            diagnostic_line(phase, &detail)
+        }
+
+        fn check_before_detach(
+            &self,
+            root: io::Result<File>,
+            mount: &Path,
+            recorded: Identity,
+        ) -> Result<File, DetachFailure> {
+            // Job code has run: reach the mount again from / without following
+            // links, and require the volume root recorded before the job.
+            root.and_then(|root| reopen(&root, mount))
+                .and_then(|root| {
+                    if identity(&root)? != recorded {
+                        return Err(invalid(
+                            "the build mount no longer names the build volume's root",
+                        ));
+                    }
+                    Ok(root)
+                })
+                .map_err(|error| self.detach_failure("before-detach", error))
         }
     }
 
@@ -1223,9 +1279,11 @@ mod native {
             self.parent = Some(parent);
             self.cargo_home_identity = Some(cargo_home);
             let (mount, target) = (self.mount.clone(), self.target.clone());
-            self.watcher = Some(Watcher::start(WATCH_INTERVAL, move || {
-                Self::look(&mount, &target, root)
-            }));
+            self.watcher = Some(Watcher::start(
+                WATCH_INTERVAL,
+                move || Self::look(&mount, &target, root),
+                Self::append_mount_table,
+            ));
             Ok(notice)
         }
 
@@ -1236,25 +1294,38 @@ mod native {
         }
 
         fn watch_report(&mut self) -> Option<String> {
-            self.watcher.take().map(|mut watcher| watcher.finish())
+            self.watcher.take()?.finish()
         }
 
-        fn detach(&mut self, no_job_processes: &dyn Fn() -> io::Result<()>) -> io::Result<()> {
+        fn detach(
+            &mut self,
+            no_job_processes: &dyn Fn() -> io::Result<()>,
+        ) -> Result<(), DetachFailure> {
             // Dropping the watcher stops it if no report was taken.
             self.watcher = None;
             let (Some(parent), Some(recorded), Some(cargo_home)) =
                 (self.parent.take(), self.root, self.cargo_home_identity)
             else {
-                return Err(invalid("build volume is not attached"));
+                return Err(
+                    self.detach_failure("detach-failed", invalid("build volume is not attached"))
+                );
             };
-            // Job code has run: reach the mount again from / without following
-            // links, and require the volume root recorded before the job.
-            let root = reopen(&open_root()?, &self.mount)?;
-            if identity(&root)? != recorded {
-                return Err(invalid(
-                    "the build mount no longer names the build volume's root",
-                ));
-            }
+            // Use the release's own root check so one fault gets one snapshot.
+            let root = self.check_before_detach(open_root(), &self.mount, recorded)?;
+            self.release(root, &parent, recorded, cargo_home, no_job_processes)
+                .map_err(|error| self.detach_failure("detach-failed", error))
+        }
+    }
+
+    impl Native {
+        fn release(
+            &mut self,
+            root: File,
+            parent: &File,
+            recorded: Identity,
+            cargo_home: Identity,
+            no_job_processes: &dyn Fn() -> io::Result<()>,
+        ) -> io::Result<()> {
             let staging = tempfile::Builder::new()
                 .prefix("motor-returns-")
                 .tempdir_in("/var/tmp")?;
@@ -1275,7 +1346,7 @@ mod native {
                 )));
             }
             unmount(&self.mount, recorded.0)?;
-            let point = open_directory_at(&parent, mount_name(&self.mount)?)?;
+            let point = open_directory_at(parent, mount_name(&self.mount)?)?;
             if point.metadata()?.dev() != parent.metadata()?.dev() {
                 return Err(invalid("the build mount is still mounted after unmounting"));
             }
@@ -1289,10 +1360,6 @@ mod native {
             }
             self.root = None;
             Ok(())
-        }
-
-        fn diagnostics(&self, phase: &str) -> Option<String> {
-            Some(self.snapshot(phase))
         }
     }
 
@@ -1483,17 +1550,62 @@ mod native {
         use super::*;
 
         #[test]
-        fn snapshot_reports_the_mount_and_targets_state_without_resolving_target() {
+        fn watch_look_requires_both_the_runner_link_and_the_recorded_root() {
+            let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+            let target = scratch.path().join("target");
+            let mount = scratch.path().join("mount");
+            std::fs::create_dir(&mount).unwrap();
+            let (fsid, inode) = identity(&File::open(&mount).unwrap()).unwrap();
+
+            let missing = Native::look(&mount, &target, (fsid, inode));
+            assert!(!missing.on_volume);
+            assert!(missing.detail.starts_with("target=missing mount("));
+            std::os::unix::fs::symlink(&mount, &target).unwrap();
+            let replaced = Native::look(&mount, &target, (fsid, inode));
+            assert!(!replaced.on_volume);
+            assert!(replaced.detail.starts_with("target=link-elsewhere mount("));
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(motor_macvm::BUILD_MOUNT, &target).unwrap();
+            assert!(Native::look(&mount, &target, (fsid, inode)).on_volume);
+
+            for wrong_root in [(fsid, inode ^ 1), ([fsid[0] ^ 1, fsid[1]], inode)] {
+                let different = Native::look(&mount, &target, wrong_root);
+                assert!(!different.on_volume);
+                assert!(
+                    different
+                        .detail
+                        .starts_with("target=link-to-build-mount mount(")
+                );
+                assert!(
+                    different
+                        .detail
+                        .contains(&format!("f_fsid={fsid:?},inode={inode}"))
+                );
+            }
+            std::fs::remove_dir(&mount).unwrap();
+            let missing = Native::look(&mount, &target, (fsid, inode));
+            assert!(!missing.on_volume);
+            assert!(
+                missing
+                    .detail
+                    .starts_with("target=link-to-build-mount mount_error=")
+            );
+        }
+
+        #[test]
+        fn before_detach_reports_a_missing_or_different_root_without_resolving_target() {
             let scratch = tempfile::Builder::new()
                 .prefix("motor-volume-diagnostic-")
                 .tempdir_in(cortexkit_test_support::scratch_root())
                 .unwrap();
-            let target = scratch.path().join("target");
-            let mount = scratch.path().join("mount");
+            let directory = scratch.path().canonicalize().unwrap();
+            let target = directory.join("target");
+            let mount = directory.join("mount");
             std::fs::create_dir(&target).unwrap();
             std::fs::create_dir(&mount).unwrap();
-            let inode = std::fs::metadata(&mount).unwrap().ino();
-            let volume = Native {
+            let (fsid, inode) = identity(&File::open(&mount).unwrap()).unwrap();
+            let parent = File::open(&directory).unwrap();
+            let mut volume = Native {
                 mount: mount.clone(),
                 target: target.clone(),
                 cargo_home: scratch.path().join("cargo-home"),
@@ -1504,11 +1616,28 @@ mod native {
                 uid: 501,
                 gid: 20,
                 parent: None,
-                root: None,
+                root: Some((fsid, inode)),
                 watcher: None,
-                cargo_home_identity: None,
+                cargo_home_identity: Some((fsid, inode)),
             };
-            let snapshot = volume.snapshot("before-detach");
+            // Walk from the scratch directory's descriptor so the test does
+            // not need access to intermediate system directories.
+            let check = |volume: &Native| {
+                volume.check_before_detach(
+                    parent.try_clone(),
+                    Path::new("/mount"),
+                    volume.root.unwrap(),
+                )
+            };
+            assert!(check(&volume).is_ok());
+            volume.root = Some((fsid, inode ^ 1));
+            let failure = check(&volume).unwrap_err();
+            assert_eq!(
+                failure.error.to_string(),
+                "the build mount no longer names the build volume's root"
+            );
+            let snapshot = failure.diagnostic.unwrap();
+            assert!(snapshot.starts_with("motor: build-volume diagnostic before-detach: "));
             for field in [
                 "target=directory",
                 "statfs(f_mntonname=",
@@ -1521,15 +1650,46 @@ mod native {
             }
             assert!(snapshot.contains(&format!("inode={inode}")), "{snapshot}");
             assert!(snapshot.len() <= DIAGNOSTIC_MAX_BYTES);
+            assert_eq!(snapshot.lines().count(), 1);
             std::fs::remove_dir(&target).unwrap();
             std::os::unix::fs::symlink(&mount, &target).unwrap();
-            let snapshot = volume.snapshot("detach-failed");
+            volume.root = Some(([fsid[0] ^ 1, fsid[1]], inode));
+            let failure = check(&volume).unwrap_err();
+            assert_eq!(
+                failure.error.to_string(),
+                "the build mount no longer names the build volume's root"
+            );
+            let snapshot = failure.diagnostic.unwrap();
+            assert!(snapshot.starts_with("motor: build-volume diagnostic before-detach: "));
             assert!(snapshot.contains("target=link-elsewhere"), "{snapshot}");
+            assert!(snapshot.contains("getfsstat=["), "{snapshot}");
+            assert_eq!(snapshot.lines().count(), 1);
             std::fs::remove_file(&target).unwrap();
             std::fs::remove_dir(&mount).unwrap();
-            let snapshot = volume.snapshot("detach-failed");
+            volume.root = Some((fsid, inode));
+            let failure = check(&volume).unwrap_err();
+            assert!(
+                failure
+                    .error
+                    .to_string()
+                    .starts_with("mount: not a plain directory:")
+            );
+            let snapshot = failure.diagnostic.unwrap();
+            assert!(snapshot.starts_with("motor: build-volume diagnostic before-detach: "));
             assert!(snapshot.contains("target=missing"), "{snapshot}");
             assert!(snapshot.contains("statfs_error="), "{snapshot}");
+            assert!(snapshot.contains("getfsstat=["), "{snapshot}");
+            assert_eq!(snapshot.lines().count(), 1);
+
+            // An unattached volume fails release for a different reason.
+            let failure = volume
+                .detach(&|| panic!("an unattached volume cannot release"))
+                .unwrap_err();
+            assert_eq!(failure.error.to_string(), "build volume is not attached");
+            let snapshot = failure.diagnostic.unwrap();
+            assert!(snapshot.starts_with("motor: build-volume diagnostic detach-failed: "));
+            assert!(snapshot.contains("getfsstat=["), "{snapshot}");
+            assert_eq!(snapshot.lines().count(), 1);
         }
     }
 }
@@ -1549,8 +1709,8 @@ mod tests {
         assert_eq!(line.lines().count(), 1);
         assert!(!line.contains('\r'));
         assert_eq!(
-            diagnostic_line("after-attach", "inode=2"),
-            "motor: build-volume diagnostic after-attach: inode=2\n"
+            diagnostic_line("detach-failed", "inode=2"),
+            "motor: build-volume diagnostic detach-failed: inode=2\n"
         );
     }
 
@@ -1914,23 +2074,36 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = std::sync::Arc::new(AtomicUsize::new(0));
         let looks = count.clone();
-        let mut watcher = Watcher::start(std::time::Duration::from_millis(1), move || match looks
-            .fetch_add(1, Ordering::SeqCst)
-        {
-            0..=2 => look(true, "on the volume"),
-            3 => look(false, "on the share"),
-            _ => look(false, "looked again"),
-        });
+        let (started, after_start) = std::sync::mpsc::channel();
+        let mut watcher = Watcher::start(
+            std::time::Duration::from_millis(1),
+            move || match looks.fetch_add(1, Ordering::SeqCst) {
+                0..=2 => look(true, "on the volume"),
+                3 => {
+                    after_start
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    look(false, "on the share")
+                }
+                _ => look(false, "looked again"),
+            },
+            |detail| detail.push_str(" getfsstat=[share mount table]"),
+        );
         watcher.command_started();
+        started.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while count.load(Ordering::SeqCst) < 4 {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let line = watcher.finish();
+        let line = watcher.finish().unwrap();
         assert!(line.starts_with("motor: build-volume diagnostic watch: target stopped naming the build volume root at look 4 "), "{line}");
+        assert!(line.contains(" ms after the command started"), "{line}");
         assert!(line.contains(": on the share; last good look "), "{line}");
-        assert!(line.ends_with(": on the volume\n"), "{line}");
+        assert!(
+            line.ends_with(": on the volume getfsstat=[share mount table]\n"),
+            "{line}"
+        );
         assert!(!line.contains("looked again"), "{line}");
         // It stops looking once the change is seen.
         assert_eq!(count.load(Ordering::SeqCst), 4);
@@ -1938,27 +2111,69 @@ mod tests {
     }
 
     #[test]
-    fn watcher_that_saw_no_change_says_so_in_one_line() {
-        let mut watcher = Watcher::start(std::time::Duration::from_millis(1), || {
-            look(true, "on the volume")
-        });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let line = watcher.finish();
+    fn watcher_that_saw_no_change_is_silent() {
+        let (sampled, sample) = std::sync::mpsc::channel();
+        let mut sampled = Some(sampled);
+        let mut watcher = Watcher::start(
+            std::time::Duration::from_millis(1),
+            move || {
+                if let Some(sampled) = sampled.take() {
+                    sampled.send(()).unwrap();
+                }
+                look(true, "on the volume")
+            },
+            |_| panic!("a good look needs no mount table"),
+        );
+        sample
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(watcher.finish(), None);
+        assert!(watcher.state.lock().unwrap().last_good.is_some());
+    }
+
+    #[test]
+    fn watcher_reports_a_fault_before_the_command_started() {
+        let (sampled, sample) = std::sync::mpsc::channel();
+        let mut early = Watcher::start(
+            std::time::Duration::from_millis(1),
+            move || {
+                sampled.send(()).unwrap();
+                look(false, "on the share")
+            },
+            |detail| detail.push_str(" getfsstat=[share mount table]"),
+        );
+        sample
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let line = early.finish().unwrap();
+        assert!(line.contains("before the command started"), "{line}");
         assert!(
-            line.starts_with(
-                "motor: build-volume diagnostic watch: target named the build volume root in all "
-            ),
+            line.contains(": on the share; last good look none"),
             "{line}"
         );
-        assert_eq!(line.matches('\n').count(), 1);
-        // A report taken before the command started says so.
-        let mut early = Watcher::start(std::time::Duration::from_millis(1), || {
-            look(false, "on the share")
-        });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let line = early.finish();
-        assert!(line.contains("before the command started"), "{line}");
-        assert!(line.contains("last good look none"), "{line}");
+        assert!(line.ends_with(" getfsstat=[share mount table]\n"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn watcher_reports_when_its_thread_could_not_start() {
+        let mut watcher = Watcher {
+            stop: std::sync::Arc::default(),
+            state: std::sync::Arc::new(std::sync::Mutex::new(Watch {
+                command: None,
+                looks: 0,
+                last_good: None,
+                first_bad: None,
+            })),
+            thread: None,
+            append_mount_table: |detail| detail.push_str(" getfsstat=[mount table]"),
+        };
+        assert_eq!(
+            watcher.finish().as_deref(),
+            Some(
+                "motor: build-volume diagnostic watch: target was not watched: the watch thread could not start getfsstat=[mount table]\n"
+            )
+        );
     }
 
     struct Volume {

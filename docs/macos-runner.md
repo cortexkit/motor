@@ -320,19 +320,24 @@ only held while the volume was mounted at `target/` itself.
   the command without the volume mounted.
 - **While the command runs**, the agent looks at the mount every 100 ms, and
   at `target` without following it (whether it is still the runner's link;
-  as root it never resolves a link the job may have changed). Just before
-  releasing the volume it adds one line to the job's standard error,
-  `motor: build-volume diagnostic watch: ...`, saying whether both held and,
-  if not, when that stopped (milliseconds after mounting and after the
-  command started) with the last good look. Lines with this prefix arrive on
-  the job's standard error, where the job can write them too, so the runner
-  logs them as job output with the job ID, at most eight per job.
+  as root it never resolves a link the job may have changed). If a look finds
+  that the mount no longer names the recorded volume root or `target` is no
+  longer the runner's link, the agent adds a
+  `motor: build-volume diagnostic watch: ...` line to the job's standard error.
+  It includes the first bad look (timed from mounting and from the command's
+  start), the last good look, and the mount table. The agent also reports if
+  the watch could not start. Healthy checks write no diagnostic lines. Lines
+  with this prefix arrive on the job's standard error, where the job can
+  write them too, so the runner logs them as job output with the job ID, at
+  most eight per job.
 - **After the command**, once every `motorjob` process is gone, the agent
   reaches the mount again from `/`, one directory at a time without following
   links, and requires the volume root it recorded before the command (the
-  same file system ID and inode). It copies the returned files out (below),
-  then unmounts the volume, which must have exactly one mount, forcing the
-  unmount if a killed process left it busy. It then counts `motorjob`
+  same file system ID and inode). If that check fails, the agent adds a
+  `before-detach` diagnostic with mount details and the mount table. Other
+  release failures get a `detach-failed` diagnostic. It copies the returned
+  files out (below), then unmounts the volume, which must have exactly one
+  mount, forcing the unmount if a killed process left it busy. It then counts `motorjob`
   processes again, after the unmount and after placing the returned files:
   any process alive then fails the release. It sends
   `BuildRelease { released: true }`, then `Exit` or `Signal`. If any of this

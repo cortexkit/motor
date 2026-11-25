@@ -613,9 +613,14 @@ mod execution {
         fail: bool,
     }
     impl StderrNotes {
-        async fn append(&mut self, output: &mpsc::UnboundedSender<Output>, text: &str) {
+        async fn append_line(&mut self, output: &mpsc::UnboundedSender<Output>, mut line: String) {
             if !self.working {
                 return;
+            }
+            // The command may leave stderr without a newline; don't join its
+            // last line or add a blank line after already terminated output.
+            if !ends_line(&self.path).unwrap_or(false) {
+                line.insert(0, '\n');
             }
             #[cfg(test)]
             let fail = self.fail;
@@ -624,14 +629,14 @@ mod execution {
             let result = if fail {
                 Err(io::Error::other("injected stderr spool failure"))
             } else {
-                match self.file.write_all(text.as_bytes()).await {
+                match self.file.write_all(line.as_bytes()).await {
                     Ok(()) => self.file.flush().await,
                     Err(error) => Err(error),
                 }
             };
             match result {
                 Ok(()) => {
-                    let _ = output.send(Output::Chunk(Stream::Stderr, text.len()));
+                    let _ = output.send(Output::Chunk(Stream::Stderr, line.len()));
                 }
                 Err(error) => {
                     self.working = false;
@@ -640,12 +645,6 @@ mod execution {
                     );
                 }
             }
-        }
-
-        /// Whether the spooled standard error is empty or ends with a newline;
-        /// false when it cannot be read.
-        fn ends_line(&self) -> bool {
-            ends_line(&self.path).unwrap_or(false)
         }
     }
 
@@ -780,7 +779,7 @@ mod execution {
         // runs no command: the caller gets the reason as one stderr line, which
         // the protocol only carries after Started, and the session then closes
         // without Exit, so the host publishes nothing.
-        let mut notice = match settings.build.as_mut().map(|volume| volume.attach()) {
+        let notice = match settings.build.as_mut().map(|volume| volume.attach()) {
             Some(Ok(notice)) => notice,
             Some(Err(error)) => {
                 eprintln!("motor-macagent: the build disk could not be mounted: {error}");
@@ -799,13 +798,6 @@ mod execution {
             }
             None => None,
         };
-        if let Some(diagnostic) = settings
-            .build
-            .as_ref()
-            .and_then(|volume| volume.diagnostics("after-attach"))
-        {
-            notice.get_or_insert_with(String::new).push_str(&diagnostic);
-        }
         let tmpdir = tempfile::Builder::new()
             .prefix("motor-job-")
             .tempdir_in(&settings.temporary_root)?;
@@ -942,42 +934,25 @@ mod execution {
         // status, both from memory: the host publishes the disk and reads the
         // returned files under target/ only after `released: true`. The
         // lines on standard error are for the caller and best effort.
-        let watch = settings
-            .build
-            .as_mut()
-            .and_then(|volume| volume.watch_report());
-        let before = settings
-            .build
-            .as_ref()
-            .and_then(|volume| volume.diagnostics("before-detach"));
-        if watch.is_some() || before.is_some() {
-            // The command may leave stderr without a newline. Keep the
-            // metadata on its own line.
-            let diagnostic = format!(
-                "\n{}{}",
-                watch.unwrap_or_default(),
-                before.unwrap_or_default()
-            );
-            notes.append(&output_tx, &diagnostic).await;
-        }
         let mut failure = None;
         if let Some(volume) = settings.build.as_mut() {
+            if let Some(diagnostic) = volume.watch_report() {
+                notes.append_line(&output_tx, diagnostic).await;
+            }
             let scope = settings.scope.clone();
             let release = match volume.detach(&|| scope.require_none()) {
                 Ok(()) => Frame::BuildRelease {
                     released: true,
                     reason: String::new(),
                 },
-                Err(error) => {
+                Err(crate::build_volume::DetachFailure { error, diagnostic }) => {
                     eprintln!("motor-macagent: the build disk could not be released: {error}");
-                    if let Some(diagnostic) = volume.diagnostics("detach-failed") {
-                        notes.append(&output_tx, &diagnostic).await;
+                    if let Some(diagnostic) = diagnostic {
+                        notes.append_line(&output_tx, diagnostic).await;
                     }
-                    let mut line = build_disk_failure("released", &error);
-                    if !notes.ends_line() {
-                        line.insert(0, '\n');
-                    }
-                    notes.append(&output_tx, &line).await;
+                    notes
+                        .append_line(&output_tx, build_disk_failure("released", &error))
+                        .await;
                     let reason = release_reason(&error);
                     failure = Some(error);
                     Frame::BuildRelease {
@@ -1415,14 +1390,30 @@ mod execution {
             notice: Option<String>,
             fail_attach: bool,
             fail_detach: bool,
-            /// Whether it returns no diagnostic lines.
+            bad_root: bool,
+            /// Whether a release failure has no diagnostic to append.
             quiet: bool,
-            /// Whether it watches `target/` and reports on it.
-            watch: bool,
+            watch_fault: bool,
             /// Whether the agent's own stderr appends fail.
             fail_notes: bool,
             /// Whether the job's processes survive the kill sweep.
             suppress_kill: bool,
+        }
+        impl FakeVolume {
+            fn detach_failure(
+                &self,
+                phase: &'static str,
+                detail: &str,
+                error: io::Error,
+            ) -> crate::build_volume::DetachFailure {
+                let diagnostic = (!self.options.quiet).then(|| {
+                    self.events.lock().unwrap().push(phase);
+                    format!(
+                        "motor: build-volume diagnostic {phase}: {detail} getfsstat=[mount table]\n"
+                    )
+                });
+                crate::build_volume::DetachFailure { error, diagnostic }
+            }
         }
         impl crate::build_volume::BuildVolume for FakeVolume {
             fn attach(&mut self) -> io::Result<Option<String>> {
@@ -1433,40 +1424,37 @@ mod execution {
                 std::fs::write(self.directory.join("mounted"), "").unwrap();
                 Ok(self.options.notice.clone())
             }
-            fn detach(&mut self, no_job_processes: &dyn Fn() -> io::Result<()>) -> io::Result<()> {
+            fn detach(
+                &mut self,
+                no_job_processes: &dyn Fn() -> io::Result<()>,
+            ) -> Result<(), crate::build_volume::DetachFailure> {
                 // A slow unmount: the exit must still wait for it.
                 std::thread::sleep(Duration::from_millis(300));
                 self.events.lock().unwrap().push("detach");
+                if self.options.bad_root {
+                    return Err(self.detach_failure(
+                        "before-detach",
+                        "statfs_error=missing mount",
+                        io::Error::other("missing mount"),
+                    ));
+                }
                 if self.options.fail_detach {
-                    return Err(io::Error::other("volume busy"));
+                    return Err(self.detach_failure(
+                        "detach-failed",
+                        "metadata",
+                        io::Error::other("volume busy"),
+                    ));
                 }
                 no_job_processes()
-            }
-            fn diagnostics(&self, phase: &str) -> Option<String> {
-                if self.options.quiet {
-                    return None;
-                }
-                let phase = match phase {
-                    "after-attach" => "after-attach",
-                    "before-detach" => "before-detach",
-                    "detach-failed" => "detach-failed",
-                    _ => panic!("unexpected diagnostic phase"),
-                };
-                self.events.lock().unwrap().push(phase);
-                Some(format!(
-                    "motor: build-volume diagnostic {phase}: metadata\n"
-                ))
+                    .map_err(|error| self.detach_failure("detach-failed", "metadata", error))
             }
             fn command_started(&mut self) {
-                if self.options.watch {
-                    // The command runs from now: the agent spawned it.
-                    self.events.lock().unwrap().push("command-started");
-                }
+                self.events.lock().unwrap().push("command-started");
             }
             fn watch_report(&mut self) -> Option<String> {
-                self.options.watch.then(|| {
-                    self.events.lock().unwrap().push("watch-report");
-                    "motor: build-volume diagnostic watch: steady\n".to_owned()
+                self.events.lock().unwrap().push("watch-report");
+                self.options.watch_fault.then(|| {
+                    "motor: build-volume diagnostic watch: target stopped naming the build volume root; getfsstat=[mount table]\n".to_owned()
                 })
             }
         }
@@ -1592,7 +1580,7 @@ mod execution {
             // Checked when the release report arrives, not after the agent ends.
             assert_eq!(
                 *events.lock().unwrap(),
-                ["attach", "after-attach", "before-detach", "detach"]
+                ["attach", "command-started", "watch-report", "detach"]
             );
             assert_eq!(Some(release), released());
             assert_eq!(
@@ -1600,7 +1588,7 @@ mod execution {
                 Some(Frame::Exit { code: 0 })
             );
             assert_eq!(stdout, b"ran\n");
-            assert_eq!(stderr, b"motor: cold\nmotor: build-volume diagnostic after-attach: metadata\n\nmotor: build-volume diagnostic before-detach: metadata\n");
+            assert_eq!(stderr, b"motor: cold\n");
             (&mut fixture.agent.0).await.unwrap().unwrap();
         }
 
@@ -1641,8 +1629,8 @@ mod execution {
                 *events.lock().unwrap(),
                 [
                     "attach",
-                    "after-attach",
-                    "before-detach",
+                    "command-started",
+                    "watch-report",
                     "detach",
                     "detach-failed"
                 ]
@@ -1651,7 +1639,7 @@ mod execution {
             // The reason is the last line, after all of the command's output.
             assert_eq!(
                 String::from_utf8(session.stderr).unwrap(),
-                "motor: build-volume diagnostic after-attach: metadata\njob-err\nmotor: build-volume diagnostic before-detach: metadata\nmotor: build-volume diagnostic detach-failed: metadata\nmotor: the build disk could not be released: volume busy\n"
+                "job-err\nmotor: build-volume diagnostic detach-failed: metadata getfsstat=[mount table]\nmotor: the build disk could not be released: volume busy\n"
             );
         }
 
@@ -1690,7 +1678,9 @@ mod execution {
                     let (mut fixture, _) = launch_fake(
                         command,
                         FakeOptions {
+                            notice: Some("motor: cold\n".into()),
                             fail_detach,
+                            watch_fault: true,
                             fail_notes: true,
                             ..FakeOptions::default()
                         },
@@ -1706,10 +1696,7 @@ mod execution {
                     assert_eq!(session.release, expected, "{command} {fail_detach}");
                     // Only the notice written before the command reached the
                     // job's standard error; none of the agent's later lines.
-                    assert_eq!(
-                        String::from_utf8(session.stderr).unwrap(),
-                        "motor: build-volume diagnostic after-attach: metadata\n"
-                    );
+                    assert_eq!(String::from_utf8(session.stderr).unwrap(), "motor: cold\n");
                 }
             }
         }
@@ -1736,14 +1723,14 @@ mod execution {
             assert!(reason.contains("running after the job ended"), "{reason}");
         }
 
-        /// The watch starts with the command and its one line comes before
-        /// the volume is released, ahead of the before-detach metadata.
+        /// The watch is told when the command starts, and its fault report
+        /// comes before successful release.
         #[tokio::test]
         async fn watch_report_comes_once_before_release() {
             let (mut fixture, events) = launch_fake(
-                "echo ran",
+                "printf job-err >&2",
                 FakeOptions {
-                    watch: true,
+                    watch_fault: true,
                     ..FakeOptions::default()
                 },
             )
@@ -1753,18 +1740,36 @@ mod execution {
             assert_eq!(session.terminal, Some(Frame::Exit { code: 0 }));
             assert_eq!(
                 *events.lock().unwrap(),
-                [
-                    "attach",
-                    "after-attach",
-                    "command-started",
-                    "watch-report",
-                    "before-detach",
-                    "detach"
-                ]
+                ["attach", "command-started", "watch-report", "detach"]
             );
             assert_eq!(
                 String::from_utf8(session.stderr).unwrap(),
-                "motor: build-volume diagnostic after-attach: metadata\n\nmotor: build-volume diagnostic watch: steady\nmotor: build-volume diagnostic before-detach: metadata\n"
+                "job-err\nmotor: build-volume diagnostic watch: target stopped naming the build volume root; getfsstat=[mount table]\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn bad_root_at_detach_reports_once_apart_from_the_watch() {
+            let (mut fixture, _) = launch_fake(
+                "exit 5",
+                FakeOptions {
+                    bad_root: true,
+                    watch_fault: true,
+                    ..FakeOptions::default()
+                },
+            )
+            .await;
+            let session = collect_session(&mut fixture).await;
+            assert_eq!(session.release, not_released("missing mount"));
+            assert_eq!(session.terminal, Some(Frame::Exit { code: 5 }));
+            assert!((&mut fixture.agent.0).await.unwrap().is_err());
+            assert_eq!(
+                String::from_utf8(session.stderr).unwrap(),
+                concat!(
+                    "motor: build-volume diagnostic watch: target stopped naming the build volume root; getfsstat=[mount table]\n",
+                    "motor: build-volume diagnostic before-detach: statfs_error=missing mount getfsstat=[mount table]\n",
+                    "motor: the build disk could not be released: missing mount\n",
+                )
             );
         }
 
