@@ -146,6 +146,107 @@ fn submit(f: &Fixture, runner: &Runner, request: &Run) {
     f.submit(runner, &request, &[bytes]);
 }
 
+fn other_workspace_request(f: &Fixture, timeout: Option<u64>) -> Run {
+    let mut request = macos_request(f);
+    request.repository_root = "/Users/motor/other-project".into();
+    request.workspace_key = request.repository_root.clone();
+    request.cwd = request.workspace_key.clone();
+    request.bundles[0].repository = request.repository_root.clone();
+    request.timeout = timeout;
+    request
+}
+
+fn hold_refusal_detail(runner: &Runner, request: Run) -> String {
+    let id = request.job_id;
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Refused(RefusalReason::RunnerDraining)
+    ));
+    let terminal = runner.job_status(id).unwrap().terminal.unwrap();
+    assert_eq!(terminal.ran, Some(Ran::None));
+    terminal.refusal_detail().unwrap().to_owned()
+}
+
+#[test]
+fn pending_hold_admits_short_job_into_free_slot() {
+    let f = Fixture::new();
+    let mut long = macos_request(&f);
+    long.timeout = Some(70 * 60);
+    let short = other_workspace_request(&f, Some(5 * 60));
+    let (finish_long, receive_long) = mpsc::channel();
+    let (finish_short, receive_short) = mpsc::channel();
+    let backend = HoldBackend(Mutex::new(BTreeMap::from([
+        (long.job_id, receive_long),
+        (short.job_id, receive_short),
+    ])));
+    let runner = Runner::open_with_backend(config(&f), Box::new(backend)).unwrap();
+    submit(&f, &runner, &long);
+    wait_for(&runner, || running(&runner, long.job_id));
+    write_hold(&runner);
+    runner.tick().unwrap();
+    assert!(!granted(&runner));
+
+    submit(&f, &runner, &short);
+    wait_for(&runner, || running(&runner, short.job_id));
+    assert!(running(&runner, long.job_id));
+    assert!(!granted(&runner));
+    finish_short.send(()).unwrap();
+    wait_for(&runner, || finished(&runner, short.job_id));
+    assert!(!granted(&runner));
+    finish_long.send(()).unwrap();
+    wait_for(&runner, || granted(&runner));
+}
+
+#[test]
+fn pending_hold_refuses_job_that_would_outlast_running_job() {
+    let f = Fixture::new();
+    let mut running_job = macos_request(&f);
+    running_job.timeout = Some(900);
+    let (finish, receive) = mpsc::channel();
+    let backend = HoldBackend(Mutex::new(BTreeMap::from([(running_job.job_id, receive)])));
+    let runner = Runner::open_with_backend(config(&f), Box::new(backend)).unwrap();
+    let start_ms = runner.now();
+    submit(&f, &runner, &running_job);
+    wait_for(&runner, || running(&runner, running_job.job_id));
+    f.clock.fetch_add(300_000, Ordering::SeqCst);
+    write_hold(&runner);
+    runner.tick().unwrap();
+    assert!(!granted(&runner));
+
+    // Without the setup allowance, this job's deadline would fit.
+    let detail = hold_refusal_detail(&runner, other_workspace_request(&f, Some(301)));
+    assert!(
+        detail.contains("would end after the running jobs"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&(start_ms + 901_000).to_string()),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&(start_ms + 900_000).to_string()),
+        "{detail}"
+    );
+    let detail = hold_refusal_detail(&runner, other_workspace_request(&f, None));
+    assert!(detail.contains("this job has no time limit"), "{detail}");
+
+    finish.send(()).unwrap();
+    wait_for(&runner, || granted(&runner));
+}
+
+#[test]
+fn idle_runner_grants_hold_on_first_tick_and_refuses_timed_job() {
+    let f = Fixture::new();
+    let runner = Runner::open_with_backend(config(&f), Box::new(MacosTerminalBackend)).unwrap();
+    write_hold(&runner);
+    runner.tick().unwrap();
+    assert!(granted(&runner));
+    assert_eq!(
+        hold_refusal_detail(&runner, other_workspace_request(&f, Some(1))),
+        "runner_draining"
+    );
+}
+
 #[test]
 fn honoured_hold_refuses_new_run_while_running_job_finishes() {
     let f = Fixture::new();
@@ -162,6 +263,11 @@ fn honoured_hold_refuses_new_run_while_running_job_finishes() {
         runner.accept(macos_request(&f)).unwrap(),
         Admission::Refused(RefusalReason::RunnerDraining)
     ));
+    let detail = hold_refusal_detail(&runner, other_workspace_request(&f, Some(1)));
+    assert!(
+        detail.contains("a running job has no time limit"),
+        "{detail}"
+    );
     assert!(running(&runner, request.job_id));
     finish.send(()).unwrap();
     wait_for(&runner, || {

@@ -1,4 +1,4 @@
-use super::*;
+use super::{macos_hold::RunHoldCheck, *};
 
 impl Runner {
     fn qualification_marker(&self) -> PathBuf {
@@ -31,6 +31,42 @@ impl Runner {
             })
             .flatten()
             .map(|detail| (RefusalReason::RunnerFull, detail))
+    }
+
+    pub(super) fn run_refusal(
+        &self,
+        inner: &Inner,
+        request: &Run,
+        access: &crate::workspace_access::Repairs,
+    ) -> Option<(RefusalReason, String)> {
+        self.check_run_refusal(inner, request, access, None)
+    }
+
+    pub(super) fn refuse_run_admission(
+        &self,
+        job: &mut Job,
+        request: &Run,
+        (reason, error): &(RefusalReason, String),
+        disk_refused: bool,
+        hold: &RunHoldCheck,
+    ) {
+        let detail = if disk_refused {
+            error.clone()
+        } else if *reason == RefusalReason::RunnerDraining {
+            hold.refusal_detail().into()
+        } else {
+            self.safe_refusal_detail(error, request.env.values().cloned())
+        };
+        refuse_before_start(
+            &self.core.health,
+            job,
+            reason.clone(),
+            error,
+            Some(detail),
+            (*reason == RefusalReason::RunnerDraining).then(|| self.drain_retry_after_ms()),
+            self.now(),
+        );
+        job.state = JobState::Tombstone;
     }
 
     // Only the ACL-protected qualification listener may call this for a peer.

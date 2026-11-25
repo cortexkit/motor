@@ -289,29 +289,31 @@ impl State {
     }
 
     pub(crate) fn status(&mut self, now: u64) -> Option<String> {
-        self.status_for(now, false)
+        self.admission_refusal(now, false, || false)
     }
 
-    pub(crate) fn admission_refusal(&mut self, now: u64) -> Option<String> {
-        self.status_for(now, true)
-    }
-
-    fn status_for(&mut self, now: u64, record_refusal: bool) -> Option<String> {
+    pub(crate) fn admission_refusal(
+        &mut self,
+        now: u64,
+        record_refusal: bool,
+        allow_pending: impl FnOnce() -> bool,
+    ) -> Option<String> {
         let hold = self.honoured(now, &self.latest);
         if hold.as_ref() != self.granted.as_ref() {
             self.remove_grant();
         }
-        hold.map(|hold| {
-            if record_refusal {
-                self.refused_owner = Some(hold.owner.clone());
-            }
-            format!(
-                "held for {} until {} (granted: {})",
-                hold.owner,
-                hold.expires_at,
-                self.granted.as_ref() == Some(&hold)
-            )
-        })
+        let hold = hold?;
+        let granted = self.granted.as_ref() == Some(&hold);
+        if !granted && allow_pending() {
+            return None;
+        }
+        if record_refusal {
+            self.refused_owner = Some(hold.owner.clone());
+        }
+        Some(format!(
+            "held for {} until {} (granted: {granted})",
+            hold.owner, hold.expires_at,
+        ))
     }
 
     #[cfg(test)]
