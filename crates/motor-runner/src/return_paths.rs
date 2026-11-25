@@ -100,6 +100,27 @@ fn open_returned(
     walk_file_withholding(root, directory, relative, Some(&route.withheld), |_, _| {})
 }
 
+#[cfg(unix)]
+fn returned_executable(
+    metadata: &fs::Metadata,
+    relative: &Path,
+    route: Option<&TargetRoute>,
+) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    if route.is_some() && target_return(relative).is_some() {
+        // The guest copies build-volume files without preserving their mode,
+        // so the mode of a copy cannot tell us whether the original was executable.
+        return None;
+    }
+    Some(metadata.mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn returned_executable(_: &fs::Metadata, _: &Path, _: Option<&TargetRoute>) -> Option<bool> {
+    None
+}
+
 #[cfg(all(unix, test))]
 fn walk_file(
     root: &Path,
@@ -500,7 +521,7 @@ fn collect_with_root(
             let relative = relative(request, path)?;
             let file = open_returned(&root, &directory, relative, route)?;
             measured = measured.saturating_add(file.metadata().map_err(|_| Cause::Missing)?.len());
-            files.push(file);
+            files.push((relative, file));
         }
         if measured > request.return_max_bytes {
             return Err(Cause::OverCap);
@@ -508,14 +529,13 @@ fn collect_with_root(
         before_read();
         let mut returned = Vec::new();
         let mut read_bytes = 0u64;
-        for (path, mut file) in crate::caller_path::run(request)
+        for (path, (_, file)) in crate::caller_path::run(request)
             .caller_return_paths
             .iter()
             .zip(&files)
         {
             let mut bytes = Vec::new();
-            (&mut file)
-                .take(request.return_max_bytes - read_bytes)
+            file.take(request.return_max_bytes - read_bytes)
                 .read_to_end(&mut bytes)
                 .map_err(|_| Cause::Missing)?;
             read_bytes += bytes.len() as u64;
@@ -528,11 +548,13 @@ fn collect_with_root(
         }
         // Recheck the open files, not their pathnames, to detect growth while
         // reading without ever reading a byte beyond the caller's total cap.
-        measured = files.iter().try_fold(0u64, |sum, file| {
-            file.metadata()
-                .map(|m| sum.saturating_add(m.len()))
-                .map_err(|_| Cause::Missing)
-        })?;
+        let mut remeasured = 0u64;
+        for ((relative, file), returned) in files.iter().zip(&mut returned) {
+            let metadata = file.metadata().map_err(|_| Cause::Missing)?;
+            remeasured = remeasured.saturating_add(metadata.len());
+            returned.executable = returned_executable(&metadata, relative, route);
+        }
+        measured = remeasured;
         if measured > request.return_max_bytes {
             return Err(Cause::OverCap);
         }
@@ -609,10 +631,23 @@ impl ChunkedCollection {
 enum Read {
     Returned {
         sha256: String,
+        metadata: fs::Metadata,
     },
     /// The file could not be read, changed size, or its path no longer named
     /// the opened file afterwards. Its chunks are dropped.
     Changed,
+}
+
+enum CollectedFile {
+    Returned {
+        size: u64,
+        sha256: String,
+        executable: Option<bool>,
+    },
+    Failed {
+        cause: ReturnPathsFailureCause,
+        size: Option<u64>,
+    },
 }
 
 /// Collect a `return_chunked` request's files into chunk files under a new
@@ -668,9 +703,11 @@ fn collect_chunked_with_root(
 ) -> ChunkedCollection {
     let cap = request.return_max_bytes;
     let directory = format!("{RETURNED_DIRECTORY_PREFIX}{}", Uuid::now_v7());
-    let mut outcomes: Vec<Option<ReturnManifestOutcome>> =
-        vec![None; crate::caller_path::run(request).caller_return_paths.len()];
-    let fail = |cause, size| ReturnManifestOutcome::Failed { cause, size };
+    let mut outcomes: Vec<Option<CollectedFile>> =
+        (0..crate::caller_path::run(request).caller_return_paths.len())
+            .map(|_| None)
+            .collect();
+    let fail = |cause, size| CollectedFile::Failed { cause, size };
     let mut admitted = Vec::new();
     let mut total = 0u64;
     match root {
@@ -712,20 +749,21 @@ fn collect_chunked_with_root(
                     let read =
                         read_chunks(file, *size, *index as u32, &chunk_directory, &mut chunks)?;
                     let read = match read {
-                        Read::Returned { sha256 }
+                        Read::Returned { .. }
                             if same_file(
                                 file,
                                 open_returned(&root, &root_directory, relative, route),
                             ) =>
                         {
-                            Read::Returned { sha256 }
+                            read
                         }
                         _ => Read::Changed,
                     };
                     outcomes[*index] = Some(match read {
-                        Read::Returned { sha256 } => ReturnManifestOutcome::Returned {
+                        Read::Returned { sha256, metadata } => CollectedFile::Returned {
                             size: *size,
                             sha256,
+                            executable: returned_executable(&metadata, relative, route),
                         },
                         Read::Changed => {
                             for position in first..chunks.len() {
@@ -765,7 +803,7 @@ fn finish(
     request: &Run,
     directory: String,
     chunks: Vec<ReturnedChunk>,
-    outcomes: Vec<Option<ReturnManifestOutcome>>,
+    outcomes: Vec<Option<CollectedFile>>,
     total_bytes: u64,
 ) -> ChunkedCollection {
     let files = crate::caller_path::run(request)
@@ -774,17 +812,22 @@ fn finish(
         .zip(outcomes)
         .map(
             |(path, outcome)| match outcome.expect("every requested path has an outcome") {
-                ReturnManifestOutcome::Returned { size, sha256 } => {
-                    ReturnManifestEntry::returned(path.clone(), size, sha256)
+                CollectedFile::Returned {
+                    size,
+                    sha256,
+                    executable,
+                } => {
+                    let mut entry = ReturnManifestEntry::returned(path.clone(), size, sha256);
+                    entry.executable = executable;
+                    entry
                 }
-                ReturnManifestOutcome::Failed { cause, size } => {
+                CollectedFile::Failed { cause, size } => {
                     let entry = ReturnManifestEntry::failed(path.clone(), cause);
                     match size {
                         Some(size) => entry.with_size(size),
                         None => entry,
                     }
                 }
-                _ => unreachable!("collection produces only returned and failed entries"),
             },
         )
         .collect();
@@ -840,12 +883,15 @@ fn read_chunks(
         });
         offset += length as u64;
     }
-    let resized = !file.metadata().is_ok_and(|m| m.len() == size);
-    if resized {
+    let Ok(metadata) = file.metadata() else {
+        return Ok(Read::Changed);
+    };
+    if metadata.len() != size {
         return Ok(Read::Changed);
     }
     Ok(Read::Returned {
         sha256: format!("{:x}", hasher.finalize()),
+        metadata,
     })
 }
 
@@ -863,7 +909,7 @@ pub(crate) struct StreamedCollection {
     job_directory: PathBuf,
     directory: String,
     chunks: Vec<ReturnedChunk>,
-    outcomes: Vec<Option<ReturnManifestOutcome>>,
+    outcomes: Vec<Option<CollectedFile>>,
     buffer: Vec<u8>,
     hasher: Sha256,
     current: u64,
@@ -968,7 +1014,11 @@ impl StreamedCollection {
                 }
                 self.flush()?;
                 self.total += size;
-                ReturnManifestOutcome::Returned { size, sha256 }
+                CollectedFile::Returned {
+                    size,
+                    sha256,
+                    executable: None,
+                }
             }
             Outcome::Failed { cause, size } => {
                 self.discarded += self.current;
@@ -988,7 +1038,7 @@ impl StreamedCollection {
                     Failure::NotRegular => ReturnPathsFailureCause::NotRegular,
                     Failure::ReadError => ReturnPathsFailureCause::ReadError,
                 };
-                ReturnManifestOutcome::Failed { cause, size }
+                CollectedFile::Failed { cause, size }
             }
         };
         self.outcomes.push(Some(outcome));
@@ -1085,7 +1135,7 @@ fn legacy_from_chunks(request: &Run, job: &Path, collection: &ChunkedCollection)
                 path: crate::caller_path::run(request).caller_return_paths[index].clone(),
                 sha256,
                 data: STANDARD.encode(bytes),
-                executable: None,
+                executable: entry.executable(),
             });
         }
         Ok(files)
@@ -1392,7 +1442,7 @@ mod tests {
                 path: file.to_str().unwrap().into(),
                 sha256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881".into(),
                 data: "eA==".into(),
-                executable: None,
+                executable: cfg!(unix).then_some(false),
             }]
         );
     }
@@ -1627,6 +1677,43 @@ mod tests {
             collection.files[0].outcome(),
             ReturnManifestOutcome::Returned { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_returns_report_checkout_modes_but_not_build_volume_copy_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = macos_stage();
+        fs::set_permissions(s.staged.join("src/kept"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(s.staged.join("src/plain"), b"plain").unwrap();
+        let paths =
+            ["target/debug/app", "src/kept", "src/plain"].map(|path| s.canonical.join(path));
+        for chunked in [false, true] {
+            let mut run = request(&s.canonical, &paths.each_ref().map(PathBuf::as_path), 1000);
+            run.return_chunked = chunked;
+            let modes: Vec<_> =
+                match collect_staged_with_target(&run, &s.staged, Some(&s.copies), &s.job) {
+                    Collection::Legacy(result) => result
+                        .returned_files
+                        .unwrap()
+                        .into_iter()
+                        .map(|file| file.executable)
+                        .collect(),
+                    Collection::Chunked(collection) => collection
+                        .files
+                        .iter()
+                        .map(|file| {
+                            assert!(matches!(
+                                file.outcome(),
+                                ReturnManifestOutcome::Returned { .. }
+                            ));
+                            file.executable()
+                        })
+                        .collect(),
+                };
+            assert_eq!(modes, [None, Some(true), Some(false)], "chunked={chunked}");
+        }
     }
 
     /// Without the agent's copies (no clean release, or the job replaced the

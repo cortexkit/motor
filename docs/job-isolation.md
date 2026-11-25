@@ -378,6 +378,12 @@ the host directory, is `escape`. Tests:
 `mapped_writer_refusal_details_name_the_caller_not_host_storage`
 (`crates/motor-runner/src/tests/caller_authorization.rs`).
 
+Returned files from Linux and macOS keep their executable bit. On macOS, files
+returned from the build folder (`target/`) don't report the bit yet and are
+left as before. When the bit is reported, paths with a `.git` component
+(`.git` in any letter case) stay non-executable. See
+[Direct runs](module.md#direct-runs) for local write modes.
+
 3.8.8. **`forget-caller-root`** is the only way to retire a mapping. It takes
 the instance's full serve argument list and the prefix:
 

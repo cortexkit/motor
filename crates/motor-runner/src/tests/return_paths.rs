@@ -276,6 +276,53 @@ fn chunked_request(f: &Fixture, command: &str, files: &[&str]) -> (Run, Vec<Vec<
     (request, bytes)
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn returned_files_report_any_execute_bit_for_plain_and_chunked_jobs() {
+    for chunked in [false, true] {
+        let f = Fixture::new();
+        let runner = Runner::open(f.config()).unwrap();
+        let (mut request, bytes) =
+            f.run("printf x > script; printf y > plain; chmod 0641 script; chmod 0640 plain");
+        request.return_paths = ["script", "plain"]
+            .into_iter()
+            .chain(chunked.then_some("missing"))
+            .map(|file| format!("{}/{file}", f.key))
+            .collect();
+        request.return_max_bytes = 2;
+        request.return_chunked = chunked;
+        f.submit(&runner, &request, &bytes);
+        assert_eq!(
+            terminal(&runner, request.job_id).await.outcome,
+            Outcome::Exit { code: 0 }
+        );
+        base_done(&runner).await;
+        let frames = runner.replay(request.job_id, 0).unwrap();
+        let returned = &frames[frames.len() - 2];
+        if chunked {
+            let (files, manifest, _) = assemble(&frames, &request);
+            assert_eq!(files, [Some(b"x".to_vec()), Some(b"y".to_vec()), None]);
+            assert_eq!(manifest.files[0].executable(), Some(true));
+            assert_eq!(manifest.files[1].executable(), Some(false));
+            assert_eq!(
+                manifest.files[2].cause(),
+                Some(&ReturnPathsFailureCause::Missing)
+            );
+            assert_eq!(manifest.files[2].executable(), None);
+            let wire = serde_json::to_value(returned).unwrap();
+            assert!(wire["files"][2].get("executable").is_none());
+        } else {
+            let Frame::ReturnResult(result) = returned else {
+                panic!("expected a plain return result: {returned:?}");
+            };
+            let files = result.returned_files.as_deref().unwrap();
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0].executable, Some(true));
+            assert_eq!(files[1].executable, Some(false));
+        }
+    }
+}
+
 #[tokio::test]
 async fn return_chunked_430_kb_file_round_trips_through_replay_and_restart() {
     let f = Fixture::new();
