@@ -161,8 +161,9 @@ pub const CANCEL_HELP: &str = "\
 usage: ck motor cancel JOB_ID [--force] [--secret-file PATH]
 
 Uses the saved default secret for JOB_ID when available, otherwise reads one
-line of stdin; --secret-file PATH selects an explicit secret file. Secrets are
-never accepted as arguments or from environment variables.
+line of stdin; --secret-file PATH selects an explicit secret file. A job started
+with --secret-file has its secret only in that file, so pass the same path.
+Secrets are never accepted as arguments or from environment variables.
 
 Run from the job's submitting checkout, or pass --force to skip the checkout
 check. A different or unknown checkout is refused with exit status 204.
@@ -175,8 +176,8 @@ it does not wait for the job to end. The result is printed as one line:
 Exit status: 0 when the job is cancelled or had already ended (including
 refused before start), 201 when the cancel may not have reached ck-motor and the
 job's fate is unknown, 200 when ck-motor refuses the cancel (with --force, an
-unknown job ID and a wrong secret look the same), 204 for bad arguments or when
-the checkout cannot be matched.
+unknown job ID and a wrong secret look the same), 204 for bad arguments, when
+no secret is found, or when the checkout cannot be matched.
 
 The job's reattach secret file is kept, so `ck motor attach JOB_ID` can still
 read the job's final output.";
@@ -477,7 +478,9 @@ pub const ATTACH_HELP: &str = "\
 usage: ck motor attach JOB_ID [--secret-file PATH] [--status]
 
 Uses the saved default secret for JOB_ID when available, otherwise reads one
-line of stdin; --secret-file PATH selects an explicit secret file.
+line of stdin; --secret-file PATH selects an explicit secret file. A job started
+with --secret-file has its secret only in that file, so pass the same path.
+With no secret found, nothing is sent and the exit status is 204.
 Secrets are never accepted as arguments or from environment variables.
 `ck motor cancel JOB_ID` uses the same lookup to stop a job that is still running.
 Replays output from the start, then streams until the job ends. --status prints
@@ -1175,6 +1178,28 @@ pub fn reattach_secret(
             saved_file: None,
         },
     }
+}
+
+/// Why no secret was found for `job_id`, or `None` when there is one.
+///
+/// Without a secret ck-motor answers "no such job for this caller" (a wrong
+/// secret and an unknown job look the same on purpose), which sends the caller
+/// looking for a missing job. The usual cause is a job started with
+/// `--secret-file`: its secret is in that file, not in ck-motor's saved copies.
+fn missing_secret(
+    job_id: Uuid,
+    secret_file: Option<&Path>,
+    found: &ReattachSecret,
+) -> Option<String> {
+    if !found.secret.is_empty() {
+        return None;
+    }
+    Some(match secret_file {
+        Some(path) => format!("cannot read a secret from {}", path.display()),
+        None => format!(
+            "no saved secret for {job_id} and none on stdin; if the job was started with --secret-file, pass the same --secret-file PATH"
+        ),
+    })
 }
 
 /// The secret for an attach or cancel, from ck-motor's own data directory.
@@ -2473,6 +2498,10 @@ pub async fn attach_main(args: &[String]) -> u8 {
         args.secret_file.as_deref(),
         std::io::stdin().lock(),
     );
+    if let Some(message) = missing_secret(args.job_id, args.secret_file.as_deref(), &found) {
+        eprintln!("ck motor attach: {message}");
+        return EXIT_USAGE;
+    }
     let default_secret_file = found.default_file.clone();
     let workspace = match std::env::current_dir() {
         Ok(path) => path,
@@ -2521,6 +2550,10 @@ pub async fn cancel_main(args: &[String]) -> u8 {
         args.secret_file.as_deref(),
         std::io::stdin().lock(),
     );
+    if let Some(message) = missing_secret(args.job_id, args.secret_file.as_deref(), &found) {
+        eprintln!("ck motor cancel: {message}; no cancel sent");
+        return EXIT_USAGE;
+    }
     let workspace = match std::env::current_dir() {
         Ok(path) => path,
         Err(_) => {
@@ -2704,6 +2737,25 @@ mod tests {
         let link = super::default_secret_path(&directory, linked_id);
         std::os::unix::fs::symlink(&file.path, &link).unwrap();
         assert!(super::SecretFile::create_default(&directory, linked_id).is_err());
+    }
+
+    #[test]
+    fn missing_secret_names_the_secret_file_instead_of_sending_an_empty_secret() {
+        let job_id = motor_protocol::Uuid::now_v7();
+        // A job started with --secret-file has no saved copy, so without the
+        // same path and with empty stdin the lookup finds nothing.
+        let found = super::reattach_secret(job_id, None, &b""[..], |_| None);
+        let message = super::missing_secret(job_id, None, &found).unwrap();
+        assert!(message.contains(&job_id.to_string()), "{message}");
+        assert!(message.contains("--secret-file"), "{message}");
+
+        let path = std::path::Path::new("/nonexistent/job.secret");
+        let found = super::reattach_secret(job_id, Some(path), &b""[..], |_| None);
+        let message = super::missing_secret(job_id, Some(path), &found).unwrap();
+        assert!(message.contains("/nonexistent/job.secret"), "{message}");
+
+        let found = super::reattach_secret(job_id, None, &b"secret\n"[..], |_| None);
+        assert_eq!(super::missing_secret(job_id, None, &found), None);
     }
 
     #[test]
