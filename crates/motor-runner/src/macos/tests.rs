@@ -1325,6 +1325,76 @@ esac
 }
 
 #[test]
+fn nested_package_inside_enclosing_workspace_is_not_fetched() {
+    let mut f = Fixture::new();
+    let package = "[package]\nname = \"patched\"\nversion = \"0.1.0\"\n";
+    // A vendored crate inside the root workspace keeps its upstream lockfile;
+    // a nested folder declaring its own workspace is a separate root.
+    for (directory, manifest) in [
+        ("", "[workspace]\n"),
+        ("vendor/patched", package),
+        ("spikes/own", "[workspace]\n"),
+        ("spikes/own/vendor/inner", package),
+    ] {
+        write(&f.source.join(directory).join("Cargo.toml"), manifest);
+        write(&f.source.join(directory).join("Cargo.lock"), "version=4\n");
+    }
+    f.staging.tools.cargo = tool(
+        f.scratch.join("tools/cargo"),
+        r#"#!/bin/sh
+set -eu
+mkdir -p "$CARGO_HOME/registry/cache"
+cache="$CARGO_HOME/registry/cache/fetch-order"
+case "$4" in
+    */project/Cargo.toml) echo root >> "$cache" ;;
+    */spikes/own/Cargo.toml) echo own >> "$cache" ;;
+    *) echo "unexpected $4" >> "$cache"; exit 1 ;;
+esac
+"#,
+    );
+    let prepared = f
+        .staging
+        .prepare(&f.request(), Cancellation::default())
+        .unwrap();
+    assert_eq!(prepared.cargo_warnings, "");
+    assert_eq!(
+        host::read_to_string(prepared.cargo_home.join("registry/cache/fetch-order")).unwrap(),
+        "root\nown\n",
+    );
+}
+
+#[test]
+fn nested_package_without_enclosing_workspace_is_fetched() {
+    let mut f = Fixture::new();
+    let package = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n");
+    for (directory, name) in [("", "root"), ("tools/standalone", "standalone")] {
+        write(&f.source.join(directory).join("Cargo.toml"), &package(name));
+        write(&f.source.join(directory).join("Cargo.lock"), "version=4\n");
+    }
+    f.staging.tools.cargo = tool(
+        f.scratch.join("tools/cargo"),
+        r#"#!/bin/sh
+set -eu
+mkdir -p "$CARGO_HOME/registry/cache"
+cache="$CARGO_HOME/registry/cache/fetch-order"
+case "$4" in
+    */project/Cargo.toml) echo root >> "$cache" ;;
+    */tools/standalone/Cargo.toml) echo standalone >> "$cache" ;;
+    *) exit 1 ;;
+esac
+"#,
+    );
+    let prepared = f
+        .staging
+        .prepare(&f.request(), Cancellation::default())
+        .unwrap();
+    assert_eq!(
+        host::read_to_string(prepared.cargo_home.join("registry/cache/fetch-order")).unwrap(),
+        "root\nstandalone\n",
+    );
+}
+
+#[test]
 fn bun_sees_root_git_alias_after_nested_cargo_fetch() {
     let mut f = Fixture::new();
     let private = f.scratch.join("private");

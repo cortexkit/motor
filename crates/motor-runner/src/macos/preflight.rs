@@ -357,6 +357,7 @@ pub(super) fn validate(
     trees: &Trees,
     control: &Control,
 ) -> io::Result<Validated> {
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         dir: &Dir,
         base: &Path,
@@ -365,8 +366,22 @@ pub(super) fn validate(
         trees: &Trees,
         validated: &mut Validated,
         control: &Control,
+        enclosing_workspace: bool,
     ) -> io::Result<()> {
-        let mut cargo_manifest = false;
+        // Read the manifest before the subfolders, so they know whether an
+        // enclosing workspace already owns them.
+        let manifest_name = std::ffi::OsStr::new("Cargo.toml");
+        let manifest = if dir.contains(manifest_name)? {
+            let value =
+                toml::from_str::<toml::Value>(&dir.text(manifest_name)?).map_err(invalid)?;
+            cargo(&value, base, roots)?;
+            Some(value)
+        } else {
+            None
+        };
+        let declares_workspace = manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.get("workspace").is_some());
         let mut cargo_lock = false;
         // The prep copy already drops target/ and .git/ and bounds tree depth.
         for name in dir.names()? {
@@ -381,18 +396,13 @@ pub(super) fn validate(
                     trees,
                     validated,
                     control,
+                    enclosing_workspace || declares_workspace,
                 )?;
                 continue;
             }
             match name.to_str() {
-                Some("Cargo.toml") => {
-                    cargo(
-                        &toml::from_str::<toml::Value>(&dir.text(&name)?).map_err(invalid)?,
-                        base,
-                        roots,
-                    )?;
-                    cargo_manifest = true;
-                }
+                // Validated above, before the subfolders.
+                Some("Cargo.toml") => {}
                 Some("Cargo.lock") => {
                     let text = dir.text(&name)?;
                     lock(&text)?;
@@ -420,7 +430,14 @@ pub(super) fn validate(
                 _ => {}
             }
         }
-        if cargo_manifest && cargo_lock && !roots.iter().any(|root| root == base) {
+        // A lockfile marks a separate workspace only when Cargo would treat
+        // the folder as its own root: it declares `[workspace]`, or no
+        // enclosing manifest does. A package inside an enclosing workspace
+        // (such as a vendored crate wired in through `[patch]`) can carry
+        // its upstream lockfile, which Cargo ignores there and which can't be
+        // fetched on its own.
+        let own_root = declares_workspace || !enclosing_workspace;
+        if manifest.is_some() && cargo_lock && own_root && !roots.iter().any(|root| root == base) {
             if validated.nested_cargo.len() < MAX_NESTED_CARGO_FETCHES {
                 validated.nested_cargo.push(base.to_path_buf());
             } else {
@@ -439,6 +456,7 @@ pub(super) fn validate(
             trees,
             &mut validated,
             control,
+            false,
         )?;
     }
     Ok(validated)
