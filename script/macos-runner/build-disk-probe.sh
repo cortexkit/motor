@@ -46,9 +46,9 @@
 # Output lines: "stdout:"/"stderr:" are the guest command's, "helper:" the job
 # helper's status reports, "returns:" and "target link:" what the host found
 # after the VM stopped, and "RESULT <bus>:" the verdict for each attachment.
-# The agent also prints one "motor: build-volume diagnostic watch:" line saying
-# whether, and how long after mounting, the build mount or target stopped
-# reaching the volume. The script exits 0 only when, with the attachment job
+# If the build mount or target stops reaching the volume, the agent also prints
+# a "motor: build-volume diagnostic watch:" line saying how long after mounting
+# that happened; a healthy run prints none. The script exits 0 only when, with the attachment job
 # VMs now use (USB), target/ reached the volume at every step in both VMs, the
 # agent reported the build disk released ("agent: build disk released: true"), the
 # returns directory held only the returned file, target was still the link,
