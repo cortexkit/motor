@@ -112,7 +112,7 @@ def tool_version(path, env, observed, version_from=None):
 
 
 def role_manifest(manifest, role, job=False):
-    """Select the role's toolchain roots; jobs keep registry caches in /motor-home/cargo."""
+    """Select the role's tools and paths; jobs keep registry caches in /motor-home/cargo."""
     selected = {**manifest, **manifest.get('layout_by_role', {}).get(role, {}).get('job' if job else 'host', {})}
     selected['tools'] = {name: spec for name, spec in manifest['tools'].items()
                          if role in spec.get('roles', ('build-server', 'boat', 'tenant'))}
@@ -123,6 +123,9 @@ def role_manifest(manifest, role, job=False):
             name: {**spec, 'targets': [target for target in spec['targets'] if target not in targets],
                    'components': [component for component in spec['components'] if component not in components]}
             for name, spec in manifest['rust_toolchains'].items()}
+    elif role in ('boat', 'tenant'):
+        selected['rust_toolchains'] = {**manifest['rust_toolchains'],
+                                       **manifest.get('image_only_rust_toolchains', {})}
     return selected
 
 
@@ -411,7 +414,11 @@ def validate(manifest, role="build-server"):
     for key in ("rustup",):
         if not re.fullmatch(r"\d+\.\d+\.\d+", manifest[key]):
             raise ValueError("unpinned version: " + key)
-    for name, spec in manifest["rust_toolchains"].items():
+    shared = manifest["rust_toolchains"]
+    image_only = manifest.get("image_only_rust_toolchains", {})
+    if not isinstance(image_only, dict) or shared.keys() & image_only.keys():
+        raise ValueError("invalid or overlapping image-only Rust toolchains")
+    for name, spec in {**shared, **image_only}.items():
         if not re.fullmatch(r"(?:\d+\.\d+\.\d+|stable)-x86_64-unknown-linux-gnu", name):
             raise ValueError("unpinned Rust toolchain: " + name)
         if not re.fullmatch(r"rustc \d+\.\d+\.\d+ \([a-f0-9]+ \d{4}-\d{2}-\d{2}\)", spec["rustc"]):
@@ -850,7 +857,7 @@ def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_
 
 
 def refresh(manifest, actual):
-    # Preserve install sources and accepted OS differences; refresh host measurements.
+    # Refresh host measurements without replacing install sources or image-only toolchains.
     manifest = json.loads(json.dumps(manifest))
     image_targets = {name: set(spec['targets']) & set(manifest.get('image_only_rust_targets', []))
                      for name, spec in manifest['rust_toolchains'].items()}

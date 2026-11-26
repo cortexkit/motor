@@ -52,9 +52,12 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(manifest["tools"]["nats-server"]["version"], "nats-server: v2.15.0")
         self.assertIn("libsqlite3-dev", manifest["apt_packages"]["required"])
         self.assertIn("python3", manifest["apt_packages"]["required"])
-        self.assertEqual(set(manifest["rust_toolchains"]), {
-            name + "-x86_64-unknown-linux-gnu"
-            for name in ("1.91.0", "1.92.0", "1.96.0", "1.99.0", "1.100.0", "stable")})
+        for role in ("boat", "tenant"):
+            with self.subTest(role=role):
+                selected = install.parity.role_manifest(manifest, role)
+                self.assertEqual(set(selected["rust_toolchains"]), {
+                    name + "-x86_64-unknown-linux-gnu"
+                    for name in ("1.91.0", "1.92.0", "1.96.0", "1.99.0", "1.99.1", "1.100.0", "stable")})
 
     def test_rust_1_100_is_default_with_previous_toolchains_still_installed(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
@@ -71,6 +74,19 @@ class RecipeTests(unittest.TestCase):
                      if call.args[:3] == ('rustup', 'toolchain', 'install')}
         self.assertTrue({'1.96.0-x86_64-unknown-linux-gnu',
                          '1.99.0-x86_64-unknown-linux-gnu'} <= installed)
+
+    def test_linux_images_install_rust_1_99_1_with_only_clippy_rustfmt_and_wasm(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        name = '1.99.1-x86_64-unknown-linux-gnu'
+        for role in ('boat', 'tenant'):
+            with self.subTest(role=role), patch.object(install, 'run', return_value='') as run:
+                install.install_rust(manifest, '/rustup-init', role=role)
+                commands = [call.args for call in run.call_args_list
+                            if call.args[:4] == ('rustup', 'toolchain', 'install', name)]
+                self.assertEqual(commands, [('rustup', 'toolchain', 'install', name, '--profile', 'minimal',
+                                             '--component', 'clippy', '--component', 'rustfmt',
+                                             '--target', 'wasm32-unknown-unknown',
+                                             '--target', 'x86_64-unknown-linux-gnu')])
 
     def test_accounts_use_boats_system_assigned_rule(self):
         with patch.object(install.job_account, 'ensure') as ensure, \
@@ -90,10 +106,11 @@ class RecipeTests(unittest.TestCase):
 
     def test_recipe_preinstalls_wasm32_unknown_unknown(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
+        selected = install.parity.role_manifest(manifest, 'boat')
         with patch.object(install, "run", return_value="") as run:
             install.install_rust(manifest, "/rustup-init")
         commands = [call.args for call in run.call_args_list if call.args[:3] == ('rustup', 'toolchain', 'install')]
-        self.assertEqual({command[3] for command in commands}, {name for name in manifest['rust_toolchains'] if not name.startswith('stable-')})
+        self.assertEqual({command[3] for command in commands}, {name for name in selected['rust_toolchains'] if not name.startswith('stable-')})
         for command in commands:
             components = [command[i + 1] for i, arg in enumerate(command) if arg == '--component']
             targets = [command[i + 1] for i, arg in enumerate(command) if arg == '--target']
@@ -105,7 +122,7 @@ class RecipeTests(unittest.TestCase):
             # 1.92.0 stays without clippy, exactly as on the build server.
             host = command[3].split('-', 1)[1]
             expected = {install.rustup_component_name(component, host)
-                        for component in manifest['rust_toolchains'][command[3]]['components']
+                        for component in selected['rust_toolchains'][command[3]]['components']
                         if not component.startswith('rust-std-')} - {'cargo', 'rustc'}
             self.assertEqual(set(components), expected)
         self.assertNotIn('clippy', [c for cmd in commands if cmd[3].startswith('1.92.0-')
@@ -195,16 +212,17 @@ class RecipeTests(unittest.TestCase):
 
     def test_recipe_freezes_stable_when_upstream_has_moved(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
+        chains = install.parity.role_manifest(manifest, 'boat')['rust_toolchains']
         stable = 'stable-x86_64-unknown-linux-gnu'
         numbered = '1.99.0-x86_64-unknown-linux-gnu'
-        state = copy.deepcopy(manifest['rust_toolchains'])
+        state = copy.deepcopy(chains)
         state[stable]['rustc'] = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
         def run(*args, **kwargs):
             if args[:3] == ('rustup', 'toolchain', 'list'):
                 return '\n'.join(state)
             if args[:3] == ('rustup', 'toolchain', 'install'):
                 name = args[3]
-                state[name] = copy.deepcopy(manifest['rust_toolchains'][name])
+                state[name] = copy.deepcopy(chains[name])
                 if name == stable:
                     state[name]['rustc'] = 'rustc 1.99.1 (58cf8f9c3 2026-10-13)'
             elif args[:3] == ('rustup', 'toolchain', 'uninstall'):

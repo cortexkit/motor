@@ -223,6 +223,8 @@ class ImageTests(unittest.TestCase):
         manifest = json.loads((image.REPO / "script/runner/toolchain.json").read_text())
         self.assertEqual(pins["rust_toolchains"]["1.100.0"],
                          manifest["rust_toolchains"]["1.100.0-x86_64-unknown-linux-gnu"]["targets"])
+        self.assertEqual(pins["rust_toolchains"]["1.99.1"],
+                         manifest["image_only_rust_toolchains"]["1.99.1-x86_64-unknown-linux-gnu"]["targets"])
 
     def test_debootstrap_includes_the_pinned_git_build_dependencies(self):
         pins = image.load_versions(self.versions)
