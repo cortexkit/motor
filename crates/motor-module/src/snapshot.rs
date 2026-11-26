@@ -14,6 +14,7 @@ use std::{
 
 const INDEX_LOCK_WAIT: Duration = Duration::from_secs(10);
 const INDEX_LOCK_POLL: Duration = Duration::from_millis(50);
+const CHECKOUT_CHANGED: &str = "checkout changed during capture";
 /// A snapshot's git steps normally finish well under a second. A much slower
 /// one usually means large untracked, non-ignored files being hashed and
 /// compressed into the caller's repository, so it is logged with its checkout.
@@ -390,6 +391,50 @@ struct Fingerprint {
     files: BTreeMap<PathBuf, Option<FileStamp>>,
 }
 
+#[derive(Clone, Copy)]
+enum CaptureChangeKind {
+    HeadMoved,
+    PathAdded,
+    PathRemoved,
+    FileMetadataChanged,
+    DirectoryEntryChurn,
+}
+
+impl CaptureChangeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HeadMoved => "HEAD moved",
+            Self::PathAdded => "path added",
+            Self::PathRemoved => "path removed",
+            Self::FileMetadataChanged => "file metadata changed",
+            Self::DirectoryEntryChurn => "folder timestamps or size",
+        }
+    }
+}
+
+struct CaptureChange {
+    kind: CaptureChangeKind,
+    path: PathBuf,
+}
+
+impl CaptureChange {
+    fn refusal_detail(&self) -> String {
+        let path: String = if self.path.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            // Keep a path containing a newline from splitting the refusal detail.
+            self.path.to_string_lossy().escape_debug().collect()
+        };
+        let mut detail = format!("{CHECKOUT_CHANGED}: {} {path}", self.kind.as_str());
+        let mut end = detail.len().min(REFUSAL_DETAIL_MAX_BYTES);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+        detail
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct FileStamp {
     size: u64,
@@ -398,7 +443,68 @@ struct FileStamp {
     inode: u64,
     device: u64,
     mode: u32,
+    directory: bool,
     submodule_head: Option<String>,
+}
+
+impl FileStamp {
+    fn same_content_ignoring_directory_entry_churn(&self, other: &Self) -> bool {
+        // A directory's size and times reflect its entry list. Its identity, mode
+        // and any tracked submodule HEAD still affect capture stability.
+        self == other
+            || (self.directory
+                && other.directory
+                && self.inode == other.inode
+                && self.device == other.device
+                && self.mode == other.mode
+                && self.submodule_head == other.submodule_head)
+    }
+}
+
+impl Fingerprint {
+    fn first_change(&self, after: &Self) -> Option<CaptureChange> {
+        if self.head != after.head {
+            return Some(CaptureChange {
+                kind: CaptureChangeKind::HeadMoved,
+                path: PathBuf::new(),
+            });
+        }
+        let paths: BTreeSet<_> = self.files.keys().chain(after.files.keys()).collect();
+        for path in paths {
+            let kind = match (self.files.get(path), after.files.get(path)) {
+                (None, Some(_)) | (Some(None), Some(Some(_))) => CaptureChangeKind::PathAdded,
+                (Some(_), None) | (Some(Some(_)), Some(None)) => CaptureChangeKind::PathRemoved,
+                (Some(Some(before)), Some(Some(after))) if before != after => {
+                    if before.same_content_ignoring_directory_entry_churn(after) {
+                        CaptureChangeKind::DirectoryEntryChurn
+                    } else {
+                        CaptureChangeKind::FileMetadataChanged
+                    }
+                }
+                _ => continue,
+            };
+            return Some(CaptureChange {
+                kind,
+                path: path.to_path_buf(),
+            });
+        }
+        None
+    }
+
+    fn same_content_ignoring_directory_entry_churn(&self, other: &Self) -> bool {
+        self.head == other.head
+            && self.files.len() == other.files.len()
+            && self
+                .files
+                .iter()
+                .all(|(path, before)| match (before, other.files.get(path)) {
+                    (Some(before), Some(Some(after))) => {
+                        before.same_content_ignoring_directory_entry_churn(after)
+                    }
+                    (None, Some(None)) => true,
+                    _ => false,
+                })
+    }
 }
 
 fn head_gitlinks(path: &Path, head: &str) -> io::Result<BTreeSet<PathBuf>> {
@@ -632,6 +738,7 @@ fn fingerprint(path: &Path, index: &Index) -> io::Result<Fingerprint> {
                 inode: m.ino(),
                 device: m.dev(),
                 mode: m.mode(),
+                directory: m.is_dir(),
                 submodule_head: if m.is_dir()
                     && !relative.as_os_str().is_empty()
                     && head_gitlinks.contains(&relative)
@@ -708,6 +815,7 @@ fn snapshot_with_hook_and_timeout(
     mut after_capture: impl FnMut(usize),
 ) -> Result<Snapshot, Failure> {
     let mut tree_hash = None;
+    let mut previous_tree = None;
     let deadline = Instant::now() + lock_wait_timeout;
     let result = (|| -> io::Result<Snapshot> {
         prune(path)?;
@@ -715,6 +823,9 @@ fn snapshot_with_hook_and_timeout(
         // the index and moves HEAD; rev-parse resolves the correct linked-worktree path.
         let lock = index_lock_path(path)?;
         for attempt in 0..3 {
+            // Only an immediately preceding completed comparison can corroborate
+            // directory-entry churn in this attempt.
+            let prior_tree = previous_tree.take();
             // A writer that started before capture must finish before we read HEAD.
             wait_for_index_lock_clear(path, &lock, deadline)?;
             let index = Index(spool.join(format!("index-{index_number}")));
@@ -839,6 +950,19 @@ fn snapshot_with_hook_and_timeout(
             // inventory, including newly created untracked files and symlink metadata.
             match fingerprint(path, &index) {
                 Ok(after) if before == after => {}
+                Ok(after)
+                    if prior_tree.as_deref() == Some(tree.as_str())
+                        && before.same_content_ignoring_directory_entry_churn(&after) => {}
+                Ok(after) => {
+                    previous_tree = Some(tree.clone());
+                    if attempt == 2 {
+                        let change = before
+                            .first_change(&after)
+                            .expect("different fingerprints must have a first change");
+                        return Err(io::Error::other(change.refusal_detail()));
+                    }
+                    continue;
+                }
                 Err(error) if attempt == 2 => return Err(error),
                 _ => continue,
             }
@@ -869,13 +993,15 @@ fn snapshot_with_hook_and_timeout(
                 tip: None,
             });
         }
-        Err(io::Error::other("checkout changed during capture"))
+        Err(io::Error::other(CHECKOUT_CHANGED))
     })();
     result.map_err(|error| {
         let detail = error.to_string();
         Failure {
             tree_hash,
-            check: if detail == "checkout changed during capture"
+            check: if detail
+                .strip_prefix(CHECKOUT_CHANGED)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(": "))
                 || detail.starts_with("a git operation is still running in ")
             {
                 detail
