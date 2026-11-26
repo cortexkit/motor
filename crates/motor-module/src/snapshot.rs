@@ -407,7 +407,7 @@ impl CaptureChangeKind {
             Self::PathAdded => "path added",
             Self::PathRemoved => "path removed",
             Self::FileMetadataChanged => "file metadata changed",
-            Self::DirectoryEntryChurn => "folder timestamps or size",
+            Self::DirectoryEntryChurn => "folder timestamps or size changed",
         }
     }
 }
