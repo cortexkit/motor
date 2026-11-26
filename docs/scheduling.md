@@ -134,6 +134,11 @@ dispatcher chooses among heads:
 3. Newer heads, rotating between workspaces by least recent dispatch.
 4. Background warm builds and cache fills, last.
 
+Jobs from push gates go ahead of ordinary jobs, but only of those that have
+waited less than 10 minutes. An ordinary job that has waited 10 minutes takes
+its turn by arrival among the gate jobs, so gate traffic can't hold it back
+until its queue wait runs out.
+
 Linux gate submissions take host-only leases with
 `allow_spill: false` and carry the same `run.gate_job` mark through motor-host. The mark
 does not affect broker placement. Each tenant VM has its own runner and queue,

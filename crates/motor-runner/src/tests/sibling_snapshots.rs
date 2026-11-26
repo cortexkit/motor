@@ -916,6 +916,7 @@ fn snapshot_mode_fences_workspaces_only_apart_from_legacy_sibling_users() {
         &inner,
         &later_job,
         runner.core.config.max_weight,
+        now,
     );
     inner.dropping.insert("/shared/running".into());
     let deleting_user = runner.deleting(

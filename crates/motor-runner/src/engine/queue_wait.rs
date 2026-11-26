@@ -168,10 +168,7 @@ impl Runner {
         };
         let now = self.now();
         let heads = index.heads(inner, now);
-        let heads_ahead = heads
-            .iter()
-            .position(|head| *head == id)
-            .unwrap_or(heads.len());
+        let heads_ahead = scheduling::heads_ahead(inner, &heads, job, now);
         let has_blockers = heads_ahead > 0
             || index.holder_ids.iter().any(|holder| *holder != id)
             || inner
@@ -187,7 +184,7 @@ impl Runner {
                 return last.render(job, max_weight, true);
             }
         }
-        let (phase, annotations) = self.queue_wait_reason(inner, index, id, || {
+        let (phase, annotations) = self.queue_wait_reason(inner, index, id, now, || {
             self.blocking_head(inner, &heads, id, index.weight, now)
         });
         QueueWaitDetail {
@@ -204,9 +201,10 @@ impl Runner {
         inner: &Inner,
         index: &DispatchIndex,
         id: Uuid,
+        now: u64,
         blocking_head: impl FnOnce() -> Option<(Uuid, bool)>,
     ) -> (String, String) {
-        let (phase, blocking) = self.queue_wait_label_with(inner, index, id, blocking_head);
+        let (phase, blocking) = self.queue_wait_label_with(inner, index, id, now, blocking_head);
         let annotations = if let Some((head, _)) = blocking {
             format!(
                 "; blocked_by=job={head} permits={}",
@@ -252,12 +250,19 @@ impl Runner {
         let positions: BTreeMap<_, _> = heads.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         let mut view = None;
         for id in index.queued.values().flatten().copied() {
-            let heads_ahead = positions.get(&id).copied().unwrap_or(heads.len());
+            let heads_ahead = positions
+                .get(&id)
+                .copied()
+                .or_else(|| scheduling::priority_heads_ahead(inner, heads, &inner.jobs[&id], now))
+                .unwrap_or(heads.len());
             if heads_ahead == 0 && index.holder_ids.is_empty() && inner.reserved.is_empty() {
                 continue;
             }
-            let (phase, annotations) = self.queue_wait_reason(inner, index, id, || {
-                blockers.get(&id).copied().unwrap_or(last_blocker)
+            let (phase, annotations) = self.queue_wait_reason(inner, index, id, now, || {
+                heads
+                    .get(heads_ahead)
+                    .and_then(|head| blockers.get(head).copied())
+                    .unwrap_or(last_blocker)
             });
             let view =
                 view.get_or_insert_with(|| Arc::new(QueueWaitView::new(inner, index, heads, now)));
