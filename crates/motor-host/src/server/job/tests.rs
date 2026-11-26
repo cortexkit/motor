@@ -8,6 +8,7 @@ use std::sync::Condvar;
 
 mod admin_tests;
 mod cache_write_tests;
+mod close_tests;
 mod deadline_tests;
 mod fill_source_tests;
 mod fork_tests;
@@ -107,6 +108,7 @@ struct Fake {
     fail_adopt: AtomicBool,
     exit_polls: std::sync::atomic::AtomicU64,
     disconnect_on_run: AtomicBool,
+    terminal_after_run: Mutex<Option<Value>>,
     acknowledgements: Mutex<Vec<motor_vm_helper::job::ExitReport>>,
     balloon_supported: AtomicBool,
     resident: Mutex<BTreeMap<String, u64>>,
@@ -502,6 +504,7 @@ impl Control for Fake {
         let reply = self.hello.lock().unwrap().clone().unwrap_or_else(hello);
         let inputs = self.inputs.clone();
         let disconnect_on_run = self.disconnect_on_run.load(Ordering::SeqCst);
+        let terminal_after_run = self.terminal_after_run.lock().unwrap().clone();
         let refuse_run = self.refuse_run.lock().unwrap().clone();
         let stall_after_refusal = self.stall_after_refusal.load(Ordering::SeqCst);
         let stopped = self.stopped.clone();
@@ -559,6 +562,9 @@ impl Control for Fake {
                             &mut b,
                             &json!({"type":"output","seq":1,"stream":"stdout","bytes":"eA=="}),
                         );
+                        if let Some(terminal) = &terminal_after_run {
+                            let _ = write_json(&mut b, terminal);
+                        }
                     }
                     _ => {}
                 }
@@ -769,10 +775,10 @@ async fn start(
     id: u64,
 ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Result<()>>) {
     let (client, mut server) = tokio::io::duplex(1024 * 1024);
-    let task = tokio::spawn(async move { serve(runtime, &c, id, &mut server).await });
+    let task = tokio::spawn(async move { serve(runtime, &c, id, &mut server).await.map(|_| ()) });
     (client, task)
 }
-async fn next_type(client: &mut tokio::io::DuplexStream, kind: &str) -> Value {
+async fn next_type(client: &mut (impl AsyncRead + Unpin), kind: &str) -> Value {
     loop {
         let frame = read_frame(client).await.unwrap();
         if frame["type"] == kind {
@@ -781,7 +787,7 @@ async fn next_type(client: &mut tokio::io::DuplexStream, kind: &str) -> Value {
         assert_eq!(frame["type"], "heartbeat", "expected {kind}, got {frame}");
     }
 }
-async fn queued(client: &mut tokio::io::DuplexStream, job: &str) {
+async fn queued(client: &mut (impl AsyncRead + AsyncWrite + Unpin), job: &str) {
     next_type(client, "lease_ok").await;
     write_frame(client, &hello()).await.unwrap();
     next_type(client, "hello").await;

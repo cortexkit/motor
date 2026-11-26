@@ -2278,8 +2278,13 @@ where
                 .at(Side::Host, "helper_cache_write_admission")?;
         }
         let outcome = job::serve(runtime.clone(), &claims, id, &mut client).await;
+        if matches!(outcome, Ok(job::ConnectionEnd::SentFinalFrames)) {
+            // A late heartbeat left unread when the socket is dropped can
+            // reset the connection and lose the final settlement frame.
+            close_client(&mut client, &claims.jti).await;
+        }
         connection.finish().await;
-        return outcome;
+        return outcome.map(|_| ());
     }
     // Set once the connection enters the relay or a stored replay; from then
     // on it ends with a graceful drain.

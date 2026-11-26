@@ -1644,12 +1644,18 @@ async fn boot(
     Ok(stream)
 }
 
+#[derive(Debug)]
+pub(super) enum ConnectionEnd {
+    SentFinalFrames,
+    Disconnected,
+}
+
 pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     runtime: Arc<Runtime>,
     claims: &Claims,
     id: u64,
     client: &mut S,
-) -> Result<()> {
+) -> Result<ConnectionEnd> {
     let acknowledged = write_frame(client, &json!({"type":"lease_ok"})).await;
     let execution = runtime
         .host
@@ -1683,7 +1689,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         }
         if cancelled || !execution.runner_hello || !delivered {
             write_frame(client, &json!({"type":"lease_refused","reason":"auth"})).await?;
-            return Ok(());
+            return Ok(ConnectionEnd::SentFinalFrames);
         }
         // A reconnect owns no launch authority. Use the existing VM by job id;
         // failure to attach must not stop a job another caller may be observing.
@@ -1700,7 +1706,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     if let Err(error) = result {
         if runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].delivered {
             tracing::debug!(jti = claims.jti, %error, "job_caller_detached");
-            return Ok(());
+            return Ok(ConnectionEnd::Disconnected);
         }
         tracing::warn!(jti = claims.jti, %error, "job_boot_or_delivery_failed");
         if let Some(refused) = error.downcast_ref::<SessionRefusal>() {
@@ -1711,7 +1717,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 // The independent spool replay may deliver Run while the caller
                 // disconnects. Refusal and delivery must race under the same lock.
                 if host.snapshot.leases[&claims.jti].delivered {
-                    return Ok(());
+                    return Ok(ConnectionEnd::Disconnected);
                 }
                 host.job_refused(&claims.jti, frame.clone(), unix_ms())?;
             }
@@ -1728,18 +1734,20 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 return Err(error);
             }
             write_frame(client, &frame).await?;
-            return Ok(());
+        } else {
+            failed(&runtime, claims, client).await?;
         }
-        failed(&runtime, claims, client).await?;
+        Ok(ConnectionEnd::SentFinalFrames)
+    } else {
+        result
     }
-    Ok(())
 }
 
 async fn live<S: AsyncRead + AsyncWrite + Unpin>(
     runtime: &Arc<Runtime>,
     claims: &Claims,
     client: &mut S,
-) -> Result<()> {
+) -> Result<ConnectionEnd> {
     stream::serve(runtime, claims, client, true, Reader::default(), false).await
 }
 
@@ -1748,7 +1756,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
     claims: &Claims,
     id: u64,
     client: &mut S,
-) -> Result<()> {
+) -> Result<ConnectionEnd> {
     let execution = runtime
         .host
         .lock()
@@ -1947,7 +1955,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 if spool.append(&frame).await.is_err() {
                     anyhow::bail!(SessionRefusal::SpoolExceeded);
                 }
-                if cancel(runtime, claims, client, &frame.value, queue_clock.observe(false), queue_limit_ms).await? { return Ok(()); }
+                if cancel(runtime, claims, client, &frame.value, queue_clock.observe(false), queue_limit_ms).await? { return Ok(ConnectionEnd::SentFinalFrames); }
                 if frame.value["type"] == "withdraw" { withdraw_replies += 1; }
                 match frame.value["type"].as_str() {
                     Some("have") if !accepted => {
@@ -2029,7 +2037,7 @@ async fn replay<S: AsyncRead + AsyncWrite + Unpin + Send>(
     client: &mut S,
     guest: tokio::net::UnixStream,
     prelude: Replay,
-) -> Result<()> {
+) -> Result<ConnectionEnd> {
     let reader = Reader {
         buffered: prelude.reader.buffered.clone(),
     };
