@@ -190,10 +190,17 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   still removes a queued job; the request's execution timeout still starts when
   its command starts. Job status reports the current scheduler blocker in
   `waiting_on`.
+  Before reserving capacity, the runner refuses a queued job that has reached
+  its queue-wait limit and moves on to the next job, so a job whose turn comes
+  after its limit is never set up.
   The client keeps a local deadline from `queue_wait_ms` and, when the budget
   runs out, asks the runner to withdraw the job. The runner answers `withdrawn`
-  (the job ends as `refused_before_start` / `queue_wait_exceeded`) or `started`
-  (too late; the job runs). Only that answer decides. Tests:
+  if the request refused the job (`refused_before_start` / `queue_wait_exceeded`),
+  or `started` if withdrawal no longer applies. The job's terminal record
+  decides the outcome: a `started` reply does not mean the command ran,
+  because a job the runner already refused for queue wait also answers `started`.
+  If the refusal no longer has a live blocker to report, its detail shows the
+  last observed holders and queue heads, with the time they were seen. Tests:
   `zero_queue_wait_withdraws_and_cancel_is_idempotent`
   (`crates/motor-module/tests/it/recovery.rs`),
   `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`,
