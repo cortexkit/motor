@@ -160,7 +160,8 @@ async fn tick() {
 }
 
 #[tokio::test]
-async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
+async fn capped_upload_survives_its_queue_budget_with_live_host_progress() {
+    const BEATS: usize = 100;
     let Upload {
         _scratch,
         motor,
@@ -171,7 +172,7 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
         capped,
         release,
         host,
-    } = upload(true, 180).await;
+    } = upload(true, 60).await;
     let reporter = progress::Reporter::new(true, 1).with_job_id(id);
     let _submission = motor.observe_health_submission(id, Platform::Linux, reporter.clone());
     let (records_tx, records_rx) = mpsc::channel(8);
@@ -195,7 +196,7 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
     tokio::time::pause();
     // More than 16 heartbeats also exceeds Channel's bounded inbox. They must
     // reach the progress reporter while the upload is blocked, not just later.
-    for _ in 0..65 {
+    for _ in 0..BEATS {
         tick().await;
         assert!(
             !uploading.is_finished(),
@@ -208,8 +209,7 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
     // cannot turn scheduling delay into a false "delayed until after upload".
     // The upload reads its bundle with tokio::fs, on blocking-pool OS threads,
     // and reads heartbeats only while it is inside send_upload. So a count of
-    // yields is no time bound: under the parallel gate, 10,000 yields once
-    // ended with 51 of the 65 heartbeats. Bound the wait by wall-clock time.
+    // yields is no time bound. Bound the wait by wall-clock time.
     let mut waits = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
@@ -220,7 +220,7 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
                 }
             }
         }
-        if waits.len() >= 65 {
+        if waits.len() >= BEATS {
             break;
         }
         tokio::task::yield_now().await;
@@ -236,8 +236,8 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
     // heartbeats were read during the blocked upload rather than buffered until
     // after it; the ordered heartbeat frames are checked one by one below.
     assert!(
-        waits.len() > 16 && waits.len() <= 65,
-        "queue progress was delayed until after upload: {} of 65 waits",
+        waits.len() > 16 && waits.len() <= BEATS,
+        "queue progress was delayed until after upload: {} of {BEATS} waits",
         waits.len()
     );
     assert!(waits.iter().all(|wait| matches!(
@@ -250,7 +250,7 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
     tokio::time::resume();
     release.send(()).unwrap();
     let (result, mut channel) = uploading.await.unwrap();
-    result.expect("heartbeats must keep the capped upload alive past 60 seconds");
+    result.expect("host heartbeats must keep the capped upload alive past its queue budget");
     let mut sequence = 0;
     loop {
         match channel.next_job().await.unwrap() {
@@ -269,7 +269,7 @@ async fn capped_upload_keeps_live_progress_and_frame_order_then_completes() {
             other => panic!("unexpected job frame: {other:?}"),
         }
     }
-    assert_eq!(sequence, 65);
+    assert_eq!(sequence, BEATS as u64);
     host.await.unwrap();
     reporting.abort();
     let _ = reporting.await;

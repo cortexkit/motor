@@ -1698,7 +1698,6 @@ impl Channel {
             }
         });
         let writing = tokio::spawn(async move {
-            let mut stall_limit = Duration::from_secs(60);
             let mut heartbeat = tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -1714,13 +1713,7 @@ impl Channel {
                         continue;
                     }
                 };
-                if let Frame::Run(run) = &frame {
-                    stall_limit =
-                        Duration::from_secs(run.queue_wait_limit_s).max(Duration::from_secs(60));
-                }
-                let result =
-                    write_active_with_peer(&mut write, &frame, Some(&last_frame), stall_limit)
-                        .await;
+                let result = write_active_with_peer(&mut write, &frame, Some(&last_frame)).await;
                 let failed = result.is_err();
                 if let Some(ack) = ack {
                     let _ = ack.send(result);
@@ -2157,26 +2150,19 @@ async fn read_exact_active<R: AsyncRead + Unpin>(
 }
 #[cfg(test)]
 async fn write_active<W: AsyncWrite + Unpin>(write: &mut W, frame: &Frame) -> io::Result<()> {
-    write_active_with_peer(write, frame, None, Duration::from_secs(60)).await
+    write_active_with_peer(write, frame, None).await
 }
 
 async fn write_active_with_peer<W: AsyncWrite + Unpin>(
     write: &mut W,
     frame: &Frame,
     peer: Option<&watch::Receiver<tokio::time::Instant>>,
-    stall_limit: Duration,
 ) -> io::Result<()> {
     let mut bytes = Vec::new();
     motor_protocol::write_frame(&mut bytes, frame)?;
     let mut offset = 0;
     while offset < bytes.len() {
-        let n = wait_write_active(
-            write.write(&bytes[offset..]),
-            peer,
-            stall_limit,
-            "write inactivity",
-        )
-        .await?;
+        let n = wait_write_active(write.write(&bytes[offset..]), peer, "write inactivity").await?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -2185,29 +2171,25 @@ async fn write_active_with_peer<W: AsyncWrite + Unpin>(
         }
         offset += n;
     }
-    wait_write_active(write.flush(), peer, stall_limit, "flush inactivity").await
+    wait_write_active(write.flush(), peer, "flush inactivity").await
 }
 
 async fn wait_write_active<T>(
     operation: impl Future<Output = io::Result<T>>,
     peer: Option<&watch::Receiver<tokio::time::Instant>>,
-    stall_limit: Duration,
     cause: &'static str,
 ) -> io::Result<T> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    // The peer can intentionally stop reading at its spool cap. Complete
-    // inbound frames prove it is alive, but cannot extend one continuous stall
-    // beyond the job's queue-wait budget (or shorten the normal 60s allowance).
-    let hard_deadline = tokio::time::Instant::now()
-        .checked_add(stall_limit.max(Duration::from_secs(60)))
-        .unwrap_or(deadline);
+    // A full host spool can pause reads until an earlier checkout user exits.
+    // Complete inbound frames keep the transport alive; the peer owns the
+    // queue deadline and can refuse the job while the upload is still blocked.
     tokio::pin!(operation);
     loop {
         if let Ok(result) = tokio::time::timeout_at(deadline, &mut operation).await {
             return result;
         }
         if let Some(peer) = peer {
-            deadline = (*peer.borrow() + Duration::from_secs(60)).min(hard_deadline);
+            deadline = *peer.borrow() + Duration::from_secs(60);
         }
         if deadline <= tokio::time::Instant::now() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, cause));
@@ -2266,7 +2248,6 @@ mod transfer_io_tests {
                 queue_status: None,
             },
             Some(&peer),
-            Duration::from_secs(180),
         )
         .await
         .unwrap();
@@ -2275,24 +2256,26 @@ mod transfer_io_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn live_peer_cannot_extend_a_stalled_write_past_the_queue_budget() {
+    async fn live_peer_keeps_a_blocked_write_alive_until_it_reads() {
         let (peer, heartbeats) = live_peer();
-        let (mut write, _unread) = tokio::io::duplex(1);
+        let (mut write, mut read) = tokio::io::duplex(1);
+        let receiver = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(85)).await;
+            motor_protocol::read_frame_async(&mut read).await.unwrap()
+        });
         let started = tokio::time::Instant::now();
-        let error = write_active_with_peer(
-            &mut write,
-            &Frame::Heartbeat {
-                queue_wait_ms: None,
-                queue_status: None,
-            },
-            Some(&peer),
-            Duration::from_secs(75),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(error.to_string(), "write inactivity");
-        assert_eq!(started.elapsed(), Duration::from_secs(75));
+        let frame = Frame::Heartbeat {
+            queue_wait_ms: None,
+            queue_status: None,
+        };
+        write_active_with_peer(&mut write, &frame, Some(&peer))
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.await.unwrap(),
+            Some(Frame::Heartbeat { .. })
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(85));
         heartbeats.abort();
         let _ = heartbeats.await;
     }
@@ -2313,7 +2296,6 @@ mod transfer_io_tests {
                 queue_status: None,
             },
             Some(&peer),
-            Duration::from_secs(180),
         )
         .await
         .unwrap_err();
