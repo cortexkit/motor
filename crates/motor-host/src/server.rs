@@ -532,10 +532,8 @@ impl Runtime {
             .refresh(fetched.map_err(|_| AuthError::Auth));
     }
     pub fn recover(self: &Arc<Self>) -> Result<()> {
-        if self.per_job() {
-            return self.recover_jobs();
-        }
-        {
+        let per_job = self.per_job();
+        if !per_job {
             let mut host = self.host.lock().expect("host lock");
             if host.snapshot.per_job.tenant_rollback_pending
                 || host
@@ -556,6 +554,9 @@ impl Runtime {
                 .lock()
                 .expect("host lock")
                 .start_billing(unix_ms())?;
+        }
+        if per_job {
+            return self.recover_jobs();
         }
         if self
             .host

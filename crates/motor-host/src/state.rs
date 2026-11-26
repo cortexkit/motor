@@ -1084,6 +1084,18 @@ impl Host {
                 return refuse(Refusal::Auth);
             }
         } else if let Some(job) = event.jti.map(|j| j.to_string()) {
+            let per_job = matches!(self.settings, crate::config::HostSettings::PerJob(_));
+            // A lifecycle reconnect can replay events even though the host
+            // continuously owned this VM. Only an adopted VM may have run
+            // while the host was down.
+            let live_event = live_event
+                || (per_job
+                    && next
+                        .per_job
+                        .executions
+                        .get(&job)
+                        .and_then(|e| e.boot_started_at_ms)
+                        .is_some_and(|boot| boot >= self.restart_ms));
             // The terminal body, host stop, or helper receipt already fixed this
             // job's usage. Later lifecycle telemetry cannot change that body.
             if next
@@ -1130,7 +1142,11 @@ impl Host {
                         // if the runner won the start race. Its own cap still applies.
                         next.pending_cancels.remove(&job);
                         lease.started_at_ms =
-                            Some(if live_event { now_ms } else { self.restart_ms });
+                            Some(if live_event || (per_job && self.restart_ms == 0) {
+                                now_ms
+                            } else {
+                                self.restart_ms
+                            });
                         if !self.provider_managed {
                             next.billing.entry(job.clone()).or_default().started_live = live_event;
                         }
@@ -1148,6 +1164,10 @@ impl Host {
                             lease.state = LeaseState::Ended;
                             lease.ended_at_ms = Some(if live_event {
                                 now_ms
+                            } else if per_job && self.prior_alive_ms == 0 {
+                                // No stored heartbeat proves any runtime before
+                                // recovery. Don't charge time in that gap.
+                                lease.started_at_ms.filter(|at| *at != 0).unwrap_or(now_ms)
                             } else {
                                 self.prior_alive_ms
                             });

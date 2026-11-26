@@ -7,6 +7,174 @@ use motor_vm_helper::job::ExitReport;
 fn event(job: &str, seq: u64, kind: TenantEventKind) -> TenantEvent {
     serde_json::from_value(json!({"type":"event","event_seq":seq,"event":kind,"jti":job})).unwrap()
 }
+
+#[test]
+fn replayed_job_start_does_not_trigger_the_runtime_backstop() {
+    for replay_through in [1, 2] {
+        let (runtime, fake, _) = fixture();
+        runtime.recover().unwrap();
+        let id = claim(&runtime, &claims(JOB));
+        let boot = unix_ms();
+        let started = boot + 20_000;
+        let mut lifecycle = crate::server::LifecycleStream::default();
+        assert!(lifecycle
+            .boundary(&json!({"type":"event_replay","through_seq":replay_through}))
+            .unwrap());
+        let lifecycle_started_live = {
+            let mut host = runtime.host.lock().unwrap();
+            boot_at(&mut host, JOB, boot);
+            host.job_runner_hello(JOB).unwrap();
+            host.delivered(id).unwrap();
+            for (seq, kind) in [
+                (1, TenantEventKind::Admitted),
+                (2, TenantEventKind::Started),
+            ] {
+                host.event_observed(JOB, &event(JOB, seq, kind), started, lifecycle.is_live(seq))
+                    .unwrap();
+            }
+            let lifecycle_started_live = host.snapshot.billing[JOB].started_live;
+            host.job_started(JOB, started).unwrap();
+            assert!(host.snapshot.billing[JOB].started_live);
+            host.billing_tick(started).unwrap();
+            lifecycle_started_live
+        };
+        runtime.tick_jobs(started + 1).unwrap();
+        let mut host = runtime.host.lock().unwrap();
+        let stopped = fake.calls.lock().unwrap().contains(&format!("stop:{JOB}"));
+        assert!(
+            !stopped,
+            "runtime backstop stopped a just-started job: replay_through={replay_through}, started_at_ms={:?}, cancelled_at_cap={}, terminal={:?}",
+            host.snapshot.leases[JOB].started_at_ms,
+            host.snapshot.billing[JOB].cancelled_at_cap,
+            host.snapshot.billing[JOB].terminal,
+        );
+        assert_eq!(host.snapshot.leases[JOB].started_at_ms, Some(started));
+        assert!(lifecycle_started_live);
+        assert!(!host.snapshot.billing[JOB].cancelled_at_cap);
+        let ended = started + 2;
+        host.event_observed(JOB, &event(JOB, 3, TenantEventKind::Terminal), ended, false)
+            .unwrap();
+        assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(ended));
+        assert!(host.snapshot.billing[JOB].terminal_live);
+    }
+}
+
+#[test]
+fn adopted_vm_replayed_lifecycle_uses_the_host_outage_bounds() {
+    for last_alive in [0, 500] {
+        let (previous, fake, storage) = fixture();
+        running(&previous, JOB, true, false);
+        {
+            let mut host = previous.host.lock().unwrap();
+            let heartbeat = host.heartbeat_unlogged(last_alive, 0, true);
+            host.queue_heartbeat("host", &heartbeat, last_alive)
+                .unwrap();
+        }
+        let (journal, snapshot) = crate::journal::FileJournal::open(storage.root.path()).unwrap();
+        let mut host = Host::new(BTreeMap::new(), snapshot, Box::new(journal));
+        host.settings = previous.host.lock().unwrap().settings.clone();
+        drop(previous);
+        let runtime = Runtime::with_job_resources("host".into(), host, fake.clone(), storage);
+        runtime.recover().unwrap();
+        assert!(fake.calls.lock().unwrap().contains(&format!("adopt:{JOB}")));
+        let mut host = runtime.host.lock().unwrap();
+        let restart = host.restart_ms;
+        assert!(
+            restart
+                > host.snapshot.per_job.executions[JOB]
+                    .boot_started_at_ms
+                    .unwrap()
+        );
+        assert_eq!(host.prior_alive_ms, last_alive);
+        assert!(host.snapshot.counter >= restart * 1000);
+        host.event_observed(
+            JOB,
+            &event(JOB, 2, TenantEventKind::Started),
+            restart + 1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(host.snapshot.leases[JOB].started_at_ms, Some(restart));
+        assert!(!host.snapshot.billing[JOB].started_live);
+        host.event_observed(
+            JOB,
+            &event(JOB, 3, TenantEventKind::Terminal),
+            restart + 2,
+            false,
+        )
+        .unwrap();
+        let expected_end = if last_alive == 0 { restart } else { last_alive };
+        assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(expected_end));
+        assert!(!host.snapshot.billing[JOB].terminal_live);
+        drop(host);
+        runtime.stop_job(JOB, false, true).unwrap();
+    }
+}
+
+#[test]
+fn deadline_stop_records_detail_and_logs_once_across_retries() {
+    for (started, reason, measured_from, deadline, outcome, detail) in [
+        (
+            true,
+            "runtime_limit",
+            200,
+            60_200,
+            "outcome_unknown",
+            "server stopped the job at its runtime limit",
+        ),
+        (
+            false,
+            "boot_deadline",
+            100,
+            1_100,
+            "refused_before_start",
+            "server stopped the job at its VM boot deadline",
+        ),
+    ] {
+        let (runtime, fake, _) = fixture();
+        if started {
+            running(&runtime, JOB, true, true);
+        } else {
+            claim(&runtime, &claims(JOB));
+            boot_at(&mut runtime.host.lock().unwrap(), JOB, measured_from);
+        }
+        let logs = Logs::default();
+        let dispatch = tracing::Dispatch::new(logs.clone());
+        let _spare = tracing::Dispatch::new(Logs::default());
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::callsite::rebuild_interest_cache();
+            runtime.tick_jobs(deadline - 1).unwrap();
+            assert!(!fake.calls.lock().unwrap().contains(&format!("stop:{JOB}")));
+            fake.fail_stop.store(true, Ordering::Release);
+            assert!(runtime.tick_jobs(deadline).is_err());
+            fake.fail_stop.store(false, Ordering::Release);
+            runtime.tick_jobs(deadline + 1).unwrap();
+        });
+        let host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.per_job.executions[JOB].ended);
+        let frames = host.host_settled_frames(JOB, 0).unwrap();
+        let terminal = frames
+            .iter()
+            .find(|frame| frame["type"] == "terminal")
+            .unwrap();
+        assert_eq!(terminal["outcome"]["type"], outcome);
+        assert_eq!(terminal["refusal_detail"], detail);
+        let lines = logs.0.lock().unwrap();
+        let stop_lines: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("message=job_deadline_stop"))
+            .collect();
+        assert_eq!(stop_lines.len(), 1, "{lines:?}");
+        let line = stop_lines[0];
+        assert!(line.contains(JOB) && line.contains(reason), "{line}");
+        assert!(line.contains(&format!("deadline_ms={deadline}")), "{line}");
+        assert!(
+            line.contains(&format!("measured_from_ms={measured_from}")),
+            "{line}"
+        );
+    }
+}
+
 fn running(runtime: &Arc<Runtime>, job: &str, delivered: bool, started: bool) {
     let id = claim(runtime, &claims(job));
     let mut host = runtime.host.lock().unwrap();
