@@ -206,7 +206,6 @@ async fn flowing_bundle_reports_growing_upload_bytes_then_queue_wait() {
         release,
         host,
     } = upload_with_checkpoints(false, 180, Some((arrived, resumes))).await;
-    let total = bundles[0].length;
     let reporter = progress::Reporter::new(true, 1).with_job_id(id);
     let _submission = motor.observe_health_submission(id, Platform::Linux, reporter.clone());
     let (records_tx, records_rx) = mpsc::channel(8);
@@ -234,7 +233,10 @@ async fn flowing_bundle_reports_growing_upload_bytes_then_queue_wait() {
             channel
         }
     });
-    for (count, delay_s) in CHECKPOINTS.into_iter().zip([2, 10]) {
+    for (count, (delay_s, detail)) in CHECKPOINTS
+        .into_iter()
+        .zip([(2, "uploading 1 of 65 MB"), (10, "uploading 2 of 65 MB")])
+    {
         assert_eq!(checkpoint.recv().await, Some(count));
         tokio::time::pause();
         for _ in 0..20 {
@@ -244,9 +246,8 @@ async fn flowing_bundle_reports_growing_upload_bytes_then_queue_wait() {
         let update = tokio::time::timeout(Duration::from_millis(100), caller.recv())
             .await
             .expect("the live bundle upload must report its byte count");
-        let detail = format!("uploading {count} of {total} bytes");
         assert!(matches!(update, Some(Ok(StreamRecord::Progress(p)))
-            if p.phase() == &ProgressPhase::Upload && p.detail() == Some(detail.as_str())));
+            if p.phase() == &ProgressPhase::Upload && p.detail() == Some(detail)));
         tokio::time::resume();
         resume.send(()).await.unwrap();
     }

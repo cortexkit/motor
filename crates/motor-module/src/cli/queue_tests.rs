@@ -74,7 +74,7 @@ async fn polled_queue_status_returns_when_upload_updates_stop() {
     let progress = Progress::new(
         ProgressPhase::Upload,
         2000,
-        Some("uploading 10 of 20 bytes".into()),
+        Some("uploading 10 of 20 KB".into()),
     )
     .unwrap();
     display.progress(&progress, &mut err);
@@ -85,7 +85,7 @@ async fn polled_queue_status_returns_when_upload_updates_stop() {
         String::from_utf8(err).unwrap(),
         concat!(
             "ck motor run: queued: waiting for memory\n",
-            "ck motor run: uploading 10 of 20 bytes\n",
+            "ck motor run: uploading 10 of 20 KB\n",
             "ck motor run: queued: waiting for memory\n"
         )
     );
@@ -195,7 +195,7 @@ async fn run_renders_stream_upload_before_polled_queue_status() {
             Progress::new(
                 ProgressPhase::Upload,
                 2000,
-                Some("uploading 1048576 of 67108864 bytes".into()),
+                Some("uploading 1 of 64 MB".into()),
             )
             .unwrap(),
         ));
@@ -240,7 +240,7 @@ async fn run_renders_stream_upload_before_polled_queue_status() {
     .await;
     assert_eq!(code, 0);
     let err = String::from_utf8(err).unwrap();
-    let upload = err.find("ck motor run: uploading 1048576 of 67108864 bytes\n");
+    let upload = err.find("ck motor run: uploading 1 of 64 MB\n");
     let wait = err.find("ck motor run: queued: ");
     assert!(
         matches!((upload, wait), (Some(upload), Some(wait)) if upload < wait),

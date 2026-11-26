@@ -232,6 +232,21 @@ impl Reporter {
         StreamRecord::Progress(record)
     }
 
+    fn upload_detail(sent: u64, total: u64) -> String {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+        let (divisor, unit) = if total < MIB {
+            (KIB, "KB")
+        } else {
+            (MIB, "MB")
+        };
+        format!(
+            "uploading {} of {} {unit}",
+            sent / divisor,
+            total.div_ceil(divisor)
+        )
+    }
+
     fn record(&self, phase: &Phase, upload: Option<(u64, u64)>) -> StreamRecord {
         let elapsed = u64::try_from(phase.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Only fixed wording and a resource count enter detail, never routing or request text.
@@ -241,7 +256,7 @@ impl Reporter {
             }
             ProgressPhase::Connect => Some("connecting to a runner".into()),
             ProgressPhase::Upload => Some(match upload {
-                Some((sent, total)) => format!("uploading {sent} of {total} bytes"),
+                Some((sent, total)) => Self::upload_detail(sent, total),
                 None => "uploading inputs".into(),
             }),
             _ => None,
@@ -416,5 +431,25 @@ impl Reporter {
                 .map_err(|_| io::Error::other("caller detached"))?;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reporter;
+
+    #[test]
+    fn upload_detail_rounds_sent_down_and_total_up_in_readable_units() {
+        const MIB: u64 = 1024 * 1024;
+        for (sent, total, expected) in [
+            (0, 0, "uploading 0 of 0 KB"),
+            (0, 1, "uploading 0 of 1 KB"),
+            (MIB - 2, MIB - 1, "uploading 1023 of 1024 KB"),
+            (MIB - 1, MIB, "uploading 0 of 1 MB"),
+            (MIB, MIB + 1, "uploading 1 of 2 MB"),
+            (513 * MIB - 1, 1089 * MIB + 1, "uploading 512 of 1090 MB"),
+        ] {
+            assert_eq!(Reporter::upload_detail(sent, total), expected);
+        }
     }
 }
