@@ -158,7 +158,13 @@ uses one byte over.
 
 5.1. The capture must see a quiet checkout. `ck-motor` fingerprints the
 checkout before and after capture; if it changed, it tries again, up to three
-attempts, then refuses with `snapshot_failed`. Tests:
+attempts, then refuses with `snapshot_failed`.
+
+Folders can also change because of ignored files, such as a build tool creating a
+cache folder. When only folder timestamps or sizes changed and two captures in a
+row produced the same tree, the capture is accepted.
+
+Tests:
 `changing_checkout_is_refused_after_three_capture_attempts`,
 `one_checkout_change_retries_then_captures_the_quiet_state`,
 `capture_fingerprint_detects_transient_untracked_files_and_head_changes`,

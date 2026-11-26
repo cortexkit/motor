@@ -264,11 +264,56 @@ async fn changing_checkout_is_refused_after_three_capture_attempts() {
         let failure = result
             .err()
             .expect("a moving checkout must not ship a tree");
-        assert_eq!(failure.check, "checkout changed during capture");
+        assert_eq!(
+            failure.check,
+            "checkout changed during capture: file metadata changed source"
+        );
         assert_eq!(failure.tree_hash, None);
         assert_eq!(calls, 3);
         assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
     }
+}
+
+#[tokio::test]
+async fn moving_head_is_refused_with_the_change_detail() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let spool = f.scratch.join("capture");
+    fs::create_dir(&spool).unwrap();
+    let mut calls = 0;
+    let failure = snapshot::snapshot_with_hook(
+        &f.main,
+        f.main.to_str().unwrap().into(),
+        &spool,
+        0,
+        false,
+        |_| {
+            calls += 1;
+            snapshot::git(
+                &f.main,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "advance",
+                ],
+            )
+            .unwrap();
+        },
+    )
+    .err()
+    .expect("a moving HEAD must not ship a tree");
+
+    assert_eq!(
+        failure.check,
+        "checkout changed during capture: HEAD moved ."
+    );
+    assert_eq!(failure.tree_hash, None);
+    assert_eq!(calls, 3);
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
 }
 
 #[tokio::test]
@@ -303,6 +348,77 @@ async fn one_checkout_change_retries_then_captures_the_quiet_state() {
             "new untracked state"
         );
     }
+}
+
+#[tokio::test]
+async fn ignored_directory_churn_with_a_stable_tree_is_accepted() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let spool = f.scratch.join("capture");
+    fs::create_dir(&spool).unwrap();
+    let source = f.main.join("src");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("source"), "stable source\n").unwrap();
+    let mut ignores = fs::read_to_string(f.main.join(".gitignore")).unwrap();
+    ignores.push_str("\nsrc/cache-*/\n");
+    fs::write(f.main.join(".gitignore"), ignores).unwrap();
+
+    let mut calls = 0;
+    let captured = snapshot::snapshot_with_hook(
+        &f.main,
+        f.main.to_str().unwrap().into(),
+        &spool,
+        0,
+        false,
+        |attempt| {
+            calls += 1;
+            let cache = source.join(format!("cache-{attempt}"));
+            fs::create_dir(&cache).unwrap();
+            fs::write(cache.join("state"), format!("state-{attempt}")).unwrap();
+        },
+    )
+    .unwrap();
+
+    assert_eq!(calls, 2);
+    let tree = snapshot::git(&f.main, &["ls-tree", "-r", "--name-only", &captured.commit]).unwrap();
+    assert!(tree.lines().any(|path| path == "src/source"));
+    assert!(!tree.lines().any(|path| path.starts_with("src/cache-")));
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn transient_source_file_is_not_accepted_on_the_first_directory_entry_churn() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let spool = f.scratch.join("capture");
+    fs::create_dir(&spool).unwrap();
+    fs::create_dir_all(f.main.join("empty/nested")).unwrap();
+    let transient = f.main.join("empty/nested/transient");
+
+    let mut calls = 0;
+    let captured = snapshot::snapshot_with_hook(
+        &f.main,
+        f.main.to_str().unwrap().into(),
+        &spool,
+        0,
+        false,
+        |attempt| {
+            calls += 1;
+            if attempt == 0 {
+                fs::write(&transient, "transient").unwrap();
+                fs::remove_file(&transient).unwrap();
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(calls, 2);
+    assert!(snapshot::git(
+        &f.main,
+        &[
+            "show",
+            &format!("{}:empty/nested/transient", captured.commit)
+        ],
+    )
+    .is_err());
 }
 
 #[tokio::test]
