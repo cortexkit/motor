@@ -22,6 +22,7 @@ use std::{os::unix::fs::PermissionsExt, path::Component};
 mod agent;
 mod bun;
 mod caches;
+mod evidence;
 #[cfg(unix)]
 mod host;
 #[cfg(windows)]

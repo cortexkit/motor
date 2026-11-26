@@ -27,6 +27,7 @@ pub(crate) struct Runtime {
     jobs: Mutex<std::collections::BTreeMap<Uuid, Arc<Control>>>,
     cleanups: Mutex<VecDeque<super::vm::Resources>>,
     cleanup_ids: Mutex<std::collections::BTreeSet<Uuid>>,
+    guest_evidence: super::evidence::GuestEvidence,
     #[cfg(any(windows, test))]
     pub(super) slot_owners: super::slot::Owners,
     guest_agent_readiness: Mutex<Option<WindowsGuestAgentReadiness>>,
@@ -155,6 +156,14 @@ impl Runtime {
                 control.abandon();
             }
         }
+    }
+    pub(crate) fn prune_guest_evidence(
+        &self,
+        layout_root: &Path,
+        held: &std::collections::BTreeSet<Uuid>,
+    ) {
+        self.guest_evidence
+            .prune(layout_root, held, std::time::SystemTime::now());
     }
     pub(super) fn cancel(&self, id: Uuid, hard: bool) -> bool {
         if let Some(control) = self.jobs.lock().unwrap().get(&id) {

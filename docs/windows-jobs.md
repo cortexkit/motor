@@ -394,6 +394,10 @@ therefore waits for started Windows jobs to finish. Tests:
 `windows_qualification_runner_sigkill_reconciles_boot_and_started_jobs` (operator-only).
 See [drain-and-rollback.md](drain-and-rollback.md).
 
+After a job VM is removed, the runner keeps the guest logs it collected from
+that VM for 72 hours, then deletes them; logs of a job the runner still holds
+are kept.
+
 ## Cache disks
 
 Each workspace has its own dynamically expanding 100 GiB build-cache disk, attached to the VM as a
