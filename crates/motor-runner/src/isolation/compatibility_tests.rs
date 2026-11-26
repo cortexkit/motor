@@ -29,6 +29,9 @@ pub(super) fn with_capture_host<T>(f: impl FnOnce() -> T) -> T {
         ]
         .into_iter()
         .map(|path| (PathBuf::from(path), true))
+        // The captured host had no fontconfig config, so the pinned argv has
+        // no `/etc/fonts` bind.
+        .chain([(PathBuf::from("/etc/fonts"), false)])
         .collect(),
         directories: [
             "/home/ubuntu/.bun/bin",

@@ -4743,7 +4743,7 @@ fn prepare_embedded_tool(state: &Path, name: &str, source: &str) -> io::Result<P
     }
     Ok(output)
 }
-const SYSTEM_READ_PATHS: [&str; 11] = [
+const SYSTEM_READ_PATHS: [&str; 12] = [
     "/usr",
     "/bin",
     "/lib",
@@ -4756,6 +4756,10 @@ const SYSTEM_READ_PATHS: [&str; 11] = [
     "/etc/ssl/certs",
     // OpenSSL's default config under /usr/lib/ssl points here.
     "/etc/ssl/openssl.cnf",
+    // Fontconfig's config: without it, programs that draw text can't resolve
+    // generic families such as "serif" to the image's fonts and have no cache
+    // folder, so they print errors and fall back to a built-in face.
+    "/etc/fonts",
 ];
 
 /// Runner-owned mounts, independent of workspace, target-folder and sibling

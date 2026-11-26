@@ -81,7 +81,7 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 | `/tmp` (`TMPDIR`, `TMP`, `TEMP` point at `/motor-home/tmp`) | Read-write | Per-job directory |
 | `/dev/shm` | Read-write, private tmpfs with mode `1777`, `nosuid,nodev`, and a size cap equal to `MemoryMax` (executable, matching the host mount) | Per-job `TemporaryFileSystem=` mount |
 | `/usr`, `/bin`, `/lib`, `/lib64`, the shared Cargo `bin`, the rustup home, Bun's `bin` if present | Read-only | Host toolchains |
-| `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, `/etc/ld.so.cache`, `/etc/alternatives`, `/etc/ssl/certs`, `/etc/ssl/openssl.cnf` | Read-only | Host files |
+| `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, `/etc/ld.so.cache`, `/etc/alternatives`, `/etc/ssl/certs`, `/etc/ssl/openssl.cnf`, `/etc/fonts` (each if present) | Read-only | Host files. Fontconfig's cache goes under `HOME` |
 | `/etc/hosts` | Read-only | Generated; see 3.5 |
 | `/motor-cache` | Read-only, optional | The shared compile cache |
 | `/motor-tools` | Read-only | Compiler wrapper and build-slot supervisor |
