@@ -71,6 +71,7 @@ mod seed_build_log;
 mod sibling_eviction;
 #[path = "terminal_evidence.rs"]
 pub(crate) mod terminal_evidence;
+mod windows_maintenance;
 
 /// Disk headroom for concurrent build-target growth and scratch files, not a quota.
 pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -7941,23 +7942,7 @@ impl Runner {
                 };
                 self.core.config.macos_runtime.prune_finished(&live);
             }
-            if self.core.config.windows_instance() {
-                self.core.config.windows_runtime.retry_cleanups();
-                let terminal = self
-                    .core
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .jobs
-                    .values()
-                    .filter(|job| job.terminal.is_some() || job.state == JobState::Tombstone)
-                    .map(|job| job.id)
-                    .collect();
-                self.core
-                    .config
-                    .windows_runtime
-                    .reconcile_terminal(&terminal);
-            }
+            self.maintain_windows();
         });
         let mut set_aside = Vec::new();
         let maintained = timings.step(3, || self.maintain_state(&mut set_aside));

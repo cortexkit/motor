@@ -547,6 +547,42 @@ fn windows_open_requires_vm_config_and_a_sealed_regular_baseline() {
     assert!(!f.config().state_dir().exists());
 }
 
+#[test]
+fn windows_maintenance_prunes_old_guest_evidence_but_keeps_queued_jobs() {
+    let f = Fixture::new();
+    let mut config = config(&f);
+    config.manual_tick = true;
+    let runner = Runner::open_with_backend(config, Box::new(InProcessWindows)).unwrap();
+    let (mut request, bundles) = f.run("must stay queued");
+    request.platform = Some(Platform::Windows);
+    f.submit(&runner, &request, &bundles);
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&request.job_id].state,
+        JobState::Queued
+    );
+
+    let evidence = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .layout_root
+        .join("evidence");
+    let old = evidence.join(format!("{}-guest", Uuid::now_v7()));
+    let held = evidence.join(format!("{}-guest", request.job_id));
+    for folder in [&old, &held] {
+        fs::create_dir_all(folder).unwrap();
+        fs::write(folder.join("guest.log"), b"guest output").unwrap();
+        let past = SystemTime::now() - Duration::from_secs(73 * 60 * 60);
+        crate::filesystem::set_directory_modified(folder, past).unwrap();
+    }
+
+    runner.maintenance().unwrap();
+
+    assert!(!old.exists(), "expired guest evidence was not pruned");
+    assert_eq!(fs::read(held.join("guest.log")).unwrap(), b"guest output");
+}
+
 #[tokio::test]
 async fn windows_weights_are_fixed_and_warm_builds_and_caller_catalog_are_disabled() {
     let f = Fixture::new();
