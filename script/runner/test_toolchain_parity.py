@@ -923,6 +923,36 @@ class ParityTests(unittest.TestCase):
         self.assertIn('aarch64-pc-windows-gnullvm',
                       refreshed['rust_toolchains']['1.99.0-x86_64-unknown-linux-gnu']['targets'])
 
+    def test_rust_1_99_1_is_required_only_in_linux_job_images(self):
+        name = '1.99.1-x86_64-unknown-linux-gnu'
+        server = self.observed()
+        self.assertNotIn(name, server['rust_toolchains'])
+        report = self.report(server)
+        self.assertTrue(report['passed'], report['errors'])
+        for role in ('boat', 'tenant'):
+            with self.subTest(role=role):
+                actual = self.observed(role, job=True)
+                self.assertIn(name, actual['rust_toolchains'])
+                report = self.report(actual, role=role, job=True)
+                self.assertTrue(report['passed'], report['errors'])
+                del actual['rust_toolchains'][name]
+                del actual['rust_target_payloads'][name]
+                report = self.report(actual, role=role, job=True)
+                self.assertFalse(report['passed'])
+                self.assertIn(name + ': missing libstd payload for wasm32-unknown-unknown', report['errors'])
+
+    def test_server_refresh_preserves_image_only_rust_toolchain(self):
+        actual = self.observed()
+        refreshed = parity.refresh(self.manifest, actual)
+        self.assertEqual(refreshed['image_only_rust_toolchains'], self.manifest['image_only_rust_toolchains'])
+        self.assertNotIn('1.99.1-x86_64-unknown-linux-gnu', refreshed['rust_toolchains'])
+
+    def test_image_only_rust_toolchains_cannot_override_shared_toolchains(self):
+        name = self.manifest['rust_default']
+        self.manifest['image_only_rust_toolchains'][name] = self.manifest['rust_toolchains'][name]
+        with self.assertRaisesRegex(ValueError, 'overlapping image-only Rust toolchains'):
+            parity.validate(self.manifest)
+
     def test_toolchain_component_and_default_drift_fail(self):
         for key in ('rust_default', 'rust_profile'):
             with self.subTest(key=key):

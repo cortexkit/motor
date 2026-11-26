@@ -503,7 +503,8 @@ def install_pnpm(manifest):
         "--sha512", expected, "--url", metadata["dist"]["tarball"])
 
 
-def install_rust(manifest, installer):
+def install_rust(manifest, installer, role="boat"):
+    manifest = parity.role_manifest(manifest, role)
     run(str(installer), "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none")
     # rustup replaces itself with the newest release during `toolchain install`
     # unless told not to, which would drift from the pinned build-server version.
@@ -568,7 +569,7 @@ def tools(manifest, role="boat"):
     path = BUILD / "downloads/rustup-init"
     download(rustup, path, urllib.request.urlopen(rustup + ".sha256", timeout=60).read().decode().split()[0])
     path.chmod(0o755)
-    install_rust(manifest, path)
+    install_rust(manifest, path, role=role)
     node = published(f"https://nodejs.org/dist/v{pins['node']}/", f"node-v{pins['node']}-linux-x64.tar.xz")
     extract(node, "/usr/local", "-J", "--strip-components=1")
     install_pnpm(manifest)

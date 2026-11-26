@@ -1,6 +1,7 @@
 {
   "accepted_os_differences": [
     "ARM64 Windows GNU/LLVM cross-lint support is image-only: Boat and tenant install the pinned private llvm-mingw toolchain and the aarch64-pc-windows-gnullvm Rust target on 1.100.0 and 1.99.0. The build server is no longer a job runner; its captured toolchains and environment remain unchanged and do not require these image-only additions.",
+    "Boat and tenant also install the Rust releases in image_only_rust_toolchains for jobs that pin those exact versions. Build-server captures and the macOS image continue to use the shared rust_toolchains set.",
     "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04 and tenant uses Debian trixie. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: both images build the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of the distro git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
     "wasm-opt uses apt binaryen (/usr/bin/wasm-opt) on the build server, where its major version is 120. Boat and tenant install the official Binaryen 120 x86_64 Linux release archive pinned by SHA-256 and remove the distro package. Parity checks the same major version and each role's executable path.",
@@ -566,6 +567,23 @@
   "image_only_rust_targets": [
     "aarch64-pc-windows-gnullvm"
   ],
+  "image_only_rust_toolchains": {
+    "1.99.1-x86_64-unknown-linux-gnu": {
+      "components": [
+        "cargo-x86_64-unknown-linux-gnu",
+        "clippy-x86_64-unknown-linux-gnu",
+        "rust-std-wasm32-unknown-unknown",
+        "rust-std-x86_64-unknown-linux-gnu",
+        "rustc-x86_64-unknown-linux-gnu",
+        "rustfmt-x86_64-unknown-linux-gnu"
+      ],
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "targets": [
+        "wasm32-unknown-unknown",
+        "x86_64-unknown-linux-gnu"
+      ]
+    }
+  },
   "job_environment": {
     "AR_aarch64_pc_windows_gnullvm": "/usr/local/lib/motor/llvm-mingw/bin/llvm-ar",
     "CARGO_HOME": "/motor-home/cargo",
