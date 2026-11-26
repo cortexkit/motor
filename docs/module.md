@@ -91,6 +91,10 @@ the current phase has lasted two seconds and are at least ten seconds apart.
 They keep carrying the job ID. Callers that do not opt in receive no progress,
 and attach does not replay progress records.
 
+While ck-motor sends Git history to the runner, progress shows how much it has
+sent out of the total. If the upload stalls because the job is waiting in the
+runner's queue, or once it finishes, progress shows the queue status again.
+
 After `Accepted` and until `Started`, an opted-in caller also receives
 display-only `queue_wait` progress each time what the queued job waits on
 changes, and never while it stays the same. `waiting_on` is `checkout` when

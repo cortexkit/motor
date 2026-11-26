@@ -2164,6 +2164,19 @@ impl Motor {
         bundles: &[BundleManifest],
         job: Option<Uuid>,
     ) -> io::Result<()> {
+        let reporter = job.filter(|_| !bundles.is_empty()).and_then(|id| {
+            self.health_progress
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|(_, reporter)| reporter.clone())
+        });
+        let upload = reporter.as_ref().and_then(|reporter| {
+            let total = bundles
+                .iter()
+                .fold(0u64, |total, bundle| total.saturating_add(bundle.length));
+            reporter.upload(total)
+        });
         for bundle in bundles {
             let mut file =
                 tokio::fs::File::open(snapshots.spool.0.join(format!("bundle-{}", bundle.index)))
@@ -2225,6 +2238,9 @@ impl Motor {
                     )
                     .await?;
                 offset += n as u64;
+                if let Some(upload) = &upload {
+                    upload.advance(n as u64);
+                }
             }
         }
         Ok(())

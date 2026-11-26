@@ -15,6 +15,16 @@ struct Upload {
 }
 
 async fn upload(heartbeats: bool, budget: u64) -> Upload {
+    upload_with_checkpoints(heartbeats, budget, None).await
+}
+
+const CHECKPOINTS: [u64; 2] = [1024 * 1024, 2 * 1024 * 1024];
+
+async fn upload_with_checkpoints(
+    heartbeats: bool,
+    budget: u64,
+    checkpoints: Option<(mpsc::Sender<u64>, mpsc::Receiver<()>)>,
+) -> Upload {
     let scratch = ScratchDir::new("upload-peer-activity");
     let repo = super::queue_tests::fixture_repo(scratch.path());
     let motor = Motor::open(Config::default(), &scratch.join("state")).unwrap();
@@ -67,6 +77,7 @@ async fn upload(heartbeats: bool, budget: u64) -> Upload {
         let mut bytes = Vec::new();
         let mut spooled = 0;
         let mut offset = 0;
+        let mut checkpoints = checkpoints;
         while offset < length {
             let frame = read_frame_async(&mut peer).await.unwrap().unwrap();
             bytes.clear();
@@ -82,6 +93,12 @@ async fn upload(heartbeats: bool, budget: u64) -> Upload {
                     assert_eq!(at, offset);
                     assert!(data.0.iter().all(|b| *b == 0));
                     offset += data.0.len() as u64;
+                    if let Some((arrived, resume)) = &mut checkpoints {
+                        if CHECKPOINTS.contains(&offset) {
+                            arrived.send(offset).await.unwrap();
+                            resume.recv().await.unwrap();
+                        }
+                    }
                 }
                 Frame::Heartbeat { .. } => {}
                 other => panic!("unexpected upload frame: {other:?}"),
@@ -93,6 +110,21 @@ async fn upload(heartbeats: bool, budget: u64) -> Upload {
         }
         assert!(offset < length, "upload must exceed the host spool cap");
         capped_tx.send(()).unwrap();
+        if checkpoints.is_some() {
+            let status = serde_json::from_value(serde_json::json!({
+                "state": "queued", "position": 3, "waiting_on": "checkout disk",
+            }))
+            .unwrap();
+            write_frame_async(
+                &mut peer,
+                &Frame::Heartbeat {
+                    queue_wait_ms: Some(0),
+                    queue_status: Some(status),
+                },
+            )
+            .await
+            .unwrap();
+        }
         let mut sequence = 0;
         let mut heartbeat = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -157,6 +189,87 @@ async fn tick() {
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
+}
+
+#[tokio::test]
+async fn flowing_bundle_reports_growing_upload_bytes_then_queue_wait() {
+    let (arrived, mut checkpoint) = mpsc::channel(1);
+    let (resume, resumes) = mpsc::channel(1);
+    let Upload {
+        _scratch,
+        motor,
+        snapshots,
+        bundles,
+        mut channel,
+        id,
+        capped,
+        release,
+        host,
+    } = upload_with_checkpoints(false, 180, Some((arrived, resumes))).await;
+    let reporter = progress::Reporter::new(true, 1).with_job_id(id);
+    let _submission = motor.observe_health_submission(id, Platform::Linux, reporter.clone());
+    let (records_tx, records_rx) = mpsc::channel(8);
+    let (caller_tx, mut caller) = mpsc::channel(8);
+    let reporting = tokio::spawn(async move {
+        reporter
+            .forward(std::future::pending(), records_rx, &caller_tx)
+            .await
+    });
+    records_tx
+        .send(Ok(StreamRecord::Accepted(Accepted::new(id, 0))))
+        .await
+        .unwrap();
+    assert!(matches!(
+        caller.recv().await,
+        Some(Ok(StreamRecord::Accepted(_)))
+    ));
+    let uploading = tokio::spawn({
+        let motor = motor.clone();
+        async move {
+            motor
+                .upload(&mut channel, &snapshots, &bundles, Some(id))
+                .await
+                .unwrap();
+            channel
+        }
+    });
+    for (count, (delay_s, detail)) in CHECKPOINTS
+        .into_iter()
+        .zip([(2, "uploading 1 of 65 MB"), (10, "uploading 2 of 65 MB")])
+    {
+        assert_eq!(checkpoint.recv().await, Some(count));
+        tokio::time::pause();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(delay_s)).await;
+        let update = tokio::time::timeout(Duration::from_millis(100), caller.recv())
+            .await
+            .expect("the live bundle upload must report its byte count");
+        assert!(matches!(update, Some(Ok(StreamRecord::Progress(p)))
+            if p.phase() == &ProgressPhase::Upload && p.detail() == Some(detail)));
+        tokio::time::resume();
+        resume.send(()).await.unwrap();
+    }
+    capped.await.unwrap();
+    release.send(()).unwrap();
+    let mut channel = uploading.await.unwrap();
+    while let Incoming::Frame(Frame::Heartbeat { queue_status, .. }) =
+        channel.next_job().await.unwrap()
+    {
+        if let Some(status) = queue_status {
+            motor.report_queue_status(id, &status);
+        }
+    }
+    let update = tokio::time::timeout(Duration::from_secs(5), caller.recv())
+        .await
+        .expect("queue status must be visible again after upload");
+    assert!(matches!(update, Some(Ok(StreamRecord::Progress(p)))
+        if p.phase() == &ProgressPhase::QueueWait
+            && p.waiting_on() == Some(&ProgressWaitingOn::CheckoutDisk)));
+    host.await.unwrap();
+    reporting.abort();
+    let _ = reporting.await;
 }
 
 #[tokio::test]

@@ -10,8 +10,8 @@
 //! through to the caller; submission or transport failures exit unsuccessfully.
 use crate::{config::DEFAULT_DIRECT_EXEC_MAX_TIMEOUT_SECS, module::direct_timeout_refusal};
 use motor_protocol::{
-    AttachRequest, CancelRequest, JobStatusReply, Killed, Outcome, OutputStream, RunRequest,
-    StreamRecord, TerminalRecord, Uuid,
+    AttachRequest, CancelRequest, JobStatusReply, Killed, Outcome, OutputStream, Progress,
+    ProgressPhase, RunRequest, StreamRecord, TerminalRecord, Uuid,
 };
 use serde_json::json;
 use std::{
@@ -1458,6 +1458,7 @@ async fn consume<C: ExecClient + ?Sized>(
         "run"
     };
     let mut job_id = session.job_id;
+    let mut admitted = false;
     let mut received = false;
     let mut last_output_seq = None;
     let mut recovery_deadline: Option<Instant> = None;
@@ -1478,9 +1479,9 @@ async fn consume<C: ExecClient + ?Sized>(
             status = async {
                 status_tick.tick().await;
                 tokio::time::timeout(Duration::from_secs(2), client.status(job_id.unwrap(), session.secret.as_deref().unwrap())).await
-            // Poll only while the stream is attached: during recovery the
-            // reattach path owns the connection to ck-motor.
-            }, if name == "run" && job_id.is_some() && session.secret.is_some() && !queue_display.started && recovery_deadline.is_none() => {
+            // A progress record can give us the ID before acceptance. Poll
+            // only after admission, and not while reattach owns the connection.
+            }, if name == "run" && admitted && job_id.is_some() && session.secret.is_some() && !queue_display.started && recovery_deadline.is_none() => {
                 if let Ok(Ok(status)) = status {
                     queue_display.observe(&status, err);
                 }
@@ -1718,6 +1719,7 @@ async fn consume<C: ExecClient + ?Sized>(
         }
         match record {
             StreamRecord::Accepted(accepted) => {
+                admitted = true;
                 if let Some(state) = &hosted {
                     let placement = state
                         .placement
@@ -1793,6 +1795,9 @@ async fn consume<C: ExecClient + ?Sized>(
                     queue_display.started(err);
                 }
             }
+            StreamRecord::Progress(progress) if name == "run" => {
+                queue_display.progress(&progress, err);
+            }
             StreamRecord::ReturnResult(result) => session.returns.legacy(&result),
             StreamRecord::ReturnChunk(chunk) => session.returns.chunk(&chunk),
             StreamRecord::ReturnManifest(manifest) => {
@@ -1809,10 +1814,10 @@ async fn consume<C: ExecClient + ?Sized>(
 #[derive(Default)]
 struct QueueDisplay {
     last: Option<(String, Option<Uuid>)>,
+    upload_at: Option<Instant>,
     started: bool,
-    /// A `queued:` line was printed, so the start is worth a line too. A job
-    /// that never visibly waited keeps the run's stderr exactly as before;
-    /// callers and scripts read it.
+    /// A status line was printed, so the start is worth a line too. A job that
+    /// never visibly waited keeps the run's stderr unchanged for scripts.
     announced: bool,
 }
 
@@ -1830,7 +1835,15 @@ impl QueueDisplay {
         if status.state == "running" {
             self.started(err);
         }
-        if self.started || status.state != "queued" {
+        // Status can say queued during a moving upload. Trust fresh stream
+        // progress, but keep polling so older runners without queue heartbeats
+        // still show why a job waits when upload updates stop.
+        if self.started
+            || status.state != "queued"
+            || self
+                .upload_at
+                .is_some_and(|at| at.elapsed() <= crate::motor::progress::UPDATE_INTERVAL)
+        {
             return;
         }
         let Some(waiting) = status.waiting_on.as_deref() else {
@@ -1897,6 +1910,24 @@ impl QueueDisplay {
         };
         self.announced = true;
         let _ = writeln!(err, "ck motor run: queued: waiting for {detail}");
+    }
+
+    fn progress(&mut self, progress: &Progress, err: &mut dyn Write) {
+        if self.started {
+            return;
+        }
+        match progress.phase() {
+            ProgressPhase::Upload => {
+                if let Some(detail) = progress.detail() {
+                    self.upload_at = Some(Instant::now());
+                    self.last = None;
+                    self.announced = true;
+                    let _ = writeln!(err, "ck motor run: {detail}");
+                }
+            }
+            ProgressPhase::QueueWait => self.upload_at = None,
+            _ => {}
+        }
     }
 }
 
@@ -2166,7 +2197,8 @@ impl ExecClient for SubcClient {
         self.return_workspace.as_deref()
     }
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
-        let mut params = serde_json::to_value(request).expect("serializable request");
+        let mut params = serde_json::to_value(request.clone().with_progress(true))
+            .expect("serializable request");
         if self.allow_spill {
             params["allow_spill"] = json!(true);
         }
