@@ -963,7 +963,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     hello: bool,
     mut reader: Reader,
     mut attached: bool,
-) -> Result<()> {
+) -> Result<ConnectionEnd> {
     let stream = runtime.job_stream(&claims.jti)?;
     // Subscribing starts after the latest heartbeat: only a new runner frame
     // can describe the queue state of this caller's live attachment.
@@ -1026,7 +1026,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     &json!({"type":"terminal","job_id":claims.jti,"outcome":{"type":"outcome_unknown"},"wall_ms":0,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null}),
                 )
                 .await?;
-                return Ok(());
+                return Ok(ConnectionEnd::SentFinalFrames);
             }
         };
         if let Some((next, bytes)) = frame {
@@ -1088,7 +1088,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     if let Some(hosted) = hosted {
                         write_frame(&mut write, &hosted).await?;
                     }
-                    return Ok(());
+                    return Ok(ConnectionEnd::SentFinalFrames);
                 }
             }
             continue;
@@ -1100,7 +1100,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 let request = match request {
                     Ok(request) => request,
                     Err(error) if hello && error.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) => return Ok(()),
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof) => return Ok(ConnectionEnd::Disconnected),
                     Err(error) => {
                         if !hello {
                             // The uploading caller's own connection ended. With
