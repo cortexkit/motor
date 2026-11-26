@@ -1,14 +1,49 @@
 use motor_protocol::{Progress, ProgressPhase, ProgressWaitingOn, QueueStatus, StreamRecord, Uuid};
-use std::{future::Future, io, time::Duration};
+use std::{
+    future::Future,
+    io,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, watch},
     time::Instant,
 };
 
+pub(crate) const UPDATE_INTERVAL: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 struct Phase {
     kind: ProgressPhase,
     started: Instant,
+    upload: Option<UploadCount>,
+}
+
+#[derive(Clone)]
+struct UploadCount {
+    sent: Arc<AtomicU64>,
+    total: u64,
+}
+
+pub(super) struct Upload<'a> {
+    reporter: &'a Reporter,
+    sent: Arc<AtomicU64>,
+}
+
+impl Upload<'_> {
+    pub(super) fn advance(&self, bytes: u64) {
+        self.sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Upload<'_> {
+    fn drop(&mut self) {
+        // An interrupted upload must stop reporting just like a finished one.
+        self.reporter.clear();
+    }
 }
 
 /// What a queued job is waiting on, as the caller sees it in `queue_wait`
@@ -98,10 +133,14 @@ impl Reporter {
     }
 
     pub(crate) fn initial(&self) -> StreamRecord {
-        self.record(&Phase {
-            kind: ProgressPhase::PlacementWait,
-            started: Instant::now(),
-        })
+        self.record(
+            &Phase {
+                kind: ProgressPhase::PlacementWait,
+                started: Instant::now(),
+                upload: None,
+            },
+            None,
+        )
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -120,6 +159,7 @@ impl Reporter {
             *current = Some(Phase {
                 kind,
                 started: Instant::now(),
+                upload: None,
             });
             true
         });
@@ -127,6 +167,26 @@ impl Reporter {
 
     pub(crate) fn clear(&self) {
         self.phase.send_replace(None);
+    }
+
+    pub(super) fn upload(&self, total: u64) -> Option<Upload<'_>> {
+        if !self.enabled || total == 0 {
+            return None;
+        }
+        // The timer samples the counter; chunks do not wake the display task.
+        let sent = Arc::new(AtomicU64::new(0));
+        self.phase.send_replace(Some(Phase {
+            kind: ProgressPhase::Upload,
+            started: Instant::now(),
+            upload: Some(UploadCount {
+                sent: sent.clone(),
+                total,
+            }),
+        }));
+        Some(Upload {
+            reporter: self,
+            sent,
+        })
     }
 
     /// Records the queue status from a heartbeat. Only a change in what the
@@ -172,7 +232,7 @@ impl Reporter {
         StreamRecord::Progress(record)
     }
 
-    fn record(&self, phase: &Phase) -> StreamRecord {
+    fn record(&self, phase: &Phase, upload: Option<(u64, u64)>) -> StreamRecord {
         let elapsed = u64::try_from(phase.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Only fixed wording and a resource count enter detail, never routing or request text.
         let detail = match phase.kind {
@@ -180,7 +240,10 @@ impl Reporter {
                 Some(format!("waiting for a host with {} free vCPUs", self.vcpus))
             }
             ProgressPhase::Connect => Some("connecting to a runner".into()),
-            ProgressPhase::Upload => Some("uploading inputs".into()),
+            ProgressPhase::Upload => Some(match upload {
+                Some((sent, total)) => format!("uploading {sent} of {total} bytes"),
+                None => "uploading inputs".into(),
+            }),
             _ => None,
         };
         let record = Progress::new(phase.kind.clone(), elapsed, detail)
@@ -215,15 +278,67 @@ impl Reporter {
         let mut queue_since: Option<Instant> = None;
         let mut queue_done = false;
         let mut last_queue_wait: Option<QueueWait> = None;
+        let mut upload_sample: Option<(Instant, u64, bool)> = None;
         tokio::pin!(future);
         let result = loop {
             let phase = phases.borrow_and_update().clone();
-            let deadline = phase.as_ref().filter(|_| !stopped).map(|phase| {
-                let quiet = phase.started + Duration::from_secs(2);
-                last_tick.map_or(quiet, |last: Instant| {
-                    quiet.max(last + Duration::from_secs(10))
+            let upload = phase.as_ref().and_then(|phase| {
+                let count = phase.upload.as_ref()?;
+                queue_since.map(|_| (phase.started, count))
+            });
+            let previous_sample =
+                upload.and_then(|(started, _)| upload_sample.filter(|(at, _, _)| *at == started));
+            // Give the upload a reporting interval to move. A host can stop
+            // reading once it has buffered all it can for a queued job. If
+            // the count stops increasing, let the queue reason explain why.
+            let moving = upload.is_some_and(|(_, count)| {
+                previous_sample.is_none_or(|(_, previous, stalled)| {
+                    !stalled || previous != count.sent.load(Ordering::Relaxed)
                 })
             });
+            if upload.is_none()
+                && matches!(&pending_display, Some(StreamRecord::Progress(p)) if stopped && p.phase() == &ProgressPhase::Upload)
+            {
+                pending_display = None;
+            }
+            if moving
+                && matches!(&pending_display, Some(StreamRecord::Progress(p)) if p.phase() == &ProgressPhase::QueueWait)
+            {
+                pending_display = None;
+                last_queue_wait = None;
+            }
+            // Report once per change of what the job waits on, never on a timer:
+            // an unchanged wait repeats nothing unless Upload replaced it.
+            if let Some(since) = queue_since {
+                let state = queue.borrow_and_update().clone();
+                match state {
+                    QueueState::Waiting(wait)
+                        if !moving && last_queue_wait.as_ref() != Some(&wait) =>
+                    {
+                        pending_display = Some(self.queue_record(&wait, since));
+                        last_queue_wait = Some(wait);
+                    }
+                    QueueState::Started => {
+                        queue_done = true;
+                        queue_since = None;
+                        pending_display = None;
+                    }
+                    _ => {}
+                }
+            }
+            let deadline = phase
+                .as_ref()
+                .filter(|phase| {
+                    if phase.upload.is_some() {
+                        queue_since.is_some()
+                    } else {
+                        !stopped
+                    }
+                })
+                .map(|phase| {
+                    let quiet = phase.started + Duration::from_secs(2);
+                    last_tick.map_or(quiet, |last: Instant| quiet.max(last + UPDATE_INTERVAL))
+                });
             let timer = async {
                 match deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -235,7 +350,7 @@ impl Reporter {
                 result = &mut future => break result,
                 record = records.recv(), if pending_ordered.is_none() => {
                     let Some(record) = record else { return Err(io::Error::other("submission stream closed")); };
-                    // Once accepted, a job only reports queue waits, even if its host changes.
+                    // Placement and connection progress cannot resume after acceptance.
                     if !stopped && matches!(&record, Ok(StreamRecord::Accepted(_) | StreamRecord::Terminal(_))) {
                         stopped = true;
                         pending_display = None;
@@ -253,6 +368,7 @@ impl Reporter {
                     pending_ordered = Some(record);
                 }
                 _ = queue.changed(), if queue_since.is_some() => {},
+                _ = phases.changed() => {},
                 // Reserving can be interrupted without consuming either record.
                 permit = tx.reserve(), if pending_ordered.is_some() || pending_display.is_some() => {
                     if let Some(record) = pending_ordered.take() {
@@ -269,27 +385,20 @@ impl Reporter {
                         }
                     }
                 }
-                _ = phases.changed() => {},
                 _ = timer => {
-                    pending_display = Some(self.record(phase.as_ref().unwrap()));
                     last_tick = Some(Instant::now());
-                }
-            }
-            // Report once per change of what the job waits on, never on a timer:
-            // an unchanged wait repeats nothing.
-            if let Some(since) = queue_since {
-                let state = queue.borrow_and_update().clone();
-                match state {
-                    QueueState::Waiting(wait) if last_queue_wait.as_ref() != Some(&wait) => {
-                        pending_display = Some(self.queue_record(&wait, since));
-                        last_queue_wait = Some(wait);
+                    let phase = phase.as_ref().unwrap();
+                    if let Some((started, count)) = upload {
+                        let sent = count.sent.load(Ordering::Relaxed);
+                        let stalled = previous_sample.map_or(0, |(_, previous, _)| previous) == sent;
+                        upload_sample = Some((started, sent, stalled));
+                        if !stalled {
+                            pending_display = Some(self.record(phase, Some((sent, count.total))));
+                            last_queue_wait = None;
+                        }
+                    } else {
+                        pending_display = Some(self.record(phase, None));
                     }
-                    QueueState::Started => {
-                        queue_done = true;
-                        queue_since = None;
-                        pending_display = None;
-                    }
-                    _ => {}
                 }
             }
         };

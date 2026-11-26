@@ -63,6 +63,34 @@ fn capacity_and_old_runner_statuses_do_not_print_queue_lines() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn polled_queue_status_returns_when_upload_updates_stop() {
+    let mut display = QueueDisplay::default();
+    let mut err = Vec::new();
+    let mut reply = queued(Uuid::now_v7(), Uuid::now_v7());
+    reply.waiting_on = Some("memory".into());
+    reply.blocker = None;
+    display.observe(&reply, &mut err);
+    let progress = Progress::new(
+        ProgressPhase::Upload,
+        2000,
+        Some("uploading 10 of 20 bytes".into()),
+    )
+    .unwrap();
+    display.progress(&progress, &mut err);
+    display.observe(&reply, &mut err);
+    tokio::time::advance(Duration::from_secs(11)).await;
+    display.observe(&reply, &mut err);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        concat!(
+            "ck motor run: queued: waiting for memory\n",
+            "ck motor run: uploading 10 of 20 bytes\n",
+            "ck motor run: queued: waiting for memory\n"
+        )
+    );
+}
+
 struct PollingClient {
     polls: AtomicUsize,
     owners: [Uuid; 2],
@@ -145,6 +173,82 @@ async fn run_polls_live_status_until_started_without_heartbeat_spam() {
     assert_eq!(err.matches("ck motor run: started\n").count(), 1, "{err}");
     assert!(!err.contains("private"));
     assert_eq!(client.polls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_renders_stream_upload_before_polled_queue_status() {
+    let client = PollingClient {
+        polls: AtomicUsize::new(0),
+        owners: [Uuid::now_v7(), Uuid::now_v7()],
+    };
+    let id = Uuid::now_v7();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tx.send(Ok(serde_json::to_vec(&StreamRecord::Accepted(
+        motor_protocol::Accepted::new(id, 0),
+    ))
+    .unwrap()))
+        .unwrap();
+    tokio::spawn(async move {
+        let send = |record| tx.send(Ok(serde_json::to_vec(&record).unwrap())).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        send(StreamRecord::Progress(
+            Progress::new(
+                ProgressPhase::Upload,
+                2000,
+                Some("uploading 1048576 of 67108864 bytes".into()),
+            )
+            .unwrap(),
+        ));
+        // The polls at 5 and 7 s see a queued status during upload. The
+        // QueueWait record then lets the poll at 9 s explain the wait.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        send(StreamRecord::Progress(
+            Progress::new(ProgressPhase::QueueWait, 8000, None).unwrap(),
+        ));
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        send(StreamRecord::Terminal(TerminalRecord::new(
+            id,
+            Outcome::Exit { code: 0 },
+            0,
+            0,
+            0,
+        )));
+    });
+    let (_, mut interrupts) = mpsc::channel(1);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = consume(
+        &client,
+        Box::new(QueuedStream(rx)),
+        Session {
+            records: None,
+            returns: returned_files::Returns::new(
+                None,
+                None,
+                cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP,
+            ),
+            job_id: None,
+            secret: Some("private".into()),
+            secret_file: None,
+            secret_for_attach: None,
+            default_secret_directory: None,
+            default_secret_file: None,
+        },
+        &mut out,
+        &mut err,
+        &mut interrupts,
+    )
+    .await;
+    assert_eq!(code, 0);
+    let err = String::from_utf8(err).unwrap();
+    let upload = err.find("ck motor run: uploading 1048576 of 67108864 bytes\n");
+    let wait = err.find("ck motor run: queued: ");
+    assert!(
+        matches!((upload, wait), (Some(upload), Some(wait)) if upload < wait),
+        "{err}"
+    );
+    assert_eq!(err.matches("queued:").count(), 1, "{err}");
+    assert!(err.contains(&client.owners[1].to_string()), "{err}");
+    assert!(!err.contains(&client.owners[0].to_string()), "{err}");
 }
 
 #[tokio::test(start_paused = true)]

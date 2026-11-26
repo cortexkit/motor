@@ -837,10 +837,16 @@ async fn hosted_heartbeats_reach_the_caller_as_queue_wait() {
         )
     })
     .await;
+    // The host already has the commits; leave the job queued longer than an
+    // upload reporting interval to catch a spurious Upload phase.
+    tokio::time::advance(Duration::from_secs(12)).await;
     h.run_gate.send_replace(true);
     until("hosted completion", || task.is_finished()).await;
     task.await.unwrap();
     let seen = seen.lock().unwrap().clone();
+    assert!(!seen
+        .iter()
+        .any(|r| matches!(r, StreamRecord::Progress(p) if p.phase() == &ProgressPhase::Upload),));
     let accepted = seen
         .iter()
         .position(|r| matches!(r, StreamRecord::Accepted(_)))
