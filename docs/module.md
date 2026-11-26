@@ -677,12 +677,14 @@ runners and the fallback when host memory metadata is absent.
 **Returned files.** `return_paths` names files relative to the request's `cwd`;
 `return_max_bytes` caps their total size, 262,144 bytes when absent. A larger
 cap is refused as `invalid_params` before any job exists, whether or not paths
-accompany it. Each path is joined to `cwd`, then the same lexical bounds as
-direct runs apply before start: an absolute path, `..`, more than 64 paths or a
-path outside the workspace is refused as `request_rejected` with
-`return_paths_exceeded`. Hosted runners collect files in the same way as the
-build server. The runner's result reaches the caller as a `return_result` record
-immediately before the terminal record, with cwd-relative paths. Collection
+accompany it. Each path is joined to `cwd` and its `.` and `..` components are
+resolved, so a path may climb out of `cwd` to another part of the workspace;
+then the same lexical bounds as direct runs apply before start: an absolute
+path, more than 64 paths or a path outside the workspace is refused as
+`request_rejected` with `return_paths_exceeded`. Hosted runners collect files in
+the same way as the build server. The runner's result reaches the caller as a
+`return_result` record immediately before the terminal record, with paths
+relative to `cwd` (climbing with `..` where a file lies outside it). Collection
 failures (`over_cap`, `missing`, `escape`, `not_regular`, `frame_limit`) do not
 change the job's outcome. A reattach from before the record's `seq` replays it.
 Files are also collected after the job's processes are killed when it is

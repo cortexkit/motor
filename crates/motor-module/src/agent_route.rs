@@ -74,7 +74,12 @@ pub(crate) fn take_return_request(
         if Path::new(path).is_absolute() {
             return Err(ReturnRequestError::Rejected("return_paths_exceeded"));
         }
-        absolute.push(cwd.join(path).to_string_lossy().into_owned());
+        // A path may climb out of `cwd` with `..` to reach another part of the
+        // workspace. Resolve it here, so the runner gets a plain absolute path;
+        // the submission check then refuses anything outside the workspace.
+        let joined = lexically_normal(&cwd.join(path))
+            .ok_or(ReturnRequestError::Rejected("return_paths_exceeded"))?;
+        absolute.push(joined.to_string_lossy().into_owned());
     }
     Ok(Some(ReturnRequest {
         options: ReturnOptions {
@@ -89,6 +94,47 @@ pub(crate) fn take_return_request(
         cwd: request.cwd.clone(),
         requested: chunked.then_some(paths),
     }))
+}
+
+/// `path` with `.` and `..` resolved without touching the filesystem, or `None`
+/// if `..` would climb above the root. Symlinks are not followed here; the
+/// runner refuses linked path components when it collects the files.
+fn lexically_normal(path: &Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut normal = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normal.pop() || normal.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            other => normal.push(other),
+        }
+    }
+    Some(normal)
+}
+
+/// `path` relative to `cwd`, climbing with `..` where `path` lies outside it.
+/// Both are absolute and already normal, as the runner echoes the paths this
+/// module resolved.
+fn caller_relative(path: &Path, cwd: &Path) -> String {
+    let path_parts: Vec<_> = path.components().collect();
+    let cwd_parts: Vec<_> = cwd.components().collect();
+    let shared = path_parts
+        .iter()
+        .zip(&cwd_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut relative = std::path::PathBuf::new();
+    for _ in shared..cwd_parts.len() {
+        relative.push("..");
+    }
+    for part in &path_parts[shared..] {
+        relative.push(part);
+    }
+    relative.to_string_lossy().into_owned()
 }
 
 /// The runner-side form of an agent's returned-file request, and what the
@@ -161,11 +207,7 @@ pub(crate) fn return_record(
                 tracing::warn!(job_id = %result.job_id, "stored return result has invalid file data; not forwarded");
                 return None;
             };
-            let path = Path::new(&file.path)
-                .strip_prefix(cwd)
-                .map_or(file.path.clone(), |relative| {
-                    relative.to_string_lossy().into_owned()
-                });
+            let path = caller_relative(Path::new(&file.path), Path::new(cwd));
             let mut returned_file = shared::ReturnedFile::new(path, file.sha256, BytePayload(data));
             if let Some(executable) = file.executable {
                 returned_file = returned_file.with_executable(executable);

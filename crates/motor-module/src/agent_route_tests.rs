@@ -74,9 +74,10 @@ fn chunked_request_raises_the_cap_to_ten_mib_and_keeps_the_paths_as_sent() {
         options.return_max_bytes,
         shared::RETURN_CHUNKED_MAX_BYTES_CAP
     );
+    // The runner gets resolved paths; the caller's spelling is kept separately.
     assert_eq!(
         options.return_paths,
-        ["/w/key/sub/./out", "/w/key/sub/nested/file.txt"]
+        ["/w/key/sub/out", "/w/key/sub/nested/file.txt"]
     );
     assert_eq!(cwd, "/w/key/sub");
     assert_eq!(
@@ -151,6 +152,44 @@ fn caller_manifest_echoes_requested_paths_by_position() {
         manifest
     );
     assert_eq!(caller_manifest(manifest.clone(), None), manifest);
+}
+
+#[test]
+fn return_paths_may_climb_out_of_cwd_and_come_back_relative_to_it() {
+    let mut climbing = request().with_return_paths(vec![
+        "../.cortexkit/x/a.png".into(),
+        "./out/../out/b".into(),
+    ]);
+    let returns = take_return_request(&mut climbing).unwrap().unwrap();
+    assert_eq!(
+        returns.options.return_paths,
+        ["/w/key/.cortexkit/x/a.png", "/w/key/sub/out/b"]
+    );
+    // Leaving the workspace is refused later by the submission check, which
+    // knows the workspace root; climbing above `/` can never resolve.
+    let mut above_root = request().with_return_paths(vec!["../../../../../etc/passwd".into()]);
+    assert_eq!(
+        take_return_request(&mut above_root),
+        Err(ReturnRequestError::Rejected("return_paths_exceeded"))
+    );
+
+    let record = return_record(
+        stored(
+            Some(vec![ReturnedFile {
+                path: "/w/key/.cortexkit/x/a.png".into(),
+                sha256: "digest".into(),
+                data: "eA==".into(),
+                executable: None,
+            }]),
+            None,
+        ),
+        "/w/key/sub",
+    )
+    .unwrap();
+    assert_eq!(
+        record.returned_files().unwrap()[0].path(),
+        "../.cortexkit/x/a.png"
+    );
 }
 
 #[test]
