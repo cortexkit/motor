@@ -32,6 +32,16 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+impl Evidence {
+    // A deadline records a host winner and unclean intent without adding a
+    // new persisted stop cause. Retry until the helper proves the VM exited.
+    pub(crate) fn hard_stop_pending(&self) -> bool {
+        self.exit.is_none()
+            && (self.stop.is_some()
+                || (self.winner == Some(Winner::HostStop) && self.unclean_stop == Some(true)))
+    }
+}
+
 /// Outcome and observed measurements frozen with the winner. Egress is supplied
 /// only by the helper receipt before the single broker usage body is built.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -207,6 +217,45 @@ impl Host {
         self.save(next)?;
         tracing::warn!(jti = job, cause = cause.as_str(), "job_host_stop");
         Ok(())
+    }
+
+    /// A deadline says why the host is tearing down the VM, not how the
+    /// command ended. Keep the existing winner and receipt rules for billing.
+    pub(crate) fn job_deadline_stop(
+        &mut self,
+        job: &str,
+        detail: &str,
+        now_ms: u64,
+    ) -> Result<bool, Error> {
+        let mut next = self.snapshot.clone();
+        let execution = next
+            .per_job
+            .executions
+            .get_mut(job)
+            .ok_or(Error::Refused(Refusal::Auth))?;
+        if execution.ended {
+            return Ok(false);
+        }
+        let evidence = execution.evidence.get_or_insert_with(Default::default);
+        let first_stop = evidence.unclean_stop != Some(true);
+        evidence.unclean_stop = Some(true);
+        if evidence.winner.is_none() {
+            evidence.winner = Some(Winner::HostStop);
+            settle_failure(&mut next, job, now_ms);
+            let billing = next.billing.entry(job.into()).or_default();
+            let terminal = billing.terminal.get_or_insert_with(|| {
+                json!({"type":"terminal","job_id":job,
+                    "outcome":{"type":"refused_before_start","reason":"internal_failure"},
+                    "wall_ms":0,"queue_wait_ms":0,"bundle_bytes":0,"ran":"none",
+                    "tree_hash":null,"workspace_changes":null})
+            });
+            terminal["refusal_detail"] = detail.into();
+            defer_usage(&mut next, job);
+        }
+        super::jobs::have::invalidate(&mut next, job);
+        super::jobs::recovery::quarantine(&mut next, job);
+        self.save(next)?;
+        Ok(first_stop)
     }
 
     /// Sync the full receipt and settlement together before acknowledging the helper.

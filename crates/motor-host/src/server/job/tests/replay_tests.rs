@@ -1420,12 +1420,9 @@ async fn lifecycle_terminal_before_stream_started_keeps_real_result_replayable()
     assert_eq!(replayed(&runtime).await, records);
 }
 
-/// A lifecycle terminal that reaches the host as replayed backlog records the
-/// previous host process's last-alive time as the lease end, which can be hours
-/// old. Return chunks still streaming at that moment once lost their stored
-/// prefix to an expiry check, leaving a sequence gap no caller can accept.
-/// The backlog comes either from a lifecycle reconnect inside one long-running
-/// host process, or from the first lifecycle connection after a host restart.
+/// Replayed lifecycle terminals use the observation time for VMs booted by
+/// this host process and the previous last-alive time for adopted VMs. Neither
+/// end time may expire a return stream that is still sending its chunks.
 async fn backlog_terminal_mid_transfer(restart: bool) {
     use crate::billing::RECORD_RETENTION_MS;
     use motor_protocol::{ReturnManifestEntry, ReturnManifestOutcome};
@@ -1464,13 +1461,12 @@ async fn backlog_terminal_mid_transfer(restart: bool) {
         drop(guest);
         guest = peer(&fake);
         let restarted = reopen(&runtime, fake.clone(), storage);
-        restarted.recover().unwrap();
         {
             // The previous host process was last alive long before this start.
             let mut host = restarted.host.lock().unwrap();
             host.snapshot.last_alive = stale;
-            host.start_billing(unix_ms()).unwrap();
         }
+        restarted.recover().unwrap();
         handshake(&mut guest).await;
         assert_eq!(
             read_frame(&mut guest).await.unwrap(),
@@ -1493,7 +1489,10 @@ async fn backlog_terminal_mid_transfer(restart: bool) {
         )
         .unwrap();
         host.event_observed(JOB, &terminal, now, false).unwrap();
-        assert_eq!(host.snapshot.leases[JOB].ended_at_ms, Some(stale));
+        assert_eq!(
+            host.snapshot.leases[JOB].ended_at_ms,
+            Some(if restart { stale } else { now })
+        );
     }
     // The host tick and every attach run this check.
     stream.expire_chunks(now).unwrap();

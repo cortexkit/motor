@@ -46,6 +46,13 @@ fn tick_step<T, E: Into<anyhow::Error>>(
     }
 }
 
+struct ExpiredDeadline {
+    reason: &'static str,
+    detail: &'static str,
+    measured_from_ms: Option<u64>,
+    deadline_ms: Option<u64>,
+}
+
 impl Runtime {
     pub(super) fn job_admin(&self, job: &str, request: &Value) -> Result<Value> {
         let id = uuid::Uuid::parse_str(job)?;
@@ -268,7 +275,11 @@ impl Runtime {
                         .lock()
                         .expect("host lock")
                         .job_vmm_gone(job, unix_ms())?;
-                } else if (cancelled && !stored_terminal)
+                } else if execution
+                    .evidence
+                    .as_ref()
+                    .is_some_and(crate::state::settlement::Evidence::hard_stop_pending)
+                    || (cancelled && !stored_terminal)
                     || (!execution.runner_hello
                         && Self::boot_remaining(
                             &self.host.lock().expect("host lock"),
@@ -400,6 +411,75 @@ impl Runtime {
         running
     }
 
+    fn expired_job_deadline(
+        &self,
+        host: &Host,
+        e: &Execution,
+        now_ms: u64,
+    ) -> Option<ExpiredDeadline> {
+        let crate::config::HostSettings::PerJob(settings) = &host.settings else {
+            return None;
+        };
+        if e.ended {
+            return None;
+        }
+        if e.boot_started && !e.runner_hello {
+            let deadline_ms = e
+                .boot_started_at_ms
+                .map(|at| at.saturating_add(settings.boot_deadline_ms));
+            if deadline_ms.is_none_or(|deadline| now_ms >= deadline) {
+                return Some(ExpiredDeadline {
+                    reason: "boot_deadline",
+                    detail: "server stopped the job at its VM boot deadline",
+                    measured_from_ms: e.boot_started_at_ms,
+                    deadline_ms,
+                });
+            }
+        }
+        let (at, limit, reason, detail) =
+            if let Some(at) = host.snapshot.leases[&e.claims.jti].started_at_ms {
+                (
+                    at,
+                    e.claims.max_s.saturating_mul(1000),
+                    "runtime_limit",
+                    "server stopped the job at its runtime limit",
+                )
+            } else {
+                let launch = self
+                    .job_launches
+                    .lock()
+                    .expect("job launches")
+                    .get(&e.claims.jti)
+                    .cloned();
+                // Waiting for another job to release the checkout disk does not
+                // spend the caller's queue budget. Recovery handles unbooted jobs separately.
+                let limit = launch
+                    .as_ref()
+                    .and_then(|launch| *launch.prestart_limit_ms.lock().expect("prestart limit"))
+                    .unwrap_or_else(|| e.claims.max_s.saturating_mul(1000));
+                let at = launch
+                    .as_ref()
+                    .and_then(|launch| *launch.boot_ready_at_ms.lock().expect("boot ready time"))
+                    .or(e.boot_started_at_ms)
+                    .or_else(|| e.boot_started.then(|| e.claims.iat.saturating_mul(1000)))?;
+                (
+                    at,
+                    limit,
+                    "prestart_limit",
+                    "server stopped the job at its pre-start limit",
+                )
+            };
+        let deadline = at
+            .saturating_add(limit)
+            .saturating_add(crate::billing::BACKSTOP_CANCEL_GRACE_MS);
+        (now_ms >= deadline).then_some(ExpiredDeadline {
+            reason,
+            detail,
+            measured_from_ms: Some(at),
+            deadline_ms: Some(deadline),
+        })
+    }
+
     pub(super) fn tick_jobs(&self, now_ms: u64) -> Result<()> {
         if !self.per_job() {
             return Ok(());
@@ -429,86 +509,15 @@ impl Runtime {
         );
         let due: Vec<_> = {
             let host = self.host.lock().expect("host lock");
-            let crate::config::HostSettings::PerJob(settings) = &host.settings else {
-                return Ok(());
-            };
             host.snapshot
                 .per_job
                 .executions
                 .values()
-                .filter(|e| {
-                    if e.ended {
-                        return false;
-                    }
-                    let lease = &host.snapshot.leases[&e.claims.jti];
-                    let started = lease.started_at_ms;
-                    let launch = self
-                        .job_launches
-                        .lock()
-                        .expect("job launches")
-                        .get(&e.claims.jti)
-                        .cloned();
-                    // Disk ownership waits do not spend the caller's queue
-                    // budget. Start the pre-boot bound only once the disk is
-                    // ready; restart recovery settles unbooted jobs separately.
-                    let prestart_limit = launch
-                        .as_ref()
-                        .and_then(|launch| {
-                            *launch.prestart_limit_ms.lock().expect("prestart limit")
-                        })
-                        .unwrap_or_else(|| e.claims.max_s.saturating_mul(1000));
-                    let prestart_at = launch
-                        .as_ref()
-                        .and_then(|launch| {
-                            *launch.boot_ready_at_ms.lock().expect("boot ready time")
-                        })
-                        .or(e.boot_started_at_ms)
-                        .or_else(|| e.boot_started.then(|| e.claims.iat.saturating_mul(1000)));
-                    let deadline = started.or(prestart_at).map(|at| {
-                        at.saturating_add(if started.is_some() {
-                            e.claims.max_s.saturating_mul(1000)
-                        } else {
-                            prestart_limit
-                        })
-                        .saturating_add(crate::billing::BACKSTOP_CANCEL_GRACE_MS)
-                    });
-                    (e.boot_started
-                        && !e.runner_hello
-                        && e.boot_started_at_ms.is_none_or(|at| {
-                            now_ms >= at.saturating_add(settings.boot_deadline_ms)
-                        }))
-                        || deadline.is_some_and(|deadline| now_ms >= deadline)
-                })
+                .filter(|e| self.expired_job_deadline(&host, e, now_ms).is_some())
                 .map(|e| (e.claims.jti.clone(), e.runner_hello))
                 .collect()
         };
         for (job, hello) in due {
-            let queue_expiry = {
-                let mut host = self
-                    .host
-                    .lock_for("settle queue deadline")
-                    .expect("host lock");
-                let execution = &host.snapshot.per_job.executions[&job];
-                if !execution.boot_started && !execution.ended {
-                    // Only a pre-start deadline can expire an unbooted job here.
-                    // Settle before stopping so replay and usage share the refusal.
-                    host.job_refused(
-                        &job,
-                        refusal(
-                            &job,
-                            "queue_wait_exceeded",
-                            "queue-wait budget expired before VM boot and Run delivery",
-                        ),
-                        now_ms,
-                    )
-                } else {
-                    Ok(())
-                }
-            };
-            if queue_expiry.is_err() {
-                tick_step(&mut failure, "settle_queue_expiry", queue_expiry);
-                continue;
-            }
             // If a VM disappeared while the host was down, still allow time
             // for a delayed helper exit report. The execution deadline alone
             // cannot prove how the VM ended.
@@ -533,11 +542,40 @@ impl Runtime {
                 );
                 continue;
             }
-            tick_step(
-                &mut failure,
-                "stop_expired",
-                self.stop_job(&job, true, true),
-            );
+            let stop = (|| -> Result<()> {
+                let mut host = self
+                    .host
+                    .lock_for("settle job deadline")
+                    .expect("host lock");
+                let execution = &host.snapshot.per_job.executions[&job];
+                // Hello or Started may have arrived while the helper checked
+                // liveness. Use the clocks that still apply when settling.
+                let Some(deadline) = self.expired_job_deadline(&host, execution, now_ms) else {
+                    return Ok(());
+                };
+                if !execution.boot_started {
+                    host.job_refused(
+                        &job,
+                        refusal(
+                            &job,
+                            "queue_wait_exceeded",
+                            "queue-wait budget expired before VM boot and Run delivery",
+                        ),
+                        now_ms,
+                    )?;
+                } else if host.job_deadline_stop(&job, deadline.detail, now_ms)? {
+                    tracing::info!(
+                        jti = job,
+                        reason = deadline.reason,
+                        deadline_ms = deadline.deadline_ms,
+                        measured_from_ms = deadline.measured_from_ms,
+                        "job_deadline_stop"
+                    );
+                }
+                drop(host);
+                self.stop_job(&job, true, true)
+            })();
+            tick_step(&mut failure, "stop_expired", stop);
         }
         let active: Vec<_> = self
             .host
@@ -588,7 +626,7 @@ impl Runtime {
                 && execution
                     .evidence
                     .as_ref()
-                    .is_some_and(|e| e.stop.is_some())
+                    .is_some_and(crate::state::settlement::Evidence::hard_stop_pending)
             {
                 tick_step(&mut failure, "stop", self.stop_job(job, false, true));
             }
