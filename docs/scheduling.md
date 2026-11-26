@@ -190,9 +190,10 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   still removes a queued job; the request's execution timeout still starts when
   its command starts. Job status reports the current scheduler blocker in
   `waiting_on`.
-  Before reserving capacity, the runner refuses a queued job that has reached
-  its queue-wait limit and moves on to the next job, so a job whose turn comes
-  after its limit is never set up.
+  Before reserving capacity, the runner refuses a queued job that waited behind
+  other work until it reached its queue-wait limit and moves on to the next
+  job, so a job whose turn comes after its limit is never set up. A job that can
+  start the first time it is considered starts, even with a zero limit.
   The client keeps a local deadline from `queue_wait_ms` and, when the budget
   runs out, asks the runner to withdraw the job. The runner answers `withdrawn`
   if the request refused the job (`refused_before_start` / `queue_wait_exceeded`),

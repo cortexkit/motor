@@ -9047,7 +9047,7 @@ impl Runner {
                 break;
             }
             let Some(id) = next else { break };
-            if queue_wait::expired(&inner.jobs[&id], self.now().max(now), 0) {
+            if queue_wait::turn_came_too_late(inner, id, self.now().max(now)) {
                 return Ok(Some(id));
             }
             self.start(inner, id, &index.claims)?;

@@ -10,6 +10,17 @@ pub(super) fn expired(job: &Job, now: u64, setup_wait: u64) -> bool {
         })
 }
 
+/// Whether dispatch should refuse `id` instead of starting it: its queue wait
+/// has reached its limit while it waited behind other work. A job that can
+/// start the first time it is considered still starts, even with a zero
+/// budget: it never waited, so there is no late turn to refuse. Being in the
+/// waiting history is the evidence that it was held back; that history is
+/// in memory only, so after a runner restart the caller's own withdrawal is
+/// what ends an expired job, as before this check existed.
+pub(super) fn turn_came_too_late(inner: &Inner, id: Uuid, now: u64) -> bool {
+    expired(&inner.jobs[&id], now, 0) && inner.queue_wait_history.0.borrow().contains_key(&id)
+}
+
 #[derive(Default)]
 pub(super) struct QueueWaitHistory(RefCell<BTreeMap<Uuid, QueueWaitDetail>>);
 
