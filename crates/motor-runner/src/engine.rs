@@ -64,6 +64,7 @@ mod queue_wait;
 mod remote_cache_engine;
 #[path = "retirement.rs"]
 mod retirement;
+mod scheduling;
 #[cfg(target_os = "linux")]
 #[path = "seed_build_log.rs"]
 mod seed_build_log;
@@ -1192,7 +1193,7 @@ impl QueueProgress {
         // Diagnostics must not stall transport liveness behind scheduler work.
         let inner = runner.core.inner.try_lock().ok()?;
         let index = DispatchIndex::build(&inner);
-        runner.queue_status_with_index(&inner, &index, self.id)
+        runner.queue_status_with_index(&inner, &index, self.id, runner.now())
     }
     pub(crate) fn elapsed_ms(&self) -> Option<u64> {
         let (entry, elapsed) = queue_clock_at(&self.entry, &self.elapsed, (self.clock)());
@@ -6941,13 +6942,15 @@ impl Runner {
         let now = self.now();
         self.update_queue_wait_clocks(&inner, now, &index);
         let job = inner.jobs.get(&id);
-        let queue_status = self.queue_status_with_index(&inner, &index, id);
+        let (waiting_on, blocker) = self
+            .queue_status_with_index(&inner, &index, id, now)
+            .map_or((None, None), |status| (status.waiting_on, status.blocker));
         let quarantine = self.core.quarantined.get(&id);
         let process = job
             .and_then(|j| j.process)
             .or_else(|| quarantine.and_then(|j| j.process));
         Ok(JobStatusReply {
-            blocker: queue_status.and_then(|status| status.blocker),
+            blocker,
             job_id: id,
             queue_wait_ms: Self::queue_wait_ms_at(&inner, id, now),
             state: job
@@ -6960,17 +6963,7 @@ impl Runner {
                     }
                     .into()
                 }),
-            // The same label the queue-wait refusal detail carries, so a job
-            // blocked behind a gate job says so before its budget runs out.
-            // A job that is not waiting to start (running, finished) has none.
-            waiting_on: self
-                .queue_wait_phase(&inner, &index, id)
-                .is_some()
-                .then(|| {
-                    let heads = index.heads(&inner, now);
-                    let (label, _) = self.queue_wait_label(&inner, &heads, &index, id, now);
-                    label
-                }),
+            waiting_on,
             terminal: job.and_then(|j| j.terminal.clone()),
             unit: process
                 .and_then(|p| p.unit)
@@ -6984,10 +6977,10 @@ impl Runner {
         inner: &Inner,
         index: &DispatchIndex,
         id: Uuid,
+        now: u64,
     ) -> Option<motor_protocol::QueueStatus> {
         let job = inner.jobs.get(&id)?;
-        let waiting_on = self.queue_wait_phase(inner, index, id).map(|_| {
-            let now = self.now();
+        let waiting_on = self.queue_wait_phase_at(inner, index, id, now).map(|_| {
             self.queue_wait_label(inner, &index.heads(inner, now), index, id, now)
                 .0
         });
@@ -7293,7 +7286,7 @@ impl Runner {
         id: Uuid,
         now: u64,
     ) -> (String, Option<(Uuid, bool)>) {
-        self.queue_wait_label_with(inner, index, id, || {
+        self.queue_wait_label_with(inner, index, id, now, || {
             self.blocking_head(inner, heads, id, index.weight, now)
         })
     }
@@ -7303,10 +7296,11 @@ impl Runner {
         inner: &Inner,
         index: &DispatchIndex,
         id: Uuid,
+        now: u64,
         blocking_head: impl FnOnce() -> Option<(Uuid, bool)>,
     ) -> (String, Option<(Uuid, bool)>) {
         let phase = self
-            .queue_wait_phase(inner, index, id)
+            .queue_wait_phase_at(inner, index, id, now)
             .unwrap_or(QUEUE_ORDER_WAIT);
         if phase != QUEUE_ORDER_WAIT {
             let reason = if phase == "returned bytes budget" {
@@ -7361,9 +7355,9 @@ impl Runner {
         held: u32,
         now: u64,
     ) -> Option<(Uuid, bool)> {
-        heads
+        let ahead = scheduling::heads_ahead(inner, heads, inner.jobs.get(&id)?, now);
+        heads[..ahead]
             .iter()
-            .take_while(|head| **head != id)
             .map(|head| &inner.jobs[head])
             .find(|head| self.holds_back_later_heads(inner, head, held, now))
             .map(|head| (head.id, head.gate_job()))
@@ -7394,9 +7388,7 @@ impl Runner {
                 .contains(&self.core.config.sccache_dir())
             && (self.fill_passes_queue(head.weight)
                 || !Self::scheduler_jobs(inner).any(|job| !job.base && job.pending()));
-        let aged = !head.base
-            && now.saturating_sub(head.queued_ms.unwrap_or(head.accepted_ms)) >= BACKFILL_GRACE_MS;
-        (head.gate_job() || fill || aged)
+        (fill || scheduling::foreground_stops_backfill(head, now))
             && (held.saturating_add(head.weight) > self.core.config.max_weight
                 || Self::start_deferred(inner, head.id, now))
     }
@@ -7417,7 +7409,7 @@ impl Runner {
         index: &DispatchIndex,
         id: Uuid,
     ) -> Option<u64> {
-        let phase = self.queue_wait_phase(inner, index, id)?;
+        let phase = self.queue_wait_phase_at(inner, index, id, self.now())?;
         if !(Self::capacity_wait(phase)
             || matches!(
                 phase,
@@ -7450,11 +7442,22 @@ impl Runner {
             .is_some_and(|retry| now < retry.not_before_ms)
     }
 
+    #[cfg(test)]
     fn queue_wait_phase(
         &self,
         inner: &Inner,
         index: &DispatchIndex,
         id: Uuid,
+    ) -> Option<&'static str> {
+        self.queue_wait_phase_at(inner, index, id, self.now())
+    }
+
+    fn queue_wait_phase_at(
+        &self,
+        inner: &Inner,
+        index: &DispatchIndex,
+        id: Uuid,
+        now: u64,
     ) -> Option<&'static str> {
         let job = inner.jobs.get(&id)?;
         if job.state == JobState::AwaitingBundles {
@@ -7480,12 +7483,12 @@ impl Runner {
                 index.siblings_blocked(&r.siblings, &inner.catalog.sibling_commits)
             }) {
                 "sibling checkout owner"
-            } else if index.held_by_queued_workspace(inner, job, self.core.config.max_weight) {
+            } else if index.held_by_queued_workspace(inner, job, self.core.config.max_weight, now) {
                 "queued workspace job"
             } else if job.weight > self.core.config.max_weight {
                 "demand exceeds capacity"
             } else if index.weight.saturating_add(job.weight) > self.core.config.max_weight
-                || Self::start_deferred(inner, id, self.now())
+                || Self::start_deferred(inner, id, now)
             {
                 // A job waiting out its start retry delay keeps its claim on
                 // capacity, as if it were waiting for permits.
@@ -7520,11 +7523,7 @@ impl Runner {
             .collect();
         for id in queued {
             let job = &inner.jobs[&id];
-            let is_workspace_head = index
-                .queued
-                .get(crate::caller_path::job_key(job))
-                .and_then(|queue| queue.first())
-                == Some(&id);
+            let is_workspace_head = blockers.contains_key(&id);
             // The running or setup jobs that hold this job's checkout: the
             // owner of the same workspace, and jobs that check out an
             // overlapping path as a sibling (the same host directory).
@@ -7548,7 +7547,7 @@ impl Runner {
             let held = holders.is_empty()
                 && is_workspace_head
                 && !index.occupied(crate::caller_path::job_key(job))
-                && index.held_by_queued_workspace(inner, job, self.core.config.max_weight);
+                && index.held_by_queued_workspace(inner, job, self.core.config.max_weight, now);
             let pause = job.queued_ms.is_some()
                 && (!holders.is_empty() || held || Self::sealed_workspace(inner, crate::caller_path::job_key(job)))
                 && job.request.as_ref().is_some_and(|request| {
@@ -8987,7 +8986,7 @@ impl Runner {
                     ))
                     || index.occupied(crate::caller_path::job_key(job))
                     || index.siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
-                    || index.held_by_queued_workspace(inner, job, self.core.config.max_weight)
+                    || index.held_by_queued_workspace(inner, job, self.core.config.max_weight, now)
                 {
                     // A checkout conflict cannot be resolved by idling unrelated CPUs.
                     continue;
@@ -9034,11 +9033,7 @@ impl Runner {
                     // backfill only for capacity, after their checkout
                     // conflicts have already been excluded. Running jobs keep
                     // their permits; the fill waits for permits to come free.
-                    if job.gate_job()
-                        || job.base
-                        || now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
-                            >= BACKFILL_GRACE_MS
-                    {
+                    if job.base || scheduling::foreground_stops_backfill(job, now) {
                         return Ok(None);
                     }
                     continue;
@@ -12586,12 +12581,6 @@ impl DispatchIndex {
                 *newest = (*newest).max(job.order);
             }
         }
-        for queue in index.queued.values_mut() {
-            queue.sort_by_key(|id| {
-                let job = &inner.jobs[id];
-                (!job.gate_job(), job.order)
-            });
-        }
         index
     }
     fn reserve(&mut self, key: &str, siblings: &[SiblingSnapshot]) {
@@ -12680,89 +12669,6 @@ impl DispatchIndex {
                                 || commits.iter().any(|commit| commit != &sibling.commit)
                         })
             })
-    }
-    /// Whether a queued workspace job holds `job` back from starting.
-    ///
-    /// A sibling is checked out in place at its canonical path, the same host
-    /// directory a job whose main workspace is that path uses, so the two
-    /// cannot run together. Jobs that use the path as a sibling at one commit
-    /// may overlap one another, so under steady load they would keep the
-    /// directory busy and the main workspace job would never start. The next
-    /// job to start on a workspace therefore holds back every job that
-    /// declares an overlapping sibling and was accepted after it. Holding
-    /// only later arrivals keeps the waits acyclic: two repositories that
-    /// name each other as siblings cannot hold each other back. Cache-fill
-    /// jobs and jobs that can never fit the runner do not hold anyone. With
-    /// snapshot siblings there is no shared checkout, so nobody is held.
-    fn held_by_queued_workspace(&self, inner: &Inner, job: &Job, max_weight: u32) -> bool {
-        if !self.in_place {
-            return false;
-        }
-        let Some(request) = job.request.as_ref() else {
-            return false;
-        };
-        if request.siblings.is_empty() {
-            return false;
-        }
-        self.queued.iter().any(|(key, queue)| {
-            let Some(head) = queue.first().map(|id| &inner.jobs[id]) else {
-                return false;
-            };
-            head.id != job.id
-                && !head.base
-                && head.weight <= max_weight
-                && head.order < job.order
-                && request
-                    .siblings
-                    .iter()
-                    .any(|sibling| Self::overlap(key, paths::sibling(sibling).caller.text()))
-        })
-    }
-    /// The head of each workspace queue, in the order dispatch tries them:
-    /// gates; then a cache fill, for the repository whose foreground jobs
-    /// arrived most recently (there is one writer slot, so at most one of
-    /// them starts); then heads that have waited past the backfill grace;
-    /// then the rest, rotating between workspaces.
-    fn heads(&self, inner: &Inner, now: u64) -> Vec<Uuid> {
-        let mut heads: Vec<_> = self
-            .queued
-            .values()
-            .filter_map(|queue| queue.first())
-            .map(|id| {
-                let job = &inner.jobs[id];
-                if job.gate_job() {
-                    (0, job.order, 0, *id)
-                } else if job.base {
-                    let newest = job
-                        .request
-                        .as_ref()
-                        .and_then(|request| {
-                            self.newest_arrivals
-                                .get(paths::request(request).caller_repository_root.text())
-                        })
-                        .copied()
-                        .unwrap_or(0);
-                    (1, u64::MAX - newest, job.order, *id)
-                } else if now.saturating_sub(job.queued_ms.unwrap_or(job.accepted_ms))
-                    >= BACKFILL_GRACE_MS
-                {
-                    (2, job.order, 0, *id)
-                } else {
-                    (
-                        3,
-                        inner
-                            .rotation
-                            .get(crate::caller_path::job_key(job))
-                            .copied()
-                            .unwrap_or(0),
-                        job.order,
-                        *id,
-                    )
-                }
-            })
-            .collect();
-        heads.sort();
-        heads.into_iter().map(|(_, _, _, id)| id).collect()
     }
     fn started(&mut self, inner: &Inner, id: Uuid) {
         let job = &inner.jobs[&id];

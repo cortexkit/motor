@@ -72,6 +72,67 @@ fn gate_gets_next_eight_permits_before_older_workers_and_later_gates() {
 }
 
 #[test]
+fn ten_minute_worker_gets_the_next_slot_before_a_later_gate() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let held = holders(&mut inner, &request, now);
+    let mut worker = job(&request, &f.key, 64, 1, false, now);
+    worker.request.as_mut().unwrap().queue_wait_limit_s = 1800;
+    let worker_id = worker.id;
+    inner.jobs.insert(worker_id, worker);
+    runner.dispatch(&mut inner, now).unwrap();
+    let started_while_full = !inner.starting.is_empty();
+
+    let now = now + 600_001;
+    f.clock.store(now, Ordering::SeqCst);
+    let gate = job(&request, &f.key, 64, 2, true, now);
+    inner.jobs.insert(gate.id, gate);
+    for id in held {
+        inner.jobs.remove(&id);
+    }
+    runner.dispatch(&mut inner, now).unwrap();
+    let selected = inner.starting.clone();
+    drop(inner);
+    assert!(!started_while_full);
+    assert_eq!(selected, BTreeSet::from([worker_id]));
+}
+
+#[test]
+fn time_paused_behind_a_workspace_owner_does_not_give_a_worker_gate_priority() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut holder = job(&request, &f.key, 64, 0, false, now);
+    holder.state = JobState::Running;
+    holder.started_ms = Some(now);
+    holder.cpus = (1..=64).collect();
+    let holder_id = holder.id;
+    inner.jobs.insert(holder_id, holder);
+    let worker = job(&request, &f.key, 64, 1, false, now);
+    let worker_id = worker.id;
+    inner.jobs.insert(worker_id, worker);
+    runner.dispatch(&mut inner, now).unwrap();
+
+    let now = now + 600_001;
+    f.clock.store(now, Ordering::SeqCst);
+    let paused_wait_ms = inner.jobs[&worker_id].queue_wait_ms(now);
+    let gate = job(&request, &f.key, 64, 2, true, now);
+    let gate_id = gate.id;
+    inner.jobs.insert(gate_id, gate);
+    inner.jobs.remove(&holder_id);
+    runner.dispatch(&mut inner, now).unwrap();
+    let selected = inner.starting.clone();
+    drop(inner);
+    assert_eq!(paused_wait_ms, 0);
+    assert_eq!(selected, BTreeSet::from([gate_id]));
+}
+
+#[test]
 fn waiting_gate_does_not_stop_or_repin_running_workers() {
     let f = Fixture::new();
     let runner = runner(&f);
@@ -1084,6 +1145,81 @@ fn job_status_names_a_gate_job_ahead_as_the_reason() {
         runner.queue_wait_detail_with_index(&inner, &DispatchIndex::build(&inner), worker_id)
     };
     assert_eq!(detail.split(';').next(), Some("waiting_on=gate job ahead"));
+}
+
+#[test]
+fn later_gate_stops_blocking_at_ten_minutes_of_queue_wait() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let worker_key = f.scratch.join("remote/worktrees/independent");
+    let worker_id = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let held = holders(&mut inner, &request, now);
+        inner.jobs.remove(&held[2]);
+        let mut worker = job(&request, text(&worker_key), 2, 1, false, now);
+        worker.request.as_mut().unwrap().siblings.clear();
+        worker.request.as_mut().unwrap().queue_wait_limit_s = 1800;
+        worker.start_queue_wait(now);
+        let worker_id = worker.id;
+        inner.jobs.insert(worker_id, worker);
+        let mut gate = job(&request, &f.key, 8, 2, true, now + 599_999);
+        gate.request.as_mut().unwrap().siblings.clear();
+        inner.jobs.insert(gate.id, gate);
+        worker_id
+    };
+
+    f.clock.store(now + 599_999, Ordering::SeqCst);
+    let young = runner.job_status(worker_id).unwrap();
+    assert_eq!(young.waiting_on.as_deref(), Some("gate job ahead"));
+
+    f.clock.store(now + 600_000, Ordering::SeqCst);
+    let old = runner.job_status(worker_id).unwrap();
+    assert_eq!(old.queue_wait_ms, Some(600_000));
+    assert_eq!(old.waiting_on.as_deref(), Some("queue order"));
+    let (detail, selected) = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let detail = runner.queue_wait_detail(&inner, worker_id);
+        runner.dispatch(&mut inner, runner.now()).unwrap();
+        (detail, inner.starting.clone())
+    };
+    assert_eq!(detail.split(';').next(), Some("waiting_on=queue order"));
+    assert!(detail.ends_with("heads_ahead=[]"), "{detail}");
+    assert_eq!(selected, BTreeSet::from([worker_id]));
+}
+
+#[test]
+fn later_gate_is_not_ahead_of_an_aged_job_waiting_behind_its_workspace_head() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let (worker_id, first_id, later_id) = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let held = holders(&mut inner, &request, now);
+        inner.jobs.remove(&held[2]);
+        let mut first = job(&request, &f.key, 2, 1, true, now);
+        let mut worker = job(&request, &f.key, 2, 2, false, now + 1);
+        let mut later = job(&request, "later-gate", 8, 3, true, now + 600_001);
+        for job in [&mut first, &mut worker, &mut later] {
+            job.request.as_mut().unwrap().siblings.clear();
+        }
+        worker.request.as_mut().unwrap().queue_wait_limit_s = 1800;
+        worker.start_queue_wait(now + 1);
+        let ids = (worker.id, first.id, later.id);
+        for job in [first, worker, later] {
+            inner.jobs.insert(job.id, job);
+        }
+        ids
+    };
+
+    f.clock.store(now + 600_001, Ordering::SeqCst);
+    let status = runner.job_status(worker_id).unwrap();
+    assert_eq!(status.waiting_on.as_deref(), Some("queue order"));
+    let detail = runner.queue_wait_detail(&runner.core.inner.lock().unwrap(), worker_id);
+    assert!(detail.contains(&format!("heads_ahead=[job={first_id} ")));
+    assert!(!detail.contains(&later_id.to_string()), "{detail}");
 }
 
 #[test]
