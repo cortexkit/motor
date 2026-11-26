@@ -1118,6 +1118,16 @@ async fn owner_wait_clock_is_paused_and_capacity_wait_clock_uses_the_budget() {
         .attached_job = Some("holder".into());
     let (mut client, task) = start(runtime.clone(), c, id).await;
     queued(&mut client, JOB).await;
+    // Account preparation runs on a blocking thread under a 60 s limit. On a
+    // loaded machine it can still be running here, and advancing the paused
+    // clock past that limit would fail preparation instead of testing the
+    // owner wait. The session marks the launch in flight before it accepts Run.
+    while runtime.job_launches.lock().unwrap()[JOB]
+        .in_flight
+        .load(Ordering::SeqCst)
+    {
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(Duration::from_secs(90)).await;
     assert_eq!(
         next_type(&mut client, "heartbeat").await["queue_wait_ms"],
