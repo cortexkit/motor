@@ -7181,7 +7181,7 @@ impl Runner {
                 }
         });
         let Some(mut job) = inner.jobs.get(&id).filter(|_| eligible).cloned() else {
-            return Ok(WithdrawOutcome::Started);
+            return Ok(queue_wait::settled_withdraw_reply(inner.jobs.get(&id)));
         };
         let detail = if stalled {
             "transfer_stalled".into()

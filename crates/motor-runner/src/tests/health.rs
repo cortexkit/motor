@@ -97,13 +97,14 @@ async fn spill_withdrawal_is_not_a_queue_wait_refusal() {
                 .starts_with("spill_withdrawal: "),
             spill
         );
-        // Replaying a withdrawal cannot count the same job twice.
+        // Replaying a withdrawal answers that the job was withdrawn, as its
+        // terminal record says, and cannot count the same job twice.
         let mut stream = connect(&socket).await;
         write_frame_async(&mut stream, &frame).await.unwrap();
         assert!(matches!(
             read_next(&mut stream).await,
             Frame::WithdrawReply {
-                outcome: WithdrawOutcome::Started
+                outcome: WithdrawOutcome::Withdrawn
             }
         ));
         let report = runner.runner_status().health.unwrap();

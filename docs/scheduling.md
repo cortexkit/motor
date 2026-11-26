@@ -196,10 +196,10 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   start the first time it is considered starts, even with a zero limit.
   The client keeps a local deadline from `queue_wait_ms` and, when the budget
   runs out, asks the runner to withdraw the job. The runner answers `withdrawn`
-  if the request refused the job (`refused_before_start` / `queue_wait_exceeded`),
-  or `started` if withdrawal no longer applies. The job's terminal record
-  decides the outcome: a `started` reply does not mean the command ran,
-  because a job the runner already refused for queue wait also answers `started`.
+  if the job ends refused for queue wait (`refused_before_start` /
+  `queue_wait_exceeded`), whether this request, an earlier one or dispatch
+  refused it, or `started` if withdrawal no longer applies. The job's terminal
+  record still decides the outcome.
   If the refusal no longer has a live blocker to report, its detail shows the
   last observed holders and queue heads, with the time they were seen. Tests:
   `zero_queue_wait_withdraws_and_cancel_is_idempotent`

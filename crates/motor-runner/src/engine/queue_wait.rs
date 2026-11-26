@@ -21,6 +21,27 @@ pub(super) fn turn_came_too_late(inner: &Inner, id: Uuid, now: u64) -> bool {
     expired(&inner.jobs[&id], now, 0) && inner.queue_wait_history.0.borrow().contains_key(&id)
 }
 
+/// The reply to a withdrawal that found nothing left to withdraw. Dispatch can
+/// refuse a job for queue wait while the caller's own withdrawal is on its way,
+/// and an earlier withdrawal may have refused it already. Either way the job
+/// was withdrawn, so say so, matching its terminal record; anything else has
+/// started or ended for another reason.
+pub(super) fn settled_withdraw_reply(job: Option<&Job>) -> WithdrawOutcome {
+    let refused_for_queue_wait =
+        job.and_then(|job| job.terminal.as_ref())
+            .is_some_and(|terminal| {
+                terminal.outcome
+                    == Outcome::RefusedBeforeStart {
+                        reason: RefusalReason::QueueWaitExceeded,
+                    }
+            });
+    if refused_for_queue_wait {
+        WithdrawOutcome::Withdrawn
+    } else {
+        WithdrawOutcome::Started
+    }
+}
+
 #[derive(Default)]
 pub(super) struct QueueWaitHistory(RefCell<BTreeMap<Uuid, QueueWaitDetail>>);
 
