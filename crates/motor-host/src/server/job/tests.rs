@@ -111,7 +111,7 @@ struct Fake {
     balloon_supported: AtomicBool,
     resident: Mutex<BTreeMap<String, u64>>,
     resident_reads: Mutex<Vec<String>>,
-    resident_host: Mutex<Option<std::sync::Weak<Mutex<Host>>>>,
+    resident_host: Mutex<Option<std::sync::Weak<HostMutex>>>,
     balloons: Mutex<Vec<(String, u64)>>,
     fail_balloons: Mutex<BTreeSet<String>>,
     scripted: Mutex<std::collections::VecDeque<UnixStream>>,
@@ -602,7 +602,7 @@ struct Storage {
     recovery_available: AtomicBool,
     /// When set, acquire refuses if the host lock is already held, as the
     /// production image manager would hang taking it.
-    host: std::sync::OnceLock<Arc<Mutex<Host>>>,
+    host: std::sync::OnceLock<Arc<HostMutex>>,
 }
 impl Storage {
     fn new() -> Arc<Self> {

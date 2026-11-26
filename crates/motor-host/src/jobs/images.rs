@@ -4,10 +4,8 @@
 use super::{Assignment, Resources};
 use crate::{
     helper::Control,
-    state::{
-        jobs::{recovery::Recovery, Execution, WorkspaceDisk},
-        Host,
-    },
+    server::HostMutex,
+    state::jobs::{recovery::Recovery, Execution, WorkspaceDisk},
 };
 use anyhow::{Context, Result};
 use std::{
@@ -17,13 +15,13 @@ use std::{
 };
 
 pub struct Images {
-    host: Arc<Mutex<Host>>,
+    host: Arc<HostMutex>,
     control: Arc<dyn Control>,
     operations: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Images {
-    pub fn new(host: Arc<Mutex<Host>>, control: Arc<dyn Control>) -> Self {
+    pub fn new(host: Arc<HostMutex>, control: Arc<dyn Control>) -> Self {
         Self {
             host,
             control,

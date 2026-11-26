@@ -112,7 +112,7 @@ fn disk_wait_outlives_token_expiry_before_booting() {
 }
 
 #[tokio::test]
-async fn memory_wait_before_boot_ends_at_prestart_deadline() {
+async fn memory_wait_with_a_full_spool_ends_at_prestart_deadline() {
     let (runtime, fake, storage) = fixture();
     claim(&runtime, &claims(JOB2));
     runtime
@@ -142,6 +142,16 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
     next_type(&mut client, "hello").await;
     let mut request = run(JOB);
     request["queue_wait_limit_s"] = json!(2);
+    let chunk = json!({"type":"bundle_chunk","index":0,"offset":0,"data":"YWFh".repeat(175_000)});
+    let chunk_len = serde_json::to_vec(&chunk).unwrap().len() as u64 + 4;
+    let threshold = SPOOL_LIMIT - FRAME_LIMIT as u64 - 4;
+    // Outrun both the spool and the test connection's 1 MiB input buffer.
+    let chunks = threshold.div_ceil(chunk_len) + 2;
+    let upload_bytes = chunks * 525_000;
+    request["bundles"] = json!([{
+        "index": 0, "repository": request["repository_root"],
+        "length": upload_bytes, "sha256": "0".repeat(64),
+    }]);
     write_frame(&mut client, &request).await.unwrap();
     assert_eq!(
         next_type(&mut client, "accepted").await["queue_position"],
@@ -150,6 +160,26 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
     assert_eq!(
         next_type(&mut client, "heartbeat").await["queue_wait_ms"],
         0
+    );
+    let (mut client, mut upload) = tokio::io::split(client);
+    let uploading = tokio::spawn(async move {
+        let mut chunk = chunk;
+        for n in 0..chunks {
+            chunk["offset"] = json!(n * 525_000);
+            write_frame(&mut upload, &chunk).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !std::fs::metadata(storage.spool(JOB)).is_ok_and(|m| m.len() > threshold) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the accepted upload fills the spool behind the checkout owner");
+    assert!(
+        !uploading.is_finished(),
+        "part of the upload must be blocked"
     );
     assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].boot_started);
     assert!(fake.calls.lock().unwrap().is_empty());
@@ -176,6 +206,7 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
 
     runtime.tick_jobs(deadline - 1).unwrap();
     assert!(!runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended);
+    assert!(!uploading.is_finished(), "the upload is still incomplete");
     runtime.tick_jobs(deadline).unwrap();
     {
         let host = runtime.host.lock().unwrap();
@@ -224,6 +255,7 @@ async fn memory_wait_before_boot_ends_at_prestart_deadline() {
         .unwrap();
     assert_eq!(terminal.bytes, stored);
     task.await.unwrap().unwrap();
+    uploading.await.unwrap().unwrap_err();
 }
 
 #[test]

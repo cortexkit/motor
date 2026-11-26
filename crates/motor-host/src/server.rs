@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod host_mutex;
+pub use host_mutex::{HostGuard, HostMutex};
+
 #[derive(Default)]
 pub struct LifecycleStream {
     boundary: Option<u64>,
@@ -204,7 +207,7 @@ pub struct Runtime {
     pub broker_endpoint: String,
     pub jwks_url: String,
     pub host_id: String,
-    pub host: Arc<Mutex<Host>>,
+    pub host: Arc<HostMutex>,
     pub keys: RwLock<KeySet>,
     pub control: Arc<dyn Control>,
     pub fetch_keys: AtomicBool,
@@ -458,7 +461,7 @@ impl Runtime {
             .values()
             .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
             .collect();
-        let host = Arc::new(Mutex::new(host));
+        let host = Arc::new(HostMutex::new(host));
         let job_resolvers = Arc::new(RwLock::new(Vec::new()));
         Arc::new(Self {
             write_block_operation: Mutex::new(()),

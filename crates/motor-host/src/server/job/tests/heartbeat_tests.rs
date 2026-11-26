@@ -464,6 +464,71 @@ fn pre_vm_queue_diagnostics_do_not_name_a_foreign_account_holder() {
     assert!(queue_status(&runtime, &other).is_none());
 }
 
+#[tokio::test]
+async fn queued_heartbeats_outlast_a_stalled_host_transaction() {
+    let (runtime, _, _) = fixture();
+    let owner = claims(JOB);
+    claim(&runtime, &owner);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    let waiting = claims(JOB2);
+    let id = claim(&runtime, &waiting);
+    let (mut client, session) = start(runtime.clone(), waiting, id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(&mut client, &run(JOB2)).await.unwrap();
+    next_type(&mut client, "accepted").await;
+    let first = next_type(&mut client, "heartbeat").await;
+    assert_eq!(first["queue_wait_ms"], 0);
+    assert_eq!(first["queue_status"]["waiting_on"], "checkout disk");
+    assert_eq!(first["queue_status"]["blocker"]["job_id"], JOB);
+
+    let host = runtime.host.clone();
+    let (locked, acquired) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let transaction = std::thread::spawn(move || {
+        let _guard = host.lock().unwrap();
+        locked.send(()).unwrap();
+        // If the session blocks the only Tokio thread on this lock, release it
+        // anyway so the test fails an assertion instead of hanging.
+        released.recv_timeout(Duration::from_secs(5)).ok();
+    });
+    acquired.await.unwrap();
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let mut cached_status_repeated = false;
+    while started.elapsed() < Duration::from_secs(65) {
+        let heartbeat = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("queued caller must not wait for the host transaction")
+            .unwrap();
+        assert!(
+            runtime.host.try_lock().is_err(),
+            "heartbeat did not arrive until the host transaction released the mutex"
+        );
+        assert_eq!(heartbeat["type"], "heartbeat");
+        assert_eq!(heartbeat["queue_wait_ms"], 0);
+        if let Some(status) = heartbeat.get("queue_status") {
+            assert_eq!(status, &first["queue_status"]);
+            cached_status_repeated = true;
+        }
+    }
+    assert!(
+        cached_status_repeated,
+        "the cached blocker still gets refreshed"
+    );
+    release.send(()).unwrap();
+    transaction.join().unwrap();
+    session.abort();
+    let _ = session.await;
+}
+
 #[test]
 fn adoption_polling_is_bounded_per_vm_and_exit_reports_do_not_wait_for_it() {
     let (runtime, fake, _) = fixture();

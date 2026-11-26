@@ -1,5 +1,6 @@
 use super::*;
 use motor_host::jobs::{images::Images, Resources};
+use motor_host::server::HostMutex;
 use motor_vm_helper::images::{Artifact, Manifest};
 
 const TOOLCHAIN: u64 = 8 * 1024 * 1024;
@@ -53,7 +54,7 @@ fn generations_pin_at_claim_across_publication_gc_attachment_and_restart() {
     enable(&mut h, &storage);
     assert!(h.begin_image_gc("gen-1").is_err());
     assert!(h.begin_job_boot_at(JOB, AT).unwrap().is_some());
-    let host = Arc::new(Mutex::new(h));
+    let host = Arc::new(HostMutex::new(h));
     let resources = Images::new(host.clone(), storage.clone());
     // Publication and a GC attempt happened after claim but before the helper
     // receives this assignment. The helper must attach the original files.
@@ -132,7 +133,7 @@ fn concurrent_first_jobs_prepare_one_reserved_account_copy() {
     assert_eq!(h.snapshot.per_job.images["gen-1"].accounts.len(), 1);
     let first = h.snapshot.per_job.executions[JOB].clone();
     let second = h.snapshot.per_job.executions[JOB2].clone();
-    let host = Arc::new(Mutex::new(h));
+    let host = Arc::new(HostMutex::new(h));
     let resources = Arc::new(Images::new(host.clone(), storage.clone()));
     let barrier = Arc::new(std::sync::Barrier::new(3));
     std::thread::scope(|scope| {
@@ -162,7 +163,7 @@ fn failed_first_copy_releases_its_unready_account_reservation_after_job_refusal(
     publish(&mut h, "gen-1");
     h.claim(job(JOB), AT).unwrap();
     let execution = h.snapshot.per_job.executions[JOB].clone();
-    let host = Arc::new(Mutex::new(h));
+    let host = Arc::new(HostMutex::new(h));
     let resources = Images::new(host.clone(), storage.clone());
     storage.fail_prepare.store(true, Ordering::SeqCst);
     assert!(resources.prepare(&execution).is_err());

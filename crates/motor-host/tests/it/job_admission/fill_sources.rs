@@ -2,6 +2,7 @@ use super::*;
 use motor_host::{
     helper::Control,
     jobs::fill_source::{self, Incoming, Request, Slot},
+    server::HostMutex,
 };
 use motor_protocol::{BundleManifest, BytePayload, FillSource, Frame, FILL_SOURCE_MAX_BYTES};
 use sha2::{Digest, Sha256};
@@ -130,7 +131,7 @@ fn response(source: &FillSource, bytes: &[u8]) -> Vec<u8> {
 #[test]
 fn an_export_cancelled_after_all_bytes_arrive_leaves_no_unreserved_generation() {
     let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
-    let host = std::sync::Arc::new(Mutex::new(durable_host(scratch.path(), 10000)));
+    let host = std::sync::Arc::new(HostMutex::new(durable_host(scratch.path(), 10000)));
     let mut original = Incoming::new(
         fill_source::directory(scratch.path(), "incoming-old"),
         source(b"old", 'a'),
@@ -210,7 +211,7 @@ fn a_failed_journal_swap_removes_the_renamed_source_generation() {
         }
     }
     let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
-    let host = std::sync::Arc::new(Mutex::new(configure(
+    let host = std::sync::Arc::new(HostMutex::new(configure(
         Host::new(
             BTreeMap::new(),
             Default::default(),
@@ -253,7 +254,7 @@ fn a_failed_journal_swap_removes_the_renamed_source_generation() {
 #[test]
 fn newer_tip_replaces_a_slot_atomically_and_a_corrupt_successor_keeps_it_across_restart() {
     let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
-    let host = std::sync::Arc::new(Mutex::new(durable_host(scratch.path(), 10000)));
+    let host = std::sync::Arc::new(HostMutex::new(durable_host(scratch.path(), 10000)));
     let helper = SourceHelper {
         reply: Mutex::new(vec![]),
     };

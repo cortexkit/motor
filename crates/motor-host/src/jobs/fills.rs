@@ -1,13 +1,10 @@
 //! Host-side fill lifecycle, isolated from billable job executions.
 use super::{Assignment, Resources};
-use crate::{
-    helper::Control,
-    state::{jobs::fills::Reservation, Host},
-};
+use crate::{helper::Control, server::HostMutex, state::jobs::fills::Reservation};
 use anyhow::Result;
 use std::sync::{
     mpsc::{self, Receiver},
-    Arc, Mutex,
+    Arc,
 };
 
 #[derive(Clone, Debug)]
@@ -90,7 +87,7 @@ impl Scheduler {
 
     pub fn tick(
         &mut self,
-        host: Arc<Mutex<Host>>,
+        host: Arc<HostMutex>,
         control: Arc<dyn Control>,
         resources: Arc<dyn Resources>,
         now_ms: u64,
@@ -237,7 +234,7 @@ impl Scheduler {
 }
 
 pub struct BundleFillGuest {
-    pub host: Arc<Mutex<Host>>,
+    pub host: Arc<HostMutex>,
     /// The runtime's configured job VM resolvers, shared so a fill VM gets
     /// the same guest identity fields as a job VM.
     pub resolvers: Arc<std::sync::RwLock<Vec<String>>>,

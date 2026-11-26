@@ -92,7 +92,7 @@ struct CallerUpload {
 
 pub(crate) struct Stream {
     job: String,
-    host: Arc<Mutex<Host>>,
+    host: Arc<HostMutex>,
     store: Mutex<std::result::Result<Store, String>>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
     runner_heartbeat: watch::Sender<Option<Vec<u8>>>,
@@ -434,7 +434,10 @@ async fn collect(
                     else {
                         unreachable!()
                     };
-                    let mut host = runtime.host.lock().expect("host lock");
+                    let mut host = runtime
+                        .host
+                        .lock_for("authorize relay Run")
+                        .expect("host lock");
                     host.note_job_repository(&claims.jti, &run.repository_root)?;
                     host.job_relayed_run(&claims.jti, !run.return_paths.is_empty())
                         .context("record relayed Run")?;
@@ -635,7 +638,10 @@ async fn collect(
                         None
                     };
                     let appended = s.append_delivery(&frame.bytes, delivery.as_deref())?;
-                    let mut host = r.host.lock().expect("host lock");
+                    let mut host = r
+                        .host
+                        .lock_for("record replay watermark")
+                        .expect("host lock");
                     if let Some(seq) = seq {
                         host.watermark(&job, seq)
                             .context("record replay watermark")?;

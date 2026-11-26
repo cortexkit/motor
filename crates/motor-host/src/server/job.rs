@@ -270,7 +270,12 @@ impl Runtime {
                         .job_vmm_gone(job, unix_ms())?;
                 } else if (cancelled && !stored_terminal)
                     || (!execution.runner_hello
-                        && self.boot_remaining(&execution, unix_ms()).is_zero())
+                        && Self::boot_remaining(
+                            &self.host.lock().expect("host lock"),
+                            &execution,
+                            unix_ms(),
+                        )
+                        .is_zero())
                 {
                     self.stop_job(job, true, running)?;
                 } else {
@@ -360,8 +365,7 @@ impl Runtime {
         });
     }
 
-    fn boot_remaining(&self, execution: &Execution, now_ms: u64) -> Duration {
-        let host = self.host.lock().expect("host lock");
+    fn boot_remaining(host: &Host, execution: &Execution, now_ms: u64) -> Duration {
         let crate::config::HostSettings::PerJob(settings) = &host.settings else {
             return Duration::ZERO;
         };
@@ -480,7 +484,10 @@ impl Runtime {
         };
         for (job, hello) in due {
             let queue_expiry = {
-                let mut host = self.host.lock().expect("host lock");
+                let mut host = self
+                    .host
+                    .lock_for("settle queue deadline")
+                    .expect("host lock");
                 let execution = &host.snapshot.per_job.executions[&job];
                 if !execution.boot_started && !execution.ended {
                     // Only a pre-start deadline can expire an unbooted job here.
@@ -825,7 +832,7 @@ impl Runtime {
             let result = (|| -> Result<()> {
                 let accepted = self
                     .host
-                    .lock()
+                    .lock_for("record VM exit")
                     .expect("host lock")
                     .job_exit_received(&report, now_ms)?;
                 if accepted {
@@ -904,7 +911,10 @@ impl Runtime {
         // evidence bound. It still needs the helper's disk release.
         self.release_job_vm(&report.job_id)?;
         {
-            let mut host = self.host.lock().expect("host lock");
+            let mut host = self
+                .host
+                .lock_for("release checkout after VM exit")
+                .expect("host lock");
             let unclean = host.snapshot.per_job.executions[&report.job_id]
                 .evidence
                 .as_ref()
@@ -1123,6 +1133,10 @@ struct QueueClock {
 
 fn queue_status(runtime: &Runtime, claims: &Claims) -> Option<motor_protocol::QueueStatus> {
     let host = runtime.host.lock().expect("host lock");
+    queue_status_from(&host, claims)
+}
+
+fn queue_status_from(host: &Host, claims: &Claims) -> Option<motor_protocol::QueueStatus> {
     let execution = host.snapshot.per_job.executions.get(&claims.jti)?;
     let disk = host.snapshot.per_job.disks.get(&execution.disk_id)?;
     if execution.ended
@@ -1427,9 +1441,9 @@ async fn boot(
     repository_root: Option<String>,
 ) -> Result<tokio::net::UnixStream> {
     let e = execution.clone();
-    let launch = runtime.launch_phase(&execution.claims.jti, false)?;
     let r = runtime.clone();
     tokio::task::spawn_blocking(move || {
+        let launch = r.launch_phase(&e.claims.jti, false)?;
         let result = (|| -> Result<()> {
             let cap = r.host.lock().expect("host lock").snapshot.per_job.disks[&e.disk_id]
                 .storage
@@ -1472,9 +1486,9 @@ async fn boot(
         burst_mib: execution.claims.mem_burst_mib,
     };
     let control = runtime.control.clone();
-    let launch = runtime.launch_phase(&execution.claims.jti, true)?;
     let r = runtime.clone();
     let reply = tokio::task::spawn_blocking(move || {
+        let launch = r.launch_phase(&start.job_id, true)?;
         let _operation = r
             .write_block_operation
             .lock()
@@ -1489,11 +1503,6 @@ async fn boot(
         result
     })
     .await??;
-    ensure!(
-        runtime.host.lock().expect("host lock").snapshot.leases[&execution.claims.jti].state
-            != LeaseState::Ended,
-        "job cancelled during launch"
-    );
     let tap = reply["tap_index"]
         .as_u64()
         .filter(|n| (1..=254).contains(n))
@@ -1504,36 +1513,36 @@ async fn boot(
         &execution.claims.jti,
         tap,
     )?;
-    if runtime
-        .host
-        .lock()
-        .expect("host lock")
-        .snapshot
-        .per_job
-        .disks[&execution.disk_id]
-        .forked
-    {
-        request["forked"] = serde_json::json!(true);
-    }
-    let control = runtime.control.clone();
-    let job = execution.claims.jti.clone();
-    let wait = runtime.boot_remaining(execution, unix_ms());
-    let initialized =
-        tokio::task::spawn_blocking(move || control.job_admin_after_start(&job, &request, wait))
-            .await??;
-    if initialized["ok"] != true && initialized["error"] == "job_vm_dax_required" {
-        runtime
-            .host
-            .lock()
-            .expect("host lock")
-            .set_dax_failed(true)?;
-        tracing::error!(
-            jti = %execution.claims.jti,
-            reason = "job_vm_dax_required",
-            image_generation = %assignment.image_generation_id,
-            "job_boot_dax_failure"
-        );
-    }
+    let e = execution.clone();
+    let r = runtime.clone();
+    let generation = assignment.image_generation_id.clone();
+    let initialized = tokio::task::spawn_blocking(move || -> Result<_> {
+        let wait = {
+            let host = r.host.lock().expect("host lock");
+            ensure!(
+                host.snapshot.leases[&e.claims.jti].state != LeaseState::Ended,
+                "job cancelled during launch"
+            );
+            if host.snapshot.per_job.disks[&e.disk_id].forked {
+                request["forked"] = serde_json::json!(true);
+            }
+            Runtime::boot_remaining(&host, &e, unix_ms())
+        };
+        let initialized = r
+            .control
+            .job_admin_after_start(&e.claims.jti, &request, wait)?;
+        if initialized["ok"] != true && initialized["error"] == "job_vm_dax_required" {
+            r.host.lock().expect("host lock").set_dax_failed(true)?;
+            tracing::error!(
+                jti = %e.claims.jti,
+                reason = "job_vm_dax_required",
+                image_generation = %generation,
+                "job_boot_dax_failure"
+            );
+        }
+        Ok(initialized)
+    })
+    .await??;
     ensure!(
         initialized["ok"] == true,
         "job runner initialization refused"
@@ -1582,15 +1591,18 @@ async fn boot(
         crate::jobs::hello_covers(&actual, &promised_hello(assignment, &hello.value)),
         SessionRefusal::CapabilitiesChanged
     );
-    runtime
-        .host
-        .lock()
-        .expect("host lock")
-        .job_runner_hello(&execution.claims.jti)?;
-    ensure!(
-        runtime.host.lock().expect("host lock").connection_live(id),
-        "connection closed before delivery"
-    );
+    let r = runtime.clone();
+    let job = execution.claims.jti.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut host = r.host.lock().expect("host lock");
+        host.job_runner_hello(&job)?;
+        ensure!(
+            host.connection_live(id),
+            "connection closed before delivery"
+        );
+        Ok(())
+    })
+    .await??;
     Ok(stream)
 }
 
@@ -1770,9 +1782,12 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     let status_started = tokio::time::Instant::now();
     let mut queue_updates = motor_protocol::QueueStatusUpdates::default();
-    type Starting =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<tokio::net::UnixStream>> + Send>>;
+    let mut last_queue_status = None;
+    type Starting = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<tokio::net::UnixStream>>> + Send>,
+    >;
     let mut starting: Option<Starting> = None;
+    let mut check_boot = true;
     let mut ready = None;
     let new_workspace = runtime
         .host
@@ -1789,21 +1804,26 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // on the heartbeat, and whether or not a Run was accepted: a caller
         // still uploading its request gets the same terminal, rather than
         // queue heartbeats with no end.
-        let ended = runtime
-            .host
-            .lock()
-            .expect("host lock")
-            .snapshot
-            .per_job
-            .executions[&claims.jti]
-            .ended;
-        if ended {
+        // Host transactions can hold the mutex across journal I/O. A late
+        // state sample can delay launch, but must not delay caller heartbeats.
+        let can_boot = check_boot
+            && preparing.is_none()
+            && starting.is_none()
+            && ready.is_none()
+            && (!new_workspace || repository_root.is_some());
+        let state = try_host(runtime).map(|host| {
+            let ended = host.snapshot.per_job.executions[&claims.jti].ended
+                || (can_boot && host.snapshot.leases[&claims.jti].state == LeaseState::Ended);
+            (ended, can_boot && host.job_boot_disk_ready(&claims.jti))
+        });
+        if state.is_some_and(|(ended, _)| ended) {
             drop(spool);
             return stream::serve(runtime, claims, client, false, reader, true).await;
         }
         // Drain buffered frames into the spool only while it has room. Once
         // full, hand them to the live reader or neither side can make progress.
         if accepted
+            && state.is_some()
             && ready.is_some()
             && (!buffered_frame_ready(&reader.buffered) || !spool.has_room())
         {
@@ -1824,61 +1844,64 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
             )
             .await;
         }
-        let (launch, cancelled) = if preparing.is_none()
-            && starting.is_none()
-            && ready.is_none()
-            && (!new_workspace || repository_root.is_some())
-        {
-            let mut host = runtime.host.lock().expect("host lock");
-            if host.snapshot.leases[&claims.jti].state == LeaseState::Ended {
-                (None, true)
-            } else {
-                let now_ms = unix_ms();
-                if host.job_boot_disk_ready(&claims.jti) {
-                    launch_session
-                        .0
-                        .boot_ready_at_ms
-                        .lock()
-                        .expect("boot ready time")
-                        .get_or_insert(now_ms);
-                }
-                (host.begin_job_boot_at(&claims.jti, now_ms)?, false)
-            }
-        } else {
-            (None, false)
-        };
-        if cancelled {
-            // The lease ended before the execution record did. Stored replay
-            // gives the terminal once it is written, as above.
-            drop(spool);
-            return stream::serve(runtime, claims, client, false, reader, true).await;
-        }
-        if let Some(execution) = launch {
-            let deadline =
-                tokio::time::Instant::now() + runtime.boot_remaining(&execution, unix_ms());
+        if state.is_some_and(|(_, boot)| boot) {
+            check_boot = false;
             let r = runtime.clone();
+            let job = claims.jti.clone();
             let a = assignment.clone();
             let h = hello.clone();
+            let launch = launch_session.0.clone();
             let root = if new_workspace {
                 repository_root.clone()
             } else {
                 None
             };
             starting = Some(Box::pin(async move {
-                tokio::time::timeout_at(deadline, boot(&r, &execution, &a, id, &h, root))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("job boot deadline exceeded"))?
+                let worker = r.clone();
+                let approved = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let mut host = worker
+                        .host
+                        .lock_for("authorize VM boot")
+                        .expect("host lock");
+                    if !launch.pending.load(Ordering::SeqCst) || !host.job_boot_disk_ready(&job) {
+                        return Ok(None);
+                    }
+                    let now_ms = unix_ms();
+                    launch
+                        .boot_ready_at_ms
+                        .lock()
+                        .expect("boot ready time")
+                        .get_or_insert(now_ms);
+                    let approved = host.begin_job_boot_at(&job, now_ms)?;
+                    Ok(approved.map(|execution| {
+                        let deadline = tokio::time::Instant::now()
+                            + Runtime::boot_remaining(&host, &execution, unix_ms());
+                        (execution, deadline)
+                    }))
+                })
+                .await??;
+                let Some((execution, deadline)) = approved else {
+                    return Ok(None);
+                };
+                let stream =
+                    tokio::time::timeout_at(deadline, boot(&r, &execution, &a, id, &h, root))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("job boot deadline exceeded"))??;
+                Ok(Some(stream))
             }));
         }
         tokio::select! {
             result = async { preparing.as_mut().expect("preparation in progress").as_mut().await }, if preparing.is_some() => {
                 result?;
                 preparing = None;
+                check_boot = true;
             },
             stream = async { starting.as_mut().expect("boot in progress").as_mut().await }, if starting.is_some() => {
-                ready = Some(stream?);
+                ready = stream?;
                 starting = None;
-                launch_session.0.pending.store(false, Ordering::SeqCst);
+                if ready.is_some() {
+                    launch_session.0.pending.store(false, Ordering::SeqCst);
+                }
             },
             _ = tokio::time::sleep_until(expires), if !accepted => anyhow::bail!("queued lease expired"),
             frame = reader.next(client), if spool.has_room() => {
@@ -1916,6 +1939,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         if let Some(network) = run.network { reply = reply.with_network(network); }
                         write_frame(client, &serde_json::to_value(motor_protocol::Frame::Accepted(reply))?).await.map_err(client_io)?;
                         accepted = true;
+                        check_boot = true;
                     },
                     Some("bundle_chunk") if accepted => {},
                     Some("heartbeat") => {},
@@ -1924,16 +1948,30 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
             },
             _ = heartbeat.tick() => {
-                // Admitted workspace queues, including a memory recheck before
-                // boot, keep the same paused caller queue clock as VM setup.
-                let wait = accepted.then(|| queue_clock.observe(false));
+                check_boot = true;
+                // A late status sample must not start the paused caller clock
+                // or replace the last known blocker with an invented one.
+                let wait = accepted.then_some(queue_clock.elapsed_ms);
+                if accepted {
+                    if let Some(host) = try_host(runtime) {
+                        last_queue_status = queue_status_from(&host, claims);
+                    }
+                }
                 let mut frame = json!({"type":"heartbeat","queue_wait_ms":wait});
-                if let Some(status) = queue_updates.update(accepted.then(|| queue_status(runtime, claims)).flatten(), u64::try_from(status_started.elapsed().as_millis()).unwrap_or(u64::MAX)) {
+                if let Some(status) = queue_updates.update(last_queue_status.clone(), u64::try_from(status_started.elapsed().as_millis()).unwrap_or(u64::MAX)) {
                     frame["queue_status"] = serde_json::to_value(status)?;
                 }
                 write_frame(client, &frame).await.map_err(client_io)?;
             },
         }
+    }
+}
+
+fn try_host(runtime: &Runtime) -> Option<HostGuard<'_>> {
+    match runtime.host.try_lock() {
+        Ok(host) => Some(host),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(_)) => panic!("host lock poisoned"),
     }
 }
 

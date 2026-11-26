@@ -1,6 +1,7 @@
 //! Host-owned bundle generations. No guest filesystem image is opened here.
 use crate::{
     helper::{self, Control},
+    server::HostMutex,
     state::Host,
 };
 use anyhow::{ensure, Context, Result};
@@ -12,7 +13,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -254,7 +255,7 @@ impl Host {
 }
 
 pub fn export(
-    host: &Arc<Mutex<Host>>,
+    host: &Arc<HostMutex>,
     control: &dyn Control,
     job: &str,
     deadline: Instant,
@@ -264,7 +265,7 @@ pub fn export(
 
 #[cfg(test)]
 pub fn export_before_commit(
-    host: &Arc<Mutex<Host>>,
+    host: &Arc<HostMutex>,
     control: &dyn Control,
     job: &str,
     deadline: Instant,
@@ -292,7 +293,7 @@ enum ExportSkip {
 }
 
 fn export_with(
-    host: &Arc<Mutex<Host>>,
+    host: &Arc<HostMutex>,
     control: &dyn Control,
     job: &str,
     deadline: Instant,

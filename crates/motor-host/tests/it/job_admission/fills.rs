@@ -7,6 +7,7 @@ use motor_host::{
         fills::{Candidate, FillGuest, Publication, Scheduler},
         Assignment, Resources,
     },
+    server::HostMutex,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -131,7 +132,7 @@ fn set_forks(host: &mut Host, enabled: bool) {
 
 #[test]
 fn checkout_forks_stop_new_fills_and_disabling_forks_resumes_the_same_scheduler() {
-    let host = Arc::new(Mutex::new(memory_host(64 * 1024)));
+    let host = Arc::new(HostMutex::new(memory_host(64 * 1024)));
     let helper = Arc::new(Helper::default());
     let images = Arc::new(Images::default());
     let guest = Arc::new(Guest {
@@ -215,7 +216,7 @@ fn checkout_forks_drain_persisted_fills_and_release_storage_and_image_holds() {
         let mut h = durable_host(root.path(), 64 * 1024);
         set_forks(&mut h, true);
         let free_before = h.job_free_mem_mib(AT);
-        let host = Arc::new(Mutex::new(h));
+        let host = Arc::new(HostMutex::new(h));
         let helper = Arc::new(Helper::default());
         let images = Arc::new(Images::default());
         let mut scheduler = Scheduler::default();
@@ -520,7 +521,7 @@ fn fills_wait_for_queued_claims_and_capacity_refusals_then_require_fresh_memory(
 fn scheduler_uses_recent_repository_and_success_have_but_discards_failures_and_never_bills_traffic()
 {
     for success in [true, false] {
-        let host = Arc::new(Mutex::new(memory_host(64 * 1024)));
+        let host = Arc::new(HostMutex::new(memory_host(64 * 1024)));
         let helper = Arc::new(Helper::default());
         let mut scheduler = Scheduler::new(Arc::new(Guest {
             success,
@@ -636,7 +637,7 @@ fn unavailable_guest_is_disabled_once_and_reserves_nothing() {
             unreachable!()
         }
     }
-    let host = Arc::new(Mutex::new(memory_host(64 * 1024)));
+    let host = Arc::new(HostMutex::new(memory_host(64 * 1024)));
     let helper = Arc::new(Helper::default());
     let guest = Arc::new(Unavailable(AtomicUsize::new(0)));
     let mut scheduler = Scheduler::new(guest.clone());
