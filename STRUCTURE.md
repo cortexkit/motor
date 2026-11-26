@@ -125,4 +125,6 @@ These are enforced by the checks in `scripts/`:
   is missing.
 - Workspace crates have no build scripts (`scripts/no-build-scripts.py`);
   release builds pass the commit in `MOTOR_BUILD_COMMIT`.
-- Nothing under `.cortexkit/` is committed (`scripts/check-cortexkit-layout.sh`).
+- Under `.cortexkit/`, only `release-notes/`, `skills/`, `rules/`, `WORKER.md` and
+  project settings files (`.cortexkit/<module>.jsonc`) are tracked
+  (`scripts/check-cortexkit-layout.sh`).
