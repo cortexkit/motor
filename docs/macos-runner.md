@@ -411,7 +411,9 @@ the whole cap (or the file's own size, if larger). The host budgets every
 returned path, the agent only those under `target/`, so a placeholder of the
 file's real size could fit the host's remaining budget and come back as
 zeros; one larger than the cap never fits, and the host reports it over the
-cap. The agent never follows a link on the volume or crosses onto another file
+cap. Files returned from the build folder (`target/`) don't report the
+executable bit yet and are left as before. The agent never follows a link on
+the volume or crosses onto another file
 system mounted below it: a returned path under `target/` must name a regular
 file on the build volume through real directories, or the host reports it
 missing. Each placed file, and the directory holding it, is flushed before the

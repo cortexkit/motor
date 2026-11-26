@@ -32,6 +32,30 @@ fn return_paths_are_additive_and_default_fields_are_omitted() {
 }
 
 #[test]
+fn plain_return_frames_round_trip_true_false_and_absent_executable_flags() {
+    let wire = serde_json::json!({
+        "type": "return_result",
+        "job_id": Uuid::nil(),
+        "seq": 1,
+        "returned_files": [
+            {"path": "tool", "sha256": "digest", "data": "eA==", "executable": true},
+            {"path": "plain", "sha256": "digest", "data": "eA==", "executable": false},
+            {"path": "unknown", "sha256": "digest", "data": "eA=="}
+        ]
+    });
+    let frame: Frame = serde_json::from_value(wire.clone()).unwrap();
+    let Frame::ReturnResult(result) = &frame else {
+        panic!("expected a return_result frame");
+    };
+    let files = result.returned_files.as_deref().unwrap();
+    assert_eq!(
+        files.iter().map(|file| file.executable).collect::<Vec<_>>(),
+        [Some(true), Some(false), None]
+    );
+    assert_eq!(serde_json::to_value(frame).unwrap(), wire);
+}
+
+#[test]
 fn return_path_request_bounds_are_lexical_and_byte_counted() {
     let valid = vec!["/workspace/out".into()];
     assert!(validate_return_paths("/workspace", &valid, 1).is_ok());
@@ -177,12 +201,10 @@ fn a_full_return_chunk_frame_fits_the_frame_cap() {
     assert_eq!(read_frame(&mut encoded.as_slice()).unwrap(), Some(frame));
 }
 
-/// The `return-chunked` vectors shipped in cortexkit-exec-remote-types 0.2.10
-/// (`test-vectors/exec-remote-v1/return-chunked`), copied byte for byte into
-/// this crate. Reading them from the registry instead needs `cargo metadata`,
-/// which fails offline on CI when any package in the resolve (bumpalo, for
-/// one) was never downloaded. When the pinned version changes, copy the new
-/// release's directory over this one.
+/// The shared `return-chunked` vectors copied from cortexkit-exec-remote-types
+/// 0.2.10, plus the executable-bit case from 0.2.23. Keeping them here lets
+/// the test run without network access or a dependency source tree at a
+/// particular registry path.
 fn shared_vectors() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/return-chunked")
 }
@@ -289,7 +311,7 @@ fn shared_return_chunked_vectors_pass_as_stream_records_and_runner_frames() {
         cases += 1;
     }
     assert_eq!(
-        cases, 21,
-        "the 0.2.10 release has 21 return-chunked vectors"
+        cases, 22,
+        "21 legacy return-chunked vectors and the executable-bit case"
     );
 }

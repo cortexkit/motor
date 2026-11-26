@@ -246,6 +246,27 @@ fn an_index_expired_before_its_terminal_stores_no_later_chunks() {
 }
 
 #[test]
+fn plain_return_replay_keeps_executable_flags_and_absence() {
+    let root = scratch();
+    let mut store = Store::open(root.path(), JOB).unwrap();
+    let bytes = frame(json!({
+        "type": "return_result",
+        "job_id": JOB,
+        "seq": 1,
+        "returned_files": [
+            {"path": "tool", "sha256": "digest", "data": "eA==", "executable": true},
+            {"path": "plain", "sha256": "digest", "data": "eA==", "executable": false},
+            {"path": "unknown", "sha256": "digest", "data": "eA=="}
+        ]
+    }));
+    assert!(store.append(&bytes).unwrap());
+    assert!(store.append(&frame(json!({"type":"terminal"}))).unwrap());
+    drop(store);
+    let store = Store::open(root.path(), JOB).unwrap();
+    assert_eq!(store.frame(0).unwrap().unwrap(), bytes);
+}
+
+#[test]
 fn excessive_return_frames_fail_only_excess_paths_and_keep_terminal() {
     let root = scratch();
     let mut store = Store::open(root.path(), JOB).unwrap();
@@ -266,8 +287,11 @@ fn excessive_return_frames_fail_only_excess_paths_and_keep_terminal() {
             3,
             format!("{:x}", Sha256::digest(b"abc")),
         )
-        .with_chunks(1),
-        motor_protocol::ReturnManifestEntry::returned("/out/1", 12, "0".repeat(64)).with_chunks(3),
+        .with_chunks(1)
+        .with_executable(true),
+        motor_protocol::ReturnManifestEntry::returned("/out/1", 12, "0".repeat(64))
+            .with_chunks(3)
+            .with_executable(false),
     ])
     .unwrap();
     store.append(&frame(m)).unwrap();
@@ -294,6 +318,8 @@ fn excessive_return_frames_fail_only_excess_paths_and_keep_terminal() {
             ..
         }
     ));
+    assert_eq!(m.files[0].executable(), Some(true));
+    assert!(frames[1]["files"][1].get("executable").is_none());
     assert_eq!(m.total_bytes, 3);
     let paths = vec!["/out/0".to_owned(), "/out/1".to_owned()];
     let mut assembler = motor_protocol::ReturnAssembler::new(&paths, RETURN_BYTES);
@@ -310,6 +336,7 @@ fn excessive_return_frames_fail_only_excess_paths_and_keep_terminal() {
     let frames = drain(&store, 0, 0);
     let manifest: motor_protocol::ReturnManifest =
         serde_json::from_value(frames[0].clone()).unwrap();
+    assert!(frames[0]["files"][0].get("executable").is_none());
     motor_protocol::ReturnAssembler::new(&paths, RETURN_BYTES)
         .finish_expired_replay(&manifest, 0)
         .expect("expiry must account for both accepted and refused chunk sequences");

@@ -405,6 +405,15 @@ contiguous; `terminal` comes only after every earlier record. Tests:
 instead of replay silently skipping them. Test:
 `legacy_replay_projects_cursors_and_real_truncation_but_not_terminal`.
 
+Linux and macOS report an optional `executable` field on each successful file
+in `return_result` and `return_manifest`: `true` if any execute bit was set and
+`false` otherwise. Failed entries omit the field. A runner that doesn't report
+the bit (Windows, or an older runner) leaves files as before. On macOS, files
+returned from the build folder (`target/`) don't report the bit yet and are
+left as before. When the bit is reported, paths with a `.git` component
+(`.git` in any letter case) stay non-executable. See
+[Direct runs](module.md#direct-runs) for local write modes.
+
 7.3a. Returned-file chunks are kept for one hour after the job ends, then
 dropped. After that, a replay sends the last `output`, then the
 `return_manifest` with no `return_chunk` records in between, and every file that

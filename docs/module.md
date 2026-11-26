@@ -779,6 +779,16 @@ runs one command on the runner from a script with no agent behind it, streams
 its output, and exits with its status. It works only when `admit_direct_exec`
 is `true` in the configuration file ([Configuration](#configuration)).
 
+`--return-path PATH` writes a file returned by the job back to the local
+checkout. Returned files from Linux and macOS keep their executable bit.
+When the runner reports the bit, `ck motor run` creates executable files with
+mode `0777` and non-executable files with mode `0666`, both subject to the local
+umask. Paths with a `.git` component (`.git` in any letter case) stay
+non-executable when the bit is reported. A runner that doesn't report the bit
+(Windows, or an older runner) leaves files as before. On macOS, files returned
+from the build folder (`target/`) don't report the bit yet and are left as
+before.
+
 `--memory N`: The job's memory limit in GiB (Linux only). Without --memory,
 the server's default applies; a job that exceeds its limit is stopped.
 
