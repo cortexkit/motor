@@ -89,35 +89,46 @@ impl DiagnosticTail {
 }
 
 pub fn skip_project(directory: &Path, refusal: Refusal) -> Result<Refusal, Refusal> {
+    clean_failed_install(directory, "", refusal)
+}
+
+fn clean_failed_install(
+    directory: &Path,
+    lock_sha256: &str,
+    refusal: Refusal,
+) -> Result<Refusal, Refusal> {
     if refusal.kind.is_security() {
         return Err(refusal);
     }
-    fn clean(directory: &Path) -> Result<(), std::path::PathBuf> {
-        for entry in std::fs::read_dir(directory).map_err(|_| directory.to_path_buf())? {
-            let entry = entry.map_err(|_| directory.to_path_buf())?;
+    let invalid = || {
+        refuse(RefusalKind::BunProjectionInvalid, &refusal.project, "", "")
+            .at(Check::InstallCleanup)
+    };
+    let failed = |path: &Path| {
+        invalid().detail(super::path_detail("InstallCleanup failed", directory, path))
+    };
+    if !directory.is_dir() {
+        return Err(failed(directory));
+    }
+    let roots = super::install_roots::Roots::read(directory, lock_sha256)
+        .map_err(|step| invalid().detail(format!("InstallCleanup: {step}")))?;
+    // The preflight rejected existing modules in these directories. Only Bun
+    // created their node_modules, so cleanup need not touch fixture source.
+    for root in roots.existing(directory).map_err(|path| failed(&path))? {
+        for entry in std::fs::read_dir(&root).map_err(|_| failed(&root))? {
+            let entry = entry.map_err(|_| failed(&root))?;
+            if !is_node_modules(&entry.file_name()) {
+                continue;
+            }
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| path.clone())?;
-            if is_node_modules(&entry.file_name()) {
-                if metadata.is_dir() {
-                    std::fs::remove_dir_all(&path).map_err(|_| path.clone())?;
-                } else {
-                    std::fs::remove_file(&path).map_err(|_| path.clone())?;
-                }
-            } else if metadata.is_dir() && !crate::is_reparse(&metadata) {
-                clean(&path)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| failed(&path))?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&path).map_err(|_| failed(&path))?;
+            } else {
+                std::fs::remove_file(&path).map_err(|_| failed(&path))?;
             }
         }
-        Ok(())
     }
-    // A failed cleanup cannot safely hand an incomplete tree to the command.
-    clean(directory).map_err(|path| {
-        refuse(RefusalKind::BunProjectionInvalid, &refusal.project, "", "")
-            .at(super::Check::InstallCleanup)
-            .detail(format!(
-                "InstallCleanup failed at {}",
-                super::installed_relative(directory, &path)
-            ))
-    })?;
     Ok(refusal)
 }
 
@@ -128,7 +139,7 @@ pub fn finish_install(
 ) -> Result<Option<Refusal>, Refusal> {
     match result.and_then(|()| super::verify_installed(project, directory)) {
         Ok(()) => Ok(None),
-        Err(refusal) => skip_project(directory, refusal).map(Some),
+        Err(refusal) => clean_failed_install(directory, &project.lock_sha256, refusal).map(Some),
     }
 }
 
@@ -148,14 +159,23 @@ pub fn skip_unprepared(source: &Path, failure: Refusal) -> Result<Vec<String>, R
             continue;
         }
         let directory = source.join(project.strip_prefix("m/").unwrap_or(""));
-        let invalid = || refuse(RefusalKind::BunProjectionInvalid, &project, "", "");
-        super::clean_install_inputs(&directory, &budget).map_err(|_| invalid())?;
+        let invalid = |detail: &str| {
+            refuse(RefusalKind::BunProjectionInvalid, &project, "", "").detail(detail)
+        };
         let lock = super::read_bounded(&directory.join("bun.lock"), super::MAX_LOCK_BYTES as u64)
-            .map_err(|_| invalid())?;
-        super::read_lock(&project, std::str::from_utf8(&lock).map_err(|_| invalid())?)?;
+            .map_err(|_| invalid("read bun.lock"))?;
+        let text = std::str::from_utf8(&lock).map_err(|_| invalid("decode bun.lock as UTF-8"))?;
+        let lock = super::text_json(text).map_err(|_| {
+            refuse(RefusalKind::BunLockInvalid, &project, "", "").detail("parse bun.lock as JSON")
+        })?;
+        super::read_lock_value(&project, &lock)?;
+        super::install_roots::check_inputs(source, &directory, &lock, &budget)
+            .map_err(|detail| invalid(&detail))?;
+        // No install ran, and validation already excluded pre-existing modules
+        // at each install root. Nothing needs to be removed before continuing.
         let mut refusal = failure.clone();
         refusal.project = project;
-        warnings.push(skip_project(&directory, refusal)?.warning());
+        warnings.push(refusal.warning());
     }
     Ok(warnings)
 }

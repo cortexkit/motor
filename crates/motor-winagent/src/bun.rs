@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256, Sha512};
 mod expansion;
 mod graph;
 mod hash;
+mod install_roots;
 mod preparation;
 mod timing;
 pub use expansion::ExpansionBudget;
@@ -538,6 +539,11 @@ pub fn read_lock(project: &str, text: &str) -> Result<Vec<LockedPackage>, Refusa
         return Err(invalid());
     }
     let lock = text_json(text).map_err(|_| invalid())?;
+    read_lock_value(project, &lock)
+}
+
+fn read_lock_value(project: &str, lock: &Value) -> Result<Vec<LockedPackage>, Refusal> {
+    let invalid = || refuse(RefusalKind::BunLockInvalid, project, "", "");
     if !matches!(
         lock.get("lockfileVersion").and_then(Value::as_u64),
         Some(1 | 2)
@@ -628,7 +634,7 @@ pub fn read_lock(project: &str, text: &str) -> Result<Vec<LockedPackage>, Refusa
             url: url.into(),
         });
     }
-    let reachable = graph::reachable(&lock, rows).map_err(|_| invalid())?;
+    let reachable = graph::reachable(lock, rows).map_err(|_| invalid())?;
     for row in &mut packages {
         row.package.windows &= reachable.contains(&row.package.placement);
     }
@@ -1030,19 +1036,33 @@ pub fn source_projects(
         projects: &mut std::collections::BTreeMap<String, Option<String>>,
         budget: &ExpansionBudget,
     ) -> Result<(), Refusal> {
-        let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
-        for entry in std::fs::read_dir(path).map_err(|_| invalid())? {
-            budget.check().map_err(|_| invalid())?;
-            let entry = entry.map_err(|_| invalid())?;
+        let invalid = |step, path: &std::path::Path| {
+            refuse(RefusalKind::BunProjectionInvalid, "", "", "")
+                .detail(path_detail(step, source, path))
+        };
+        for entry in std::fs::read_dir(path)
+            .map_err(|_| invalid("open source for Bun project discovery", path))?
+        {
+            budget
+                .check()
+                .map_err(|_| invalid("Bun project discovery deadline", path))?;
+            let entry = entry
+                .map_err(|_| invalid("read directory entry for Bun project discovery", path))?;
             if is_node_modules(&entry.file_name()) {
                 continue;
             }
-            let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| invalid())?;
+            let entry_path = entry.path();
+            let metadata = std::fs::symlink_metadata(&entry_path).map_err(|_| {
+                invalid(
+                    "inspect source entry for Bun project discovery",
+                    &entry_path,
+                )
+            })?;
             if crate::is_reparse(&metadata) {
-                return Err(invalid());
+                return Err(invalid("reparse point in Bun source", &entry_path));
             }
             if metadata.is_dir() {
-                walk(&entry.path(), source, projects, budget)?;
+                walk(&entry_path, source, projects, budget)?;
             } else if entry.file_name() == "bun.lock" || entry.file_name() == "bun.lockb" {
                 let relative = path
                     .strip_prefix(source)
@@ -1055,7 +1075,8 @@ pub fn source_projects(
                     format!("m/{relative}")
                 };
                 if entry.file_name() == "bun.lockb" {
-                    return Err(refuse(RefusalKind::BunLockInvalid, &project, "", ""));
+                    return Err(refuse(RefusalKind::BunLockInvalid, &project, "", "")
+                        .detail("unsupported binary lockfile bun.lockb"));
                 }
                 projects.insert(project, None);
             }
@@ -1072,15 +1093,23 @@ pub fn source_projects(
         let member = source.join(project.strip_prefix("m/").unwrap_or(""));
         let mut ancestor = member.parent();
         while let Some(directory) = ancestor.filter(|path| path.starts_with(source)) {
-            budget
-                .check()
-                .map_err(|_| refuse(RefusalKind::BunProjectionInvalid, project, "", ""))?;
+            budget.check().map_err(|_| {
+                refuse(RefusalKind::BunProjectionInvalid, project, "", "").detail(path_detail(
+                    "Bun workspace discovery deadline",
+                    source,
+                    directory,
+                ))
+            })?;
             let manifest = directory.join("package.json");
             let declares_workspaces = if manifest.is_file() {
+                let invalid = |step| {
+                    refuse(RefusalKind::BunLockInvalid, project, "", "")
+                        .detail(path_detail(step, source, &manifest))
+                };
                 let bytes = read_bounded(&manifest, MAX_LOCK_BYTES as u64)
-                    .map_err(|_| refuse(RefusalKind::BunLockInvalid, project, "", ""))?;
+                    .map_err(|_| invalid("read enclosing workspace manifest"))?;
                 let value: Value = serde_json::from_slice(&bytes)
-                    .map_err(|_| refuse(RefusalKind::BunLockInvalid, project, "", ""))?;
+                    .map_err(|_| invalid("parse enclosing workspace manifest"))?;
                 value.get("workspaces").is_some()
             } else {
                 false
@@ -1096,9 +1125,7 @@ pub fn source_projects(
                 } else {
                     format!("m/{relative}")
                 };
-                if paths.contains(&owner)
-                    && lists_member(&directory.join("bun.lock"), directory, &member, budget)?
-                {
+                if paths.contains(&owner) && lists_member(source, directory, &member, budget)? {
                     projects.insert(project.clone(), Some(owner));
                 }
                 break;
@@ -1114,21 +1141,35 @@ pub fn source_projects(
 /// version of Bun's workspace glob expansion. Bun checks manifest drift during
 /// the frozen install; an unused member lockfile must not be parsed as a project.
 fn lists_member(
-    lock: &std::path::Path,
+    source: &std::path::Path,
     directory: &std::path::Path,
     member: &std::path::Path,
     budget: &ExpansionBudget,
 ) -> Result<bool, Refusal> {
-    let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
-    budget.check().map_err(|_| invalid())?;
-    let bytes = read_bounded(lock, MAX_LOCK_BYTES as u64).map_err(|_| invalid())?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
-    let lock: Value = text_json(text).map_err(|_| invalid())?;
+    let invalid = |step, path: &std::path::Path| {
+        refuse(RefusalKind::BunProjectionInvalid, "", "", "")
+            .detail(path_detail(step, source, path))
+    };
+    let lock_path = directory.join("bun.lock");
+    budget
+        .check()
+        .map_err(|_| invalid("workspace membership check deadline", &lock_path))?;
+    let bytes = read_bounded(&lock_path, MAX_LOCK_BYTES as u64)
+        .map_err(|_| invalid("read enclosing workspace lockfile", &lock_path))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| invalid("decode enclosing workspace lockfile as UTF-8", &lock_path))?;
+    let lock: Value =
+        text_json(text).map_err(|_| invalid("parse enclosing workspace lockfile", &lock_path))?;
     let relative = member
         .strip_prefix(directory)
-        .map_err(|_| invalid())?
+        .map_err(|_| {
+            invalid(
+                "workspace member is not under its enclosing project",
+                member,
+            )
+        })?
         .to_str()
-        .ok_or_else(invalid)?
+        .ok_or_else(|| invalid("decode workspace member path as UTF-8", member))?
         .replace('\\', "/");
     let Some(name) = lock
         .get("workspaces")
@@ -1139,9 +1180,11 @@ fn lists_member(
     else {
         return Ok(false);
     };
-    let bytes =
-        read_bounded(&member.join("package.json"), MAX_LOCK_BYTES as u64).map_err(|_| invalid())?;
-    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let manifest = member.join("package.json");
+    let bytes = read_bounded(&manifest, MAX_LOCK_BYTES as u64)
+        .map_err(|_| invalid("read workspace member manifest", &manifest))?;
+    let manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("parse workspace member manifest", &manifest))?;
     Ok(manifest.get("name").and_then(Value::as_str) == Some(name))
 }
 
@@ -1155,24 +1198,23 @@ pub fn workspace_member_warning(project: &str, owner: &str) -> String {
     )
 }
 
-fn clean_install_inputs(directory: &std::path::Path, budget: &ExpansionBudget) -> io::Result<()> {
-    for entry in std::fs::read_dir(directory)? {
-        budget.check()?;
-        let entry = entry?;
-        // A committed node_modules could make Bun accept unverified files as an
-        // existing install. Only the verified seed may supply installed packages.
-        if is_node_modules(&entry.file_name()) {
-            return Err(io::Error::other("pre-existing node_modules in Bun project"));
+fn path_detail(step: &str, root: &std::path::Path, path: &std::path::Path) -> String {
+    detail_location(step, &installed_relative(root, path))
+}
+
+fn detail_location(step: &str, relative: &str) -> String {
+    let mut detail = format!("{step} at ");
+    for c in relative.chars() {
+        if detail.len() + c.len_utf8() > 4096 {
+            break;
         }
-        let metadata = std::fs::symlink_metadata(entry.path())?;
-        if crate::is_reparse(&metadata) {
-            return Err(io::Error::other("reparse point in Bun project"));
-        }
-        if metadata.is_dir() {
-            clean_install_inputs(&entry.path(), budget)?;
-        }
+        detail.push(if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            '?'
+        } else {
+            c
+        });
     }
-    Ok(())
+    detail
 }
 
 pub fn prepare_cache(
@@ -1201,8 +1243,17 @@ pub fn prepare_cache_with_budget(
     cache: &std::path::Path,
     budget: &ExpansionBudget,
 ) -> Result<Option<Manifest>, Refusal> {
-    let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
-    budget.check().map_err(|_| invalid())?;
+    let invalid = |check, detail: &str| {
+        refuse(RefusalKind::BunProjectionInvalid, "", "", "")
+            .at(check)
+            .detail(detail)
+    };
+    budget.check().map_err(|_| {
+        invalid(
+            Check::SeedBudget,
+            "cache preparation deadline before scanning source root (m/)",
+        )
+    })?;
     // Members are prepared by the enclosing project, so the host publishes no
     // manifest row of their own.
     let input_projects: std::collections::BTreeSet<String> = source_projects(source, budget)?
@@ -1214,23 +1265,41 @@ pub fn prepare_cache_with_budget(
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if let Some(project) = input_projects.first() {
-                return Err(
-                    refuse(RefusalKind::BunCacheMissing, project, "", "").at(Check::SeedManifest)
-                );
+                return Err(refuse(RefusalKind::BunCacheMissing, project, "", "")
+                    .at(Check::SeedManifest)
+                    .detail("missing bun-seed/manifest.json"));
             }
             return Ok(None);
         }
-        Err(_) => return Err(invalid()),
+        Err(_) => return Err(invalid(Check::SeedManifest, "read bun-seed/manifest.json")),
     };
-    let mut manifest: Manifest = serde_json::from_value(
-        text_json(std::str::from_utf8(&bytes).map_err(|_| invalid())?).map_err(|_| invalid())?,
-    )
-    .map_err(|_| invalid())?;
-    if manifest.format != 1 || manifest.bun_version != BUN_VERSION {
-        return Err(invalid());
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        invalid(
+            Check::SeedManifest,
+            "decode bun-seed/manifest.json as UTF-8",
+        )
+    })?;
+    let json = text_json(text)
+        .map_err(|_| invalid(Check::SeedManifest, "parse bun-seed/manifest.json as JSON"))?;
+    let mut manifest: Manifest = serde_json::from_value(json)
+        .map_err(|_| invalid(Check::SeedManifest, "decode bun-seed/manifest.json fields"))?;
+    if manifest.format != 1 {
+        return Err(invalid(
+            Check::SeedManifest,
+            "unsupported bun-seed/manifest.json format",
+        ));
+    }
+    if manifest.bun_version != BUN_VERSION {
+        return Err(invalid(
+            Check::SeedManifest,
+            "unsupported bun-seed/manifest.json bun_version",
+        ));
     }
     if manifest.projects.is_empty() || manifest.projects.len() > 1000 {
-        return Err(invalid());
+        return Err(invalid(
+            Check::SeedManifest,
+            "bun-seed/manifest.json projects count outside 1..=1000",
+        ));
     }
     if manifest
         .projects
@@ -1239,7 +1308,10 @@ pub fn prepare_cache_with_budget(
         .collect::<std::collections::BTreeSet<_>>()
         != input_projects
     {
-        return Err(invalid());
+        return Err(invalid(
+            Check::SeedManifest,
+            "bun-seed/manifest.json projects[].path does not match source lockfiles",
+        ));
     }
     let expected_blobs: std::collections::BTreeSet<_> = manifest
         .projects
@@ -1252,26 +1324,45 @@ pub fn prepare_cache_with_budget(
                 .map(|package| package.integrity.blob_path())
         })
         .collect();
-    if seed.join("blobs").exists() {
-        for algorithm in std::fs::read_dir(seed.join("blobs")).map_err(|_| invalid())? {
-            let algorithm = algorithm.map_err(|_| invalid())?;
-            for blob in std::fs::read_dir(algorithm.path()).map_err(|_| invalid())? {
-                let blob = blob.map_err(|_| invalid())?;
+    let blobs = seed.join("blobs");
+    let blob_error = |step, path: &std::path::Path| {
+        refuse(RefusalKind::BunProjectionInvalid, "", "", "")
+            .at(Check::SeedBlobs)
+            .detail(detail_location(
+                step,
+                &format!("bun-seed/{}", installed_relative(seed, path)),
+            ))
+    };
+    if blobs.exists() {
+        for algorithm in
+            std::fs::read_dir(&blobs).map_err(|_| blob_error("list blob algorithms", &blobs))?
+        {
+            let algorithm =
+                algorithm.map_err(|_| blob_error("read blob algorithm entry", &blobs))?;
+            let directory = algorithm.path();
+            for blob in std::fs::read_dir(&directory)
+                .map_err(|_| blob_error("list blobs for algorithm", &directory))?
+            {
+                let blob = blob.map_err(|_| blob_error("read blob entry", &directory))?;
                 let relative = blob
                     .path()
                     .strip_prefix(seed)
-                    .map_err(|_| invalid())?
+                    .map_err(|_| blob_error("blob path is not relative to the seed", &directory))?
                     .to_string_lossy()
                     .replace('\\', "/");
                 if !expected_blobs.contains(&relative) {
-                    return Err(invalid());
+                    return Err(blob_error(
+                        "blob is not listed in the manifest",
+                        &blob.path(),
+                    ));
                 }
             }
         }
     }
     // A fresh cache cannot contain stale or attacker-supplied junctions. It is
     // intentionally writable because Bun applies patches and creates temp files.
-    std::fs::create_dir(cache).map_err(|_| invalid())?;
+    std::fs::create_dir(cache)
+        .map_err(|_| invalid(Check::CachePublish, "create fresh bun-cache directory"))?;
     let mut cleanup = DisposableCache {
         path: cache,
         keep: false,
@@ -1279,54 +1370,78 @@ pub fn prepare_cache_with_budget(
     let mut keys = BTreeMap::<String, Integrity>::new();
     let mut projects = std::collections::BTreeSet::new();
     for project in &mut manifest.projects {
-        let invalid = || {
+        let invalid = |detail: &str| {
             refuse(
                 RefusalKind::BunProjectionInvalid,
                 &project.path,
                 &project.name,
                 &project.version,
             )
+            .detail(detail)
         };
-        crate::validate_archive_path(&project.path).map_err(|_| invalid())?;
+        crate::validate_archive_path(&project.path).map_err(|_| {
+            invalid("invalid archive path in bun-seed/manifest.json projects[].path")
+        })?;
         let relative = if project.path == "m" {
             ""
         } else {
-            project.path.strip_prefix("m/").ok_or_else(invalid)?
+            project.path.strip_prefix("m/").ok_or_else(|| {
+                invalid("path outside m/ in bun-seed/manifest.json projects[].path")
+            })?
         };
-        clean_install_inputs(&source.join(relative), budget).map_err(|_| invalid())?;
         if !projects.insert(project.path.to_uppercase()) {
-            return Err(invalid());
+            return Err(invalid(
+                "duplicate path in bun-seed/manifest.json projects[].path",
+            ));
         }
-        let lock = read_bounded(
-            &source.join(relative).join("bun.lock"),
-            MAX_LOCK_BYTES as u64,
-        )
-        .map_err(|_| invalid())?;
+        let directory = source.join(relative);
+        let lock = read_bounded(&directory.join("bun.lock"), MAX_LOCK_BYTES as u64)
+            .map_err(|_| invalid("read bun.lock"))?;
         if hex(&Sha256::digest(&lock)) != project.lock_sha256 {
-            return Err(invalid());
+            return Err(invalid(
+                "bun.lock digest does not match projects[].lock_sha256",
+            ));
         }
-        let package_json = read_bounded(
-            &source.join(relative).join("package.json"),
-            MAX_LOCK_BYTES as u64,
-        )
-        .map_err(|_| invalid())?;
+        let package_json = read_bounded(&directory.join("package.json"), MAX_LOCK_BYTES as u64)
+            .map_err(|_| invalid("read package.json"))?;
         if hex(&Sha256::digest(&package_json)) != project.manifest_sha256 {
-            return Err(invalid());
+            return Err(invalid(
+                "package.json digest does not match projects[].manifest_sha256",
+            ));
         }
-        let locked = read_lock(
-            &project.path,
-            std::str::from_utf8(&lock).map_err(|_| invalid())?,
-        )?;
+        let text = std::str::from_utf8(&lock).map_err(|_| invalid("decode bun.lock as UTF-8"))?;
+        let lock = text_json(text).map_err(|_| {
+            refuse(RefusalKind::BunLockInvalid, &project.path, "", "")
+                .detail("parse bun.lock as JSON")
+        })?;
+        let locked = read_lock_value(&project.path, &lock).map_err(|refusal| {
+            refusal.detail("validate locked package rows and workspaces in bun.lock")
+        })?;
+        install_roots::check_inputs(source, &directory, &lock, budget)
+            .map_err(|detail| invalid(&detail))?;
         let expected: Vec<_> = locked.into_iter().map(|p| p.package).collect();
-        if serde_json::to_value(expected).map_err(|_| invalid())?
-            != serde_json::to_value(&project.packages).map_err(|_| invalid())?
+        if serde_json::to_value(expected)
+            .map_err(|_| invalid("encode expected packages from bun.lock"))?
+            != serde_json::to_value(&project.packages)
+                .map_err(|_| invalid("encode bun-seed/manifest.json projects[].packages"))?
         {
-            return Err(invalid());
+            return Err(invalid(
+                "bun-seed/manifest.json projects[].packages does not match bun.lock",
+            ));
         }
         if let Some(refusal) = &project.skipped {
-            refusal.validate().map_err(|_| invalid())?;
-            if refusal.kind.is_security() || refusal.project != project.path {
-                return Err(invalid());
+            refusal
+                .validate()
+                .map_err(|_| invalid("invalid bun-seed/manifest.json projects[].skipped fields"))?;
+            if refusal.kind.is_security() {
+                return Err(invalid(
+                    "security refusal in bun-seed/manifest.json projects[].skipped.kind",
+                ));
+            }
+            if refusal.project != project.path {
+                return Err(invalid(
+                    "bun-seed/manifest.json projects[].skipped.project does not match projects[].path",
+                ));
             }
             continue;
         }
@@ -1352,6 +1467,7 @@ pub fn prepare_cache_with_budget(
                     &first.version,
                 )
                 .at(Check::SeedBlobs)
+                .detail("required Windows package missing from bun-seed/blobs")
                 .registry(&manifest.registries)
                 .missing_packages(missing),
             );
@@ -1361,7 +1477,9 @@ pub fn prepare_cache_with_budget(
         for package in &project.packages {
             let fail = || projection_error(&project.path, package).registry(&manifest.registries);
             if !package.integrity.valid() {
-                return Err(fail());
+                return Err(
+                    fail().detail("invalid bun-seed/manifest.json projects[].packages[].integrity")
+                );
             }
             if !package.windows {
                 continue;
@@ -1378,6 +1496,7 @@ pub fn prepare_cache_with_budget(
                                 &package.version,
                             )
                             .at(Check::CacheRead)
+                            .detail(format!("read bun-seed/{}", package.integrity.blob_path()))
                             .registry(&manifest.registries)
                             .missing_packages([MissingPackage {
                                 name: package.name.clone(),
@@ -1394,24 +1513,58 @@ pub fn prepare_cache_with_budget(
                     &package.name,
                     &package.version,
                 )
-                .registry(&manifest.registries));
+                .registry(&manifest.registries)
+                .detail(format!(
+                    "verify digest of bun-seed/{}",
+                    package.integrity.blob_path()
+                )));
             }
-            let key = cache_key(package, &manifest.registries).map_err(|_| fail())?;
+            let key = cache_key(package, &manifest.registries)
+                .map_err(|_| fail().detail("derive Bun cache key from bun-seed/manifest.json package and registries fields"))?;
             if let Some(previous) = keys.insert(key.to_uppercase(), package.integrity.clone()) {
                 if previous != package.integrity {
-                    return Err(fail());
+                    return Err(fail().detail(detail_location(
+                        "conflicting integrity for cache entry",
+                        &format!("bun-cache/{key}"),
+                    )));
                 }
                 continue;
             }
             let destination = cache.join(&key);
-            expand_tarball_with_budget(&bytes, &destination, budget).map_err(|_| fail())?;
+            expand_tarball_with_budget(&bytes, &destination, budget).map_err(|_| {
+                fail().detail(format!(
+                    "expand archive from bun-seed/{}",
+                    package.integrity.blob_path()
+                ))
+            })?;
+            let metadata_path = format!("bun-cache/{key}/package.json");
             let metadata: Value = serde_json::from_slice(
-                &read_bounded(&destination.join("package.json"), MAX_LOCK_BYTES as u64)
-                    .map_err(|_| fail())?,
+                &read_bounded(&destination.join("package.json"), MAX_LOCK_BYTES as u64).map_err(
+                    |_| {
+                        fail().detail(detail_location(
+                            "read expanded package metadata",
+                            &metadata_path,
+                        ))
+                    },
+                )?,
             )
-            .map_err(|_| fail())?;
-            if metadata["name"] != package.name || metadata["version"] != package.version {
-                return Err(fail());
+            .map_err(|_| {
+                fail().detail(detail_location(
+                    "parse expanded package metadata",
+                    &metadata_path,
+                ))
+            })?;
+            if metadata["name"] != package.name {
+                return Err(fail().detail(detail_location(
+                    "expanded package name mismatch",
+                    &metadata_path,
+                )));
+            }
+            if metadata["version"] != package.version {
+                return Err(fail().detail(detail_location(
+                    "expanded package version mismatch",
+                    &metadata_path,
+                )));
             }
             created_keys.push(key);
         }
@@ -1419,16 +1572,31 @@ pub fn prepare_cache_with_budget(
         // entries shared with earlier complete projects, not this failed prefix.
         if project.skipped.is_some() {
             for key in created_keys {
-                std::fs::remove_dir_all(cache.join(&key)).map_err(|_| invalid())?;
+                std::fs::remove_dir_all(cache.join(&key)).map_err(|_| {
+                    invalid(&detail_location(
+                        "remove partial cache entry",
+                        &format!("bun-cache/{key}"),
+                    ))
+                })?;
                 keys.remove(&key.to_uppercase());
                 if let Some((scope, _)) = key.split_once('/') {
                     let directory = cache.join(scope);
                     if std::fs::read_dir(&directory)
-                        .map_err(|_| invalid())?
+                        .map_err(|_| {
+                            invalid(&detail_location(
+                                "list partial cache scope",
+                                &format!("bun-cache/{scope}"),
+                            ))
+                        })?
                         .next()
                         .is_none()
                     {
-                        std::fs::remove_dir(directory).map_err(|_| invalid())?;
+                        std::fs::remove_dir(directory).map_err(|_| {
+                            invalid(&detail_location(
+                                "remove empty cache scope",
+                                &format!("bun-cache/{scope}"),
+                            ))
+                        })?;
                     }
                 }
             }
@@ -1523,27 +1691,6 @@ fn installed_relative(directory: &std::path::Path, path: &std::path::Path) -> St
 /// A successful offline install may omit optional packages. Check identities and
 /// declared bin targets independently instead of treating exit zero as completeness.
 pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Result<(), Refusal> {
-    fn walk_projects(
-        path: &std::path::Path,
-        root: &Directory,
-        seen: &mut std::collections::BTreeSet<std::path::PathBuf>,
-        installed: &mut Vec<(Value, std::path::PathBuf)>,
-    ) -> Result<(), Containment> {
-        for entry in std::fs::read_dir(path).map_err(|error| root.failed(path, error))? {
-            let entry = entry.map_err(|error| root.failed(path, error))?;
-            let target = entry.path();
-            if is_node_modules(&entry.file_name()) {
-                walk_modules(&target, root, seen, installed)?;
-            } else {
-                let metadata = std::fs::symlink_metadata(&target)
-                    .map_err(|error| root.failed(&target, error))?;
-                if metadata.is_dir() && !crate::is_reparse(&metadata) {
-                    walk_projects(&target, root, seen, installed)?;
-                }
-            }
-        }
-        Ok(())
-    }
     fn walk_modules(
         path: &std::path::Path,
         root: &Directory,
@@ -1605,18 +1752,29 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         walk_modules(&path.join("node_modules"), root, seen, installed)
     }
     let mut installed = Vec::new();
-    // Only enclosing workspace projects are installed. Their store and member
-    // links stay inside this tree; the walk checks every entry before following
-    // it, including modules in members that have no root node_modules link.
-    // Visiting each resolved modules directory once breaks link cycles.
     let boundary = Directory::new(directory, &project.path)?;
-    walk_projects(
-        directory,
-        &boundary,
-        &mut Default::default(),
-        &mut installed,
-    )
-    .map_err(|error| error.into_refusal(project))?;
+    let invalid = || refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "");
+    let roots = install_roots::Roots::read(directory, &project.lock_sha256)
+        .map_err(|step| invalid().detail(format!("verify install roots: {step}")))?;
+    let roots = roots.existing(directory).map_err(|path| {
+        invalid().detail(path_detail(
+            "verify install root directory",
+            directory,
+            &path,
+        ))
+    })?;
+    let mut seen = Default::default();
+    // A fixture may name a locked package without supplying it to Bun. Check
+    // only the root install and workspace members, including their store links.
+    for root in roots {
+        walk_modules(
+            &root.join("node_modules"),
+            &boundary,
+            &mut seen,
+            &mut installed,
+        )
+        .map_err(|error| error.into_refusal(project))?;
+    }
     for package in project.packages.iter().filter(|p| p.windows) {
         let fail = || {
             refuse(

@@ -1,5 +1,9 @@
 use cortexkit_test_support::ScratchDir;
 
+const EMPTY_LOCK: &str = r#"{"lockfileVersion":1,"workspaces":{"":{}},"packages":{}}"#;
+const MEMBER_LOCK: &str =
+    r#"{"lockfileVersion":1,"workspaces":{"":{},"workspace":{"name":"member"}},"packages":{}}"#;
+
 #[test]
 fn local_fixture_pipe_eof_before_exit_is_not_install_failure() {
     let project = Project {
@@ -23,6 +27,11 @@ fn local_fixture_pipe_eof_before_exit_is_not_install_failure() {
     // itself when a local install succeeds.
     assert!(project.packages.is_empty());
     let scratch = ScratchDir::new("bun-local-eof");
+    std::fs::write(
+        scratch.join("bun.lock"),
+        include_str!("../../../test-fixtures/javascript/bun/bun.lock"),
+    )
+    .unwrap();
     verify_installed(&project, scratch.path()).unwrap();
     let mut polls = 0;
     let mut pipes = 0;
@@ -438,6 +447,7 @@ fn expansion_refuses_traversal_links_reserved_names_and_case_collisions() {
 #[test]
 fn missing_optional_windows_package_and_bin_are_named_refusals() {
     let scratch = ScratchDir::new("bun-missing-optional");
+    std::fs::write(scratch.join("bun.lock"), EMPTY_LOCK).unwrap();
     let project = Project {
         path: "m/project".into(),
         lock_sha256: String::new(),
@@ -488,6 +498,7 @@ fn missing_optional_windows_package_and_bin_are_named_refusals() {
 #[test]
 fn operational_install_and_verification_failures_skip_and_remove_partial_modules() {
     let scratch = ScratchDir::new("bun-install-skips");
+    std::fs::write(scratch.join("bun.lock"), MEMBER_LOCK).unwrap();
     let project = Project {
         path: "m/project".into(),
         lock_sha256: String::new(),
@@ -543,6 +554,63 @@ fn operational_install_and_verification_failures_skip_and_remove_partial_modules
 }
 
 #[test]
+fn fixture_package_cannot_satisfy_a_missing_installed_package() {
+    let scratch = ScratchDir::new("bun-fixture-not-installed");
+    let package = package();
+    let project = Project {
+        path: "m/project".into(),
+        lock_sha256: String::new(),
+        manifest_sha256: String::new(),
+        name: String::new(),
+        version: String::new(),
+        packages: vec![package.clone()],
+        skipped: None,
+    };
+    std::fs::write(scratch.join("bun.lock"), EMPTY_LOCK).unwrap();
+    let fixture = scratch
+        .join("tests/fixtures/repo/node_modules")
+        .join(&package.name);
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("package.json"),
+        serde_json::json!({"name": package.name, "version": package.version}).to_string(),
+    )
+    .unwrap();
+    let refusal = verify_installed(&project, scratch.path()).unwrap_err();
+    assert_eq!(refusal.check, Some(Check::InstalledPackage));
+    assert_eq!(refusal.package, "@private/win");
+}
+
+#[test]
+fn failed_install_preserves_fixture_but_removes_install_root_modules() {
+    let scratch = ScratchDir::new("bun-failed-install-with-fixture");
+    std::fs::write(scratch.join("bun.lock"), MEMBER_LOCK).unwrap();
+    let project = Project {
+        path: "m/project".into(),
+        lock_sha256: String::new(),
+        manifest_sha256: String::new(),
+        name: String::new(),
+        version: String::new(),
+        packages: Vec::new(),
+        skipped: None,
+    };
+    let fixture = scratch.join("workspace/tests/fixtures/repo/node_modules/pkg/x.js");
+    std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+    std::fs::write(&fixture, b"fixture source").unwrap();
+    for modules in ["node_modules", "workspace/node_modules"] {
+        std::fs::create_dir_all(scratch.join(modules).join("partial")).unwrap();
+    }
+    let failure = refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", "");
+    assert_eq!(
+        finish_install(&project, scratch.path(), Err(failure.clone())).unwrap(),
+        Some(failure)
+    );
+    assert!(!scratch.join("node_modules").exists());
+    assert!(!scratch.join("workspace/node_modules").exists());
+    assert_eq!(std::fs::read(fixture).unwrap(), b"fixture source");
+}
+
+#[test]
 fn bun_stderr_tail_is_bounded_and_has_no_control_characters() {
     let mut tail = DiagnosticTail::default();
     tail.push(&vec![b'a'; 4096]);
@@ -564,6 +632,7 @@ fn installed_package_path_escape_is_a_security_refusal() {
     let outside = scratch.join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::create_dir_all(directory.join("node_modules/@private")).unwrap();
+    std::fs::write(directory.join("bun.lock"), EMPTY_LOCK).unwrap();
     std::os::unix::fs::symlink(&outside, directory.join("node_modules/@private/win")).unwrap();
     let project = Project {
         path: "m/project".into(),
@@ -737,6 +806,128 @@ fn missing_seed_is_refused_even_when_a_host_omits_the_bun_namespace() {
     );
 }
 
+#[test]
+fn cache_preparation_distinguishes_invalid_steps_and_fields() {
+    use super::hex_sha256;
+    use serde_json::json;
+    use std::fs;
+
+    let scratch = ScratchDir::new("bun-cache-preparation-details");
+    let source = scratch.join("source");
+    let seed = scratch.join("seed");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&seed).unwrap();
+    fs::write(source.join("bun.lock"), EMPTY_LOCK).unwrap();
+    fs::write(source.join("package.json"), b"{}").unwrap();
+    let valid = json!({
+        "format": 1,
+        "bun_version": BUN_VERSION,
+        "registries": {},
+        "projects": [{
+            "path": "m", "name": "", "version": "3.17.4", "packages": [],
+            "lock_sha256": hex_sha256(EMPTY_LOCK.as_bytes()),
+            "manifest_sha256": hex_sha256(b"{}"),
+        }],
+    });
+    let manifest = seed.join("manifest.json");
+    let cache = scratch.join("cache");
+    let check = |expected_check, detail: &str, project| {
+        let refusal = prepare_cache(&seed, &source, &cache).unwrap_err();
+        assert_eq!(refusal.kind, RefusalKind::BunProjectionInvalid);
+        assert_eq!(&*refusal.detail, detail);
+        assert_eq!(refusal.check, Some(expected_check));
+        assert_eq!(refusal.project, project);
+        assert!(refusal.to_string().contains(detail));
+        refusal.validate().unwrap();
+    };
+
+    fs::create_dir(&manifest).unwrap();
+    check(Check::SeedManifest, "read bun-seed/manifest.json", "");
+    fs::remove_dir(&manifest).unwrap();
+    for (text, step) in [
+        (&[0xff][..], "decode bun-seed/manifest.json as UTF-8"),
+        (b"{", "parse bun-seed/manifest.json as JSON"),
+        (b"{}", "decode bun-seed/manifest.json fields"),
+    ] {
+        fs::write(&manifest, text).unwrap();
+        check(Check::SeedManifest, step, "");
+    }
+    for (field, value, detail) in [
+        (
+            "format",
+            json!(42),
+            "unsupported bun-seed/manifest.json format",
+        ),
+        (
+            "bun_version",
+            json!("0.0.0"),
+            "unsupported bun-seed/manifest.json bun_version",
+        ),
+        (
+            "projects",
+            json!([]),
+            "bun-seed/manifest.json projects count outside 1..=1000",
+        ),
+    ] {
+        let mut input = valid.clone();
+        input[field] = value;
+        fs::write(&manifest, input.to_string()).unwrap();
+        check(Check::SeedManifest, detail, "");
+    }
+    let mut input = valid.clone();
+    input["projects"][0]["path"] = json!("m/another-project");
+    fs::write(&manifest, input.to_string()).unwrap();
+    check(
+        Check::SeedManifest,
+        "bun-seed/manifest.json projects[].path does not match source lockfiles",
+        "",
+    );
+    for (field, value, detail) in [
+        (
+            "lock_sha256",
+            json!("wrong"),
+            "bun.lock digest does not match projects[].lock_sha256",
+        ),
+        (
+            "manifest_sha256",
+            json!("wrong"),
+            "package.json digest does not match projects[].manifest_sha256",
+        ),
+        (
+            "packages",
+            json!([package()]),
+            "bun-seed/manifest.json projects[].packages does not match bun.lock",
+        ),
+        (
+            "skipped",
+            json!(refuse(RefusalKind::BunProjectionInvalid, "m", "", "")),
+            "security refusal in bun-seed/manifest.json projects[].skipped.kind",
+        ),
+        (
+            "skipped",
+            json!(refuse(RefusalKind::BunFetchUnavailable, "m/other", "", "")),
+            "bun-seed/manifest.json projects[].skipped.project does not match projects[].path",
+        ),
+    ] {
+        let mut input = valid.clone();
+        input["projects"][0][field] = value;
+        fs::write(&manifest, input.to_string()).unwrap();
+        check(Check::Projection, detail, "m");
+        assert!(!cache.exists());
+    }
+    fs::write(&manifest, valid.to_string()).unwrap();
+    fs::create_dir(&cache).unwrap();
+    check(Check::CachePublish, "create fresh bun-cache directory", "");
+    fs::remove_dir(&cache).unwrap();
+    fs::create_dir_all(seed.join("blobs/sha256")).unwrap();
+    fs::write(seed.join("blobs/sha256/extra"), b"").unwrap();
+    check(
+        Check::SeedBlobs,
+        "blob is not listed in the manifest at bun-seed/blobs/sha256/extra",
+        "",
+    );
+}
+
 /// Missing link targets and failed cleanup need distinct checks and lexical
 /// checkout paths, not opaque guest filesystem errors.
 #[cfg(unix)]
@@ -746,6 +937,7 @@ fn post_install_unreadable_tree_and_cleanup_failures_name_their_paths() {
     let directory = scratch.join("project");
     let modules = directory.join("node_modules");
     std::fs::create_dir_all(&modules).unwrap();
+    std::fs::write(directory.join("bun.lock"), EMPTY_LOCK).unwrap();
     std::os::unix::fs::symlink(scratch.join("missing"), modules.join("broken")).unwrap();
     let project = Project {
         path: "m/project".into(),
