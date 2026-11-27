@@ -534,8 +534,8 @@ exports current compatible JSON and exits non-zero on any export/replay/lease
 failure. The root must contain an existing `state.json` checkpoint. If the
 checkpoint is missing, the command refuses to export and leaves any journal
 files untouched. Only replace the binary after exit status 0. Do not delete
-journal files or copy state.json by hand. The previous `222d833` binary cannot
-replay a journal.
+journal files or copy state.json by hand. A ck-motor build from before the
+journal existed cannot replay one, which is why the export must come first.
 An abrupt stop followed by rollback **without** this command may lose up to five
 minutes of transitions, including cancellation and Run intent fences (longer if
 checkpointing was failing). A clean stop is lossless only if its checkpoint
