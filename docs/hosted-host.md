@@ -146,10 +146,10 @@ jobs get their tools and isolation from the tenant image instead.
    leaves the original nft/NAT/UFW policy bytes unchanged. Old configs without
    an explicit uplink/public address deliberately fail closed with the new helper.
 
-The renderer retains the build server's 32-thread topology and excludes
-`12-15,28-31`, even on a host without Windows. A host with a different topology
-needs a reviewed CPU policy change, not a guessed template. First-install
-templates do not bypass provision.py's sizing, resolver or CPU validation.
+The renderer checks that every CPU named by the tenant layout is online on this
+host and excludes `12-15,28-31` only when `capacity.json` budgets memory for a
+Windows VM. First-install templates do not bypass provision.py's sizing,
+resolver or CPU validation.
 
 ## What gets installed
 
@@ -1091,8 +1091,9 @@ extra rule.
    installed tenant record as it is, not against the checkout template:
    `provision.py`'s own record validation; the record and the helper registry
    agree on every field; `/etc/motor-vm-helper.json` equals the render from the
-   record (its slot CPUs come from the record's cpuset); the cpuset avoids the
-   Windows CPUs and stays within the host's 32 threads; `capacity.json`, the
+   record (its slot CPUs come from the record's cpuset); every CPU in the cpuset
+   is online and, when a Windows VM is budgeted, the cpuset avoids its reserved
+   CPUs; `capacity.json`, the
    memory fit and the jobs slice's live `MemoryMax`; and that no `resize.json`
    exists. A resized record therefore passes and is never reset. A reinstall
    (`--build` or install mode) keeps an installed record's sizing and image

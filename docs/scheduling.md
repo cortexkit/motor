@@ -14,18 +14,19 @@ produce.
   do not change the claim. Test: `claims_are_exact_and_unsized_jobs_always_claim_two`
   (`crates/motor-runner/src/tests/vcpu.rs`).
 - A claim of 0, or larger than the runner's claim limit, is refused before
-  start with `runner_full` and a detail naming the limit. The claim limit is
-  the host's allocatable CPUs, or `max_weight` when Linux jobs are confined to a
-  CPU list (below). Tests:
+  upload with `runner_full` and a detail naming the limit. The claim limit is
+  the smaller of `max_weight` and the allocatable CPU count, or just
+  `max_weight` when Linux jobs are confined to a CPU list (below). Tests:
   `oversized_and_zero_claims_are_refused_before_start_with_limit_detail`,
   `oversized_vcpu_refusal_detail_reaches_the_run_terminal`
   (`crates/motor-module/tests/it/recovery.rs`),
   `linux_cpu_list_refuses_claims_above_max_weight_before_start_without_waiting`
   (`crates/motor-runner/src/tests/vcpu.rs`).
-- A claim that fits the claim limit but exceeds `max_weight` (possible only
-  without a CPU list) is accepted but waits until it fits; it does not block
-  other jobs. Tests: `pinned_job_waits_until_its_exact_claim_fits_max_weight`,
-  `without_a_linux_cpu_list_claims_above_max_weight_still_wait`.
+- A claim within the limit waits if running jobs and setups leave it too little
+  room. `max_weight` is set at startup, so a claim above it cannot start and is
+  refused even when no CPU list is configured. Tests:
+  `pinned_job_waits_until_its_exact_claim_fits_max_weight`,
+  `without_a_linux_cpu_list_claims_above_max_weight_are_refused_before_upload`.
 - Every new Linux job requires a hosted lease. A broker `no_host_fits` response
   returns a typed refusal; it never sends the job to a direct build-server
   runner. Test: `linux_exec_refusals_and_followups_never_reach_a_direct_runner`.
@@ -37,11 +38,15 @@ produce.
 The runner gives each Linux job specific logical CPUs, records them in the job
 record before setup, and pins the job's service to them with `AllowedCPUs=`.
 
-- The topology comes from the host's online CPUs and their hyperthread
-  siblings. On a host with at least four physical cores, the first core and its
-  siblings are kept for the runner and the system; smaller hosts keep nothing
-  back. Tests: `topology_reads_online_siblings_and_reserves_cpu_zero_core`,
-  `small_hosts_keep_every_cpu_allocatable` (`crates/motor-runner/src/cpu_tests.rs`).
+- The topology comes from the host's online CPUs and their hyperthread siblings.
+  For isolated Linux jobs, the runner intersects those CPUs with the effective
+  CPU set of `motor-jobs.slice`, including inherited limits. For jobs launched
+  directly by the Linux runner, it uses the runner's inherited CPU affinity.
+  By default, if at least four physical cores remain, the first core and its
+  siblings are kept for the runner and the system; smaller sets keep nothing
+  back. Tests: `realized_job_slice_limits_placement_and_recomputes_daemon_reservation`,
+  `topology_reads_online_siblings_and_reserves_cpu_zero_core`,
+  `small_hosts_keep_every_cpu_allocatable`.
 - Placement prefers whole free sibling pairs; an odd claim prefers a pair that
   is already split. Tests: `even_claims_use_whole_pairs_without_overlap_while_free`,
   `odd_claims_prefer_an_already_split_pair`,
@@ -58,9 +63,10 @@ record before setup, and pins the job's service to them with `AllowedCPUs=`.
 ### Confining Linux jobs to a CPU list
 
 `serve --linux-cpus <list>` (for example `12-15,28-31`) places Linux jobs only
-on the listed online CPUs, with no core held back for the daemon; a sibling
-outside the list is never used. Absent the option, the topology above is
-unchanged. With the option:
+on the listed CPUs, with no core held back for the daemon; a sibling outside the
+list is never used. Startup refuses an explicitly configured CPU outside the
+available CPU set rather than silently dropping it. Absent the option, the
+topology above is unchanged. With the option:
 
 - The claim limit is `--max-weight`, not the number of listed CPUs. A claim up
   to it is admitted and placed on at most as many CPUs as the list has,
@@ -79,7 +85,7 @@ unchanged. With the option:
   Tests: `confined_linux_cpus_share_windows_threads_while_the_slot_is_active`,
   `linux_cpu_list_shares_the_windows_threads_while_the_slot_is_active`.
 - The option is refused on a VM instance, with an empty list, a CPU that is
-  not online, or `--max-weight 0`.
+  not available to jobs, or `--max-weight 0`.
 
 ### Memory and the jobs slice
 

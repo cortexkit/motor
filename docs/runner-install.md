@@ -29,8 +29,14 @@ host.
   Linux callers' `/home` checkouts are not prepared this way; they are stored
   under per-instance caller roots on the same filesystem instead
   ([section 9](#9-optional-caller-roots-for-home-checkouts)).
-- systemd with `PrivatePIDs=` support (systemd 257 or newer; the runner does
-  not check the version). The CPU
+  On native isolated Linux, startup refuses if the runner state filesystem
+  fails a reflink check. Filesystems containing Cargo build folders that the
+  runner cleans by age must use `relatime` or `strictatime`, not `noatime`:
+  cleanup uses file access times. Set `--free-space-floor-bytes` below the
+  size of the state volume; startup refuses a floor at or above its total size.
+- An isolated Linux runner queries the running systemd manager at startup and
+  requires systemd 257 or newer for `PrivatePIDs=`. An explicitly configured
+  `--boat-profile` uses the runner's PID namespace bootstrap instead. The CPU
   accounting parser is tested against output captured from systemd 259. Also
   POSIX ACL tools (`setfacl`), and Linux namespaces and mounts.
 - An operator account with `sudo`. The runner calls `sudo -n` for the
@@ -318,7 +324,7 @@ stay up (`loginctl enable-linger <operator>`).
 | `--windows-cpus LIST` | absent | Linux placement avoidance: Windows VM host CPUs in CPU-list syntax; their online SMT siblings are included. Requires `--windows-slot-lock`. |
 | `--windows-slot-lock PATH` | absent | Absolute path to the shared Windows QEMU slot lock; requires `--windows-cpus`. Read-only observation, never acquires the lock. |
 | `--job-network veth` | absent | Allow outbound networking for jobs that request it. |
-| `--reserve-daemon-core false` | true | Explicitly let a dedicated single-job sandbox use all online CPUs. The fleet default keeps its existing daemon-core reservation policy. `--tenant-vm` implies `false`: a tenant VM is sized for its tenant's jobs, so it never keeps a core back (`tenant_mode_never_reserves_a_daemon_core`). |
+| `--reserve-daemon-core false` | true | Explicitly let a dedicated single-job sandbox use all available CPUs. The fleet default keeps its existing daemon-core reservation policy. `--tenant-vm` implies `false`: a tenant VM is sized for its tenant's jobs, so it never keeps a core back (`tenant_mode_never_reserves_a_daemon_core`). |
 | `--boat-profile` | absent | Explicit single-tenant Boat compatibility for systemd 255: omit unsupported PrivatePIDs, retain other isolation and add CPU/PID ceilings. Do not enable it to bypass missing PID isolation on an ordinary build server; the default profile refuses unsupported systemd. See `script/boat-image/README.md`. |
 | `--drain-timeout-s N` | 1800 | Deadline for a SIGUSR1-initiated drain. |
 

@@ -207,6 +207,10 @@ pub(super) struct Mount {
     device: Vec<u8>,
     root: PathBuf,
     pub(super) mountpoint: PathBuf,
+    #[cfg(target_os = "linux")]
+    id: u64,
+    #[cfg(target_os = "linux")]
+    noatime: bool,
 }
 
 fn unescape(value: &[u8]) -> io::Result<PathBuf> {
@@ -248,9 +252,40 @@ pub(super) fn mounts(table: &[u8]) -> io::Result<Vec<Mount>> {
                 device: fields[2].into(),
                 root: unescape(fields[3])?,
                 mountpoint: unescape(fields[4])?,
+                #[cfg(target_os = "linux")]
+                id: std::str::from_utf8(fields[0])
+                    .map_err(io::Error::other)?
+                    .parse()
+                    .map_err(io::Error::other)?,
+                // Per-mount options come first; superblock options are the last field.
+                #[cfg(target_os = "linux")]
+                noatime: [fields[5], fields[fields.len() - 1]]
+                    .iter()
+                    .any(|options| options.split(|&byte| byte == b',').any(|o| o == b"noatime")),
             })
         })
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn check_gc_mounts(
+    table: &[u8],
+    targets: impl IntoIterator<Item = (PathBuf, u64)>,
+) -> io::Result<()> {
+    let mounts = mounts(table)?;
+    for (path, id) in targets {
+        let mount = mounts.iter().find(|mount| mount.id == id).ok_or_else(|| {
+            io::Error::other(format!("cannot find mount ID {id} for {}", path.display()))
+        })?;
+        if mount.noatime {
+            return Err(io::Error::other(format!(
+                "Cargo GC needs relatime or strictatime: {} is on the noatime mount {}",
+                path.display(),
+                mount.mountpoint.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn bind_sources(root: &Path, table: &[Mount]) -> Vec<PathBuf> {
@@ -399,7 +434,6 @@ pub(super) fn filesystem_with_probe(
 fn probe(config: &Config, root: &CallerRoot) -> io::Result<()> {
     use std::{
         ffi::CString,
-        io::{Read, Seek, Write},
         os::{
             fd::{AsRawFd, FromRawFd},
             unix::fs::MetadataExt,
@@ -435,6 +469,16 @@ fn probe(config: &Config, root: &CallerRoot) -> io::Result<()> {
             "host root and state must share a filesystem",
         ));
     }
+    reflink(&directory)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reflink(directory: &fs::File) -> io::Result<()> {
+    use std::{
+        io::{Read, Seek, Write},
+        os::fd::{AsRawFd, FromRawFd},
+    };
+
     let temporary = || -> io::Result<fs::File> {
         let fd = unsafe {
             libc::openat(
@@ -451,7 +495,8 @@ fn probe(config: &Config, root: &CallerRoot) -> io::Result<()> {
     };
     let mut source = temporary()?;
     let mut target = temporary()?;
-    source.write_all(b"motor caller-root reflink probe")?;
+    let data = b"motor reflink probe";
+    source.write_all(data)?;
     source.sync_all()?;
     if unsafe {
         libc::ioctl(
@@ -468,7 +513,7 @@ fn probe(config: &Config, root: &CallerRoot) -> io::Result<()> {
     target.rewind()?;
     let mut contents = Vec::new();
     target.read_to_end(&mut contents)?;
-    if contents != b"motor caller-root reflink probe" {
+    if contents != data {
         return Err(io::Error::other("reflink probe contents differ"));
     }
     Ok(())

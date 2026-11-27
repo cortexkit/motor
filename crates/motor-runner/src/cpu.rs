@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Online sibling groups, sorted by CPU number. On hosts with enough cores the
+#[cfg(target_os = "linux")]
+mod effective;
+
+/// Available sibling groups, sorted by CPU number. With enough cores the
 /// first core is daemon-only (see `RESERVE_MIN_CORES`).
 #[derive(Clone)]
 pub(crate) struct CpuTopology {
@@ -146,6 +149,57 @@ pub(crate) fn format_list(cpus: &[u32]) -> String {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+pub(crate) fn configure(config: &crate::Config) -> io::Result<CpuTopology> {
+    if config.linux_cpus.is_some() && config.vm_instance() {
+        return Err(io::Error::other(
+            "--linux-cpus applies only to a runner serving Linux jobs",
+        ));
+    }
+    let (mut cpus, use_host_limits) = if let Some(vm) = &config.windows {
+        #[cfg(unix)]
+        let fixed = CpuTopology::fixed(vm.cpu_set.clone())?;
+        #[cfg(windows)]
+        let fixed = CpuTopology::fixed((0..vm.concurrent_jobs * 4).collect())?;
+        (fixed, false)
+    } else {
+        #[cfg(test)]
+        let fixture = config.cpu_topology.clone();
+        #[cfg(not(test))]
+        let fixture: Option<CpuTopology> = None;
+        match fixture {
+            Some(cpus) => (cpus, false),
+            None => (CpuTopology::read()?, !config.vm_instance()),
+        }
+    };
+    // Windows may use CPUs outside the Linux jobs' effective set. Validate the
+    // reservation against online CPUs and keep its expanded sibling groups.
+    match (&config.windows_cpus, &config.windows_slot_lock) {
+        (None, None) => (),
+        (Some(list), Some(path)) if config.windows.is_none() => {
+            cpus = cpus.avoid_windows(&parse_list(list)?, path.clone())?;
+        }
+        _ => {
+            return Err(io::Error::other(
+                "--windows-cpus and --windows-slot-lock must be supplied together on the Linux runner",
+            ));
+        }
+    }
+    let explicit = config.linux_cpus.as_deref().map(parse_list).transpose()?;
+    #[cfg(target_os = "linux")]
+    if use_host_limits {
+        cpus = effective::read(config)?.restrict(cpus, explicit.as_deref())?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = use_host_limits;
+    if !config.reserves_daemon_core() {
+        cpus = cpus.without_daemon_reservation();
+    }
+    if let Some(list) = explicit {
+        cpus = cpus.confine(&list, config.max_weight)?;
+    }
+    Ok(cpus)
 }
 
 impl CpuTopology {
