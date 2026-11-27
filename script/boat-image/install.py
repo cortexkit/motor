@@ -859,6 +859,7 @@ def main():
         "node": ["node", "--version"], "bun": ["bun", "--version"],
         "pnpm": ["pnpm", "--version"], "git": ["git", "--version"],
         "wasm-opt": ["wasm-opt", "--version"], "nats": ["nats-server", "--version"], "python": ["python3", "--version"],
+        "pil": ["python3", "-c", "from PIL import Image, ImageChops"],
         "systemd": ["systemctl", "--version"],
     }.items()}
     inventory.update(revision=args.revision, runner_sha256=digest("/usr/local/bin/motor-runner"),

@@ -1249,6 +1249,16 @@ class ParityTests(unittest.TestCase):
                         self.assertEqual([], parity.differences(self.manifest, actual, role, job,
                                                                gnu_test_sha256='package-qualified-test'))
 
+    def test_python3_pil_is_required_on_every_linux_role(self):
+        self.assertIn('python3-pil', self.manifest['apt_packages']['required'])
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role):
+                actual = self.observed_host(role)
+                self.assertEqual([], parity.differences(self.manifest, actual, role=role))
+                del actual['apt_packages']['python3-pil']
+                self.assertIn('missing apt package: python3-pil',
+                              parity.differences(self.manifest, actual, role=role))
+
     def test_python3_venv_is_required_only_on_boat_and_tenant_roles(self):
         manifest = self.manifest
         self.assertNotIn('python3-venv', manifest['apt_packages']['required'])

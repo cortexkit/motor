@@ -1394,10 +1394,13 @@ class AptInstallTests(unittest.TestCase):
         self.assertIn('cmake', command)
         self.assertIn('gdb', command)
         self.assertIn('elfutils', command)
+        self.assertIn('python3-pil', command)
         self.assertIn('python3-venv', command)
         for package in manifest['apt_packages']['required'] + manifest['apt_packages']['by_role']['boat']:
             if package != 'openssh-server':
                 self.assertIn(package, command)
+        pil_probe = ('python3', '-c', 'from PIL import Image, ImageChops')
+        self.assertIn(pil_probe, [call.args for call in run.call_args_list])
 
 
 class JournalRetentionTests(unittest.TestCase):
