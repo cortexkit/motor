@@ -90,8 +90,11 @@ def renderer_cli(*args):
 class CapacityConfigTests(unittest.TestCase):
     def setUp(self):
         self.capacity = dict(CAPACITY)
+        self.online_cpus = mock.Mock(spec=Path)
+        self.online_cpus.read_text.return_value = "0-31\n"
         for patch in (mock.patch.object(hosted, "load_provision", return_value=provision),
-                      mock.patch.object(provision, "read_capacity", side_effect=lambda: dict(self.capacity))):
+                      mock.patch.object(provision, "read_capacity", side_effect=lambda: dict(self.capacity)),
+                      mock.patch.object(hosted, "ONLINE_CPUS", self.online_cpus, create=True)):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -224,6 +227,23 @@ class HostedHostConfigTests(CapacityConfigTests):
         self.capacity["windows_vm_bytes"] = 0
         with self.assertRaises(ValueError):
             hosted.helper_config(998, 998, "enp6s0", "8.8.8.8", {"cpuset": "not-a-cpuset"})
+
+    def test_tenant_and_helper_allow_online_cpus_above_31(self):
+        self.online_cpus.read_text.return_value = "0-63\n"
+        record = dict(json.loads(hosted.TENANT_FILE.read_text()), sub=SUB,
+                      vcpu_ceiling=4, cpuset="32-35")
+        hosted.validate_tenant(record)
+        helper = hosted.helper_config(998, 998, "enp6s0", "8.8.8.8", record)
+        self.assertEqual(helper["slots"][0]["cpus"], "32-35")
+
+    def test_tenant_and_helper_refuse_cpus_missing_from_a_sparse_online_set(self):
+        self.online_cpus.read_text.return_value = "0-9,11-63\n"
+        record = dict(json.loads(hosted.TENANT_FILE.read_text()), sub=SUB,
+                      vcpu_ceiling=4, cpuset="8-11")
+        with self.assertRaisesRegex(ValueError, "not online: 10"):
+            hosted.validate_tenant(record)
+        with self.assertRaisesRegex(ValueError, "not online: 10"):
+            hosted.helper_config(998, 998, "enp6s0", "8.8.8.8", record)
 
     def test_helpers_and_tenants_reserve_threads_for_any_positive_windows_budget(self):
         self.capacity["windows_vm_bytes"] = 1
@@ -485,7 +505,7 @@ class InstalledStateTests(CapacityConfigTests):
 
     def test_a_hand_edited_cpuset_on_the_windows_cpus_fails(self):
         for cpuset, needle in (("8-15,24-31", "overlaps the Windows VM's CPUs 12-15,28-31"),
-                               ("0-11,16-27,32", "beyond this host's 32 threads")):
+                               ("0-11,16-27,32", "not online: 32")):
             with self.subTest(cpuset=cpuset):
                 record = dict(self.resized(), cpuset=cpuset)
                 # Record, registry and helper edited alike, so only the cpuset rule

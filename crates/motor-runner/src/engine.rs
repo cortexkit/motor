@@ -54,6 +54,8 @@ mod disk;
 mod guest_disk;
 #[path = "health.rs"]
 mod health;
+#[cfg(target_os = "linux")]
+mod host_storage;
 mod macos_hold;
 #[path = "migration.rs"]
 mod migration;
@@ -2387,53 +2389,6 @@ impl Runner {
                 "disk eviction threshold must be above the refusal floor",
             ));
         }
-        #[cfg(test)]
-        let cpus = config
-            .cpu_topology
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(CpuTopology::read)?;
-        #[cfg(not(test))]
-        let cpus = CpuTopology::read()?;
-        let cpus = if config.reserves_daemon_core() {
-            cpus
-        } else {
-            cpus.without_daemon_reservation()
-        };
-        let cpus = if let Some(vm) = &config.windows {
-            #[cfg(unix)]
-            {
-                CpuTopology::fixed(vm.cpu_set.clone())?
-            }
-            #[cfg(windows)]
-            {
-                CpuTopology::fixed((0..vm.concurrent_jobs * 4).collect())?
-            }
-        } else {
-            cpus
-        };
-        let cpus = match (&config.windows_cpus, &config.windows_slot_lock) {
-            (None, None) => cpus,
-            (Some(list), Some(path)) if config.windows.is_none() => {
-                cpus.avoid_windows(&crate::cpu::parse_list(list)?, path.clone())?
-            }
-            _ => {
-                return Err(invalid(
-                    "--windows-cpus and --windows-slot-lock must be supplied together on the Linux runner",
-                ));
-            }
-        };
-        // Confine after Windows avoidance so the Windows CPUs are checked
-        // against every online CPU, not only the listed ones.
-        let cpus = match &config.linux_cpus {
-            None => cpus,
-            Some(_) if config.vm_instance() => {
-                return Err(invalid(
-                    "--linux-cpus applies only to a runner serving Linux jobs",
-                ));
-            }
-            Some(list) => cpus.confine(&crate::cpu::parse_list(list)?, config.max_weight)?,
-        };
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
             // The runner's own command hook answers this query in tests, so a
@@ -2457,6 +2412,7 @@ impl Runner {
                 prepare_job_shared_roots(&config)?;
             }
         }
+        let cpus = crate::cpu::configure(&config)?;
         // The operator's state root may be reached through symlinks (for example
         // when storage lives on another volume). Resolve only that trusted root
         // once; job-controlled descendants must still pass the no-follow walk.
@@ -2574,6 +2530,8 @@ impl Runner {
         }
         paths::owner::check(&config)?;
         paths::catalog::fixed(&config.caller_roots, &pins)?;
+        #[cfg(target_os = "linux")]
+        host_storage::check(&config, &state, &catalog)?;
         paths::startup::filesystem(&config)?;
         if !config.caller_roots.is_empty() {
             if !state.join("caller-roots-ever-enabled").exists() {
@@ -4734,16 +4692,22 @@ impl Runner {
             .unwrap_or(Admission::Accepted(depth as u32)))
     }
 
+    fn max_cpu_claim(&self) -> u32 {
+        self.core
+            .cpus
+            .claim_limit()
+            .min(self.core.config.max_weight)
+    }
+
     fn cpu_refusal(&self, claim: u32) -> Option<(RefusalReason, String)> {
-        let limit = self.core.cpus.claim_limit();
+        let limit = self.max_cpu_claim();
         if claim == 0 || claim > limit {
             let basis = match &self.core.config.linux_cpus {
-                // A confined runner refuses what it could never admit, rather
-                // than accepting a claim above max_weight that would wait forever.
                 Some(list) => format!(
                     "max_weight limit; Linux jobs share {} CPUs ({list})",
                     self.core.cpus.capacity()
                 ),
+                None if limit < self.core.cpus.capacity() => "max_weight limit".into(),
                 None => format!(
                     "allocatable CPU limit; daemon core reservation {}",
                     self.core.config.daemon_core_reservation()
@@ -6330,7 +6294,9 @@ impl Runner {
         let request = fill_request(id, root, &cwd, tip, tree, command.clone(), git_dependencies);
         // Warm builds use 4 vCPUs, or the whole allocatable set on a smaller
         // host, where a fixed 4 would be refused and the target never warmed.
-        let claim = WARM_BUILD_VCPUS.min(self.core.cpus.capacity());
+        let claim = WARM_BUILD_VCPUS
+            .min(self.core.cpus.capacity())
+            .min(self.max_cpu_claim());
         let mut job = Job::new(id, Some(request), self.now(), inner.order, claim);
         job.base = true;
         job.writer_descriptor = Some(descriptor);
@@ -10747,7 +10713,7 @@ impl Runner {
                 oom_memory_limit_detail(
                     &self.core.config,
                     job.weight,
-                    self.core.cpus.claim_limit(),
+                    self.max_cpu_claim(),
                     self.core
                         .slice_budget
                         .load(std::sync::atomic::Ordering::Relaxed),

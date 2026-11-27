@@ -10,7 +10,7 @@ fn assert_oom_detail_uses_configured_limits(runner: &Runner, job: &Job, detail: 
         "{detail}"
     );
 
-    let more = (job.weight.max(4) * 2).min(runner.core.cpus.capacity());
+    let more = (job.weight.max(4) * 2).min(runner.max_cpu_claim());
     if more > job.weight {
         let more_limit = crate::backend::memory_limit_gib(more, floor_gib);
         assert!(
@@ -129,7 +129,9 @@ fn claims_are_exact_and_unsized_jobs_always_claim_two() {
 #[test]
 fn oversized_and_zero_claims_are_refused_before_start_with_limit_detail() {
     let f = Fixture::new();
-    let runner = Runner::open(f.config()).unwrap();
+    let mut config = f.config();
+    config.max_weight = 32;
+    let runner = Runner::open(config).unwrap();
     for claim in [0, 31, u32::MAX] {
         let (mut request, _) = f.run("touch must-not-start");
         request.weight_hint = Some(claim);
@@ -492,26 +494,28 @@ fn linux_cpu_list_refuses_claims_above_max_weight_before_start_without_waiting()
     assert!(!Path::new(&f.key).join("must-not-start").exists());
 }
 
-/// Without a CPU list the allocatable CPUs stay the claim limit, so a claim
-/// above max_weight that fits the host is still accepted and waits.
 #[test]
-fn without_a_linux_cpu_list_claims_above_max_weight_still_wait() {
+fn without_a_linux_cpu_list_claims_above_max_weight_are_refused_before_upload() {
     let f = Fixture::new();
     let mut config = f.config();
     config.max_weight = 16;
+    config.manual_tick = true;
     let runner = Runner::open(config).unwrap();
     assert_eq!(runner.core.cpus.capacity(), 30);
-    assert_eq!(runner.core.cpus.claim_limit(), 30);
     let (mut request, _) = f.run("true");
     request.weight_hint = Some(17);
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
-        Admission::Accepted(_)
+        Admission::Refused(RefusalReason::RunnerFull)
     ));
-    runner.tick().unwrap();
-    let inner = runner.core.inner.lock().unwrap();
-    let job = &inner.jobs[&request.job_id];
-    assert!(job.terminal.is_none() && job.cpus.is_empty() && job.setup_ms.is_none());
+    let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert!(terminal
+        .refusal_detail()
+        .unwrap()
+        .contains("1..=16 (max_weight limit)"));
+    assert_eq!(runner.status().queue_depth, 0);
 }
 
 #[tokio::test]
@@ -915,7 +919,7 @@ async fn oversized_vcpu_refusal_frame_carries_the_recorded_detail() {
     assert_eq!(refusal.reason, RefusalReason::RunnerFull);
     let detail = refusal.detail.expect("runner refusal detail");
     assert!(detail.contains("vcpu request 40"), "{detail}");
-    assert!(detail.contains("1..=30"), "{detail}");
+    assert!(detail.contains("1..=28 (max_weight limit)"), "{detail}");
     let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
     assert_eq!(
         job.terminal.unwrap().refusal_detail(),

@@ -80,11 +80,10 @@ STORAGE = Path("/var/lib/motor-vm")
 TENANT_RECORD = Path("/etc/motor-host/provision/tenant-1.json")
 HELPER_CONFIG = Path("/etc/motor-vm-helper.json")
 
-# The build server has 16 cores / 32 threads; thread n and n+16 share a core.
 # When capacity.json budgets memory for a Windows VM, it owns cores 12-15
 # (threads 12-15 and 28-31), which must stay clear of hosted work.
-THREADS = 32
 WINDOWS_CPUS = "12-15,28-31"
+ONLINE_CPUS = Path("/sys/devices/system/cpu/online")
 
 # The helper's job slots are unused on a hosted host (motor-host only sends
 # tenant operations), but its config requires at least one. These are the
@@ -100,6 +99,20 @@ def cpus(text: str) -> set[int]:
         bounds = [int(n) for n in part.split("-")]
         result.update(range(bounds[0], bounds[-1] + 1))
     return result
+
+
+def check_host_cpus(cpuset: str, capacity: dict) -> None:
+    selected = cpus(cpuset)
+    if capacity["windows_vm_bytes"] > 0 and selected & cpus(WINDOWS_CPUS):
+        raise ValueError(f"tenant cpuset {cpuset} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
+    try:
+        online = cpus(ONLINE_CPUS.read_text().strip())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read online host CPUs from {ONLINE_CPUS}: {error}") from error
+    missing = selected - online
+    if missing:
+        ids = ",".join(map(str, sorted(missing)))
+        raise ValueError(f"tenant cpuset {cpuset} names CPUs that are not online: {ids}")
 
 
 def host_config(host_id: str, port: int = PORT, mode: str = "tenant",
@@ -172,11 +185,8 @@ def helper_config(uid: int, gid: int, uplink: str, public_ipv4: str, tenant: dic
         raise ValueError("the host agent account must not be root")
     if not isinstance(tenant.get("cpuset"), str):
         raise ValueError("the tenant record has no cpuset")
-    tenant_cpus = cpus(tenant["cpuset"])
     host_capacity: dict = load_provision().read_capacity() if capacity is None else capacity
-    # Reserve Windows threads only on hosts that budget memory for that VM.
-    if host_capacity["windows_vm_bytes"] > 0 and tenant_cpus & cpus(WINDOWS_CPUS):
-        raise ValueError(f"tenant cpuset {tenant['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
+    check_host_cpus(tenant["cpuset"], host_capacity)
     images = STORAGE / "images"
     # Absent files the helper never opens: they are read only when a job slot
     # starts, and no client of this helper asks for one.
@@ -211,11 +221,7 @@ def validate_tenant(config: dict, provision=None, *, capacity: dict | None = Non
     except (KeyError, TypeError) as error:
         raise ValueError(f"invalid tenant record: {error!r}") from error
     host_capacity: dict = provision.read_capacity() if capacity is None else capacity
-    cpuset = cpus(config["cpuset"])
-    if host_capacity["windows_vm_bytes"] > 0 and cpuset & cpus(WINDOWS_CPUS):
-        raise ValueError(f"tenant cpuset {config['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
-    if max(cpuset) >= THREADS:
-        raise ValueError(f"tenant cpuset {config['cpuset']} names a CPU beyond this host's {THREADS} threads")
+    check_host_cpus(config["cpuset"], host_capacity)
     if config["resolvers"] != RESOLVERS:
         raise ValueError("tenant resolvers must match the host agent's")
 

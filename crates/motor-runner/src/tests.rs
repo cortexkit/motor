@@ -601,7 +601,7 @@ fn ignored_target_is_not_hashed_when_materializing_workspace() {
     fs::write(f.main.join(".gitignore"), "target/\n").unwrap();
     commit(&f.main, "first\n");
     let mut config = f.config();
-    config.max_weight = 1; // Hold the queue while checking materialization directly.
+    config.manual_tick = true; // Check materialization before dispatch.
     let runner = Runner::open(config).unwrap();
     let (request, bytes) = f.run("true");
     f.submit(&runner, &request, &bytes);
@@ -639,7 +639,7 @@ fn dissociated_workspace_checks_out_a_commit_fetched_into_the_mirror_later() {
     let f = Fixture::new();
     commit(&f.main, "dissociation base\n");
     let mut config = f.config();
-    config.max_weight = 1; // Hold the queue while checking materialization directly.
+    config.manual_tick = true; // Check materialization before dispatch.
     let runner = Runner::open(config).unwrap();
     let (first, bytes) = f.run("true");
     f.submit(&runner, &first, &bytes);
@@ -720,7 +720,7 @@ fn standalone_build_slot_wrapper_compiles_with_its_cargo_edition() {
 fn sibling_catalog_rematerializes_deleted_or_moved_checkouts() {
     let f = Fixture::new();
     let mut config = f.config();
-    config.max_weight = 1;
+    config.manual_tick = true;
     let runner = Runner::open(config).unwrap();
     let (request, bytes) = f.run("true");
     f.submit(&runner, &request, &bytes);
