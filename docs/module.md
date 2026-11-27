@@ -219,7 +219,7 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `runner_instance` | `main` | Storage namespace and legacy runner instance for follow-ups to persisted pre-cutover direct jobs; never selects a runner for a new Linux job. |
 | `windows_runner_instance`, `windows_runner_state_root` | absent | Legacy Windows runner instance and absolute state root. Set both or neither; the instance must differ from `runner_instance`. Used when `windows_runners` is empty. |
 | `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root` (absolute POSIX or drive-letter path), `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
-| `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
+| `worktree_roots` | `cortexkit/alfonso/worktrees` under the data home, or `[]` without a data home | Absolute roots under which linked worktrees are recognised as task workspaces. |
 | `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose Linux leases use repository-specific placement policy. See [repository routing](#hosted-repository-routing). |
 | `hosted_repositories_placement_hint` | absent (omitted) | Optional `{ "host": "control-host", "vm": "t1" }` placement hint for repository-routed leases only. Both names must follow the broker grammar; `vm` cannot be null. Hinted jobs never fall back to the build server. |
 | `hosted_repositories_placement_hints` | `{}` (omitted) | Map from absolute repository roots listed in `hosted_repositories` to `{ "host": "control-host", "vm": "t1" }` placement hints. Each entry overrides `hosted_repositories_placement_hint` for that repository, with the same name requirements. |
@@ -229,6 +229,12 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `direct_exec_max_timeout_secs` | `7200` | Longest timeout a direct run may ask for. |
 | `ssh_config_override` | absent | Test control: an SSH config file used instead of the vault-backed identity. |
 | `inject_tree_hash_mismatch`, `inject_snapshot_failure` | `false` | Test controls that force a tree-hash mismatch or a snapshot failure. |
+
+The data home is the absolute `$XDG_DATA_HOME`, or `$HOME/.local/share` if
+`$XDG_DATA_HOME` is unset, empty or relative (as required by the XDG
+specification). With neither variable set to an absolute path, ck-motor has
+no default worktree root and refuses to open its default storage, naming both
+variables in the error.
 
 The three test controls are refused when `runner_instance` is `main`, so a
 production configuration cannot weaken authentication or fake failures.
@@ -867,6 +873,16 @@ on Boat the runner serves a `/home` checkout at the caller's own path (see
 [job-isolation.md](job-isolation.md#38-caller-root-mapping)); where a runner is
 not configured for it, the request is refused before the job starts, and a
 direct run prints the reason and exits 200.
+
+Hosted jobs require `workspace_key`, `repository_root`, `cwd` and each sibling
+to be under `/Users` or `/home`, including their symlink targets, with no `..`
+components, because hosted runners recreate caller paths only under those two
+roots. `worktree_roots` does not extend these allowed prefixes.
+
+When run from a main checkout with a separate Git directory, `ck motor run`
+uses the checkout itself as the repository root. A linked worktree is refused
+if Git does not identify a verifiable main checkout for it; run from the main
+checkout instead.
 
 Windows callers are supported only through WSL2, with the checkout in the WSL
 filesystem. A checkout on a Windows drive (`/mnt/c`, `/mnt/C/x`, or a symlink

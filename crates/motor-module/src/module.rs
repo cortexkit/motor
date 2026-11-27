@@ -346,25 +346,9 @@ pub struct Handler {
     engram_config_path: Option<PathBuf>,
 }
 pub(crate) fn module_data_dir(module_id: &str) -> io::Result<PathBuf> {
-    module_data_dir_for(
-        module_id,
-        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )
-}
-
-fn module_data_dir_for(
-    module_id: &str,
-    xdg_data_home: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> io::Result<PathBuf> {
-    let data = match xdg_data_home {
-        Some(data) => data,
-        None => home
-            .ok_or_else(|| io::Error::other("neither XDG_DATA_HOME nor HOME is set"))?
-            .join(".local/share"),
-    };
-    Ok(data.join("cortexkit").join(module_id))
+    Ok(crate::config::data_home()?
+        .join("cortexkit")
+        .join(module_id))
 }
 
 impl Handler {
@@ -1866,16 +1850,58 @@ mod startup_tests {
     }
 
     #[test]
-    fn module_data_directory_uses_the_runtime_module_id() {
-        let data_home = PathBuf::from("/test/data");
-        assert_eq!(
-            module_data_dir_for("ck-motor", Some(data_home.clone()), None).unwrap(),
-            data_home.join("cortexkit/ck-motor")
-        );
-        assert_eq!(
-            module_data_dir_for("motor", Some(data_home.clone()), None).unwrap(),
-            data_home.join("cortexkit/motor")
-        );
+    fn default_paths_require_an_absolute_data_home() {
+        const EXPECTED: &str = "MOTOR_TEST_EXPECTED_DATA_HOME";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            let roots = Config::default().worktree_roots;
+            if expected.is_empty() {
+                let error = module_data_dir("ck-motor").unwrap_err().to_string();
+                assert!(error.contains("XDG_DATA_HOME nor HOME"), "{error}");
+                assert!(roots.is_empty());
+            } else {
+                let expected = PathBuf::from(expected).join("cortexkit");
+                for id in ["ck-motor", "motor"] {
+                    assert_eq!(module_data_dir(id).unwrap(), expected.join(id));
+                }
+                assert_eq!(roots, [expected.join("alfonso/worktrees")]);
+            }
+            return;
+        }
+
+        for (xdg, home, expected) in [
+            (Some("/test/data"), None, "/test/data"),
+            (None, Some("/test/home"), "/test/home/.local/share"),
+            (Some(""), Some("/test/home"), "/test/home/.local/share"),
+            (
+                Some("relative"),
+                Some("/test/home"),
+                "/test/home/.local/share",
+            ),
+            (Some("relative"), Some("relative"), ""),
+            (None, None, ""),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "module::startup_tests::default_paths_require_an_absolute_data_home",
+                ])
+                .env(EXPECTED, expected);
+            for (name, value) in [("XDG_DATA_HOME", xdg), ("HOME", home)] {
+                match value {
+                    Some(value) => child.env(name, value),
+                    None => child.env_remove(name),
+                };
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "XDG_DATA_HOME={xdg:?}, HOME={home:?} ({})\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -1893,9 +1919,7 @@ mod startup_tests {
         for module_id in ["ck-motor", "motor"] {
             let handler = Handler::new(Config::default()).with_module_id(module_id);
             let storage_root = handler
-                .storage_root_with_data_dir(&ack, |id| {
-                    module_data_dir_for(id, Some(data_home.clone()), None)
-                })
+                .storage_root_with_data_dir(&ack, |id| Ok(data_home.join("cortexkit").join(id)))
                 .unwrap();
             assert_eq!(
                 storage_root,
