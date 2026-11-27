@@ -722,12 +722,20 @@ class ProvisionTests(unittest.TestCase):
             events.append(path.name)
             records[path.name] = value
             original(path, value)
+        original_write = p.durable_write
+        def durable_write(path, value, mode):
+            self.assertTrue((self.root / "tenants/a/generation").is_file())
+            events.append(path.name)
+            original_write(path, value, mode)
         def base(c, image, path):
             events.append("base")
             path.mkdir(parents=True)
-        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": 2**63})), mock.patch.object(p, "atomic", side_effect=atomic):
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": 2**63})), \
+                mock.patch.object(p, "atomic", side_effect=atomic), \
+                mock.patch.object(p, "durable_write", side_effect=durable_write):
             p.provision(c, base, execute)
-        self.assertEqual(events, ["base", "fallocate", "mkfs.xfs", "mount", "runner-args", "umount", "generation", "a.json", "tenants.json"])
+        self.assertEqual(events, ["base", "fallocate", "mkfs.xfs", "mount", "runner-args", "umount",
+                                  "generation", p.PROVISION_REQUEST, "a.json", "tenants.json"])
         record = json.loads((p.REGISTRY / "a.json").read_text())
         self.assertEqual(record["disk"], str(self.root / "tenants/a/disk.img"))
         self.assertEqual(record["image_version"], "v1")
@@ -735,6 +743,106 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(json.loads(p.BINDINGS.read_text()), {"vm-a": {"tenant": "a", "sub": c["sub"]}})
         self.assertEqual(records["runner-args"], p.runner_args(c))
         self.assertEqual((self.root / "tenants/a/generation").read_text(), "0\n")
+
+    def provision_failure_fixture(self):
+        c = config()
+        base = p.base_path(c, self.image)
+        base.mkdir(parents=True)
+        for name in ("base.vmstate", "base.memory"):
+            (base / name).write_bytes(b"snapshot")
+        free = mock.patch.object(p.shutil, "disk_usage", return_value=mock.Mock(free=2**63))
+        free.start()
+        self.addCleanup(free.stop)
+        return c
+
+    def simulate_disk_commands(self, *args):
+        if args[0] == "fallocate":
+            with args[-1].open("wb") as disk:
+                disk.write(b"preserve this disk")
+                disk.truncate(args[-2])
+
+    def test_provision_refuses_and_names_an_interrupted_stage(self):
+        c = self.provision_failure_fixture()
+        def fail_during_format(*args):
+            self.simulate_disk_commands(*args)
+            if args[0] == "mkfs.xfs":
+                raise OSError("interrupted during format")
+        with self.assertRaisesRegex(OSError, "interrupted during format"):
+            p.provision(c, execute=fail_during_format)
+        stage, = (self.root / "tenants").iterdir()
+        execute = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "left staging directory") as rejected:
+            p.provision(c, execute=execute)
+        self.assertIn(str(stage), str(rejected.exception))
+        self.assertIn("check that nothing uses it", str(rejected.exception))
+        self.assertNotEqual(stage.name, c["tenant"])
+        self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
+        with (stage / "disk.img").open("rb") as disk:
+            self.assertEqual(disk.read(18), b"preserve this disk")
+        execute.assert_not_called()
+        self.assertFalse((p.REGISTRY / "a.json").exists())
+        self.assertFalse(p.BINDINGS.exists())
+
+    def interrupt_after_provision_commit(self, c):
+        self.reset_counter.side_effect = OSError("interrupted before registry")
+        with self.assertRaisesRegex(OSError, "interrupted before registry"):
+            p.provision(c, execute=self.simulate_disk_commands)
+        self.reset_counter.side_effect = None
+        self.assertFalse((p.REGISTRY / "a.json").exists())
+        self.assertFalse(p.BINDINGS.exists())
+
+    def test_provision_resumes_committed_home_without_recreating_disk(self):
+        c = self.provision_failure_fixture()
+        self.interrupt_after_provision_commit(c)
+        home = self.root / "tenants/a"
+        disk = home / "disk.img"
+        inode = disk.stat().st_ino
+        execute = mock.Mock()
+        p.provision(c, execute=execute)
+        execute.assert_not_called()
+        self.assertEqual(disk.stat().st_ino, inode)
+        with disk.open("rb") as file:
+            self.assertEqual(file.read(18), b"preserve this disk")
+        self.assertEqual(json.loads((p.REGISTRY / "a.json").read_text())["disk"], str(disk))
+        self.assertEqual(json.loads(p.BINDINGS.read_text()), {"vm-a": {"tenant": "a", "sub": c["sub"]}})
+        self.assertFalse((home / p.PROVISION_REQUEST).exists())
+        with self.assertRaisesRegex(ValueError, "binding already exists"):
+            p.provision(c, execute=execute)
+        execute.assert_not_called()
+
+    def test_provision_refuses_changed_request_after_commit(self):
+        c = self.provision_failure_fixture()
+        self.interrupt_after_provision_commit(c)
+        execute = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "request differs in: disk_quota_bytes, vm"):
+            p.provision(dict(c, disk_quota_bytes=c["disk_quota_bytes"] + 4096, vm="other"), execute=execute)
+        execute.assert_not_called()
+        self.assertFalse((p.REGISTRY / "a.json").exists())
+        self.assertFalse(p.BINDINGS.exists())
+
+    def test_provision_resumes_binding_only_and_ignores_old_pending_files(self):
+        c = self.provision_failure_fixture()
+        registry = p.REGISTRY / "a.json"
+        original_replace = p.os.replace
+        def interrupt_binding(source, destination):
+            if destination == p.BINDINGS:
+                raise OSError("interrupted before binding")
+            original_replace(source, destination)
+        with mock.patch.object(p.os, "replace", side_effect=interrupt_binding), \
+                self.assertRaisesRegex(OSError, "interrupted before binding"):
+            p.provision(c, execute=self.simulate_disk_commands)
+        inode = registry.stat().st_ino
+        for path in (registry, p.BINDINGS):
+            path.with_suffix(".json.pending").write_text("not a record")
+        execute = mock.Mock()
+        p.provision(c, execute=execute)
+        execute.assert_not_called()
+        self.reset_counter.assert_called_once_with(c["tap_index"])
+        self.assertEqual(registry.stat().st_ino, inode)
+        self.assertEqual(json.loads(p.BINDINGS.read_text()), {"vm-a": {"tenant": "a", "sub": c["sub"]}})
+        for path in (registry, p.BINDINGS):
+            self.assertEqual(path.with_suffix(".json.pending").read_text(), "not a record")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
 
     def test_runner_refusal_floor_comes_from_the_live_runner_arguments(self):
         home = {"HOME": "/home/ubuntu"}

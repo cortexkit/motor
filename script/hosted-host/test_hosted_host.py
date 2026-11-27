@@ -959,6 +959,21 @@ echo installed > "$scratch/installed"
         self.assertLess(tail.index("\nstage_host_config\n"), tail.index("\nbinaries\n"))
         self.assertLess(tail.index("\nstage_host_config\n"), tail.index("\nconfigs\n"))
 
+    def test_preflight_failure_stops_before_account_or_file_installation(self):
+        dispatch = self.script[self.script.index("\nstage_host_config\n"):]
+        fail = next(line for line in self.script.splitlines() if line.startswith("fail()"))
+        script = fail + '''
+mode=install problems=0 skipped=0
+stage_host_config() { :; }
+preflight() { fail "storage is not a private mount"; }
+# Stop the harness if dispatch reaches the first operation that can write.
+trap 'if [ "$BASH_COMMAND" = account ]; then echo "account stage reached" >&2; exit 97; fi' DEBUG
+''' + dispatch
+        result = subprocess.run(["bash", "-ec", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("FAIL: storage is not a private mount", result.stderr)
+        self.assertIn("1 preflight problem(s); not installed", result.stderr)
+
     def test_per_job_install_arguments_refuse_missing_settings(self):
         base = ["bash", str(HERE / "install.sh"), "--checkout", str(REPO),
                 "--host-id", HOST_ID, "--tenant-sub", SUB, "--uplink", "eth0"]

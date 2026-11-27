@@ -506,6 +506,12 @@ echo "hosted host $host_id endpoint $public_ip:$port ($mode)"
 # configs. The built host supplies the schema and the host's online CPU rule.
 stage_host_config
 preflight
+# Check and start can keep collecting read-only diagnostics after a failure.
+# Install must stop before account creation or writes to installed files.
+if [ "$mode" = install ] && [ "$problems" != 0 ]; then
+  echo "$problems preflight problem(s); not installed" >&2
+  exit 1
+fi
 account
 binaries
 configs

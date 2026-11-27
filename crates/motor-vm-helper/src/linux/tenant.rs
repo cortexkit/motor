@@ -68,6 +68,7 @@ impl LinuxTenants {
         Ok(uid)
     }
     pub fn reconcile(&mut self) -> Result<()> {
+        let registries = self.registries()?;
         // A helper restart is a loss boundary, not adoption of an unverified pid.
         // Kill old VMMs before unmounting any resource, but never remove disk data.
         if self.groups.exists() {
@@ -78,8 +79,8 @@ impl LinuxTenants {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .ok_or_else(|| Error("invalid tenant cgroup name".into()))?;
-                    let registry = self.registry(name)?;
-                    self.mark_unclean(&registry, "helper_restart")?;
+                    let registry = registry_for_tenant_group(name, &registries)?;
+                    self.mark_unclean(registry, "helper_restart")?;
                     std::fs::write(path.join("cgroup.kill"), "1")?;
                     wait_empty(&path)?;
                     std::fs::remove_dir(path)?;
@@ -94,7 +95,6 @@ impl LinuxTenants {
         }
         // A disk may still have its jail uid after a helper crash. All registry
         // ancestors remain root-controlled; restore ownership only after kill.
-        let registries = self.registries()?;
         for r in &registries {
             for ancestor in r.disk.parent().unwrap().ancestors() {
                 fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
@@ -185,11 +185,14 @@ impl LinuxTenants {
                 continue;
             };
             let r = self.registry(name)?;
-            if values
-                .iter()
-                .any(|v: &Registry| v.tap_index == r.tap_index || v.disk == r.disk)
-            {
-                return Err(Error("duplicate tenant tap or disk".into()));
+            if values.iter().any(|v: &Registry| v.tap_index == r.tap_index) {
+                return Err(Error(format!(
+                    "ambiguous tenant cgroup {}: duplicate registry TAP index",
+                    tenant_vmm_id(r.tap_index)
+                )));
+            }
+            if values.iter().any(|v| v.disk == r.disk) {
+                return Err(Error("duplicate tenant disk".into()));
             }
             values.push(r);
         }
@@ -460,7 +463,7 @@ impl Backend for LinuxTenants {
             return Err(Error("tenant disk already attached".into()).into());
         }
         let boundary = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
-        let id = format!("tenant-{}", r.tap_index);
+        let id = tenant_vmm_id(r.tap_index);
         let root = boundary.join(format!("firecracker/{id}/root"));
         let group = self.groups.join(&id);
         let state = if saved { &r.suspend } else { &r.base() };
@@ -1349,6 +1352,54 @@ pub(super) fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(tmp, path)?;
     File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
+}
+
+fn tenant_vmm_id(tap_index: u8) -> String {
+    format!("tenant-{tap_index}")
+}
+
+fn registry_for_tenant_group<'a>(name: &str, registries: &'a [Registry]) -> Result<&'a Registry> {
+    // The jailer's ID comes from the TAP index, not the tenant's registry name.
+    registries
+        .iter()
+        .find(|r| tenant_vmm_id(r.tap_index) == name)
+        .ok_or_else(|| Error(format!("tenant cgroup {name} has no registered TAP owner")))
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    fn record(tenant: &str, tap_index: u8) -> Registry {
+        let home = Path::new(crate::tenant::TENANTS).join(tenant);
+        let r: Registry = serde_json::from_value(json!({
+            "disk": home.join("disk.img"), "generation": home.join("generation"),
+            "suspend": home.join("suspend"), "image_version": "v1", "vcpu_ceiling": 2,
+            "guest_ram_mib": 18432, "disk_quota_bytes": 21474836480_u64, "cpuset": "0-1",
+            "tap_index": tap_index, "idle_suspend_s": 60, "host_floor_bytes": 0,
+            "memory_headroom_mib": 2048,
+        }))
+        .unwrap();
+        r.validate(tenant).unwrap();
+        r
+    }
+
+    #[test]
+    fn restart_resolves_tap_group_to_registry_not_same_named_tenant() {
+        let records = [record("tenant-7", 8), record("customer", 7)];
+        let owner = registry_for_tenant_group("tenant-7", &records).unwrap();
+        assert_eq!(owner.disk, records[1].disk);
+    }
+
+    #[test]
+    fn restart_refuses_unmapped_or_noncanonical_group() {
+        let records = [record("customer", 7)];
+        for group in ["tenant-8", "tenant-07", "customer"] {
+            let error = registry_for_tenant_group(group, &records).unwrap_err();
+            assert!(error.0.contains(group));
+            assert!(error.0.contains("no registered TAP owner"));
+        }
+    }
 }
 
 #[cfg(test)]

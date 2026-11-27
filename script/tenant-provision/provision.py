@@ -1575,6 +1575,57 @@ def build_base(c, image, base, console=None, diagnostics=None):
     sync_dir(base.parent)
 
 
+PROVISION_REQUEST = ".provision-request.json"
+
+
+def check_provision_path(path, kind, mode):
+    info = path.lstat()
+    if not kind(info.st_mode) or stat.S_IMODE(info.st_mode) != mode or info.st_uid != os.geteuid():
+        raise ValueError(f"unsafe interrupted provisioning path: {path}")
+    return info
+
+
+def provision_retry_request(home, request):
+    marker = home / PROVISION_REQUEST
+    if not os.path.lexists(marker):
+        raise ValueError(f"tenant home {home} already exists without a provisioning request; "
+                         "refusing to change or delete its disk")
+    check_provision_path(home, stat.S_ISDIR, 0o700)
+    check_provision_path(marker, stat.S_ISREG, 0o600)
+    saved = json.loads(marker.read_text())
+    if not isinstance(saved, dict):
+        raise ValueError(f"invalid provisioning request in {marker}")
+    differences = sorted(key for key in saved.keys() | request.keys()
+                         if key not in saved or key not in request or saved[key] != request[key])
+    if differences:
+        raise ValueError(f"interrupted provisioning request differs in: {', '.join(differences)}")
+    disk = check_provision_path(home / "disk.img", stat.S_ISREG, 0o600)
+    check_provision_path(home / "generation", stat.S_ISREG, 0o600)
+    check_provision_path(home / "suspend", stat.S_ISDIR, 0o700)
+    if disk.st_size != request["disk_quota_bytes"] or (home / "generation").read_text() != "0\n":
+        raise ValueError(f"interrupted provisioning disk size or generation differs in {home}")
+
+
+def publish_provision(c, home, registry, record, bindings, registry_published):
+    # Ensure the home rename survives a crash before either record is visible,
+    # including a retry after an interruption immediately following rename.
+    sync_dir(home.parent)
+    if registry_published:
+        # The previous process could have stopped just after the registry rename.
+        sync_dir(registry.parent)
+    else:
+        # A previous tenant's deferred egress counters can outlive its TAP.
+        # Reset them before publishing a new owner for this index.
+        reset_egress_counter(c["tap_index"])
+        durable_write(registry, json.dumps(record, indent=2) + "\n", 0o644)
+    # The binding lets the host agent use the tenant. Publish it only after the
+    # helper registry is durable; once bound the tenant must not be provisioned again.
+    bindings[c["vm"]] = {"tenant": c["tenant"], "sub": c["sub"]}
+    durable_write(BINDINGS, json.dumps(bindings, indent=2) + "\n", 0o644)
+    (home / PROVISION_REQUEST).unlink()
+    sync_dir(home)
+
+
 def provision(c, make_base=build_base, execute=run, stage=None, runners=None, remote_cache=None):
     """Create a tenant. `remote_cache` is the cache provisioning files from
     read_remote_cache, required exactly when the record sets remote_cache.
@@ -1594,19 +1645,44 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None, re
     image = ROOT / "tenant-images" / c["image_version"]
     base = base_path(c, image)
     registry = REGISTRY / (c["tenant"] + ".json")
-    if home.exists() or registry.exists():
-        raise ValueError("tenant already exists; refusing to change or delete its disk")
-    if base.exists() and any(not (base / name).is_file() for name in ("base.vmstate", "base.memory")):
-        raise ValueError("incomplete size base; refusing to reuse it")
     bindings = json.loads(BINDINGS.read_text()) if BINDINGS.exists() else {}
-    if c["vm"] in bindings or any(v["tenant"] == c["tenant"] for v in bindings.values()):
+    if any(v["tenant"] == c["tenant"] for v in bindings.values()):
+        raise ValueError("tenant binding already exists; refusing to change or delete its disk")
+    request = dict(c)
+    if remote_cache is not None:
+        # Compare the cache inputs on retry without saving credentials in the provisioning request.
+        request["cache_file_digests"] = {name: hashlib.sha256(data).hexdigest() for name, data in remote_cache.items()}
+    resume = os.path.lexists(home)
+    registry_published = os.path.lexists(registry)
+    # The staging name is longer than a valid tenant name and uses no raw input
+    # in the glob. An interrupted stage cannot be mistaken for a tenant home.
+    stage_prefix = f".provision-{hashlib.sha512(c['tenant'].encode()).hexdigest()}-"
+    if resume:
+        provision_retry_request(home, request)
+    elif registry_published:
+        raise ValueError("tenant registry already exists; refusing to change or delete its disk")
+    else:
+        leftover = next(iter(sorted(home.parent.glob(stage_prefix + "*"))), None)
+        if leftover is not None:
+            raise ValueError(f"interrupted provisioning left staging directory {leftover}; "
+                             "check that nothing uses it before deleting it and retrying")
+    if c["vm"] in bindings:
         raise ValueError("tenant binding already exists")
+    if (resume or base.exists()) and any(not (base / name).is_file() for name in ("base.vmstate", "base.memory")):
+        raise ValueError("incomplete size base; refusing to reuse it")
     for entry in REGISTRY.glob("*.json"):
-        if json.loads(entry.read_text())["tap_index"] == c["tap_index"]:
+        if entry != registry and json.loads(entry.read_text())["tap_index"] == c["tap_index"]:
             raise ValueError("tap index already assigned")
     memory_fit(capacity, replacement=c)
     verify_jobs_slice(capacity)
     check_windows_cpus(c["cpuset"], capacity)
+    record = {k: v for k, v in c.items() if k not in PROVISION_ONLY}
+    record["account"] = c["sub"]
+    record.update(disk=str(home / "disk.img"), generation=str(home / "generation"), suspend=str(home / "suspend"))
+    if registry_published:
+        check_provision_path(registry, stat.S_ISREG, 0o644)
+        if json.loads(registry.read_text()) != record:
+            raise ValueError(f"interrupted provisioning conflicts with registry {registry}")
     manifest = json.loads((image / "manifest.json").read_text())
     if manifest["version"] != c["image_version"]:
         raise ValueError("image version mismatch")
@@ -1621,8 +1697,10 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None, re
     # Byte accounting includes the size base, the filesystem metadata mkfs
     # writes, and the space motor-host needs to stay admitting and to let the
     # disk grow. Neither a disk nor a directory is created if the available byte
-    # count is one byte short.
-    needed = pre_operation_free_bytes(c, capacity, base_present(c, image))
+    # count is one byte short. A retry still needs operating headroom, but the
+    # base and disk initialization have already consumed their space.
+    needed = (operating_requirement(c, capacity) if resume
+              else pre_operation_free_bytes(c, capacity, base_present(c, image)))
     free = shutil.disk_usage(ROOT).free
     if free < needed:
         raise ValueError(f"provisioning needs {needed} free bytes on {ROOT}; {free} are available")
@@ -1639,11 +1717,15 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None, re
             f"tenant would leave {(free - consumed) * 10 // 1024**3 / 10:.1f} GiB free on {ROOT} ({free} free, tenant needs {consumed} bytes), "
             f"below motor-runner pid {pid}'s refusal floor {reserve / 1024**3:.1f} GiB; "
             "lower disk_quota_bytes or free space first")
+    if resume:
+        publish_provision(c, home, registry, record, bindings, registry_published)
+        return
     if not base.exists():
         make_base(c, image, base)
-    home.mkdir(mode=0o700)
-    (home / "suspend").mkdir(mode=0o700)
-    disk = home / "disk.img"
+    staged = Path(tempfile.mkdtemp(prefix=stage_prefix, dir=home.parent))
+    sync_dir(staged.parent)
+    (staged / "suspend").mkdir(mode=0o700)
+    disk = staged / "disk.img"
     if sparse_v1(manifest):
         # The guest sees the full quota, but only the blocks it writes occupy
         # the host. Its trim support returns freed blocks to the host filesystem.
@@ -1668,20 +1750,13 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None, re
     with disk.open("rb") as file:
         os.fsync(file.fileno())
     if remote_cache is not None:
-        atomic(home / REMOTE_CACHE_MANIFEST, remote_cache_manifest(remote_cache))
-    atomic(home / "generation", "0\n")
-    record = {k: v for k, v in c.items() if k not in PROVISION_ONLY}
-    record["account"] = c["sub"]
-    record.update(disk=str(disk), generation=str(home / "generation"), suspend=str(home / "suspend"))
-    # Only an unallocated, stopped index reaches publication. Reset legacy
-    # deferred counters before a replacement registry can expose old usage.
-    reset_egress_counter(c["tap_index"])
-    atomic(registry, json.dumps(record, indent=2) + "\n")
-    registry.chmod(0o644)
-    bindings[c["vm"]] = {"tenant": c["tenant"], "sub": c["sub"]}
-    atomic(BINDINGS, json.dumps(bindings, indent=2) + "\n")
-    # The host agent can read the binding map, but only root may replace it.
-    BINDINGS.chmod(0o644)
+        atomic(staged / REMOTE_CACHE_MANIFEST, remote_cache_manifest(remote_cache))
+    atomic(staged / "generation", "0\n")
+    atomic(staged / PROVISION_REQUEST, json.dumps(request, indent=2) + "\n")
+    # Installing the prepared home is the commit point. Interruption before
+    # this rename leaves an untrusted staging disk, never a resumable tenant.
+    os.rename(staged, home)
+    publish_provision(c, home, registry, record, bindings, registry_published=False)
 
 
 # ---------------------------------------------------------------------------

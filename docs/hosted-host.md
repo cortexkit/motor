@@ -938,8 +938,9 @@ extra rule.
    jailer 1.17.0 in `/usr/local/lib/firecracker/1.17.0/`, the qualified tenant
    image in `/var/lib/motor-vm/tenant-images/tenant-20261020-main-806a6d3-20261020T021255Z/`,
    (or the image built above, selected by a first-install template),
-   and the `x86_64-unknown-linux-musl` Rust target. The installer verifies all of
-   them and stops at the end with a count of problems if one is missing.
+   and the `x86_64-unknown-linux-musl` Rust target. If preflight reports problems,
+   the installer stops before changing installed files or creating the service
+   account.
 3. Build and install. The build runs as the checkout's owner, with
    `/srv/build/runner.env`, into `/srv/build/target`:
 
@@ -995,6 +996,13 @@ extra rule.
    sudo python3 /srv/build/src/motor/script/tenant-provision/provision.py apply-jobs-slice
    sudo python3 /srv/build/src/motor/script/tenant-provision/provision.py --config /etc/motor-host/provision/tenant-1.json
    ```
+
+   If first provisioning is interrupted after the initialized tenant home is
+   installed, rerun the same command to finish publishing the tenant. If an
+   interruption leaves a staging directory instead, provisioning names the
+   directory and refuses to proceed. Check that nothing uses it before deleting
+   it and retrying. Provisioning never deletes an interrupted disk and refuses
+   an existing active tenant or a different request for an unpublished tenant.
 
    To change an existing tenant to a new image without recreating its disk, run
    the following command from the checkout at `/srv/build/src/motor`:
