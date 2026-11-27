@@ -245,6 +245,19 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(state[stable], manifest['rust_toolchains'][stable])
         self.assertEqual(state[numbered], manifest['rust_toolchains'][numbered])
 
+    def test_tenant_freezes_stable_inside_the_install_rustup_home(self):
+        # tools() installs every role under the base RUSTUP_HOME; the tenant
+        # layout's rustup_home is where its guest keeps Rust afterwards, so the
+        # frozen stable copy must not read from it.
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with patch.object(install, 'run', return_value='') as run:
+            install.install_rust(manifest, '/rustup-init', role='tenant')
+        copies = [call.args for call in run.call_args_list if call.args[0] == 'cp']
+        self.assertEqual(len(copies), 1)
+        root = Path(manifest['rustup_home']) / 'toolchains'
+        self.assertEqual(Path(copies[0][-2]).parent, root)
+        self.assertEqual(Path(copies[0][-1]).parent, root)
+
     def test_recipe_bootstraps_empty_rustup_and_removes_unlisted_toolchains(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
         stable = 'stable-x86_64-unknown-linux-gnu'

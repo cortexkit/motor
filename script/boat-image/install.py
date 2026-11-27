@@ -504,7 +504,10 @@ def install_pnpm(manifest):
 
 
 def install_rust(manifest, installer, role="boat"):
-    manifest = parity.role_manifest(manifest, role)
+    # Only the set of toolchains depends on the role. The paths must stay the
+    # base manifest's, which match the RUSTUP_HOME that tools() exports for the
+    # install; the tenant role's layout names where its guest later keeps them.
+    manifest = {**manifest, "rust_toolchains": parity.role_manifest(manifest, role)["rust_toolchains"]}
     run(str(installer), "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none")
     # rustup replaces itself with the newest release during `toolchain install`
     # unless told not to, which would drift from the pinned build-server version.
