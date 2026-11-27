@@ -1405,7 +1405,19 @@ async fn project_free_binds_keep_principal_admission() {
 async fn hosted_check_is_direct_only_and_mints_through_real_module_with_hosted_off() {
     use crate::hosted::account::tests::{refusal, token, FakeVault};
     let f = Fixture::new(Cut::None, 28).await;
-    let config = direct_config(&f);
+    // The check probes the broker that jobs would use; without a URL that is
+    // the production broker. Point it at a local stand-in so the test never
+    // leaves the machine and the probe cannot spend a vault token.
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        assert_eq!(path, "/v1/leases");
+        (400, json!({}))
+    })
+    .await;
+    let config = Config {
+        broker_url: Some(broker.url.clone()),
+        broker_token_source: crate::BrokerTokenSource::Fake,
+        ..direct_config(&f)
+    };
     assert!(serde_json::to_value(&config)
         .unwrap()
         .get("hosted_runners")
@@ -1471,6 +1483,8 @@ async fn hosted_check_is_direct_only_and_mints_through_real_module_with_hosted_o
         }
     }
     assert_eq!(vault.requests.lock().unwrap().len(), 6);
+    // The check that minted a token probed the local stand-in, not production.
+    assert!(!broker.requests.lock().unwrap().is_empty());
     assert!(logs.text().contains("hosted operator capture active"));
 }
 
