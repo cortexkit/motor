@@ -420,6 +420,7 @@ def verify(pins):
         raise ValueError(f"expected {expected_sccache}, found {inventory['sccache']}")
     inventory["sccache_sha256"] = hashlib.sha256((PREFIX / "cargo/bin/sccache").read_bytes()).hexdigest()
     inventory["python"] = run("python3", "--version", capture=True)
+    run("python3", "-c", "from PIL import Image, ImageChops", capture=True)
     inventory["nextest"] = run("cargo", "nextest", "--version", capture=True)
     run("systemd-analyze", "verify", "/etc/systemd/system/motor-tenant-agent.service",
         "/etc/systemd/system/motor-net-rules.service", "/etc/systemd/system/motor-image-check.service",

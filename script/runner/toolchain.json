@@ -100,6 +100,7 @@
       "python3": "3.14.3-0ubuntu2",
       "python3-gdbm": "3.14.3-0ubuntu2",
       "python3-packaging": "26.0-1",
+      "python3-pil": "12.1.1-2ubuntu1.6",
       "python3-setuptools": "78.1.1-0.1build1",
       "python3-yaml": "6.0.3-1build1",
       "ripgrep": "15.1.0-1ubuntu1",
@@ -210,6 +211,7 @@
       "libxml2-dev",
       "python3-gdbm",
       "python3-packaging",
+      "python3-pil",
       "python3-setuptools",
       "python3-yaml"
     ]

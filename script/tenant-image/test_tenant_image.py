@@ -93,11 +93,16 @@ class ImageTests(unittest.TestCase):
         self.assertIn('cmake', install[4:])
         self.assertIn('gdb', install[4:])
         self.assertIn('elfutils', install[4:])
+        self.assertIn('python3-pil', install[4:])
         self.assertIn('python3-venv', install[4:])
         self.assertIn('Acquire::Retries "3";', written['/etc/apt/apt.conf.d/99snapshot'])
         self.assertIn('APT::Update::Error-Mode "any";', written['/etc/apt/apt.conf.d/99snapshot'])
         self.assertIn('Acquire::AllowInsecureRepositories "false";', written['/etc/apt/apt.conf.d/99snapshot'])
         self.assertIn('APT::Get::AllowUnauthenticated "false";', written['/etc/apt/apt.conf.d/99snapshot'])
+
+    def test_guest_verify_imports_pil_with_the_image_python(self):
+        source = (HERE / 'install-guest.py').read_text()
+        self.assertIn('run("python3", "-c", "from PIL import Image, ImageChops"', source)
 
     def test_mirror_override_is_used_for_installs_but_never_shipped(self):
         pins = {'debian_snapshot': '20261016T000000Z', 'debian_suite': 'trixie'}
