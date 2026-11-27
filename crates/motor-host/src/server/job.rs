@@ -1615,6 +1615,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     client: &mut S,
 ) -> Result<ConnectionEnd> {
     let acknowledged = write_frame(client, &json!({"type":"lease_ok"})).await;
+    if claims.purpose == Purpose::Attach {
+        // The claim already matched this job and its workspace. Attach can
+        // wait for replay even while boot or settlement is still in flight.
+        acknowledged?;
+        return live(&runtime, claims, client).await;
+    }
     let execution = runtime
         .host
         .lock()
@@ -1629,32 +1635,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
             runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].delivered;
         let cancelled = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].state
             == LeaseState::Ended;
-        if cancelled && claims.purpose == Purpose::Attach {
-            let terminal_stored = runtime
-                .host
-                .lock()
-                .expect("host lock")
-                .snapshot
-                .per_job
-                .executions[&claims.jti]
-                .replay_completion
-                == Some(crate::state::jobs::storage::ReplayCompletion::Terminal);
-            // A stored terminal ends the lease before VM teardown finishes.
-            // Attach still needs replay even while the execution remains live.
-            if terminal_stored {
-                return live(&runtime, claims, client).await;
-            }
-        }
         if cancelled || !execution.runner_hello || !delivered {
             write_frame(client, &json!({"type":"lease_refused","reason":"auth"})).await?;
             return Ok(ConnectionEnd::SentFinalFrames);
         }
         // A reconnect owns no launch authority. Use the existing VM by job id;
         // failure to attach must not stop a job another caller may be observing.
-        return live(&runtime, claims, client).await;
-    }
-    if claims.purpose == Purpose::Attach {
-        acknowledged?;
         return live(&runtime, claims, client).await;
     }
     let result = match acknowledged {
@@ -2044,11 +2030,16 @@ async fn cancel<S: AsyncWrite + Unpin>(
             motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX
         ));
     }
-    runtime.host.lock().expect("host lock").job_refused(
-        &claims.jti,
-        terminal.clone(),
-        unix_ms(),
-    )?;
+    {
+        let mut host = runtime.host.lock().expect("host lock");
+        let lease = &host.snapshot.leases[&claims.jti];
+        // An Attach can race the original connection's Run relay. Only the
+        // lock that authorizes delivery can fence it off for a no-start reply.
+        if lease.delivered || lease.state == LeaseState::Ended {
+            return Ok(false);
+        }
+        host.job_refused(&claims.jti, terminal.clone(), unix_ms())?;
+    }
     let r = runtime.clone();
     let job = claims.jti.clone();
     tokio::task::spawn_blocking(move || r.stop_job(&job, true, false)).await??;
