@@ -827,9 +827,10 @@ impl Backend for LinuxTenants {
         connect_relay(&vm.root, vm.uid, port)
     }
     fn vm_present(&mut self, tenant: &str) -> Result<bool> {
-        crate::tenant::validate_name(tenant)?;
+        // An unreadable registry cannot prove the tenant has no cgroup.
+        let registry = self.registry(tenant)?;
         let jail = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
-        Ok(self.groups.join(tenant).exists() || jail.exists())
+        Ok(tenant_vm_present(&self.groups, &jail, &registry))
     }
     fn remove(&mut self, tenant: &str, registry: &Registry) -> Result<PathBuf> {
         let paths = crate::removal::Paths::live();
@@ -1358,6 +1359,10 @@ fn tenant_vmm_id(tap_index: u8) -> String {
     format!("tenant-{tap_index}")
 }
 
+fn tenant_vm_present(groups: &Path, jail: &Path, registry: &Registry) -> bool {
+    groups.join(tenant_vmm_id(registry.tap_index)).exists() || jail.exists()
+}
+
 fn registry_for_tenant_group<'a>(name: &str, registries: &'a [Registry]) -> Result<&'a Registry> {
     // The jailer's ID comes from the TAP index, not the tenant's registry name.
     registries
@@ -1399,6 +1404,23 @@ mod reconcile_tests {
             assert!(error.0.contains(group));
             assert!(error.0.contains("no registered TAP owner"));
         }
+    }
+
+    #[test]
+    fn vm_presence_uses_the_registered_tap_not_a_colliding_tenant_name() {
+        let scratch = cortexkit_test_support::ScratchDir::new("tenant-vm-presence");
+        let groups = scratch.join("groups");
+        let jail = scratch.join("jail/tenants");
+        std::fs::create_dir_all(groups.join("tenant-7")).unwrap();
+
+        let decoy = record("tenant-7", 8);
+        let owner = record("customer", 7);
+        assert!(!tenant_vm_present(&groups, &jail.join("tenant-7"), &decoy));
+        assert!(tenant_vm_present(&groups, &jail.join("customer"), &owner));
+
+        // A jail without a cgroup still blocks removal of its own tenant.
+        std::fs::create_dir_all(jail.join("tenant-7")).unwrap();
+        assert!(tenant_vm_present(&groups, &jail.join("tenant-7"), &decoy));
     }
 }
 
