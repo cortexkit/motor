@@ -329,9 +329,9 @@ jobs open a session on that connection instead of a new TCP and SSH handshake,
 which a saturated uplink can stretch past the timeout. Its control socket sits
 in the agent's runtime directory. A master that died, or one opened for other
 endpoint settings, is killed and its socket removed before a new one starts; a
-left-over socket is never reused. The master sends keepalives after 15 seconds
-without server data and exits after four unanswered ones, so a dead connection
-is replaced. Windows endpoints keep one connection per job. Tests:
+left-over socket is never reused. The shared macOS SSH connection sends
+keepalives, and ck-motor replaces a dead connection before opening the next
+session. Windows endpoints keep one connection per job. Tests:
 `macos_jobs_share_one_endpoint_master_and_replace_a_dead_one`,
 `macos_endpoint_uses_its_own_pin_vault_identity_and_ten_second_timeout`.
 
