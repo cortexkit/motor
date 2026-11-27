@@ -100,7 +100,7 @@ fn sha256sums_covers_every_corpus_file() {
         );
     }
     let mut actual = BTreeSet::from(["README.md".to_owned()]);
-    for folder in ["frames", "outcomes", "replies", "guest-agent"] {
+    for folder in ["frames", "outcomes", "replies"] {
         for entry in fs::read_dir(root().join(folder)).unwrap() {
             actual.insert(format!(
                 "{folder}/{}",
@@ -109,9 +109,9 @@ fn sha256sums_covers_every_corpus_file() {
         }
     }
     assert_eq!(listed, actual, "missing or unchecked corpus checksums");
-    // Each of 142 cases has .json, .jcs and .sha256 files. Eleven published
+    // Each of 140 cases has .json, .jcs and .sha256 files. Eleven published
     // cases have only .jcs/.sha256 pairs; README.md adds one file.
-    assert_eq!(listed.len(), 449);
+    assert_eq!(listed.len(), 443);
 }
 
 #[test]

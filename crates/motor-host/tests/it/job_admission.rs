@@ -2,8 +2,6 @@ use super::*;
 use motor_host::state::jobs::{guest_ram_mib, memory_limit_mib, HostResources};
 use motor_host::state::{Admission, Error, LeaseState, Refusal};
 use motor_host::store::SqliteJournal;
-mod fill_sources;
-mod fills;
 mod heartbeats;
 mod residency;
 mod storage;

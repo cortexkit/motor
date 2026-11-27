@@ -25,19 +25,6 @@ impl Host {
             .values()
             .filter(|job| job.boot_started && job.runner_hello && !job.ended)
             .map(|job| (job.claims.jti.as_str(), job.claims.mem_mib))
-            .chain(
-                self.snapshot
-                    .per_job
-                    .fills
-                    .values()
-                    .filter(|fill| fill.runner_hello)
-                    .map(|fill| {
-                        (
-                            fill.fill.fill_id.as_str(),
-                            fill_stated_mib(fill.guest_ram_mib),
-                        )
-                    }),
-            )
     }
 
     pub(crate) fn resident_samples_due(&mut self, now_ms: u64) -> Vec<String> {
@@ -119,11 +106,6 @@ fn unused_hold_mib(percent: u8, stated_mib: u64, overhead_mib: u64, resident_mib
     hold.min(u128::from(u64::MAX)) as u64
 }
 
-fn fill_stated_mib(guest_ram_mib: u64) -> u64 {
-    // floor(3 * guest / 4) exactly inverts the fill's ceil(4 * stated / 3) sizing.
-    (u128::from(guest_ram_mib) * 3 / 4) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,14 +125,5 @@ mod tests {
             4_611_686_018_427_387_904
         );
         assert_eq!(unused_hold_mib(25, 0, 1, 0), 1);
-    }
-
-    #[test]
-    fn fill_sizing_recovers_stated_memory_without_a_stored_field() {
-        for stated in [0u64, 1, 2, 3, 4, 24_576, 24_577, 32_768] {
-            let guest = (stated * 4).div_ceil(3);
-            assert_eq!(fill_stated_mib(guest), stated);
-        }
-        assert_eq!(fill_stated_mib(u64::MAX), 13_835_058_055_282_163_711);
     }
 }

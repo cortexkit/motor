@@ -750,7 +750,7 @@ async fn failed_cache_publication_reason_reaches_fill_settlement() {
     h.store.status(Some(500));
     assert_eq!(h.put(&binding, "/compiled", b"compiled").await.status, 503);
     settle(&f, &runner, &job).await;
-    let error = runner.fill_settled(job.id, &f.root).unwrap_err();
+    let error = repository(&f, &runner).failure_detail.unwrap();
     assert!(
         error
             .to_string()
@@ -1471,88 +1471,62 @@ mod per_job_security {
 
     #[tokio::test]
     async fn write_granted_job_vm_never_queues_refresh_or_fixed_path_fills() {
-        for fill_vm in [false, true] {
-            let f = Fixture::new();
-            let mut config = fill_config(&f);
-            config.manual_tick = true;
-            config.tenant_vm = true;
-            config.per_job = !fill_vm;
-            config.fill_vm = fill_vm;
-            // The existing provisioning seam holds a key without requiring a
-            // systemd host account. It does not override the Job/Fill role check.
-            config.tenant_write_key = Some(true);
-            config.disable_warm_builds = fill_vm;
-            let runner = Runner::open(config).unwrap();
-            struct ClearWriter<'a>(&'a Runner);
-            impl Drop for ClearWriter<'_> {
-                fn drop(&mut self) {
-                    self.0.core.inner.lock().unwrap().writer = None;
-                }
-            }
-            let _clear_writer = ClearWriter(&runner);
-            set_publishing(&runner, State::publishing_in(store("fleet")));
-            submit_reader(&f, &runner).await;
-            let at = runner.now() - 100 * DAY;
-            record_fill(&f, &runner, "expired-publication", store("fleet"), at);
-            runner
-                .core
-                .inner
-                .lock()
-                .unwrap()
-                .catalog
-                .repositories
-                .get_mut(&f.root)
-                .unwrap()
-                .desired
-                .as_mut()
-                .unwrap()
-                .tip = git(&f.main, &["rev-parse", "HEAD"]);
-            f.clock.fetch_add(policy::REFRESH_TICK_MS, Ordering::SeqCst);
-            {
-                let mut inner = runner.core.inner.lock().unwrap();
-                // Hold the writer slot so the test observes queued work without
-                // executing a unit; production account checks are never bypassed.
-                inner.writer = Some(Uuid::nil());
-                assert_eq!(
-                    runner
-                        .refresh_bases(&inner, &runner.publishing_policy(), runner.now())
-                        .len(),
-                    1,
-                    "fixture must offer a real expired refresh"
-                );
-                if !fill_vm {
-                    let mut candidate_config = runner.config().clone();
-                    candidate_config.fixed_path_repositories = vec![f.root.clone()];
-                    assert!(runner
-                        .build_base_candidates(&inner, &candidate_config)
-                        .is_empty());
-                }
-            }
-            assert!(runner.config().tenant_write_key_held());
-            assert!(runner.publishing_policy().publishing());
-            runner.tick().unwrap();
-            runner.tick().unwrap();
-            assert_eq!(
-                count_fills(&runner),
-                usize::from(fill_vm),
-                "only Fill boot may queue maintenance with its write key; repository={} writer={}",
-                serde_json::to_string(&repository(&f, &runner)).unwrap(),
-                runner.config().writer_enabled()
-            );
-            assert_eq!(runner.config().writer_enabled(), fill_vm);
-            let fills = runner
-                .core
-                .inner
-                .lock()
-                .unwrap()
-                .jobs
-                .values()
-                .filter(|job| job.base)
-                .map(|job| job.id)
-                .collect::<Vec<_>>();
-            for fill in fills {
-                runner.cancel(fill).unwrap();
+        let f = Fixture::new();
+        let mut config = fill_config(&f);
+        config.manual_tick = true;
+        config.tenant_vm = true;
+        config.per_job = true;
+        // Hold a key without requiring a systemd host account. The gateway
+        // and scheduler still enforce the job VM's role.
+        config.tenant_write_key = Some(true);
+        let runner = Runner::open(config).unwrap();
+        struct ClearWriter<'a>(&'a Runner);
+        impl Drop for ClearWriter<'_> {
+            fn drop(&mut self) {
+                self.0.core.inner.lock().unwrap().writer = None;
             }
         }
+        let _clear_writer = ClearWriter(&runner);
+        set_publishing(&runner, State::publishing_in(store("fleet")));
+        submit_reader(&f, &runner).await;
+        let at = runner.now() - 100 * DAY;
+        record_fill(&f, &runner, "expired-publication", store("fleet"), at);
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .catalog
+            .repositories
+            .get_mut(&f.root)
+            .unwrap()
+            .desired
+            .as_mut()
+            .unwrap()
+            .tip = git(&f.main, &["rev-parse", "HEAD"]);
+        f.clock.fetch_add(policy::REFRESH_TICK_MS, Ordering::SeqCst);
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            // Hold the writer slot so the test observes queued work without
+            // executing a unit; production account checks are never bypassed.
+            inner.writer = Some(Uuid::nil());
+            assert_eq!(
+                runner
+                    .refresh_bases(&inner, &runner.publishing_policy(), runner.now())
+                    .len(),
+                1,
+                "fixture must offer a real expired refresh"
+            );
+            let mut candidate_config = runner.config().clone();
+            candidate_config.fixed_path_repositories = vec![f.root.clone()];
+            assert!(runner
+                .build_base_candidates(&inner, &candidate_config)
+                .is_empty());
+        }
+        assert!(runner.config().tenant_write_key_held());
+        assert!(runner.publishing_policy().publishing());
+        runner.tick().unwrap();
+        assert_eq!(count_fills(&runner), 0);
+        assert!(!runner.config().writer_enabled());
     }
 }

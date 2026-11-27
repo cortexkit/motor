@@ -323,10 +323,6 @@ fn tick_steps(runtime: &Arc<Runtime>) {
         "exits",
         measure(|| runtime.collect_job_exits_at(now, false).unwrap()).1,
     );
-    report(
-        "fill_sources",
-        measure(|| runtime.host.lock().unwrap().clean_fill_sources().unwrap()).1,
-    );
     let ended: Vec<String> = runtime
         .host
         .lock()
@@ -358,23 +354,6 @@ fn tick_steps(runtime: &Arc<Runtime>) {
     report(
         "recoveries",
         measure(|| runtime.tick_recoveries(now).unwrap()).1,
-    );
-    report(
-        "fills",
-        measure(|| {
-            runtime
-                .job_fills
-                .lock()
-                .unwrap()
-                .tick(
-                    runtime.host.clone(),
-                    runtime.control.clone(),
-                    runtime.job_resources.clone(),
-                    now,
-                )
-                .unwrap()
-        })
-        .1,
     );
     report("balloon", measure(|| runtime.tick_balloon(now)).1);
 }

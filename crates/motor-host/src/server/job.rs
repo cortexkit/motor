@@ -502,11 +502,6 @@ impl Runtime {
                     })
                 });
         }
-        tick_step(
-            &mut failure,
-            "fill_sources",
-            self.host.lock().expect("host lock").clean_fill_sources(),
-        );
         let due: Vec<_> = {
             let host = self.host.lock().expect("host lock");
             host.snapshot
@@ -793,13 +788,6 @@ impl Runtime {
         let result = self.host.lock().expect("host lock").retention_tick(now_ms);
         tick_step(&mut failure, "retention", result);
         tick_step(&mut failure, "recoveries", self.tick_recoveries(now_ms));
-        let result = self.job_fills.lock().expect("fill scheduler").tick(
-            self.host.clone(),
-            self.control.clone(),
-            self.job_resources.clone(),
-            now_ms,
-        );
-        tick_step(&mut failure, "fills", result);
         self.tick_balloon(now_ms);
         if let Some(error) = failure {
             return Err(error);
@@ -1375,7 +1363,7 @@ pub(crate) fn job_vm_memory(slice: &std::path::Path) -> Result<crate::helper::Jo
     })
 }
 
-fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
+fn fork_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
     let job = &execution.claims.jti;
     if !runtime
         .host
@@ -1383,7 +1371,6 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
         .expect("host lock")
         .job_workspace_is_new(job)
     {
-        tracing::info!(jti = %job, reason = "disk_exists", "workspace_seed_not_needed; checkout disk already exists and keeps its own warm build");
         return;
     }
     let fork_plan = runtime
@@ -1408,15 +1395,14 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                         .donor_ids
                         .iter()
                         .position(|id| id == &reply.donor_id);
+                    // The durable forked flag tells the runner to remove the
+                    // donor's job history even if saving donor possession fails.
                     tracing::info!(jti = %job, donor_id = reply.donor_id,
                         candidate_count = plan.request.donor_ids.len(), ?selected_position,
                         size_rule = "size rule applied by the helper",
                         clone_elapsed_ms = elapsed_ms, committed = committed.is_ok(),
                         forked = true,
                         error = ?committed.err(), "workspace_forked");
-                    // The durable forked flag still requires guest history cleanup
-                    // if saving the donor's have records or forked_from id fails.
-                    return;
                 }
                 Err(error) => {
                     runtime
@@ -1427,45 +1413,13 @@ fn seed_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                     tracing::info!(jti = %job, donor_ids = ?plan.request.donor_ids,
                         candidate_count = plan.request.donor_ids.len(),
                         size_rule = "size rule applied by the helper", clone_elapsed_ms = elapsed_ms,
-                        committed = false, forked = true, %error, "workspace_fork_failed; falling back to base or empty");
+                         committed = false, %error, "workspace_fork_failed; using empty workspace");
                 }
             }
         }
         Ok(None) => {}
         Err(error) => {
-            tracing::info!(jti = %job, %error, "workspace_fork_plan_failed; falling back to base or empty");
-        }
-    }
-    let started = std::time::Instant::now();
-    let seeded = (|| -> Result<Option<String>> {
-        let plan = runtime
-            .host
-            .lock()
-            .expect("host lock")
-            .job_seed_plan(job, &crate::jobs::fill_source::repository_key(root))?;
-        let Some(plan) = plan else {
-            return Ok(None);
-        };
-        runtime.control.seed_workspace(&plan.request)?;
-        runtime
-            .host
-            .lock()
-            .expect("host lock")
-            .job_seeded(job, &plan, unix_ms())?;
-        Ok(Some(plan.request.base_id.clone()))
-    })();
-    match seeded {
-        // The one host-side record that a new checkout started from a
-        // trusted base rather than empty.
-        Ok(Some(base_id)) => tracing::info!(
-            jti = %job,
-            base_id,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "workspace_seeded_from_base"
-        ),
-        Ok(None) => tracing::info!(jti = %job, "workspace_base_missing; using empty workspace"),
-        Err(error) => {
-            tracing::warn!(jti = %job, %error, "workspace_base_seed_failed; ensuring workspace without seed")
+            tracing::info!(jti = %job, %error, "workspace_fork_plan_failed; using empty workspace");
         }
     }
 }
@@ -1489,7 +1443,7 @@ async fn boot(
                 .context("workspace cap missing")?
                 .cap_bytes;
             if let Some(root) = repository_root {
-                seed_workspace(&r, &e, &root);
+                fork_workspace(&r, &e, &root);
             }
             let selector = (e.claims.cache_write == Some(true) && !r.remote_cache_write_blocked())
                 .then_some(e.claims.jti.as_str());
@@ -1880,7 +1834,6 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 client,
                 ready.take().unwrap(),
                 Replay {
-                    default_branch_tip: hello.value["default_branch_tip"] == true,
                     spool,
                     reader,
                     have_replies,
@@ -2022,7 +1975,6 @@ fn try_host(runtime: &Runtime) -> Option<HostGuard<'_>> {
 }
 
 struct Replay {
-    default_branch_tip: bool,
     spool: Spool,
     reader: Reader,
     have_replies: usize,

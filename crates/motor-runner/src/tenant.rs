@@ -291,16 +291,6 @@ pub async fn serve_tenant(runner: crate::Runner) -> io::Result<()> {
         Ok::<(), io::Error>(())
     };
     let job_runner = runner.clone();
-    let control_runner = runner.clone();
-    let control = async move {
-        if control_runner.config().per_job
-            || crate::fill_source::fill_boot(&std::fs::read_to_string("/proc/cmdline")?)
-        {
-            crate::fill_source::serve_control(control_runner).await
-        } else {
-            std::future::pending::<io::Result<()>>().await
-        }
-    };
     let job_connections = async move {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -324,7 +314,7 @@ pub async fn serve_tenant(runner: crate::Runner) -> io::Result<()> {
             });
         }
     };
-    tokio::select! { result = lifecycle => result, result = job_connections => result, result = control => result }
+    tokio::select! { result = lifecycle => result, result = job_connections => result }
 }
 
 #[cfg(any(target_os = "linux", test))]

@@ -273,12 +273,16 @@ pub(super) fn stage(
     jail: &File,
     uid: u32,
 ) -> Result<Option<String>> {
-    let role = if kind == VmKind::Fill {
-        crate::job::WorkspaceRole::Fill
-    } else {
-        crate::job::WorkspaceRole::Job
-    };
-    stage_with_write(store, account, kind, role, jail, uid, false).map(|(nonce, _)| nonce)
+    stage_with_write(
+        store,
+        account,
+        kind,
+        crate::job::WorkspaceRole::Job,
+        jail,
+        uid,
+        false,
+    )
+    .map(|(nonce, _)| nonce)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -329,8 +333,7 @@ fn credentials_for_boot(
     job_write: bool,
 ) -> (RemoteCacheRequest, bool) {
     let granted_job = kind == VmKind::Job && role == crate::job::WorkspaceRole::Job && job_write;
-    let fill = kind == VmKind::Fill && role == crate::job::WorkspaceRole::Fill;
-    if !granted_job && !fill {
+    if !granted_job {
         set.write_key = None;
     }
     let job_write = granted_job && set.write_key.is_some();

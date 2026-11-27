@@ -17,7 +17,7 @@ fn donor(host: &mut Host, id: &str, used: u64) {
     disk.queue.clear();
     disk.attached_job = None;
     disk.workspace_key_hash = motor_lease::base64url(&[6; 32]);
-    disk.repository_key = Some(crate::jobs::fill_source::repository_key(ROOT));
+    disk.repository_key = Some(crate::state::jobs::forks::repository_key(ROOT));
     disk.storage.as_mut().unwrap().last_used_ms = used;
     disk.have = vec![motor_protocol::MirrorRef {
         repository: Some(ROOT.into()),
@@ -199,6 +199,7 @@ async fn disabled_checkout_forks_take_no_hold_send_no_request_and_attach_unmarke
     let (mut client, task) = start(runtime.clone(), c, id).await;
     run_at_root(&mut client, ROOT).await;
     assert!(fake.forks.lock().unwrap().is_empty());
+    assert_eq!(fake.workspace_contents.lock().unwrap()[&disk_id], None);
     assert!(fake.guest_identity.lock().unwrap()[0]
         .get("forked")
         .is_none());
@@ -404,7 +405,7 @@ fn fork_log_records_selected_position_clone_time_and_commit_outcome() {
         host.snapshot.per_job.executions[JOB].clone()
     };
     *fake.fork_reply.lock().unwrap() = Some("second".into());
-    let logs = crate::test_logs::capture(|| seed_workspace(&runtime, &execution, ROOT));
+    let logs = crate::test_logs::capture(|| fork_workspace(&runtime, &execution, ROOT));
     assert!(
         logs.iter().any(|line| line.contains("workspace_forked")
             && line.contains("second")
@@ -440,31 +441,19 @@ impl crate::journal::Journal for FailOneSave {
 }
 
 #[test]
-fn failed_preclone_mark_save_does_not_fork_and_still_seeds_from_base() {
-    let (runtime, fake, _storage, c, _) = setup();
-    let (execution, base_have) = {
+fn failed_preclone_mark_save_does_not_fork_and_leaves_the_disk_empty() {
+    let (runtime, fake, _storage, _, _) = setup();
+    let execution = {
         let mut host = runtime.host.lock().unwrap();
         donor(&mut host, "donor", 1);
-        let have = host.snapshot.per_job.disks["donor"].have.clone();
-        host.snapshot.per_job.bases.insert(
-            "base".into(),
-            crate::state::jobs::storage::Base {
-                sub: c.sub,
-                repository_key: Some(crate::jobs::fill_source::repository_key(ROOT)),
-                have: have.clone(),
-                last_used_ms: 1,
-                evicting: false,
-            },
-        );
         host.replace_journal(Box::new(FailOneSave(AtomicBool::new(true))));
-        (host.snapshot.per_job.executions[JOB].clone(), have)
+        host.snapshot.per_job.executions[JOB].clone()
     };
-    seed_workspace(&runtime, &execution, ROOT);
+    fork_workspace(&runtime, &execution, ROOT);
     assert!(fake.forks.lock().unwrap().is_empty());
-    assert_eq!(fake.seeds.lock().unwrap().len(), 1);
     let host = runtime.host.lock().unwrap();
     let disk = &host.snapshot.per_job.disks[&execution.disk_id];
-    assert_eq!(disk.have, base_have);
+    assert!(disk.have.is_empty());
     assert!(!disk.forked);
     assert!(disk.forked_from.is_none());
 }
@@ -588,7 +577,6 @@ async fn helper_forks_unlocked_and_attach_carries_marker_until_booted_job_ends()
             cache_write_job_id: Some(JOB.into()),
         }]
     );
-    assert!(fake.seeds.lock().unwrap().is_empty());
     assert_eq!(fake.guest_identity.lock().unwrap()[0]["forked"], true);
     {
         let host = runtime.host.lock().unwrap();
@@ -609,53 +597,22 @@ async fn helper_forks_unlocked_and_attach_carries_marker_until_booted_job_ends()
     assert!(!runtime.host.lock().unwrap().snapshot.per_job.disks[&disk_id].forked);
 }
 
-async fn assert_fork_fallback(error: &str, use_base: bool, fail_seed: bool) {
+async fn assert_empty_fork_fallback(error: &str) {
     let (runtime, fake, _storage, c, id) = setup();
-    let base_have = vec![motor_protocol::MirrorRef {
-        repository: Some(ROOT.into()),
-        dependency: None,
-        reference: "refs/heads/base".into(),
-        commit: "base-commit".into(),
-    }];
     let disk_id = {
         let mut host = runtime.host.lock().unwrap();
         donor(&mut host, "donor", 1);
-        if use_base {
-            host.snapshot.per_job.bases.insert(
-                "base".into(),
-                crate::state::jobs::storage::Base {
-                    sub: c.sub.clone(),
-                    repository_key: Some(crate::jobs::fill_source::repository_key(ROOT)),
-                    have: base_have.clone(),
-                    last_used_ms: 1,
-                    evicting: false,
-                },
-            );
-        }
         host.snapshot.per_job.executions[JOB].disk_id.clone()
     };
     *fake.fork_error.lock().unwrap() = Some(error.into());
-    fake.fail_seed.store(fail_seed, Ordering::SeqCst);
     let (mut client, task) = start(runtime.clone(), c, id).await;
     run_at_root(&mut client, ROOT).await;
     assert_eq!(fake.forks.lock().unwrap().len(), 1);
-    assert_eq!(fake.seeds.lock().unwrap().len(), usize::from(use_base));
-    assert_eq!(
-        fake.workspace_contents.lock().unwrap()[&disk_id],
-        (use_base && !fail_seed).then(|| "base".into())
-    );
+    assert_eq!(fake.workspace_contents.lock().unwrap()[&disk_id], None);
     {
         let host = runtime.host.lock().unwrap();
         let disk = &host.snapshot.per_job.disks[&disk_id];
-        if use_base && !fail_seed {
-            assert_eq!(disk.have, base_have);
-            assert!(host.snapshot.per_job.bases["base"].last_used_ms > 1);
-        } else {
-            assert!(disk.have.is_empty());
-            if use_base {
-                assert_eq!(host.snapshot.per_job.bases["base"].last_used_ms, 1);
-            }
-        }
+        assert!(disk.have.is_empty());
         assert!(disk.forked_from.is_none());
         assert!(!disk.quarantined);
         assert!(host.snapshot.leases[JOB].delivered);
@@ -667,16 +624,9 @@ async fn assert_fork_fallback(error: &str, use_base: bool, fail_seed: bool) {
 }
 
 #[tokio::test]
-async fn fork_errors_and_unknown_operation_without_a_base_leave_empty_have_and_job_runs() {
+async fn fork_errors_and_unknown_operation_leave_empty_have_and_job_runs() {
     for error in ["clone failed", "unknown variant `fork_workspace`"] {
-        assert_fork_fallback(error, false, false).await;
-    }
-}
-
-#[tokio::test]
-async fn fork_refused_then_base_seed_records_have_last_used_and_attach_forked() {
-    for error in ["clone failed", "unknown variant `fork_workspace`"] {
-        assert_fork_fallback(error, true, false).await;
+        assert_empty_fork_fallback(error).await;
     }
 }
 
@@ -727,7 +677,7 @@ async fn lost_fork_reply_reloads_durable_mark_and_next_boot_attaches_forked() {
     };
     *fake.fork_journal.lock().unwrap() = Some(storage.root.path().join("journal.json"));
     fake.fork_reply_lost.store(true, Ordering::SeqCst);
-    seed_workspace(&runtime, &execution, ROOT);
+    fork_workspace(&runtime, &execution, ROOT);
     assert_eq!(
         fake.workspace_contents.lock().unwrap()[&execution.disk_id],
         Some("donor".into())
@@ -766,13 +716,6 @@ async fn lost_fork_reply_reloads_durable_mark_and_next_boot_attaches_forked() {
     drop(client);
     task.await.unwrap().unwrap();
     runtime.stop_job(JOB2, true, false).unwrap();
-}
-
-#[tokio::test]
-async fn fork_and_base_seed_errors_leave_empty_have_without_quarantine_and_job_runs() {
-    for error in ["clone failed", "unknown variant `fork_workspace`"] {
-        assert_fork_fallback(error, true, true).await;
-    }
 }
 
 #[tokio::test]
@@ -817,7 +760,7 @@ async fn both_run_relay_sites_record_repository_without_tips_and_last_nonempty_r
     run_at_root(&mut client, ROOT).await;
     assert_eq!(
         runtime.host.lock().unwrap().snapshot.per_job.disks[&disk_id].repository_key,
-        Some(crate::jobs::fill_source::repository_key(ROOT))
+        Some(crate::state::jobs::forks::repository_key(ROOT))
     );
     let stream = runtime.job_stream(JOB).unwrap();
     let mut request = run(JOB);
@@ -827,7 +770,7 @@ async fn both_run_relay_sites_record_repository_without_tips_and_last_nonempty_r
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if runtime.host.lock().unwrap().snapshot.per_job.disks[&disk_id].repository_key
-                == Some(crate::jobs::fill_source::repository_key("/home/other"))
+                == Some(crate::state::jobs::forks::repository_key("/home/other"))
             {
                 break;
             }
@@ -853,7 +796,7 @@ async fn both_run_relay_sites_record_repository_without_tips_and_last_nonempty_r
     .unwrap();
     assert_eq!(
         runtime.host.lock().unwrap().snapshot.per_job.disks[&disk_id].repository_key,
-        Some(crate::jobs::fill_source::repository_key("/home/other"))
+        Some(crate::state::jobs::forks::repository_key("/home/other"))
     );
     drop(client);
     task.await.unwrap().unwrap();

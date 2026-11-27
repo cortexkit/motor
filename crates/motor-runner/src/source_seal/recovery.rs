@@ -52,7 +52,7 @@ pub(crate) fn stopped_disk(state: &Path, roots: &[(&Path, &Path)]) -> io::Result
 /// can an unrecorded flag be attributed to the runner rather than to another
 /// writer of the checkout filesystem.
 fn orphan_recovery_enabled(config: &Config) -> bool {
-    config.per_job && config.tenant_vm && config.isolate_jobs && !config.fill_vm
+    config.per_job && config.tenant_vm && config.isolate_jobs
 }
 
 pub(crate) fn restore_access(

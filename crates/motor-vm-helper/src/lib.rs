@@ -48,16 +48,6 @@ pub enum Request {
         token: String,
     },
     PerJobReadiness {},
-    PrepareFill {
-        fill: job::Fill,
-    },
-    FinishFill {
-        fill: job::Fill,
-        published: bool,
-    },
-    SeedWorkspace {
-        seed: job::Seed,
-    },
     ForkWorkspace {
         fork: job::Fork,
     },
@@ -106,10 +96,6 @@ pub enum Request {
     },
     JobExits {},
     DeleteWorkspace {
-        account: String,
-        disk_id: String,
-    },
-    EvictBase {
         account: String,
         disk_id: String,
     },
@@ -276,9 +262,6 @@ pub enum Reply {
         job_vms_configured: bool,
         workspace_disk_max_bytes: Option<u64>,
         published_generations: Vec<String>,
-    },
-    FillFinished {
-        published: bool,
     },
     WorkspaceForked(job::Forked),
     JobImages {
@@ -523,15 +506,7 @@ impl<M: Machine> Helper<M> {
             Request::DeleteWorkspace { account, disk_id } => {
                 self.job(job::Operation::DeleteWorkspace { account, disk_id }, peer)
             }
-            Request::PrepareFill { fill } => self.job(job::Operation::PrepareFill(fill), peer),
-            Request::FinishFill { fill, published } => {
-                self.job(job::Operation::FinishFill { fill, published }, peer)
-            }
-            Request::SeedWorkspace { seed } => self.job(job::Operation::SeedWorkspace(seed), peer),
             Request::ForkWorkspace { fork } => self.job(job::Operation::ForkWorkspace(fork), peer),
-            Request::EvictBase { account, disk_id } => {
-                self.job(job::Operation::EvictBase { account, disk_id }, peer)
-            }
             Request::WorkspaceUsage { account, disk_id } => {
                 self.job(job::Operation::WorkspaceUsage { account, disk_id }, peer)
             }

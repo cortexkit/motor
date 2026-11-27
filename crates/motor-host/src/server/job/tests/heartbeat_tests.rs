@@ -678,37 +678,6 @@ fn lifecycle_comparison_heartbeats_do_not_log_their_placeholder_memory() {
 }
 
 #[test]
-fn no_fill_starts_while_the_host_drains() {
-    let (runtime, _, _) = fixture();
-    let now = unix_ms();
-    let mut host = runtime.host.lock().unwrap();
-    host.record_host_resources(HostResources {
-        at_ms: now,
-        available_mem_mib: 100_000,
-        job_vm_headroom_mib: 80_000,
-        vcpu_ceiling: 4,
-        permit_budget: 100,
-    });
-    let key = "a".repeat(64);
-    host.snapshot.accept_until_ms = Some(now + 3_600_000);
-    assert!(host
-        .reserve_fill(&claims(JOB).sub, &key, 1000, now)
-        .unwrap()
-        .is_none());
-    host.snapshot.accept_until_ms = None;
-    host.snapshot.draining = true;
-    assert!(host
-        .reserve_fill(&claims(JOB).sub, &key, 1000, now)
-        .unwrap()
-        .is_none());
-    host.snapshot.draining = false;
-    assert!(host
-        .reserve_fill(&claims(JOB).sub, &key, 1000, now)
-        .unwrap()
-        .is_some());
-}
-
-#[test]
 fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_waiters() {
     let (runtime, _, _) = fixture();
     let now = unix_ms();
@@ -721,9 +690,6 @@ fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_wa
             vcpu_ceiling: 2,
             permit_budget: 100,
         });
-        host.reserve_fill(&claims(JOB).sub, &"a".repeat(64), 1000, now)
-            .unwrap()
-            .unwrap();
     }
     for (job, key, boot, hello) in [
         (JOB, 5, true, true),
@@ -753,17 +719,9 @@ fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_wa
             retry_after_ms: None,
         });
     host.job_vm_file_mib = Some(512);
-    let fill_debit = host
-        .snapshot
-        .per_job
-        .fills
-        .values()
-        .next()
-        .unwrap()
-        .memory_debit_mib;
     let logs = crate::test_logs::capture(|| {
         let free = host.job_free_mem_mib(now);
-        assert_eq!(free, 80_000 - 50 - 120 - 600 - fill_debit);
+        assert_eq!(free, 80_000 - 50 - 120 - 600);
         host.heartbeat(now, free, true);
     });
     let line = logs
@@ -784,10 +742,6 @@ fn memory_advertisement_logs_the_actual_accounting_inputs_and_unreserved_disk_wa
     ] {
         assert!(line.contains(field), "missing {field}: {line}");
     }
-    assert!(
-        line.contains(&format!("fill_memory_debit_mib={fill_debit} ")),
-        "{line}"
-    );
 }
 
 #[test]

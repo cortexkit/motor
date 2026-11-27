@@ -158,10 +158,11 @@ atomically and syncs it before returning; motor-host never reads it or receives
 its contents. No drain or service restart is needed: the next VM start reads
 the replacement, while an already started VM retains its original set.
 
-An ordinary job gets only config and the read key. Trusted fill and base-build
-VMs also get the write key; recovery VMs get neither credentials nor a network
-interface. An account without a set gets no credential drive. The helper makes
-a fresh read-only drive for each start, binds it to that boot with a random
+An ordinary job gets only the config and read key. The job VM's runner gets the
+write key only when the helper verifies the job's cache-write grant. Recovery VMs
+get neither credentials nor a network interface. An account without a set gets
+no credential drive. The helper makes a fresh read-only drive for each start,
+binds it to that boot with a random
 nonce on the kernel command line, and deletes it on VM exit or release (also
 after adopting an exited VM on helper restart). The mode-0600 image is owned
 by that VM's exclusive jail UID, beneath a root-only jail boundary, and is

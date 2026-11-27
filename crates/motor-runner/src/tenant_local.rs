@@ -128,20 +128,6 @@ pub(crate) async fn admin_session(runner: Runner, mut socket: UnixStream) -> io:
     let mut bytes = vec![0; len];
     socket.read_exact(&mut bytes).await?;
     let request: TenantAgentRequest = serde_json::from_slice(&bytes)?;
-    #[cfg(target_os = "linux")]
-    if matches!(
-        request,
-        TenantAgentRequest::Fill { .. } | TenantAgentRequest::ExportTip { .. }
-    ) {
-        if let Err(error) = crate::fill_source::control(runner, request, &mut socket).await {
-            crate::tenant_agent::write_json(
-                &mut socket,
-                &json!({"ok":false,"error":error.to_string()}),
-            )
-            .await?;
-        }
-        return Ok(());
-    }
     let reply = dispatch(runner, request).await?;
     let bytes = serde_json::to_vec(&reply)?;
     socket.write_u32(bytes.len() as u32).await?;

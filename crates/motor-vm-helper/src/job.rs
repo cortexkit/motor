@@ -17,8 +17,6 @@ pub const RECORDS: &str = "/var/lib/motor-vm/jobs";
 pub enum VmKind {
     #[default]
     Job,
-    Fill,
-    BaseBuild,
     Recovery,
 }
 
@@ -146,39 +144,6 @@ pub struct Workspace {
     pub workspace_key_hash: Option<String>,
 }
 
-/// Helper-owned provenance, stored separately from the guest-written image.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Fill {
-    pub account: String,
-    pub repository_key: String,
-    pub fill_id: String,
-    pub size_bytes: u64,
-}
-
-impl Fill {
-    pub fn validate(&self) -> Result<()> {
-        validate_account(&self.account)?;
-        validate_id(&self.repository_key)?;
-        validate_job_id(&self.fill_id)
-    }
-
-    pub fn disk_id(&self) -> String {
-        format!("fill-{}", self.fill_id)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Seed {
-    pub account: String,
-    pub repository_key: String,
-    pub base_id: String,
-    pub disk_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_write_job_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fork {
@@ -218,8 +183,7 @@ impl Fork {
     }
 }
 
-/// Internal sparse-disk request. The provisioning operation chooses the role;
-/// ordinary workspace requests cannot select the Fill or Base role.
+/// Internal sparse-disk request.
 pub struct CreateWorkspace {
     pub account: String,
     pub workspace_disk_id: String,
@@ -233,19 +197,11 @@ pub struct CreateWorkspace {
 pub enum WorkspaceRole {
     #[default]
     Job,
-    Fill,
-    Base,
 }
 
 impl WorkspaceRole {
     pub fn permits(self, kind: VmKind) -> bool {
-        matches!(
-            (self, kind),
-            (Self::Job, VmKind::Recovery)
-                | (Self::Job, VmKind::Job)
-                | (Self::Fill, VmKind::Fill)
-                | (Self::Base, VmKind::BaseBuild)
-        )
+        matches!((self, kind), (Self::Job, VmKind::Recovery | VmKind::Job))
     }
 }
 
@@ -267,18 +223,8 @@ pub struct ExitReport {
 }
 
 pub enum Operation {
-    PrepareFill(Fill),
-    FinishFill {
-        fill: Fill,
-        published: bool,
-    },
-    SeedWorkspace(Seed),
     ForkWorkspace(Fork),
     DeleteWorkspace {
-        account: String,
-        disk_id: String,
-    },
-    EvictBase {
         account: String,
         disk_id: String,
     },
@@ -305,16 +251,8 @@ pub enum Operation {
 impl Operation {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::PrepareFill(fill) | Self::FinishFill { fill, .. } => fill.validate(),
             Self::ForkWorkspace(fork) => fork.validate(),
-            Self::SeedWorkspace(seed) => {
-                validate_account(&seed.account)?;
-                validate_id(&seed.repository_key)?;
-                validate_id(&seed.base_id)?;
-                validate_id(&seed.disk_id)
-            }
             Self::DeleteWorkspace { account, disk_id }
-            | Self::EvictBase { account, disk_id }
             | Self::WorkspaceUsage { account, disk_id }
             | Self::EnsureWorkspace {
                 account, disk_id, ..
@@ -407,7 +345,7 @@ mod tests {
 
     #[test]
     fn workspace_storage_operations_accept_identities_never_paths_or_roles() {
-        for op in ["workspace_usage", "evict_base", "ensure_workspace"] {
+        for op in ["workspace_usage", "ensure_workspace"] {
             let mut request = serde_json::json!({"op":op, "account":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", "disk_id":"ws-1"});
             if op == "ensure_workspace" {
                 request["size_bytes"] = serde_json::json!(4096);
@@ -422,10 +360,6 @@ mod tests {
         for account in ["../other", "a/b"] {
             for op in [
                 super::Operation::WorkspaceUsage {
-                    account: account.into(),
-                    disk_id: "ws-1".into(),
-                },
-                super::Operation::EvictBase {
                     account: account.into(),
                     disk_id: "ws-1".into(),
                 },
@@ -502,28 +436,16 @@ mod tests {
     #[test]
     fn workspace_role_authorizes_only_its_kind_and_legacy_is_job() {
         use WorkspaceRole::*;
-        for (role, allowed) in [
-            (Job, [true, false, false, true]),
-            (Fill, [false, true, false, false]),
-            (Base, [false, false, true, false]),
-        ] {
-            for (kind, expected) in [
-                VmKind::Job,
-                VmKind::Fill,
-                VmKind::BaseBuild,
-                VmKind::Recovery,
-            ]
-            .into_iter()
-            .zip(allowed)
-            {
-                assert_eq!(role.permits(kind), expected, "{role:?} {kind:?}");
-            }
+        for kind in [VmKind::Job, VmKind::Recovery] {
+            assert!(Job.permits(kind));
+        }
+        for role in ["base", "fill", "unknown"] {
+            assert!(serde_json::from_value::<WorkspaceRole>(serde_json::json!(role)).is_err());
         }
         let legacy: Workspace =
             serde_json::from_str(r#"{"account":"account-1","workspace_disk_id":"disk-1"}"#)
                 .unwrap();
         assert_eq!(legacy.role, Job);
-        assert!(!legacy.role.permits(VmKind::Fill));
     }
 
     #[test]
@@ -562,12 +484,7 @@ mod tests {
                 ..
             }
         ));
-        for (kind, expected) in [
-            ("job", VmKind::Job),
-            ("fill", VmKind::Fill),
-            ("base_build", VmKind::BaseBuild),
-            ("recovery", VmKind::Recovery),
-        ] {
+        for (kind, expected) in [("job", VmKind::Job), ("recovery", VmKind::Recovery)] {
             let mut request = value.clone();
             request["kind"] = serde_json::json!(kind);
             let request: crate::Request = serde_json::from_value(request).unwrap();

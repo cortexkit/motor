@@ -11,10 +11,6 @@ impl Runtime {
                 "tenant rollback requires drained leases"
             );
             ensure!(
-                host.snapshot.per_job.fills.is_empty(),
-                "tenant rollback requires completed fills"
-            );
-            ensure!(
                 host.snapshot.per_job.executions.values().all(|e| e.ended),
                 "tenant rollback requires stopped executions"
             );

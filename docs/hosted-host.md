@@ -302,7 +302,7 @@ out of memory.
 
 | Setting | Unit | Meaning |
 | --- | --- | --- |
-| `fork_checkouts` | boolean | Copy a new worktree's checkout disk from the repository's most recent warm disk; requires a job image whose runner adopts forked disks. When true, background fills and fill-source exports stop; pending exports and stored fill sources are retired. When false, background fills and exports continue. Existing fill bases remain available as seed fallbacks in either case. |
+| `fork_checkouts` | boolean | Copy a new worktree’s checkout disk from the repository’s chosen warm disk. When false, new worktrees start empty. |
 | `vcpu_ceiling` | vCPUs | Maximum job size; 1 through the helper's online CPU count. |
 | `permit_budget` | vCPU permits | Host admission budget with CPU overcommit; at least `vcpu_ceiling`, at most four times online CPUs. |
 | `host_reserve_mib` | MiB | Available-memory floor at both the host and job-VM slice limits for admission and pressure reclamation. |
@@ -413,8 +413,7 @@ warm disk instead of building cold elsewhere. It reads busy again if teardown
 still holds it 60 seconds later. A running job, a waiting successor, quarantine,
 or recovery keeps the disk busy. Admission still queues a new job behind the
 attached VM until the disk is released. The change reaches the broker in the
-next heartbeat, sent as soon as the state changes. Recovery and fills consume
-capacity too.
+next heartbeat, sent as soon as the state changes. Recovery consumes capacity too.
 
 Tests: `stored_terminal_makes_attached_disk_idle_for_at_most_sixty_seconds`,
 `terminal_disk_still_queues_successor_until_vm_release`, and
@@ -478,8 +477,7 @@ Before switching:
    before anything stops, using the target helper binary's read-only
    `check-config` command.
 
-   The optional `job_vms.fixed_path_repositories` map enables fixed checkout paths
-   and local build bases per account. For example:
+   The optional `job_vms.fixed_path_repositories` map enables fixed checkout paths per account. For example:
 
    ```json
    {"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV": ["/home/project"]}
@@ -489,9 +487,8 @@ Before switching:
    absolute repository roots without whitespace, or `["*"]` alone. A missing
    map, missing account or empty list leaves fixed paths off. The map is part of
    the root-owned helper configuration, not the host's start request or guest
-   source metadata. Job and Fill VMs receive the same policy for their own
-   account; Recovery VMs receive none. Malformed maps are refused at helper
-   startup and by `check-config`.
+   input. Job VMs receive the policy for their account; Recovery VMs receive
+   none. Malformed maps are refused at helper startup and by `check-config`.
    The list travels on a job VM's boot command line, so settings validation refuses
    lists too long to fit. Use `"*"` to enable every repository of the account, or list
    fewer roots.
@@ -533,10 +530,10 @@ readiness, the switch fails immediately and prints its last 20 journal lines.
 The script then obtains
 a fresh broker drain acknowledgement, and waits up to `--timeout` seconds (300 by
 default) for work to finish. In per-job mode, `host-status` additionally reports
-`active_job_vms` (including pending teardown), `active_fills` and
-`active_recoveries`; all must be zero along with `active_leases`. A timeout names
-the remaining work, exits nonzero and leaves placement drained. Missing counts
-are not treated as zero.
+`active_job_vms` (including pending teardown) and `active_recoveries`; both must
+be zero along with `active_leases`. If an older host reports `active_fills`, it
+must also be zero. A timeout names the remaining work, exits nonzero and leaves
+placement drained.
 
 It stops `motor-host`, explicitly sends the
 helper's clean `stop_tenant` operation for each retained tenant, checks that both
@@ -652,37 +649,12 @@ and tool prerequisites. No drain is needed. From the repository root:
    If publication is refused for space, it needs more room than the host can
    free now; retry after running jobs end.
 
-### Per-job fill sources
+### New per-job worktrees
 
-After a job's terminal result is durably stored, the host may ask its VM to
-export the client's default-branch tip and the Git dependency mirrors the fill
-needs. The connected caller receives its terminal result before export begins,
-and billing ends at the terminal, not at VM shutdown. Export may retain the VM's
-memory, CPU permits and workspace disk for up to 300 seconds; failure or timeout
-discards only the new fill source.
-
-Export checks every Git dependency commit locked by the default-branch tip before
-creating bundles. A job snapshot can use a different dependency graph, and an
-online Cargo fetch does not populate the trusted mirrors. If a locked commit is
-unavailable or is not a verified commit object, export skips the new source and
-the host logs `fill_source_incomplete` at info level with its URL and commit. The
-previous source is kept; export never fetches missing dependencies or sends a
-partial source.
-
-The host checks bundle lengths, chunk offsets and SHA-256 before atomically
-replacing its per-account, per-repository source slot. Each slot is capped at
-1 GiB and counts in storage admission; an oversized export is refused, never
-truncated. A fresh Fill disk receives bundles, not a job-written filesystem.
-Only the helper's root-owned disk role enables the Fill guest operation; Job VMs
-refuse it, and Fill VMs refuse Run admission. With an eligible root in
-`job_vms.fixed_path_repositories`, a fill can publish a
-[build base](compile-cache.md#fixed-paths-and-local-build-bases). Other fills warm
-the compiler cache and delete their disks. A new workspace disk may be seeded
-from a matching base; an existing disk is never replaced. For a new disk, the
-host waits for Run to identify the repository and selects a base for that exact
-root and the lease's account before boot. The helper creates a separate Job disk
-from the detached base. A missing base or failed seed falls back to normal
-workspace creation.
+An existing checkout disk keeps its own files. For a new worktree, the host
+waits for Run to identify the repository. With `fork_checkouts: true`, the helper
+copies an eligible warm checkout disk for that repository and account. If no
+donor can be copied, or forking is disabled, the new disk starts empty.
 
 ### Root remote-cache credential command
 
@@ -705,15 +677,14 @@ provisioner: config schema, account subject, tenant prefix and key generations.
 The helper atomically replaces `/var/lib/motor-vm/remote-cache`'s account set
 (root-owned directories 0700, files 0600) and syncs it before success. Replacement
 needs no drain or restart and applies at the next VM start; running VMs keep
-their original set. Jobs receive config and the read key, trusted fill/base-build
-VMs also receive the write key, and recovery receives neither keys nor a virtual
-network interface (TAP). The one exception for jobs: when the helper itself has
-verified that a job may write to the cache, that job VM's runner also receives
-the write key, while the job's own processes still see only a socket; see
-[Job writes to the remote cache](#job-writes-to-the-remote-cache).
+their original set. Jobs receive the config and read key. A job VM's runner
+receives the write key only when the helper has verified its cache-write grant;
+the job's processes still see only a socket. See
+[Job writes to the remote cache](#job-writes-to-the-remote-cache). Recovery gets
+neither keys nor a virtual network interface (TAP).
 The helper delivers a read-only, nonce-bound credential drive; the guest consumes
 it into tmpfs. `motor-host` never reads or relays key bytes, and no key is stored
-on a workspace disk, base, published image, replay store or log. See the
+on a workspace disk, published image, replay store or log. See the
 [helper credential rules](../crates/motor-vm-helper/README.md#credential-store)
 for the named tests and the [rollback credential gate](#per-job-mode-rollback).
 
@@ -924,8 +895,7 @@ the socket.
 The helper records which workspace a disk belongs to only when it creates the
 disk for a verified grant. A disk created before that, including one first
 created for a read-only job, stays read-only for every later job until it is
-recreated. A write-enabled job VM is still a Job VM: it refuses fill
-operations and never gets the fill socket.
+recreated. A write-enabled job VM can only create cache entries, not replace them.
 
 Tests (`crates/motor-vm-helper/src/cache_write_tests.rs`):
 `invalid_credentials_never_record_a_grant`,

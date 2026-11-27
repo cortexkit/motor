@@ -190,14 +190,9 @@ mod root {
         store::install(&path, "account-1", &set("account-1", "old")).unwrap();
         store::install(&path, "account-2", &set("account-2", "other")).unwrap();
         let mut previous = None;
-        for (index, kind) in [
-            VmKind::Job,
-            VmKind::Fill,
-            VmKind::BaseBuild,
-            VmKind::Recovery,
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, kind) in [VmKind::Job, VmKind::Job, VmKind::Recovery]
+            .into_iter()
+            .enumerate()
         {
             let jail = base.join(format!("jail-{index}"));
             std::fs::DirBuilder::new()
@@ -231,18 +226,11 @@ mod root {
             let config: serde_json::Value =
                 serde_json::from_str(payload["config"].as_str().unwrap()).unwrap();
             assert_eq!(config["tenant"], "account-1");
-            if kind == VmKind::Job {
-                assert!(payload.get("write_key").is_none());
-                assert!(
-                    !String::from_utf8_lossy(&std::fs::read(jail.join(IMAGE)).unwrap())
-                        .contains("WRITE-SECRET")
-                );
-            } else {
-                assert!(payload["write_key"]
-                    .as_str()
-                    .unwrap()
-                    .contains("WRITE-SECRET-new"));
-            }
+            assert!(payload.get("write_key").is_none());
+            assert!(
+                !String::from_utf8_lossy(&std::fs::read(jail.join(IMAGE)).unwrap())
+                    .contains("WRITE-SECRET")
+            );
             let metadata = std::fs::metadata(jail.join(IMAGE)).unwrap();
             assert_eq!(metadata.uid(), 600001);
             assert_eq!(metadata.mode() & 0o777, 0o600);
@@ -426,43 +414,21 @@ fn job_credential_staging_requires_matching_grant_and_keeps_read_key() {
     );
     assert!(staged.write_key.is_none());
     assert!(!write_boot);
-    for kind in [VmKind::Fill, VmKind::BaseBuild] {
-        let role = if kind == VmKind::Fill {
-            WorkspaceRole::Fill
-        } else {
-            WorkspaceRole::Base
-        };
-        let (staged, write_boot) = credentials_for_boot(set("account-1", "new"), kind, role, false);
-        assert_eq!(staged.write_key.is_some(), kind == VmKind::Fill);
-        assert!(!write_boot);
-    }
 }
 
 #[test]
-fn write_key_is_kept_only_for_fill_role_or_granted_job() {
+fn write_key_is_kept_only_for_granted_job() {
     use crate::job::WorkspaceRole;
-    for kind in [
-        VmKind::Job,
-        VmKind::Fill,
-        VmKind::BaseBuild,
-        VmKind::Recovery,
-    ] {
-        for role in [WorkspaceRole::Job, WorkspaceRole::Fill, WorkspaceRole::Base] {
-            for granted in [false, true] {
-                let (staged, write_boot) =
-                    credentials_for_boot(set("account-1", "new"), kind, role, granted);
-                let job = kind == VmKind::Job && role == WorkspaceRole::Job && granted;
-                let fill = kind == VmKind::Fill && role == WorkspaceRole::Fill;
-                assert_eq!(
-                    staged.write_key.is_some(),
-                    job || fill,
-                    "{kind:?}/{role:?}/{granted}"
-                );
-                assert_eq!(write_boot, job, "{kind:?}/{role:?}/{granted}");
-                assert!(serde_json::to_string(&staged)
-                    .unwrap()
-                    .contains("READ-SECRET-new"));
-            }
+    for kind in [VmKind::Job, VmKind::Recovery] {
+        for granted in [false, true] {
+            let (staged, write_boot) =
+                credentials_for_boot(set("account-1", "new"), kind, WorkspaceRole::Job, granted);
+            let job = kind == VmKind::Job && granted;
+            assert_eq!(staged.write_key.is_some(), job, "{kind:?}/{granted}");
+            assert_eq!(write_boot, job, "{kind:?}/{granted}");
+            assert!(serde_json::to_string(&staged)
+                .unwrap()
+                .contains("READ-SECRET-new"));
         }
     }
 }

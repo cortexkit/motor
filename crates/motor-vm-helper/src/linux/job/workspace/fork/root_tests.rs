@@ -53,20 +53,22 @@ fn fork(jobs: &LinuxJobs, request: job::Fork) -> Result<Response> {
 fn isolated_fork_refuses_foreign_non_job_and_existing_destination() {
     let (base, jobs) = fixture(None);
     donor(&jobs, ACCOUNT, "valid", job::WorkspaceRole::Job);
-    for (account, role, id, error) in [
-        (
-            "other",
-            job::WorkspaceRole::Job,
-            "foreign",
-            "identity mismatch",
-        ),
-        (ACCOUNT, job::WorkspaceRole::Fill, "fill", "root-owned Job"),
-        (ACCOUNT, job::WorkspaceRole::Base, "base", "root-owned Job"),
-    ] {
-        donor(&jobs, account, id, role);
-        // Even a later invalid donor refuses the request; it is not skipped.
-        let err = fork(&jobs, request(&["valid", id])).err().unwrap();
-        assert!(err.0.contains(error), "{}", err.0);
+    donor(&jobs, "other", "foreign", job::WorkspaceRole::Job);
+    let error = fork(&jobs, request(&["valid", "foreign"])).err().unwrap();
+    assert!(error.0.contains("identity mismatch"), "{error}");
+    assert!(!jobs.workspaces.join("new").exists());
+    for role in ["fill", "base"] {
+        donor(&jobs, ACCOUNT, role, job::WorkspaceRole::Job);
+        std::fs::write(
+            jobs.workspaces.join(role).join("registry.json"),
+            json!({
+                "account": ACCOUNT, "workspace_disk_id": role, "role": role
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = fork(&jobs, request(&["valid", role])).err().unwrap();
+        assert!(error.0.contains("unknown variant"), "{error}");
         assert!(!jobs.workspaces.join("new").exists());
     }
     let destination = jobs.workspaces.join("new");

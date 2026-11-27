@@ -211,15 +211,6 @@ impl LinuxJobs {
         }
     }
 
-    /// Whether `cell` is still the registered cell for `id`. A writer that
-    /// looked a cell up before taking its J must check this before any change.
-    pub(super) fn is_registered(&self, id: &str, cell: &Arc<JobCell>) -> bool {
-        self.registry
-            .lock()
-            .get(id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.cell, cell))
-    }
-
     pub(super) fn persist(&self, state: &mut JobState, record: Record) -> Result<()> {
         self.write_record(&record)?;
         state.record = record;

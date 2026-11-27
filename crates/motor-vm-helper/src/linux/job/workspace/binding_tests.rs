@@ -168,7 +168,6 @@ fn isolated_pre_intent_retry_stages_write_key_and_read_only_credential_drive() {
             .as_str()
             .unwrap();
         assert!(boot.contains("motor.cache_write=1"));
-        assert!(!boot.contains("motor.fill=1"));
     });
     std::fs::remove_dir_all(base).unwrap();
 }

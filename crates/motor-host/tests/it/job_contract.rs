@@ -26,7 +26,6 @@ mod cache_write;
 
 enum Probe {
     Sandbox,
-    Fill,
     #[cfg(feature = "job-cache-vm-tests")]
     Cache(std::rc::Rc<cache_write::Prepared>),
 }
@@ -250,7 +249,13 @@ async fn run_probe(
         .await
         .unwrap();
     write(&mut socket, &serde_json::from_value(json!({"type":"hello", "protocol_version":1, "started":true, "default_branch_tip":true})).unwrap()).await.unwrap();
-    assert!(matches!(next(&mut socket).await, Frame::Hello { .. }));
+    assert!(matches!(
+        next(&mut socket).await,
+        Frame::Hello {
+            default_branch_tip: false,
+            ..
+        }
+    ));
     let workspace = "/home/motor-contract";
     let request = json!({"type":"run", "job_id":id, "workspace_key":workspace, "repository_root":workspace, "cwd":workspace,
         "command":"python3 -c 'import os; print(\"fixed cwd hex: \" + os.getcwd().encode().hex())' && python3 probe.py", "env":{}, "weight_hint":2, "timeout":60, "queue_wait_limit_s":10,
@@ -295,40 +300,6 @@ async fn run_probe(
                     "missing fixed checkout path: {output}"
                 );
                 println!("real job VM contract: {output}");
-                let refused = crate::helper::exchange_control(
-                    relay(root, 54),
-                    "contract",
-                    &json!({"op":"fill","source":{"repository_root":workspace,"integration_tip":commit,"bundles":[]}}),
-                    Duration::from_secs(10),
-                ).unwrap();
-                assert_eq!(refused["ok"], false);
-                assert!(
-                    refused["error"].as_str().unwrap().contains("boot kind"),
-                    "{refused}"
-                );
-                let mut export = relay(root, 54);
-                export
-                    .set_read_timeout(Some(Duration::from_secs(30)))
-                    .unwrap();
-                crate::helper::write_json(&mut export, &json!({"op":"export_tip","job_id":id,"max_bytes":motor_protocol::FILL_SOURCE_MAX_BYTES})).unwrap();
-                let reply = crate::helper::read_json(&mut export).unwrap();
-                assert_eq!(reply["ok"], true, "{reply}");
-                let source: motor_protocol::FillSource =
-                    serde_json::from_value(reply["source"].clone()).unwrap();
-                assert_eq!(source.repository_root, workspace);
-                assert_eq!(source.integration_tip, commit);
-                let mut incoming =
-                    crate::jobs::fill_source::Incoming::new(scratch.join("exported-tip"), source)
-                        .unwrap();
-                while !incoming.complete() {
-                    incoming
-                        .chunk(
-                            motor_protocol::read_frame(&mut export)
-                                .unwrap()
-                                .expect("complete exported tip"),
-                        )
-                        .unwrap();
-                }
                 write(&mut socket, &Frame::TerminalStored { jti: id })
                     .await
                     .unwrap();
@@ -367,14 +338,7 @@ fn isolated_job_vm_preserves_full_sandbox_contract() {
     isolated_vm(Probe::Sandbox);
 }
 
-#[test]
-#[ignore = "requires root, KVM, cgroup v2, iproute2, jailer/Firecracker 1.17.0 and job image artifacts"]
-fn isolated_fill_vm_refuses_run_admission() {
-    isolated_vm(Probe::Fill);
-}
-
 fn isolated_vm(probe: Probe) {
-    let fill = matches!(probe, Probe::Fill);
     assert_eq!(unsafe { libc::geteuid() }, 0, "run as the root operator");
     let firecracker = artifact("MOTOR_VM_TEST_FIRECRACKER");
     let jailer = artifact("MOTOR_VM_TEST_JAILER");
@@ -501,11 +465,7 @@ fn isolated_vm(probe: Probe) {
         wait_for(|| short_root.join("api.sock").exists());
         let start = Start {
             cache_write_blocked: false,
-            kind: if fill {
-                motor_vm_helper::job::VmKind::Fill
-            } else {
-                Default::default()
-            },
+            kind: Default::default(),
             job_id: id.to_string(),
             account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
             workspace_disk_id: "contract".into(),
@@ -518,11 +478,7 @@ fn isolated_vm(probe: Probe) {
             workspace_key_hash: None,
             account: start.account.clone(),
             workspace_disk_id: start.workspace_disk_id.clone(),
-            role: if fill {
-                motor_vm_helper::job::WorkspaceRole::Fill
-            } else {
-                motor_vm_helper::job::WorkspaceRole::Job
-            },
+            role: motor_vm_helper::job::WorkspaceRole::Job,
         };
         let settings = motor_vm_helper::config::JobVms {
             uid_base: uid,
@@ -615,7 +571,6 @@ fn isolated_vm(probe: Probe) {
             .block_on(async {
                 let probe = async {
                     match &probe {
-                        Probe::Fill => refuse_run_probe(&short_root, id).await,
                         #[cfg(feature = "job-cache-vm-tests")]
                         Probe::Cache(prepared) => {
                             let source = prepared.probe();
@@ -655,45 +610,6 @@ fn isolated_vm(probe: Probe) {
     if let Err(error) = result {
         std::panic::resume_unwind(error);
     }
-}
-
-async fn refuse_run_probe(root: &Path, id: uuid::Uuid) {
-    let socket = relay(root, 52);
-    socket.set_nonblocking(true).unwrap();
-    let mut socket = tokio::net::UnixStream::from_std(socket).unwrap();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    // A Run that would be admitted on a Job VM (its weight matches the lease's
-    // vCPUs), so the refusal below can only come from the Fill boot kind.
-    let lease = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV","vcpus":2,"mem_mib":4096,"platform":"linux-x64","net":false,"max_s":60,"exp":now+120});
-    motor_protocol::write_frame_async(&mut socket, &serde_json::from_value(lease).unwrap())
-        .await
-        .unwrap();
-    motor_protocol::write_frame_async(
-        &mut socket,
-        &serde_json::from_value(json!({"type":"hello","protocol_version":1,"started":true}))
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(next(&mut socket).await, Frame::Hello { .. }));
-    let run = json!({"type":"run","job_id":id,"workspace_key":"/home/motor-contract","repository_root":"/home/motor-contract","cwd":"/home/motor-contract","command":"true","env":{},"weight_hint":2,"timeout":60,"queue_wait_limit_s":10,"snapshot_commit":"a".repeat(40),"integration_tip":"a".repeat(40),"tree_hash":"b".repeat(40),"siblings":[],"bundles":[]});
-    motor_protocol::write_frame_async(&mut socket, &serde_json::from_value(run).unwrap())
-        .await
-        .unwrap();
-    let Frame::Refusal(refusal) = next(&mut socket).await else {
-        panic!("Fill VM admitted a Run")
-    };
-    assert!(
-        refusal
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("Fill VM refuses job admission"),
-        "{refusal:?}"
-    );
 }
 
 #[test]

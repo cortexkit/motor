@@ -191,7 +191,7 @@ class SwitchModeTests(unittest.TestCase):
         self.host["mode"] = "per_job"
         self.host_path.write_text(json.dumps(self.host))
         before = self.host_path.read_bytes()
-        for field in switch.COUNTS:
+        for field in (*switch.COUNTS, "active_fills"):
             with self.subTest(field=field):
                 self.status.update(dict.fromkeys(switch.COUNTS, 0))
                 self.status[field] = 1
@@ -210,6 +210,11 @@ class SwitchModeTests(unittest.TestCase):
                 with mock.patch.object(switch.hosted_host, "admin_exchange", return_value=status):
                     with self.assertRaisesRegex(ValueError, "lacks mode-switch work counts"):
                         switch.wait_empty(Path("unused.sock"), "per_job", 1)
+
+    def test_retired_fill_count_can_be_absent_or_zero(self):
+        for status in [self.status, dict(self.status, active_fills=0)]:
+            with mock.patch.object(switch.hosted_host, "admin_exchange", return_value=status):
+                self.assertEqual(switch.wait_empty(Path("unused.sock"), "per_job", 1), status)
 
     def test_failed_fresh_broker_echo_never_stops_services_or_changes_configs(self):
         self.drain.side_effect = ValueError("fresh broker echo timed out")

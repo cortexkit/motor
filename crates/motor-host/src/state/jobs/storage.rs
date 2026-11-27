@@ -1,5 +1,5 @@
 //! Host-space promises. Filesystem free space already charges all physical
-//! blocks, including shared base blocks and legacy tenant disks. Only exclusive
+//! blocks, including shared checkout blocks and legacy tenant disks. Only exclusive
 //! workspace extents reduce the promise: overwriting a shared extent needs a
 //! new block. The filesystem, not an individual clone, owns that shared charge.
 use super::*;
@@ -39,19 +39,6 @@ impl Disk {
             evicting: false,
         }
     }
-}
-
-/// Registered only by the host's clean, detached base publication path.
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct Base {
-    pub sub: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub have: Vec<motor_protocol::MirrorRef>,
-    pub last_used_ms: u64,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub evicting: bool,
 }
 
 #[derive(Serialize)]
@@ -251,29 +238,6 @@ impl Host {
         loop {
             let mut reserved =
                 super::images::reserved_bytes(&next.per_job).ok_or(RefusalCause::Storage)?;
-            reserved = reserved
-                .checked_add(
-                    (next.per_job.export_tips.len() as u64)
-                        .checked_mul(motor_protocol::FILL_SOURCE_MAX_BYTES)
-                        .ok_or(RefusalCause::Storage)?,
-                )
-                .ok_or(RefusalCause::Storage)?;
-            for source in next.per_job.fill_sources.values() {
-                reserved = reserved
-                    .checked_add(motor_protocol::FILL_SOURCE_MAX_BYTES.saturating_sub(source.bytes))
-                    .ok_or(RefusalCause::Storage)?;
-            }
-            for fill in next.per_job.fills.values() {
-                let exclusive = control
-                    .workspace_usage(&fill.fill.account, &fill.fill.disk_id())
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0)
-                    .min(fill.fill.size_bytes);
-                reserved = reserved
-                    .checked_add(fill.fill.size_bytes - exclusive)
-                    .ok_or(RefusalCause::Storage)?;
-            }
             for (id, disk) in next.per_job.disks.iter_mut() {
                 let active = !disk.deleted
                     && (disk.attached_job.is_some()
@@ -353,43 +317,6 @@ impl Host {
         control: &dyn crate::helper::Control,
         attempted: &mut std::collections::BTreeSet<String>,
     ) -> Result<bool, ClaimError> {
-        let source = self
-            .snapshot
-            .per_job
-            .fill_sources
-            .iter()
-            .filter(|(key, slot)| {
-                !attempted.contains(*key)
-                    && !next.per_job.fills.values().any(|fill| {
-                        fill.fill.account == slot.request.account
-                            && fill.fill.repository_key
-                                == crate::jobs::fill_source::repository_key(
-                                    &slot.request.repository_root,
-                                )
-                    })
-                    && !next.per_job.export_tips.values().any(|request| {
-                        request.account == slot.request.account
-                            && request.repository_root == slot.request.repository_root
-                    })
-            })
-            .min_by_key(|(key, slot)| (slot.request.observed_ms, *key))
-            .map(|(key, slot)| (key.clone(), slot.clone()));
-        if let Some((key, slot)) = source {
-            attempted.insert(key.clone());
-            let mut intent = self.snapshot.clone();
-            intent.per_job.fill_sources.remove(&key);
-            self.save(intent).map_err(ClaimError::from)?;
-            next.per_job.fill_sources.remove(&key);
-            if let Some(root) = self.journal_directory() {
-                if let Err(error) = std::fs::remove_dir_all(crate::jobs::fill_source::directory(
-                    &root,
-                    &slot.generation,
-                )) {
-                    tracing::warn!(%error, "fill_source_eviction_failed");
-                }
-            }
-            return Ok(true);
-        }
         let idle = self
             .snapshot
             .per_job
@@ -411,83 +338,52 @@ impl Host {
                         .any(|e| !e.ended && e.disk_id == **id)
             })
             .min_by_key(|(id, disk)| (disk.storage.as_ref().map_or(0, |s| s.last_used_ms), *id));
-        let victim = idle
-            .map(|(id, disk)| (id.clone(), disk.sub.clone(), false))
-            .or_else(|| {
-                self.snapshot
-                    .per_job
-                    .bases
-                    .iter()
-                    .filter(|(id, _)| !attempted.contains(id.as_str()))
-                    .min_by_key(|(id, base)| (base.last_used_ms, *id))
-                    .map(|(id, base)| (id.clone(), base.sub.clone(), true))
-            });
-        let Some((id, account, base)) = victim else {
+        let Some((id, disk)) = idle else {
             return Ok(false);
         };
+        let (id, account) = (id.clone(), disk.sub.clone());
         attempted.insert(id.clone());
         let before = control
             .available_bytes()
             .map_err(|_| RefusalCause::Storage)?;
         let mut intent = self.snapshot.clone();
-        if base {
-            intent.per_job.bases.get_mut(&id).unwrap().evicting = true;
-        } else {
-            let disk = intent.per_job.disks.get_mut(&id).unwrap();
-            disk.deleted = true;
-            disk.have.clear();
-            let storage = disk.storage.get_or_insert_with(|| Disk::new(0, 0));
-            storage.evicting = true;
-            storage.growth_reservation_bytes = 0;
-        }
+        let disk = intent.per_job.disks.get_mut(&id).unwrap();
+        disk.deleted = true;
+        disk.have.clear();
+        let storage = disk.storage.get_or_insert_with(|| Disk::new(0, 0));
+        storage.evicting = true;
+        storage.growth_reservation_bytes = 0;
         // Fence selection and have replies before the helper deletes anything.
         // A crash leaves an idempotent deletion intent, never a reusable disk.
         self.save(intent)?;
-        if base {
-            next.per_job
-                .bases
-                .insert(id.clone(), self.snapshot.per_job.bases[&id].clone());
-        } else {
-            next.per_job
-                .disks
-                .insert(id.clone(), self.snapshot.per_job.disks[&id].clone());
-        }
-        let result = if base {
-            control.evict_base(&account, &id)
-        } else {
-            control.delete_workspace(&account, &id)
-        };
-        if let Err(error) = result {
-            // The helper may still hold a seed lease or an unreleased VM that
-            // the host has not re-adopted yet. Try other safe victims, but keep
-            // this deletion fenced for an idempotent retry.
+        next.per_job
+            .disks
+            .insert(id.clone(), self.snapshot.per_job.disks[&id].clone());
+        if let Err(error) = control.delete_workspace(&account, &id) {
+            // The helper may still hold a VM the host has not re-adopted.
+            // Try other safe victims, but keep this disk marked deleted and
+            // evicting so deletion can be retried.
             tracing::warn!(disk_id = id, %error, "workspace_disk_eviction_deferred");
             return Ok(true);
         }
         let mut done = self.snapshot.clone();
-        if base {
-            done.per_job.bases.remove(&id);
-            next.per_job.bases.remove(&id);
-        } else {
-            done.per_job
-                .disks
-                .get_mut(&id)
-                .unwrap()
-                .storage
-                .as_mut()
-                .unwrap()
-                .evicting = false;
-            next.per_job
-                .disks
-                .insert(id.clone(), done.per_job.disks[&id].clone());
-        }
+        done.per_job
+            .disks
+            .get_mut(&id)
+            .unwrap()
+            .storage
+            .as_mut()
+            .unwrap()
+            .evicting = false;
+        next.per_job
+            .disks
+            .insert(id.clone(), done.per_job.disks[&id].clone());
         self.save(done)?;
         let after = control
             .available_bytes()
             .map_err(|_| RefusalCause::Storage)?;
         tracing::info!(
             disk_id = id,
-            role = if base { "base" } else { "job" },
             bytes_freed = after.saturating_sub(before),
             "workspace_disk_evicted"
         );

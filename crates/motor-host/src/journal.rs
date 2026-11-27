@@ -46,7 +46,6 @@ impl FileJournal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Snapshot::default(),
             Err(e) => return Err(e),
         };
-        crate::jobs::fill_source::remove_unreferenced(directory, &snapshot.per_job.fill_sources)?;
         Ok((
             Self {
                 path,

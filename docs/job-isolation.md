@@ -563,6 +563,11 @@ Tests: `isolated_seed_base_is_warm_and_copy_on_write`,
 `eligibility_refuses_incompatible_records_and_leftovers`
 (`crates/motor-runner/src/seed.rs`).
 
+In per-job hosted execution, a new worktree instead forks an eligible warm
+checkout disk in the same account and repository when forking is enabled. It
+starts empty if forking is disabled or no donor can be copied. Existing
+worktrees keep their own disks.
+
 3.9.8. **Install the matching permissions helper before deployment.** Base
 publication and removal use fixed no-follow `check-staging-links` and
 `remove-staging` helper operations. On an unprivileged Linux runner, reinstall the matching

@@ -65,7 +65,6 @@ impl Runtime {
                 .filter(|(_, job)| job.boot_started && !job.ended)
                 .map(|(id, _)| id.clone())
                 .collect::<BTreeSet<_>>();
-            jobs.extend(host.snapshot.per_job.fills.keys().cloned());
             jobs.extend(
                 host.snapshot
                     .per_job

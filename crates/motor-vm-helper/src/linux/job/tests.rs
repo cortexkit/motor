@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod absence_tests;
 mod console_tests;
 mod exit_tests;
-mod fill_tests;
 mod network_tests;
 mod plane_tests;
 #[cfg(feature = "linux-service-tests")]
@@ -89,12 +88,7 @@ fn every_boot_request_uses_ids_firecracker_accepts() {
     let valid =
         |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     let nonce = "0123456789abcdef0123456789abcdef";
-    for kind in [
-        job::VmKind::Job,
-        job::VmKind::Fill,
-        job::VmKind::BaseBuild,
-        job::VmKind::Recovery,
-    ] {
+    for kind in [job::VmKind::Job, job::VmKind::Recovery] {
         let mut start = start();
         start.kind = kind;
         for nonce in [Some(nonce), None] {
@@ -277,47 +271,6 @@ fn restart_start(base: &Path) -> Start {
     serde_json::from_reader(File::open(base.join("start.json")).unwrap()).unwrap()
 }
 
-#[test]
-fn legacy_job_records_have_no_clean_fill_exit_evidence() {
-    let mut value = serde_json::to_value(record()).unwrap();
-    value.as_object_mut().unwrap().remove("fill_exit_success");
-    let restored: Record = serde_json::from_value(value).unwrap();
-    assert_eq!(restored.fill_exit_success, None);
-    assert!(serde_json::to_value(restored)
-        .unwrap()
-        .get("fill_exit_success")
-        .is_none());
-}
-
-#[test]
-fn fill_process_exit_success_is_durable_and_failure_never_becomes_success() {
-    for (program, success) in [("/bin/true", true), ("/bin/false", false)] {
-        let base = scratch();
-        let jobs = machine(&base);
-        std::fs::create_dir_all(&jobs.records_path).unwrap();
-        let mut record = record();
-        record.start.kind = job::VmKind::Fill;
-        let id = record.start.job_id.clone();
-        jobs.insert_record(record);
-        jobs.cell(&id).unwrap().0.lock().child = Some(Command::new(program).spawn().unwrap());
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while jobs.cell(&id).unwrap().0.lock().child.is_some() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture child did not exit"
-            );
-            jobs.reap();
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let durable: Record = serde_json::from_slice(
-            &std::fs::read(jobs.records_path.join(format!("{id}.json"))).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(durable.fill_exit_success, Some(success));
-        std::fs::remove_dir_all(base).unwrap();
-    }
-}
-
 pub(super) fn scratch() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = cortexkit_test_support::scratch_root().join(format!(
@@ -448,11 +401,7 @@ fn disk_registry(start: &Start) -> Workspace {
         workspace_key_hash: None,
         account: start.account.clone(),
         workspace_disk_id: start.workspace_disk_id.clone(),
-        role: if start.kind == job::VmKind::Fill {
-            job::WorkspaceRole::Fill
-        } else {
-            job::WorkspaceRole::Job
-        },
+        role: job::WorkspaceRole::Job,
     }
 }
 
@@ -507,12 +456,12 @@ fn disabled_fixed_paths_preserve_the_boot_line_bytes() {
 }
 
 #[test]
-fn fixed_path_policy_is_shared_by_job_and_fill_but_not_recovery_or_other_accounts() {
+fn fixed_path_policy_is_for_job_boots_and_scoped_to_the_account() {
     let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
     let other = "org:01ARZ3NDEKTSV4RRFFQ69G5FAV";
     for roots in [vec!["/repo/a", "/repo/b"], vec!["*"]] {
         let settings = fixed_path_settings(json!({account: roots, other: ["/other"]}));
-        for kind in [job::VmKind::Job, job::VmKind::Fill, job::VmKind::Recovery] {
+        for kind in [job::VmKind::Job, job::VmKind::Recovery] {
             let mut shape = start();
             shape.account = account.into();
             shape.kind = kind;
@@ -537,7 +486,6 @@ fn fixed_path_policy_is_shared_by_job_and_fill_but_not_recovery_or_other_account
             }
             assert!(!text.contains("/other"));
             assert!(!text.contains(other));
-            assert_eq!(line.ends_with(" motor.fill=1"), kind == job::VmKind::Fill);
             let early = early_boot_command_line(
                 &shape,
                 4 << 30,
@@ -596,15 +544,14 @@ fn fixed_path_policy_is_shared_by_job_and_fill_but_not_recovery_or_other_account
 fn configured_fixed_paths_are_included_in_the_early_boot_budget() {
     let mut shape = start();
     shape.account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
-    for kind in [job::VmKind::Job, job::VmKind::Fill] {
-        shape.kind = kind;
+    {
         let registry = disk_registry(&shape);
         let settings =
             fixed_path_settings(json!({shape.account.clone(): [format!("/{}", "x".repeat(1024))]}));
         assert!(early_boot_command_line(
             &shape,
             4 << 30,
-            fixed_path_policy(&settings, &registry, kind)
+            fixed_path_policy(&settings, &registry, shape.kind)
         )
         .unwrap_err()
         .0
@@ -614,7 +561,7 @@ fn configured_fixed_paths_are_included_in_the_early_boot_budget() {
 }
 
 #[test]
-fn fixed_path_validation_worst_case_bounds_real_job_and_fill_boot_lines() {
+fn fixed_path_validation_worst_case_bounds_real_job_boot_lines() {
     let account = "acct:01KXJJHK4V6DB42W1YAN2XD9QN";
     let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
     for ceiling in [Some(4 << 30), Some(1024 << 30), Some(u64::MAX - 511), None] {
@@ -628,39 +575,36 @@ fn fixed_path_validation_worst_case_bounds_real_job_and_fill_boot_lines() {
         let mut reached_worst = false;
         for bytes in [512, 4 << 30, maximum_disk] {
             for vcpus in [1, 9, 10, 32] {
-                for kind in [job::VmKind::Job, job::VmKind::Fill] {
-                    for cache_nonce in [None, Some(nonce.as_str())] {
-                        let mut shape = start();
-                        shape.account = account.into();
-                        shape.vcpus = vcpus;
-                        shape.kind = kind;
-                        let registry = disk_registry(&shape);
-                        let mut requests = recorded_boot_requests(
-                            &shape,
-                            Some(17),
-                            cache_nonce,
-                            bytes,
-                            &registry,
-                            &settings,
-                        )
-                        .unwrap();
-                        authorize_job_write_boot(
-                            &mut requests,
-                            &shape,
-                            cache_nonce,
-                            kind == job::VmKind::Job && cache_nonce.is_some(),
-                        )
-                        .unwrap();
-                        let actual = requests[1].1["boot_args"].as_str().unwrap();
-                        assert!(
+                for cache_nonce in [None, Some(nonce.as_str())] {
+                    let mut shape = start();
+                    shape.account = account.into();
+                    shape.vcpus = vcpus;
+                    let registry = disk_registry(&shape);
+                    let mut requests = recorded_boot_requests(
+                        &shape,
+                        Some(17),
+                        cache_nonce,
+                        bytes,
+                        &registry,
+                        &settings,
+                    )
+                    .unwrap();
+                    authorize_job_write_boot(
+                        &mut requests,
+                        &shape,
+                        cache_nonce,
+                        cache_nonce.is_some(),
+                    )
+                    .unwrap();
+                    let actual = requests[1].1["boot_args"].as_str().unwrap();
+                    assert!(
                             worst.len() >= actual.len(),
-                            "validation reserved {} bytes, start needs {} (ceiling={ceiling:?}, disk={bytes}, vcpus={vcpus}, kind={kind:?}, remote_cache={})",
+                            "validation reserved {} bytes, start needs {} (ceiling={ceiling:?}, disk={bytes}, vcpus={vcpus}, remote_cache={})",
                             worst.len(),
                             actual.len(),
                             cache_nonce.is_some(),
                         );
-                        reached_worst |= worst.len() == actual.len();
-                    }
+                    reached_worst |= worst.len() == actual.len();
                 }
             }
         }
@@ -1419,37 +1363,6 @@ fn isolated_job_vmm_survives_helper_service_restart() {
     restarted.acknowledge_exit(report).unwrap();
 }
 #[test]
-fn fill_boot_authority_comes_from_the_root_disk_role_not_the_requested_start_kind() {
-    let mut start = start();
-    start.kind = job::VmKind::Fill;
-    let mut requested = boot_requests(&start, Some(7), None, 4u64 << 30).unwrap();
-    let boot = |requests: &[(&str, Value)]| {
-        requests
-            .iter()
-            .find(|(path, _)| *path == "/boot-source")
-            .unwrap()
-            .1["boot_args"]
-            .as_str()
-            .unwrap()
-            .to_owned()
-    };
-    assert!(!boot(&requested)
-        .split_whitespace()
-        .any(|word| word == "motor.fill=1"));
-    authorize_fill_boot(&mut requested, job::WorkspaceRole::Job).unwrap();
-    assert!(!boot(&requested)
-        .split_whitespace()
-        .any(|word| word == "motor.fill=1"));
-    authorize_fill_boot(&mut requested, job::WorkspaceRole::Fill).unwrap();
-    assert!(boot(&requested)
-        .split_whitespace()
-        .any(|word| word == "page_reporting.page_reporting_order=5"));
-    assert!(boot(&requested)
-        .split_whitespace()
-        .any(|word| word == "motor.fill=1"));
-}
-
-#[test]
 fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
     let base = scratch();
     let mut record = record();
@@ -1490,7 +1403,7 @@ fn replayed_token_after_helper_restart_cannot_start_a_second_write_vm() {
 }
 
 #[test]
-fn write_boot_flag_requires_job_role_and_staged_credentials_without_granting_fill() {
+fn write_boot_flag_requires_job_role_and_staged_credentials() {
     let start = start();
     let nonce = "ab".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES);
     let mut requests = boot_requests(&start, Some(1), Some(&nonce), 4096).unwrap();
@@ -1505,7 +1418,6 @@ fn write_boot_flag_requires_job_role_and_staged_credentials_without_granting_fil
     assert!(boot
         .split_whitespace()
         .any(|part| part == "motor.cache_write=1"));
-    assert!(!boot.contains("motor.fill=1"));
     assert!(!boot.contains("motor.recovery=1"));
     assert_eq!(
         requests
@@ -1516,11 +1428,10 @@ fn write_boot_flag_requires_job_role_and_staged_credentials_without_granting_fil
         true
     );
     assert_eq!(start.kind, job::VmKind::Job);
-    for case in ["missing-key", "no-disk", "block", "fill", "recovery"] {
+    for case in ["missing-key", "no-disk", "block", "recovery"] {
         let mut start = start.clone();
         match case {
             "block" => start.cache_write_blocked = true,
-            "fill" => start.kind = job::VmKind::Fill,
             "recovery" => start.kind = job::VmKind::Recovery,
             _ => {}
         }

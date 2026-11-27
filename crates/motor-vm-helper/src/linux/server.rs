@@ -56,12 +56,8 @@ impl Service {
                 | crate::job::Operation::Stop(_)
                 | crate::job::Operation::EnsureWorkspace { .. }
                 | crate::job::Operation::DeleteWorkspace { .. }
-                | crate::job::Operation::SeedWorkspace(_)
                 | crate::job::Operation::ForkWorkspace(_)
-                | crate::job::Operation::EvictBase { .. }
                 | crate::job::Operation::WorkspaceUsage { .. }
-                | crate::job::Operation::PrepareFill(_)
-                | crate::job::Operation::FinishFill { .. }
         ) {
             let held = crate::lock_order::enter(crate::lock_order::Lock::G);
             let guard = self

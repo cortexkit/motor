@@ -175,7 +175,7 @@ under a new one.
 The helper accepts bounded, newline-delimited JSON operations from authorized
 peers. A job start names `job_id`, `account`, `workspace_disk_id` and
 `image_generation_id`, with `vcpus`, `memory_mib`, optional `burst_mib` and a
-`kind` of `job` (default), `fill`, `base_build` or `recovery`. It accepts neither
+`kind` of `job` (default) or `recovery`. It accepts neither
 caller paths nor key material. Relays return descriptors; the host never gets
 the Firecracker API socket. Tenant operations are described in the
 [helper README](../crates/motor-vm-helper/README.md#persistent-tenant-operations).
@@ -240,15 +240,6 @@ implementation with fixtures; root-only tests need a dedicated operator host.
 
 ### Per-job host settings and rollback
 
-The helper grants the Fill guest operation only from the root-owned disk role,
-never from a host-supplied start kind alone. Job VMs refuse the Fill operation,
-and Fill VMs refuse Run admission. Fill VMs import verified bundles on a fresh
-disk, never a filesystem written by a job VM. Fills for fixed-path repositories
-can publish [build bases](compile-cache.md#fixed-paths-and-local-build-bases);
-other fills warm the compiler cache and delete their disks. See
-[per-job fill sources](hosted-host.md#per-job-fill-sources) for the byte and time
-limits and VM resource lifetime.
-
 The root-owned helper configuration accepts an optional
 `job_vms.fixed_path_repositories` map, for example:
 
@@ -260,12 +251,12 @@ Keys must be `acct:` or `org:` account subjects. Values are lists of distinct
 absolute repository roots without whitespace, or `["*"]` alone. A missing map,
 missing account or empty list leaves fixed paths off. Helper startup and the
 read-only `check-config` command refuse malformed maps. The helper uses the
-account in its root-owned workspace registry to supply the same fixed-path
-policy to Job and Fill VMs, never Recovery VMs. Neither a host start request nor
-guest source metadata can add roots. A new workspace disk may be seeded from a
-matching base; an existing disk is never replaced. The host selects a base using
-the lease's account and Run's exact repository root before boot. Missing bases
-and failed seed attempts fall back to normal workspace creation.
+account in its root-owned workspace registry to supply the fixed-path policy
+to Job VMs, never Recovery VMs. Neither the start request nor guest input can
+add roots. For a new worktree with `fork_checkouts: true`, the helper copies
+an eligible warm checkout disk from the same account and repository. If no donor
+can be copied, or forking is disabled, the new disk starts empty. An existing
+disk is never replaced.
 The list travels on a job VM's boot command line, so settings validation refuses
 lists too long to fit. Use `"*"` to enable every repository of the account, or list
 fewer roots.
@@ -274,6 +265,7 @@ The host JSON's required `per_job` settings have no compiled-in defaults:
 
 | Setting | Purpose |
 | --- | --- |
+| `fork_checkouts` | Copy a new worktree's checkout disk from the repository's chosen warm disk. When false, new worktrees start empty. |
 | `vcpu_ceiling` | Maximum job vCPUs, bounded by online CPUs. |
 | `permit_budget` | Overcommitted host vCPU permits, from the ceiling through four times online CPUs. |
 | `host_reserve_mib` | Available-memory reserve in MiB. |
@@ -297,8 +289,9 @@ served production jobs yet.
 
 The helper owns the account credential store. Root's `motor-vm-helper
 set-remote-cache` installs a complete set atomically; only future starts see a
-replacement. Jobs get read credentials, fills/base builds also get the write key,
-and recovery gets none. See the [root command and source-file requirements](hosted-host.md#root-remote-cache-credential-command).
+replacement. Jobs get read credentials, and only jobs with a verified cache-write
+grant get the write key. Recovery gets neither. See the
+[root command and source-file requirements](hosted-host.md#root-remote-cache-credential-command).
 
 The implemented rollback keeps placement drained, selects tenant mode and
 restarts from retained tenant disks through recovery, discarding per-job workspace

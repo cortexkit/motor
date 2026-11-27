@@ -1,5 +1,10 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+pub(crate) fn repository_key(root: &str) -> String {
+    format!("{:x}", Sha256::digest(root.as_bytes()))
+}
 
 #[derive(Default)]
 pub(crate) struct Hold {
@@ -18,12 +23,22 @@ pub(crate) struct Plan {
 }
 
 impl Host {
+    /// A prior boot attempt may already have created or warmed this disk.
+    pub(crate) fn job_workspace_is_new(&self, job: &str) -> bool {
+        let execution = &self.snapshot.per_job.executions[job];
+        !self
+            .snapshot
+            .per_job
+            .executions
+            .values()
+            .any(|e| e.disk_id == execution.disk_id && e.boot_started && e.claims.jti != job)
+    }
     pub(crate) fn note_job_repository(&mut self, job: &str, root: &str) -> Result<(), Error> {
         if root.is_empty() {
             return Ok(());
         }
         let disk_id = &self.snapshot.per_job.executions[job].disk_id;
-        let key = crate::jobs::fill_source::repository_key(root);
+        let key = repository_key(root);
         if self.snapshot.per_job.disks[disk_id].repository_key.as_ref() == Some(&key) {
             return Ok(());
         }
@@ -66,7 +81,7 @@ impl Host {
         let Some(storage) = &disk.storage else {
             return Ok(None);
         };
-        let key = crate::jobs::fill_source::repository_key(root);
+        let key = repository_key(root);
         let mut donors: Vec<_> = self
             .snapshot
             .per_job

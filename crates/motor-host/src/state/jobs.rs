@@ -7,7 +7,6 @@ use motor_lease::{Claims, Purpose};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-pub mod fills;
 pub(crate) mod forks;
 pub(crate) mod have;
 pub mod images;
@@ -31,24 +30,16 @@ pub(super) struct MemoryWaiterHold {
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Ledger {
-    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
-    pub fill_sources: super::Table<crate::jobs::fill_source::Slot>,
-    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
-    pub export_tips: super::Table<crate::jobs::fill_source::Request>,
     /// The helper's store may rotate while the kept tenant disk is unused.
     /// Tenant startup must install the current sets before clearing this fence.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tenant_rollback_pending: bool,
-    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
-    pub fills: super::Table<fills::Reservation>,
     /// A DAX-less boot requires operator intervention, not an automatic retry.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dax_failed: bool,
     /// Disk ids are opaque VM names in placement hints, not account or workspace names.
     pub disks: super::Table<WorkspaceDisk>,
     pub executions: super::Table<Execution>,
-    #[serde(default, skip_serializing_if = "super::Table::is_empty")]
-    pub bases: super::Table<storage::Base>,
     #[serde(default, skip_serializing_if = "super::Table::is_empty")]
     pub images: super::Table<images::Generation>,
 }
@@ -57,33 +48,21 @@ impl Ledger {
     /// Folds every table's changes into its base; see `Snapshot::commit`.
     pub(super) fn commit(&mut self) {
         let Self {
-            fill_sources,
-            export_tips,
             tenant_rollback_pending: _,
-            fills,
             dax_failed: _,
             disks,
             executions,
-            bases,
             images,
         } = self;
-        fill_sources.commit();
-        export_tips.commit();
-        fills.commit();
         disks.commit();
         executions.commit();
-        bases.commit();
         images.commit();
     }
     pub fn is_empty(&self) -> bool {
         !self.tenant_rollback_pending
-            && self.fill_sources.is_empty()
-            && self.export_tips.is_empty()
             && !self.dax_failed
-            && self.fills.is_empty()
             && self.disks.is_empty()
             && self.executions.is_empty()
-            && self.bases.is_empty()
             && self.images.is_empty()
     }
 }
@@ -361,13 +340,6 @@ impl Host {
             .filter_map(|d| d.recovery.as_ref())
             .filter(|r| r.holds_vm_capacity())
             .fold(free, |free, r| free.saturating_sub(r.memory_debit_mib));
-        let free = self
-            .snapshot
-            .per_job
-            .fills
-            .values()
-            .filter(|f| !f.runner_hello)
-            .fold(free, |free, f| free.saturating_sub(f.memory_debit_mib));
         free.saturating_sub(self.job_memory_hold(now_ms).held_back_mib)
     }
 
@@ -431,13 +403,6 @@ impl Host {
             .fold(0u64, |sum, recovery| {
                 sum.saturating_add(recovery.memory_debit_mib)
             });
-        let fill_memory_debit_mib = self
-            .snapshot
-            .per_job
-            .fills
-            .values()
-            .filter(|fill| !fill.runner_hello)
-            .fold(0u64, |sum, fill| sum.saturating_add(fill.memory_debit_mib));
         let hold = self.job_memory_hold(now_ms);
         let held_for_waiter_mib = self.job_memory_waiter_hold.as_ref().map_or(0, |hold| {
             self.snapshot.per_job.executions[&hold.job].memory_debit_mib
@@ -453,7 +418,6 @@ impl Host {
             running_memory_debit_mib,
             running_subtracted_mib = 0u64,
             recovery_memory_debit_mib,
-            fill_memory_debit_mib,
             disk_waiters,
             held_back_mib = hold.held_back_mib,
             held_for_waiter_mib,
@@ -549,10 +513,9 @@ impl Host {
                 .executions
                 .values()
                 .filter(|job| !job.ended)
-                .try_fold(
-                    self.recovery_permits().saturating_add(self.fill_permits()),
-                    |used, job| used.checked_add(job.claims.vcpus),
-                );
+                .try_fold(self.recovery_permits(), |used, job| {
+                    used.checked_add(job.claims.vcpus)
+                });
             if claims.vcpus > sample.vcpu_ceiling
                 || used
                     .and_then(|used| used.checked_add(claims.vcpus))

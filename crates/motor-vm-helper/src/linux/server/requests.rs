@@ -33,11 +33,7 @@ pub(super) fn job_request(request: Request) -> Result<job::Operation, Request> {
         Request::DeleteWorkspace { account, disk_id } => {
             job::Operation::DeleteWorkspace { account, disk_id }
         }
-        Request::PrepareFill { fill } => job::Operation::PrepareFill(fill),
-        Request::FinishFill { fill, published } => job::Operation::FinishFill { fill, published },
-        Request::SeedWorkspace { seed } => job::Operation::SeedWorkspace(seed),
         Request::ForkWorkspace { fork } => job::Operation::ForkWorkspace(fork),
-        Request::EvictBase { account, disk_id } => job::Operation::EvictBase { account, disk_id },
         Request::WorkspaceUsage { account, disk_id } => {
             job::Operation::WorkspaceUsage { account, disk_id }
         }
