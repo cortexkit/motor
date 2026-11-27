@@ -2682,37 +2682,38 @@ async fn aged_workspace_head_precedes_never_dispatched_workspaces() {
 }
 
 #[tokio::test]
-async fn impossible_demand_does_not_fence_other_workspaces() {
+async fn impossible_demand_is_refused_up_front_without_fencing_other_workspaces() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
     warm(&f, &runner).await;
-    let (mut impossible, bytes) = f.run("touch impossible");
+    let (mut impossible, _) = f.run("touch impossible");
     impossible.weight_hint = Some(30);
-    impossible.queue_wait_limit_s = BACKFILL_GRACE_MS / 1000;
-    f.submit(&runner, &impossible, &bytes);
-    f.clock.fetch_add(BACKFILL_GRACE_MS, Ordering::SeqCst);
+    assert!(matches!(
+        runner.accept(impossible.clone()).unwrap(),
+        Admission::Refused(RefusalReason::RunnerFull)
+    ));
+    assert_eq!(runner.status().queue_depth, 0);
+    let record = terminal(&runner, impossible.job_id).await;
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerFull
+        }
+    );
+    assert_eq!(record.ran, Some(Ran::None));
+    let detail = record
+        .refusal_detail()
+        .expect("missing capacity diagnostic");
+    assert!(
+        detail.contains("vcpu request 30") && detail.contains("max_weight limit"),
+        "{detail}"
+    );
     let (cheap, bytes) = job_at(&f, "cheap", "true");
     f.submit(&runner, &cheap, &bytes);
     assert_eq!(
         terminal(&runner, cheap.job_id).await.outcome,
         Outcome::Exit { code: 0 }
     );
-    runner.withdraw(impossible.job_id).unwrap();
-    let record = terminal(&runner, impossible.job_id).await;
-    assert_eq!(
-        record.outcome,
-        Outcome::RefusedBeforeStart {
-            reason: RefusalReason::QueueWaitExceeded
-        }
-    );
-    let detail = record
-        .refusal_detail()
-        .expect("missing capacity diagnostic");
-    assert!(
-        detail.contains("waiting_on=demand exceeds capacity"),
-        "{detail}"
-    );
-    assert!(detail.contains("requested_permits=30"), "{detail}");
     assert!(!Path::new(&impossible.workspace_key)
         .join("impossible")
         .exists());
@@ -2945,19 +2946,26 @@ async fn capacity_retry_hint_is_clamped_to_its_bounds() {
 
 /// A job too heavy for the runner can never start, so a recent median queue
 /// wait is no reason to send the caller back.
-#[tokio::test]
-async fn impossible_demand_refusal_carries_no_retry_hint() {
+#[test]
+fn impossible_demand_admission_refusal_carries_no_retry_hint() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
-    warm(&f, &runner).await;
-    let record = capacity_refusal(&runner, &f, "retry-hint-impossible", 30, &[30_000], 1_000);
+    record_queue_waits(&runner, &[30_000]);
+    let (mut impossible, _) = f.run("true");
+    impossible.weight_hint = Some(30);
+    assert!(matches!(
+        runner.accept(impossible.clone()).unwrap(),
+        Admission::Refused(RefusalReason::RunnerFull)
+    ));
+    let record = runner
+        .job_status(impossible.job_id)
+        .unwrap()
+        .terminal
+        .unwrap();
     let detail = record
         .refusal_detail()
         .expect("missing capacity diagnostic");
-    assert!(
-        detail.starts_with("waiting_on=demand exceeds capacity"),
-        "{detail}"
-    );
+    assert!(detail.contains("max_weight limit"), "{detail}");
     assert_eq!(record.retry_after_ms(), None);
 }
 
@@ -3263,9 +3271,25 @@ async fn writer_failure_keeps_success_status_without_publishing_target_generatio
 #[tokio::test]
 async fn queued_withdraw_is_atomic_and_running_withdraw_reports_started() {
     let f = Fixture::new();
-    let runner = Runner::open(f.config()).unwrap();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let release = f.scratch.join("release");
+    let mut release_writer = ReleaseWriter::new(release.clone());
+    let (mut holder, bytes) = job_at(
+        &f,
+        "holder",
+        &format!(
+            "while test ! -e '{}'; do sleep .02; done",
+            release.display()
+        ),
+    );
+    holder.weight_hint = Some(4);
+    f.submit(&runner, &holder, &bytes);
+    until(|| runner.job_status(holder.job_id).unwrap().state == "running").await;
+
     let (mut r, bytes) = f.run("touch marker");
-    r.weight_hint = Some(30);
     r.queue_wait_limit_s = 0;
     f.submit(&runner, &r, &bytes);
     assert_eq!(
@@ -3279,31 +3303,22 @@ async fn queued_withdraw_is_atomic_and_running_withdraw_reports_started() {
             reason: RefusalReason::QueueWaitExceeded
         }
     );
-    assert!(record.refusal_detail().unwrap().starts_with("waiting_on="));
     assert!(record
         .refusal_detail()
         .unwrap()
-        .contains("requested_permits=30"));
+        .starts_with("waiting_on=permits"));
+    assert!(record
+        .refusal_detail()
+        .unwrap()
+        .contains("requested_permits=2"));
     assert!(!Path::new(&f.key).join("marker").exists());
-    base_done(&runner).await;
-    let release = f.scratch.join("release");
-    let (r, bytes) = f.run(&format!(
-        "while test ! -e '{}'; do sleep .02; done",
-        release.display()
-    ));
-    f.submit(&runner, &r, &bytes);
-    until(|| {
-        runner
-            .status()
-            .running_jobs
-            .iter()
-            .any(|j| j.job_id == r.job_id)
-    })
-    .await;
-    assert_eq!(runner.withdraw(r.job_id).unwrap(), WithdrawOutcome::Started);
-    fs::write(release, "").unwrap();
     assert_eq!(
-        terminal(&runner, r.job_id).await.outcome,
+        runner.withdraw(holder.job_id).unwrap(),
+        WithdrawOutcome::Started
+    );
+    release_writer.release();
+    assert_eq!(
+        terminal(&runner, holder.job_id).await.outcome,
         Outcome::Exit { code: 0 }
     );
 }
@@ -5262,9 +5277,10 @@ fn drain_tick_refusal_carries_the_retry_floor() {
 fn refused_transfer_survives_maintenance_and_restart_until_retention_expires() {
     let f = Fixture::new();
     fs::write(f.main.join("source"), "dirty snapshot\n").unwrap();
-    let runner = Runner::open(f.config()).unwrap();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config.clone()).unwrap();
     let (mut request, bytes) = f.run_worktree("true");
-    request.weight_hint = Some(30);
     request.queue_wait_limit_s = 0;
     f.submit(&runner, &request, &bytes);
     assert_eq!(
@@ -5280,7 +5296,7 @@ fn refused_transfer_survives_maintenance_and_restart_until_retention_expires() {
         .commits
         .contains(&request.snapshot_commit));
     drop(runner);
-    let runner = reopen(f.config());
+    let runner = reopen(config);
     runner.maintenance().unwrap();
     assert!(runner.have(offered.clone())[0]
         .commits
@@ -5325,9 +5341,8 @@ fn failed_prepare_keeps_its_completed_transfer_after_guard_and_restart() {
 #[tokio::test]
 async fn queued_heartbeat_does_not_wait_for_the_global_state_lock() {
     let f = Fixture::new();
-    let runner = Runner::open(f.config()).unwrap();
-    let (mut request, bytes) = f.run("true");
-    request.weight_hint = Some(30);
+    let runner = manual_tick_runner(&f, 4);
+    let (request, bytes) = f.run("true");
     f.submit(&runner, &request, &bytes);
     let (socket, server) = listener(&f, &runner);
     let mut stream = connect(&socket).await;
@@ -5379,9 +5394,8 @@ async fn queued_heartbeat_does_not_wait_for_the_global_state_lock() {
 #[test]
 fn terminal_transition_clears_published_queue_entry() {
     let f = Fixture::new();
-    let runner = Runner::open(f.config()).unwrap();
+    let runner = manual_tick_runner(&f, 4);
     let (mut request, bytes) = f.run("true");
-    request.weight_hint = Some(30);
     request.queue_wait_limit_s = 0;
     f.submit(&runner, &request, &bytes);
     let progress = runner.queue_progress(request.job_id);

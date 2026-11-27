@@ -260,6 +260,18 @@ pub(super) struct Fixture {
     pub clock: Arc<AtomicU64>,
     pub remote_key: PathBuf,
 }
+
+struct PermitHolder {
+    release: PathBuf,
+    stream: JobStream,
+}
+
+impl Drop for PermitHolder {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, "");
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
@@ -436,6 +448,42 @@ impl Fixture {
     }
     pub fn request(&self, command: &str) -> RunRequest {
         serde_json::from_value(serde_json::json!({"workspace_key":text(&self.key),"repository_root":text(&self.main),"cwd":text(&self.key),"command":command,"env":{},"siblings":[text(&self.sibling)],"queue_wait_limit_s":900})).unwrap()
+    }
+    /// Use a separate workspace so the waiting job is blocked by permits,
+    /// not by a checkout owner, which would pause its queue-wait clock.
+    async fn hold_permits(&self, motor: &Motor) -> PermitHolder {
+        let workspace = self.key.with_file_name("permit-holder");
+        git(
+            &self.main,
+            &["worktree", "add", "--detach", &text(&workspace)],
+        );
+        let release = self.scratch.join("release-permits");
+        let mut request = self.request(&format!(
+            "while test ! -e '{}'; do sleep .02; done",
+            release.display()
+        ));
+        request.workspace_key = text(&workspace);
+        request.cwd = text(&workspace);
+        request.siblings.clear();
+        request.weight_hint = Some(self.runner.config().max_weight);
+        let holder = PermitHolder {
+            release,
+            stream: motor.run(request).unwrap(),
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !self
+                .runner
+                .status()
+                .running_jobs
+                .iter()
+                .any(|job| job.job_id == holder.stream.job_id)
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("permit holder must start before submitting another job");
+        holder
     }
     pub fn recorded_run(&self) -> Run {
         self.proxy
@@ -762,12 +810,26 @@ async fn lost_upload_a_before_runner_reads_run() {
 
 #[tokio::test]
 async fn queued_job_restart_returns_lost_to_restart_promptly_without_resubmission() {
-    let mut f = Fixture::new(Cut::None, 1).await;
+    // Low free space for the requested return keeps this valid job queued
+    // without keeping the old runner alive to monitor a permit holder.
+    let free = Arc::new(AtomicU64::new(4096));
+    let probe = free.clone();
+    let mut f = Fixture::with_runner_config(Cut::None, 2, None, |config| {
+        config.return_budget_bytes = Some(32 * 1024 * 1024);
+        config.free_space_probe = Arc::new(move |_| Ok(probe.load(Ordering::SeqCst)));
+    })
+    .await;
     let motor = f.motor();
-    let mut request = f.request("echo forbidden >> marker");
-    // Valid CPU claims above the one-permit budget queue instead of being refused at admission.
-    request.weight_hint = Some(2);
-    let mut stream = motor.run(request).unwrap();
+    let mut stream = motor
+        .run_with_returns(
+            f.request("echo forbidden >> marker"),
+            ReturnOptions {
+                return_paths: vec![text(&f.key.join("marker"))],
+                return_max_bytes: 1024 * 1024,
+                return_chunked: true,
+            },
+        )
+        .unwrap();
     let id = stream.job_id;
     assert!(matches!(
         stream.records.recv().await.unwrap().unwrap(),
@@ -784,7 +846,15 @@ async fn queued_job_restart_returns_lost_to_restart_promptly_without_resubmissio
     })
     .await
     .unwrap();
+    let waiting_on = f.runner.job_status(id).unwrap().waiting_on;
+    assert!(
+        waiting_on
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("returned bytes budget (")),
+        "waiting_on={waiting_on:?}"
+    );
     f.restart_runner().await;
+    free.store(u64::MAX, Ordering::SeqCst);
     let records = tokio::time::timeout(Duration::from_secs(5), collect(stream))
         .await
         .expect("restart terminal must not wait for the 1830-second transport deadline");
@@ -1062,18 +1132,17 @@ async fn setup_failure_has_one_terminal_and_no_queue_entry() {
 }
 #[tokio::test]
 async fn queue_depth_counts_sixty_four_awaiting_bundles() {
-    let f = Fixture::new(Cut::None, 0).await;
+    let f = Fixture::new(Cut::HoldSecond, 2).await;
     let motor = f.motor();
-    // Obtain real snapshot/manifest data without letting its first job dispatch.
+    // Capture a real bundle manifest while the first upload is incomplete.
     let first = motor.run(f.request("true")).unwrap();
-    let first_id = first.job_id;
-    let mut first = first;
-    assert!(matches!(
-        first.records.recv().await.unwrap().unwrap(),
-        StreamRecord::Accepted(_)
-    ));
-    motor.cancel(CancelRequest::new(first_id)).await.unwrap();
-    collect(first).await;
+    tokio::time::timeout(Duration::from_secs(10), f.proxy.cut_seen.notified())
+        .await
+        .expect("first job must reach the held second bundle");
+    first.cancel().unwrap();
+    let records = collect(first).await;
+    assert!(matches!(records.first(), Some(StreamRecord::Accepted(_))));
+    assert_eq!(terminal(&records).outcome, Outcome::Cancelled);
     let template = f.recorded_run();
     let mut channels = Vec::new();
     for _ in 0..64 {
@@ -1103,8 +1172,9 @@ async fn queue_depth_counts_sixty_four_awaiting_bundles() {
 }
 #[tokio::test]
 async fn zero_queue_wait_withdraws_and_cancel_is_idempotent() {
-    let f = Fixture::new(Cut::None, 0).await;
+    let f = Fixture::new(Cut::None, 2).await;
     let motor = f.motor();
+    let _holder = f.hold_permits(&motor).await;
     let mut request = f.request("echo ran >> marker");
     request.queue_wait_limit_s = Some(0);
     let stream = motor.run(request).unwrap();
@@ -1117,7 +1187,7 @@ async fn zero_queue_wait_withdraws_and_cancel_is_idempotent() {
         }
     );
     let detail = terminal(&records).refusal_detail().unwrap();
-    assert!(detail.starts_with("waiting_on=") && detail.contains("held_permits=0/1"));
+    assert!(detail.starts_with("waiting_on=permits") && detail.contains("held_permits=2/2"));
     motor.cancel(CancelRequest::new(id)).await.unwrap();
     motor.cancel(CancelRequest::new(id)).await.unwrap();
     assert_eq!(
@@ -1166,12 +1236,10 @@ async fn draining_retry_hint_is_decoded_and_logged_by_ck_motor() {
 
 #[tokio::test]
 async fn queued_drain_retry_hint_reaches_ck_motor_callers() {
-    let f = Fixture::new(Cut::None, 1).await;
+    let f = Fixture::new(Cut::None, 2).await;
     let motor = f.motor();
-    let mut request = f.request("echo forbidden >> marker");
-    // A valid claim above the permit budget keeps the job queued until drain.
-    request.weight_hint = Some(2);
-    let mut stream = motor.run(request).unwrap();
+    let _holder = f.hold_permits(&motor).await;
+    let mut stream = motor.run(f.request("echo forbidden >> marker")).unwrap();
     let id = stream.job_id;
     assert!(matches!(
         stream.records.recv().await.unwrap().unwrap(),
@@ -1244,12 +1312,12 @@ async fn retry_hint_is_removed_from_started_job_terminal() {
 
 #[tokio::test]
 async fn refused_snapshot_retry_after_maintenance_sends_no_bundle() {
-    let f = Fixture::new(Cut::None, 1).await;
-    fs::write(f.key.join("source"), "dirty retained snapshot\n").unwrap();
+    let f = Fixture::new(Cut::None, 2).await;
     let motor = f.motor();
+    let _holder = f.hold_permits(&motor).await;
+    f.proxy.frames.lock().unwrap().clear();
+    fs::write(f.key.join("source"), "dirty retained snapshot\n").unwrap();
     let mut request = f.request("true");
-    // Import the snapshot before withdrawing the request from the queue; a CPU claim above the allocatable limit is refused without importing it.
-    request.weight_hint = Some(2);
     request.queue_wait_limit_s = Some(0);
     let records = collect(motor.run(request.clone()).unwrap()).await;
     assert_eq!(terminal(&records).ran, Some(Ran::None));
