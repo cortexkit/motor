@@ -175,10 +175,15 @@ def artifact(path):
 JOB_RUNNER_HELLO_ARGS = ("--backend", "host", "--tenant-vm",
                          "--return-chunked-max-bytes", "134217728",
                          "--return-budget-bytes", "2147483648")
+# The flag the guest adds to those at boot (crates/motor-runner/src/tenant_agent/
+# per_job.rs). Without it the pinned Hello would offer a default-branch tip
+# the per-job runner never sends, and motor-host would refuse every job.
+JOB_RUNNER_GUEST_ARGS = ("--per-job",)
 
 
 def runner_hello(runner):
-    result = subprocess.run([str(runner), "print-hello", *JOB_RUNNER_HELLO_ARGS],
+    result = subprocess.run([str(runner), "print-hello", *JOB_RUNNER_HELLO_ARGS,
+                             *JOB_RUNNER_GUEST_ARGS],
                             check=True, capture_output=True, text=True)
     hello = json.loads(result.stdout)
     if not isinstance(hello, dict) or hello.get("type") != "hello" or hello.get("protocol_version") != 1:

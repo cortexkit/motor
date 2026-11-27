@@ -29,6 +29,20 @@ class JobImageTests(unittest.TestCase):
         self.assertIn(f'"{backend} --job-network', source)
         self.assertIn(returns, source)
 
+    def test_pinned_hello_arguments_include_the_flag_the_guest_adds_at_boot(self):
+        # The booted runner also gets the guest's own flag; the pinned Hello
+        # must be printed with it, or the per-job runner's Hello would not
+        # cover the pinned one.
+        guest = Path(__file__).resolve().parents[2] / "crates/motor-runner/src/tenant_agent/per_job.rs"
+        source = guest.read_text()
+        for flag in job_images.JOB_RUNNER_GUEST_ARGS:
+            self.assertIn(f'args.words.push("{flag}".into())', source)
+        with mock.patch.object(job_images.subprocess, "run") as run:
+            run.return_value.stdout = '{"type":"hello","protocol_version":1}'
+            job_images.runner_hello(Path("/runner"))
+        self.assertEqual(run.call_args.args[0][-len(job_images.JOB_RUNNER_GUEST_ARGS):],
+                         list(job_images.JOB_RUNNER_GUEST_ARGS))
+
     def test_missing_installer_loader_refuses_build(self):
         with mock.patch.object(job_images.importlib.util, "spec_from_file_location", return_value=None):
             with self.assertRaisesRegex(ImportError, "shared tenant installer"):

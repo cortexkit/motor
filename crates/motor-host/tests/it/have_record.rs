@@ -52,6 +52,11 @@ fn commit(path: &Path, text: &str) -> String {
 fn hello() -> Value {
     json!({"type":"hello","protocol_version":1,"started":true,"default_branch_tip":true})
 }
+/// The Hello pinned in a job image, which is what the booted per-job runner
+/// sends: it offers no default-branch tip, even to a client that offers one.
+fn image_hello() -> Value {
+    json!({"type":"hello","protocol_version":1,"started":true,"default_branch_tip":false})
+}
 
 const WORKSPACE_DISK_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -225,7 +230,7 @@ impl Resources for Disk {
     fn acquire(&self, execution: &Execution) -> Result<Assignment> {
         Ok(Assignment {
             image_generation_id: "generation".into(),
-            hello: hello(),
+            hello: image_hello(),
             guest_init: json!({}),
             spool: self.root.join(format!("{}.spool", execution.claims.jti)),
         })
