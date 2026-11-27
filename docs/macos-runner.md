@@ -351,6 +351,8 @@ only held while the volume was mounted at `target/` itself.
   status; the caller's standard error also ends with
   `motor: the build disk could not be released: <reason>` when the agent can
   still write it. The runner logs the reason with the job ID.
+  A job process that survives the end-of-job sweeps fails the build-disk
+  release, not the command's exit status.
 - **Publication.** After the VM has provably stopped, the runner renames the
   job's disk over `targets/<key>.img` when the agent sent
   `BuildRelease { released: true }`, because only then was the volume cleanly
