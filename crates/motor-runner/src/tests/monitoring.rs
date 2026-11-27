@@ -332,17 +332,17 @@ fn oom_result_records_detail_and_preserves_the_exit_code() {
         (
             16,
             "56",
-            " Request more vCPUs, for example linux,30c, to raise the limit to 105 GiB.",
+            " Request more vCPUs, for example linux,28c, to raise the limit to 98 GiB.",
         ),
         (
-            29,
-            "101.5",
-            " Request more vCPUs, for example linux,30c, to raise the limit to 105 GiB.",
+            27,
+            "94.5",
+            " Request more vCPUs, for example linux,28c, to raise the limit to 98 GiB.",
         ),
         (
-            30,
-            "105",
-            " The job is already at the maximum of 30 vCPUs (105 GiB).",
+            28,
+            "98",
+            " The job is already at the maximum of 28 vCPUs (98 GiB).",
         ),
     ] {
         for (result, code, oom) in [("oom-kill", 143, true), ("success", 0, false)] {

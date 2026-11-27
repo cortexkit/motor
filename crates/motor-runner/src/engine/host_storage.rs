@@ -1,4 +1,5 @@
 use super::{Catalog, Config};
+use crate::caller_path;
 use std::{
     collections::BTreeSet,
     ffi::CString,
@@ -32,12 +33,10 @@ pub(super) fn check(config: &Config, state: &Path, catalog: &Catalog) -> io::Res
                     .map(|root| root.host_root.clone()),
             )
             .collect();
-        for key in catalog
-            .workspaces
-            .keys()
-            .filter(|key| Path::new(key).is_absolute())
+        for path in caller_path::keys(&catalog.workspaces)
+            .filter(|path| crate::workspace::absolute(path.caller.text()))
         {
-            let target = crate::caller_path::host_path(config, key).join("target");
+            let target = caller_path::host_path(config, path.caller.text()).join("target");
             // Cargo cleanup does not traverse absent or symlinked targets.
             if target.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
                 roots.insert(target);
