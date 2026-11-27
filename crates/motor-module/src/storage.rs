@@ -729,6 +729,23 @@ impl Storage {
     }
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
+        Self::open_leased(root, journal::open)
+    }
+    pub fn open_for_checkpoint(root: &Path) -> io::Result<Self> {
+        // Don't leave a lease file in an unrelated or incomplete directory.
+        // Check for the file again under the lease before replay.
+        if !root.join("state.json").try_exists()? {
+            return Err(journal::missing_checkpoint());
+        }
+        Self::open_leased(root, journal::open_existing)
+    }
+    fn open_leased(
+        root: &Path,
+        open_journal: impl FnOnce(
+            &Path,
+            &Arc<journal::Metrics>,
+        ) -> io::Result<(State, journal::Backend)>,
+    ) -> io::Result<Self> {
         let lease = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -747,7 +764,7 @@ impl Storage {
         })?;
         let lease = StoreLease(lease);
         let metrics = Arc::new(journal::Metrics::default());
-        let (state, backend) = journal::open(root, &metrics)?;
+        let (state, backend) = open_journal(root, &metrics)?;
         let state = Arc::new(Mutex::new(state));
         let persistence = Arc::new(compaction::Persistence::new(root, backend, metrics));
         let worker = compaction::start(state.clone(), persistence.clone())?;

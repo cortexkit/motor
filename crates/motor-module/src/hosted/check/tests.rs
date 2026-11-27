@@ -33,7 +33,12 @@ async fn hosted_check_returns_only_nonsecret_claims_with_switch_off() {
     let payload = motor_lease::base64url(serde_json::to_vec(&serde_json::json!({"aud":"cortexkit-runners", "account":"01KXJJHK4V6DB42W1YAN2XD9QN", "device":"not-for-output-device", "jti":"not-for-output-jti", "iat":1,"exp":u64::MAX,"secret":"not-for-output"})).unwrap().as_slice());
     let jwt = format!("secret-header.{payload}.secret-signature");
     let vault = FakeVault::new(vec![Ok(token(&jwt))]);
-    let result = check(Some(&vault.client()), &crate::Config::default()).await;
+    let result = check_with_probe(
+        Some(&vault.client()),
+        &crate::Config::default(),
+        async |_| Some(400),
+    )
+    .await;
     assert_eq!(result.status, "ok");
     let output = serde_json::to_string(&result).unwrap();
     for secret in [
@@ -50,6 +55,30 @@ async fn hosted_check_returns_only_nonsecret_claims_with_switch_off() {
     }
     assert!(output.contains("01KXJJHK4V6DB42W1YAN2XD9QN"));
     assert!(logs.text().contains("hosted check log capture active"));
+}
+
+#[tokio::test]
+async fn hosted_check_probes_the_default_broker_used_by_jobs() {
+    let config = crate::Config::default();
+    assert!(config.broker_url.is_none());
+    let payload = motor_lease::base64url(
+        &serde_json::to_vec(&serde_json::json!({
+            "aud": "cortexkit-runners", "account": "account", "iat": 1, "exp": u64::MAX,
+        }))
+        .unwrap(),
+    );
+    let jwt = format!("header.{payload}.signature");
+    let vault = FakeVault::new(vec![Ok(token(&jwt))]);
+    let expected = format!("{}/v1/leases", motor_lease::ISSUER);
+    let result = check_with_probe(Some(&vault.client()), &config, async |request| {
+        let request = request.build().unwrap();
+        assert_eq!(request.url().as_str(), expected);
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.headers()["authorization"], format!("Bearer {jwt}"));
+        Some(400)
+    })
+    .await;
+    assert_eq!(result.broker_status, Some(400));
 }
 
 #[tokio::test]
