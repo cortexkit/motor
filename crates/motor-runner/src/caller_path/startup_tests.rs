@@ -87,7 +87,7 @@ fn caller_root_spelling_and_option_refusals_name_both_paths() {
 
 #[test]
 fn startup_finds_bind_sources_in_both_containment_directions() {
-    let table = "10 1 8:1 / / rw - xfs /dev/root rw\n11 10 8:2 / /srv/build rw - xfs /dev/build rw\n12 10 8:2 /Users /Users rw - xfs /dev/build rw\n";
+    let table = b"10 1 8:1 / / rw - xfs /dev/root rw\n11 10 8:2 / /srv/build rw - xfs /dev/build rw\n12 10 8:2 /Users /Users rw - xfs /dev/build rw\n";
     for host in ["/srv/build/Users/hidden", "/srv/build", "/srv/build/Users"] {
         let mut c = config();
         c.caller_roots[0].host_root = host.into();
@@ -99,7 +99,7 @@ fn startup_finds_bind_sources_in_both_containment_directions() {
             "{error}"
         );
     }
-    let escaped = "12 10 8:2 /Users /srv/build\\040disk rw - xfs /dev/build rw\n";
+    let escaped = b"12 10 8:2 /Users /srv/build\\040disk rw - xfs /dev/build rw\n";
     let parsed = mounts(escaped).unwrap();
     assert_eq!(parsed[0].mountpoint, Path::new("/srv/build disk"));
 }
@@ -114,7 +114,7 @@ fn startup_refuses_symlink_ancestors_without_following_them() {
     symlink(&outside, &link).unwrap();
     let mut c = config();
     c.caller_roots[0].host_root = link.join("home");
-    let error = filesystem_with_mountinfo(&c, "").unwrap_err().to_string();
+    let error = filesystem_with_mountinfo(&c, b"").unwrap_err().to_string();
     assert!(
         error.contains(link.to_str().unwrap()) && error.contains("symlink"),
         "{error}"
@@ -130,19 +130,47 @@ fn startup_reflink_probe_leaves_no_directory_entries() {
     c.build_slot_root = scratch.join("slots");
     c.caller_roots[0].host_root = scratch.join("home");
     fs::create_dir(&c.caller_roots[0].host_root).unwrap();
-    filesystem_with_mountinfo(&c, "").unwrap();
+    filesystem_with_mountinfo(&c, b"").unwrap();
     assert!(!c.state_dir().exists());
     assert_eq!(
         fs::read_dir(&c.caller_roots[0].host_root).unwrap().count(),
         0
     );
     c.caller_roots[0].host_root = scratch.join("missing");
-    let error = filesystem_with_mountinfo(&c, "").unwrap_err().to_string();
+    let error = filesystem_with_mountinfo(&c, b"").unwrap_err().to_string();
     assert!(
         error.contains("missing") && error.contains(c.state_dir().to_str().unwrap()),
         "{error}"
     );
     assert!(!c.state_dir().exists());
+}
+
+#[test]
+fn startup_preserves_non_utf8_mounts_without_admitting_reserved_aliases() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let scratch = cortexkit_test_support::ScratchDir::new("motor-caller-byte-mounts");
+    let mut c = config();
+    c.state_root = scratch.join("state");
+    c.build_slot_root = scratch.join("slots");
+    c.caller_roots[0].host_root = scratch.join("home");
+    let host = &c.caller_roots[0].host_root;
+    fs::create_dir(host).unwrap();
+
+    let mut table = b"10 1 8:1 / / rw - xfs /dev/root rw\n11 10 8:3 /other\xff /other\xff rw - xfs /dev/other rw\n".to_vec();
+    filesystem_with_mountinfo(&c, &table)
+        .expect("unrelated non-UTF-8 mount must not refuse startup");
+
+    table.extend_from_slice(b"12 10 8:2 /Users /Users rw - xfs /dev/build rw\n13 10 8:2 /Users ");
+    table.extend_from_slice(host.as_os_str().as_bytes());
+    table.extend_from_slice(b"/alias\xff rw - xfs /dev/build rw\n");
+    let error = filesystem_with_mountinfo(&c, &table)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("host roots and reserved bind sources must not overlap"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -156,7 +184,7 @@ fn startup_device_and_reflink_probe_failures_preserve_host_and_state() {
     fs::create_dir(host).unwrap();
     fs::write(host.join("sentinel"), "unchanged").unwrap();
     for failure in ["st_dev failed", "FICLONE failed"] {
-        let error = filesystem_with_probe(&c, "", |_, _| Err(std::io::Error::other(failure)))
+        let error = filesystem_with_probe(&c, b"", |_, _| Err(std::io::Error::other(failure)))
             .unwrap_err()
             .to_string();
         assert!(

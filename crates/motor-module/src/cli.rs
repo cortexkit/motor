@@ -812,10 +812,43 @@ fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<Run
     };
     let workspace = workspace_root(Some(&cwd))?;
     let common = canonical(&git_path(&workspace, "--git-common-dir")?, "git common dir")?;
-    let repository_root = common
-        .parent()
-        .ok_or_else(|| format!("{} has no main checkout", common.display()))?
-        .to_path_buf();
+    let dir = canonical(&git_path(&workspace, "--git-dir")?, "git dir")?;
+    let repository_root = if dir == common {
+        workspace.clone()
+    } else {
+        use std::os::unix::ffi::OsStrExt;
+
+        let cannot_identify_main = || {
+            format!(
+                "cannot identify the main checkout of this linked worktree (Git common directory {}); run from the main checkout if it uses a separate Git directory",
+                common.display()
+            )
+        };
+        let list = crate::snapshot::output_bytes(crate::snapshot::command(&workspace).args([
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+        ]))
+        .map_err(|error| format!("{}: {error}", cannot_identify_main()))?;
+        // Git lists the main checkout first, but with separate metadata it can
+        // print the metadata directory instead. Verify the candidate from inside it.
+        list.split(|&byte| byte == 0)
+            .next()
+            .and_then(|entry| entry.strip_prefix(b"worktree "))
+            .filter(|entry| entry.starts_with(b"/"))
+            .and_then(|entry| fs::canonicalize(std::ffi::OsStr::from_bytes(entry)).ok())
+            .filter(|root| {
+                let resolved = |flag| {
+                    git_path(root, flag)
+                        .ok()
+                        .and_then(|path| fs::canonicalize(path).ok())
+                };
+                resolved("--show-toplevel").as_ref() == Some(root)
+                    && resolved("--git-dir").as_ref() == Some(&common)
+            })
+            .ok_or_else(cannot_identify_main)?
+    };
     let mut request = RunRequest::new(
         text(&workspace)?,
         text(&repository_root)?,
@@ -3679,6 +3712,87 @@ mod tests {
         if let Ok(request) = build_request(&outside) {
             assert_ne!(request.workspace_key, main.to_str().unwrap());
         }
+    }
+
+    #[test]
+    fn separate_git_directory_uses_the_checkout_when_invoked_directly() {
+        let (_scratch, main, _) = separate_git_checkout();
+        let request = build_request(&RunArgs {
+            cwd: Some(main.clone()),
+            ..RunArgs::default()
+        })
+        .unwrap();
+        assert_eq!(request.workspace_key, main.to_str().unwrap());
+        assert_eq!(request.repository_root, main.to_str().unwrap());
+        crate::snapshot::validate(
+            &crate::Config::default(),
+            &request.workspace_key,
+            &request.repository_root,
+            &request.cwd,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_with_separate_git_directory_reports_an_unidentifiable_main_checkout() {
+        let (scratch, main, metadata) = separate_git_checkout();
+        let linked = scratch.join("linked");
+        crate::snapshot::git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let error = build_request(&RunArgs {
+            cwd: Some(linked),
+            ..RunArgs::default()
+        })
+        .expect_err("a linked worktree without a resolvable main checkout must be refused");
+        assert!(
+            error.contains("linked worktree") && error.contains("separate Git directory"),
+            "{error}"
+        );
+        assert!(error.contains(metadata.to_str().unwrap()), "{error}");
+    }
+
+    fn separate_git_checkout() -> (cortexkit_test_support::ScratchDir, PathBuf, PathBuf) {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-separate-git-dir");
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        let main = root.join("main");
+        let metadata = root.join("metadata/repo.git");
+        fs::create_dir(metadata.parent().unwrap()).unwrap();
+        crate::snapshot::git(
+            &root,
+            &[
+                "init",
+                "--quiet",
+                "--separate-git-dir",
+                metadata.to_str().unwrap(),
+                main.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        crate::snapshot::git(
+            &main,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        (scratch, main, metadata)
     }
 }
 

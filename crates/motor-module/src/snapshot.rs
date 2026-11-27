@@ -37,7 +37,7 @@ pub(crate) fn command(path: &Path) -> Command {
     cmd.arg("--no-optional-locks").arg("-C").arg(path);
     cmd
 }
-fn output(cmd: &mut Command) -> io::Result<String> {
+pub(crate) fn output_bytes(cmd: &mut Command) -> io::Result<Vec<u8>> {
     let started = Instant::now();
     let result = cmd.output()?;
     let elapsed = started.elapsed();
@@ -53,7 +53,10 @@ fn output(cmd: &mut Command) -> io::Result<String> {
             String::from_utf8_lossy(&result.stderr).into_owned(),
         ));
     }
-    Ok(String::from_utf8(result.stdout)
+    Ok(result.stdout)
+}
+fn output(cmd: &mut Command) -> io::Result<String> {
+    Ok(String::from_utf8(output_bytes(cmd)?)
         .map_err(io::Error::other)?
         .trim()
         .into())
@@ -389,6 +392,7 @@ pub(crate) fn local_default_branch(root: &Path) -> Option<(String, String)> {
 struct Fingerprint {
     head: String,
     files: BTreeMap<PathBuf, Option<FileStamp>>,
+    staged_ignored: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -488,11 +492,22 @@ impl Fingerprint {
                 path: path.to_path_buf(),
             });
         }
-        None
+        self.staged_ignored
+            .symmetric_difference(&after.staged_ignored)
+            .next()
+            .map(|path| CaptureChange {
+                kind: if after.staged_ignored.contains(path) {
+                    CaptureChangeKind::PathAdded
+                } else {
+                    CaptureChangeKind::PathRemoved
+                },
+                path: path.clone(),
+            })
     }
 
     fn same_content_ignoring_directory_entry_churn(&self, other: &Self) -> bool {
         self.head == other.head
+            && self.staged_ignored == other.staged_ignored
             && self.files.len() == other.files.len()
             && self
                 .files
@@ -579,11 +594,7 @@ fn untracked_directories(
     Ok(())
 }
 
-/// Adds to the snapshot index every path the caller's real index tracks that
-/// also matches an ignore rule and still exists in the working tree. Paths are
-/// passed NUL-separated and literal, so names with glob characters or spaces
-/// never match anything else.
-fn force_add_staged_ignored(path: &Path, index: &Index) -> io::Result<()> {
+fn staged_ignored_paths(path: &Path) -> io::Result<BTreeSet<PathBuf>> {
     let listed = command(path)
         .args([
             "ls-files",
@@ -599,15 +610,25 @@ fn force_add_staged_ignored(path: &Path, index: &Index) -> io::Result<()> {
             String::from_utf8_lossy(&listed.stderr)
         )));
     }
+    Ok(listed
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty() && !runner_owned(name))
+        .map(|name| PathBuf::from(std::ffi::OsStr::from_bytes(name)))
+        .collect())
+}
+
+fn force_add_staged_ignored(
+    path: &Path,
+    index: &Index,
+    staged_ignored: &BTreeSet<PathBuf>,
+) -> io::Result<()> {
     let mut paths = Vec::new();
-    for name in listed.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
-        if runner_owned(name) {
-            continue;
-        }
+    for name in staged_ignored {
         // A staged path deleted from the working tree is left as HEAD has it;
         // `add -A` already recorded the deletion of any committed path.
-        if fs::symlink_metadata(path.join(std::ffi::OsStr::from_bytes(name))).is_ok() {
-            paths.extend_from_slice(name);
+        if fs::symlink_metadata(path.join(name)).is_ok() {
+            paths.extend_from_slice(name.as_os_str().as_bytes());
             paths.push(0);
         }
     }
@@ -668,6 +689,12 @@ fn fingerprint(path: &Path, index: &Index) -> io::Result<Fingerprint> {
         )));
     }
     let mut paths = BTreeSet::from([PathBuf::new()]);
+    let staged_ignored = staged_ignored_paths(path)?;
+    // These files bypass the temporary index's ignore rules during capture.
+    // Watch their membership and metadata as well as the rest of the inventory.
+    for relative in &staged_ignored {
+        paths.extend(relative.ancestors().map(Path::to_path_buf));
+    }
     for name in listed.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
         if runner_owned(name) {
             continue;
@@ -754,7 +781,11 @@ fn fingerprint(path: &Path, index: &Index) -> io::Result<Fingerprint> {
         };
         files.insert(relative, stamp);
     }
-    Ok(Fingerprint { head, files })
+    Ok(Fingerprint {
+        head,
+        files,
+        staged_ignored,
+    })
 }
 
 pub(crate) fn snapshot_with_hook(
@@ -894,7 +925,7 @@ fn snapshot_with_hook_and_timeout(
             // matches .gitignore. The snapshot index starts from HEAD, so `add -A`
             // above skips such a path when it is staged but not yet committed.
             // Add those explicitly from the caller's real index.
-            force_add_staged_ignored(path, &index)?;
+            force_add_staged_ignored(path, &index, &before.staged_ignored)?;
             // Untracked nested repositories and linked worktrees are added as
             // mode 160000 gitlinks by git add -A when they have a commit checked out.
             // Remove every mode-160000 entry whose path is not a gitlink in HEAD.
@@ -1429,20 +1460,23 @@ pub(crate) fn lockfile_sources(
     } else {
         BTreeMap::new()
     };
-    let entries = git(path, &["ls-tree", "-rz", commit])?;
+    let entries = output_bytes(command(path).args(["ls-tree", "-rz", commit]))?;
     let files: BTreeMap<_, _> = entries
-        .split('\0')
+        .split(|&byte| byte == 0)
         .filter_map(|entry| {
-            let (header, path) = entry.split_once('\t')?;
+            let tab = entry.iter().position(|&byte| byte == b'\t')?;
+            let header = &entry[..tab];
             Some((
-                path,
-                header.starts_with("100644 blob ") || header.starts_with("100755 blob "),
+                &entry[tab + 1..],
+                header
+                    .strip_prefix(b"100644 blob ")
+                    .or_else(|| header.strip_prefix(b"100755 blob ")),
             ))
         })
         .collect();
-    let mut count = usize::from(files.contains_key("Cargo.lock"));
-    for (lock, regular) in &files {
-        let lock = Path::new(lock);
+    let mut count = usize::from(files.contains_key(b"Cargo.lock".as_slice()));
+    for (lock, object) in &files {
+        let lock = Path::new(std::ffi::OsStr::from_bytes(lock));
         if lock == Path::new("Cargo.lock")
             || lock.file_name().is_none_or(|name| name != "Cargo.lock")
         {
@@ -1452,12 +1486,16 @@ pub(crate) fn lockfile_sources(
         // Match the runner's bounded nested-prefetch discovery: both files
         // must be regular blobs in the captured snapshot, not later edits.
         if count > 128
-            || !regular
-            || files.get(lock.with_file_name("Cargo.toml").to_str().unwrap_or("")) != Some(&true)
+            || files
+                .get(lock.with_file_name("Cargo.toml").as_os_str().as_bytes())
+                .is_none_or(Option::is_none)
         {
             continue;
         }
-        let content = git(path, &["show", &format!("{commit}:{}", lock.display())])?;
+        let Some(object) = object else { continue };
+        // Read by blob ID so a lockfile in a non-UTF-8 directory needs no path conversion.
+        let object = std::str::from_utf8(object).map_err(io::Error::other)?;
+        let content = git(path, &["cat-file", "blob", object])?;
         match parse_lockfile(&content) {
             Ok(nested) => {
                 for (url, commits) in nested {
@@ -1898,6 +1936,42 @@ mod tests {
     }
 
     #[test]
+    fn staged_ignored_input_changed_during_capture_retries() {
+        let (_scratch, checkout, spool, _) = repository();
+        fs::write(checkout.join(".gitignore"), "inputs/\n").unwrap();
+        fs::create_dir(checkout.join("inputs")).unwrap();
+        let input = checkout.join("inputs/staged.txt");
+        fs::write(&input, "old contents").unwrap();
+        fs::write(checkout.join("inputs/ignored.txt"), "not staged").unwrap();
+        git(&checkout, &["add", "--force", "inputs/staged.txt"]).unwrap();
+
+        let snapshot = snapshot_with_hook(&checkout, "test".into(), &spool, 0, false, |attempt| {
+            if attempt == 0 {
+                // Change the existing file without touching its directory entry.
+                fs::write(&input, "new, longer contents").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            git(
+                &checkout,
+                &["show", &format!("{}:inputs/staged.txt", snapshot.commit)]
+            )
+            .unwrap(),
+            "new, longer contents"
+        );
+        assert!(git(
+            &checkout,
+            &[
+                "cat-file",
+                "-e",
+                &format!("{}:inputs/ignored.txt", snapshot.commit)
+            ]
+        )
+        .is_err());
+    }
+
+    #[test]
     fn top_level_target_file_symlink_and_repository_are_excluded() {
         for kind in [
             "file",
@@ -2231,6 +2305,29 @@ mod tests {
         assert!(skip.contains(&format!("job_id={id}")), "{skip}");
         assert!(skip.contains(&format!("url={url}")), "{skip}");
         assert!(skip.contains(&format!("commit={commit}")), "{skip}");
+    }
+
+    #[test]
+    fn lockfile_discovery_preserves_non_utf8_tree_paths() {
+        use std::ffi::OsStr;
+
+        let (_scratch, checkout, spool, commit) = repository();
+        fs::write(checkout.join(OsStr::from_bytes(b"input-\xff.txt")), "data").unwrap();
+        let crate_dir = checkout.join(OsStr::from_bytes(b"crate-\xfe"));
+        fs::create_dir(&crate_dir).unwrap();
+        fs::write(crate_dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let url = "https://example.invalid/locked.git";
+        fs::write(
+            crate_dir.join("Cargo.lock"),
+            format!("version=4\n[[package]]\nname='dependency'\nversion='0.1.0'\nsource='git+{url}#{commit}'\n"),
+        )
+        .unwrap();
+
+        let snapshot = build_snapshots(&checkout, &checkout, &spool);
+        assert_eq!(
+            snapshot.git_dependencies,
+            BTreeMap::from([(url.into(), vec![commit])])
+        );
     }
 
     #[test]

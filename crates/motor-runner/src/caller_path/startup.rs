@@ -1,6 +1,6 @@
 use super::*;
 use crate::{BackendKind, Config};
-use std::{fs, io, path::PathBuf};
+use std::{ffi::OsString, fs, io, os::unix::ffi::OsStringExt, path::PathBuf};
 
 /// An operator-supplied mapping. Neither side is normalized on input.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -204,14 +204,14 @@ fn same_or_nested(a: &Path, b: &Path) -> io::Result<bool> {
 
 #[derive(Debug)]
 pub(super) struct Mount {
-    device: String,
+    device: Vec<u8>,
     root: PathBuf,
     pub(super) mountpoint: PathBuf,
 }
 
-fn unescape(value: &str) -> io::Result<String> {
+fn unescape(value: &[u8]) -> io::Result<PathBuf> {
     let mut bytes = Vec::new();
-    let mut input = value.bytes();
+    let mut input = value.iter().copied();
     while let Some(byte) = input.next() {
         if byte != b'\\' {
             bytes.push(byte);
@@ -226,21 +226,28 @@ fn unescape(value: &str) -> io::Result<String> {
             + u16::from(digits[2] - b'0');
         bytes.push(u8::try_from(value).map_err(io::Error::other)?);
     }
-    String::from_utf8(bytes).map_err(io::Error::other)
+    Ok(OsString::from_vec(bytes).into())
 }
 
-pub(super) fn mounts(table: &str) -> io::Result<Vec<Mount>> {
+pub(super) fn mounts(table: &[u8]) -> io::Result<Vec<Mount>> {
+    if table.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The kernel separates fields with spaces. Other bytes may be part of a
+    // path, which must stay exact for the bind-source containment checks.
     table
-        .lines()
+        .strip_suffix(b"\n")
+        .unwrap_or(table)
+        .split(|&byte| byte == b'\n')
         .map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.len() < 10 || !fields.contains(&"-") {
+            let fields: Vec<_> = line.split(|&byte| byte == b' ').collect();
+            if fields.len() < 10 || !fields.contains(&b"-".as_slice()) {
                 return Err(io::Error::other(format!("invalid mountinfo line {line:?}")));
             }
             Ok(Mount {
                 device: fields[2].into(),
-                root: unescape(fields[3])?.into(),
-                mountpoint: unescape(fields[4])?.into(),
+                root: unescape(fields[3])?,
+                mountpoint: unescape(fields[4])?,
             })
         })
         .collect()
@@ -292,11 +299,14 @@ mod mounted_file_tests {
                 .replace('\t', "\\011")
                 .replace('\n', "\\012")
         };
-        let table = mounts(&format!(
-            "1 0 8:1 / / rw - xfs /dev/root rw\n2 1 8:1 {} {} rw - xfs /dev/root rw\n",
-            encode(&backing),
-            encode(&mounted)
-        ))
+        let table = mounts(
+            format!(
+                "1 0 8:1 / / rw - xfs /dev/root rw\n2 1 8:1 {} {} rw - xfs /dev/root rw\n",
+                encode(&backing),
+                encode(&mounted)
+            )
+            .as_bytes(),
+        )
         .unwrap();
         let sources = bind_sources(&mounted, &table);
         assert_eq!(sources.len(), 2);
@@ -314,19 +324,19 @@ pub(crate) fn filesystem(config: &Config) -> io::Result<()> {
         return Ok(());
     }
     #[cfg(target_os = "linux")]
-    let table = fs::read_to_string("/proc/self/mountinfo")?;
+    let table = fs::read("/proc/self/mountinfo")?;
     #[cfg(not(target_os = "linux"))]
-    let table = String::new();
+    let table = Vec::new();
     filesystem_with_mountinfo(config, &table)
 }
 
-pub(super) fn filesystem_with_mountinfo(config: &Config, table: &str) -> io::Result<()> {
+pub(super) fn filesystem_with_mountinfo(config: &Config, table: &[u8]) -> io::Result<()> {
     filesystem_with_probe(config, table, probe)
 }
 
 pub(super) fn filesystem_with_probe(
     config: &Config,
-    table: &str,
+    table: &[u8],
     probe_root: impl Fn(&Config, &CallerRoot) -> io::Result<()>,
 ) -> io::Result<()> {
     options(config)?;

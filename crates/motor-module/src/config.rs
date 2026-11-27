@@ -290,14 +290,22 @@ impl MacosRunner {
     }
 }
 
+pub(crate) fn data_home() -> io::Result<PathBuf> {
+    // The XDG base-directory specification ignores non-absolute paths.
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/share"))
+        })
+        .ok_or_else(|| io::Error::other("neither XDG_DATA_HOME nor HOME is an absolute path"))
+}
+
 impl Default for Config {
     fn default() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let data = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"));
         Self {
             hosted_runners: serde::de::IgnoredAny,
             hosted_fleet_routing: serde::de::IgnoredAny,
@@ -316,7 +324,10 @@ impl Default for Config {
             windows_runner_state_root: None,
             windows_runners: Vec::new(),
             macos_runner: None,
-            worktree_roots: vec![data.join("cortexkit/alfonso/worktrees")],
+            worktree_roots: data_home()
+                .into_iter()
+                .map(|data| data.join("cortexkit/alfonso/worktrees"))
+                .collect(),
             queue_wait_limit_s: serde::de::IgnoredAny,
             ssh_config_override: None,
             inject_tree_hash_mismatch: false,
