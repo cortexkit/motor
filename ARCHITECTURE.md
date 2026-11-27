@@ -138,7 +138,7 @@ defaults:
 
 | Setting | Meaning |
 | --- | --- |
-| `fork_checkouts` | Copy a new worktree's checkout disk from the repository's most recent warm disk; requires a job image whose runner adopts forked disks. When true, background fills and fill-source exports stop; pending exports and stored fill sources are retired. When false, background fills and exports continue. Existing fill bases remain available as seed fallbacks in either case. |
+| `fork_checkouts` | Copy a new worktree’s checkout disk from the repository’s chosen warm disk. When false, new worktrees start empty. |
 | `vcpu_ceiling` | Maximum job vCPUs, at most the online CPU count. |
 | `permit_budget` | Host vCPU permits with overcommit, at least the ceiling and at most four times online CPUs. |
 | `host_reserve_mib` | Host available-memory floor in MiB. |
@@ -157,9 +157,9 @@ defaults:
 
 Time fields use milliseconds. [hosted-host.md](docs/hosted-host.md#per-job-mode-settings)
 describes admission and configuration tests. The helper owns cache credentials
-and installs only the account's read set for a job, the write key only for
-fills/base builds, and nothing for recovery. Key bytes
-never pass through `motor-host` or the workspace disk.
+and installs the account's read set for jobs, the write key only for jobs with a
+verified cache-write grant, and nothing for recovery. Key bytes never pass
+through `motor-host` or the workspace disk.
 
 Rollback keeps the host drained, selects tenant mode and restarts from retained
 tenant disks through recovery. Before placement resumes, the helper installs

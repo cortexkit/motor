@@ -201,7 +201,6 @@ pub struct Runtime {
     job_adoptions: Mutex<BTreeMap<String, job::Adoption>>,
     job_launches: Mutex<BTreeMap<String, Arc<job::Launch>>>,
     job_recoveries: Mutex<BTreeMap<String, job::recovery::Worker>>,
-    job_fills: Mutex<crate::jobs::fills::Scheduler>,
     job_balloon: Mutex<job::balloon::Controller>,
     job_streams: Mutex<BTreeMap<String, Arc<job::stream::Stream>>>,
     pub broker_endpoint: String,
@@ -462,10 +461,9 @@ impl Runtime {
             .map(|tenant| (tenant.tenant.clone(), Arc::new(Mutex::new(()))))
             .collect();
         let host = Arc::new(HostMutex::new(host));
-        let job_resolvers = Arc::new(RwLock::new(Vec::new()));
         Arc::new(Self {
             write_block_operation: Mutex::new(()),
-            job_resolvers: job_resolvers.clone(),
+            job_resolvers: Arc::new(RwLock::new(Vec::new())),
             job_resources: Arc::new(crate::jobs::Unavailable),
             image_generations: None,
             job_stops: Mutex::new(BTreeMap::new()),
@@ -475,12 +473,6 @@ impl Runtime {
             job_adoptions: Mutex::new(BTreeMap::new()),
             job_launches: Mutex::new(BTreeMap::new()),
             job_recoveries: Mutex::new(BTreeMap::new()),
-            job_fills: Mutex::new(crate::jobs::fills::Scheduler::new(Arc::new(
-                crate::jobs::fills::BundleFillGuest {
-                    host: host.clone(),
-                    resolvers: job_resolvers,
-                },
-            ))),
             job_balloon: Mutex::new(Default::default()),
             job_streams: Mutex::new(BTreeMap::new()),
             broker_endpoint,
@@ -1644,7 +1636,6 @@ impl Runtime {
             "bounded_drain_cancelled":bounded_drain_cancelled});
         if op == "host_status" && host.settings.mode() == crate::config::HostMode::PerJob {
             reply["storage_reservations"] = json!(host.operator_storage_reservations(unix_ms()));
-            reply["active_fills"] = json!(host.snapshot.per_job.fills.len());
             reply["active_recoveries"] = json!(host
                 .snapshot
                 .per_job

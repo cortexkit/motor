@@ -18,6 +18,7 @@ pub(super) const CLIENT_HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// Report a stalled spool handover before the runner's 60-second timeout.
 const LIVE_UPLOAD_NOTICE: Duration = Duration::from_secs(10);
+const TERMINAL_ACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 // A liveness frame may wait for the caller without holding up input reads.
 // Once a frame is partly written, finish it before any other frame, and keep
@@ -103,8 +104,6 @@ pub(crate) struct Stream {
     terminal_delivery: tokio::sync::Mutex<()>,
     #[cfg(test)]
     crash: AtomicBool,
-    #[cfg(test)]
-    export_limit: Mutex<Option<Duration>>,
 }
 impl Stream {
     #[cfg(test)]
@@ -113,17 +112,6 @@ impl Stream {
         let bytes = [(body.len() as u32).to_be_bytes().as_slice(), &body].concat();
         let sender = self.input.lock().unwrap().as_ref().unwrap().clone();
         sender.send(Input { bytes, reply: None }).await.unwrap();
-    }
-    fn export_timeout(&self) -> Duration {
-        #[cfg(test)]
-        if let Some(limit) = *self.export_limit.lock().unwrap() {
-            return limit;
-        }
-        Duration::from_secs(motor_protocol::FILL_SOURCE_EXPORT_TIMEOUT_S)
-    }
-    #[cfg(test)]
-    pub(super) fn set_export_timeout(&self, limit: Duration) {
-        *self.export_limit.lock().unwrap() = Some(limit);
     }
     pub(super) fn expire_chunks(&self, now_ms: u64) -> Result<()> {
         let due = {
@@ -278,8 +266,6 @@ impl Runtime {
             terminal_delivery: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             crash: AtomicBool::new(false),
-            #[cfg(test)]
-            export_limit: Mutex::new(None),
         });
         streams.insert(job.to_owned(), stream.clone());
         Ok(stream)
@@ -405,7 +391,6 @@ async fn collect(
     let first_live_forwarded = Cell::new(false);
     let guest_write_pending = Cell::new(false);
     let upload = async {
-        let default_branch_tip = prelude.as_ref().is_some_and(|(_, p)| p.default_branch_tip);
         let mut upload = Upload::default();
         if let Some((id, p)) = &mut prelude {
             // These lines, with the live ones below, show where an upload
@@ -441,13 +426,6 @@ async fn collect(
                     host.note_job_repository(&claims.jti, &run.repository_root)?;
                     host.job_relayed_run(&claims.jti, !run.return_paths.is_empty())
                         .context("record relayed Run")?;
-                    if let Err(error) = if default_branch_tip {
-                        host.note_fill_source(&claims.jti, &run, unix_ms())
-                    } else {
-                        Ok(())
-                    } {
-                        tracing::warn!(jti=claims.jti, %error, "fill_export_setup_failed");
-                    }
                     host.delivered(*id)
                         .context("authorize queued Run delivery")?;
                 }
@@ -495,9 +473,6 @@ async fn collect(
                         if let Ok(motor_protocol::Frame::Run(run)) = serde_json::from_value(frame.clone()) {
                             let mut host = runtime.host.lock().expect("host lock");
                             host.note_job_repository(&claims.jti, &run.repository_root)?;
-                            if let Err(error) = if default_branch_tip { host.note_fill_source(&claims.jti, &run, unix_ms()) } else { Ok(()) } {
-                                tracing::warn!(jti=claims.jti, %error, "fill_export_setup_failed");
-                            }
                         }
                     }
                     upload.observe(&frame)?;
@@ -666,11 +641,8 @@ async fn collect(
                 }
             }
             if refused_before_start {
-                // The runner refused before admission, so there is nothing to
-                // export, and it will not end its own VM: that needs a stored
-                // terminal of its own to acknowledge. Stop the VM here, the
-                // same way as a guest that never acknowledges its terminal.
-                release_export_tip(runtime, &claims.jti);
+                // Pre-admission refusals leave no terminal for the runner to
+                // acknowledge, so the host must stop the VM.
                 let runtime = runtime.clone();
                 let job = claims.jti.clone();
                 tokio::task::spawn_blocking(move || runtime.stop_job(&job, false, true))
@@ -679,80 +651,27 @@ async fn collect(
                 return Ok::<(), anyhow::Error>(());
             }
             if terminal {
-                let host = runtime.host.clone();
-                let control = runtime.control.clone();
-                let job = claims.jti.clone();
-                let limit = store.export_timeout();
-                let deadline = std::time::Instant::now() + limit;
-                let due = {
-                    let host = host.lock().expect("host lock");
-                    host.settings.background_fills_enabled()
-                        && host.snapshot.per_job.export_tips.contains_key(&job)
-                };
-                // The terminal is already durable and billing has ended. Do not
-                // make a connected caller wait for maintenance before seeing it.
-                let export = async {
-                    while due
-                        && !resume
-                        && !store.terminal_delivered.load(Ordering::Acquire)
-                        && !store.upload_detached.load(Ordering::Acquire)
-                    {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    if !due {
-                        return Ok(());
-                    }
-                    tokio::task::spawn_blocking(move || {
-                        crate::jobs::fill_source::export(&host, &*control, &job, deadline)
-                    })
-                    .await?
-                };
-                let timed_out = match tokio::time::timeout(limit, export).await {
-                    Ok(Ok(())) => false,
-                    Ok(Err(error)) => {
-                        tracing::warn!(jti=claims.jti, %error, "fill_export_failed");
-                        // The export gives up at the same deadline as this
-                        // timer and can return first, under load. A failure at
-                        // the deadline is a timeout: the guest may still be
-                        // stuck exporting, so it is stopped, not acknowledged.
-                        std::time::Instant::now() >= deadline
-                    }
-                    Err(_) => {
-                        tracing::warn!(jti = claims.jti, "fill_export_timed_out");
-                        true
-                    }
-                };
-                release_export_tip(runtime, &claims.jti);
-                if !timed_out {
-                    // Once acknowledged, the guest drains its reports, unmounts
-                    // its disks and ends its own VM: a clean stop, so the disk
-                    // is reused without a recovery check. Record that before the
-                    // guest can exit. A forced stop later (no acknowledgement,
-                    // or a guest that never ends) upgrades it to unclean.
-                    runtime
-                        .host
-                        .lock()
-                        .expect("host lock")
-                        .job_stop_intent(&claims.jti, false)
-                        .context("record clean job VM stop before terminal acknowledgement")?;
-                }
-                let acknowledged = if timed_out {
-                    false
-                } else {
-                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                        write_frame(
-                            &mut *write.lock().await,
-                            &json!({"type":"terminal_stored","jti":claims.jti}),
-                        )
-                        .await
-                    })
+                // Once acknowledged, the guest drains its reports, unmounts
+                // its disks and ends the VM. Record the clean stop before the
+                // guest can exit; a forced stop later upgrades it to unclean.
+                runtime
+                    .host
+                    .lock()
+                    .expect("host lock")
+                    .job_stop_intent(&claims.jti, false)
+                    .context("record clean job VM stop before terminal acknowledgement")?;
+                let acknowledged = tokio::time::timeout(TERMINAL_ACK_TIMEOUT, async {
+                    write_frame(
+                        &mut *write.lock().await,
+                        &json!({"type":"terminal_stored","jti":claims.jti}),
+                    )
                     .await
-                    .is_ok_and(|result| result.is_ok())
-                };
+                })
+                .await
+                .is_ok_and(|result| result.is_ok());
                 if !acknowledged {
-                    // The guest may be stuck exporting or no longer reading its
-                    // job channel. Its already committed terminal still wins;
-                    // a hard stop quarantines only the unfinished disk cleanup.
+                    // The committed terminal still wins; a hard stop only
+                    // quarantines the unfinished disk cleanup.
                     let runtime = runtime.clone();
                     let job = claims.jti.clone();
                     tokio::task::spawn_blocking(move || runtime.stop_job(&job, false, true))
@@ -836,16 +755,6 @@ fn admission_refusal(runtime: &Runtime, job: &str, frame: &Value) -> Option<Valu
         }
     }
     Some(terminal)
-}
-
-/// A finished job no longer pins its default-branch tip for a fill export.
-fn release_export_tip(runtime: &Runtime, job: &str) {
-    let mut host = runtime.host.lock().expect("host lock");
-    let mut next = host.snapshot.clone();
-    next.per_job.export_tips.remove(job);
-    if let Err(error) = host.save(next) {
-        tracing::warn!(%error, "fill_export_release_failed");
-    }
 }
 
 #[cfg(test)]

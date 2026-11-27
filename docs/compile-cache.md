@@ -52,9 +52,9 @@ and `a_job_beside_its_tenants_fill_keeps_its_memory_and_egress`
 (`crates/motor-host/tests/it/billing.rs`).
 
 ck-motor offers default-branch tips only where the runner may fill. Hosted
-channels to a registered host's tenant runner (a `first_party` placement)
-advertise the fill capability in Hello and send the resolved integration tip.
-Boat spills omit both.
+channels to registered hosts offer the capability in Hello. Tenant-mode runners
+can negotiate it; per-job runners do not, so ck-motor sends neither the tip nor
+its locked Git dependencies to them. Boat spills also omit both.
 Tests:
 `hosted_hello_advertises_fill_support_only_to_registered_host_tenants`,
 `hello_advertises_default_branch_tip_on_the_wire`,
@@ -470,9 +470,8 @@ tests.
 
 ### When fills run
 
-Background compile-cache fills have a 24 GiB memory floor, because some
-repositories' builds need more than 16 GiB; in per-job mode, a fill VM's stated
-memory is at least 24 GiB.
+Background compile-cache fills have a 24 GiB memory floor because some
+repositories' builds need more than 16 GiB.
 
 - A fill's identity is its descriptor: a hash of the toolchain, the warm
   command, and every `Cargo.toml`, `Cargo.lock`, `rust-toolchain*` and
@@ -529,15 +528,9 @@ foreground jobs still run. Test: `unavailable_writer_account_disables_fills_and_
 
 ## Fixed paths and local build bases
 
-On per-job hosts, fills receive an exported default-branch tip and the Git
-dependency mirrors the fill needs through verified bundles on a fresh Fill
-disk. They never mount a job-written filesystem. Current per-job settings have
-no root-owned fixed-path repository allowlist, so per-job fills write the shared
-compiler cache only; their disks are deleted, not promoted to local build bases
-that seed later jobs.
-Promotion requires fixed paths, which per-job hosts do not have yet.
-See [per-job fill sources](hosted-host.md#per-job-fill-sources) for export limits,
-storage accounting and VM lifetime.
+Per-job hosted execution does not build local bases. A new worktree forks an
+eligible warm checkout disk for the same repository and account when forking is
+enabled; otherwise it starts empty. An existing checkout keeps its own disk.
 
 ### Enablement and paths
 

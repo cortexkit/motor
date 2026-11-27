@@ -115,24 +115,6 @@ fn booting_and_ended_jobs_do_not_get_a_running_hold() {
 }
 
 #[test]
-fn fill_after_hello_gets_the_same_hold_instead_of_a_boot_debit() {
-    let mut host = hold_host(25);
-    refresh(&mut host, AT, 100_000);
-    let fill = host
-        .reserve_fill(&job(JOB).sub, "repo", 24_577, AT)
-        .unwrap()
-        .unwrap();
-    let id = &fill.fill.fill_id;
-    assert!(host.resident_samples_due(AT).is_empty());
-    assert_eq!(host.job_free_mem_mib(AT), 75_353);
-    host.fill_runner_hello(id).unwrap();
-    assert_eq!(host.resident_samples_due(AT), vec![id.clone()]);
-    assert_eq!(host.job_free_mem_mib(AT), 93_803);
-    host.record_job_resident(id, AT, Ok(24_587 * MIB));
-    assert_eq!(host.job_free_mem_mib(AT), 99_950);
-}
-
-#[test]
 fn attempts_are_paced_and_failures_preserve_samples_and_warn_only_once() {
     let mut host = hold_host(25);
     running(&mut host, job(JOB));

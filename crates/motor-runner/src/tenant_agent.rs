@@ -127,96 +127,8 @@ async fn agent_session<S: AsyncRead + AsyncWrite + Unpin>(
     attach: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> io::Result<()> {
     while let Some(value) = read_json(&mut socket).await? {
-        if matches!(value["op"].as_str(), Some("export_tip" | "fill")) {
-            let result = fill_session(&mut socket, value).await;
-            if let Err(error) = result {
-                write_json(&mut socket, &agent_result(Err(error))).await?;
-            }
-            return Ok(());
-        }
         let result = dispatch_value(value, &attach).await;
         write_json(&mut socket, &agent_result(result)).await?;
-    }
-    Ok(())
-}
-
-async fn fill_session<S: AsyncRead + AsyncWrite + Unpin>(
-    socket: &mut S,
-    value: Value,
-) -> io::Result<()> {
-    let request: TenantAgentRequest = serde_json::from_value(value.clone())?;
-    if recovery::enabled()? {
-        return Err(io::Error::other("operation does not match VM boot kind"));
-    }
-    let fill = matches!(request, TenantAgentRequest::Fill { .. });
-    if fill {
-        crate::fill_source::require_fill_boot()?;
-    } else if !per_job::enabled()?
-        || crate::fill_source::fill_boot(&fs::read_to_string("/proc/cmdline")?)
-    {
-        return Err(io::Error::other("export requires a Job VM"));
-    }
-    let expected =
-        runner_socket::main_pid()?.ok_or_else(|| io::Error::other("runner has no MainPID"))?;
-    let mut runner = tokio::net::UnixStream::connect("/run/motor/fill-control/admin.sock").await?;
-    if !runner_socket::peer_is_current(&runner, expected, &mut runner_socket::main_pid)? {
-        return Err(io::Error::other("fill control peer is not current runner"));
-    }
-    write_json(&mut runner, &value).await?;
-    if let TenantAgentRequest::Fill { source } = request {
-        source.validate(FILL_SOURCE_MAX_BYTES)?;
-        relay_chunks(socket, &mut runner, &source).await?;
-        let reply = read_json(&mut runner)
-            .await?
-            .ok_or_else(|| io::Error::other("missing fill reply"))?;
-        if reply["ok"] == true {
-            let status = tokio::task::spawn_blocking(|| {
-                Command::new("sync").args(["-f", "/tenant"]).status()
-            })
-            .await
-            .map_err(io::Error::other)??;
-            if !status.success() {
-                return Err(io::Error::other("fill disk sync failed"));
-            }
-        }
-        write_json(socket, &reply).await?;
-        if reply["ok"] == true {
-            crate::tenant::end_job_vm("fill")?;
-        }
-    } else {
-        let reply = read_json(&mut runner)
-            .await?
-            .ok_or_else(|| io::Error::other("missing export reply"))?;
-        write_json(socket, &reply).await?;
-        if reply["ok"] == true {
-            let source: FillSource = serde_json::from_value(reply["source"].clone())?;
-            source.validate(FILL_SOURCE_MAX_BYTES)?;
-            relay_chunks(&mut runner, socket, &source).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn relay_chunks<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    read: &mut R,
-    write: &mut W,
-    source: &FillSource,
-) -> io::Result<()> {
-    let mut remaining = source.validate(FILL_SOURCE_MAX_BYTES)?;
-    while remaining != 0 {
-        let frame = motor_protocol::read_frame_async(read)
-            .await?
-            .ok_or_else(|| io::Error::other("incomplete fill transfer"))?;
-        let Frame::BundleChunk { ref data, .. } = frame else {
-            return Err(io::Error::other("expected fill chunk"));
-        };
-        if data.0.is_empty() {
-            return Err(io::Error::other("empty fill chunk"));
-        }
-        remaining = remaining
-            .checked_sub(data.0.len() as u64)
-            .ok_or_else(|| io::Error::other("fill source overrun"))?;
-        write_frame_async(write, &frame).await?;
     }
     Ok(())
 }
@@ -269,11 +181,6 @@ async fn dispatch_value(value: Value, attach: &tokio::sync::Mutex<()>) -> io::Re
         }
         let _guard = attach.lock().await;
         return forward(Frame::SetRemoteCacheWriteBlock { blocked }).await;
-    }
-    if crate::fill_source::fill_boot(&fs::read_to_string("/proc/cmdline")?)
-        && value["op"] != "attach_tenant"
-    {
-        return Err(io::Error::other("operation does not match VM boot kind"));
     }
     if value["op"] == "job_status" {
         return forward(job_status_request(value)?).await;
@@ -335,15 +242,7 @@ async fn dispatch(
     if recovering != matches!(request, TenantAgentRequest::RecoverWorkspace { .. }) {
         return Err(io::Error::other("operation does not match VM boot kind"));
     }
-    if crate::fill_source::fill_boot(&fs::read_to_string("/proc/cmdline")?)
-        && !matches!(request, TenantAgentRequest::AttachTenant { .. })
-    {
-        return Err(io::Error::other("operation does not match VM boot kind"));
-    }
     match request {
-        TenantAgentRequest::Fill { .. } | TenantAgentRequest::ExportTip { .. } => {
-            Err(io::Error::other("streaming operation required"))
-        }
         TenantAgentRequest::RecoverWorkspace { budget_ms } => {
             let _guard = attach.lock().await;
             tokio::task::spawn_blocking(move || recovery::run(budget_ms))

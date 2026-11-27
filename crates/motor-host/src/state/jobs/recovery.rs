@@ -54,10 +54,9 @@ impl Host {
             .executions
             .values()
             .filter(|e| !e.ended)
-            .fold(
-                self.recovery_permits().saturating_add(self.fill_permits()),
-                |n, e| n.saturating_add(e.claims.vcpus),
-            );
+            .fold(self.recovery_permits(), |n, e| {
+                n.saturating_add(e.claims.vcpus)
+            });
         u64::from(sample.permit_budget.saturating_sub(used))
     }
 

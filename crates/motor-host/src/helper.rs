@@ -20,15 +20,6 @@ pub trait Control: Send + Sync {
     fn install_tenant_cache(&self, _tenant: &str, _account: &str) -> Result<()> {
         anyhow::bail!("tenant cache install unavailable")
     }
-    fn prepare_fill(&self, _fill: &motor_vm_helper::job::Fill) -> Result<()> {
-        anyhow::bail!("fill provisioning unavailable")
-    }
-    fn finish_fill(&self, _fill: &motor_vm_helper::job::Fill, _published: bool) -> Result<bool> {
-        anyhow::bail!("fill completion unavailable")
-    }
-    fn seed_workspace(&self, _seed: &motor_vm_helper::job::Seed) -> Result<()> {
-        anyhow::bail!("base seeding unavailable")
-    }
     fn fork_workspace(
         &self,
         _fork: &motor_vm_helper::job::Fork,
@@ -50,9 +41,6 @@ pub trait Control: Send + Sync {
     /// Exclusive extents only; unavailable measurements must not become zero.
     fn workspace_usage(&self, _account: &str, _disk_id: &str) -> Result<Option<u64>> {
         Ok(None)
-    }
-    fn evict_base(&self, _account: &str, _disk_id: &str) -> Result<()> {
-        anyhow::bail!("base eviction unavailable")
     }
     fn ensure_workspace(&self, _account: &str, _disk_id: &str, _size_bytes: u64) -> Result<()> {
         anyhow::bail!("workspace creation unavailable")
@@ -434,21 +422,6 @@ impl Control for Helper {
         ensure!(reply["result"] == "ok", "tenant cache install failed");
         Ok(())
     }
-    fn prepare_fill(&self, fill: &motor_vm_helper::job::Fill) -> Result<()> {
-        self.request(json!({"op":"prepare_fill", "fill":fill}))?;
-        Ok(())
-    }
-    fn finish_fill(&self, fill: &motor_vm_helper::job::Fill, published: bool) -> Result<bool> {
-        let (reply, _) =
-            self.request(json!({"op":"finish_fill", "fill":fill, "published":published}))?;
-        reply["published"]
-            .as_bool()
-            .context("missing fill publication result")
-    }
-    fn seed_workspace(&self, seed: &motor_vm_helper::job::Seed) -> Result<()> {
-        self.request(json!({"op":"seed_workspace", "seed":seed}))?;
-        Ok(())
-    }
     fn fork_workspace(
         &self,
         fork: &motor_vm_helper::job::Fork,
@@ -498,12 +471,6 @@ impl Control for Helper {
             "workspace usage refused"
         );
         Ok(serde_json::from_value(reply["exclusive_bytes"].clone())?)
-    }
-    fn evict_base(&self, account: &str, disk_id: &str) -> Result<()> {
-        let (reply, _) =
-            self.request(json!({"op":"evict_base", "account":account, "disk_id":disk_id}))?;
-        ensure!(reply["result"] == "ok", "base eviction refused");
-        Ok(())
     }
     fn ensure_workspace(&self, account: &str, disk_id: &str, size_bytes: u64) -> Result<()> {
         let (reply, _) = self.request(json!({"op":"ensure_workspace", "account":account, "disk_id":disk_id, "size_bytes":size_bytes}))?;

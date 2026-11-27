@@ -124,10 +124,6 @@ pub struct Config {
     /// Shared Cargo storage for isolated jobs; defaults to CARGO_HOME.
     #[cfg(target_os = "linux")]
     pub cargo_home: Option<PathBuf>,
-    /// A per-job fill VM: a tenant runner (not `per_job`) booted only to run one
-    /// imported fill. Like a job VM, it reads its cache credentials from the
-    /// boot drive the guest agent installs, not from tenant provisioning.
-    pub fill_vm: bool,
     /// Exact caller repository roots selected for job checkouts at
     /// `/w/<account>/<repo-key>/<name>`; `*` selects all roots.
     pub fixed_path_repositories: Vec<String>,
@@ -599,7 +595,6 @@ impl Config {
             image_cargo: PathBuf::from(crate::isolation::cargo_sources::IMAGE_CARGO),
             #[cfg(target_os = "linux")]
             cargo_home: None,
-            fill_vm: false,
             fixed_path_repositories: Vec::new(),
             account_subject: None,
             boat_profile: false,
@@ -788,11 +783,6 @@ impl Config {
         if self.per_job && (!self.tenant_vm || self.boat_profile) {
             return Err(io::Error::other("--per-job requires a tenant runner"));
         }
-        if self.fill_vm && (!self.tenant_vm || self.boat_profile || self.per_job) {
-            return Err(io::Error::other(
-                "--fill-vm requires a tenant runner without --per-job",
-            ));
-        }
         check_fixed_path_options(
             &self.fixed_path_repositories,
             self.account_subject.as_deref(),
@@ -916,10 +906,9 @@ impl Config {
                     .is_some_and(|generation| generation.write_key.is_some())
             })
     }
-    /// A Job VM's create-only key never authorizes maintenance fills. Dedicated
-    /// fill runners and shared tenants still require an installed write key.
+    /// Job VMs never run maintenance fills. Shared tenants need a write key.
     pub(crate) fn tenant_fills(&self) -> bool {
-        if self.per_job && !self.fill_vm {
+        if self.per_job {
             return false;
         }
         #[cfg(unix)]
@@ -1860,9 +1849,6 @@ struct Core {
     /// after a restart every connection that received a reply is gone, so the
     /// first prune removes all held refs.
     held_offers: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>>,
-    /// Connection-scoped mirror refs, retained through the fill control reply.
-    #[cfg(target_os = "linux")]
-    fill_source_holds: Mutex<BTreeMap<Uuid, BTreeMap<PathBuf, BTreeSet<String>>>>,
     /// Immutable until restart after operator reconciliation. Even readable
     /// workspace metadata cannot establish a damaged job's full CPU/cache use.
     quarantined: BTreeMap<Uuid, QuarantinedJob>,
@@ -2122,24 +2108,6 @@ enum DrainResult {
 #[derive(Clone)]
 pub struct Runner {
     core: Arc<Core>,
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) struct FillSourceHold {
-    runner: Runner,
-    token: Uuid,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for FillSourceHold {
-    fn drop(&mut self) {
-        self.runner
-            .core
-            .fill_source_holds
-            .lock()
-            .unwrap()
-            .remove(&self.token);
-    }
 }
 
 struct WorkspaceDrop {
@@ -3165,8 +3133,6 @@ impl Runner {
                 job_logs: Mutex::new(BTreeMap::new()),
                 ref_mutation: Mutex::new(()),
                 held_offers: Mutex::new(BTreeMap::new()),
-                #[cfg(target_os = "linux")]
-                fill_source_holds: Mutex::new(BTreeMap::new()),
                 quarantine_admission: Mutex::new(
                     (!quarantined.is_empty())
                         .then(|| "live unit ownership has not been inspected".into()),
@@ -3507,22 +3473,6 @@ impl Runner {
         }
         detail.truncate(end);
         detail
-    }
-
-    /// Cache fills run only on Linux runners, so only Linux builds call this.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn redact_fill_output(&self, id: Uuid, text: impl std::fmt::Display) -> String {
-        let values = self
-            .core
-            .inner
-            .lock()
-            .unwrap()
-            .jobs
-            .get(&id)
-            .and_then(|job| job.request.as_ref())
-            .map(|request| request.env.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        self.redact_refusal_detail(text, values)
     }
 
     fn redact_refusal_detail(
@@ -3939,164 +3889,6 @@ impl Runner {
         true
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn export_fill_source(
-        &self,
-        id: Uuid,
-        directory: &Path,
-        cap: u64,
-    ) -> io::Result<crate::fill_source::Export> {
-        let request = {
-            let inner = self.core.inner.lock().unwrap();
-            let job = inner
-                .jobs
-                .get(&id)
-                .ok_or_else(|| invalid("unknown export job"))?;
-            if !self.config().per_job || job.base || job.terminal.is_none() {
-                return Err(invalid("export requires a completed job VM job"));
-            }
-            job.request
-                .clone()
-                .ok_or_else(|| invalid("missing export request"))?
-        };
-        crate::fill_source::export(
-            &self.core.trees,
-            paths::request(&request).caller_repository_root.text(),
-            &request.integration_tip,
-            directory,
-            cap,
-        )
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn import_fill_source(
-        &self,
-        source: &motor_protocol::FillSource,
-        directory: &Path,
-    ) -> io::Result<(Option<Uuid>, FillSourceHold)> {
-        crate::fill_source::require_fill_boot()?;
-        self.import_fill_source_contents(source, directory)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn import_fill_source_contents(
-        &self,
-        source: &motor_protocol::FillSource,
-        directory: &Path,
-    ) -> io::Result<(Option<Uuid>, FillSourceHold)> {
-        self.validate_writer_paths(paths::fill_source(source).host, None, &[])?;
-        // Import, hold registration and queuing are one ref-mutation turn:
-        // maintenance must not observe the imported refs without their owner.
-        let _refs = self.core.ref_mutation.lock().unwrap();
-        crate::fill_source::import(&self.core.trees, source, directory)?;
-        let mut mirrors = BTreeMap::<PathBuf, BTreeSet<String>>::new();
-        for pin in crate::fill_source::pins(&self.core.trees, source)? {
-            let mirror = if let Some(repository) = pin.repository {
-                self.core.trees.mirror(&repository)
-            } else {
-                self.core
-                    .trees
-                    .dependency_mirror(pin.dependency.as_ref().unwrap())
-            };
-            mirrors.entry(mirror).or_default().insert(pin.reference);
-        }
-        let token = Uuid::now_v7();
-        self.core
-            .fill_source_holds
-            .lock()
-            .unwrap()
-            .insert(token, mirrors);
-        let hold = FillSourceHold {
-            runner: self.clone(),
-            token,
-        };
-        tracing::info!(
-            tip = source.integration_tip,
-            repository_key = workspace::name(paths::fill_source(source).caller.text()),
-            dependencies = source.git_dependencies.len(),
-            "fill_source_imported"
-        );
-        Ok((self.queue_imported_fill(source)?, hold))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn queue_imported_fill(&self, source: &motor_protocol::FillSource) -> io::Result<Option<Uuid>> {
-        let repository = paths::fill_source(source).caller;
-        let plan = self.base_plan(repository.text(), &source.integration_tip, true);
-        let mut inner = self.core.inner.lock().unwrap();
-        if let Some(reason) = self.fill_vm_writer_refusal(&source.integration_tip) {
-            return Err(invalid(format!("fill writer unavailable: {reason}")));
-        }
-        self.queue_base_planned(&mut inner, repository.text(), repository.text(), plan)?;
-        let id = inner
-            .jobs
-            .values()
-            .find(|job| {
-                job.base
-                    && job.terminal.is_none()
-                    && job
-                        .request
-                        .as_ref()
-                        .is_some_and(|r| paths::request(r).caller_repository_root == repository)
-            })
-            .map(|job| job.id);
-        if id.is_none()
-            && inner
-                .catalog
-                .repositories
-                .get(repository.text())
-                .is_none_or(|repo| repo.result != Some(RebuildResult::Ok))
-        {
-            return Err(invalid("fill was not queued"));
-        }
-        Ok(id)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn fill_settled(&self, id: Uuid, repository: &str) -> io::Result<bool> {
-        let inner = self.core.inner.lock().unwrap();
-        if inner.base_finishes.contains_key(&id) {
-            return Ok(false);
-        }
-        let record = inner.catalog.repositories.get(repository);
-        if record.is_none_or(|record| record.result != Some(RebuildResult::Ok)) {
-            let reason = record
-                .and_then(|record| record.failure_detail.as_deref())
-                .filter(|detail| !detail.trim().is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| match record {
-                    Some(record) => format!(
-                        "repository rebuild result is {:?} without a failure detail",
-                        record.result
-                    ),
-                    None => "repository rebuild record is missing".into(),
-                });
-            return Err(invalid(format!("fill writer publication failed: {reason}")));
-        }
-        Ok(true)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn fill_source_pins(
-        &self,
-        source: &motor_protocol::FillSource,
-    ) -> io::Result<Vec<motor_protocol::MirrorRef>> {
-        crate::fill_source::pins(&self.core.trees, source)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn fill_write_samples(&self, id: Uuid, repository: &str) -> Option<u64> {
-        let inner = self.core.inner.lock().unwrap();
-        let descriptor = inner.jobs.get(&id)?.writer_descriptor.as_ref()?;
-        let record = inner
-            .catalog
-            .repositories
-            .get(repository)?
-            .publications
-            .get(descriptor)?;
-        let samples = record.keys.len() as u64;
-        (samples > 0).then_some(samples)
-    }
     pub(crate) fn terminal_ready(&self, id: Uuid) -> bool {
         self.core
             .inner
@@ -5047,22 +4839,6 @@ impl Runner {
         access: &crate::workspace_access::Repairs,
         hold_check: Option<&mut macos_hold::RunHoldCheck>,
     ) -> Option<(RefusalReason, String)> {
-        #[cfg(target_os = "linux")]
-        if self.config().tenant_vm {
-            match std::fs::read_to_string("/proc/cmdline") {
-                Ok(line) => {
-                    if let Some(refusal) = crate::fill_source::run_refusal_for_boot(&line) {
-                        return Some(refusal);
-                    }
-                }
-                Err(_) => {
-                    return Some((
-                        RefusalReason::RequestRejected,
-                        "VM boot kind unavailable".into(),
-                    ))
-                }
-            }
-        }
         if self.core.config.per_job
             && (inner.per_job_id != Some(request.job_id)
                 || inner.per_job_workspace.as_ref()
@@ -6067,14 +5843,6 @@ impl Runner {
         Ok(())
     }
     pub(crate) fn allow_prepare(&self) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if self.config().tenant_vm {
-            if let Some((_, detail)) =
-                crate::fill_source::run_refusal_for_boot(&std::fs::read_to_string("/proc/cmdline")?)
-            {
-                return Err(invalid(detail));
-            }
-        }
         self.ensure_admission_ownership()?;
         if self.core.config.windows_instance() {
             Err(io::Error::new(io::ErrorKind::Unsupported, "Prepare is unsupported by the Windows instance; caller workspaces are never materialized on the host"))
@@ -6109,52 +5877,6 @@ impl Runner {
     }
     /// Whether warm builds may be queued for `tip` at all, from configuration
     /// alone; `queue_base_planned` also checks for a drain under the lock.
-    /// Why a per-job fill VM may not run the fill it was booted for, or `None`
-    /// when it may. The caller has already proved this is a fill boot
-    /// (`import_fill_source` requires one), and a fill boot's runner starts
-    /// without `--per-job` (see `tenant_agent::per_job::args`), so neither the
-    /// per-job flag nor `warm_builds_enabled`'s refusal of VM instances applies.
-    /// The cache writer and its write key still must be present. The reason is
-    /// returned to the host, whose log is the only record of a fill VM.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn fill_vm_writer_refusal(&self, tip: &str) -> Option<String> {
-        let config = &self.core.config;
-        if tip.is_empty() {
-            return Some("no default-branch tip".into());
-        }
-        if !self.core.quarantined.is_empty() {
-            return Some("a job record is quarantined".into());
-        }
-        if config.boat_profile {
-            return Some("Boat sandboxes never fill".into());
-        }
-        if config.tenant_vm && !config.tenant_fills() {
-            return Some(if !config.remote_cache {
-                "remote cache is off in the runner arguments".into()
-            } else if let Some(error) = &config.remote_cache_error {
-                format!("remote cache did not start: {error}")
-            } else if let Some(runtime) = &config.remote_cache_runtime {
-                match runtime.watch.admit() {
-                    Some(_) => "no cache write key in the installed credentials".into(),
-                    None => format!(
-                        "no usable cache credentials (enabled={:?}, status={:?})",
-                        runtime.watch.enabled_setting(),
-                        runtime.watch.status()
-                    ),
-                }
-            } else {
-                "remote cache runtime is not running".into()
-            });
-        }
-        if !config.writer_enabled() {
-            return Some(if config.writer_account.is_none() {
-                "cache writer account unavailable".into()
-            } else {
-                "cache writer disabled".into()
-            });
-        }
-        None
-    }
     fn warm_builds_enabled(&self, tip: &str) -> bool {
         if self.core.config.per_job {
             return false;
@@ -8419,15 +8141,6 @@ impl Runner {
             );
         }
         drop(offers);
-        #[cfg(target_os = "linux")]
-        for hold in self.core.fill_source_holds.lock().unwrap().values() {
-            for (mirror, references) in hold {
-                mirrors
-                    .entry(mirror.clone())
-                    .or_default()
-                    .extend(references.iter().cloned());
-            }
-        }
         // Expired records may be the last mention of a repository. Enumerate
         // mirrors too, so their unheld refs are pruned after that record expires.
         for entry in fs::read_dir(&self.core.trees.mirrors)? {

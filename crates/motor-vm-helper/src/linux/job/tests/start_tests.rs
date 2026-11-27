@@ -186,52 +186,6 @@ fn racing_starts_reserve_one_disk_or_one_id_exactly_once() {
     }
 }
 
-#[test]
-fn finish_fill_waits_for_stop_without_holding_admission() {
-    let base = cortexkit_test_support::ScratchDir::new("finish-fill-admission");
-    let jobs = Arc::new(fixture(&base));
-    let fill = job::Fill {
-        account: "account-1".into(),
-        fill_id: job::test_id(1),
-        repository_key: "repo-1".into(),
-        size_bytes: 1 << 30,
-    };
-    let mut intent = record();
-    intent.start.kind = job::VmKind::Fill;
-    intent.start.workspace_disk_id = fill.disk_id();
-    jobs.save(&intent).unwrap();
-    jobs.adopt_record(intent).unwrap();
-    let (waiting, release) = pause(&jobs, ExitStep::Stop);
-    let finishing = jobs.clone();
-    let finish = std::thread::spawn(move || {
-        finishing.handle(
-            Operation::FinishFill {
-                fill,
-                published: false,
-            },
-            peer(),
-        )
-    });
-    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
-    let (sent, reply) = mpsc::channel();
-    let requesting = jobs.clone();
-    let request = std::thread::spawn(move || {
-        sent.send(requesting.handle(
-            Operation::WorkspaceUsage {
-                account: "account-1".into(),
-                disk_id: "idle-disk".into(),
-            },
-            peer(),
-        ))
-        .unwrap();
-    });
-    let result = reply.recv_timeout(Duration::from_secs(1));
-    release.send(()).unwrap();
-    let _ = finish.join().unwrap();
-    request.join().unwrap();
-    result.expect("workspace waited for fill stop").unwrap();
-}
-
 fn removal_order(images: bool, removal_first: bool) {
     let base = cortexkit_test_support::ScratchDir::new("start-removal-order");
     let jobs = Arc::new(fixture(&base));

@@ -69,17 +69,19 @@ these rules:
    `isolated_source_and_store_never_follow_links_or_accept_unsafe_keys`
    (`src/linux/cache/tests.rs`). Full command/source requirements are in
    [hosted-host.md](../../docs/hosted-host.md#root-remote-cache-credential-command).
-2. **Deliver only what this boot needs.** Jobs get config and read key;
-   trusted fill/base-build VMs also get write key; recovery and unprovisioned
-   accounts get no credential drive. Each read-only drive is nonce-bound to
-   its boot, mode 0600, owned by that VM's exclusive jail uid inside a root-only
+2. **Deliver only what this boot needs.** Jobs get the config and read key.
+   Only a job with a verified cache-write grant also gets the write key for its
+   runner. Recovery VMs and unprovisioned accounts get no credential drive.
+   Each read-only drive is nonce-bound to its boot, mode 0600, and owned by
+   that VM's exclusive jail uid inside a root-only
    boundary. The guest validates it before installing config 0444 and keys 0400
    for the runner in tmpfs. Keys never reach host-agent memory, workspace disks,
-   bases, published images, replay or logs. The helper removes the temporary
+   published images, stored job replay records or logs. The helper removes the temporary
    drive before releasing the jail/uid, including cleanup after restart. Tests:
    `credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms`,
    `isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse`
    (`src/linux/job/tests.rs`),
+   `job_credential_staging_requires_matching_grant_and_keeps_read_key`,
    `isolated_account_drives_rotate_at_next_start_and_never_reuse_nonces` and
    `isolated_store_and_drive_refuse_host_and_other_jail_uids`
    (`src/linux/cache/tests.rs`).

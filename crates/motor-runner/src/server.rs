@@ -40,7 +40,7 @@ pub fn runner_hello(
         sibling_paths: config.sibling_snapshot_mode(),
         protocol_version: PROTOCOL_VERSION,
         started,
-        default_branch_tip,
+        default_branch_tip: default_branch_tip && !config.per_job,
         gate_jobs,
         platforms: match config.served_platform() {
             Platform::Windows => vec!["windows".into()],

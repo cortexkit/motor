@@ -150,8 +150,7 @@ impl Endpoint {
 /// Gateway limits; the defaults are the configured defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Limits {
-    /// Dedicated Job/Fill VMs may bind fill writers only when the host supplied
-    /// the privileged `motor.fill=1` kernel boot argument.
+    /// Job VMs may use create-only cache writes, but cannot bind fill writers.
     pub(crate) fill_write_allowed: bool,
     /// Largest object a PUT may send or a response may carry.
     pub(crate) max_object_bytes: u64,
@@ -216,19 +215,8 @@ impl Default for Limits {
 
 impl Limits {
     pub(crate) fn for_config(config: &crate::Config) -> Self {
-        #[cfg(target_os = "linux")]
-        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        #[cfg(not(target_os = "linux"))]
-        let cmdline = String::new();
-        Self::for_config_and_boot(config, &cmdline)
-    }
-
-    pub(crate) fn for_config_and_boot(config: &crate::Config, cmdline: &str) -> Self {
         Self {
-            fill_write_allowed: !(config.per_job || config.fill_vm)
-                || cmdline
-                    .split_whitespace()
-                    .any(|word| word == "motor.fill=1"),
+            fill_write_allowed: !config.per_job,
             max_job_put_objects: config.remote_cache_max_job_put_objects,
             max_job_put_bytes: config.remote_cache_max_job_put_bytes,
             max_job_puts: config.remote_cache_max_job_puts,
@@ -1016,7 +1004,7 @@ impl Gateway {
         if binding.endpoint == Endpoint::Write && !self.shared.limits.fill_write_allowed {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "fill cache binding requires a Fill VM boot",
+                "job VMs cannot bind fill cache writers",
             ));
         }
         let mut stopped = binding.owner.stopped.subscribe();

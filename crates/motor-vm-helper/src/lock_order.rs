@@ -95,16 +95,6 @@ impl<T> Mutex<T> {
         let guard = self.inner.lock().unwrap();
         Guard { guard, _held: held }
     }
-
-    #[cfg(test)]
-    pub(crate) fn try_lock(&self) -> Option<Guard<'_, T>> {
-        let held = enter(self.order);
-        match self.inner.try_lock() {
-            Ok(guard) => Some(Guard { guard, _held: held }),
-            Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]

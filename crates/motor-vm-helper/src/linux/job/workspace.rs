@@ -5,6 +5,62 @@ pub(super) use usage::exclusive_bytes;
 mod fork;
 pub(super) use fork::fork_bound;
 
+pub(super) fn validate_registries(root: &Path) -> Result<()> {
+    if !root.try_exists()? {
+        return Ok(());
+    }
+    trusted_directory(root)?;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("registry.json");
+        if path.try_exists()? {
+            let mut file = fs::trusted_file(&path)?;
+            decode_registry(
+                &entry.file_name().to_string_lossy(),
+                &std::io::read_to_string(&mut file)?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_registry(disk_id: &str, json: &str) -> Result<Workspace> {
+    serde_json::from_str(json).map_err(|error| {
+        if let Ok(value) = serde_json::from_str::<Value>(json) {
+            if let Some(role @ ("fill" | "base")) = value["role"].as_str() {
+                return Error(format!("workspace disk {disk_id} has retired role {role}; delete the directory while the helper is stopped"));
+            }
+        }
+        Error(format!("invalid workspace registry for disk {disk_id}: {error}"))
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn retired_workspace_roles_name_the_disk_and_require_operator_cleanup() {
+    let mut value =
+        json!({"account":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", "workspace_disk_id":"disk-1"});
+    assert_eq!(
+        decode_registry("disk-1", &value.to_string()).unwrap().role,
+        job::WorkspaceRole::Job
+    );
+    for role in ["fill", "base", "unknown"] {
+        value["role"] = json!(role);
+        let error = decode_registry("disk-1", &value.to_string()).unwrap_err().0;
+        assert!(error.contains("disk-1"));
+        if role == "unknown" {
+            assert!(error.contains("invalid workspace registry"));
+            assert!(!error.contains("delete the directory"));
+        } else {
+            assert!(error.contains(&format!("retired role {role}")));
+            assert!(error.contains("delete the directory while the helper is stopped"));
+        }
+    }
+}
+
 pub(super) fn open_disk(root: &Path, account: &str, disk_id: &str) -> Result<(Workspace, File)> {
     job::validate_account(account)?;
     job::validate_id(disk_id)?;
@@ -104,27 +160,6 @@ fn grow_disk(root: &Path, disk_id: &str, identity: (u64, u64), size: u64) -> Res
     Ok(())
 }
 
-pub(super) fn base_lease(
-    root: &Path,
-    account: &str,
-    disk_id: &str,
-    exclusive: bool,
-) -> Result<File> {
-    let (registry, disk) = open_disk(root, account, disk_id)?;
-    if registry.role != job::WorkspaceRole::Base || disk.metadata()?.uid() != 0 {
-        return Err(Error("base lease requires a root-owned base".into()));
-    }
-    let mode = if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    };
-    if unsafe { libc::flock(disk.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
-        return Err(Error("base is held by a seed or clone".into()));
-    }
-    Ok(disk)
-}
-
 // Only helper-created trash names are visited. A synced rename is the deletion
 // decision; startup can finish removing its contents without opening guest data.
 pub(super) fn finish_deletions(root: &Path) -> Result<()> {
@@ -152,15 +187,6 @@ pub(super) fn finish_deletions(root: &Path) -> Result<()> {
 }
 
 pub(super) fn delete(root: &Path, account: &str, disk_id: &str) -> Result<()> {
-    delete_role(root, account, disk_id, job::WorkspaceRole::Job)
-}
-
-pub(super) fn delete_role(
-    root: &Path,
-    account: &str,
-    disk_id: &str,
-    role: job::WorkspaceRole,
-) -> Result<()> {
     job::validate_account(account)?;
     job::validate_id(disk_id)?;
     trusted_directory(root)?;
@@ -171,11 +197,8 @@ pub(super) fn delete_role(
         let registry: Workspace =
             serde_json::from_reader(fs::trusted_file(&path.join("registry.json"))?)
                 .map_err(|e| Error(e.to_string()))?;
-        if registry.account != account
-            || registry.workspace_disk_id != disk_id
-            || registry.role != role
-        {
-            return Err(Error("workspace deletion identity or role mismatch".into()));
+        if registry.account != account || registry.workspace_disk_id != disk_id {
+            return Err(Error("workspace deletion identity mismatch".into()));
         }
         if trash.try_exists()? {
             return Err(Error("workspace trash collision".into()));
@@ -191,7 +214,7 @@ pub(super) fn delete_role(
     Ok(())
 }
 
-// The role is chosen by the helper's provisioning operation, never by Start.
+#[cfg(all(test, feature = "linux-root-tests"))]
 pub(super) fn create(
     root: &Path,
     request: job::CreateWorkspace,
@@ -270,141 +293,6 @@ pub(super) fn create_bound(
     Ok(())
 }
 
-pub(super) fn prepare_fill(root: &Path, fill: &job::Fill) -> Result<()> {
-    fill.validate()?;
-    let id = fill.disk_id();
-    if root.join(&id).try_exists()? {
-        let (registry, _) = open_disk(root, &fill.account, &id)?;
-        if registry.role != job::WorkspaceRole::Fill || read_fill(root, &id)? != *fill {
-            return Err(Error("fill provenance mismatch".into()));
-        }
-        return Ok(());
-    }
-    create(
-        root,
-        job::CreateWorkspace {
-            cache_write_job_id: None,
-            account: fill.account.clone(),
-            workspace_disk_id: id.clone(),
-            size_bytes: fill.size_bytes,
-        },
-        job::WorkspaceRole::Fill,
-    )?;
-    tenant::durable_write(
-        &root.join(&id).join("fill.json"),
-        &serde_json::to_vec(fill).map_err(|e| Error(e.to_string()))?,
-    )
-}
-
-pub(super) fn read_fill(root: &Path, id: &str) -> Result<job::Fill> {
-    serde_json::from_reader(fs::trusted_file(&root.join(id).join("fill.json"))?)
-        .map_err(|e| Error(e.to_string()))
-}
-
-pub(super) fn promote(root: &Path, fill: &job::Fill) -> Result<()> {
-    let id = fill.disk_id();
-    let (mut registry, disk) = open_disk(root, &fill.account, &id)?;
-    if read_fill(root, &id)? != *fill
-        || disk.metadata()?.uid() != 0
-        || !matches!(
-            registry.role,
-            job::WorkspaceRole::Fill | job::WorkspaceRole::Base
-        )
-    {
-        return Err(Error("base publication provenance mismatch".into()));
-    }
-    disk.sync_all()?;
-    registry.role = job::WorkspaceRole::Base;
-    // The synced atomic registry replacement is the publication point. A crash
-    // leaves an unpublishable Fill or a complete, immutable Base.
-    tenant::durable_write(
-        &root.join(id).join("registry.json"),
-        &serde_json::to_vec(&registry).map_err(|e| Error(e.to_string()))?,
-    )
-}
-
-#[cfg(all(test, feature = "linux-root-tests"))]
-pub(super) fn seed(root: &Path, seed: &job::Seed) -> Result<()> {
-    seed_bound(root, seed, None)
-}
-
-pub(super) fn seed_bound(
-    root: &Path,
-    seed: &job::Seed,
-    grant: Option<&crate::cache_write::Grant>,
-) -> Result<()> {
-    let id = &seed.disk_id;
-    if root.join(id).try_exists()? {
-        let (registry, disk) = open_disk(root, &seed.account, id)?;
-        let previous: job::Seed =
-            serde_json::from_reader(fs::trusted_file(&root.join(id).join("seed.json"))?)
-                .map_err(|e| Error(e.to_string()))?;
-        // cache_write_job_id selects a verified grant when creating a new disk.
-        // Ignore that field on an existing disk: retries must not replace its
-        // stored workspace hash or add a hash to a legacy registry.
-        if registry.role != job::WorkspaceRole::Job
-            || disk.metadata()?.uid() != 0
-            || previous.account != seed.account
-            || previous.repository_key != seed.repository_key
-            || previous.base_id != seed.base_id
-            || previous.disk_id != seed.disk_id
-        {
-            return Err(Error("seed identity mismatch".into()));
-        }
-        return Ok(());
-    }
-    let base = base_lease(root, &seed.account, &seed.base_id, false)?;
-    let provenance = read_fill(root, &seed.base_id)?;
-    if provenance.account != seed.account || provenance.repository_key != seed.repository_key {
-        return Err(Error("base repository or account mismatch".into()));
-    }
-    // Publish the new Job registry only after cloning and syncing. Incomplete
-    // directories have no usable registry and cannot be attached after a crash.
-    let mut random = [0u8; 16];
-    if unsafe { libc::getrandom(random.as_mut_ptr().cast(), random.len(), 0) }
-        != random.len() as isize
-    {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let staging = format!(".seed-{:032x}", u128::from_ne_bytes(random));
-    let path = root.join(&staging);
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-    let result = (|| {
-        let disk = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path.join("workspace.img"))?;
-        fs::reflink(&base, &disk)?;
-        disk.sync_all()?;
-        tenant::durable_write(
-            &path.join("seed.json"),
-            &serde_json::to_vec(seed).map_err(|e| Error(e.to_string()))?,
-        )?;
-        tenant::durable_write(
-            &path.join("registry.json"),
-            &serde_json::to_vec(&Workspace {
-                workspace_key_hash: binding(&seed.account, job::WorkspaceRole::Job, grant),
-                account: seed.account.clone(),
-                workspace_disk_id: id.clone(),
-                role: job::WorkspaceRole::Job,
-            })
-            .map_err(|e| Error(e.to_string()))?,
-        )?;
-        std::fs::rename(&path, root.join(id))?;
-        File::open(root)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(path);
-    }
-    result
-}
-
-#[cfg(all(test, feature = "linux-root-tests"))]
-mod fill_tests;
-
 #[cfg(all(test, feature = "linux-root-tests"))]
 mod binding_tests;
 
@@ -424,11 +312,11 @@ mod tests {
             workspace_disk_id: "disk-1".into(),
             size_bytes: 4096,
         };
-        create(&root, request(), job::WorkspaceRole::Fill).unwrap();
+        create(&root, request(), job::WorkspaceRole::Job).unwrap();
         let registry = root.join("disk-1/registry.json");
         let before = std::fs::read(&registry).unwrap();
         let saved: Workspace = serde_json::from_slice(&before).unwrap();
-        assert_eq!(saved.role, job::WorkspaceRole::Fill);
+        assert_eq!(saved.role, job::WorkspaceRole::Job);
         assert_eq!(saved.account, request().account);
         assert_eq!(
             std::fs::metadata(root.join("disk-1/workspace.img"))
@@ -439,7 +327,7 @@ mod tests {
         assert!(create(&root, request(), job::WorkspaceRole::Job).is_err());
         assert_eq!(std::fs::read(&registry).unwrap(), before);
         std::fs::remove_file(&registry).unwrap();
-        assert!(create(&root, request(), job::WorkspaceRole::Base).is_err());
+        assert!(create(&root, request(), job::WorkspaceRole::Job).is_err());
         assert!(!registry.exists());
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -513,8 +401,16 @@ mod tests {
         finish_deletions(&root).unwrap();
         delete(&root, &account, &disk_id).unwrap();
         assert!(!root.join(&disk_id).exists());
-        for role in [job::WorkspaceRole::Fill, job::WorkspaceRole::Base] {
-            create(&root, request(), role).unwrap();
+        for role in ["fill", "base"] {
+            create(&root, request(), job::WorkspaceRole::Job).unwrap();
+            std::fs::write(
+                root.join(&disk_id).join("registry.json"),
+                json!({
+                    "account": account, "workspace_disk_id": disk_id, "role": role
+                })
+                .to_string(),
+            )
+            .unwrap();
             assert!(delete(&root, &account, &disk_id).is_err());
             std::fs::remove_dir_all(root.join(&disk_id)).unwrap();
         }
@@ -627,47 +523,6 @@ mod tests {
                 exclusive_bytes: None
             }
         ));
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn isolated_base_eviction_refuses_vm_seed_clone_job_and_fill_holders() {
-        assert_eq!(unsafe { libc::geteuid() }, 0);
-        let base = super::super::tests::scratch();
-        let jobs = super::super::tests::machine(&base);
-        let account = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let peer = Peer { uid: 0, gid: 0 };
-        let op = || Operation::EvictBase {
-            account: account.into(),
-            disk_id: "disk-1".into(),
-        };
-        let request = || job::CreateWorkspace {
-            cache_write_job_id: None,
-            account: account.into(),
-            workspace_disk_id: "disk-1".into(),
-            size_bytes: 8192,
-        };
-        for role in [job::WorkspaceRole::Job, job::WorkspaceRole::Fill] {
-            create(&jobs.workspaces, request(), role).unwrap();
-            assert!(jobs.handle(op(), peer).is_err());
-            std::fs::remove_dir_all(jobs.workspaces.join("disk-1")).unwrap();
-        }
-        create(&jobs.workspaces, request(), job::WorkspaceRole::Base).unwrap();
-        let seed = jobs.lease_base(account, "disk-1").unwrap();
-        let clone = jobs.lease_base(account, "disk-1").unwrap();
-        assert!(jobs.handle(op(), peer).is_err());
-        drop(seed);
-        assert!(jobs.handle(op(), peer).is_err());
-        drop(clone);
-        let mut record = super::super::tests::record();
-        record.start.workspace_disk_id = "disk-1".into();
-        record.start.kind = job::VmKind::BaseBuild;
-        jobs.insert_record(record);
-        assert!(jobs.handle(op(), peer).is_err());
-        jobs.registry.lock().clear();
-        jobs.handle(op(), peer).unwrap();
-        jobs.handle(op(), peer).unwrap();
-        assert!(!jobs.workspaces.join("disk-1").exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 }

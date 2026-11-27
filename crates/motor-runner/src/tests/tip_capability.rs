@@ -175,3 +175,20 @@ async fn capable_empty_tip_skips_verification_pinning_and_fills() {
         server.abort();
     }
 }
+
+#[test]
+fn per_job_hello_does_not_advertise_default_branch_tip() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.tenant_vm = true;
+    for (per_job, expected) in [(false, true), (true, false)] {
+        config.per_job = per_job;
+        let Frame::Hello {
+            default_branch_tip, ..
+        } = crate::server::runner_hello(&config, true, true, false)
+        else {
+            panic!("expected runner hello");
+        };
+        assert_eq!(default_branch_tip, expected, "per_job={per_job}");
+    }
+}

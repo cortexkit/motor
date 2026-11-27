@@ -28,7 +28,6 @@ use std::{
 const JOB_OOM_SCORE: i32 = 1000;
 const JOB_BOOT_CMDLINE_MAX_BYTES: usize = 1536;
 const JOB_CACHE_WRITE_BOOT_SUFFIX: &str = " motor.cache_write=1";
-const FILL_BOOT_SUFFIX: &str = " motor.fill=1";
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
 const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 // The kernel takes an exiting task out of cgroup.procs a moment before the task
@@ -79,8 +78,6 @@ struct Record {
     tap_index: Option<u8>,
     #[serde(default)]
     egress_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    fill_exit_success: Option<bool>,
 }
 
 impl Record {
@@ -101,7 +98,6 @@ impl Record {
             exit_acknowledged: false,
             tap_index,
             egress_bytes: None,
-            fill_exit_success: None,
         }
     }
 
@@ -140,8 +136,6 @@ pub(super) enum ExitStep {
     MemoryRead,
     #[cfg(test)]
     Reap,
-    #[cfg(test)]
-    FillAdmission,
     Stop,
     Adopt,
     Ack,
@@ -267,11 +261,6 @@ impl LinuxJobs {
         }
         Ok(())
     }
-    /// A seed/clone holds this shared lease until it has synced its new disk.
-    /// Base eviction takes the exclusive lease under job admission.
-    pub fn lease_base(&self, account: &str, disk_id: &str) -> Result<File> {
-        workspace::base_lease(&self.workspaces, account, disk_id, false)
-    }
     pub fn new(config: &Config) -> Self {
         Self {
             cache_write_grants: std::sync::Arc::new(crate::cache_write::Grants::new(config)),
@@ -312,63 +301,8 @@ impl LinuxJobs {
     }
 
     pub fn reconcile(&self) -> Result<()> {
+        workspace::validate_registries(&self.workspaces)?;
         self.reconcile_records(network::read_records(&self.records_path)?)?;
-        let abandoned: Vec<_> = self
-            .records()
-            .values()
-            .filter(|r| r.start.kind == job::VmKind::Fill)
-            .filter_map(|r| match self.pid(r) {
-                Ok(None) => Some(Ok(r.start.clone())),
-                Ok(Some(_)) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<Result<_>>()?;
-        for start in abandoned {
-            if let Ok((registry, _)) =
-                workspace::open_disk(&self.workspaces, &start.account, &start.workspace_disk_id)
-            {
-                if registry.role == job::WorkspaceRole::Fill {
-                    let fill = workspace::read_fill(&self.workspaces, &start.workspace_disk_id)?;
-                    self.finish_fill(&fill, false)?;
-                }
-            }
-        }
-        if self.workspaces.try_exists()? {
-            for entry in std::fs::read_dir(&self.workspaces)? {
-                let entry = entry?;
-                let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if !id.starts_with("fill-") {
-                    continue;
-                }
-                // A live fill survives a helper restart just like a job.
-                if self
-                    .records()
-                    .values()
-                    .any(|r| !r.released && r.start.workspace_disk_id == id)
-                {
-                    continue;
-                }
-                if !entry.path().join("registry.json").try_exists()? {
-                    trusted_directory(&entry.path())?;
-                    std::fs::remove_dir_all(entry.path())?;
-                    File::open(&self.workspaces)?.sync_all()?;
-                    continue;
-                }
-                let registry: Workspace =
-                    serde_json::from_reader(fs::trusted_file(&entry.path().join("registry.json"))?)
-                        .map_err(|e| Error(e.to_string()))?;
-                if registry.role == job::WorkspaceRole::Fill {
-                    workspace::delete_role(
-                        &self.workspaces,
-                        &registry.account,
-                        &id,
-                        job::WorkspaceRole::Fill,
-                    )?;
-                }
-            }
-        }
         workspace::finish_deletions(&self.workspaces)
     }
 
@@ -483,13 +417,6 @@ impl LinuxJobs {
         let id = state.record.start.job_id.clone();
         eprintln!("job {id} VMM exited: {status}");
         log_console_tail(&id, &self.boundary(&id));
-        if state.record.start.kind == job::VmKind::Fill {
-            // std keeps the reaped status in the Child, so a failed write is
-            // retried with the same status while the child stays recorded.
-            let mut record = state.record.clone();
-            record.fill_exit_success = Some(status.success());
-            self.persist(state, record)?;
-        }
         state.child = None;
         state.pidfd = None;
         self.publish(state);
@@ -520,15 +447,6 @@ impl LinuxJobs {
             return wait;
         }
         wait
-    }
-
-    #[cfg(test)]
-    fn reap(&self) {
-        for (_, cell, _) in self.snapshot() {
-            if let Some(mut state) = cell.0.try_lock() {
-                let _ = self.reap_job(&mut state, Duration::ZERO);
-            }
-        }
     }
 
     fn log_collection_failure(
@@ -914,34 +832,13 @@ impl LinuxJobs {
         // its own writer.
         let _admission = if matches!(
             op,
-            Operation::PrepareFill(_)
-                | Operation::SeedWorkspace(_)
-                | Operation::ForkWorkspace(_)
-                | Operation::WorkspaceUsage { .. }
-                | Operation::EvictBase { .. }
+            Operation::ForkWorkspace(_) | Operation::WorkspaceUsage { .. }
         ) {
             Some(self.admission.lock())
         } else {
             None
         };
         match op {
-            Operation::PrepareFill(fill) => {
-                self.check_workspace_size(fill.size_bytes)?;
-                self.disk_available_identity(&fill.disk_id())?;
-                workspace::prepare_fill(&self.workspaces, &fill)?;
-                Ok(Response::new(Reply::Ok))
-            }
-            Operation::FinishFill { fill, published } => {
-                let published = self.finish_fill(&fill, published)?;
-                Ok(Response::new(Reply::FillFinished { published }))
-            }
-            Operation::SeedWorkspace(seed) => {
-                self.disk_available_identity(&seed.disk_id)?;
-                self.disk_available_identity(&seed.base_id)?;
-                let grant = self.disk_grant(seed.cache_write_job_id.as_deref());
-                workspace::seed_bound(&self.workspaces, &seed, grant.as_ref())?;
-                Ok(Response::new(Reply::Ok))
-            }
             Operation::ForkWorkspace(fork) => {
                 let allowed = self
                     .settings
@@ -1006,21 +903,6 @@ impl LinuxJobs {
                 })?;
                 Ok(Response::new(Reply::Ok))
             }
-            Operation::EvictBase { account, disk_id } => {
-                self.disk_available_identity(&disk_id)?;
-                if self.workspaces.join(&disk_id).try_exists()? {
-                    let _lease = workspace::base_lease(&self.workspaces, &account, &disk_id, true)?;
-                    workspace::delete_role(
-                        &self.workspaces,
-                        &account,
-                        &disk_id,
-                        job::WorkspaceRole::Base,
-                    )?;
-                } else {
-                    workspace::finish_deletions(&self.workspaces)?;
-                }
-                Ok(Response::new(Reply::Ok))
-            }
             Operation::DeleteWorkspace { account, disk_id } => {
                 self.with_disk_admission(&disk_id, || {
                     workspace::delete(&self.workspaces, &account, &disk_id)
@@ -1070,33 +952,6 @@ impl LinuxJobs {
         }
     }
 
-    /// Opens the disk a finished fill's VM wrote, as named by its execution
-    /// record. None means the disk is gone and there is nothing to promote.
-    /// The open descriptor keeps the inode allocated, so no later disk at
-    /// the same path can share its device and inode numbers.
-    fn open_executed_disk(&self, record: &Record) -> Result<Option<(u64, u64, File)>> {
-        let path = self
-            .workspaces
-            .join(&record.start.workspace_disk_id)
-            .join("workspace.img");
-        let disk = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(disk) => disk,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let meta = disk.metadata()?;
-        if (meta.dev(), meta.ino()) != (record.disk_device, record.disk_inode) {
-            return Err(Error(
-                "fill disk is not the disk its VM ran on; refusing promotion".into(),
-            ));
-        }
-        Ok(Some((meta.dev(), meta.ino(), disk)))
-    }
-
     fn disk_available_identity(&self, disk_id: &str) -> Result<()> {
         if self
             .records()
@@ -1117,94 +972,6 @@ impl LinuxJobs {
         let _admission = self.admission.lock();
         self.disk_available_identity(disk_id)?;
         operation()
-    }
-
-    fn finish_fill(&self, fill: &job::Fill, mut published: bool) -> Result<bool> {
-        let requested_publication = published;
-        let id = fill.disk_id();
-        // The disk this fill's VM wrote: its identity from the execution record,
-        // and an open descriptor so the inode number cannot be reused by a
-        // replacement disk before promotion compares it under admission.
-        let mut executed = None;
-        let mut registered = false;
-        // Only this fill's writer is needed while waiting for its VM to stop.
-        // Holding admission here would delay every unrelated start/workspace.
-        if let Ok(cell) = self.cell(&fill.fill_id) {
-            let mut state = cell.0.lock();
-            // Pruning can retire an expired tombstone between the lookup and
-            // J. A retired cell is finished: never change or publish it again.
-            registered = self.is_registered(&fill.fill_id, &cell);
-            if registered {
-                let record = &state.record;
-                if record.start.kind != job::VmKind::Fill
-                    || record.start.account != fill.account
-                    || record.start.workspace_disk_id != id
-                {
-                    return Err(Error("fill execution identity mismatch".into()));
-                }
-                // Finishing must observe this fill's final child status and
-                // evidence even when maintenance has not run since the exit.
-                self.reap_job(&mut state, Duration::ZERO)?;
-                self.collect_exit_locked(&mut state, NetworkLock::Wait)?;
-                let record = &state.record;
-                if published {
-                    published = self.pid(record)?.is_none()
-                        && record.oom_kill == Some(0)
-                        && record.fill_exit_success == Some(true);
-                }
-                self.stop_locked(&mut state)?;
-                if published {
-                    executed = self.open_executed_disk(&state.record)?;
-                    published = executed.is_some();
-                }
-            }
-        }
-        if !registered {
-            published = false;
-        }
-        #[cfg(test)]
-        self.exit_checkpoint(ExitStep::FillAdmission)?;
-        // The job guard is gone before admission: disk identity and promotion
-        // must serialize with new reservations, never with a running VM's I/O.
-        let _admission = self.admission.lock();
-        if self.workspaces.join(&id).try_exists()? {
-            let (registry, disk) = workspace::open_disk(&self.workspaces, &fill.account, &id)?;
-            if workspace::read_fill(&self.workspaces, &id)? != *fill {
-                return Err(Error("fill provenance mismatch".into()));
-            }
-            // Between J and admission, a discard of this fill and a new
-            // PrepareFill can put an unbuilt disk with identical provenance at
-            // this path. Only the disk the VM wrote may become a base.
-            if let Some((device, inode, _)) = &executed {
-                let meta = disk.metadata()?;
-                if (meta.dev(), meta.ino()) != (*device, *inode) {
-                    return Err(Error(
-                        "fill disk was replaced after its VM ran; refusing promotion".into(),
-                    ));
-                }
-            }
-            if registry.role == job::WorkspaceRole::Base {
-                return if requested_publication {
-                    Ok(true)
-                } else {
-                    Err(Error("published base cannot be discarded as a fill".into()))
-                };
-            }
-        } else {
-            published = false;
-        }
-        self.disk_available_identity(&id)?;
-        if published {
-            workspace::promote(&self.workspaces, fill)?;
-        } else if self.workspaces.join(&id).try_exists()? {
-            workspace::delete_role(
-                &self.workspaces,
-                &fill.account,
-                &id,
-                job::WorkspaceRole::Fill,
-            )?;
-        }
-        Ok(published)
     }
 
     fn status(&self, id: &str) -> Result<Response> {
@@ -1324,23 +1091,11 @@ impl LinuxJobs {
         {
             return Err(Error("workspace disk identity or account mismatch".into()));
         }
-        if !registry.role.permits(start.kind)
-            || (registry.role == job::WorkspaceRole::Base
-                && workspace.join("fill.json").try_exists()?)
-        {
+        if !registry.role.permits(start.kind) {
             return Ok(Response::new(Reply::StartRefused {
                 case: crate::tenant::StartRefusalCase::WorkspaceRole,
                 message: "workspace disk role does not permit requested VM kind".into(),
             }));
-        }
-        if start.kind == job::VmKind::Fill {
-            let fill = workspace::read_fill(&self.workspaces, &start.workspace_disk_id)?;
-            if fill.account != start.account
-                || fill.fill_id != start.job_id
-                || fill.disk_id() != start.workspace_disk_id
-            {
-                return Err(Error("fill start provenance mismatch".into()));
-            }
         }
         let disk = fs::trusted_file(&workspace.join("workspace.img"))?;
         let meta = disk.metadata()?;
@@ -1953,11 +1708,7 @@ fn worst_case_fixed_path_boot_command_line(
     // long lists report the account and the actual boot-line budget overrun.
     let text = build_runner_args(&start, workspace_bytes, true, Some((account, roots)))?;
     let line = build_boot_command_line(&start, Some(&nonce), &text)?;
-    let suffix = [JOB_CACHE_WRITE_BOOT_SUFFIX, FILL_BOOT_SUFFIX]
-        .into_iter()
-        .max_by_key(|suffix| suffix.len())
-        .unwrap();
-    Ok(format!("{line}{suffix}"))
+    Ok(format!("{line}{JOB_CACHE_WRITE_BOOT_SUFFIX}"))
 }
 
 fn early_boot_command_line(
@@ -1969,14 +1720,10 @@ fn early_boot_command_line(
     // now so command-line refusal precedes any namespace, cgroup or VM work.
     let nonce = "0".repeat(REMOTE_CACHE_DRIVE_NONCE_BYTES * 2);
     let line = boot_command_line(start, Some(&nonce), workspace_bytes, fixed_paths)?;
-    if start.kind == job::VmKind::Fill {
-        checked_boot_command_line(format!("{line}{FILL_BOOT_SUFFIX}"))
-    } else if start.kind == job::VmKind::Job {
+    if start.kind == job::VmKind::Job {
         checked_boot_command_line(format!("{line}{JOB_CACHE_WRITE_BOOT_SUFFIX}"))?;
-        Ok(line)
-    } else {
-        Ok(line)
     }
+    Ok(line)
 }
 
 fn fixed_path_policy<'a>(
@@ -1984,7 +1731,7 @@ fn fixed_path_policy<'a>(
     registry: &'a Workspace,
     kind: job::VmKind,
 ) -> Option<(&'a str, &'a [String])> {
-    if !matches!(kind, job::VmKind::Job | job::VmKind::Fill) {
+    if kind != job::VmKind::Job {
         return None;
     }
     // Neither the start request nor guest-exported source metadata chooses roots.
@@ -2005,22 +1752,6 @@ fn checked_boot_command_line(line: String) -> Result<String> {
         ));
     }
     Ok(line)
-}
-
-fn authorize_fill_boot(requests: &mut [(&str, Value)], role: job::WorkspaceRole) -> Result<()> {
-    // Only the root-owned disk registry grants fill authority. In particular,
-    // Start.kind alone must never give a job disk access to the fill operation.
-    if role == job::WorkspaceRole::Fill {
-        let (_, boot) = requests
-            .iter_mut()
-            .find(|(path, _)| *path == "/boot-source")
-            .ok_or_else(|| Error("missing boot source".into()))?;
-        let args = boot["boot_args"]
-            .as_str()
-            .ok_or_else(|| Error("missing boot arguments".into()))?;
-        boot["boot_args"] = checked_boot_command_line(format!("{args}{FILL_BOOT_SUFFIX}"))?.into();
-    }
-    Ok(())
 }
 
 fn authorize_job_write_boot(
@@ -2066,15 +1797,13 @@ pub fn recorded_boot_requests(
         return Err(Error("workspace registry does not permit boot".into()));
     }
     settings.validate_fixed_path_repositories()?;
-    let mut requests = boot_requests_with_fixed_paths(
+    boot_requests_with_fixed_paths(
         start,
         tap_index,
         nonce,
         workspace_bytes,
         fixed_path_policy(settings, registry, start.kind),
-    )?;
-    authorize_fill_boot(&mut requests, registry.role)?;
-    Ok(requests)
+    )
 }
 
 fn boot_command_line(

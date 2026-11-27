@@ -10,13 +10,11 @@ mod admin_tests;
 mod cache_write_tests;
 mod close_tests;
 mod deadline_tests;
-mod fill_source_tests;
 mod fork_tests;
 mod heartbeat_tests;
 mod recovery_tests;
 mod residency_tests;
 mod scale_tests;
-mod seed_tests;
 mod startup_tests;
 #[path = "upload_tests.rs"]
 mod upload_tests;
@@ -77,15 +75,12 @@ struct Fake {
     cache_write_tokens: Mutex<Vec<String>>,
     fail_cache_write: AtomicBool,
     readiness: Mutex<Option<motor_vm_helper::images::Readiness>>,
-    fill_export: Mutex<Option<UnixStream>>,
     capacity_available: AtomicBool,
     slice_headroom_mib: Mutex<Option<u64>>,
     fail_ensure: AtomicBool,
     ensured_caps: Mutex<Vec<u64>>,
     workspace_grant_selectors: Mutex<Vec<Option<String>>>,
     job_starts: Mutex<Vec<motor_vm_helper::job::Start>>,
-    seeds: Mutex<Vec<motor_vm_helper::job::Seed>>,
-    fail_seed: AtomicBool,
     forks: Mutex<Vec<motor_vm_helper::job::Fork>>,
     fork_reply: Mutex<Option<String>>,
     fork_error: Mutex<Option<String>>,
@@ -238,21 +233,6 @@ impl Control for Fake {
             .unwrap()
             .entry(disk.into())
             .or_insert(None);
-        Ok(())
-    }
-    fn seed_workspace(&self, seed: &motor_vm_helper::job::Seed) -> Result<()> {
-        self.wait("seed");
-        self.seeds.lock().unwrap().push(seed.clone());
-        ensure!(
-            !self.fail_seed.load(Ordering::SeqCst),
-            "injected seed failure"
-        );
-        let mut disks = self.workspace_contents.lock().unwrap();
-        ensure!(
-            !disks.contains_key(&seed.disk_id),
-            "existing disk cannot be seeded"
-        );
-        disks.insert(seed.disk_id.clone(), Some(seed.base_id.clone()));
         Ok(())
     }
     fn fork_workspace(
@@ -479,14 +459,6 @@ impl Control for Fake {
         Ok(())
     }
     fn job_relay(&self, _: &str, port: u32) -> Result<UnixStream> {
-        if port == 54 {
-            return self
-                .fill_export
-                .lock()
-                .unwrap()
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("export unavailable"));
-        }
         if port == 53 {
             return self
                 .lifecycle
@@ -2513,47 +2485,6 @@ async fn bundle_chunks_after_the_run_reach_the_guest() {
     drop(client);
     assert!(task.await.unwrap().is_ok(), "the upload was refused");
     runtime.stop_job(JOB, true, false).unwrap();
-}
-
-/// The guest agent refuses an attach that lacks the identity fields
-/// (resolvers, hostname, machine id); a fill VM needs them as a job VM does.
-#[test]
-fn fill_guest_attach_carries_the_job_vm_identity_fields() {
-    use crate::jobs::fills::FillGuest;
-    let (runtime, fake, _) = fixture();
-    let guest = crate::jobs::fills::BundleFillGuest {
-        host: runtime.host.clone(),
-        resolvers: runtime.job_resolvers.clone(),
-    };
-    let fill = crate::state::jobs::fills::Reservation {
-        fill: motor_vm_helper::job::Fill {
-            account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-            repository_key: "0".repeat(64),
-            fill_id: JOB2.into(),
-            size_bytes: 1 << 30,
-        },
-        vcpus: 4,
-        memory_debit_mib: 8192,
-        guest_ram_mib: 8192,
-        runner_hello: false,
-        image_generation: None,
-        publication: None,
-    };
-    let assignment = Assignment {
-        image_generation_id: "generation".into(),
-        hello: json!({}),
-        spool: std::path::PathBuf::new(),
-        guest_init: json!({}),
-    };
-    guest
-        .initialize(&fill, &assignment, &*fake, &json!({"tap_index": 3}))
-        .unwrap();
-    let request = fake.guest_identity.lock().unwrap()[0].clone();
-    assert_eq!(request["op"], "attach_tenant");
-    assert_eq!(request["resolvers"], json!(["1.1.1.1"]));
-    assert_eq!(request["hostname"], "motor");
-    assert_eq!(request["machine_id"].as_str().unwrap().len(), 32);
-    assert_eq!(request["address"], "10.200.3.2/30");
 }
 
 #[test]

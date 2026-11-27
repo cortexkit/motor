@@ -124,9 +124,9 @@ pub(crate) struct Layout {
 impl Layout {
     pub(crate) fn for_config(config: &crate::Config) -> Self {
         let role = HostRole::of(config);
-        // Job and fill VMs read the set the guest agent copies from their
+        // Job VMs read the set the guest agent copies from their
         // read-only credential drive (tenant_agent::cache_drive).
-        let directory = if config.per_job || config.fill_vm {
+        let directory = if config.per_job {
             PathBuf::from(BOAT_DIRECTORY)
         } else {
             match role {

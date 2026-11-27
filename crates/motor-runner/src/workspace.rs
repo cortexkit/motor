@@ -92,8 +92,6 @@ pub(crate) fn write_mirror_identity(mirror: &Path, key: &str, value: &str) -> io
     .map(|_| ())
 }
 
-pub(crate) const FILL_BUNDLE_REF: &str = "refs/ck-motor/fill-export";
-
 fn git_command(path: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -1208,40 +1206,11 @@ impl Trees {
         )
     }
 
-    // Only the fill-source import calls this, and that module is Linux-only.
-    #[cfg(any(target_os = "linux", test))]
-    pub(crate) fn fetch_fill(
-        &self,
-        directory: &Path,
-        bundle: &BundleManifest,
-        root: &str,
-        tip: &str,
-    ) -> io::Result<()> {
-        self.fetch_checked(
-            directory,
-            std::slice::from_ref(bundle),
-            (root, tip, tip, &[]),
-            Some(tip),
-            |_| Ok(()),
-        )
-    }
-
     fn fetch_with(
         &self,
         directory: &Path,
         bundles: &[BundleManifest],
         snapshot: (&str, &str, &str, &[SiblingSnapshot]),
-        before_fetch: impl Fn(&Path) -> io::Result<()>,
-    ) -> io::Result<()> {
-        self.fetch_checked(directory, bundles, snapshot, None, before_fetch)
-    }
-
-    fn fetch_checked(
-        &self,
-        directory: &Path,
-        bundles: &[BundleManifest],
-        snapshot: (&str, &str, &str, &[SiblingSnapshot]),
-        fill_tip: Option<&str>,
         before_fetch: impl Fn(&Path) -> io::Result<()>,
     ) -> io::Result<()> {
         let (root, commit, tip, siblings) = snapshot;
@@ -1265,9 +1234,6 @@ impl Trees {
             // objects, not a held snapshot that have_reply would advertise.
             let spool = directory.join(b.index.to_string());
             let prerequisites = bundle_prerequisites(&spool)?;
-            if fill_tip.is_some() && !prerequisites.is_empty() {
-                return Err(invalid("fill bundle has prerequisites"));
-            }
             for prerequisite in prerequisites {
                 git(
                     &mirror,
@@ -1282,7 +1248,7 @@ impl Trees {
             }
             let spool = spool.to_str().ok_or_else(|| invalid("spool path"))?;
             let heads = git(&mirror, &["bundle", "list-heads", spool])?;
-            let mut refs: Vec<_> = heads
+            let refs: Vec<_> = heads
                 .lines()
                 .filter_map(|line| line.split_once(' ').map(|(_, r)| r))
                 .collect();
@@ -1294,16 +1260,6 @@ impl Trees {
                 })
             {
                 return Err(invalid("invalid bundle refs"));
-            }
-            if let Some(tip) = fill_tip {
-                if heads != format!("{tip} {FILL_BUNDLE_REF}") {
-                    return Err(invalid(
-                        "fill bundle must have exactly its expected tip ref",
-                    ));
-                }
-                // A bundle header is data, not a fetch refspec. Even a valid
-                // advertised name must not choose a destination in a Fill VM.
-                refs = vec![FILL_BUNDLE_REF];
             }
             // Fetch's own automatic maintenance would start a detached gc
             // racing the compaction below; the runner compacts explicitly.

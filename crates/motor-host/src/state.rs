@@ -292,7 +292,6 @@ pub struct Host {
     job_memory_reservations: std::collections::BTreeSet<String>,
     job_memory_waiters: BTreeMap<String, jobs::MemoryWaiter>,
     job_memory_waiter_hold: Option<jobs::MemoryWaiterHold>,
-    fill_capacity_refused_at_ms: Option<u64>,
     host_resources_failed: std::cell::RefCell<Option<jobs::HostResourcesFailure>>,
     job_storage: Option<std::sync::Arc<dyn crate::helper::Control>>,
     // These operator reservations are lost on restart. The image builder's
@@ -347,7 +346,6 @@ impl Host {
             job_memory_reservations: Default::default(),
             job_memory_waiters: BTreeMap::new(),
             job_memory_waiter_hold: None,
-            fill_capacity_refused_at_ms: None,
             host_resources_failed: std::cell::RefCell::new(None),
             job_storage: None,
             operator_storage_reservations: BTreeMap::new(),
@@ -720,14 +718,6 @@ impl Host {
     }
     pub fn claim(&mut self, claims: Claims, now_ms: u64) -> Result<(u64, Admission), Error> {
         let result = self.claim_inner(&claims, now_ms);
-        if claims.purpose == Purpose::Run
-            && self.settings.mode() == crate::config::HostMode::PerJob
-            && result
-                .as_ref()
-                .is_err_and(|e| matches!(e.cause.reason(), Refusal::HostFull | Refusal::Capacity))
-        {
-            self.fill_capacity_refused_at_ms = Some(now_ms);
-        }
         crate::claim_log::record(
             self.settings.mode(),
             &claims,

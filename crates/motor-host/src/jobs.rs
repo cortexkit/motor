@@ -5,13 +5,9 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::PathBuf;
 
-pub mod fill_source;
-pub mod fills;
 pub mod images;
 
-/// The guest agent's `attach_tenant` request for a job or fill VM: the image's
-/// guest init plus this VM's network slot and identity. Both kinds go through
-/// here because the guest refuses an attach that lacks any identity field.
+/// Builds the guest agent attach request with the job VM’s network slot and identity.
 pub(crate) fn guest_attach_request(
     guest_init: &Value,
     resolvers: &std::sync::RwLock<Vec<String>>,
@@ -60,9 +56,6 @@ pub struct Assignment {
 }
 
 pub trait Resources: Send + Sync {
-    fn acquire_fill(&self, _fill: &crate::state::jobs::fills::Reservation) -> Result<Assignment> {
-        anyhow::bail!("fill images unavailable")
-    }
     /// Atomically acquire all storage and generation reservations, or none.
     /// Repeating this after a restart returns the same assignment for the job id.
     /// This must not copy images or recover disks.

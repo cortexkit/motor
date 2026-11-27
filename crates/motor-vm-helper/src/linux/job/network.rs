@@ -98,8 +98,8 @@ pub(super) fn read_records(root: &Path) -> Result<Vec<Record>> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let record: Record = serde_json::from_reader(fs::trusted_file(&path)?)
-            .map_err(|error| Error(format!("invalid job record: {error}")))?;
+        let json = std::io::read_to_string(fs::trusted_file(&path)?)?;
+        let record = decode_record(&path, &json)?;
         record.start.validate()?;
         if path.file_stem().and_then(|s| s.to_str()) != Some(&record.start.job_id) {
             return Err(Error("job record identity mismatch".into()));
@@ -107,6 +107,39 @@ pub(super) fn read_records(root: &Path) -> Result<Vec<Record>> {
         records.push(record);
     }
     Ok(records)
+}
+
+fn decode_record(path: &Path, json: &str) -> Result<Record> {
+    serde_json::from_str(json).map_err(|error| {
+        if serde_json::from_str::<serde_json::Value>(json).is_ok_and(|value| {
+            matches!(value["start"]["kind"].as_str(), Some("fill" | "base_build"))
+        }) {
+            return Error(format!(
+                "{} is a retired fill execution record; delete it while the helper is stopped after a drain",
+                path.display()
+            ));
+        }
+        Error(format!("invalid job record {}: {error}", path.display()))
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn retired_execution_record_names_the_file_and_requires_operator_cleanup() {
+    let path = Path::new("/var/lib/motor-vm/jobs/retired.json");
+    let mut record = serde_json::to_value(super::tests::record()).unwrap();
+    assert!(decode_record(path, &record.to_string()).is_ok());
+    for kind in ["fill", "base_build"] {
+        record["start"]["kind"] = kind.into();
+        let error = decode_record(path, &record.to_string()).unwrap_err().0;
+        assert!(error.contains("/var/lib/motor-vm/jobs/retired.json"));
+        assert!(error.contains("retired fill execution record"));
+        assert!(error.contains("delete it while the helper is stopped after a drain"));
+    }
+    record["start"]["kind"] = "unknown".into();
+    let error = decode_record(path, &record.to_string()).unwrap_err().0;
+    assert!(error.contains("invalid job record"));
+    assert!(!error.contains("delete it"));
 }
 
 pub(in crate::linux) fn check_capacity(job_count: u32, tenants: usize) -> Result<()> {

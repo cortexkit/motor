@@ -340,7 +340,7 @@ fn per_job_status_exposes_background_work_and_counts_pending_execution_teardown(
     let status = runtime.host_admin(&json!({"op":"host_status"})).unwrap();
     assert_eq!(status["active_leases"], 0);
     assert_eq!(status["active_job_vms"], 1);
-    assert_eq!(status["active_fills"], 0);
+    assert!(status.get("active_fills").is_none());
     assert_eq!(status["active_recoveries"], 0);
     let drain = runtime.host_admin(&json!({"op":"drain_host"})).unwrap();
     for field in ["active_job_vms", "active_fills", "active_recoveries"] {

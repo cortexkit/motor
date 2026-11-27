@@ -19,10 +19,9 @@ fn owned_child(jobs: &LinuxJobs, id: &str) -> std::process::ChildStdin {
     stdin
 }
 
-fn fill_fixture(base: &Path) -> (LinuxJobs, String, PathBuf) {
+fn exited_fixture(base: &Path) -> (LinuxJobs, String, PathBuf) {
     let jobs = fixture(base);
-    let mut record = record();
-    record.start.kind = job::VmKind::Fill;
+    let record = record();
     let id = record.start.job_id.clone();
     jobs.save(&record).unwrap();
     jobs.insert_record(record);
@@ -32,9 +31,9 @@ fn fill_fixture(base: &Path) -> (LinuxJobs, String, PathBuf) {
 }
 
 #[test]
-fn vmm_that_left_its_cgroup_is_reaped_before_evidence_and_keeps_fill_success() {
+fn vmm_that_left_its_cgroup_is_reaped_before_evidence() {
     let base = scratch();
-    let (jobs, id, group) = fill_fixture(&base);
+    let (jobs, id, group) = exited_fixture(&base);
     let mut stdin = Some(owned_child(&jobs, &id));
     // The VMM finishes exiting only while collection waits for it, as one does
     // between leaving its cgroup and becoming a reapable zombie.
@@ -48,7 +47,6 @@ fn vmm_that_left_its_cgroup_is_reaped_before_evidence_and_keeps_fill_success() {
     }
     assert!(jobs.view(&id).unwrap().pidfd.is_none());
     let durable = read_record(&jobs);
-    assert_eq!(durable.fill_exit_success, Some(true), "clean fill lost");
     assert_eq!(durable.oom_kill, Some(0));
     assert!(!group.exists());
     std::fs::remove_dir_all(base).unwrap();
@@ -57,7 +55,7 @@ fn vmm_that_left_its_cgroup_is_reaped_before_evidence_and_keeps_fill_success() {
 #[test]
 fn unreaped_vmm_keeps_exit_evidence_unpublished_until_a_later_collection() {
     let base = scratch();
-    let (jobs, id, group) = fill_fixture(&base);
+    let (jobs, id, group) = exited_fixture(&base);
     let stdin = owned_child(&jobs, &id);
     jobs.hooks.lock().unwrap().child_wait = Some(Duration::from_millis(100));
     let error = jobs.collect_exit(&id).unwrap_err();
@@ -72,7 +70,6 @@ fn unreaped_vmm_keeps_exit_evidence_unpublished_until_a_later_collection() {
     jobs.collect_exit(&id).unwrap();
     let durable = read_record(&jobs);
     assert_eq!(durable.oom_kill, Some(0));
-    assert_eq!(durable.fill_exit_success, Some(true));
     std::fs::remove_dir_all(base).unwrap();
 }
 

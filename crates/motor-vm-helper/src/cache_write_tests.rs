@@ -578,15 +578,7 @@ fn verified_grant_binds_exact_job_subject_workspace_and_deny_flag() {
         workspace_key_hash: c.workspace_key_hash.clone(),
     };
     assert!(grant.permits(&start, &disk));
-    for case in [
-        "job",
-        "workspace",
-        "legacy",
-        "account",
-        "block",
-        "fill",
-        "recovery",
-    ] {
+    for case in ["job", "workspace", "legacy", "account", "block", "recovery"] {
         let mut start = start.clone();
         let mut disk = disk.clone();
         match case {
@@ -598,10 +590,6 @@ fn verified_grant_binds_exact_job_subject_workspace_and_deny_flag() {
                 start.account = disk.account.clone();
             }
             "block" => start.cache_write_blocked = true,
-            "fill" => {
-                start.kind = crate::job::VmKind::Fill;
-                disk.role = crate::job::WorkspaceRole::Fill;
-            }
             "recovery" => start.kind = crate::job::VmKind::Recovery,
             _ => unreachable!(),
         }

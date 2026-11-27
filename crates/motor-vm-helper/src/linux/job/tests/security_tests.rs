@@ -155,118 +155,33 @@ mod root {
     }
 
     #[test]
-    fn isolated_start_enforces_workspace_role_before_opening_disk_or_booting() {
+    fn isolated_reconcile_refuses_retired_workspace_registries_before_reading_job_records() {
         let base = scratch();
-        let mut jobs = machine(&base);
-        settings(&mut jobs);
-        for role in [
-            job::WorkspaceRole::Job,
-            job::WorkspaceRole::Fill,
-            job::WorkspaceRole::Base,
-        ] {
-            let disk_id = format!("disk-{role:?}");
-            super::super::super::workspace::create(
-                &jobs.workspaces,
-                job::CreateWorkspace {
-                    cache_write_job_id: None,
-                    account: "account-1".into(),
-                    workspace_disk_id: disk_id.clone(),
-                    size_bytes: 4096,
-                },
-                role,
+        let jobs = machine(&base);
+        let path = jobs.workspaces.join("disk-legacy");
+        std::fs::create_dir_all(&path).unwrap();
+        let records = &jobs.records_path;
+        std::fs::create_dir_all(records).unwrap();
+        std::fs::write(records.join("invalid.json"), "broken").unwrap();
+        for role in ["fill", "base"] {
+            std::fs::write(
+                path.join("registry.json"),
+                json!({
+                    "account": "account-1", "workspace_disk_id": "disk-legacy", "role": role
+                })
+                .to_string(),
             )
             .unwrap();
-            // A denial must precede even opening this now-missing disk.
-            std::fs::remove_file(jobs.workspaces.join(&disk_id).join("workspace.img")).unwrap();
-            for kind in [
-                job::VmKind::Job,
-                job::VmKind::Fill,
-                job::VmKind::BaseBuild,
-                job::VmKind::Recovery,
-            ] {
-                let mut request = start();
-                request.workspace_disk_id = disk_id.clone();
-                request.kind = kind;
-                let response = jobs.start(request, Peer { uid: 0, gid: 0 });
-                let allowed = matches!(
-                    (role, kind),
-                    (
-                        job::WorkspaceRole::Job,
-                        job::VmKind::Job | job::VmKind::Recovery
-                    ) | (job::WorkspaceRole::Fill, job::VmKind::Fill)
-                        | (job::WorkspaceRole::Base, job::VmKind::BaseBuild)
-                );
-                if allowed {
-                    assert!(
-                        response.is_err(),
-                        "permitted kind reaches missing disk, not role denial"
-                    );
-                } else {
-                    assert!(matches!(
-                        response.unwrap().reply,
-                        Reply::StartRefused {
-                            case: crate::tenant::StartRefusalCase::WorkspaceRole,
-                            ..
-                        }
-                    ));
-                }
-                assert!(jobs.records().is_empty());
-                assert!(!jobs.jail.exists());
-                assert!(!jobs.groups.exists());
-            }
-        }
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn isolated_recovery_refuses_fill_and_base_before_opening_disk() {
-        let base = scratch();
-        let mut jobs = machine(&base);
-        settings(&mut jobs);
-        for role in [job::WorkspaceRole::Fill, job::WorkspaceRole::Base] {
-            let mut request = start();
-            request.kind = job::VmKind::Recovery;
-            request.workspace_disk_id = format!("recovery-{role:?}");
-            super::super::super::workspace::create(
-                &jobs.workspaces,
-                job::CreateWorkspace {
-                    cache_write_job_id: None,
-                    account: request.account.clone(),
-                    workspace_disk_id: request.workspace_disk_id.clone(),
-                    size_bytes: 4096,
-                },
-                role,
-            )
-            .unwrap();
-            std::fs::remove_file(
-                jobs.workspaces
-                    .join(&request.workspace_disk_id)
-                    .join("workspace.img"),
-            )
-            .unwrap();
-            let response = jobs
-                .handle(
-                    Operation::Start(request),
-                    Peer {
-                        uid: 600001,
-                        gid: 600001,
-                    },
-                )
-                .unwrap();
-            assert!(matches!(
-                response.reply,
-                Reply::StartRefused {
-                    case: crate::tenant::StartRefusalCase::WorkspaceRole,
-                    ..
-                }
-            ));
+            let error = jobs.reconcile().unwrap_err().0;
+            assert!(error.contains(&format!(
+                "workspace disk disk-legacy has retired role {role}"
+            )));
+            assert!(error.contains("delete the directory while the helper is stopped"));
+            assert!(path.join("registry.json").exists());
             assert!(jobs.records().is_empty());
-            assert!(!jobs.jail.exists());
-            assert!(!jobs.groups.exists());
         }
         std::fs::remove_dir_all(base).unwrap();
     }
-
     #[test]
     fn isolated_start_does_not_take_a_short_lived_workspace_flock() {
         let base = scratch();

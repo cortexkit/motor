@@ -71,14 +71,11 @@ pub struct SqliteJournal {
     synced: Synced,
 }
 
-/// Which SQL table a row lives in. Job-VM state and fill-source metadata sit
-/// in additive tables an older host binary never reads; see
-/// [`execute`].
+/// Job-VM rows live in an additive table an older host binary never reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Rows {
     Host,
     JobVm,
-    FillSource,
 }
 
 impl Rows {
@@ -92,16 +89,12 @@ impl Rows {
                 "INSERT INTO job_vm_entries (kind, key, value) VALUES (?1, ?2, ?3)
                  ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value"
             }
-            Self::FillSource => {
-                "INSERT INTO fill_source_entries(kind,key,value) VALUES (?1,?2,?3) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value"
-            }
         }
     }
     fn delete(self) -> &'static str {
         match self {
             Self::Host => "DELETE FROM host_entries WHERE kind = ?1 AND key = ?2",
             Self::JobVm => "DELETE FROM job_vm_entries WHERE kind = ?1 AND key = ?2",
-            Self::FillSource => "DELETE FROM fill_source_entries WHERE kind=?1 AND key=?2",
         }
     }
 }
@@ -220,6 +213,18 @@ impl SqliteJournal {
                 outcome.chain_max
             )));
         }
+        // Remove retired per-job fill state before decoding any job VM rows.
+        // The job VM table is lazy; leave it absent on a tenant-only store.
+        store.with_conn_fenced(|tx| {
+            let has_jobs: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_vm_entries')",
+                [], |row| row.get(0),
+            )?;
+            if has_jobs {
+                tx.execute("DELETE FROM job_vm_entries WHERE kind IN ('base', 'fill')", [])?;
+            }
+            tx.execute_batch("DROP TABLE IF EXISTS fill_source_entries")
+        }).map_err(other)?;
         let legacy = directory.join("journal.json");
         let imported = store
             .with_conn(|c| {
@@ -246,7 +251,6 @@ impl SqliteJournal {
                 .with_conn_fenced(|tx| {
                     tx.execute("DELETE FROM host_entries", [])?;
                     tx.execute("DELETE FROM host_values", [])?;
-                    tx.execute_batch("DROP TABLE IF EXISTS fill_source_entries;")?;
                     write_diff(tx, &Snapshot::default(), &snapshot)?;
                     put_value(tx, IMPORTED, &true)
                 })
@@ -259,7 +263,6 @@ impl SqliteJournal {
             fs::rename(&legacy, directory.join("journal.json.imported"))?;
             File::open(directory)?.sync_all()?;
         }
-        crate::jobs::fill_source::remove_unreferenced(directory, &snapshot.per_job.fill_sources)?;
         let mut journal = Self {
             store,
             directory: directory.to_path_buf(),
@@ -397,7 +400,6 @@ impl Journal for SqliteJournal {
         } = next;
         let host = Rows::Host;
         let job = Rows::JobVm;
-        let fill = Rows::FillSource;
         let p = &mut plan;
         self.plan_table(p, host, REVOCATION, revocations)?;
         self.plan_table(p, host, LEASE, leases)?;
@@ -408,12 +410,8 @@ impl Journal for SqliteJournal {
         self.plan_table(p, host, BILLING, billing)?;
         self.plan_table(p, host, CLOSED, closed)?;
         self.plan_table(p, job, "disk", &per_job.disks)?;
-        self.plan_table(p, job, "base", &per_job.bases)?;
         self.plan_table(p, job, "image", &per_job.images)?;
-        self.plan_table(p, job, "fill", &per_job.fills)?;
         self.plan_table(p, job, "execution", &per_job.executions)?;
-        self.plan_table(p, fill, "slot", &per_job.fill_sources)?;
-        self.plan_table(p, fill, "export", &per_job.export_tips)?;
         let values = Values::of(next);
         diff_values(&mut plan.writes, &self.synced.values, &values).map_err(other)?;
         // Only the retention pass deletes a job's lease, billing or no-start
@@ -493,12 +491,8 @@ impl Journal for SqliteJournal {
             ((Rows::Host, BILLING), billing.version()),
             ((Rows::Host, CLOSED), closed.version()),
             ((Rows::JobVm, "disk"), per_job.disks.version()),
-            ((Rows::JobVm, "base"), per_job.bases.version()),
             ((Rows::JobVm, "image"), per_job.images.version()),
-            ((Rows::JobVm, "fill"), per_job.fills.version()),
             ((Rows::JobVm, "execution"), per_job.executions.version()),
-            ((Rows::FillSource, "slot"), per_job.fill_sources.version()),
-            ((Rows::FillSource, "export"), per_job.export_tips.version()),
         ];
         for (id, version) in tables {
             self.synced.tables.insert(
@@ -658,7 +652,7 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
     } = new;
     let mut writes = Vec::new();
     let w = &mut writes;
-    let (host, job, fill) = (Rows::Host, Rows::JobVm, Rows::FillSource);
+    let (host, job) = (Rows::Host, Rows::JobVm);
     diff_entries(w, host, REVOCATION, &old.revocations, revocations)?;
     diff_entries(w, host, LEASE, &old.leases, leases)?;
     diff_entries(w, host, NONCE, &old.nonces, nonces)?;
@@ -675,12 +669,8 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
     diff_entries(w, host, CLOSED, &old.closed, closed)?;
     let (o, n) = (&old.per_job, per_job);
     diff_entries(w, job, "disk", &o.disks, &n.disks)?;
-    diff_entries(w, job, "base", &o.bases, &n.bases)?;
     diff_entries(w, job, "image", &o.images, &n.images)?;
-    diff_entries(w, job, "fill", &o.fills, &n.fills)?;
     diff_entries(w, job, "execution", &o.executions, &n.executions)?;
-    diff_entries(w, fill, "slot", &o.fill_sources, &n.fill_sources)?;
-    diff_entries(w, fill, "export", &o.export_tips, &n.export_tips)?;
     diff_values(w, &Values::of(old), &Values::of(new))?;
     execute(tx, &writes)
 }
@@ -705,9 +695,6 @@ fn execute(tx: &Transaction<'_>, writes: &[Write]) -> rusqlite::Result<()> {
             PRIMARY KEY (kind, key)
         ) WITHOUT ROWID;",
         )?;
-    }
-    if uses(Rows::FillSource) {
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS fill_source_entries (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;")?;
     }
     for write in writes {
         // Each statement changes at most one row; the count is not needed.
@@ -749,7 +736,6 @@ fn load_rows<V: DeserializeOwned>(
     let table = match rows {
         Rows::Host => "host_entries",
         Rows::JobVm => "job_vm_entries",
-        Rows::FillSource => "fill_source_entries",
     };
     let exists: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -770,32 +756,6 @@ fn load_rows<V: DeserializeOwned>(
 }
 
 fn load_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
-    let mut snapshot = load_job_snapshot(conn)?;
-    let exists: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='fill_source_entries')", [], |row| row.get(0))?;
-    if exists {
-        let mut entries = conn.prepare("SELECT kind,key,value FROM fill_source_entries")?;
-        let mut rows = entries.query([])?;
-        while let Some(row) = rows.next()? {
-            let (kind, key, value): (String, String, String) =
-                (row.get(0)?, row.get(1)?, row.get(2)?);
-            match kind.as_str() {
-                "slot" => drop(
-                    snapshot
-                        .per_job
-                        .fill_sources
-                        .insert(key, from_json(&value)?),
-                ),
-                "export" => drop(snapshot.per_job.export_tips.insert(key, from_json(&value)?)),
-                _ => return Err(unknown("fill source entry kind", &kind)),
-            }
-        }
-    }
-    // Loaded rows are the database's contents: make them each table's base.
-    snapshot.commit();
-    Ok(snapshot)
-}
-
-fn load_job_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
     let mut snapshot = load(conn)?;
     let exists: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_vm_entries')",
@@ -812,14 +772,14 @@ fn load_job_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
                     snapshot.per_job.tenant_rollback_pending = from_json(&value)?;
                 }
                 "disk" => drop(snapshot.per_job.disks.insert(key, from_json(&value)?)),
-                "base" => drop(snapshot.per_job.bases.insert(key, from_json(&value)?)),
                 "image" => drop(snapshot.per_job.images.insert(key, from_json(&value)?)),
-                "fill" => drop(snapshot.per_job.fills.insert(key, from_json(&value)?)),
                 "execution" => drop(snapshot.per_job.executions.insert(key, from_json(&value)?)),
                 _ => return Err(unknown("job VM entry kind", &kind)),
             }
         }
     }
+    // Loaded rows are the database's contents: make them each table's base.
+    snapshot.commit();
     Ok(snapshot)
 }
 
@@ -1115,33 +1075,6 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
             have_invalidated: true,
         },
     );
-    snapshot.per_job.bases.insert(
-        "base-test".into(),
-        crate::state::jobs::storage::Base {
-            sub: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-            repository_key: None,
-            have: Vec::new(),
-            last_used_ms: 456,
-            evicting: true,
-        },
-    );
-    snapshot.per_job.fills.insert(
-        "00000000-0000-7000-8000-000000000002".into(),
-        crate::state::jobs::fills::Reservation {
-            fill: motor_vm_helper::job::Fill {
-                account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-                repository_key: "repo".into(),
-                fill_id: "00000000-0000-7000-8000-000000000002".into(),
-                size_bytes: 1024,
-            },
-            vcpus: 4,
-            memory_debit_mib: 120,
-            guest_ram_mib: 134,
-            runner_hello: true,
-            image_generation: Some("gen-rollback".into()),
-            publication: Some(snapshot.per_job.disks["ws-rollback"].have.clone()),
-        },
-    );
     journal.store(&snapshot).unwrap();
     drop(journal);
     let conn = Connection::open(dir.path().join("store.db")).unwrap();
@@ -1174,98 +1107,44 @@ fn legacy_loader_opens_job_claim_lease_and_ignores_boot_timestamp() {
     }
 }
 #[cfg(test)]
-fn source_slot_fixture() -> crate::jobs::fill_source::Slot {
-    crate::jobs::fill_source::Slot {
-        request: crate::jobs::fill_source::Request {
-            account: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-            repository_root: "/home/source".into(),
-            integration_tip: "a".repeat(40),
-            mem_mib: 100,
-            observed_ms: 1,
-        },
-        generation: "referenced".into(),
-        source: motor_protocol::FillSource {
-            repository_root: "/home/source".into(),
-            integration_tip: "a".repeat(40),
-            bundles: vec![],
-            git_dependencies: vec![],
-        },
-        bytes: 1,
-        last_fill_started_ms: None,
+#[test]
+fn open_purges_retired_per_job_fill_state_idempotently() {
+    let root = cortexkit_test_support::scratch_root();
+    fs::create_dir_all(&root).unwrap();
+    let dir = tempfile::tempdir_in(root).unwrap();
+    let (mut journal, mut expected) = SqliteJournal::open(dir.path()).unwrap();
+    expected.per_job.tenant_rollback_pending = true;
+    journal.store(&expected).unwrap();
+    drop(journal);
+    let conn = Connection::open(dir.path().join("store.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO job_vm_entries VALUES ('fill', 'old-fill', '{}'), ('base', 'old-base', '{}');
+         CREATE TABLE fill_source_entries(kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                                          PRIMARY KEY(kind, key)) WITHOUT ROWID;
+         INSERT INTO fill_source_entries VALUES ('slot', 'old-slot', '{}');",
+    ).unwrap();
+    for _ in 0..2 {
+        let (journal, restored) = SqliteJournal::open(dir.path()).unwrap();
+        assert_eq!(restored, expected);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM job_vm_entries WHERE kind IN ('fill', 'base')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='fill_source_entries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(journal);
     }
 }
-
-#[cfg(test)]
-#[test]
-fn fill_source_table_is_lazy_and_the_legacy_job_loader_can_update_old_state() {
-    let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
-    let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
-    let exists = || {
-        Connection::open(dir.path().join("store.db")).unwrap().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='fill_source_entries')", [], |row| row.get::<_, bool>(0)).unwrap()
-    };
-    assert!(!exists());
-    journal.store(&snapshot).unwrap();
-    assert!(!exists());
-    let slot = source_slot_fixture();
-    snapshot
-        .per_job
-        .export_tips
-        .insert("job".into(), slot.request.clone());
-    snapshot.per_job.fill_sources.insert("slot".into(), slot);
-    journal.store(&snapshot).unwrap();
-    assert!(exists());
-    drop(journal);
-    let mut conn = Connection::open(dir.path().join("store.db")).unwrap();
-    // This is the unchanged loader used before fill sources existed: it reads
-    // host and job tables, never enumerating unrelated additive tables.
-    let legacy = load_job_snapshot(&conn).unwrap();
-    assert!(legacy.per_job.fill_sources.is_empty());
-    assert!(legacy.per_job.export_tips.is_empty());
-    let mut updated = legacy.clone();
-    updated.draining = true;
-    let tx = conn.transaction().unwrap();
-    write_diff(&tx, &legacy, &updated).unwrap();
-    tx.commit().unwrap();
-    assert!(load_job_snapshot(&conn).unwrap().draining);
-    let restored = load_snapshot(&conn).unwrap();
-    assert_eq!(restored.per_job.fill_sources, snapshot.per_job.fill_sources);
-    assert_eq!(restored.per_job.export_tips, snapshot.per_job.export_tips);
-}
-
-#[cfg(test)]
-#[test]
-fn open_removes_unreferenced_source_generations_before_admission_and_export_keeps_referenced_files()
-{
-    let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
-    let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
-    snapshot
-        .per_job
-        .fill_sources
-        .insert("slot".into(), source_slot_fixture());
-    journal.store(&snapshot).unwrap();
-    for name in [
-        "referenced",
-        "renamed-before-commit",
-        "incoming-interrupted",
-    ] {
-        let path = crate::jobs::fill_source::directory(dir.path(), name);
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("0"), b"x").unwrap();
-    }
-    drop(journal);
-    let (journal, restored) = SqliteJournal::open(dir.path()).unwrap();
-    assert_eq!(restored.per_job.fill_sources, snapshot.per_job.fill_sources);
-    let referenced = crate::jobs::fill_source::directory(dir.path(), "referenced");
-    assert!(referenced.join("0").exists());
-    assert!(!crate::jobs::fill_source::directory(dir.path(), "renamed-before-commit").exists());
-    assert!(!crate::jobs::fill_source::directory(dir.path(), "incoming-interrupted").exists());
-    drop(journal);
-    SqliteJournal::export(dir.path()).unwrap();
-    let (_, exported) = FileJournal::open(dir.path()).unwrap();
-    assert_eq!(exported.per_job.fill_sources, snapshot.per_job.fill_sources);
-    assert!(referenced.join("0").exists());
-}
-
 /// The journal writes only changed keys, comparing against the table base it
 /// last stored. These check that the database still ends up holding exactly
 /// the stored snapshot on every path: the host's own saves, repeated stores

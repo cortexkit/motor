@@ -406,6 +406,9 @@ workspace's incremental directories, not its base. Test:
   `fourth_pass_evicts_oldest_base_after_workspaces_and_staging_before_refusal`,
   `seed_pin_racing_eviction_keeps_current_and_allows_cold_fallback_after_release`
   (`crates/motor-runner/src/tests.rs`).
+- Per-job hosts copy an eligible warm checkout disk for a new worktree when
+  forking is enabled; otherwise, or if no donor can be copied, the disk starts
+  empty. Host storage admission evicts idle checkout disks, not build bases.
 - In a job VM the disk holds only the incoming job's own checkout, which the
   passes above protect. So whenever free space is still under the soft goal,
   admission deletes that checkout's incremental state and then, if needed,

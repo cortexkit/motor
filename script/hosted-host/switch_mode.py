@@ -20,7 +20,7 @@ import hosted_host
 
 HOST_CONFIG = Path("/etc/motor-host/host.json")
 REMOTE_CACHE_STORE = Path("/var/lib/motor-vm/remote-cache")
-COUNTS = ("active_leases", "active_job_vms", "active_fills", "active_recoveries")
+COUNTS = ("active_leases", "active_job_vms", "active_recoveries")
 
 
 def run(*args):
@@ -39,6 +39,8 @@ def wait_empty(path, mode, timeout):
         if status.get("ok") is not True or status.get("draining") is not True:
             raise ValueError("host must remain fully drained during the mode switch")
         counts = {field: status.get(field) for field in fields}
+        if mode == "per_job" and "active_fills" in status:
+            counts["active_fills"] = status["active_fills"]
         if any(type(value) is not int or value < 0 for value in counts.values()):
             raise ValueError(f"host status lacks mode-switch work counts: {counts}")
         if not any(counts.values()):
