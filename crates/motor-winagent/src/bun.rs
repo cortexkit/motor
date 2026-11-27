@@ -1764,8 +1764,10 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         ))
     })?;
     let mut seen = Default::default();
-    // A fixture may name a locked package without supplying it to Bun. Check
-    // only the root install and workspace members, including their store links.
+    // A test fixture may contain a package with a locked name and version that
+    // Bun never installed. Only the node_modules folders Bun creates count: the
+    // project root's and each workspace member's, followed through the links
+    // Bun places there to its shared package store.
     for root in roots {
         walk_modules(
             &root.join("node_modules"),
