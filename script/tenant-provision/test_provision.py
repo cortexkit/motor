@@ -468,7 +468,12 @@ class ProvisionTests(unittest.TestCase):
 
     def installer_render(self, image_version):
         """The bytes install.sh installs, and compares, for tenant-1's record."""
-        with mock.patch.object(hosted, "load_provision", return_value=p):
+        # The renderer checks the tenant's CPUs against the host's online list;
+        # give it the 32-thread host the template is written for, not the test machine.
+        online = mock.Mock(spec=Path)
+        online.read_text.return_value = "0-31\n"
+        with mock.patch.object(hosted, "load_provision", return_value=p), \
+                mock.patch.object(hosted, "ONLINE_CPUS", online):
             return json.dumps(hosted.tenant_config(SUB, 100, image_version), indent=2) + "\n"
 
     def add_image(self, version):

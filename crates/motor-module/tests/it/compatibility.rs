@@ -979,7 +979,7 @@ async fn oldest_production_client_receives_output_and_terminal_after_started() {
 
 #[tokio::test]
 #[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production client"]
-async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() {
+async fn oldest_production_client_keeps_typed_capacity_and_setup_refusal_details() {
     let helper = std::env::var_os("MOTOR_COMPAT_CLIENT")
         .expect("run python3 scripts/mixed-version.py to build the real pinned client");
     for setup_failure in [false, true] {
@@ -1006,10 +1006,10 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
         fs::write(&config, serde_json::to_vec(&f.config).unwrap()).unwrap();
         let mut request = f.request("echo forbidden > typed-refusal-marker");
         if !setup_failure {
-            // The runner is the only job in its queue, so its waiting phase is
-            // "demand exceeds capacity": it asks for more permits than the
-            // one-permit runner can ever grant, and a wait cannot help it.
-            // That is the refusal this pinned client must read, hint or not.
+            // The request asks for more vCPUs than the one-permit runner can
+            // ever grant, so the runner refuses it before upload instead of
+            // letting it wait. That is the refusal this pinned client must
+            // read, with its detail and without a retry hint.
             request.queue_wait_limit_s = Some(0);
         }
         fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
@@ -1030,7 +1030,7 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
                 reason: if setup_failure {
                     RefusalReason::WorkspaceSetupFailed
                 } else {
-                    RefusalReason::QueueWaitExceeded
+                    RefusalReason::RunnerFull
                 }
             }
         );
@@ -1044,8 +1044,11 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
             );
             assert!(detail.contains("destination path"), "{detail}");
         } else {
-            assert!(detail.starts_with("waiting_on="), "{detail}");
-            assert!(detail.contains("held_permits=0/1"), "{detail}");
+            assert!(detail.starts_with("vcpu request "), "{detail}");
+            assert!(
+                detail.contains("outside the supported range 1..=1"),
+                "{detail}"
+            );
         }
         assert_eq!(terminal.ran, Some(Ran::None));
         // A refusal that waiting cannot clear carries no hint, and the pinned

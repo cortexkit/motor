@@ -1,6 +1,6 @@
 use super::*;
 use crate::{BackendKind, Config};
-use std::{ffi::OsString, fs, io, os::unix::ffi::OsStringExt, path::PathBuf};
+use std::{fs, io, path::PathBuf};
 
 /// An operator-supplied mapping. Neither side is normalized on input.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -230,7 +230,19 @@ fn unescape(value: &[u8]) -> io::Result<PathBuf> {
             + u16::from(digits[2] - b'0');
         bytes.push(u8::try_from(value).map_err(io::Error::other)?);
     }
-    Ok(OsString::from_vec(bytes).into())
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::ffi::OsString::from_vec(bytes).into())
+    }
+    // Only Linux has a mount table; elsewhere it is empty, so this never runs
+    // on real input. Keep it strict rather than guessing an encoding.
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(io::Error::other)
+    }
 }
 
 pub(super) fn mounts(table: &[u8]) -> io::Result<Vec<Mount>> {

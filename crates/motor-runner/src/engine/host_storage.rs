@@ -2,9 +2,8 @@ use super::{Catalog, Config};
 use crate::caller_path;
 use std::{
     collections::BTreeSet,
-    ffi::CString,
     fs, io,
-    os::unix::ffi::OsStrExt,
+    os::unix::{fs::OpenOptionsExt, io::AsRawFd},
     path::{Path, PathBuf},
 };
 
@@ -92,36 +91,32 @@ fn check_atime(roots: BTreeSet<PathBuf>) -> io::Result<()> {
 
 fn covering_mount_id(path: &Path) -> io::Result<u64> {
     for ancestor in path.ancestors() {
-        let name = CString::new(ancestor.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
-        // Mount ID identifies the visible mount, even at a stacked or bind mount
-        // where matching the path or st_dev in mountinfo can select the wrong row.
-        let status = unsafe {
-            libc::statx(
-                libc::AT_FDCWD,
-                name.as_ptr(),
-                0,
-                libc::STATX_MNT_ID,
-                stat.as_mut_ptr(),
-            )
-        };
-        if status == 0 {
-            let stat = unsafe { stat.assume_init() };
-            if stat.stx_mask & libc::STATX_MNT_ID != 0 {
-                return Ok(stat.stx_mnt_id);
+        // An O_PATH handle needs no read permission on the directory itself.
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(ancestor)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "cannot find mount for {}: {error}",
+                    ancestor.display()
+                )))
             }
-            return Err(io::Error::other(format!(
-                "no mount ID for {}",
-                ancestor.display()
-            )));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(io::Error::other(format!(
-                "cannot find mount for {}: {error}",
-                ancestor.display()
-            )));
-        }
+        };
+        // The mount ID identifies the visible mount, even at a stacked or bind
+        // mount where matching the path or st_dev in mountinfo can select the
+        // wrong row. fdinfo reports it on every libc, unlike statx.
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+        return info
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .ok_or_else(|| io::Error::other(format!("no mount ID for {}", ancestor.display())))?
+            .trim()
+            .parse()
+            .map_err(io::Error::other);
     }
     Err(io::Error::other(format!("no mount for {}", path.display())))
 }
