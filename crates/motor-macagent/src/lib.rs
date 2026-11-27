@@ -108,6 +108,7 @@ mod execution {
     use tokio::task::{JoinHandle, JoinSet};
 
     const PIPE_EOF_LIMIT: Duration = Duration::from_secs(2);
+    const ERROR_REPORT_LIMIT: Duration = Duration::from_secs(1);
     const OUTPUT_CHUNK: usize = 16 * 1024;
     type SharedProtocol = Arc<Mutex<Protocol>>;
 
@@ -236,10 +237,15 @@ mod execution {
                     suppress,
                     killed,
                 } => {
+                    let pid = pid.load(std::sync::atomic::Ordering::SeqCst);
                     if suppress.load(std::sync::atomic::Ordering::SeqCst) {
+                        if pid > 0 && unsafe { libc::kill(-pid, 0) } == 0 {
+                            return Err(io::Error::other(
+                                "job processes were running after the job ended",
+                            ));
+                        }
                         return Ok(());
                     }
-                    let pid = pid.load(std::sync::atomic::Ordering::SeqCst);
                     if pid > 0 && unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
                         let error = io::Error::last_os_error();
                         if error.raw_os_error() != Some(libc::ESRCH) {
@@ -274,15 +280,7 @@ mod execution {
                     ))),
                 },
                 #[cfg(test)]
-                Self::ProcessGroup { pid, .. } => {
-                    let pid = pid.load(std::sync::atomic::Ordering::SeqCst);
-                    if pid > 0 && unsafe { libc::kill(-pid, 0) } == 0 {
-                        return Err(io::Error::other(
-                            "job processes were running after the job ended",
-                        ));
-                    }
-                    Ok(())
-                }
+                Self::ProcessGroup { .. } => self.kill(),
             }
         }
     }
@@ -562,6 +560,12 @@ mod execution {
         reader: &mut R,
         protocol: &SharedProtocol,
     ) -> io::Result<Frame> {
+        let frame = read_frame(reader).await?;
+        protocol.lock().unwrap().accept(Peer::Host, &frame)?;
+        Ok(frame)
+    }
+
+    async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
         let mut header = [0; 4];
         reader.read_exact(&mut header).await?;
         let length = u32::from_be_bytes(header) as usize;
@@ -574,9 +578,17 @@ mod execution {
         let mut bytes = vec![0; length + 4];
         bytes[..4].copy_from_slice(&header);
         reader.read_exact(&mut bytes[4..]).await?;
-        let frame = motor_winagent::read_frame(&mut &bytes[..])?.expect("complete frame");
-        protocol.lock().unwrap().accept(Peer::Host, &frame)?;
-        Ok(frame)
+        Ok(motor_winagent::read_frame(&mut &bytes[..])?.expect("complete frame"))
+    }
+
+    async fn receive_cancel<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<()> {
+        // Cancel is the only host frame allowed after TreeEnd and changes no
+        // protocol state. Keep a rejected control from poisoning the output
+        // side before it can report why the session is ending.
+        match read_frame(reader).await? {
+            Frame::Cancel {} => Ok(()),
+            _ => Err(io::Error::other("unexpected host frame")),
+        }
     }
 
     async fn send<W: AsyncWrite + Unpin>(
@@ -593,9 +605,14 @@ mod execution {
 
     enum Output {
         Chunk(Stream, usize),
-        /// A frame the agent sends from memory, before the terminal status.
-        Frame(Frame),
-        Terminal(Frame),
+        StderrLine(String),
+        Abort(String),
+        Terminal(Box<Completion>),
+    }
+
+    struct Completion {
+        release: Option<Frame>,
+        status: Frame,
     }
 
     /// Lines the agent adds to the job's standard error after the command's
@@ -676,28 +693,71 @@ mod execution {
         mut stderr: tokio::fs::File,
         mut output: mpsc::UnboundedReceiver<Output>,
     ) -> io::Result<()> {
-        send(&mut writer, &protocol, Frame::Started {}).await?;
-        while let Some(event) = output.recv().await {
-            match event {
-                Output::Chunk(stream, count) => {
-                    let mut bytes = vec![0; count];
-                    let file = match stream {
-                        Stream::Stdout => &mut stdout,
-                        Stream::Stderr => &mut stderr,
-                    };
-                    file.read_exact(&mut bytes).await?;
-                    send(&mut writer, &protocol, Frame::Output { stream, bytes }).await?;
+        let mut stderr_ends_line = true;
+        let result = async {
+            send(&mut writer, &protocol, Frame::Started {}).await?;
+            while let Some(event) = output.recv().await {
+                let frame = match event {
+                    Output::Chunk(stream, count) => {
+                        let mut bytes = vec![0; count];
+                        let file = match stream {
+                            Stream::Stdout => &mut stdout,
+                            Stream::Stderr => &mut stderr,
+                        };
+                        file.read_exact(&mut bytes).await?;
+                        Frame::Output { stream, bytes }
+                    }
+                    Output::StderrLine(line) => stderr_frame(line, stderr_ends_line),
+                    Output::Abort(reason) => return Err(io::Error::other(reason)),
+                    Output::Terminal(completion) => {
+                        let Completion { release, status } = *completion;
+                        if let Some(release) = release {
+                            send(&mut writer, &protocol, release).await?;
+                        }
+                        return send(&mut writer, &protocol, status).await;
+                    }
+                };
+                if let Frame::Output {
+                    stream: Stream::Stderr,
+                    bytes,
+                } = &frame
+                    && let Some(&last) = bytes.last()
+                {
+                    stderr_ends_line = last == b'\n';
                 }
-                Output::Frame(frame) => send(&mut writer, &protocol, frame).await?,
-                Output::Terminal(frame) => {
-                    send(&mut writer, &protocol, frame).await?;
-                    return writer.shutdown().await;
-                }
+                send(&mut writer, &protocol, frame).await?;
             }
+            Err(io::Error::other(
+                "output_incomplete: missing terminal status",
+            ))
         }
-        Err(io::Error::other(
-            "output_incomplete: missing terminal status",
-        ))
+        .await;
+        if let Err(error) = result {
+            // Only the writer knows where the output stopped. Sending from
+            // memory lets it report a broken spool without reading it again.
+            if protocol.lock().unwrap().state() == motor_winagent::State::Running {
+                let frame = stderr_frame(error_line(&error), stderr_ends_line);
+                let _ =
+                    tokio::time::timeout(ERROR_REPORT_LIMIT, send(&mut writer, &protocol, frame))
+                        .await;
+            }
+            return Err(error);
+        }
+        writer.shutdown().await
+    }
+
+    fn stderr_frame(mut line: String, ends_line: bool) -> Frame {
+        if !ends_line {
+            line.insert(0, '\n');
+        }
+        Frame::Output {
+            stream: Stream::Stderr,
+            bytes: line.into_bytes(),
+        }
+    }
+
+    fn error_line(error: &io::Error) -> String {
+        format!("motor: {}\n", short_reason(error))
     }
 
     fn termination(status: ExitStatus) -> io::Result<Frame> {
@@ -728,9 +788,9 @@ mod execution {
         format!("motor: the build disk could not be {action}: {reason}\n")
     }
 
-    /// The reason sent in `BuildRelease`: folded onto one line and cut to
-    /// `MAX_RELEASE_REASON_BYTES` on a character boundary.
-    fn release_reason(error: &io::Error) -> String {
+    /// The reason sent in `BuildRelease` or a final diagnostic, folded onto
+    /// one line and cut to `MAX_RELEASE_REASON_BYTES` on a character boundary.
+    fn short_reason(error: &io::Error) -> String {
         let mut reason = error
             .to_string()
             .split_whitespace()
@@ -807,7 +867,7 @@ mod execution {
         let stdout = tempfile::NamedTempFile::new_in(&settings.temporary_root)?;
         let stderr = tempfile::NamedTempFile::new_in(&settings.temporary_root)?;
         let stdout_write = tokio::fs::File::from_std(stdout.reopen()?);
-        let mut stderr_write = tokio::fs::File::from_std(stderr.reopen()?);
+        let stderr_write = tokio::fs::File::from_std(stderr.reopen()?);
         let stdout_read = tokio::fs::File::from_std(stdout.reopen()?);
         let stderr_read = tokio::fs::File::from_std(stderr.reopen()?);
         // Appends after everything the pipe readers wrote, for a line the agent
@@ -870,14 +930,10 @@ mod execution {
         }
         let _cleanup = Cleanup(settings.scope.clone());
         let (output_tx, output_rx) = mpsc::unbounded_channel();
-        // The notice goes through the stderr spool ahead of the command's own
-        // output, so the job's log says why its build started cold.
+        // Queue the notice ahead of the pipe readers so it reaches the job's
+        // log before any command output, even if the spool cannot be written.
         if let Some(notice) = notice {
-            stderr_write.write_all(notice.as_bytes()).await?;
-            stderr_write.flush().await?;
-            output_tx
-                .send(Output::Chunk(Stream::Stderr, notice.len()))
-                .map_err(|_| io::Error::other("output closed"))?;
+            let _ = output_tx.send(Output::StderrLine(notice));
         }
         let mut pipes = JoinSet::new();
         pipes.spawn(drain(
@@ -894,58 +950,96 @@ mod execution {
         ));
         let mut forwarding = Task(tokio::spawn(forward(
             writer,
-            protocol.clone(),
+            protocol,
             stdout_read,
             stderr_read,
             output_rx,
         )));
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        let _input = Task(tokio::spawn(async move {
+        let input = Task(tokio::spawn(async move {
             loop {
-                let message = receive(&mut reader, &protocol).await;
+                let message = receive_cancel(&mut reader).await;
                 let failed = message.is_err();
                 if control_tx.send(message).is_err() || failed {
                     break;
                 }
             }
         }));
-        let mut status = None;
-        let mut eof_deadline = None;
-        while status.is_none() || !pipes.is_empty() {
-            tokio::select! {
-                result = child.wait(), if status.is_none() => {
-                    status = Some(result?);
-                    settings.scope.kill()?;
-                    eof_deadline = Some(tokio::time::Instant::now() + PIPE_EOF_LIMIT);
-                }
-                result = pipes.join_next(), if !pipes.is_empty() => {
-                    result.unwrap().map_err(io::Error::other)??;
-                }
-                result = &mut forwarding.0 => { return result.map_err(io::Error::other)?; }
-                message = control_rx.recv() => { handle_control(message, &settings.scope)?; }
-                _ = async { tokio::time::sleep_until(eof_deadline.unwrap()).await }, if eof_deadline.is_some() && !pipes.is_empty() => {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "output_incomplete: pipe did not reach EOF after SIGKILL"));
+        let mut forwarding_finished = false;
+        let result = async {
+            let mut status = None;
+            let mut sweep_failed = false;
+            let mut eof_deadline = None;
+            while status.is_none() || !pipes.is_empty() {
+                tokio::select! {
+                    result = child.wait(), if status.is_none() => {
+                        status = Some(result?);
+                        sweep_failed = settings.scope.kill().is_err();
+                        eof_deadline = Some(tokio::time::Instant::now() + PIPE_EOF_LIMIT);
+                    }
+                    result = pipes.join_next(), if !pipes.is_empty() => {
+                        result.unwrap().map_err(io::Error::other)??;
+                    }
+                    result = &mut forwarding.0 => {
+                        forwarding_finished = true;
+                        result.map_err(io::Error::other)??;
+                        return Err(io::Error::other("output stopped before terminal status"));
+                    }
+                    message = control_rx.recv() => {
+                        message.ok_or_else(|| io::Error::other("control channel closed"))??;
+                        settings.scope.kill()?;
+                    }
+                    _ = async { tokio::time::sleep_until(eof_deadline.unwrap()).await }, if eof_deadline.is_some() && !pipes.is_empty() => {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "output_incomplete: pipe did not reach EOF after SIGKILL"));
+                    }
                 }
             }
-        }
-        let terminal = termination(status.unwrap())?;
-        // Every job process is gone. The agent releases the build volume and
-        // reports the result in a BuildRelease frame, then the command's
-        // status, both from memory: the host publishes the disk and reads the
-        // returned files under target/ only after `released: true`. The
-        // lines on standard error are for the caller and best effort.
-        let mut failure = None;
-        if let Some(volume) = settings.build.as_mut() {
+            Ok((termination(status.unwrap())?, sweep_failed))
+        }.await;
+        // Once the command and its pipes are done, no late control message
+        // should interrupt delivery of the release report or status.
+        drop(input);
+        let (status, sweep_failed) = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                pipes.abort_all();
+                if !forwarding_finished
+                    && output_tx.send(Output::Abort(short_reason(&error))).is_ok()
+                {
+                    // Don't wait indefinitely if the host has stopped reading.
+                    let _ = tokio::time::timeout(ERROR_REPORT_LIMIT, &mut forwarding.0).await;
+                }
+                return Err(error);
+            }
+        };
+        // Launchd can respawn per-user services for the job account. Retry a
+        // failed sweep before allowing detach to copy files or unmount.
+        let cleanup = if sweep_failed || settings.build.is_none() {
+            settings.scope.require_none()
+        } else {
+            Ok(())
+        };
+        let (release, failure) = if let Some(volume) = settings.build.as_mut() {
+            use crate::build_volume::DetachFailure;
+
             if let Some(diagnostic) = volume.watch_report() {
                 notes.append_line(&output_tx, diagnostic).await;
             }
-            let scope = settings.scope.clone();
-            let release = match volume.detach(&|| scope.require_none()) {
-                Ok(()) => Frame::BuildRelease {
-                    released: true,
-                    reason: String::new(),
-                },
-                Err(crate::build_volume::DetachFailure { error, diagnostic }) => {
+            let result = cleanup
+                .map_err(|error| DetachFailure {
+                    error,
+                    diagnostic: None,
+                })
+                .and_then(|()| volume.detach(&|| settings.scope.require_none()));
+            match result {
+                Ok(()) => (
+                    Some(Frame::BuildRelease {
+                        released: true,
+                        reason: String::new(),
+                    }),
+                    None,
+                ),
+                Err(DetachFailure { error, diagnostic }) => {
                     eprintln!("motor-macagent: the build disk could not be released: {error}");
                     if let Some(diagnostic) = diagnostic {
                         notes.append_line(&output_tx, diagnostic).await;
@@ -953,34 +1047,26 @@ mod execution {
                     notes
                         .append_line(&output_tx, build_disk_failure("released", &error))
                         .await;
-                    let reason = release_reason(&error);
-                    failure = Some(error);
-                    Frame::BuildRelease {
-                        released: false,
-                        reason,
-                    }
+                    let reason = short_reason(&error);
+                    (
+                        Some(Frame::BuildRelease {
+                            released: false,
+                            reason,
+                        }),
+                        Some(error),
+                    )
                 }
-            };
-            let _ = output_tx.send(Output::Frame(release));
-        }
-        let _ = output_tx.send(Output::Terminal(terminal));
-        loop {
-            tokio::select! {
-                result = &mut forwarding.0 => {
-                    result.map_err(io::Error::other)??;
-                    return failure.map_or(Ok(()), Err);
-                }
-                message = control_rx.recv() => { handle_control(message, &settings.scope)?; }
             }
-        }
-    }
-
-    fn handle_control(message: Option<io::Result<Frame>>, scope: &KillScope) -> io::Result<()> {
-        match message {
-            Some(Ok(Frame::Cancel {})) => scope.kill(),
-            Some(Err(error)) => Err(error),
-            _ => Err(io::Error::other("unexpected host frame")),
-        }
+        } else {
+            let failure = cleanup.err();
+            if let Some(error) = &failure {
+                let _ = output_tx.send(Output::StderrLine(error_line(error)));
+            }
+            (None, failure)
+        };
+        let _ = output_tx.send(Output::Terminal(Box::new(Completion { release, status })));
+        (&mut forwarding.0).await.map_err(io::Error::other)??;
+        failure.map_or(Ok(()), Err)
     }
 
     #[cfg(test)]
@@ -1318,17 +1404,48 @@ mod execution {
             // owns and kills this process group after checking the failure path.
             let mut fixture = start("sleep 1000 & exit 0", true).await;
             let began = tokio::time::Instant::now();
-            assert!(
-                tokio::time::timeout(Duration::from_secs(3), host_receive(&mut fixture.host))
+            let session =
+                tokio::time::timeout(Duration::from_secs(3), collect_session(&mut fixture))
                     .await
-                    .unwrap()
-                    .unwrap()
-                    .is_none()
+                    .unwrap();
+            assert!(session.release.is_none());
+            assert!(session.terminal.is_none());
+            assert_eq!(
+                session.stderr,
+                b"motor: output_incomplete: pipe did not reach EOF after SIGKILL\n"
             );
             let error = (&mut fixture.agent.0).await.unwrap().unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
             assert!(error.to_string().contains("output_incomplete"));
             assert!(began.elapsed() >= Duration::from_secs(2));
+        }
+
+        #[tokio::test]
+        async fn unexpected_host_frame_during_command_reports_reason_before_close() {
+            let mut fixture = start("printf job-err >&2; exec sleep 30", false).await;
+            assert_eq!(
+                host_receive(&mut fixture.host).await.unwrap(),
+                Some(Frame::Output {
+                    stream: Stream::Stderr,
+                    bytes: b"job-err".to_vec(),
+                })
+            );
+            host_send(&mut fixture.host, Frame::Started {}).await;
+            let session =
+                tokio::time::timeout(Duration::from_secs(2), collect_session(&mut fixture))
+                    .await
+                    .unwrap();
+            assert_eq!(session.stderr, b"\nmotor: unexpected host frame\n");
+            assert!(session.release.is_none());
+            assert!(session.terminal.is_none());
+            assert_eq!(
+                (&mut fixture.agent.0)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string(),
+                "unexpected host frame"
+            );
         }
 
         #[tokio::test]
@@ -1701,12 +1818,12 @@ mod execution {
             }
         }
 
-        /// A job process still alive after the kill sweep (here, one that
-        /// escaped it) fails the release, which is reported with the real exit.
+        /// A survivor that closed its output pipes must not enter detach or
+        /// hide the command's exit status.
         #[tokio::test]
-        async fn a_job_process_alive_after_the_job_fails_the_release() {
-            let (mut fixture, _) = launch_fake(
-                "(sleep 30 </dev/null >/dev/null 2>&1 &); exit 0",
+        async fn failed_post_exit_sweep_reports_failed_release_then_exit() {
+            let (mut fixture, events) = launch_fake(
+                "(sleep 30 </dev/null >/dev/null 2>&1 &); exit 7",
                 FakeOptions {
                     suppress_kill: true,
                     quiet: true,
@@ -1715,12 +1832,31 @@ mod execution {
             )
             .await;
             let session = collect_session(&mut fixture).await;
-            assert_eq!(session.terminal, Some(Frame::Exit { code: 0 }));
-            let Some(Frame::BuildRelease { released, reason }) = session.release else {
-                panic!("no release report");
-            };
-            assert!(!released);
-            assert!(reason.contains("running after the job ended"), "{reason}");
+            assert_eq!(
+                session.release,
+                not_released("job processes were running after the job ended")
+            );
+            assert_eq!(session.terminal, Some(Frame::Exit { code: 7 }));
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["attach", "command-started", "watch-report"]
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_post_exit_sweep_without_volume_reports_reason_and_exit() {
+            let mut fixture = start(
+                "printf job-err >&2; (sleep 30 </dev/null >/dev/null 2>&1 &); exit 7",
+                true,
+            )
+            .await;
+            let session = collect_session(&mut fixture).await;
+            assert!(session.release.is_none());
+            assert_eq!(session.terminal, Some(Frame::Exit { code: 7 }));
+            assert_eq!(
+                session.stderr,
+                b"job-err\nmotor: job processes were running after the job ended\n"
+            );
         }
 
         /// The watch is told when the command starts, and its fault report
@@ -1775,7 +1911,7 @@ mod execution {
 
         #[test]
         fn release_reason_is_one_line_within_the_frame_bound() {
-            let reason = release_reason(&io::Error::other(format!("a\n b {}", "é".repeat(2000))));
+            let reason = short_reason(&io::Error::other(format!("a\n b {}", "é".repeat(2000))));
             assert!(reason.starts_with("a b é"));
             assert!(reason.len() <= motor_winagent::MAX_RELEASE_REASON_BYTES);
             assert!(reason.len() > motor_winagent::MAX_RELEASE_REASON_BYTES - 2);
