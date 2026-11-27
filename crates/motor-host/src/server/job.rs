@@ -1395,8 +1395,10 @@ fn fork_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                         .donor_ids
                         .iter()
                         .position(|id| id == &reply.donor_id);
-                    // The durable forked flag tells the runner to remove the
-                    // donor's job history even if saving donor possession fails.
+                    // The copy is done even when `job_forked` fails to record
+                    // which donor's cached commits the new disk inherited: the
+                    // helper's durable forked flag still makes the runner remove
+                    // the donor's job history on first boot.
                     tracing::info!(jti = %job, donor_id = reply.donor_id,
                         candidate_count = plan.request.donor_ids.len(), ?selected_position,
                         size_rule = "size rule applied by the helper",
@@ -1417,7 +1419,8 @@ fn fork_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                 }
             }
         }
-        // No warm disk of this repository to copy: the job's first build is cold.
+        // No used checkout disk of this repository is available to copy, so
+        // the job starts on an empty disk and builds everything.
         Ok(None) => tracing::info!(jti = %job, "workspace_fork_unavailable; using empty workspace"),
         Err(error) => {
             tracing::info!(jti = %job, %error, "workspace_fork_plan_failed; using empty workspace");

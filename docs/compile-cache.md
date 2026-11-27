@@ -54,7 +54,8 @@ and `a_job_beside_its_tenants_fill_keeps_its_memory_and_egress`
 ck-motor offers default-branch tips only where the runner may fill. Hosted
 channels to registered hosts offer the capability in Hello. Tenant-mode runners
 can negotiate it; per-job runners do not, so ck-motor sends neither the tip nor
-its locked Git dependencies to them. Boat spills also omit both.
+its locked Git dependencies to them. Jobs placed on an overflow sandbox, when no
+registered host has room, also omit both.
 Tests:
 `hosted_hello_advertises_fill_support_only_to_registered_host_tenants`,
 `hello_advertises_default_branch_tip_on_the_wire`,
