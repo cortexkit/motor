@@ -312,8 +312,12 @@ the unprivileged guest job runs locked Cargo fetches for transferred workspaces
 with lockfiles, using only file-protocol Git rewrites and the staged local
 registry. These fetches temporarily disable Cargo's offline switch: Cargo refuses
 even a local Git rewrite until its own `git/db` has the locked commit. The VM
-still has no network adapter. Nested fetch failures warn without suppressing the
-caller command; any missing required dependency then fails that offline command.
+still has no network adapter. A nested folder counts as its own workspace when
+its manifest declares `[workspace]` or no enclosing manifest does; a package
+inside an enclosing workspace, such as a vendored crate wired in through
+`[patch]`, is skipped even when it carries a lockfile. Nested fetch failures warn
+without suppressing the caller command; any missing required dependency then
+fails that offline command.
 The caller command retains `CARGO_NET_OFFLINE=true`. Test:
 `tagged_git_mirror_reaches_cargo_build_offline_locked`. Path dependencies must
 resolve inside the transferred snapshots. An alternate registry, undeclared Git
