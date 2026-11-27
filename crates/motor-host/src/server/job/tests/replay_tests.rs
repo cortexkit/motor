@@ -56,10 +56,17 @@ async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_no
     .await
     .unwrap();
     for _ in 0..3 {
-        let (client, task, id) = observer(&runtime).await;
+        let (mut client, task, id) = observer(&runtime).await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::time::resume();
+        // The host can replay the interruption before the guest reports it.
+        let terminal = next_type(&mut client, "terminal").await;
+        assert_eq!(
+            terminal["outcome"],
+            json!({"type":"refused_before_start","reason":"transfer_interrupted"})
+        );
+        assert_eq!(terminal["ran"], "none");
         drop(client);
         task.await.unwrap().unwrap();
         runtime.host.lock().unwrap().close(id).unwrap();
@@ -120,7 +127,7 @@ async fn incomplete_spooled_upload_disconnects_and_sixty_second_reattaches_do_no
 }
 
 #[tokio::test]
-async fn reconnect_without_a_stored_terminal_refuses_unready_or_ended_leases() {
+async fn unready_or_ended_leases_allow_replay_only_attach_but_not_run_reconnect() {
     for (runner_hello, delivered, ended) in [
         (false, false, false),
         (true, false, false),
@@ -155,17 +162,72 @@ async fn reconnect_without_a_stored_terminal_refuses_unready_or_ended_leases() {
             let id = claim(&runtime, &c);
             let (mut client, task) = start(runtime.clone(), c, id).await;
             next_type(&mut client, "lease_ok").await;
-            assert_eq!(
-                next_type(&mut client, "lease_refused").await,
-                json!({"type":"lease_refused","reason":"auth"}),
-                "purpose={purpose:?}, runner_hello={runner_hello}, delivered={delivered}, ended={ended}"
-            );
-            task.await.unwrap().unwrap();
+            if purpose == Purpose::Attach {
+                write_frame(&mut client, &hello()).await.unwrap();
+                next_type(&mut client, "hello").await;
+                write_frame(
+                    &mut client,
+                    &json!({"type":"attach","job_id":JOB,"from_seq":0}),
+                )
+                .await
+                .unwrap();
+                if ended {
+                    assert_eq!(
+                        next_type(&mut client, "output").await["truncated_before_seq"],
+                        1
+                    );
+                    let terminal = next_type(&mut client, "terminal").await;
+                    assert_eq!(terminal["outcome"]["type"], "outcome_unknown");
+                    next_type(&mut client, "hosted_terminal").await;
+                }
+                drop(client);
+                task.await.unwrap().unwrap();
+            } else {
+                assert_eq!(
+                    next_type(&mut client, "lease_refused").await,
+                    json!({"type":"lease_refused","reason":"auth"}),
+                    "runner_hello={runner_hello}, delivered={delivered}, ended={ended}"
+                );
+                task.await.unwrap().unwrap();
+            }
             runtime.host.lock().unwrap().close(id).unwrap();
             assert!(fake.calls.lock().unwrap().is_empty());
             runtime.stop_job(JOB, true, false).unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn early_attach_cancel_fences_run_delivery() {
+    let (runtime, fake, _) = fixture();
+    let mut c = claims(JOB);
+    let run_id = claim(&runtime, &c);
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .begin_job_boot(JOB)
+        .unwrap()
+        .unwrap();
+    c.purpose = Purpose::Attach;
+    let attach_id = claim(&runtime, &c);
+    let (mut client, task) = start(runtime.clone(), c, attach_id).await;
+    next_type(&mut client, "lease_ok").await;
+    write_frame(&mut client, &hello()).await.unwrap();
+    next_type(&mut client, "hello").await;
+    write_frame(&mut client, &json!({"type":"cancel","job_id":JOB}))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_type(&mut client, "cancel_reply").await["state"],
+        "cancelled"
+    );
+    let terminal = next_type(&mut client, "terminal").await;
+    assert_eq!(terminal["outcome"], json!({"type":"cancelled"}));
+    assert_eq!(terminal["ran"], "none");
+    task.await.unwrap().unwrap();
+    assert!(runtime.host.lock().unwrap().delivered(run_id).is_err());
+    assert!(fake.inputs.lock().unwrap().is_empty());
 }
 
 fn bytes(text: &[u8]) -> Vec<u8> {

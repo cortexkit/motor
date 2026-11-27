@@ -460,8 +460,30 @@ async fn collect(
                 && !upload.complete()
                 && commands.is_empty()
             {
-                // EOF still means transfer_interrupted for an unfinished input
-                // upload. A fully uploaded command keeps its independent channel.
+                // The upload owner has gone and every queued chunk has been
+                // forwarded. This is the only writer of Run and bundle frames;
+                // it will forward no more. The runner cannot fetch or execute
+                // the command without all the declared bundle bytes.
+                let runtime = runtime.clone();
+                let store = store.clone();
+                let job = claims.jti.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    {
+                        let mut host = runtime.host.lock().expect("host lock");
+                        if host.snapshot.leases[&job].started_at_ms.is_none() {
+                            let terminal = refusal(
+                                &job,
+                                "transfer_interrupted",
+                                "caller disconnected before bundle upload completed",
+                            );
+                            host.receive_terminal_observed(&job, terminal, unix_ms(), false)?;
+                        }
+                    }
+                    publish_settlement(&runtime, &job, &store)
+                })
+                .await??;
+                // Let the guest finish closing its stream. The caller can
+                // already replay the terminal even if the guest sends none.
                 write.lock().await.shutdown().await?;
                 return std::future::pending::<Result<()>>().await;
             }
@@ -779,6 +801,13 @@ pub(super) fn publish_settlement(runtime: &Runtime, job: &str, stream: &Stream) 
     stream.with_store(|store| publish_to_store(runtime, job, store))
 }
 
+fn is_interrupted_upload_terminal(terminal: &Value) -> bool {
+    terminal["type"] == "terminal"
+        && terminal["ran"] == "none"
+        && terminal["outcome"]["type"] == "refused_before_start"
+        && terminal["outcome"]["reason"] == "transfer_interrupted"
+}
+
 fn publish_to_store(runtime: &Runtime, job: &str, store: &mut Store) -> Result<()> {
     if store.ended() {
         // The host saves the cancellation first. Reconcile a replay index
@@ -804,6 +833,16 @@ fn publish_to_store(runtime: &Runtime, job: &str, store: &mut Store) -> Result<(
             // These frames already encode proven queued-job withdrawals or
             // outcomes selected by the host's settlement evidence.
             frames
+        } else if let Some(terminal) = host
+            .snapshot
+            .billing
+            .get(job)
+            .and_then(|b| b.terminal.as_ref())
+            .filter(|terminal| is_interrupted_upload_terminal(terminal))
+        {
+            // The terminal is already durable, even if the VM is still
+            // stopping or the host crashed before indexing the replay.
+            vec![terminal.clone()]
         } else {
             let execution = &host.snapshot.per_job.executions[job];
             if !execution.ended
@@ -957,11 +996,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     // Reconnects still receive the durable terminal unchanged.
                     anyhow::bail!("execution ended before Run delivery");
                 }
-                if value["type"] == "terminal"
-                    && value["ran"] == "none"
-                    && value["outcome"]["type"] == "refused_before_start"
-                    && value["outcome"]["reason"] == "transfer_interrupted"
-                {
+                if is_interrupted_upload_terminal(&value) {
                     // Mark the interrupted terminal as delivered before replay
                     // can escape, even if the host restarts during the write.
                     runtime
@@ -1055,24 +1090,30 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                                 })?;
                             }
                         }
-                        let ended = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.terminal.clone());
                         let kind = request.value["type"].as_str().context("control type")?;
+                        if hello && claims.purpose == Purpose::Attach && kind == "cancel" {
+                            liveness.before_ordered(&mut write).await?;
+                            if super::cancel(runtime, claims, &mut write, &request.value, 0, None).await? {
+                                return Ok(ConnectionEnd::SentFinalFrames);
+                            }
+                        }
+                        let (ended, delivered) = {
+                            let host = runtime.host.lock().expect("host lock");
+                            (
+                                host.snapshot.billing.get(&claims.jti).and_then(|b| b.terminal.clone()),
+                                host.snapshot.leases[&claims.jti].delivered,
+                            )
+                        };
+                        let tx = if delivered {
+                            stream.input.lock().expect("job input").clone()
+                        } else {
+                            None
+                        };
                         if let Some(terminal) = ended {
                             let reply = stored_reply(kind, &claims.jti, terminal)?;
                             liveness.before_ordered(&mut write).await?;
                             write_frame(&mut write, &reply).await?;
-                        } else if kind == "job_status" && stream.input.lock().expect("job input").is_none() {
-                            if let Some(status) = queue_status(runtime, claims) {
-                                let reply = motor_protocol::JobStatusReply {
-                                    job_id: claims.jti.parse()?, state: status.state,
-                                    waiting_on: status.waiting_on, blocker: status.blocker,
-                                    queue_wait_ms: Some(0), terminal: None, unit: None, unit_alive: None,
-                                };
-                                liveness.before_ordered(&mut write).await?;
-                                write_frame(&mut write, &serde_json::to_value(motor_protocol::Frame::JobStatusReply(reply))?).await?;
-                            }
-                        } else {
-                            let tx = stream.input.lock().expect("job input").clone().context("runner disconnected")?;
+                        } else if let Some(tx) = tx {
                             let (reply, response) = oneshot::channel();
                             tx.send(Input { bytes: request.bytes, reply: Some(reply) }).await?;
                             let response = response.await;
@@ -1084,9 +1125,24 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                                     write_frame(&mut write, &stored_reply(kind, &claims.jti, terminal)?).await?;
                                 }
                             }
+                        } else {
+                            let status = (kind == "job_status").then(|| queue_status(runtime, claims)).flatten();
+                            let reply = if let Some(status) = status {
+                                let reply = motor_protocol::JobStatusReply {
+                                    job_id: claims.jti.parse()?, state: status.state,
+                                    waiting_on: status.waiting_on, blocker: status.blocker,
+                                    queue_wait_ms: Some(0), terminal: None, unit: None, unit_alive: None,
+                                };
+                                serde_json::to_value(motor_protocol::Frame::JobStatusReply(reply))?
+                            } else {
+                                json!({"type":"refusal","job_id":claims.jti,
+                                    "reason":"request_rejected","detail":"job control is not available"})
+                            };
+                            liveness.before_ordered(&mut write).await?;
+                            write_frame(&mut write, &reply).await?;
                         }
                     }
-                    Some("bundle_chunk") if attached => {
+                    Some("bundle_chunk") if attached && !hello => {
                         let tx = stream.input.lock().expect("job input").clone().context("runner disconnected")?;
                         note_input("input_mailbox", &liveness);
                         tx.send(Input { bytes: request.bytes, reply: None }).await?;
@@ -1177,7 +1233,12 @@ struct Upload {
 }
 impl Upload {
     fn complete(&self) -> bool {
-        self.expected == self.received
+        // Extra chunks cannot undo a complete upload the runner may already
+        // have accepted. Count overruns as possibly complete, not no-start.
+        self.expected
+            .iter()
+            .zip(&self.received)
+            .all(|(expected, received)| received >= expected)
     }
     /// Contiguous bytes received and bytes the Run declared, over all bundles.
     fn bytes(&self) -> (u64, u64) {

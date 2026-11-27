@@ -807,3 +807,100 @@ async fn interrupted_upload_abrupt_eof_keeps_result_unobserved_until_attach() {
         .any(|frame| frame["type"] == "hosted_terminal"));
     assert!(runtime.host.lock().unwrap().snapshot.billing[JOB2].delivered);
 }
+
+#[tokio::test]
+async fn upload_cut_after_boot_replays_no_start_to_early_and_late_attach() {
+    let (runtime, fake, _storage) = fixture();
+    hold_boot(&runtime, &fake, "unused");
+    let (host_end, runner_end) = UnixStream::pair().unwrap();
+    fake.scripted.lock().unwrap().push_back(host_end);
+    runner_end.set_nonblocking(true).unwrap();
+    let mut runner = tokio::net::UnixStream::from_std(runner_end).unwrap();
+
+    let run_claims = claims(JOB);
+    let run_id = claim(&runtime, &run_claims);
+    let (mut caller, original) = start(runtime.clone(), run_claims.clone(), run_id).await;
+    let mut attach = run_claims;
+    attach.purpose = Purpose::Attach;
+    let attach_frame = json!({"type":"attach","job_id":JOB,"from_seq":0});
+    let mut request = run(JOB);
+    request["bundles"] = json!([{
+        "index":0, "repository":request["repository_root"], "length":6, "sha256":"0".repeat(64)
+    }]);
+    request["siblings"] = json!([]);
+    request["git_dependencies"] = json!([]);
+    let chunk = json!({"type":"bundle_chunk","index":0,"offset":0,"data":"YWJj"});
+    let expected = json!({"type":"refused_before_start","reason":"transfer_interrupted"});
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        next_type(&mut caller, "lease_ok").await;
+        write_frame(&mut caller, &hello()).await.unwrap();
+        next_type(&mut caller, "hello").await;
+        write_frame(&mut caller, &request).await.unwrap();
+        next_type(&mut caller, "accepted").await;
+
+        next_type(&mut runner, "verified_lease").await;
+        next_type(&mut runner, "hello").await;
+        // Boot has reached the runner, but the host has not authorized Run delivery yet.
+        let early_id = claim(&runtime, &attach);
+        let (mut early, early_task) = start(runtime.clone(), attach.clone(), early_id).await;
+        next_type(&mut early, "lease_ok").await;
+        // If the host already refused this attach, read the refusal even if
+        // the hello write fails because the peer closed.
+        let _ = write_frame(&mut early, &hello()).await;
+        let early_hello = read_frame(&mut early).await.unwrap();
+        if early_hello["type"] == "hello" {
+            write_frame(&mut early, &attach_frame).await.unwrap();
+        }
+
+        write_frame(&mut runner, &hello()).await.unwrap();
+        assert_eq!(next_type(&mut runner, "run").await, request);
+        write_frame(&mut caller, &chunk).await.unwrap();
+        assert_eq!(next_type(&mut runner, "bundle_chunk").await, chunk);
+        // Cut the connection inside the next frame. The runner loses the
+        // upload without sending its own terminal, as on a relay failure.
+        caller.write_all(&8u32.to_be_bytes()).await.unwrap();
+        caller.write_all(b"{").await.unwrap();
+        drop(caller);
+        original.await.unwrap().unwrap();
+        runtime.host.lock().unwrap().close(run_id).unwrap();
+        let eof = loop {
+            match read_frame(&mut runner).await {
+                Ok(frame) => assert_eq!(frame["type"], "heartbeat"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(
+            eof.downcast_ref::<std::io::Error>().unwrap().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        drop(runner);
+
+        let early_terminal = if early_hello["type"] == "hello" {
+            Some(next_type(&mut early, "terminal").await)
+        } else {
+            None
+        };
+        early_task.await.unwrap().unwrap();
+        runtime.host.lock().unwrap().close(early_id).unwrap();
+
+        while !runtime.host.lock().unwrap().snapshot.per_job.executions[JOB].ended {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let late_id = claim(&runtime, &attach);
+        let (mut late, late_task) = start(runtime.clone(), attach, late_id).await;
+        next_type(&mut late, "lease_ok").await;
+        write_frame(&mut late, &hello()).await.unwrap();
+        next_type(&mut late, "hello").await;
+        write_frame(&mut late, &attach_frame).await.unwrap();
+        let terminal = next_type(&mut late, "terminal").await;
+        assert_eq!(terminal["outcome"], expected);
+        assert_eq!(terminal["ran"], "none");
+        assert_eq!(early_hello["type"], "hello", "{early_hello}");
+        assert_eq!(early_terminal.unwrap(), terminal);
+        late_task.await.unwrap().unwrap();
+        runtime.host.lock().unwrap().close(late_id).unwrap();
+    })
+    .await
+    .expect("the interrupted upload settles for both attachments");
+}
