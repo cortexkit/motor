@@ -306,10 +306,7 @@ impl HostedJobState {
     }
     pub(crate) fn new(config: &Config) -> Self {
         Self {
-            broker_url: config
-                .broker_url
-                .clone()
-                .unwrap_or_else(|| motor_lease::ISSUER.into()),
+            broker_url: effective_broker_url(config).into(),
             token_source: config.broker_token_source,
             ..Self::default()
         }
@@ -343,6 +340,10 @@ impl HostedJobState {
             ),
         }
     }
+}
+
+fn effective_broker_url(config: &Config) -> &str {
+    config.broker_url.as_deref().unwrap_or(motor_lease::ISSUER)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

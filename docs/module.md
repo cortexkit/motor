@@ -531,8 +531,11 @@ ck-motor store-checkpoint --root /path/to/store.db.ck-motor
 
 This offline command acquires the same exclusive lease, replays the journal,
 exports current compatible JSON and exits non-zero on any export/replay/lease
-failure. Only replace the binary after exit status 0. Do not delete journal files
-or copy state.json by hand. The previous `222d833` binary cannot replay a journal.
+failure. The root must contain an existing `state.json` checkpoint. If the
+checkpoint is missing, the command refuses to export and leaves any journal
+files untouched. Only replace the binary after exit status 0. Do not delete
+journal files or copy state.json by hand. The previous `222d833` binary cannot
+replay a journal.
 An abrupt stop followed by rollback **without** this command may lose up to five
 minutes of transitions, including cancellation and Run intent fences (longer if
 checkpointing was failing). A clean stop is lossless only if its checkpoint

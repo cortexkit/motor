@@ -566,6 +566,74 @@ fn append_failure_preserves_shared_jobs_and_all_in_memory_state() {
 }
 
 #[test]
+fn offline_checkpoint_refuses_wrong_roots_without_initializing_a_store() {
+    let root = ScratchDir::new("motor-offline-checkpoint-wrong-root");
+    let missing = root.join("missing");
+    let empty = root.join("empty");
+    fs::create_dir(&empty).unwrap();
+    for path in [&missing, &empty] {
+        let args = vec!["--root".into(), path.to_str().unwrap().into()];
+        assert_eq!(
+            crate::cli::store_checkpoint_main(&args),
+            1,
+            "must refuse a root without an existing checkpoint: {}",
+            path.display()
+        );
+    }
+    assert!(!missing.exists());
+    assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+}
+
+#[test]
+fn offline_checkpoint_preserves_the_journal_when_the_checkpoint_is_missing() {
+    let root = ScratchDir::new("motor-offline-checkpoint-journal-source");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::now_v7();
+    storage.cancel(id, true).unwrap();
+
+    let damaged = ScratchDir::new("motor-offline-checkpoint-missing-state");
+    copy_store(&root, &damaged);
+    assert_eq!(
+        durable_value(&damaged).unwrap()["jobs"][id.to_string()]["pending_cancel"],
+        true
+    );
+    fs::remove_file(damaged.join("state.json")).unwrap();
+    let segment = log(&damaged);
+    let bytes = fs::read(&segment).unwrap();
+
+    let args = vec!["--root".into(), damaged.to_str().unwrap().into()];
+    let status = crate::cli::store_checkpoint_main(&args);
+    assert_eq!(
+        fs::read(&segment).expect("journal segment must survive export refusal"),
+        bytes
+    );
+    assert_eq!(status, 1);
+    assert_eq!(fs::read_dir(&damaged).unwrap().count(), 1);
+}
+
+#[test]
+fn offline_checkpoint_accepts_an_old_writers_checkpoint_over_a_stale_journal() {
+    let root = ScratchDir::new("motor-offline-checkpoint-old-writer-source");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::now_v7();
+    storage.cancel(id, true).unwrap();
+
+    let old_root = ScratchDir::new("motor-offline-checkpoint-old-writer");
+    copy_store(&root, &old_root);
+    let checkpoint = old_root.join("state.json");
+    let mut old = durable_value(&old_root).unwrap();
+    assert_eq!(old["jobs"][id.to_string()]["pending_cancel"], true);
+    old["jobs"][id.to_string()]["pending_cancel"] = json!(false);
+    old.as_object_mut().unwrap().remove("_journal");
+    fs::write(&checkpoint, serde_json::to_vec(&old).unwrap()).unwrap();
+
+    let args = vec!["--root".into(), old_root.to_str().unwrap().into()];
+    assert_eq!(crate::cli::store_checkpoint_main(&args), 0);
+    let value: Value = serde_json::from_slice(&fs::read(checkpoint).unwrap()).unwrap();
+    assert_eq!(value["jobs"][id.to_string()]["pending_cancel"], false);
+}
+
+#[test]
 fn offline_checkpoint_takes_the_lease_and_fails_closed_on_export_error() {
     let root = ScratchDir::new("motor-offline-checkpoint");
     let storage = Storage::open(&root).unwrap();

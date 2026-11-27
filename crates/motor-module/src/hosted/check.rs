@@ -58,6 +58,21 @@ fn token_claims(token: &str) -> Option<Claims> {
 // This check deliberately has no access to job storage or the hosted switch.
 // Only the vault mints the bearer; neither it nor broker response text is returned.
 pub(crate) async fn check(tokens: Option<&Arc<AccountTokens>>, config: &crate::Config) -> Check {
+    check_with_probe(tokens, config, async |request| {
+        request
+            .send()
+            .await
+            .ok()
+            .map(|reply| reply.status().as_u16())
+    })
+    .await
+}
+
+async fn check_with_probe(
+    tokens: Option<&Arc<AccountTokens>>,
+    config: &crate::Config,
+    probe: impl AsyncFn(reqwest::RequestBuilder) -> Option<u16>,
+) -> Check {
     let Some(tokens) = tokens else {
         return Check::refusal(Error::AccountNotFound);
     };
@@ -68,45 +83,41 @@ pub(crate) async fn check(tokens: Option<&Arc<AccountTokens>>, config: &crate::C
     let Some(mut claims) = token_claims(&token) else {
         return Check::refusal(Error::AccountInvalid);
     };
-    let broker_status = if let Some(url) = &config.broker_url {
-        match reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(super::account::BROKER_TIMEOUT)
-            .build()
-        {
-            Ok(client) => {
-                let mut status = None;
-                for attempt in 0..2 {
-                    status = client
+    let url = super::effective_broker_url(config);
+    let broker_status = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(super::account::BROKER_TIMEOUT)
+        .build()
+    {
+        Ok(client) => {
+            let mut status = None;
+            for attempt in 0..2 {
+                status = probe(
+                    client
                         .post(format!("{}/v1/leases", url.trim_end_matches('/')))
                         .bearer_auth(&token)
-                        .json(&serde_json::json!({}))
-                        .send()
-                        .await
-                        .ok()
-                        .map(|reply| reply.status().as_u16());
-                    if status != Some(401) {
-                        break;
-                    }
-                    tokens.invalidate(&token).await;
-                    if attempt == 1 {
-                        return Check::refusal(Error::AccountInvalid);
-                    }
-                    token = match tokens.bearer().await {
-                        Ok(token) => token,
-                        Err(error) => return Check::refusal(error),
-                    };
-                    claims = match token_claims(&token) {
-                        Some(claims) => claims,
-                        None => return Check::refusal(Error::AccountInvalid),
-                    };
+                        .json(&serde_json::json!({})),
+                )
+                .await;
+                if status != Some(401) {
+                    break;
                 }
-                status
+                tokens.invalidate(&token).await;
+                if attempt == 1 {
+                    return Check::refusal(Error::AccountInvalid);
+                }
+                token = match tokens.bearer().await {
+                    Ok(token) => token,
+                    Err(error) => return Check::refusal(error),
+                };
+                claims = match token_claims(&token) {
+                    Some(claims) => claims,
+                    None => return Check::refusal(Error::AccountInvalid),
+                };
             }
-            Err(_) => None,
+            status
         }
-    } else {
-        None
+        Err(_) => None,
     };
     Check {
         status: "ok".into(),

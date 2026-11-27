@@ -4406,7 +4406,6 @@ mod hosted_cli_tests {
 }
 
 /// Export the complete durable store before placing a journal-unaware binary.
-/// The normal storage open owns the same exclusive lease as the daemon.
 pub fn store_checkpoint_main(args: &[String]) -> u8 {
     if args == ["--help"] || args == ["-h"] {
         println!("usage: ck-motor store-checkpoint --root STORE_DIR");
@@ -4420,7 +4419,9 @@ pub fn store_checkpoint_main(args: &[String]) -> u8 {
         eprintln!("usage: ck-motor store-checkpoint --root STORE_DIR");
         return EXIT_USAGE;
     }
-    match crate::storage::Storage::open(Path::new(root)).and_then(|store| store.shutdown()) {
+    match crate::storage::Storage::open_for_checkpoint(Path::new(root))
+        .and_then(|store| store.shutdown())
+    {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("ck-motor store-checkpoint: {error}; do not roll back until export succeeds");

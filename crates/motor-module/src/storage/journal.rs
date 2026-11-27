@@ -308,14 +308,41 @@ fn create_segment(root: &Path, epoch: Uuid, first: u64) -> io::Result<(File, Seg
     ))
 }
 
+enum OpenMode {
+    Initialize,
+    Existing,
+}
+
+pub(super) fn missing_checkpoint() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "storage checkpoint state.json is missing; verify the store root and preserve any journal segments for recovery",
+    )
+}
+
 pub(super) fn open(root: &Path, metrics: &Arc<Metrics>) -> io::Result<(State, Backend)> {
+    open_with_mode(root, metrics, OpenMode::Initialize)
+}
+
+pub(super) fn open_existing(root: &Path, metrics: &Arc<Metrics>) -> io::Result<(State, Backend)> {
+    open_with_mode(root, metrics, OpenMode::Existing)
+}
+
+fn open_with_mode(
+    root: &Path,
+    metrics: &Arc<Metrics>,
+    mode: OpenMode,
+) -> io::Result<(State, Backend)> {
     let mut value = match File::open(root.join("state.json")) {
         Ok(file) => {
             serde_json::from_reader::<_, Value>(BufReader::new(file)).map_err(io::Error::other)?
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            serde_json::to_value(State::default()).map_err(io::Error::other)?
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match mode {
+            OpenMode::Initialize => {
+                serde_json::to_value(State::default()).map_err(io::Error::other)?
+            }
+            OpenMode::Existing => return Err(missing_checkpoint()),
+        },
         Err(e) => return Err(e),
     };
     let position = value
