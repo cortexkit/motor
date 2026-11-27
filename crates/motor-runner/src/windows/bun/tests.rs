@@ -534,6 +534,94 @@ fn stage_real_project(staging: &Path, name: &str, manifest: &str, lock: &str) ->
 
 #[cfg(unix)]
 #[test]
+fn nameless_project_with_tracked_node_modules_fixture_prepares() {
+    let scratch = ScratchDir::new("bun-nameless-project");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let (lock, archives) = real_lock_registry(
+        r#"{
+          "lockfileVersion": 1,
+          "workspaces": {"": {"name": "@cortexkit/alfonso", "dependencies": {"gopd": "1.2.0"}}},
+          "packages": {"gopd": ["gopd@1.2.0", "", {}, ""]}
+        }"#,
+    );
+    let relative = "Users/test/Work/Projects/CortexKit-scratch/prefrontal-batch-1127b";
+    let checkout = stage_real_project(
+        &staging,
+        relative,
+        r#"{"private":true,"version":"3.17.4","dependencies":{"gopd":"1.2.0"}}"#,
+        &lock,
+    );
+    for target in [
+        "darwin-arm64",
+        "darwin-x64",
+        "darwin-x64-baseline",
+        "linux-arm64",
+        "linux-arm64-musl",
+        "linux-x64",
+        "linux-x64-baseline",
+        "linux-x64-musl",
+        "linux-x64-musl-baseline",
+        "windows-arm64",
+        "windows-x64",
+    ] {
+        let directory = checkout.join("platform-packages").join(target);
+        fs::create_dir_all(&directory).unwrap();
+        let stub =
+            serde_json::json!({"name": format!("@cortexkit/alfonso-{target}"), "version": "0.1.0"});
+        fs::write(directory.join("package.json"), stub.to_string()).unwrap();
+    }
+    let fixture = checkout.join(
+        "crates/prefrontal-core-module/tests/fixtures/gather/roots/repoA/node_modules/pkg/lib/x.js",
+    );
+    fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+    fs::write(&fixture, b"fixture source").unwrap();
+    prepare_with_fetch(
+        &config,
+        &staging,
+        "/repo",
+        std::slice::from_ref(&checkout),
+        |target| Ok(archives[target.url.path()].clone()),
+    )
+    .unwrap();
+    let cache = scratch.join("guest-cache");
+    let manifest = bun::prepare_cache(&staging.join("bun-seed"), &staging.join("m"), &cache)
+        .unwrap()
+        .unwrap();
+    let [project] = manifest.projects.as_slice() else {
+        panic!(
+            "expected only the root project, got {:?}",
+            manifest.projects
+        );
+    };
+    assert_eq!(project.path, format!("m/{relative}"));
+    assert_eq!(project.name, "");
+    assert_eq!(project.version, "3.17.4");
+    assert!(project.skipped.is_none());
+
+    let output = std::process::Command::new("bun")
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--ignore-scripts",
+        ])
+        .env("BUN_INSTALL_CACHE_DIR", &cache)
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bun::verify_installed(project, &checkout).unwrap();
+    assert_eq!(fs::read(fixture).unwrap(), b"fixture source");
+}
+
+#[cfg(unix)]
+#[test]
 fn probe_missing_transitives_do_not_publish_a_partial_seed() {
     let scratch = ScratchDir::new("bun-probe-partial");
     let config = config(scratch.path());
@@ -1116,6 +1204,43 @@ fn stage_workspace(staging: &Path) -> PathBuf {
         fs::copy(fixture.join(relative), destination).unwrap();
     }
     staging.join("m/repo")
+}
+
+#[cfg(unix)]
+#[test]
+fn preexisting_modules_in_install_roots_and_local_targets_name_the_path() {
+    let scratch = ScratchDir::new("bun-protected-modules");
+    let config = config(scratch.path());
+    for (i, relative) in [
+        "node_modules",
+        "packages/member/NoDe_MoDuLeS",
+        "packages/member/vendor/memberdep/tests/fixtures/node_modules",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let staging = scratch.join(format!("staging-{i}"));
+        let checkout = stage_workspace(&staging);
+        let modules = checkout.join(relative);
+        fs::create_dir_all(&modules).unwrap();
+        fs::write(modules.join("tracked.js"), "tracked source").unwrap();
+        prepare_with_fetch(&config, &staging, "/repo", &[checkout], |_| {
+            panic!("file: and workspace: dependencies need no registry")
+        })
+        .unwrap();
+        let cache = staging.join("cache");
+        let refusal =
+            bun::prepare_cache(&staging.join("bun-seed"), &staging.join("m"), &cache).unwrap_err();
+        assert_eq!(refusal.kind, RefusalKind::BunProjectionInvalid);
+        assert_eq!(refusal.check, Some(bun::Check::Projection));
+        assert_eq!(
+            &*refusal.detail,
+            format!("pre-existing node_modules at {relative}")
+        );
+        refusal.validate().unwrap();
+        assert!(!cache.exists());
+        assert!(modules.join("tracked.js").exists());
+    }
 }
 
 /// Bun invoked in a workspace member reads the root lockfile, not the member's
