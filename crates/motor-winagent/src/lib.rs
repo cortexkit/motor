@@ -1023,6 +1023,54 @@ fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<
     Ok(env)
 }
 
+#[cfg(any(windows, test))]
+fn cargo_workspace_header(path: &std::path::Path) -> io::Result<bool> {
+    let mut text = String::new();
+    open_source_file(path)?.read_to_string(&mut text)?;
+    // The guest has no TOML parser. A strict header check cannot validate a
+    // malformed manifest; Cargo still rejects it when building that package.
+    for line in text.lines() {
+        if line.contains("\"\"\"") || line.contains("'''") {
+            // A later line that looks like a header could be part of a string.
+            return Err(invalid(
+                "cannot classify a manifest with a multiline string",
+            ));
+        }
+        let header = line.split('#').next().unwrap().trim_matches([' ', '\t']);
+        if let Some(table) = header
+            .strip_prefix('[')
+            .and_then(|name| name.strip_suffix(']'))
+            && table.trim_matches([' ', '\t']) == "workspace"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(windows, test))]
+fn separate_cargo_workspace(source_root: &std::path::Path, directory: &str) -> io::Result<bool> {
+    let mut path = source_root.to_path_buf();
+    let mut parents = Vec::new();
+    let mut enclosing_workspace = false;
+    for component in directory.split('/') {
+        // Keep the ancestor handles open, as collection does, so Windows
+        // cannot replace a directory with a junction while we read below it.
+        parents.push(source_directory(&path)?);
+        match cargo_workspace_header(&path.join("Cargo.toml")) {
+            Ok(workspace) => enclosing_workspace |= workspace,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        path.push(component);
+    }
+    if !enclosing_workspace {
+        return Ok(true);
+    }
+    let _directory = source_directory(&path)?;
+    cargo_workspace_header(&path.join("Cargo.toml"))
+}
+
 /// Populate Cargo's own Git cache from the shipped mirrors before an offline
 /// command. Cargo's offline switch refuses even a file-only Git rewrite when
 /// its `git/db` is empty, so only these fetches temporarily lift that switch.
@@ -1044,11 +1092,21 @@ pub fn command_with_git_cache(
         if !files.contains_key(&manifest) {
             continue;
         }
-        let path = source_root.join(
-            manifest
-                .strip_prefix("m/")
-                .ok_or_else(|| invalid("manifest outside source root"))?,
-        );
+        let relative = manifest
+            .strip_prefix("m/")
+            .ok_or_else(|| invalid("manifest outside source root"))?;
+        for component in relative.split('/') {
+            validate_component(component)?;
+        }
+        // Cargo uses the enclosing workspace's lockfile for a nested package,
+        // even if the package ships its own (for example, a vendored patch).
+        // If we cannot classify a manifest, keep the best-effort fetch.
+        if let Some((directory, _)) = relative.rsplit_once('/')
+            && !separate_cargo_workspace(source_root, directory).unwrap_or(true)
+        {
+            continue;
+        }
+        let path = source_root.join(relative);
         let path = path
             .to_str()
             .ok_or_else(|| invalid("manifest path is not UTF-8"))?
@@ -2472,6 +2530,137 @@ mod tests {
             fs::read_to_string(checkout.join("dependency.txt")).unwrap(),
             "from bundled git source\n"
         );
+    }
+
+    mod cargo_git_fetch {
+        use super::*;
+        use std::{fs, path::PathBuf};
+
+        const PACKAGE: &str = "[package]\nname = 'patched'\nversion = '0.1.0'\n";
+
+        struct Fixture {
+            scratch: Scratch,
+            source: PathBuf,
+            cargo_home: PathBuf,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let scratch = Scratch::new();
+                let source = scratch.0.join("sources");
+                let cargo_home = scratch.0.join("cargo-home");
+                fs::create_dir(&source).unwrap();
+                // The command generator only needs one staged Git rewrite, not a real mirror.
+                fs::create_dir_all(cargo_home.join("git-mirrors/0")).unwrap();
+                fs::write(cargo_home.join("gitconfig"), "").unwrap();
+                fs::write(
+                    cargo_home.join("git-rewrites.json"),
+                    r#"{"schema":1,"routes":[{"url":"https://dep.invalid/repo","mirror":"git-mirrors/0"}]}"#,
+                )
+                .unwrap();
+                Self {
+                    scratch,
+                    source,
+                    cargo_home,
+                }
+            }
+
+            fn manifest(&self, directory: &str, text: impl AsRef<[u8]>, locked: bool) {
+                let directory = self.source.join(directory);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join("Cargo.toml"), text).unwrap();
+                if locked {
+                    fs::write(directory.join("Cargo.lock"), "version = 4\n").unwrap();
+                }
+            }
+
+            fn fetches(&self, directory: &str) -> bool {
+                let script = command_with_git_cache(
+                    "echo caller",
+                    &self.cargo_home,
+                    &self.source,
+                    &inventory(&self.source).unwrap(),
+                )
+                .unwrap();
+                let path = self.source.join(directory).join("Cargo.toml");
+                let path = path.to_str().unwrap().replace('\\', "/");
+                script.contains(&format!("--manifest-path '{path}'"))
+            }
+        }
+
+        #[test]
+        fn skips_patched_package_inside_enclosing_workspace() {
+            let f = Fixture::new();
+            f.manifest(
+                "project",
+                "[workspace] # root\n[patch.crates-io]\npatched = { path = 'vendor/patched' }\n",
+                true,
+            );
+            f.manifest("project/vendor/patched", PACKAGE, true);
+
+            assert!(!f.fetches("project/vendor/patched"));
+        }
+
+        #[test]
+        fn fetches_nested_workspace_inside_enclosing_workspace() {
+            let f = Fixture::new();
+            f.manifest("project", "[workspace]\n", false);
+            f.manifest("project/tools/own", "  [ workspace ]  \n", true);
+
+            assert!(f.fetches("project/tools/own"));
+        }
+
+        #[test]
+        fn fetches_nested_package_without_enclosing_workspace() {
+            let f = Fixture::new();
+            f.manifest("project", PACKAGE, false);
+            f.manifest("project/tools/own", PACKAGE, true);
+
+            assert!(f.fetches("project/tools/own"));
+        }
+
+        #[test]
+        fn always_fetches_source_root_manifest() {
+            let f = Fixture::new();
+            fs::write(f.scratch.0.join("Cargo.toml"), "[workspace]\n").unwrap();
+            f.manifest("", PACKAGE, true);
+
+            assert!(f.fetches(""));
+        }
+
+        #[test]
+        fn keeps_best_effort_fetch_when_manifest_is_not_utf8() {
+            let f = Fixture::new();
+            f.manifest("project", "[workspace]\n", false);
+            f.manifest("project/vendor/patched", [0xff], true);
+
+            assert!(f.fetches("project/vendor/patched"));
+        }
+
+        #[test]
+        fn does_not_treat_multiline_description_as_workspace() {
+            let f = Fixture::new();
+            f.manifest(
+                "project",
+                format!("{PACKAGE}description = '''\n[workspace]\n'''\n"),
+                false,
+            );
+            f.manifest("project/tools/own", PACKAGE, true);
+
+            assert!(f.fetches("project/tools/own"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn does_not_read_enclosing_manifest_through_symlink() {
+            let f = Fixture::new();
+            let outside = f.scratch.0.join("Cargo.toml");
+            fs::write(&outside, "[workspace]\n").unwrap();
+            f.manifest("project/vendor/patched", PACKAGE, true);
+            std::os::unix::fs::symlink(outside, f.source.join("project/Cargo.toml")).unwrap();
+
+            assert!(f.fetches("project/vendor/patched"));
+        }
     }
 
     #[cfg(unix)]
