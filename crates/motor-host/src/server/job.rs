@@ -1417,7 +1417,8 @@ fn fork_workspace(runtime: &Runtime, execution: &Execution, root: &str) {
                 }
             }
         }
-        Ok(None) => {}
+        // No warm disk of this repository to copy: the job's first build is cold.
+        Ok(None) => tracing::info!(jti = %job, "workspace_fork_unavailable; using empty workspace"),
         Err(error) => {
             tracing::info!(jti = %job, %error, "workspace_fork_plan_failed; using empty workspace");
         }
