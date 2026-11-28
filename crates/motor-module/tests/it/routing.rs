@@ -94,7 +94,7 @@ struct RoutingPeer {
     last_behavior: AtomicUsize,
     queued: Arc<tokio::sync::Notify>,
     queue_release: Arc<tokio::sync::Semaphore>,
-    queue_cancelled: Arc<tokio::sync::Notify>,
+    queue_cancelled: tokio::sync::watch::Sender<bool>,
     last_hello_pause: Mutex<Option<Arc<FramePause>>>,
     have_pause: Arc<Mutex<Option<Arc<FramePause>>>>,
     run_pause: Arc<Mutex<Option<Arc<FramePause>>>>,
@@ -126,7 +126,7 @@ impl RoutingPeer {
             last_behavior: AtomicUsize::new(0),
             queued: Arc::new(tokio::sync::Notify::new()),
             queue_release: Arc::new(tokio::sync::Semaphore::new(0)),
-            queue_cancelled: Arc::default(),
+            queue_cancelled: tokio::sync::watch::channel(false).0,
             last_hello_pause: Mutex::default(),
             have_pause: Arc::default(),
             run_pause: Arc::default(),
@@ -317,6 +317,9 @@ impl Connector for RoutingPeer {
                                 binding["runner_instance"], instance,
                                 "binding must be durable before Run"
                             );
+                            if windows || macos {
+                                assert_eq!(binding["direct_run_committed"], true);
+                            }
                             assert_eq!(
                                 run.platform,
                                 if macos {
@@ -451,7 +454,8 @@ impl Connector for RoutingPeer {
                                 .await;
                                 queued.notify_one();
                                 if behavior == QUEUED_UNTIL_CANCEL {
-                                    queue_cancelled.notified().await;
+                                    let mut cancelled = queue_cancelled.subscribe();
+                                    cancelled.wait_for(|cancelled| *cancelled).await.unwrap();
                                     dispatches.lock().unwrap().finished(id);
                                     let _ = write_frame_async(
                                         &mut peer,
@@ -548,7 +552,7 @@ impl Connector for RoutingPeer {
                             )
                             .await;
                             if behavior == QUEUED_UNTIL_CANCEL {
-                                queue_cancelled.notify_one();
+                                queue_cancelled.send_replace(true);
                             }
                             return;
                         }
@@ -1343,6 +1347,172 @@ async fn assert_windows_placement_cancelled(motor: &Motor, stream: crate::JobStr
     .expect("placement cancellation must interrupt the current wait");
     assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
         if t.job_id == id && t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)));
+}
+
+async fn restart_in_windows_placement(f: &Fixture, peer: &Arc<RoutingPeer>) -> (Config, Uuid) {
+    peer.fail_windows.store(true, Ordering::SeqCst);
+    let config = ordered(f.config.clone());
+    let motor = peer.motor(config.clone());
+    let mut request = f.request("true").with_platform(Platform::Windows);
+    request.queue_wait_limit_s = Some(30);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    let storage = stream.storage();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let tried_last = peer
+                .visits
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|v| v.instance == "windows");
+            if tried_last && storage.job(id).unwrap().windows_runner.unwrap().name == "ally" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("placement must rebind to the unreachable first runner for the next pass");
+    // Dropping the stream in backoff stops the old submission without cancelling it.
+    drop(storage);
+    drop(stream);
+    motor.close().await;
+    let stored = crate::storage::durable_value(&peer.module_state).unwrap();
+    assert!(stored["jobs"][id.to_string()]["local_terminal"].is_null());
+    assert!(peer.dispatches.lock().unwrap().runs.is_empty());
+    peer.visits.lock().unwrap().clear();
+    (config, id)
+}
+
+#[tokio::test]
+async fn ordered_windows_restart_cancels_unsent_placement_locally() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let (config, id) = restart_in_windows_placement(&f, &peer).await;
+    let motor = peer.motor(config);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        motor.cancel(CancelRequest::new(id)).await.unwrap();
+        assert!(
+            peer.visits.lock().unwrap().is_empty(),
+            "cancel contacted an unreachable runner"
+        );
+        let records = collect(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+        assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+            if t.job_id == id && t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)));
+    })
+    .await
+    .expect("unsent placement must be cancelled locally");
+    assert!(peer.visits.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ordered_windows_restart_reattach_finishes_unsent_placement_locally() {
+    let f = Fixture::new(Cut::None, 28).await;
+    for pending_cancel in [false, true] {
+        let peer = RoutingPeer::new(&f);
+        let (config, id) = restart_in_windows_placement(&f, &peer).await;
+        if pending_cancel {
+            let storage = crate::storage::Storage::open(&peer.module_state).unwrap();
+            storage.cancel(id, true).unwrap();
+        }
+        let motor = peer.motor(config);
+        let stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
+        let storage = stream.storage();
+        let records = tokio::time::timeout(Duration::from_secs(2), collect(stream))
+            .await
+            .expect("reattach must finish unsent placement without opening a connection");
+        let expected = if pending_cancel {
+            Outcome::Cancelled
+        } else {
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::LostToRestart,
+            }
+        };
+        assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+            if t.job_id == id && t.outcome == expected && t.ran == Some(Ran::None)));
+        let job = storage.job(id).unwrap();
+        assert!(!job.pending_cancel);
+        assert_eq!(job.local_terminal.unwrap().outcome, expected);
+        motor.cancel(CancelRequest::new(id)).await.unwrap();
+        assert!(peer.visits.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ordered_windows_restart_cancels_accepted_job_on_runner() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior
+        .store(QUEUED_UNTIL_CANCEL, Ordering::SeqCst);
+    let config = ordered(f.config.clone());
+    let motor = peer.motor(config.clone());
+    let mut stream = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    let id = stream.job_id;
+    assert_windows_queued(&peer, &mut stream).await;
+    drop(stream);
+    motor.close().await;
+    peer.frames.lock().unwrap().clear();
+
+    let motor = peer.motor(config);
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    let stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    let records = tokio::time::timeout(Duration::from_secs(2), collect(stream))
+        .await
+        .unwrap();
+    assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+        if t.job_id == id && t.outcome == Outcome::Cancelled && t.queue_wait_ms == 1_234
+            && t.ran == Some(Ran::None)));
+    let frames = peer.frames.lock().unwrap();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| matches!(f, Frame::Cancel(c) if c.job_id == id))
+            .count(),
+        1
+    );
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, Frame::Attach(a) if a.job_id == id)));
+    assert!(!frames.iter().any(|f| matches!(f, Frame::Run(_))));
+}
+
+#[tokio::test]
+async fn macos_restart_cancels_unsent_placement_locally() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let (fault, motor) = SigningFaultPeer::motor(
+        &f,
+        Platform::Macos,
+        "runner_sign_unavailable",
+        Some(20_000),
+        false,
+    );
+    let stream = motor
+        .run(f.request("true").with_platform(Platform::Macos))
+        .unwrap();
+    let id = stream.job_id;
+    tokio::time::timeout(Duration::from_secs(10), fault.observed.notified())
+        .await
+        .unwrap();
+    drop(stream);
+    motor.close().await;
+
+    // Even removing the macOS runner from configuration cannot turn unsent
+    // placement into a remote cancel.
+    let motor = fault.peer.motor(f.config.clone());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        motor.cancel(CancelRequest::new(id)).await.unwrap();
+        let records = collect(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+        assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+            if t.job_id == id && t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)));
+    })
+    .await
+    .unwrap();
+    assert!(fault.peer.visits.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

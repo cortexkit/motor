@@ -79,6 +79,10 @@ pub(crate) struct Job {
     /// and reordering or editing configuration must not move an admitted job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_runner: Option<crate::WindowsRunner>,
+    /// Whether a direct Windows or macOS job committed a Run on any binding.
+    /// Missing on older records: an absent marker does not prove no Run was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) direct_run_committed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<JobAttribution>,
     pub queue_wait_limit_s: u64,
@@ -139,6 +143,7 @@ impl PartialEq for Job {
             gate_job,
             runner_instance,
             windows_runner,
+            direct_run_committed,
             attribution,
             queue_wait_limit_s,
             pending_cancel,
@@ -163,6 +168,7 @@ impl PartialEq for Job {
             && gate_job == &other.gate_job
             && runner_instance == &other.runner_instance
             && windows_runner == &other.windows_runner
+            && direct_run_committed == &other.direct_run_committed
             && attribution == &other.attribution
             && queue_wait_limit_s == &other.queue_wait_limit_s
             && pending_cancel == &other.pending_cancel
@@ -188,11 +194,35 @@ impl Job {
                 && (state.finish_done || state.billing != crate::BillingStatus::Pending)
         })
     }
-    pub(crate) fn windows_placement_cancelled(&self) -> bool {
-        self.windows_runner.is_some()
-            && self.local_terminal.as_ref().is_some_and(|terminal| {
-                terminal.outcome == Outcome::Cancelled && terminal.ran == Some(Ran::None)
-            })
+    pub(crate) fn direct_run_unsent(&self) -> bool {
+        if self.hosted.is_some()
+            || self.remote_terminal.is_some()
+            || self.direct_run_committed == Some(true)
+            || self
+                .submission
+                .as_ref()
+                .is_some_and(|record| record.run_sent || record.accepted.is_some())
+        {
+            return false;
+        }
+        // Older keyed Windows records can prove the same thing when they pin
+        // a Windows route. An instance name alone does not identify the old
+        // platform if configuration has changed.
+        self.direct_run_committed == Some(false)
+            || (self.windows_runner.is_some() && self.submission.is_some())
+    }
+    pub(crate) fn direct_placement_local_terminal(&self) -> bool {
+        self.local_terminal.as_ref().is_some_and(|terminal| {
+            self.direct_run_unsent()
+                || (self.windows_runner.is_some()
+                    && terminal.outcome == Outcome::Cancelled
+                    && terminal.ran == Some(Ran::None))
+        })
+    }
+    fn record_placement_terminal(&mut self, terminal: TerminalRecord) {
+        self.local_terminal = Some(terminal);
+        self.pending_cancel = false;
+        self.terminal_observed_at_ms.get_or_insert_with(now_ms);
     }
     /// A job resubmitted to the build server retains its old hosted booking for
     /// cleanup. Pending cancellation belongs to the replacement command, not
@@ -301,6 +331,7 @@ impl Job {
             && !self.gate_job
             && self.runner_instance.is_none()
             && self.windows_runner.is_none()
+            && self.direct_run_committed.is_none()
             && self.attribution.is_none()
             && self.terminal_observed_at_ms.is_none()
             && self.terminal_delivered_at_ms.is_none()
@@ -913,6 +944,8 @@ impl Storage {
             if let Some(destination) = destination {
                 job.build_server_job_id = Some(destination);
             }
+            // Keep both durable Run markers. A rebind never erases a prior
+            // commitment, even after a refusal allows another attempt.
             job.queue_wait_limit_s = remaining_s;
         })
     }
@@ -962,6 +995,9 @@ impl Storage {
             let job = Arc::make_mut(state.jobs.entry(id).or_default());
             if let Some(route) = job.hosted.as_mut().filter(|_| hosted) {
                 route.run_sent = true;
+            }
+            if !hosted && job.direct_run_committed.is_some() {
+                job.direct_run_committed = Some(true);
             }
             if let Some(record) = job.submission.as_mut() {
                 record.run_sent = true;
@@ -1075,14 +1111,21 @@ impl Storage {
         runner_instance: Option<String>,
         gate_job: bool,
     ) -> io::Result<()> {
-        self.create_authorized(id, wait, attribution, runner_instance, gate_job, None)
+        self.create_authorized(
+            id,
+            wait,
+            attribution,
+            (runner_instance, false),
+            gate_job,
+            None,
+        )
     }
     pub fn create_authorized(
         &self,
         id: Uuid,
         wait: u64,
         attribution: Option<JobAttribution>,
-        runner_instance: Option<String>,
+        (runner_instance, track_direct_run): (Option<String>, bool),
         gate_job: bool,
         direct_secret_hash: Option<[u8; 32]>,
     ) -> io::Result<()> {
@@ -1094,6 +1137,7 @@ impl Storage {
                     attribution,
                     runner_instance,
                     direct_secret_hash,
+                    direct_run_committed: track_direct_run.then_some(false),
                     ..Job::default()
                 })
             });
@@ -1205,7 +1249,7 @@ impl Storage {
     pub fn cancel(&self, id: Uuid, pending: bool) -> io::Result<()> {
         self.update(|s| {
             let job = Arc::make_mut(s.jobs.entry(id).or_default());
-            let completed = job.hosted_cancel_complete() || job.windows_placement_cancelled();
+            let completed = job.hosted_cancel_complete() || job.direct_placement_local_terminal();
             job.pending_cancel = pending && !completed;
             if job.pending_cancel {
                 job.retain_until_ms = Some(
@@ -1281,10 +1325,36 @@ impl Storage {
     pub(crate) fn cancel_windows_placement(&self, terminal: TerminalRecord) -> io::Result<()> {
         self.update(|s| {
             let job = Arc::make_mut(s.jobs.get_mut(&terminal.job_id).expect("bound Windows job"));
-            job.local_terminal = Some(terminal);
-            job.pending_cancel = false;
-            job.terminal_observed_at_ms.get_or_insert_with(now_ms);
+            job.record_placement_terminal(terminal);
         })
+    }
+    pub(crate) fn recover_unstarted_direct(
+        &self,
+        id: Uuid,
+        requested_cancel: bool,
+    ) -> io::Result<Option<TerminalRecord>> {
+        let mut terminal = None;
+        self.update_when(
+            |s| s.jobs.get(&id).is_some_and(|job| job.direct_run_unsent()),
+            |s| {
+                let job = Arc::make_mut(s.jobs.get_mut(&id).unwrap());
+                // Serialize cancellation and reattach so neither replaces a
+                // terminal the other already recorded.
+                let record = job.local_terminal.clone().unwrap_or_else(|| {
+                    let outcome = if requested_cancel || job.pending_cancel {
+                        Outcome::Cancelled
+                    } else {
+                        Outcome::RefusedBeforeStart {
+                            reason: RefusalReason::LostToRestart,
+                        }
+                    };
+                    TerminalRecord::new(id, outcome, 0, 0, 0).with_ran(Ran::None)
+                });
+                job.record_placement_terminal(record.clone());
+                terminal = Some(record);
+            },
+        )?;
+        Ok(terminal)
     }
     pub(crate) fn remote_terminal(&self, terminal: TerminalRecord) -> io::Result<()> {
         self.update(|s| {

@@ -604,8 +604,16 @@ impl Motor {
                 .unwrap()
                 .windows_placement = Some(Arc::new(WindowsPlacement::new()));
         }
-        self.storage
-            .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
+        let track_direct_run =
+            !hosted_test && matches!(request.platform, Some(Platform::Windows | Platform::Macos));
+        self.storage.create_authorized(
+            id,
+            wait,
+            attribution,
+            (instance, track_direct_run),
+            gate_job,
+            secret_hash,
+        )?;
         self.storage.health_deadline(id, request.timeout)?;
         if let Some(key) = key {
             self.storage.record_submission(id, key)?;
@@ -756,10 +764,11 @@ impl Motor {
         self.storage.retain_job(id, None)?;
         if self.hosted_state(id).is_none()
             && self.storage.job(id).is_none_or(|job| {
-                job.local_terminal.is_none()
-                    || job.runner_instance.is_some()
-                    || job.windows_runner.is_some()
-                    || job.hosted.is_some()
+                !job.direct_run_unsent()
+                    && (job.local_terminal.is_none()
+                        || job.runner_instance.is_some()
+                        || job.windows_runner.is_some()
+                        || job.hosted.is_some())
             })
         {
             self.connector_for_job(id)?;
@@ -844,6 +853,18 @@ impl Motor {
             .unwrap()
             .get(&id)
             .and_then(|signals| signals.windows_placement.clone())
+    }
+    fn recover_unstarted_direct(
+        &self,
+        id: Uuid,
+        requested_cancel: bool,
+    ) -> io::Result<Option<TerminalRecord>> {
+        if self.submissions.lock().unwrap().contains_key(&id) {
+            return Ok(None);
+        }
+        // Read the durable markers only after the live owner is gone: the last
+        // thing it did may have been to commit Run or rebind the job.
+        self.storage.recover_unstarted_direct(id, requested_cancel)
     }
     async fn wait_for_submission(
         &self,
@@ -2970,6 +2991,15 @@ impl Motor {
         mut placement_queue: Option<&mut PlacementQueue>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
+        if !hosted && channel.is_none() && placement_queue.is_none() {
+            // A reattach cannot resume placement. Settle a pending cancel (or
+            // the lost placement) before either path opens a runner connection.
+            if let Some(terminal) = self.recover_unstarted_direct(id, false)? {
+                return emit(tx, StreamRecord::Terminal(terminal))
+                    .await
+                    .map(|_| false);
+            }
+        }
         if self
             .storage
             .job(id)
@@ -3798,7 +3828,7 @@ impl Motor {
         // An unbound local refusal reached no runner. Bound direct records and
         // unconfirmed cancellation still need their persisted follow-up route.
         if self.storage.job(id).is_some_and(|job| {
-            job.windows_placement_cancelled()
+            job.direct_placement_local_terminal()
                 || (job.runner_instance.is_none()
                     && job.windows_runner.is_none()
                     && !job.pending_cancel
@@ -3812,6 +3842,9 @@ impl Motor {
         let started = tokio::time::Instant::now();
         let elapsed_ms = || started.elapsed().as_millis() as u64;
         tracing::info!(job_id = %id, "job cancel received from caller");
+        if self.recover_unstarted_direct(id, true)?.is_some() {
+            return Ok(CancelReply::new(id));
+        }
         let build_server = self.hosted_state(id).is_none();
         if build_server {
             self.connector_for_job(id)?;
@@ -3833,7 +3866,7 @@ impl Motor {
             // check. In that case there is no runner job to cancel.
             self.storage
                 .job(id)
-                .is_some_and(|job| job.windows_placement_cancelled())
+                .is_some_and(|job| job.direct_placement_local_terminal())
         };
         tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel intent persisted");
         if local_placement_cancel {
@@ -4068,7 +4101,7 @@ impl Motor {
                 job.direct_secret_hash.is_some()
                     || job.health_retired()
                     || hosted_never_sent
-                    || job.windows_placement_cancelled()
+                    || job.direct_placement_local_terminal()
                     || (job.runner_instance.is_none()
                         && job.windows_runner.is_none()
                         && job.hosted.is_none()

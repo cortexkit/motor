@@ -47,6 +47,71 @@ fn terminal(id: Uuid) -> TerminalRecord {
 }
 
 #[test]
+fn direct_run_commit_survives_windows_rebind_and_reopen() {
+    let scratch = ScratchDir::new("direct-run-rebind");
+    let storage = Storage::open(scratch.path()).unwrap();
+    let id = Uuid::now_v7();
+    storage
+        .create_authorized(id, 60, None, (Some("first".into()), true), false, None)
+        .unwrap();
+    assert_eq!(
+        durable_value(scratch.path()).unwrap()["jobs"][id.to_string()]["direct_run_committed"],
+        false
+    );
+    storage.run_sent(id, false).unwrap();
+    let destination = Uuid::now_v7();
+    storage
+        .bind_windows_retry(id, crate::WindowsRunner::default(), Some(destination), 40)
+        .unwrap();
+    drop(storage);
+
+    let storage = Storage::open(scratch.path()).unwrap();
+    let job = storage.job(id).unwrap();
+    assert_eq!(job.direct_run_committed, Some(true));
+    assert_eq!(job.build_server_job_id, Some(destination));
+    assert!(storage
+        .recover_unstarted_direct(id, true)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn direct_run_recovery_requires_conclusive_unsent_evidence() {
+    for (marker, keyed_run_sent, expected_unsent) in [
+        (None, None, false),
+        (None, Some(false), true),
+        (None, Some(true), false),
+        (Some(false), None, true),
+        (Some(false), Some(true), false),
+        (Some(true), Some(false), false),
+    ] {
+        let job = Job {
+            windows_runner: Some(crate::WindowsRunner::default()),
+            direct_run_committed: marker,
+            submission: keyed_run_sent.map(|run_sent| crate::motor::submission_key::KeyRecord {
+                principal: "principal".into(),
+                key: "key".into(),
+                digest: "digest".into(),
+                run_sent,
+                accepted: None,
+            }),
+            ..Job::default()
+        };
+        let value = serde_json::to_value(job).unwrap();
+        assert_eq!(
+            value.get("direct_run_committed"),
+            marker.map(Value::from).as_ref()
+        );
+        assert_eq!(
+            serde_json::from_value::<Job>(value)
+                .unwrap()
+                .direct_run_unsent(),
+            expected_unsent
+        );
+    }
+}
+
+#[test]
 fn hosted_terminal_last_seq_preserves_runner_or_uses_persisted_replay_end() {
     for (end, runner_seq, outcome, ran, expected) in [
         (
@@ -503,14 +568,14 @@ fn direct_hash_creation_is_atomic_and_append_failure_is_not_published() {
         j.set_append_readonly(true);
     }
     assert!(storage
-        .create_authorized(id, 60, None, None, true, Some([9; 32]))
+        .create_authorized(id, 60, None, (None, false), true, Some([9; 32]))
         .is_err());
     assert!(storage.job(id).is_none());
     if let journal::Backend::Journal(j) = &mut *storage.persistence.backend.lock().unwrap() {
         j.set_append_readonly(false);
     }
     storage
-        .create_authorized(id, 60, None, None, true, Some([9; 32]))
+        .create_authorized(id, 60, None, (None, false), true, Some([9; 32]))
         .unwrap();
     let crash = ScratchDir::new("motor-journal-create-hash-crash");
     copy_store(&root, &crash);
@@ -698,7 +763,7 @@ fn lifecycle(storage: &Storage, id: Uuid) {
             id,
             900,
             None,
-            Some("build-server".into()),
+            (Some("build-server".into()), false),
             true,
             Some([3; 32]),
         )
