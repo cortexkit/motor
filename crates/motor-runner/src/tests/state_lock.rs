@@ -1061,6 +1061,42 @@ fn withdrawal_save_holds_no_lock_and_the_job_is_not_dispatched() {
     f.runner.resume();
 }
 
+#[test]
+fn move_withdraw_and_dispatch_cannot_both_win() {
+    let f = SaveFixture::new("record_save");
+    let request = f.queued("queued", "true");
+    let id = request.job_id;
+    f.hold_save(id, Saved::Queued);
+    let held = f.hold_in(move |runner| {
+        assert_eq!(
+            runner
+                .withdraw_for(
+                    id,
+                    Some(RefusalReason::Unknown(
+                        motor_protocol::QUEUE_MOVE_REASON.into()
+                    )),
+                    false
+                )
+                .unwrap(),
+            WithdrawOutcome::Withdrawn,
+        );
+    });
+    let runner = f.runner.clone();
+    completes("dispatch during move withdrawal", move || {
+        runner.tick().unwrap()
+    });
+    assert!(!f.runner.core.inner.lock().unwrap().starting.contains(&id));
+    drop(held);
+    f.runner.tick().unwrap();
+    let replay = f.runner.replay(id, 0).unwrap();
+    assert!(
+        matches!(replay.as_slice(), [Frame::Terminal(t)] if t.ran == Some(Ran::None)
+        && t.outcome == Outcome::RefusedBeforeStart {
+            reason: RefusalReason::Unknown(motor_protocol::QUEUE_MOVE_REASON.into()),
+        })
+    );
+}
+
 /// A finishing job writes its workspace's catalog record without the state
 /// lock, and before its terminal is published.
 #[test]

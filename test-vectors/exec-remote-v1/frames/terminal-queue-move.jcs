@@ -1,0 +1,1 @@
+{"bundle_bytes":29,"job_id":"0192a64a-1234-7000-8000-000000000001","outcome":{"reason":"queue_move","type":"refused_before_start"},"queue_wait_ms":25,"ran":"none","refusal_detail":"withdrawn to move to another runner","tree_hash":null,"type":"terminal","wall_ms":0,"workspace_changes":null}

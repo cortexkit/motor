@@ -416,6 +416,9 @@ pub enum WithdrawOutcome {
 /// Prefix on the legacy queue-wait terminal detail for a move to hosted capacity.
 pub const SPILL_WITHDRAWAL_DETAIL_PREFIX: &str = "spill_withdrawal: ";
 
+/// Withdraw request and before-start refusal reason for a queue move.
+pub const QUEUE_MOVE_REASON: &str = "queue_move";
+
 // Generate the tag probe from the same declaration as Frame so new variants
 // cannot be mistaken for future records when their payload is malformed.
 macro_rules! define_frames {
@@ -460,6 +463,9 @@ define_frames! {
         /// without stopping or changing the CPU reservation of any running job.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         gate_jobs: bool,
+        /// Supports a pre-deadline withdrawal of the sole pending queued job.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queue_move: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         return_paths: bool,
         /// The runner accepts `Run.return_chunked` and answers it with

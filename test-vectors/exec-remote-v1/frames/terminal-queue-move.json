@@ -1,0 +1,15 @@
+{
+  "type": "terminal",
+  "job_id": "0192a64a-1234-7000-8000-000000000001",
+  "outcome": {
+    "type": "refused_before_start",
+    "reason": "queue_move"
+  },
+  "wall_ms": 0,
+  "queue_wait_ms": 25,
+  "bundle_bytes": 29,
+  "ran": "none",
+  "tree_hash": null,
+  "workspace_changes": null,
+  "refusal_detail": "withdrawn to move to another runner"
+}

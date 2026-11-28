@@ -6844,7 +6844,24 @@ impl Runner {
         // The refusal records queue wait through this withdrawal.
         self.update_queue_wait_clocks(&inner, now, &index);
         let stalled = reason == Some(RefusalReason::Unknown("transfer_stalled".into()));
+        let queue_move = reason
+            == Some(RefusalReason::Unknown(
+                motor_protocol::QUEUE_MOVE_REASON.into(),
+            ));
         let eligible = inner.jobs.get(&id).is_some_and(|job| {
+            if queue_move {
+                // Check the pending count and dispatch reservation under the same
+                // lock used to pick the next job. The client's probe can be stale.
+                return !spill
+                    && job.state == JobState::Queued
+                    && job.queued_ms.is_some()
+                    && job.request.is_some()
+                    && !inner.starting.contains(&id)
+                    && !inner.terminal_saves.contains(&id)
+                    && !self.core.config.cleanup_pending(id)
+                    && !queue_wait::expired(job, now, 0)
+                    && Self::pending_count(&inner) == 1;
+            }
             (!inner.starting.contains(&id) || self.core.config.vm_instance())
                 && job.pending()
                 && if stalled {
@@ -6862,10 +6879,16 @@ impl Runner {
                 }
         });
         let Some(mut job) = inner.jobs.get(&id).filter(|_| eligible).cloned() else {
-            return Ok(queue_wait::settled_withdraw_reply(inner.jobs.get(&id)));
+            return Ok(if queue_move {
+                WithdrawOutcome::Started
+            } else {
+                queue_wait::settled_withdraw_reply(inner.jobs.get(&id))
+            });
         };
         let detail = if stalled {
             "transfer_stalled".into()
+        } else if queue_move {
+            "withdrawn to move to another runner".into()
         } else {
             self.queue_wait_detail_with_index(&inner, &index, id)
         };
@@ -6887,7 +6910,9 @@ impl Runner {
         // its workspace or its checkout, may be able to start once that passes.
         // `queue_wait_phase` names the phase from the same dispatch index, so a
         // job behind one that can never fit keeps no hint.
-        let retry_after_ms = self.queue_clear_retry_after_ms(&inner, &index, id);
+        let retry_after_ms = (!queue_move)
+            .then(|| self.queue_clear_retry_after_ms(&inner, &index, id))
+            .flatten();
         if spill && !stalled {
             // Keep the legacy outcome so old clients know the job never started,
             // but do not count a move to hosted capacity as a runner refusal.
@@ -6914,6 +6939,8 @@ impl Runner {
                 &mut job,
                 if stalled {
                     RefusalReason::TransferInterrupted
+                } else if queue_move {
+                    RefusalReason::Unknown(motor_protocol::QUEUE_MOVE_REASON.into())
                 } else {
                     RefusalReason::QueueWaitExceeded
                 },

@@ -864,6 +864,7 @@ impl crate::Connector for TerminalBeforeUsage {
                         return_paths: false,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: false,
                         sibling_paths: false,
                     },
                 )
@@ -1226,6 +1227,7 @@ impl crate::Connector for SilentStatus {
                         return_paths: false,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: false,
                         sibling_paths: false,
                     },
                 )

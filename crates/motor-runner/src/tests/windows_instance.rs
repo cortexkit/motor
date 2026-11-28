@@ -346,6 +346,7 @@ async fn windows_connection(socket: &Path) -> UnixStream {
             return_paths: false,
             return_chunked_max_bytes: None,
             return_chunked: false,
+            queue_move: false,
             sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
@@ -357,7 +358,7 @@ async fn windows_connection(socket: &Path) -> UnixStream {
     .await
     .unwrap();
     assert!(matches!(read_next(&mut stream).await,
-        Frame::Hello { protocol_version: PROTOCOL_VERSION, platforms, .. }
+        Frame::Hello { protocol_version: PROTOCOL_VERSION, platforms, queue_move: true, .. }
             if platforms == ["windows"]));
     stream
 }

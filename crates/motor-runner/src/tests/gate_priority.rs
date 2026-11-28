@@ -223,6 +223,7 @@ async fn gate_mark_is_honored_only_after_capability_negotiation() {
                 return_paths: false,
                 return_chunked_max_bytes: None,
                 return_chunked: false,
+                queue_move: false,
                 sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,

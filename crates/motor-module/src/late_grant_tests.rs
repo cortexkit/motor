@@ -104,6 +104,7 @@ impl Connector for Runner {
                         return_paths: false,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: false,
                         sibling_paths: false,
                     },
                 )

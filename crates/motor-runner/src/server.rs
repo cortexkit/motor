@@ -37,6 +37,7 @@ pub fn runner_hello(
         return_paths: config.supports_returns(),
         return_chunked_max_bytes: config.return_chunked_max_bytes,
         return_chunked: config.supports_returns(),
+        queue_move: config.served_platform() == Platform::Windows,
         sibling_paths: config.sibling_snapshot_mode(),
         protocol_version: PROTOCOL_VERSION,
         started,

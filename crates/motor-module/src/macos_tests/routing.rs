@@ -69,6 +69,7 @@ impl Connector for Peer {
                         return_paths: state.returns,
                         return_chunked_max_bytes: None,
                         return_chunked: state.returns,
+                        queue_move: false,
                         sibling_paths: true,
                     },
                 )

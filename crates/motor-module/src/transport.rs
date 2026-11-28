@@ -1372,6 +1372,7 @@ pub(crate) struct Channel {
     pub return_chunked: bool,
     pub return_chunked_max_bytes: u64,
     pub gate_jobs: bool,
+    pub queue_move: bool,
     pub sibling_paths: bool,
     pub platforms: Vec<String>,
     /// This client's Hello advertised default-branch tips, so a Run on this
@@ -1446,6 +1447,7 @@ impl Channel {
                 return_paths: false,
                 return_chunked_max_bytes: None,
                 return_chunked: false,
+                queue_move: false,
                 sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
@@ -1567,7 +1569,7 @@ impl Channel {
                     advance(&mut attempt, UnreachableStep::HelloSend);
                     let mut channel = Self::new(pipe);
                     channel
-                        .send(Frame::Hello { return_paths: false, return_chunked_max_bytes: None, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION,
+                        .send(Frame::Hello { return_paths: false, return_chunked_max_bytes: None, return_chunked: false, queue_move: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: true,
                         gate_jobs: true,
@@ -1580,11 +1582,12 @@ impl Channel {
                     match channel.next().await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::HelloRecv, error.to_string())
                     })? {
-                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, return_chunked, return_chunked_max_bytes, sibling_paths, .. })
+                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, queue_move, return_paths, return_chunked, return_chunked_max_bytes, sibling_paths, .. })
                             if protocol_version == PROTOCOL_VERSION =>
                         {
                             channel.platforms = platforms;
                             channel.gate_jobs = gate_jobs;
+                            channel.queue_move = queue_move;
                             channel.return_paths = return_paths;
                             channel.return_chunked = return_chunked;
                             channel.return_chunked_max_bytes = return_chunked_max_bytes.unwrap_or(motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP);
@@ -1754,6 +1757,7 @@ impl Channel {
             return_paths: false,
             return_chunked: false,
             return_chunked_max_bytes: motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP,
+            queue_move: false,
             sibling_paths: false,
             platforms: Vec::new(),
             fill_tips: false,
@@ -1891,6 +1895,7 @@ mod hello_tests {
                         return_paths: false,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: false,
                         sibling_paths: true,
                         platforms: vec!["linux".into()],
                     },
@@ -1929,6 +1934,7 @@ mod hello_tests {
                     return_paths: false,
                     return_chunked_max_bytes: None,
                     return_chunked: false,
+                    queue_move: false,
                     sibling_paths: false,
                     protocol_version: PROTOCOL_VERSION,
                     started: true,
@@ -1963,6 +1969,7 @@ mod hello_tests {
                         return_paths: false,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: false,
                         sibling_paths: capable,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,

@@ -500,6 +500,7 @@ impl Harness {
                                 return_paths: false,
                                 return_chunked_max_bytes: None,
                                 return_chunked: false,
+                                queue_move: false,
                                 sibling_paths: false,
                                 protocol_version: if matches!(behavior, Behavior::WrongHello) {
                                     PROTOCOL_VERSION + 1

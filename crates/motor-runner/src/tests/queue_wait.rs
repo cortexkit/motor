@@ -8,6 +8,107 @@ fn test_runner(f: &Fixture) -> Runner {
     Runner::open(config).unwrap()
 }
 
+fn move_withdraw(runner: &Runner, id: Uuid) -> WithdrawOutcome {
+    runner
+        .withdraw_for(
+            id,
+            Some(RefusalReason::Unknown(
+                motor_protocol::QUEUE_MOVE_REASON.into(),
+            )),
+            false,
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn move_withdraws_fully_queued_job_before_deadline() {
+    let f = Fixture::new();
+    let runner = test_runner(&f);
+    let (mut request, bytes) = f.run("true");
+    request.queue_wait_limit_s = 30;
+    f.submit(&runner, &request, &bytes);
+    assert_eq!(
+        runner.withdraw(request.job_id).unwrap(),
+        WithdrawOutcome::Started
+    );
+    assert_eq!(
+        move_withdraw(&runner, request.job_id),
+        WithdrawOutcome::Withdrawn
+    );
+    runner.tick().unwrap();
+    let replay = runner.replay(request.job_id, 0).unwrap();
+    assert!(matches!(replay.as_slice(), [Frame::Terminal(t)]
+    if t.ran == Some(Ran::None)
+    && t.outcome == Outcome::RefusedBeforeStart {
+        reason: RefusalReason::Unknown(motor_protocol::QUEUE_MOVE_REASON.into()),
+    }));
+}
+
+#[tokio::test]
+async fn move_withdraw_does_not_acknowledge_an_expired_job_or_deadline_tombstone() {
+    let f = Fixture::new();
+    let runner = test_runner(&f);
+    let (mut request, bytes) = f.run("true");
+    request.queue_wait_limit_s = 1;
+    f.submit(&runner, &request, &bytes);
+    f.clock.fetch_add(1_000, Ordering::SeqCst);
+    assert_eq!(
+        move_withdraw(&runner, request.job_id),
+        WithdrawOutcome::Started
+    );
+    assert_eq!(
+        runner.withdraw(request.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    assert_eq!(
+        move_withdraw(&runner, request.job_id),
+        WithdrawOutcome::Started
+    );
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+}
+
+#[tokio::test]
+async fn move_withdraw_leaves_two_pending_jobs_untouched() {
+    let f = Fixture::new();
+    let runner = test_runner(&f);
+    for workspace in ["first", "second"] {
+        let (request, bytes) = job_at(&f, workspace, "true");
+        f.submit(&runner, &request, &bytes);
+        assert_eq!(runner.job_status(request.job_id).unwrap().state, "queued");
+    }
+    let ids = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    for id in ids {
+        assert_eq!(move_withdraw(&runner, id), WithdrawOutcome::Started);
+        assert_eq!(runner.job_status(id).unwrap().state, "queued");
+    }
+}
+
+#[tokio::test]
+async fn started_job_rejects_move_withdrawal() {
+    let f = Fixture::new();
+    let runner = test_runner(&f);
+    let (holder, release) = start_holder(&f, &runner).await;
+    assert_eq!(move_withdraw(&runner, holder), WithdrawOutcome::Started);
+    drop(release);
+    let term = terminal(&runner, holder).await;
+    assert_eq!(term.outcome, Outcome::Exit { code: 0 });
+    assert_eq!(term.ran, Some(Ran::Remote));
+}
+
 async fn start_holder(f: &Fixture, runner: &Runner) -> (Uuid, ReleaseWriter) {
     let release = f.scratch.join("release");
     let release_writer = ReleaseWriter::new(release.clone());

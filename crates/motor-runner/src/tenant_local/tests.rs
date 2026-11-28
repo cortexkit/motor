@@ -34,6 +34,7 @@ fn hello() -> Frame {
         return_paths: false,
         return_chunked_max_bytes: None,
         return_chunked: false,
+        queue_move: false,
         sibling_paths: false,
         protocol_version: 1,
         started: true,
