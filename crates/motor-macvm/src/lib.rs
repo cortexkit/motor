@@ -1,7 +1,7 @@
 //! Job-only macOS VM plans and the helper's fail-closed control protocol.
 //!
-//! Image creation is deliberately a binary-only subcommand. A `JobVmConfig`
-//! has no switch for adding a display or a network adapter.
+//! Image creation is deliberately a binary-only subcommand. Runner requests
+//! cannot add a display or a network adapter.
 
 use motor_winagent::{Frame, MACOS_PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,7 @@ pub struct JobVmConfig {
     request: JobVmRequest,
     disks: [Disk; 3],
     shares: Vec<Share>,
+    probe_graphics: bool,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -217,6 +218,7 @@ impl JobVmConfig {
             ],
             request,
             shares,
+            probe_graphics: false,
         })
     }
 
@@ -262,7 +264,13 @@ impl JobVmConfig {
         0
     }
     pub fn graphics_devices(&self) -> usize {
-        0
+        usize::from(self.probe_graphics)
+    }
+    /// Only the operator's Metal probe can opt in to a display. This setting
+    /// is not part of the runner's serialized request.
+    fn with_probe_graphics(mut self) -> Self {
+        self.probe_graphics = true;
+        self
     }
     pub fn cpu_count(&self) -> usize {
         4
@@ -581,6 +589,23 @@ pub fn spawn_job_helper(
     config: &JobVmConfig,
     slot: &std::fs::File,
 ) -> io::Result<JobHelper> {
+    // The request does not carry the probe settings. The build disk probe
+    // runs the production command for the production attachment.
+    let args = if config.build_disk_bus() == BUILD_DISK_BUS {
+        &["job"][..]
+    } else {
+        &["probe-job", config.build_disk_bus().name()][..]
+    };
+    spawn_helper(executable, args, config, slot)
+}
+
+#[cfg(unix)]
+fn spawn_helper(
+    executable: &Path,
+    args: &[&str],
+    config: &JobVmConfig,
+    slot: &std::fs::File,
+) -> io::Result<JobHelper> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -597,14 +622,8 @@ pub fn spawn_job_helper(
     let guest_fd = duplicate(child_session.as_raw_fd())?;
     let slot_fd = duplicate(slot.as_raw_fd())?;
     let mut command = Command::new(executable);
-    // The request does not carry the build disk's bus, so a plan that differs
-    // from the production attachment starts the probe form of the helper.
-    if config.build_disk_bus() == BUILD_DISK_BUS {
-        command.arg("job");
-    } else {
-        command.arg("probe-job").arg(config.build_disk_bus().name());
-    }
     command
+        .args(args)
         .arg(serde_json::to_string(config.request())?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -638,7 +657,7 @@ mod tests {
             guest: guest.into(),
         }
     }
-    fn request() -> JobVmRequest {
+    pub(super) fn request() -> JobVmRequest {
         JobVmRequest {
             clone: "/state/clones/job".into(),
             nonce_disk: "/state/nonces/job.raw".into(),
