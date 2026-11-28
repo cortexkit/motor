@@ -4247,7 +4247,7 @@ impl Motor {
             let mut status_channel = open_for_request(connector.as_ref(), destination)
                 .await
                 .ok()?;
-            // The runner does not report dispatch rank. A sole pending job is
+            // The runner does not report which queued job runs next. A sole pending job is
             // unambiguous, and the runner checks the count again at withdrawal.
             if !status_channel.queue_move
                 || probe_windows_status(&mut status_channel)

@@ -81,7 +81,7 @@ budget. A lost Run acknowledgement never causes a retry on another runner. A
 queued job on the last runner can move to an earlier runner with a free slot
 only when the last runner reports exactly one pending job and confirms the job
 was withdrawn before it started. The caller keeps the same job ID and remaining
-queue budget. The snapshot is captured once; a moved job sends its bundles again
+queue budget. The job's snapshot is captured once; a moved job sends its bundles again
 to the new runner. Tests:
 `ordered_windows_last_runner_admission_full_spends_shared_budget`,
 `ordered_windows_all_busy_recover_on_whichever_runner_frees`,

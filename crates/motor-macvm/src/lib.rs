@@ -1,7 +1,8 @@
 //! Job-only macOS VM plans and the helper's fail-closed control protocol.
 //!
-//! Image creation is deliberately a binary-only subcommand. Runner requests
-//! cannot add a display or a network adapter.
+//! Image creation runs only through the helper's `image-build` subcommand,
+//! never through a runner request, and runner requests cannot add a display or
+//! a network adapter.
 
 use motor_winagent::{Frame, MACOS_PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};

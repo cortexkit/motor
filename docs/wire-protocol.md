@@ -525,8 +525,8 @@ already running or not eligible, and the client follows it. Test:
 On runners whose `hello` advertises `queue_move`, `withdraw` with reason
 `queue_move` may remove the sole pending queued Windows job before its deadline.
 `withdrawn` confirms the runner retained a `refused_before_start` terminal with
-the same reason and `ran: none`. Otherwise there is no move. Omission leaves
-deadline and upload-stall withdrawals unchanged.
+the same reason and `ran: none`. Otherwise there is no move. A `withdraw`
+without that reason is a deadline or upload-stall withdrawal, unchanged.
 
 ## 9. Cancel
 

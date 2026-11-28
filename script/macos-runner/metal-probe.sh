@@ -19,9 +19,9 @@
 # Metal device") and, if present, the pixel read back after an off-screen clear.
 # The headless control is expected to have no Metal device.
 #
-# The summary gives the time from the framework start call to the authenticated
-# agent Hello and, after the guest command exits, the Virtualization XPC
-# process's physical footprint in bytes. The exit status describes whether
+# The summary gives the time from the Virtualization framework's start call to
+# the authenticated agent Hello and, after the guest command exits, the physical
+# footprint in bytes of the macOS service process that runs that VM. The exit status describes whether
 # both measurements and applicable render checks completed, not whether a
 # Metal device was available.
 set -euo pipefail
