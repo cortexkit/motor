@@ -275,8 +275,16 @@ def main():
     signal.alarm(args.timeout_s)
     progress = Progress()
     try:
-        result = run(args.state_root, args.instance, args.workspace_root,
-                      time.monotonic() + args.timeout_s, progress, args.home_compile_check)
+        try:
+            result = run(args.state_root, args.instance, args.workspace_root,
+                          time.monotonic() + args.timeout_s, progress, args.home_compile_check)
+        finally:
+            # run() also stops at the same deadline by itself, so the alarm can
+            # fire just after it returns or raises. Disarm it here, inside the
+            # handlers below, so a late alarm is handled like an early one
+            # instead of escaping from the cleanup.
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
+            signal.alarm(0)
     except CanaryDeadline as error:
         # Only a queued job or a capacity refusal can excuse a deadline. A
         # failed handshake, upload, or a started job without a result cannot.
@@ -285,8 +293,6 @@ def main():
         result = INCONCLUSIVE
     except (CanaryError, OSError, ValueError, subprocess.SubprocessError) as error:
         parser.exit(1, f'{error}\n')
-    finally:
-        signal.alarm(0)
     if result == INCONCLUSIVE:
         print('canary inconclusive: no free permit; keeping the new runner (isolation not verified)',
               file=sys.stderr)
