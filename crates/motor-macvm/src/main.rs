@@ -17,6 +17,7 @@ fn main() -> io::Result<()> {
 #[cfg(target_os = "macos")]
 mod native {
     use super::*;
+    use motor_macvm::probe::metal;
     use motor_macvm::*;
     use objc2::{
         AllocAnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send,
@@ -26,12 +27,12 @@ mod native {
         NSArray, NSData, NSDate, NSError, NSObject, NSObjectProtocol, NSRunLoop, NSString, NSURL,
     };
     use objc2_virtualization::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs::File;
     use std::io::Write;
     use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -158,7 +159,14 @@ mod native {
             }
             config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
             config.setNetworkDevices(&NSArray::new());
-            config.setGraphicsDevices(&NSArray::new());
+            if plan.graphics_devices() == 0 {
+                config.setGraphicsDevices(&NSArray::new());
+            } else {
+                let graphics = VZMacGraphicsDeviceConfiguration::new();
+                let display = VZMacGraphicsDisplayConfiguration::initWithWidthInPixels_heightInPixels_pixelsPerInch(VZMacGraphicsDisplayConfiguration::alloc(), 1920, 1080, 144);
+                graphics.setDisplays(&NSArray::from_retained_slice(&[display]));
+                config.setGraphicsDevices(&NSArray::from_retained_slice(&[graphics.into_super()]));
+            }
             Ok(())
         }
     }
@@ -177,6 +185,7 @@ mod native {
         session: UnixStream,
         events: mpsc::Sender<Event>,
         connection: RefCell<Option<Retained<VZVirtioSocketConnection>>>,
+        probe_boot: Cell<Option<(Instant, PathBuf)>>,
     }
 
     define_class!(
@@ -221,9 +230,10 @@ mod native {
                     let guest = unsafe { UnixStream::from_raw_fd(fd) };
                     let host = state.session.try_clone()?;
                     let events = state.events.clone();
+                    let probe_boot = state.probe_boot.take();
                     state.connection.replace(Some(connection.retain()));
                     std::thread::spawn(move || {
-                        if let Err(e) = proxy(guest, host, acceptor) {
+                        if let Err(e) = proxy(guest, host, acceptor, probe_boot) {
                             let _ = events.send(Event::Failed(e.to_string()));
                         }
                     });
@@ -242,6 +252,7 @@ mod native {
         mut guest: UnixStream,
         mut host: UnixStream,
         acceptor: SessionAcceptor,
+        probe_boot: Option<(Instant, PathBuf)>,
     ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         let flags = unsafe { libc::fcntl(guest.as_raw_fd(), libc::F_GETFL) };
@@ -253,6 +264,12 @@ mod native {
         }
         guest.set_read_timeout(Some(Duration::from_secs(10)))?;
         let hello = acceptor.receive_hello(&mut guest)?;
+        if let Some((start, path)) = probe_boot {
+            let micros = start.elapsed().as_micros();
+            // Publish the elapsed time before forwarding Hello so the probe
+            // can read it without adding to the runner's helper protocol.
+            writeln!(File::create_new(path)?, "{micros}")?;
+        }
         guest.set_read_timeout(None)?;
         motor_winagent::write_frame(&mut host, &hello)?;
         let mut guest_write = guest.try_clone()?;
@@ -276,14 +293,20 @@ mod native {
     pub fn run() -> io::Result<()> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        match args[..] {
-            ["job", request] => run_job(JobVmConfig::new(serde_json::from_str(request)?)?),
+        match args.as_slice() {
+            ["job", request] => run_job(JobVmConfig::new(serde_json::from_str(request)?)?, None),
             // The job helper with the build disk on another bus, which only
             // the build disk probe starts.
             ["probe-job", bus, request] => run_job(
                 JobVmConfig::new(serde_json::from_str(request)?)?
                     .with_build_disk_bus(DiskBus::parse(bus)?),
+                None,
             ),
+            ["metal-probe-job", mode, request] => {
+                let plan = metal::Mode::parse(mode)?.plan(serde_json::from_str(request)?)?;
+                let boot_timing = metal::timing_path(&plan.request().clone);
+                run_job(plan, Some(boot_timing))
+            }
             ["image-build", image] => unsafe { image_build(Path::new(image), None) },
             ["image-build", image, restore] => unsafe {
                 image_build(Path::new(image), Some(Path::new(restore)))
@@ -291,13 +314,14 @@ mod native {
             ["build-disk-probe", image, work] => {
                 motor_macvm::probe::run(Path::new(image), Path::new(work))
             }
+            ["metal-probe", args @ ..] => metal::run(args),
             _ => Err(error(
-                "usage: motor-macvm job <request-json> | image-build <image-directory> [<restore.ipsw>] | build-disk-probe <sealed-image> <new-work-directory>",
+                "usage: motor-macvm job <request-json> | image-build <image-directory> [<restore.ipsw>] | build-disk-probe <sealed-image> <new-work-directory> | metal-probe <sealed-image> <new-work-directory>",
             )),
         }
     }
 
-    fn run_job(plan: JobVmConfig) -> io::Result<()> {
+    fn run_job(plan: JobVmConfig, boot_timing: Option<PathBuf>) -> io::Result<()> {
         // A runner that stops reading status must not prevent gate cancellation.
         let flags = unsafe { libc::fcntl(1, libc::F_GETFL) };
         if flags == -1 || unsafe { libc::fcntl(1, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
@@ -328,7 +352,7 @@ mod native {
                 _ => {}
             }
         }
-        let result = unsafe { run_open_job(plan, lifecycle, tx, rx) };
+        let result = unsafe { run_open_job(plan, boot_timing, lifecycle, tx, rx) };
         if let Err(e) = &result {
             let _ = report(HelperReport::Failed {
                 detail: e.to_string(),
@@ -339,6 +363,7 @@ mod native {
 
     unsafe fn run_open_job(
         plan: JobVmConfig,
+        boot_timing: Option<PathBuf>,
         mut lifecycle: HelperLifecycle,
         tx: mpsc::Sender<Event>,
         rx: mpsc::Receiver<Event>,
@@ -367,6 +392,7 @@ mod native {
                 session,
                 events: tx.clone(),
                 connection: RefCell::new(None),
+                probe_boot: Cell::new(None),
             };
             let delegate: Retained<SocketDelegate> =
                 msg_send![super(SocketDelegate::alloc().set_ivars(state)), init];
@@ -380,14 +406,21 @@ mod native {
                 .map_err(|_| error("not a virtio socket device"))?;
             socket.setSocketListener_forPort(&listener, VSOCK_PORT);
             let start_tx = tx.clone();
-            vm.startWithCompletionHandler(&block2::RcBlock::new(move |e: *mut NSError| {
+            let completion = block2::RcBlock::new(move |e: *mut NSError| {
                 let result = if e.is_null() {
                     Ok(())
                 } else {
                     Err((&*e).to_string())
                 };
                 let _ = start_tx.send(Event::Started(result));
-            }));
+            });
+            if let Some(path) = boot_timing {
+                delegate
+                    .ivars()
+                    .probe_boot
+                    .set(Some((Instant::now(), path)));
+            }
+            vm.startWithCompletionHandler(&completion);
             let mut started = false;
             let mut start_completed = false;
             let mut service_reported = false;
@@ -628,6 +661,17 @@ mod native {
                 assert_eq!(config.networkDevices().len(), 0);
                 assert_eq!(config.graphicsDevices().len(), 0);
                 assert_eq!(config.directorySharingDevices().len(), 3);
+                let probe = VZVirtualMachineConfiguration::new();
+                let probe_plan = metal::Mode::Graphics.plan(plan.request().clone()).unwrap();
+                apply_job_devices(&probe, &probe_plan).unwrap();
+                assert_eq!(probe.networkDevices().len(), 0);
+                assert_eq!(probe.graphicsDevices().len(), 1);
+                let graphics = probe
+                    .graphicsDevices()
+                    .objectAtIndex(0)
+                    .downcast::<VZMacGraphicsDeviceConfiguration>()
+                    .unwrap();
+                assert_eq!(graphics.displays().len(), 1);
                 for (index, expected) in plan.disks().iter().enumerate() {
                     let device = config.storageDevices().objectAtIndex(index);
                     let attachment = match expected.bus {

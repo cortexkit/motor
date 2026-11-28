@@ -44,6 +44,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::time::Duration;
 
+pub mod metal;
+
 /// Where the probe's checkout appears in the guest. The agent only accepts
 /// workspaces below /Users.
 pub const CHECKOUT: &str = "/Users/motor-probe/checkout";
@@ -310,42 +312,19 @@ fn boot_with(
     command: &str,
     run: &mut Run,
 ) -> io::Result<()> {
-    let clone = directory.join(name);
-    crate::clone_image(image, &clone)?;
+    let plan = prepare_job(image, directory, name)?.with_build_disk_bus(bus);
+    let request = plan.request();
     if let Some(disk) = disk {
         // As the runner does with a kept disk: replace the blank one.
-        std::fs::rename(disk, clone.join(BUILD_DISK))?;
+        std::fs::rename(disk, request.clone.join(BUILD_DISK))?;
     }
-    let workspace = directory.join(format!("{name}-checkout"));
-    // As the runner stages a checkout: its directories have mode 0700 (the
-    // runner's job tree), and target is a link to the guest's build mount.
-    write_checkout(&workspace)?;
-    let cargo_home = directory.join(format!("{name}-cargo-home"));
-    std::fs::DirBuilder::new().mode(0o700).create(&cargo_home)?;
-    let nonce_disk = directory.join(format!("{name}.nonce"));
-    let plan = JobVmConfig::new(JobVmRequest {
-        clone: clone.clone(),
-        nonce_disk: nonce_disk.clone(),
-        workspace: ShareLocation {
-            host: workspace.clone(),
-            tag: "workspace".into(),
-            guest: CHECKOUT.into(),
-        },
-        siblings: Vec::new(),
-        cargo_home: ShareLocation {
-            host: cargo_home.clone(),
-            tag: "cargo-home".into(),
-            guest: CARGO_HOME.into(),
-        },
-    })?
-    .with_build_disk_bus(bus);
     let nonce = random_hex(16)?;
     // A runner job with a return path under target/ asks the agent for it.
     let build = BuildConfig {
         returns: vec![RETURNED.into()],
         return_max_bytes: RETURN_MAX_BYTES,
     };
-    crate::create_job_nonce_disk(&nonce_disk, &nonce, &plan.mounts(), &build)?;
+    crate::create_job_nonce_disk(&request.nonce_disk, &nonce, &plan.mounts(), &build)?;
     let slot = std::fs::File::create(directory.join(format!("{name}.slot")))?;
     let mut job = crate::spawn_job_helper(helper, &plan, &slot)?;
     let reports = std::fs::File::from(job.reports.as_fd().try_clone_to_owned()?);
@@ -355,7 +334,7 @@ fn boot_with(
         }
     });
     job.open_gate()?;
-    let result = converse(&mut job.session, &nonce, &clone, command, run);
+    let result = converse(&mut job.session, &nonce, &request.clone, command, run, true);
     // Closing the gate stops the VM; the helper exits once it has stopped.
     job.close_gate();
     let status = job.child.wait()?;
@@ -365,18 +344,42 @@ fn boot_with(
     }
     // The VM has stopped. The agent's returns directory should hold only the
     // returned file, and the checkout's target should still be the link.
-    match list(&cargo_home.join(crate::TARGET_RETURNS)) {
+    match list(&request.cargo_home.host.join(crate::TARGET_RETURNS)) {
         Ok(entries) => run.returns = entries,
         Err(error) => println!("returns: unreadable: {error}"),
     }
     for entry in &run.returns {
         println!("returns: {entry}");
     }
-    run.target_link = std::fs::read_link(workspace.join("target"))
+    run.target_link = std::fs::read_link(request.workspace.host.join("target"))
         .ok()
         .map(|link| link.to_string_lossy().into_owned());
     println!("target link: {:?}", run.target_link);
     result
+}
+
+fn prepare_job(image: &Path, directory: &Path, name: &str) -> io::Result<JobVmConfig> {
+    let clone = directory.join(name);
+    crate::clone_image(image, &clone)?;
+    let workspace = directory.join(format!("{name}-checkout"));
+    write_checkout(&workspace)?;
+    let cargo_home = directory.join(format!("{name}-cargo-home"));
+    std::fs::DirBuilder::new().mode(0o700).create(&cargo_home)?;
+    JobVmConfig::new(JobVmRequest {
+        clone,
+        nonce_disk: directory.join(format!("{name}.nonce")),
+        workspace: ShareLocation {
+            host: workspace,
+            tag: "workspace".into(),
+            guest: CHECKOUT.into(),
+        },
+        siblings: Vec::new(),
+        cargo_home: ShareLocation {
+            host: cargo_home,
+            tag: "cargo-home".into(),
+            guest: CARGO_HOME.into(),
+        },
+    })
 }
 
 /// Writes the probe's Cargo checkout, with directories created as the runner
@@ -432,6 +435,7 @@ fn converse(
     clone: &Path,
     command: &str,
     run: &mut Run,
+    show_stdout: bool,
 ) -> io::Result<()> {
     let mut acceptor = SessionAcceptor::new(nonce.into(), clone.display().to_string())?;
     acceptor.claim()?;
@@ -469,8 +473,10 @@ fn converse(
                     Stream::Stdout => ("stdout", &mut run.stdout),
                     Stream::Stderr => ("stderr", &mut run.stderr),
                 };
-                for line in text.lines() {
-                    println!("{prefix}: {line}");
+                if show_stdout || stream != Stream::Stdout {
+                    for line in text.lines() {
+                        println!("{prefix}: {line}");
+                    }
                 }
                 collected.push_str(&text);
             }
