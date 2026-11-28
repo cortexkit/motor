@@ -203,7 +203,9 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.assertCodeIn("WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 5_000)", self.registry)
         self.assertCodeIn("check_download_deadline(deadline, timeout, host, path", self.registry)
         self.assertCodeIn("local-registry HTTPS request timed out after", self.registry)
-        self.assertCodeIn('download_error(host, path, "read response body", error)', self.registry)
+        self.assertCodeIn('winhttp_error(&url, "read response body", error)', self.registry)
+        # Transient network failures are retried; a dropped link alone must not refuse the job.
+        self.assertCodeIn('retry_fetch(\n        || download_https_once(host, path, size_limit, None, &mut phase),', self.registry)
 
     def test_local_registry_proof_checks_pinned_cargo_offline(self):
         self.assertCodeIn("[switch]$LocalRegistryOnly", self.wrapper)
