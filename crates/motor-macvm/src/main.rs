@@ -659,14 +659,14 @@ mod native {
                 assert_eq!(config.storageDevices().len(), 3);
                 assert_eq!(config.socketDevices().len(), 1);
                 assert_eq!(config.networkDevices().len(), 0);
-                assert_eq!(config.graphicsDevices().len(), 0);
+                assert_eq!(config.graphicsDevices().len(), 1);
                 assert_eq!(config.directorySharingDevices().len(), 3);
-                let probe = VZVirtualMachineConfiguration::new();
-                let probe_plan = metal::Mode::Graphics.plan(plan.request().clone()).unwrap();
-                apply_job_devices(&probe, &probe_plan).unwrap();
-                assert_eq!(probe.networkDevices().len(), 0);
-                assert_eq!(probe.graphicsDevices().len(), 1);
-                let graphics = probe
+                let control = VZVirtualMachineConfiguration::new();
+                let control_plan = metal::Mode::Control.plan(plan.request().clone()).unwrap();
+                apply_job_devices(&control, &control_plan).unwrap();
+                assert_eq!(control.networkDevices().len(), 0);
+                assert_eq!(control.graphicsDevices().len(), 0);
+                let graphics = config
                     .graphicsDevices()
                     .objectAtIndex(0)
                     .downcast::<VZMacGraphicsDeviceConfiguration>()

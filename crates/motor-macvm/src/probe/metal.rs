@@ -1,4 +1,5 @@
-//! Compare headless job VMs with and without a paravirtual GPU.
+//! Compare job VMs, which have no window or login, with and without their
+//! paravirtual GPU.
 
 use crate::{JobVmConfig, JobVmRequest};
 use std::io;
@@ -25,8 +26,8 @@ impl Mode {
     pub fn plan(self, request: JobVmRequest) -> io::Result<JobVmConfig> {
         let plan = JobVmConfig::new(request)?;
         Ok(match self {
-            Self::Graphics => plan.with_probe_graphics(),
-            Self::Control => plan,
+            Self::Graphics => plan,
+            Self::Control => plan.with_probe_without_graphics(),
         })
     }
 
@@ -127,7 +128,7 @@ mod tests {
             .plan(request.clone())
             .unwrap();
         assert!(Mode::parse("virtio").is_err());
-        assert_eq!(production.graphics_devices(), 0);
+        assert_eq!(production.graphics_devices(), 1);
         assert_eq!(control.graphics_devices(), 0);
         assert_eq!(graphics.graphics_devices(), 1);
         for plan in [control, graphics] {
@@ -138,7 +139,7 @@ mod tests {
             assert_eq!(plan.shares(), production.shares());
         }
         let mut serialized = serde_json::to_value(request).unwrap();
-        serialized["probe_graphics"] = true.into();
+        serialized["probe_without_graphics"] = true.into();
         assert!(serde_json::from_value::<JobVmRequest>(serialized).is_err());
     }
 

@@ -599,8 +599,13 @@ cache requirements and evidence commands are in
 ## Host helper and sealed-image layout
 
 `motor-macvm` is the VM-creating binary; the installer must sign it with the
-virtualization entitlement. The library's `JobVmConfig` cannot request networking
-or graphics. `job_configuration_has_exact_devices_and_share_access` checks the
+virtualization entitlement. The library's `JobVmConfig` has no network adapter
+and one paravirtual graphics device with one display, so job processes get a
+Metal device for off-screen rendering. There is no window, keyboard or pointer,
+and no logged-in user is needed. Runner requests cannot change either device.
+The graphics device adds about 80 MB of host memory and about a second of boot
+time per VM, measured with `script/macos-runner/metal-probe.sh`.
+`job_configuration_has_exact_devices_and_share_access` checks the
 portable plan, and `framework_job_devices_match_portable_plan_without_booting_vm`
 checks its actual framework device arrays on macOS without starting a VM.
 Workspace and cargo-home shares are read-write; siblings are read-only. Tags and
@@ -688,8 +693,8 @@ inspected prevents cleanup rather than becoming a false negative.
 ### Image-build subcommand and operator qualification
 
 `motor-macvm image-build <image-directory> [<restore.ipsw>]` is separate from the
-job API. It alone adds a display, keyboard, pointer and NAT adapter, and presents
-the guest in a window for Setup Assistant. The image recipe supplies a writable
+job API. It alone adds a keyboard, pointer and NAT adapter, and presents the
+guest in a window for Setup Assistant. The image recipe supplies a writable
 bundle with a sized boot disk and the restore image's compatible hardware model,
 machine identifier and auxiliary storage. With an IPSW argument the helper uses
 `VZMacOSInstaller`; otherwise it boots that bundle. Closing the window force-stops

@@ -1,8 +1,8 @@
 //! Job-only macOS VM plans and the helper's fail-closed control protocol.
 //!
 //! Image creation runs only through the helper's `image-build` subcommand,
-//! never through a runner request, and runner requests cannot add a display or
-//! a network adapter.
+//! never through a runner request. Every job VM has one display and no network
+//! adapter, and runner requests cannot change either.
 
 use motor_winagent::{Frame, MACOS_PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
@@ -124,7 +124,7 @@ pub struct JobVmConfig {
     request: JobVmRequest,
     disks: [Disk; 3],
     shares: Vec<Share>,
-    probe_graphics: bool,
+    probe_without_graphics: bool,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -219,7 +219,7 @@ impl JobVmConfig {
             ],
             request,
             shares,
-            probe_graphics: false,
+            probe_without_graphics: false,
         })
     }
 
@@ -264,13 +264,16 @@ impl JobVmConfig {
     pub fn network_devices(&self) -> usize {
         0
     }
+    /// Every job VM has one paravirtual graphics device, so job processes get
+    /// a Metal device for off-screen rendering. There is no window, keyboard
+    /// or pointer.
     pub fn graphics_devices(&self) -> usize {
-        usize::from(self.probe_graphics)
+        usize::from(!self.probe_without_graphics)
     }
-    /// Only the operator's Metal probe can opt in to a display. This setting
-    /// is not part of the runner's serialized request.
-    fn with_probe_graphics(mut self) -> Self {
-        self.probe_graphics = true;
+    /// Only the operator's Metal probe can drop the display, as its control
+    /// case. This setting is not part of the runner's serialized request.
+    fn with_probe_without_graphics(mut self) -> Self {
+        self.probe_without_graphics = true;
         self
     }
     pub fn cpu_count(&self) -> usize {
@@ -720,7 +723,7 @@ mod tests {
                 plan.network_devices(),
                 plan.graphics_devices()
             ),
-            (1, 0, 0)
+            (1, 0, 1)
         );
         assert_eq!(
             (plan.cpu_count(), plan.memory_bytes()),
