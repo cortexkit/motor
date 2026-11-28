@@ -275,33 +275,54 @@ fn expansion_budget_is_cumulative_across_tarballs() {
 }
 
 #[test]
-fn cache_refusal_cleans_prior_packages_and_honors_early_deadline() {
+fn expansion_filesystem_error_names_operation_entry_and_os_code() {
+    let scratch = ScratchDir::new("bun-expansion-fs-error");
+    let directory = scratch.join("dist");
+    fs::write(&directory, b"not a directory").unwrap();
+    let os_code = fs::create_dir_all(&directory)
+        .unwrap_err()
+        .raw_os_error()
+        .unwrap();
+    let tar = tar_of(&[
+        ("package/package.json", b"{}"),
+        ("package/dist/script.js", b"console.log(1)"),
+    ]);
+    let error = bun::expand_tarball(&tar, directory.parent().unwrap()).unwrap_err();
+    let detail = error.to_string();
+    assert!(detail.contains("create directory"), "{detail}");
+    assert!(detail.contains("at entry \"dist\""), "{detail}");
+    assert!(
+        detail.contains(&format!("(os error {os_code})")),
+        "{detail}"
+    );
+    assert!(!detail.contains(directory.to_str().unwrap()), "{detail}");
+}
+
+fn write_archive_seed(seed: &Path, source: &Path, archives: &[(&str, Vec<u8>)]) {
     use base64::Engine;
-    let scratch = ScratchDir::new("bun-cache-cleanup");
-    let source = scratch.join("source/project");
-    let seed = scratch.join("seed");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source).unwrap();
     let mut rows = serde_json::Map::new();
-    for name in ["first", "second"] {
-        let bytes = package_tar(name);
-        let hex = hex_sha256(&bytes);
+    let mut dependencies = serde_json::Map::new();
+    for (name, bytes) in archives {
+        let hex = hex_sha256(bytes);
         let path = seed.join("blobs/sha256").join(&hex);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, &bytes).unwrap();
+        fs::write(path, bytes).unwrap();
+        dependencies.insert((*name).into(), "1.0.0".into());
         rows.insert(
-            name.into(),
+            (*name).into(),
             serde_json::json!([
                 format!("{name}@1.0.0"),
                 "",
                 {},
                 format!(
                     "sha256-{}",
-                    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes))
+                    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
                 )
             ]),
         );
     }
-    let lock = serde_json::json!({"lockfileVersion":1,"workspaces":{"":{"dependencies":{"first":"1.0.0","second":"1.0.0"}}},"packages":rows}).to_string();
+    let lock = serde_json::json!({"lockfileVersion":1,"workspaces":{"":{"dependencies":dependencies}},"packages":rows}).to_string();
     fs::write(source.join("bun.lock"), &lock).unwrap();
     fs::write(source.join("package.json"), "{}").unwrap();
     let manifest = Manifest {
@@ -327,6 +348,58 @@ fn cache_refusal_cleans_prior_packages_and_honors_early_deadline() {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+fn cache_refusal_names_expansion_limit_and_byte_counts() {
+    let scratch = ScratchDir::new("bun-archive-refusal-detail");
+    let bytes = package_tar("only");
+    let blob = hex_sha256(&bytes);
+    let seed = scratch.join("seed");
+    write_archive_seed(&seed, &scratch.join("source/project"), &[("only", bytes)]);
+    // A single tar header is 512 bytes, so the very first read trips the cap.
+    let budget = ExpansionBudget::new(511, 100, Instant::now() + Duration::from_secs(30));
+    let cache = scratch.join("cache");
+    let error =
+        prepare_cache_with_budget(&seed, &scratch.join("source"), &cache, &budget).unwrap_err();
+    assert_eq!(error.kind, RefusalKind::BunProjectionInvalid);
+    assert_eq!(error.check, Some(bun::Check::Projection));
+    assert_eq!(
+        &*error.detail,
+        format!("expand archive from bun-seed/blobs/sha256/{blob}: Bun job expanded-byte limit exceeded (512 > 511)")
+    );
+    error.validate().unwrap();
+    assert!(!cache.exists());
+}
+
+#[test]
+fn cache_refusal_bounds_diagnostic_from_a_long_archive_member() {
+    let scratch = ScratchDir::new("bun-archive-refusal-long-member");
+    let seed = scratch.join("seed");
+    let tar = pax_tar(&"é\u{2028}".repeat(350), b"x", &[]);
+    write_archive_seed(&seed, &scratch.join("source/project"), &[("pax", tar)]);
+    let cache = scratch.join("cache");
+    let error = bun::prepare_cache(&seed, &scratch.join("source"), &cache).unwrap_err();
+    assert_eq!(error.kind, RefusalKind::BunProjectionInvalid);
+    assert!(error.detail.contains("Bun Windows path length at entry"));
+    assert!(error.detail.len() <= 768);
+    assert!(!error.detail.contains('\u{2028}'));
+    error.validate().unwrap();
+    assert!(!cache.exists());
+}
+
+#[test]
+fn cache_refusal_cleans_prior_packages_and_honors_early_deadline() {
+    let scratch = ScratchDir::new("bun-cache-cleanup");
+    let seed = scratch.join("seed");
+    write_archive_seed(
+        &seed,
+        &scratch.join("source/project"),
+        &[
+            ("first", package_tar("first")),
+            ("second", package_tar("second")),
+        ],
+    );
     for (name, budget) in [
         (
             "bytes",
