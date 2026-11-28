@@ -539,6 +539,7 @@ mod tests {
                             return_paths: false,
                             return_chunked_max_bytes: None,
                             return_chunked: false,
+                            queue_move: false,
                             sibling_paths: false,
                             started: false,
                             default_branch_tip: false,

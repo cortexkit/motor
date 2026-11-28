@@ -135,6 +135,12 @@ struct PlacementQueue {
     run_sent: bool,
     accepted: bool,
     retry_delay: Duration,
+    windows_move: Option<WindowsMove>,
+}
+
+struct WindowsMove {
+    index: usize,
+    permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct WindowsPlacement {
@@ -1305,6 +1311,7 @@ impl Motor {
                     run_sent: false,
                     accepted: false,
                     retry_delay: Duration::from_secs(5),
+                    windows_move: None,
                 }
             });
         // A zero queue budget still permits one immediate admission attempt.
@@ -1381,8 +1388,11 @@ impl Motor {
                         .iter()
                         .position(|runner| runner.name == current.name)
                         .unwrap();
-                    let next = &self.config.windows_runners
-                        [(index + 1) % self.config.windows_runners.len()];
+                    let next_index = queue.windows_move.as_ref().map_or_else(
+                        || (index + 1) % self.config.windows_runners.len(),
+                        |moved| moved.index,
+                    );
+                    let next = &self.config.windows_runners[next_index];
                     // Runners retain refusals by destination ID. A proven
                     // before-start retry needs a new ID, durably mapped with its
                     // endpoint before another Run can be sent.
@@ -1408,9 +1418,19 @@ impl Motor {
                     } else {
                         rebind()?;
                     }
+                    if queue.windows_move.is_some() && progress.enabled() {
+                        let name: String = next.name.chars().take(120).collect();
+                        if let Ok(record) = Progress::new(
+                            ProgressPhase::QueueWait,
+                            0,
+                            Some(format!("queued job moved to {name}")),
+                        ) {
+                            emit(tx, StreamRecord::Progress(record.with_job_id(id))).await?;
+                        }
+                    }
                 }
                 queue.run_sent = false;
-                if windows_last || !queue.cycle_windows {
+                if queue.windows_move.is_none() && (windows_last || !queue.cycle_windows) {
                     // Back off between Windows passes, or before retrying a
                     // single endpoint. A signing hint can extend this delay.
                     let backoff = tokio::time::Instant::now() + queue.retry_delay;
@@ -1533,20 +1553,26 @@ impl Motor {
         });
         let probe_windows_capacity =
             windows_runner_index.is_some_and(|index| index + 1 < self.config.windows_runners.len());
+        let reserved_move = placement_queue
+            .as_mut()
+            .and_then(|queue| queue.windows_move.take());
+        let probe_windows_capacity = probe_windows_capacity && reserved_move.is_none();
         // Reserve earlier runners before probing so callers cannot all observe
         // the same free slot. The last runner owns the queue: do not reserve a
         // local permit across its queue wait or reject it based on a busy probe.
-        let _windows_slot =
-            if let Some(index) = windows_runner_index.filter(|_| probe_windows_capacity) {
-                match self.windows_slots[index].clone().try_acquire_owned() {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        return Ok(true);
-                    }
+        let _windows_slot = if let Some(moved) = reserved_move {
+            debug_assert_eq!(Some(moved.index), windows_runner_index);
+            Some(moved.permit)
+        } else if let Some(index) = windows_runner_index.filter(|_| probe_windows_capacity) {
+            match self.windows_slots[index].clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Ok(true);
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         // Measures how long a spilled job spent on its hosted route.
         let spill_started = tokio::time::Instant::now();
         let mut caller_placement = None;
@@ -1637,29 +1663,16 @@ impl Motor {
                         open_for_request(connector.as_ref().unwrap().as_ref(), build_server_id)
                             .await?;
                     if probe_windows_capacity {
-                        channel
-                            .send(Frame::Status)
+                        let status = probe_windows_status(&mut channel)
                             .await
                             .map_err(|e| (RefusalReason::Unreachable, Some(e.to_string()), None))?;
-                        match channel.next().await {
-                            Ok(Incoming::Frame(Frame::StatusReply(status))) => {
-                                let runner =
-                                    self.storage.job(id).and_then(|j| j.windows_runner).unwrap();
-                                if windows_busy(&status, runner.max_concurrent) {
-                                    return Err((
-                                        RefusalReason::RunnerFull,
-                                        Some("windows_slots_busy".into()),
-                                        None,
-                                    ));
-                                }
-                            }
-                            _ => {
-                                return Err((
-                                    RefusalReason::Unreachable,
-                                    Some("Windows runner status unavailable".into()),
-                                    None,
-                                ))
-                            }
+                        let runner = self.storage.job(id).and_then(|j| j.windows_runner).unwrap();
+                        if windows_busy(&status, runner.max_concurrent) {
+                            return Err((
+                                RefusalReason::RunnerFull,
+                                Some("windows_slots_busy".into()),
+                                None,
+                            ));
                         }
                         drop(channel);
                         channel =
@@ -3029,6 +3042,7 @@ impl Motor {
         let mut backoff = 1;
         let mut withdraw_sent = false;
         let mut queue_deadline = None;
+        let mut windows_move_retry_at = tokio::time::Instant::now();
         let mut wake_open = true;
         let mut reattaches = 0;
         let mut reconnect_delay = 1;
@@ -3356,6 +3370,7 @@ impl Motor {
                 }
             }
             let c = channel.as_mut().unwrap();
+            let queue_move_supported = c.queue_move;
             let incoming = tokio::select! {
                 biased;
                 _ = tx.closed() => {
@@ -3415,6 +3430,26 @@ impl Motor {
                             wait.saturating_mul(1000).saturating_sub(elapsed),
                         ))
                     });
+                    if let Some((queue, deadline)) = placement_queue.as_mut().zip(queue_deadline) {
+                        let now = tokio::time::Instant::now();
+                        if queue.cycle_windows
+                            && queue.accepted
+                            && queue.run_sent
+                            && !withdraw_sent
+                            && now >= windows_move_retry_at
+                            && queue_move_supported
+                        {
+                            windows_move_retry_at = now + Duration::from_secs(2);
+                            let moved = tokio::select! {
+                                moved = self.try_windows_queue_move(id, build_server_id, deadline.min(queue.deadline)) => moved,
+                                _ = tx.closed() => return Err(io::Error::other("caller detached")),
+                            };
+                            if let Some(moved) = moved {
+                                queue.windows_move = Some(moved);
+                                return Ok(true);
+                            }
+                        }
+                    }
                 }
                 Ok(Incoming::Frame(Frame::Started {
                     job_id,
@@ -4170,6 +4205,88 @@ impl Motor {
             target,
         })
     }
+    async fn try_windows_queue_move(
+        &self,
+        id: Uuid,
+        destination: Uuid,
+        deadline: tokio::time::Instant,
+    ) -> Option<WindowsMove> {
+        let (last, earlier) = self.config.windows_runners.split_last()?;
+        let bound = self.storage.job(id)?.windows_runner?;
+        if &bound != last || self.pending(id) {
+            return None;
+        }
+        let probe_deadline = || deadline.min(tokio::time::Instant::now() + WINDOWS_PROBE_TIMEOUT);
+        let mut free = None;
+        for (index, runner) in earlier.iter().enumerate() {
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            let Ok(permit) = self.windows_slots[index].clone().try_acquire_owned() else {
+                continue;
+            };
+            let connector = self.connector_for_target(runner.target());
+            let verified = tokio::time::timeout_at(probe_deadline(), async {
+                let Ok(mut channel) = open_for_request(connector.as_ref(), destination).await
+                else {
+                    return false;
+                };
+                probe_windows_status(&mut channel)
+                    .await
+                    .is_ok_and(|status| !windows_busy(&status, runner.max_concurrent))
+            })
+            .await;
+            if matches!(verified, Ok(true)) {
+                free = Some(WindowsMove { index, permit });
+                break;
+            }
+        }
+        let moved = free?;
+        tokio::time::timeout_at(probe_deadline(), async {
+            let connector = self.connector_for_target(last.target());
+            let mut status_channel = open_for_request(connector.as_ref(), destination)
+                .await
+                .ok()?;
+            // The runner does not report dispatch rank. A sole pending job is
+            // unambiguous, and the runner checks the count again at withdrawal.
+            if !status_channel.queue_move
+                || probe_windows_status(&mut status_channel)
+                    .await
+                    .ok()?
+                    .queue_depth
+                    != 1
+            {
+                return None;
+            }
+            drop(status_channel);
+            // A dedicated exchange cannot mistake a deadline withdrawal's
+            // reply for permission to resubmit the command.
+            let mut channel = open_for_request(connector.as_ref(), destination)
+                .await
+                .ok()?;
+            if !channel.queue_move || self.pending(id) || tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            channel
+                .send(Frame::Withdraw {
+                    job_id: destination,
+                    reason: Some(RefusalReason::Unknown(QUEUE_MOVE_REASON.into())),
+                    spill: false,
+                })
+                .await
+                .ok()?;
+            matches!(
+                channel.next_job().await,
+                Ok(Incoming::Frame(Frame::WithdrawReply {
+                    outcome: WithdrawOutcome::Withdrawn
+                }))
+            )
+            .then_some(moved)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
     fn connector_for_job(&self, id: Uuid) -> io::Result<Arc<dyn Connector>> {
         let job = self.storage.job(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "job not recorded by this client")
@@ -4256,6 +4373,14 @@ fn windows_busy(status: &RunnerStatusReply, max_concurrent: usize) -> bool {
         || status.health.as_ref().is_some_and(
             |h| matches!((h.permits_held, h.permits_cap), (Some(held), Some(cap)) if held >= cap),
         )
+}
+
+async fn probe_windows_status(channel: &mut Channel) -> io::Result<RunnerStatusReply> {
+    channel.send(Frame::Status).await?;
+    match channel.next().await {
+        Ok(Incoming::Frame(Frame::StatusReply(status))) => Ok(status),
+        _ => Err(io::Error::other("Windows runner status unavailable")),
+    }
 }
 fn request_refusal_fields(reason: RefusalReason) -> (RefusalReason, Option<String>) {
     match reason {
@@ -4504,6 +4629,7 @@ mod delivery_tests {
                             return_paths: false,
                             return_chunked_max_bytes: None,
                             return_chunked: false,
+                            queue_move: false,
                             sibling_paths: false,
                             protocol_version: PROTOCOL_VERSION,
                             started: false,

@@ -61,6 +61,7 @@ fn hello_with_gate_jobs(gate_jobs: bool) -> Frame {
         return_paths: false,
         return_chunked_max_bytes: None,
         return_chunked: false,
+        queue_move: false,
         sibling_paths: false,
         protocol_version: motor_protocol::PROTOCOL_VERSION,
         started: true,

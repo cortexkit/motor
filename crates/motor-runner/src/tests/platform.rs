@@ -212,6 +212,7 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
             return_paths: false,
             return_chunked_max_bytes: None,
             return_chunked: false,
+            queue_move: false,
             sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started,

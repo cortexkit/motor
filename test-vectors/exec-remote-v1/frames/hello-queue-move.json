@@ -1,0 +1,8 @@
+{
+  "type": "hello",
+  "protocol_version": 1,
+  "queue_move": true,
+  "platforms": [
+    "windows"
+  ]
+}

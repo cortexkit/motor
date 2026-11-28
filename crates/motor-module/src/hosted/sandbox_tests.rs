@@ -149,6 +149,7 @@ impl Endpoint {
                 gate_jobs: true,
                 return_paths: false,
                 return_chunked: false,
+                queue_move: false,
                 sibling_paths: false,
                 platforms: Vec::new(),
             };

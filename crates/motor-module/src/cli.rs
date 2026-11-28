@@ -1958,7 +1958,13 @@ impl QueueDisplay {
                     let _ = writeln!(err, "ck motor run: {detail}");
                 }
             }
-            ProgressPhase::QueueWait => self.upload_at = None,
+            ProgressPhase::QueueWait => {
+                self.upload_at = None;
+                if let Some(detail) = progress.detail() {
+                    self.announced = true;
+                    let _ = writeln!(err, "ck motor run: {detail}");
+                }
+            }
             _ => {}
         }
     }

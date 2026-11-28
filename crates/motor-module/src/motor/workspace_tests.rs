@@ -37,6 +37,7 @@ impl Connector for DropPeer {
                         return_paths: true,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: false,
                         sibling_paths: false,
                     },
                 )

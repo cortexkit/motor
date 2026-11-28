@@ -235,6 +235,7 @@ async fn users_runner_hello_matches_pre_mapping_bytes() {
             return_paths: true,
             return_chunked_max_bytes: None,
             return_chunked: true,
+            queue_move: false,
             sibling_paths: true,
             platforms: Vec::new(),
         };

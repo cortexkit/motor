@@ -172,6 +172,7 @@ impl Connector for ClockPeer {
                         return_paths: false,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: false,
                         sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
@@ -579,6 +580,7 @@ impl Connector for ResubmitPeer {
                     return_paths: false,
                     return_chunked_max_bytes: None,
                     return_chunked: false,
+                    queue_move: false,
                     sibling_paths: false,
                 };
                 write_frame_async(&mut peer, &hello).await.unwrap();
@@ -1158,6 +1160,7 @@ impl Connector for QueuedPeer {
                     return_paths: false,
                     return_chunked_max_bytes: None,
                     return_chunked: false,
+                    queue_move: false,
                     sibling_paths: false,
                     protocol_version: PROTOCOL_VERSION,
                     started: true,

@@ -522,6 +522,12 @@ stalled, only before dispatch. The `withdraw_reply` is authoritative:
 already running or not eligible, and the client follows it. Test:
 `zero_queue_wait_withdraws_and_cancel_is_idempotent`.
 
+On runners whose `hello` advertises `queue_move`, `withdraw` with reason
+`queue_move` may remove the sole pending queued Windows job before its deadline.
+`withdrawn` confirms the runner retained a `refused_before_start` terminal with
+the same reason and `ran: none`. Otherwise there is no move. Omission leaves
+deadline and upload-stall withdrawals unchanged.
+
 ## 9. Cancel
 
 9.1. `cancel {job_id}` is durable and idempotent; the reply acknowledges the

@@ -20,7 +20,7 @@ SOURCE_SUFFIXES = (".rs", ".py", ".sh", ".ps1", ".swift")
 # path: (most lines allowed, why it is over the limit)
 EXCEPTIONS = {
     "crates/motor-runner/src/engine.rs": (
-        12942,
+        12259,
         "the runner's job engine predates the limit; split it by area (admission, "
         "dispatch, lifecycle, retention) when next working in it",
     ),

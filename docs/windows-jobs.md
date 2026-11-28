@@ -76,16 +76,27 @@ holds no module-side capacity reservation. The runner owns admission and queuein
 within the job's non-spill queue budget (30 minutes by default, capped by the
 job timeout, unless explicitly overridden); Windows jobs cannot spill.
 A received `runner_full` admission refusal may fall through from an earlier
-entry, but is final at the last entry. A lost Run acknowledgement or any
-acceptance never falls through to the next entry. Snapshot upload is reused
-across attempts.
+entry; on the last entry, it can start another pass within the same queue
+budget. A lost Run acknowledgement never causes a retry on another runner. A
+queued job on the last runner can move to an earlier runner with a free slot
+only when the last runner reports exactly one pending job and confirms the job
+was withdrawn before it started. The caller keeps the same job ID and remaining
+queue budget. The snapshot is captured once; a moved job sends its bundles again
+to the new runner. Tests:
+`ordered_windows_last_runner_admission_full_spends_shared_budget`,
+`ordered_windows_all_busy_recover_on_whichever_runner_frees`,
+`sole_queued_windows_job_moves_and_keeps_its_caller_id`,
+`windows_move_racing_start_leaves_job_in_place_and_releases_permit`,
+`neither_windows_job_moves_until_only_one_is_pending`,
+`restart_without_move_reply_reattaches_to_withdrawn_job`,
+`windows_queue_deadline_withdrawal_remains_queue_wait_exceeded`, and
+`legacy_windows_queue_owner_never_receives_a_move_request`.
 `ck health motor` includes each runner's sampled reachability and busy state;
 a busy runner is not itself a module failure. Tests:
 `ordered_windows_unreachable_handshake_falls_through_within_three_seconds`,
 `ordered_windows_busy_refusal_resubmits_but_lost_ack_and_started_never_move`,
 `ordered_windows_local_slot_reservation_falls_through_and_last_runner_queues`,
 `ordered_windows_both_busy_queue_on_last_runner_with_non_spill_budget`,
-`ordered_windows_last_runner_admission_full_still_refuses`,
 `ordered_windows_health_reports_each_runner_reachability_and_busy_state`.
 
 1.3. A runner lists the platforms it serves in its `hello` (`platforms:

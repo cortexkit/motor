@@ -9,6 +9,7 @@ const FRAME_CASES: &[&str] = &[
     "hello-started",
     "hello-default-branch-tip",
     "hello-gate-jobs",
+    "hello-queue-move",
     "run-gate-job",
     "have",
     "have_reply",
@@ -57,10 +58,12 @@ const FRAME_CASES: &[&str] = &[
     "heartbeat-queued",
     "run-queue-state-transcript",
     "withdraw",
+    "withdraw-queue-move",
     "withdraw_reply",
     "withdraw_reply-started",
     "attach",
     "terminal",
+    "terminal-queue-move",
     "terminal-last-seq",
     "prepare",
     "prepare-workspace-kind-head",
@@ -262,7 +265,7 @@ fn golden_vectors_are_complete_and_canonical() {
             count += 1;
         }
     }
-    assert_eq!(count, 140);
+    assert_eq!(count, 143);
 }
 
 #[test]
@@ -1202,6 +1205,7 @@ fn hello_without_started_capability_keeps_legacy_wire_bytes() {
             return_paths: false,
             return_chunked: false,
             return_chunked_max_bytes: None,
+            queue_move: false,
             sibling_paths: false,
             started: false,
             default_branch_tip: false,
@@ -1218,6 +1222,7 @@ fn hello_without_started_capability_keeps_legacy_wire_bytes() {
             return_paths: false,
             return_chunked: false,
             return_chunked_max_bytes: None,
+            queue_move: false,
             sibling_paths: false,
             started: true,
             default_branch_tip: false,
@@ -1238,6 +1243,7 @@ fn hello_default_branch_tip_capability_is_additive() {
             return_paths: false,
             return_chunked: false,
             return_chunked_max_bytes: None,
+            queue_move: false,
             sibling_paths: false,
             started: true,
             default_branch_tip: true,
@@ -1280,6 +1286,49 @@ fn hello_sibling_paths_capability_is_additive_and_defaults_false() {
             enabled.then_some(&serde_json::Value::Bool(true))
         );
     }
+}
+
+#[test]
+fn queue_move_withdrawal_has_an_additive_capability_and_open_reason() {
+    let legacy = vector("frames", "hello");
+    let frame: Frame = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(
+        frame,
+        Frame::Hello {
+            queue_move: false,
+            ..
+        }
+    ));
+    assert_eq!(serde_json::to_value(frame).unwrap(), legacy);
+
+    let hello = vector("frames", "hello-queue-move");
+    let frame: Frame = serde_json::from_value(hello.clone()).unwrap();
+    assert!(matches!(
+        frame,
+        Frame::Hello {
+            queue_move: true,
+            ..
+        }
+    ));
+    assert_eq!(serde_json::to_value(frame).unwrap(), hello);
+
+    let withdraw = vector("frames", "withdraw-queue-move");
+    let frame: Frame = serde_json::from_value(withdraw.clone()).unwrap();
+    assert!(
+        matches!(&frame, Frame::Withdraw { reason: Some(RefusalReason::Unknown(reason)), spill: false, .. }
+        if reason == motor_protocol::QUEUE_MOVE_REASON)
+    );
+    assert_eq!(serde_json::to_value(frame).unwrap(), withdraw);
+
+    let terminal = vector("frames", "terminal-queue-move");
+    let frame: Frame = serde_json::from_value(terminal.clone()).unwrap();
+    assert!(
+        matches!(&frame, Frame::Terminal(t) if t.ran == Some(Ran::None)
+        && t.outcome == Outcome::RefusedBeforeStart {
+            reason: RefusalReason::Unknown(motor_protocol::QUEUE_MOVE_REASON.into()),
+        })
+    );
+    assert_eq!(serde_json::to_value(frame).unwrap(), terminal);
 }
 
 #[test]

@@ -1951,6 +1951,7 @@ async fn connect_with_sibling_paths(socket: &Path, sibling_paths: bool) -> UnixS
             return_paths: false,
             return_chunked_max_bytes: None,
             return_chunked: false,
+            queue_move: false,
             sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
@@ -1965,6 +1966,7 @@ async fn connect_with_sibling_paths(socket: &Path, sibling_paths: bool) -> UnixS
         read_next(&mut stream).await,
         Frame::Hello {
             return_paths: true,
+            queue_move: false,
             return_chunked_max_bytes: None,
             return_chunked: true,
             sibling_paths,
@@ -2158,6 +2160,7 @@ fn blocking_hello(socket: &Path) -> io::Result<std::os::unix::net::UnixStream> {
             return_paths: false,
             return_chunked_max_bytes: None,
             return_chunked: false,
+            queue_move: false,
             sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,

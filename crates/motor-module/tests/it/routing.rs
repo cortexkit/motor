@@ -19,6 +19,8 @@ use subc_client_rs::HandlerOutcome;
 const WINDOWS_ROOT: &str = "/srv/build/motor-windows/windows/state";
 const QUEUED_UNTIL_CANCEL: usize = 22;
 
+mod queue_move;
+
 fn configured(mut config: Config) -> Config {
     config.windows_runner_instance = Some("windows".into());
     config.windows_runner_state_root = Some(WINDOWS_ROOT.into());
@@ -99,6 +101,7 @@ struct RoutingPeer {
     endpoints: Mutex<Vec<crate::WindowsRunner>>,
     refused: Arc<Mutex<std::collections::HashMap<Uuid, TerminalRecord>>>,
     dispatches: Arc<Mutex<DispatchLog>>,
+    move_queue: Option<Arc<queue_move::MoveQueue>>,
 }
 
 impl RoutingPeer {
@@ -130,6 +133,7 @@ impl RoutingPeer {
             endpoints: Mutex::new(Vec::new()),
             refused: Arc::default(),
             dispatches: Arc::default(),
+            move_queue: None,
         })
     }
     fn motor(self: &Arc<Self>, config: Config) -> Motor {
@@ -235,6 +239,9 @@ impl Connector for RoutingPeer {
         let run_pause = self.run_pause.clone();
         let refused = self.refused.clone();
         let dispatches = self.dispatches.clone();
+        let move_queue = (instance == "windows")
+            .then(|| self.move_queue.clone())
+            .flatten();
         Box::pin(async move {
             if behavior == 1 {
                 return std::future::pending().await;
@@ -260,6 +267,7 @@ impl Connector for RoutingPeer {
                         return_paths: false,
                         return_chunked_max_bytes: None,
                         return_chunked: false,
+                        queue_move: move_queue.as_ref().is_some_and(|queue| queue.capable),
                         sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
@@ -362,6 +370,9 @@ impl Connector for RoutingPeer {
                             if behavior == 3 {
                                 return;
                             }
+                            if let Some(queue) = &move_queue {
+                                queue.admit(id);
+                            }
                             let mut accepted = Accepted::new(id, 3);
                             accepted.platform = echo;
                             let _ = write_frame_async(&mut peer, &Frame::Accepted(accepted)).await;
@@ -381,6 +392,10 @@ impl Connector for RoutingPeer {
                             return;
                         }
                         Frame::Attach(request) => {
+                            if let Some(queue) = &move_queue {
+                                queue.follow(id, &mut peer, &dispatches).await;
+                                return;
+                            }
                             let retained = refused.lock().unwrap().get(&id).cloned();
                             if let Some(terminal) = retained {
                                 let _ =
@@ -560,7 +575,30 @@ impl Connector for RoutingPeer {
                                 status.status.queue_depth = 1;
                                 status.health.as_mut().unwrap().queue_depth = 1;
                             }
+                            if let Some(queue) = &move_queue {
+                                status.status.queue_depth = queue.depth();
+                                queue.probes.add_permits(1);
+                            }
                             let _ = write_frame_async(&mut peer, &Frame::StatusReply(status)).await;
+                            return;
+                        }
+                        Frame::Withdraw {
+                            job_id,
+                            reason,
+                            spill,
+                        } if move_queue.is_some() => {
+                            assert_eq!(job_id, id);
+                            assert!(!spill);
+                            let queue = move_queue.as_ref().unwrap();
+                            let reply = queue.withdraw(id, reason, &dispatches);
+                            if let Some(outcome) = reply {
+                                let _ =
+                                    write_frame_async(&mut peer, &Frame::WithdrawReply { outcome })
+                                        .await;
+                            } else {
+                                // Keep the connection open until the client's restart.
+                                let _ = read_frame_async(&mut peer).await;
+                            }
                             return;
                         }
                         _ => {}
