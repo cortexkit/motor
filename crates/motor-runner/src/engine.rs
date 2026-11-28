@@ -62,7 +62,6 @@ mod migration;
 #[path = "mirror_reports.rs"]
 mod mirror_reports;
 mod queue_wait;
-mod withdraw;
 #[path = "remote_cache_engine.rs"]
 mod remote_cache_engine;
 #[path = "retirement.rs"]
@@ -76,6 +75,7 @@ mod sibling_eviction;
 #[path = "terminal_evidence.rs"]
 pub(crate) mod terminal_evidence;
 mod windows_maintenance;
+mod withdraw;
 
 /// Disk headroom for concurrent build-target growth and scratch files, not a quota.
 pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 128 * 1024 * 1024 * 1024;
