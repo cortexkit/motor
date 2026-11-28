@@ -825,6 +825,49 @@ fn projection_error(project: &str, package: &Package) -> Refusal {
     )
 }
 
+fn archive_member_error(error: io::Error, path: &[u8]) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{error} at entry {:?}", String::from_utf8_lossy(path)),
+    )
+}
+
+fn unsupported_archive_member(entry: &tar::Entry<'_, impl io::Read>) -> io::Error {
+    let kind = entry.header().entry_type();
+    let what = if kind.is_symlink() {
+        "npm symlink"
+    } else if kind.is_hard_link() {
+        "npm hard link"
+    } else {
+        "npm special file"
+    };
+    let error = if let Some(target) = entry.link_name_bytes() {
+        io::Error::other(format!("{what} to {:?}", String::from_utf8_lossy(&target)))
+    } else {
+        io::Error::other(what)
+    };
+    archive_member_error(error, &entry.path_bytes())
+}
+
+fn archive_fs_error(action: &str, member: &str, error: io::Error) -> io::Error {
+    // Report the archive-relative name, never a destination path or native error text.
+    let kind = error.kind();
+    let code = error
+        .raw_os_error()
+        .map(|code| format!(" (os error {code})"))
+        .unwrap_or_default();
+    io::Error::new(
+        kind,
+        format!("{action}: {kind:?}{code} at entry {member:?}"),
+    )
+}
+
+fn archive_refusal_detail(integrity: &Integrity, error: &io::Error) -> String {
+    let mut detail = format!("expand archive from bun-seed/{}: ", integrity.blob_path());
+    append_detail(&mut detail, &error.to_string(), 768);
+    detail
+}
+
 /// Preflight the full tar before writing: implicit directory prefixes also take
 /// part in collision detection, and neither links nor tar permissions are used.
 pub fn expand_tarball(bytes: &[u8], destination: &std::path::Path) -> io::Result<()> {
@@ -845,12 +888,14 @@ pub fn expand_tarball_with_budget(
         let mut entry = entry?;
         let kind = entry.header().entry_type().as_byte();
         let metadata = matches!(kind, b'L' | b'K' | b'x' | b'g');
-        budget.entry(metadata.then_some(entry.size()))?;
+        budget
+            .entry(metadata.then_some(entry.size()))
+            .map_err(|error| archive_member_error(error, &entry.path_bytes()))?;
         if !metadata
             && !entry.header().entry_type().is_file()
             && !entry.header().entry_type().is_dir()
         {
-            return Err(io::Error::other("npm link or special file"));
+            return Err(unsupported_archive_member(&entry));
         }
         if metadata {
             use std::io::Read;
@@ -885,7 +930,8 @@ pub fn expand_tarball_with_budget(
             {
                 return Err(io::Error::other("npm pax size differs from its header"));
             }
-            io::copy(&mut entry, &mut io::sink())?;
+            io::copy(&mut entry, &mut io::sink())
+                .map_err(|error| archive_member_error(error, &entry.path_bytes()))?;
         }
     }
     if pax_size.is_some() {
@@ -921,19 +967,21 @@ pub fn expand_tarball_with_budget(
     {
         let entry = entry?;
         let raw = entry.path_bytes();
-        let path = std::str::from_utf8(&raw).map_err(|_| io::Error::other("non-UTF8 npm path"))?;
+        let entry_error = |error| archive_member_error(error, &raw);
+        let path = std::str::from_utf8(&raw)
+            .map_err(|_| entry_error(io::Error::other("non-UTF8 npm path")))?;
         let kind = entry.header().entry_type();
         if !kind.is_file() && !kind.is_dir() {
-            return Err(io::Error::other("npm link or special file"));
+            return Err(unsupported_archive_member(&entry));
         }
-        let Some(relative) = relative(path, kind.is_dir())? else {
+        let Some(relative) = relative(path, kind.is_dir()).map_err(entry_error)? else {
             continue;
         };
         let mut prefix = String::new();
         for component in relative.split('/') {
-            crate::validate_component(component)?;
+            crate::validate_component(component).map_err(entry_error)?;
             if component.encode_utf16().count() > 255 || relative.encode_utf16().count() > 32_700 {
-                return Err(io::Error::other("Bun Windows path length"));
+                return Err(entry_error(io::Error::other("Bun Windows path length")));
             }
             if !prefix.is_empty() {
                 prefix.push('/');
@@ -941,7 +989,7 @@ pub fn expand_tarball_with_budget(
             prefix.push_str(component);
             let file = kind.is_file() && prefix == relative;
             if !names.contains_key(&prefix.to_uppercase()) {
-                budget.path(prefix.len())?;
+                budget.path(prefix.len()).map_err(entry_error)?;
             }
             if let Some((previous, was_file)) =
                 names.insert(prefix.to_uppercase(), (prefix.clone(), file))
@@ -950,25 +998,31 @@ pub fn expand_tarball_with_budget(
                 // extracted; any other overlap (case, file over folder) is not.
                 let same_file = previous == prefix && was_file && file;
                 if !same_file && (previous != prefix || was_file || file) {
-                    return Err(io::Error::other("npm path collision"));
+                    return Err(entry_error(io::Error::other(format!(
+                        "npm path collision with {previous:?}"
+                    ))));
                 }
             }
         }
         files.insert(relative);
         if files.len() > 100_000 {
-            return Err(io::Error::other("npm entry limit"));
+            return Err(entry_error(io::Error::other("npm entry limit (100000)")));
         }
     }
     if !files.contains("package.json") {
         return Err(io::Error::other("npm package.json missing"));
     }
-    std::fs::create_dir_all(destination)?;
+    std::fs::create_dir_all(destination)
+        .map_err(|error| archive_fs_error("create package directory", ".", error))?;
     // The validated index includes implicit parents and repeated directory headers.
     // Create each directory once, not once per file (costly CreateFile probes on NTFS).
     for (path, file) in names.values() {
         if !file {
-            budget.check()?;
-            std::fs::create_dir_all(destination.join(path))?;
+            budget
+                .check()
+                .map_err(|error| archive_member_error(error, path.as_bytes()))?;
+            std::fs::create_dir_all(destination.join(path))
+                .map_err(|error| archive_fs_error("create directory", path, error))?;
         }
     }
     for entry in
@@ -984,7 +1038,7 @@ pub fn expand_tarball_with_budget(
         else {
             continue;
         };
-        let dest = destination.join(relative);
+        let dest = destination.join(&relative);
         if entry.header().entry_type().is_file() {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -992,18 +1046,31 @@ pub fn expand_tarball_with_budget(
                 .open(&dest)
             {
                 Ok(mut out) => {
-                    io::copy(&mut entry, &mut out)?;
+                    io::copy(&mut entry, &mut out).map_err(|error| {
+                        if error.raw_os_error().is_some() {
+                            archive_fs_error("write file", &relative, error)
+                        } else {
+                            archive_member_error(error, relative.as_bytes())
+                        }
+                    })?;
                 }
                 // A repeated member was written earlier from this archive;
                 // keep it only if this copy is byte-identical.
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     let mut again = Vec::new();
-                    entry.read_to_end(&mut again)?;
-                    if std::fs::read(&dest)? != again {
-                        return Err(io::Error::other("npm duplicate member differs"));
+                    entry
+                        .read_to_end(&mut again)
+                        .map_err(|error| archive_member_error(error, relative.as_bytes()))?;
+                    let previous = std::fs::read(&dest)
+                        .map_err(|error| archive_fs_error("read prior member", &relative, error))?;
+                    if previous != again {
+                        return Err(archive_member_error(
+                            io::Error::other("npm duplicate member differs"),
+                            relative.as_bytes(),
+                        ));
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(archive_fs_error("create file", &relative, error)),
             }
         }
     }
@@ -1204,8 +1271,13 @@ fn path_detail(step: &str, root: &std::path::Path, path: &std::path::Path) -> St
 
 fn detail_location(step: &str, relative: &str) -> String {
     let mut detail = format!("{step} at ");
-    for c in relative.chars() {
-        if detail.len() + c.len_utf8() > 4096 {
+    append_detail(&mut detail, relative, 4096);
+    detail
+}
+
+fn append_detail(detail: &mut String, text: &str, limit: usize) {
+    for c in text.chars() {
+        if detail.len() + c.len_utf8() > limit {
             break;
         }
         detail.push(if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
@@ -1214,7 +1286,6 @@ fn detail_location(step: &str, relative: &str) -> String {
             c
         });
     }
-    detail
 }
 
 pub fn prepare_cache(
@@ -1531,11 +1602,8 @@ pub fn prepare_cache_with_budget(
                 continue;
             }
             let destination = cache.join(&key);
-            expand_tarball_with_budget(&bytes, &destination, budget).map_err(|_| {
-                fail().detail(format!(
-                    "expand archive from bun-seed/{}",
-                    package.integrity.blob_path()
-                ))
+            expand_tarball_with_budget(&bytes, &destination, budget).map_err(|error| {
+                fail().detail(archive_refusal_detail(&package.integrity, &error))
             })?;
             let metadata_path = format!("bun-cache/{key}/package.json");
             let metadata: Value = serde_json::from_slice(

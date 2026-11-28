@@ -41,8 +41,13 @@ impl ExpansionBudget {
         })))
     }
     pub fn check(&self) -> io::Result<()> {
-        if Instant::now() >= self.0.borrow().deadline {
-            Err(io::Error::other("Bun preparation deadline"))
+        let now = Instant::now();
+        let deadline = self.0.borrow().deadline;
+        if now >= deadline {
+            Err(io::Error::other(format!(
+                "Bun preparation deadline reached ({} ms past deadline)",
+                now.duration_since(deadline).as_millis()
+            )))
         } else {
             Ok(())
         }
@@ -53,12 +58,23 @@ impl ExpansionBudget {
         state.entries += 1;
         if let Some(bytes) = metadata {
             state.metadata = state.metadata.saturating_add(bytes);
-            if bytes > 32 * 1024 || state.metadata > 8 * 1024 * 1024 {
-                return Err(io::Error::other("Bun tar metadata limit"));
+            if bytes > 32 * 1024 {
+                return Err(over_limit("Bun tar metadata", bytes, 32 * 1024));
+            }
+            if state.metadata > 8 * 1024 * 1024 {
+                return Err(over_limit(
+                    "Bun job tar metadata",
+                    state.metadata,
+                    8 * 1024 * 1024,
+                ));
             }
         }
         if state.entries > state.max_entries {
-            return Err(io::Error::other("Bun job entry limit"));
+            return Err(over_limit(
+                "Bun job entry",
+                state.entries,
+                state.max_entries,
+            ));
         }
         Ok(())
     }
@@ -66,8 +82,19 @@ impl ExpansionBudget {
         let mut state = self.0.borrow_mut();
         state.names = state.names.saturating_add(size);
         state.components += 1;
-        if state.names > 32 * 1024 * 1024 || state.components > state.max_entries {
-            return Err(io::Error::other("Bun path index limit"));
+        if state.names > 32 * 1024 * 1024 {
+            return Err(over_limit(
+                "Bun path index bytes",
+                state.names as u64,
+                32 * 1024 * 1024,
+            ));
+        }
+        if state.components > state.max_entries {
+            return Err(over_limit(
+                "Bun path index entries",
+                state.components,
+                state.max_entries,
+            ));
         }
         Ok(())
     }
@@ -79,6 +106,11 @@ impl ExpansionBudget {
         }
     }
 }
+
+fn over_limit(what: &str, used: u64, limit: u64) -> io::Error {
+    io::Error::other(format!("{what} limit exceeded ({used} > {limit})"))
+}
+
 pub(super) struct Reader<R> {
     reader: R,
     budget: ExpansionBudget,
@@ -106,7 +138,11 @@ impl<R: Read> Read for Reader<R> {
             let mut state = self.budget.0.borrow_mut();
             state.bytes = state.bytes.saturating_add(count as u64);
             if state.bytes > state.max_bytes {
-                return Err(io::Error::other("Bun job expanded-byte limit"));
+                return Err(over_limit(
+                    "Bun job expanded-byte",
+                    state.bytes,
+                    state.max_bytes,
+                ));
             }
         }
         Ok(count)
