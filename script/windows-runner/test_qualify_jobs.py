@@ -433,6 +433,33 @@ class QualificationReadinessTests(unittest.TestCase):
         self.assertIn("parent-verification-complete windows-protocol-hello", output.getvalue())
         self.assertTrue(all(bridge.reaped and bridge.log is not None and bridge.log.closed for bridge in (missing, serving)))
 
+    def test_bridge_exiting_before_hello_is_retried_not_fatal(self):
+        # The service reports Running before its pipe exists, so the bridge
+        # exits at once; on Windows both the hello write and the close-time
+        # flush of the unread frame then fail with EINVAL.
+        class DeadPipe(io.BytesIO):
+            def flush(self):
+                raise OSError(22, "Invalid argument")
+
+            def close(self):
+                try:
+                    self.flush()
+                finally:
+                    super().close()
+
+        exited = Bridge(diagnostic=b'Error: Os { code: 2, kind: NotFound }')
+        exited.stdin = DeadPipe()
+        serving = Bridge(hello(), running=True)
+        self.bridges = [exited, serving]
+        with self.readiness_environment() as (_, launch, _):
+            JOBS.wait_for_service_ready(self.root, self.runner, self.root, timeout=10)
+        self.assertEqual(launch.call_count, 2)
+        evidence = json.loads((self.root / "service-readiness.json").read_text())
+        self.assertTrue(evidence["ready"])
+        self.assertIn("Invalid argument", evidence["observations"][0]["bridge_error"])
+        assert exited.log is not None
+        self.assertTrue(exited.log.closed)
+
     def test_start_pending_is_not_readiness(self):
         serving = Bridge(hello(), running=True)
         self.bridges = [serving]

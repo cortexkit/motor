@@ -208,7 +208,15 @@ class Channel:
         finally:
             for pipe in (self.process.stdin, self.process.stdout):
                 if pipe is not None:
-                    pipe.close()
+                    try:
+                        pipe.close()
+                    except OSError:
+                        # A frame the bridge exited before reading stays in the
+                        # write buffer, and closing flushes it into the dead pipe
+                        # (EINVAL on Windows). The process is gone, so nothing is
+                        # left to release; a live bridge's error still surfaces.
+                        if self.process.poll() is None:
+                            raise
             self.log.close()
 
 
