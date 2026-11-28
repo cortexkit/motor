@@ -1,4 +1,7 @@
 use super::*;
+use crate::windows::prep::local_registry_retry::{
+    check_body_length, retry_fetch, winhttp_error, FetchError,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -19,8 +22,7 @@ const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
 const WINHTTP_QUERY_CONTENT_LENGTH: u32 = 5;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
-const ERROR_WINHTTP_HEADER_NOT_FOUND: u32 = 12150;
-const ERROR_WINHTTP_TIMEOUT: i32 = 12002;
+const ERROR_WINHTTP_HEADER_NOT_FOUND: i32 = 12150;
 const MAX_CRATE_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CRATE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 const INDEX_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -93,13 +95,9 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-fn winhttp_error(call: &str) -> io::Error {
-    io::Error::other(format!("{call}: {}", io::Error::last_os_error()))
-}
-
-fn handle(raw: HInternet, call: &str) -> io::Result<Internet> {
+fn handle(raw: HInternet) -> io::Result<Internet> {
     if raw.is_null() {
-        Err(winhttp_error(call))
+        Err(io::Error::last_os_error())
     } else {
         Ok(Internet(raw))
     }
@@ -187,37 +185,24 @@ fn check_download_deadline(
     host: &str,
     path: &str,
     phase: &str,
-) -> io::Result<()> {
+) -> Result<(), FetchError> {
     if Instant::now() >= deadline {
-        return Err(io::Error::new(
+        return Err(FetchError::Transient(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "local-registry HTTPS request timed out after {} seconds during {phase}: https://{host}{path}",
                 timeout.as_secs()
             ),
-        ));
+        )));
     }
     Ok(())
-}
-
-fn download_error(host: &str, path: &str, phase: &str, error: io::Error) -> io::Error {
-    if error.raw_os_error() == Some(ERROR_WINHTTP_TIMEOUT) {
-        return io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("local-registry HTTPS request timed out during {phase}: https://{host}{path}"),
-        );
-    }
-    io::Error::new(
-        error.kind(),
-        format!("local-registry HTTPS {phase} failed for https://{host}{path}: {error}"),
-    )
 }
 
 fn download_allowlisted(
     host: &str,
     path: &str,
     size_limit: usize,
-    phase: impl FnMut(&str) -> io::Result<()>,
+    mut phase: impl FnMut(&str) -> io::Result<()>,
 ) -> io::Result<Vec<u8>> {
     let maximum = allowlisted_download_limit(host, path).ok_or_else(|| {
         invalid(format!(
@@ -229,7 +214,10 @@ fn download_allowlisted(
             "local-registry download size limit exceeds its host policy",
         ));
     }
-    download_https(host, path, size_limit, None, phase)
+    retry_fetch(
+        || download_https_once(host, path, size_limit, None, &mut phase),
+        std::thread::sleep,
+    )
 }
 
 pub(super) fn download_bun(
@@ -237,37 +225,35 @@ pub(super) fn download_bun(
     path: &str,
     authorization: Option<&str>,
 ) -> io::Result<Vec<u8>> {
-    download_https(
+    download_https_once(
         host,
         path,
         motor_winagent::bun::MAX_BLOB_BYTES as usize,
         authorization,
         |_| Ok(()),
     )
+    .map_err(io::Error::from)
 }
 
-fn download_https(
+fn download_https_once(
     host: &str,
     path: &str,
     size_limit: usize,
     authorization: Option<&str>,
     mut phase: impl FnMut(&str) -> io::Result<()>,
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, FetchError> {
     let timeout = download_timeout(host);
     let deadline = Instant::now() + timeout;
     let url = format!("https://{host}{path}");
     phase(&format!("{url} open WinHTTP session"))?;
     check_download_deadline(deadline, timeout, host, path, "open session")?;
     let user_agent = wide("MotorRunner local-registry fetcher");
-    let session = handle(
-        unsafe { WinHttpOpen(user_agent.as_ptr(), 0, null(), null(), 0) },
-        "WinHttpOpen",
-    )
-    .map_err(|error| download_error(host, path, "open session", error))?;
+    let session = handle(unsafe { WinHttpOpen(user_agent.as_ptr(), 0, null(), null(), 0) })
+        .map_err(|error| winhttp_error(&url, "open session", error))?;
     check_download_deadline(deadline, timeout, host, path, "set request timeouts")?;
     phase(&format!("{url} set request timeouts"))?;
     checked(unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 5_000) })
-        .map_err(|error| download_error(host, path, "set request timeouts", error))?;
+        .map_err(|error| winhttp_error(&url, "set request timeouts", error))?;
     check_download_deadline(deadline, timeout, host, path, "disable redirects")?;
     phase(&format!("{url} disable redirects"))?;
     let mut redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
@@ -279,34 +265,28 @@ fn download_https(
             std::mem::size_of_val(&redirect_policy) as u32,
         )
     })
-    .map_err(|error| download_error(host, path, "disable redirects", error))?;
+    .map_err(|error| winhttp_error(&url, "disable redirects", error))?;
     phase(&format!("{url} resolve and connect"))?;
     check_download_deadline(deadline, timeout, host, path, "connect")?;
     let host_wide = wide(host);
-    let connection = handle(
-        unsafe { WinHttpConnect(session.0, host_wide.as_ptr(), 443, 0) },
-        "WinHttpConnect",
-    )
-    .map_err(|error| download_error(host, path, "connect", error))?;
+    let connection = handle(unsafe { WinHttpConnect(session.0, host_wide.as_ptr(), 443, 0) })
+        .map_err(|error| winhttp_error(&url, "connect", error))?;
     phase(&format!("{url} open request"))?;
     check_download_deadline(deadline, timeout, host, path, "open request")?;
     let get = wide("GET");
     let path_wide = wide(path);
-    let request = handle(
-        unsafe {
-            WinHttpOpenRequest(
-                connection.0,
-                get.as_ptr(),
-                path_wide.as_ptr(),
-                null(),
-                null(),
-                null(),
-                WINHTTP_FLAG_SECURE,
-            )
-        },
-        "WinHttpOpenRequest",
-    )
-    .map_err(|error| download_error(host, path, "open request", error))?;
+    let request = handle(unsafe {
+        WinHttpOpenRequest(
+            connection.0,
+            get.as_ptr(),
+            path_wide.as_ptr(),
+            null(),
+            null(),
+            null(),
+            WINHTTP_FLAG_SECURE,
+        )
+    })
+    .map_err(|error| winhttp_error(&url, "open request", error))?;
     phase(&format!("{url} send request"))?;
     check_download_deadline(deadline, timeout, host, path, "send request")?;
     let headers = authorization.map(|token| wide(&format!("Authorization: Bearer {token}\r\n")));
@@ -321,11 +301,11 @@ fn download_https(
             0,
         )
     })
-    .map_err(|error| download_error(host, path, "send request", error))?;
+    .map_err(|error| winhttp_error(&url, "send request", error))?;
     phase(&format!("{url} receive response"))?;
     check_download_deadline(deadline, timeout, host, path, "receive response")?;
     checked(unsafe { WinHttpReceiveResponse(request.0, null_mut()) })
-        .map_err(|error| download_error(host, path, "receive response", error))?;
+        .map_err(|error| winhttp_error(&url, "receive response", error))?;
     phase(&format!("{url} query response status"))?;
     check_download_deadline(deadline, timeout, host, path, "query status")?;
 
@@ -341,7 +321,7 @@ fn download_https(
             null_mut(),
         )
     })
-    .map_err(|error| download_error(host, path, "query status", error))?;
+    .map_err(|error| winhttp_error(&url, "query status", error))?;
     require_success_status(status)
         .map_err(|error| io::Error::new(error.kind(), format!("{error} from {url}")))?;
     phase(&format!("{url} query content length"))?;
@@ -360,24 +340,15 @@ fn download_https(
         )
     } != 0;
     if !has_size {
-        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        if error != ERROR_WINHTTP_HEADER_NOT_FOUND {
-            if error as i32 == ERROR_WINHTTP_TIMEOUT {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "local-registry HTTPS request timed out during query content length: {url}"
-                    ),
-                ));
-            }
-            return Err(io::Error::other(format!(
-                "local-registry HTTPS query Content-Length failed for {url} with Win32 {error}"
-            )));
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_WINHTTP_HEADER_NOT_FOUND) {
+            return Err(winhttp_error(&url, "query content length", error));
         }
     } else if declared_size as usize > size_limit {
         return Err(invalid(format!(
             "local-registry HTTPS response from {url} exceeds the {size_limit}-byte limit"
-        )));
+        ))
+        .into());
     }
 
     phase(&format!("{url} read response body"))?;
@@ -394,23 +365,21 @@ fn download_https(
                 &mut count,
             )
         })
-        .map_err(|error| download_error(host, path, "read response body", error))?;
+        .map_err(|error| winhttp_error(&url, "read response body", error))?;
+        if bytes.len().saturating_add(count as usize) > size_limit {
+            return Err(invalid(format!(
+                "local-registry HTTPS response from {url} exceeds the {size_limit}-byte limit"
+            ))
+            .into());
+        }
         check_download_deadline(deadline, timeout, host, path, "read response body")?;
         if count == 0 {
             break;
         }
-        if bytes.len().saturating_add(count as usize) > size_limit {
-            return Err(invalid(format!(
-                "local-registry HTTPS response from {url} exceeds the {size_limit}-byte limit"
-            )));
-        }
         bytes.extend_from_slice(&chunk[..count as usize]);
     }
-    if has_size && bytes.len() != declared_size as usize {
-        return Err(io::Error::other(format!(
-            "incomplete HTTPS response from {url}: declared {declared_size} bytes, received {}",
-            bytes.len()
-        )));
+    if has_size {
+        check_body_length(&url, declared_size as usize, bytes.len())?;
     }
     Ok(bytes)
 }

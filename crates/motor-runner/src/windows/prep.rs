@@ -6,6 +6,9 @@ use std::{
     io::Write,
 };
 
+#[cfg(any(windows, test))]
+pub(super) mod local_registry_retry;
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Snapshot {
     pub(crate) mirror: PathBuf,
