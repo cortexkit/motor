@@ -23,6 +23,7 @@ pub struct JobStream {
     pub records: mpsc::Receiver<io::Result<StreamRecord>>,
     storage: Arc<Storage>,
     wake: watch::Sender<bool>,
+    windows_placement: Option<Arc<WindowsPlacement>>,
     _lease: JobLease,
 }
 impl JobStream {
@@ -43,7 +44,11 @@ impl JobStream {
     /// Persist before waking the attached task. Dropping a stream is a detach,
     /// not a cancel; only this explicit operation records cancellation intent.
     pub fn cancel(&self) -> io::Result<()> {
-        self.storage.cancel(self.job_id, true)?;
+        if let Some(placement) = &self.windows_placement {
+            placement.request_cancel(&self.storage, self.job_id)?;
+        } else {
+            self.storage.cancel(self.job_id, true)?;
+        }
         if self.hosted_state().is_some() {
             tracing::info!(job_id = %self.job_id, step = "cancel", cause = "caller requested cancellation", "hosted cancellation requested");
         }
@@ -70,7 +75,7 @@ pub struct Motor {
     hosted_cancels: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, CancelDelivery>>>,
     /// Attach must not follow a withdrawn runner while its submission owner can
     /// still move the command to another runner. Closing a watch opens the fence.
-    submissions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, watch::Sender<()>>>>,
+    submissions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, SubmissionSignals>>>,
     hosted_cleanup: Arc<hosted_cleanup::Cleanup>,
     hosted_results:
         Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Arc<hosted_result::Owner>>>>,
@@ -102,6 +107,11 @@ struct Submission {
     motor: Motor,
     id: Uuid,
 }
+
+struct SubmissionSignals {
+    ready: watch::Sender<()>,
+    windows_placement: Option<Arc<WindowsPlacement>>,
+}
 impl Drop for Submission {
     fn drop(&mut self) {
         self.motor.submission_ready(self.id);
@@ -121,9 +131,71 @@ struct PlacementQueue {
     deadline: tokio::time::Instant,
     retry_at: Option<tokio::time::Instant>,
     cycle_windows: bool,
+    windows: Option<Arc<WindowsPlacement>>,
     run_sent: bool,
     accepted: bool,
     retry_delay: Duration,
+}
+
+struct WindowsPlacement {
+    run_committed: std::sync::Mutex<bool>,
+    cancel: watch::Sender<bool>,
+}
+
+impl WindowsPlacement {
+    fn new() -> Self {
+        Self {
+            run_committed: std::sync::Mutex::new(false),
+            cancel: watch::channel(false).0,
+        }
+    }
+
+    /// Cancellation and Run share this lock around their durable decisions.
+    /// Only cancellation that wins before Run can skip runner delivery.
+    fn request_cancel(&self, storage: &Storage, id: Uuid) -> io::Result<bool> {
+        let run_committed = self.run_committed.lock().unwrap();
+        storage.cancel(id, true)?;
+        // A runner's CancelReply clears pending delivery, not the caller's
+        // instruction to stop trying other runners after a proven refusal.
+        self.cancel.send_replace(true);
+        Ok(!*run_committed)
+    }
+
+    fn commit_run(&self, storage: &Storage, id: Uuid) -> io::Result<bool> {
+        let mut run_committed = self.run_committed.lock().unwrap();
+        if self.is_cancelled() || storage.job(id).is_some_and(|job| job.pending_cancel) {
+            return Ok(false);
+        }
+        storage.run_sent(id, false)?;
+        *run_committed = true;
+        Ok(true)
+    }
+
+    fn retry(&self, rebind: impl FnOnce() -> io::Result<()>) -> io::Result<bool> {
+        let mut run_committed = self.run_committed.lock().unwrap();
+        // The attempt returned a retry only if no Run can still start.
+        *run_committed = false;
+        if self.is_cancelled() {
+            return Ok(false);
+        }
+        rebind()?;
+        Ok(true)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    async fn cancelled(placement: Option<&Self>) {
+        let Some(placement) = placement else {
+            return std::future::pending().await;
+        };
+        let _ = placement
+            .cancel
+            .subscribe()
+            .wait_for(|cancelled| *cancelled)
+            .await;
+    }
 }
 impl Drop for CancelInFlight {
     fn drop(&mut self) {
@@ -512,7 +584,20 @@ impl Motor {
         });
         // Own the route before publishing it: health may run on another thread
         // before the caller's stream and progress reporter have been created.
+        let windows_placement = request.platform == Some(Platform::Windows)
+            && !self.config.windows_runners.is_empty()
+            && !hosted_test
+            && wsl_refusal.is_none()
+            && memory_refusal.is_none();
         let submission = self.submission(id);
+        if windows_placement {
+            self.submissions
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .windows_placement = Some(Arc::new(WindowsPlacement::new()));
+        }
         self.storage
             .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
         self.storage.health_deadline(id, request.timeout)?;
@@ -732,7 +817,13 @@ impl Motor {
     }
     fn submission(&self, id: Uuid) -> Submission {
         let (ready, _) = watch::channel(());
-        self.submissions.lock().unwrap().insert(id, ready);
+        self.submissions.lock().unwrap().insert(
+            id,
+            SubmissionSignals {
+                ready,
+                windows_placement: None,
+            },
+        );
         Submission {
             motor: self.clone(),
             id,
@@ -740,6 +831,13 @@ impl Motor {
     }
     fn submission_ready(&self, id: Uuid) {
         self.submissions.lock().unwrap().remove(&id);
+    }
+    fn windows_placement(&self, id: Uuid) -> Option<Arc<WindowsPlacement>> {
+        self.submissions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|signals| signals.windows_placement.clone())
     }
     async fn wait_for_submission(
         &self,
@@ -751,7 +849,7 @@ impl Motor {
             .lock()
             .unwrap()
             .get(&id)
-            .map(|s| s.subscribe());
+            .map(|s| s.ready.subscribe());
         if let Some(mut ready) = ready {
             tokio::select! {
                 _ = ready.changed() => {},
@@ -805,6 +903,7 @@ impl Motor {
                 records,
                 storage: self.storage.clone(),
                 wake,
+                windows_placement: self.windows_placement(id),
                 _lease: self.storage.lease_job(id),
             },
             tx,
@@ -1202,6 +1301,7 @@ impl Motor {
                     retry_at: signing_retry.map(|(_, retry_at)| retry_at),
                     cycle_windows: request.platform == Some(Platform::Windows)
                         && !self.config.windows_runners.is_empty(),
+                    windows: self.windows_placement(id),
                     run_sent: false,
                     accepted: false,
                     retry_delay: Duration::from_secs(5),
@@ -1225,11 +1325,18 @@ impl Motor {
                 if let Some(retry_at) = queue.retry_at.take() {
                     progress.phase(ProgressPhase::PlacementWait);
                     tokio::select! {
+                        biased;
+                        _ = WindowsPlacement::cancelled(queue.windows.as_deref()) => {
+                            return self.cancel_windows_placement(id, tx).await;
+                        },
                         _ = tokio::time::sleep_until(queue.deadline.min(retry_at)) => {},
                         _ = tx.closed() => return Err(io::Error::other("caller detached")),
                     }
                 }
-                if self.pending(id) {
+                if self.pending(id) || queue.windows.as_ref().is_some_and(|w| w.is_cancelled()) {
+                    if queue.windows.is_some() {
+                        return self.cancel_windows_placement(id, tx).await;
+                    }
                     let terminal =
                         TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0).with_ran(Ran::None);
                     self.storage.local_terminal(terminal.clone())?;
@@ -1279,19 +1386,28 @@ impl Motor {
                     // Runners retain refusals by destination ID. A proven
                     // before-start retry needs a new ID, durably mapped with its
                     // endpoint before another Run can be sent.
-                    self.storage.bind_windows_retry(
-                        id,
-                        next.clone(),
-                        queue.run_sent.then(Uuid::now_v7),
-                        u64::try_from(
-                            queue
-                                .deadline
-                                .saturating_duration_since(tokio::time::Instant::now())
-                                .as_millis()
-                                .div_ceil(1000),
+                    let rebind = || {
+                        self.storage.bind_windows_retry(
+                            id,
+                            next.clone(),
+                            queue.run_sent.then(Uuid::now_v7),
+                            u64::try_from(
+                                queue
+                                    .deadline
+                                    .saturating_duration_since(tokio::time::Instant::now())
+                                    .as_millis()
+                                    .div_ceil(1000),
+                            )
+                            .unwrap_or(u64::MAX),
                         )
-                        .unwrap_or(u64::MAX),
-                    )?;
+                    };
+                    if let Some(windows) = &queue.windows {
+                        if !windows.retry(rebind)? {
+                            return self.cancel_windows_placement(id, tx).await;
+                        }
+                    } else {
+                        rebind()?;
+                    }
                 }
                 queue.run_sent = false;
                 if windows_last || !queue.cycle_windows {
@@ -1303,6 +1419,15 @@ impl Motor {
                 }
             }
         }
+    }
+    async fn cancel_windows_placement(
+        &self,
+        id: Uuid,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> io::Result<()> {
+        let terminal = TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0).with_ran(Ran::None);
+        self.storage.cancel_windows_placement(terminal.clone())?;
+        emit(tx, StreamRecord::Terminal(terminal)).await
     }
     #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
@@ -1390,6 +1515,9 @@ impl Motor {
             Some(self.connector_for_job(id)?)
         };
         let explicit_windows = windows && !self.config.windows_runners.is_empty();
+        let windows_placement = placement_queue
+            .as_ref()
+            .and_then(|queue| queue.windows.clone());
         let windows_runner = explicit_windows.then(|| {
             self.storage
                 .job(id)
@@ -1541,15 +1669,19 @@ impl Motor {
                     Ok(channel)
                 };
                 let opened = if explicit_windows {
-                    tokio::time::timeout(WINDOWS_PROBE_TIMEOUT, opened)
-                        .await
-                        .unwrap_or_else(|_| {
+                    tokio::select! {
+                        biased;
+                        _ = WindowsPlacement::cancelled(windows_placement.as_deref()) => {
+                            return self.cancel_windows_placement(id, tx).await.map(|_| false);
+                        },
+                        result = tokio::time::timeout(WINDOWS_PROBE_TIMEOUT, opened) => result.unwrap_or_else(|_| {
                             Err((
                                 RefusalReason::Unreachable,
                                 Some("Windows runner handshake/status timed out after 3s".into()),
                                 None,
                             ))
-                        })
+                        }),
+                    }
                 } else {
                     opened.await
                 };
@@ -1840,7 +1972,7 @@ impl Motor {
         // A cancellation recorded while the lease was provisioning belongs to
         // the destination job too, including a newly minted resubmission ID.
         // Install its tombstone before Run so an empty upload cannot race it.
-        if self.pending(id) {
+        if windows_placement.is_none() && self.pending(id) {
             self.send_cancel(id)
                 .await
                 .inspect_err(|error| self.log_hosted_failure(id, "cancel_before_run", error))?;
@@ -1858,20 +1990,25 @@ impl Motor {
         // connection cannot prove that the command never ran.
         // A hosted Run is also fenced against shutdown, so the shutdown
         // inventory cannot miss a booking whose Run is about to be sent.
-        let _booking_open = if hosted {
-            let open = self.hosted_cleanup.booking_open.lock().unwrap();
-            if !*open {
-                return Err(io::Error::other("hosted Run stopped during shutdown"));
+        if let Some(placement) = &windows_placement {
+            if !placement.commit_run(&self.storage, id)? {
+                return self.cancel_windows_placement(id, tx).await.map(|_| false);
             }
-            Some(open)
         } else {
-            None
-        };
-        self.storage
-            .run_sent(id, hosted)
-            .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
-        drop(_booking_open);
-        if let Some(queue) = placement_queue {
+            let _booking_open = if hosted {
+                let open = self.hosted_cleanup.booking_open.lock().unwrap();
+                if !*open {
+                    return Err(io::Error::other("hosted Run stopped during shutdown"));
+                }
+                Some(open)
+            } else {
+                None
+            };
+            self.storage
+                .run_sent(id, hosted)
+                .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
+        }
+        if let Some(queue) = placement_queue.as_mut() {
             queue.run_sent = true;
         }
         if let Err(error) = channel.send(Frame::Run(run)).await {
@@ -1975,7 +2112,7 @@ impl Motor {
                 // A positive refusal proves this Run did not start. A lost
                 // acknowledgement or an Accepted response alone cannot permit a move.
                 if explicit_windows
-                    && !self.pending(id)
+                    && (windows_placement.is_some() || !self.pending(id))
                     && windows_retryable_refusal(&reason, detail.as_deref())
                 {
                     if let Some(queue) = placement_queue.as_mut() {
@@ -3420,11 +3557,10 @@ impl Motor {
                     if terminal.ran == Some(Ran::None)
                         && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }
                             if windows_retryable_refusal(reason, terminal.refusal_detail.as_deref()))
-                        && !self.pending(id)
                     {
-                        if let Some(queue) =
-                            placement_queue.as_mut().filter(|queue| queue.cycle_windows)
-                        {
+                        if let Some(queue) = placement_queue.as_mut().filter(|queue| {
+                            queue.cycle_windows && (queue.windows.is_some() || !self.pending(id))
+                        }) {
                             queue.retry_delay = queue
                                 .retry_delay
                                 .max(Duration::from_millis(terminal.retry_after_ms.unwrap_or(0)));
@@ -3627,13 +3763,14 @@ impl Motor {
         // An unbound local refusal reached no runner. Bound direct records and
         // unconfirmed cancellation still need their persisted follow-up route.
         if self.storage.job(id).is_some_and(|job| {
-            job.runner_instance.is_none()
-                && job.windows_runner.is_none()
-                && !job.pending_cancel
-                && job
-                    .local_terminal
-                    .is_some_and(|terminal| terminal.ran == Some(Ran::None))
-                && self.hosted_state(id).is_none_or(|state| !state.run_sent)
+            job.windows_placement_cancelled()
+                || (job.runner_instance.is_none()
+                    && job.windows_runner.is_none()
+                    && !job.pending_cancel
+                    && job
+                        .local_terminal
+                        .is_some_and(|terminal| terminal.ran == Some(Ran::None))
+                    && self.hosted_state(id).is_none_or(|state| !state.run_sent))
         }) {
             return Ok(CancelReply::new(id));
         }
@@ -3653,8 +3790,20 @@ impl Motor {
         // Mark the delivery before the intent is persisted, so the job's
         // stream never acts on a pending cancel this call is about to send.
         let _delivering = build_server.then(|| self.deliver_cancel(id));
-        self.storage.cancel(id, true)?;
+        let local_placement_cancel = if let Some(placement) = self.windows_placement(id) {
+            placement.request_cancel(&self.storage, id)?
+        } else {
+            self.storage.cancel(id, true)?;
+            // Placement may have ended locally since the initial terminal
+            // check. In that case there is no runner job to cancel.
+            self.storage
+                .job(id)
+                .is_some_and(|job| job.windows_placement_cancelled())
+        };
         tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel intent persisted");
+        if local_placement_cancel {
+            return Ok(CancelReply::new(id));
+        }
         if self.hosted_state(id).is_some() {
             tracing::info!(job_id = %id, step = "cancel", cause = "caller requested cancellation", "hosted cancellation requested");
         }
@@ -3884,6 +4033,7 @@ impl Motor {
                 job.direct_secret_hash.is_some()
                     || job.health_retired()
                     || hosted_never_sent
+                    || job.windows_placement_cancelled()
                     || (job.runner_instance.is_none()
                         && job.windows_runner.is_none()
                         && job.hosted.is_none()

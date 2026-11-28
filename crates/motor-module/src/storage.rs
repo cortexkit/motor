@@ -188,6 +188,12 @@ impl Job {
                 && (state.finish_done || state.billing != crate::BillingStatus::Pending)
         })
     }
+    pub(crate) fn windows_placement_cancelled(&self) -> bool {
+        self.windows_runner.is_some()
+            && self.local_terminal.as_ref().is_some_and(|terminal| {
+                terminal.outcome == Outcome::Cancelled && terminal.ran == Some(Ran::None)
+            })
+    }
     /// A job resubmitted to the build server retains its old hosted booking for
     /// cleanup. Pending cancellation belongs to the replacement command, not
     /// that booking.
@@ -1199,7 +1205,7 @@ impl Storage {
     pub fn cancel(&self, id: Uuid, pending: bool) -> io::Result<()> {
         self.update(|s| {
             let job = Arc::make_mut(s.jobs.entry(id).or_default());
-            let completed = job.hosted_cancel_complete();
+            let completed = job.hosted_cancel_complete() || job.windows_placement_cancelled();
             job.pending_cancel = pending && !completed;
             if job.pending_cancel {
                 job.retain_until_ms = Some(
@@ -1270,6 +1276,14 @@ impl Storage {
             let job = Arc::make_mut(s.jobs.entry(id).or_default());
             job.local_terminal = Some(t);
             job.terminal_observed_at_ms.get_or_insert(now_ms());
+        })
+    }
+    pub(crate) fn cancel_windows_placement(&self, terminal: TerminalRecord) -> io::Result<()> {
+        self.update(|s| {
+            let job = Arc::make_mut(s.jobs.get_mut(&terminal.job_id).expect("bound Windows job"));
+            job.local_terminal = Some(terminal);
+            job.pending_cancel = false;
+            job.terminal_observed_at_ms.get_or_insert_with(now_ms);
         })
     }
     pub(crate) fn remote_terminal(&self, terminal: TerminalRecord) -> io::Result<()> {

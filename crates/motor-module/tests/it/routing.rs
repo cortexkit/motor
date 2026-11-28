@@ -17,6 +17,7 @@ use std::{
 use subc_client_rs::HandlerOutcome;
 
 const WINDOWS_ROOT: &str = "/srv/build/motor-windows/windows/state";
+const QUEUED_UNTIL_CANCEL: usize = 22;
 
 fn configured(mut config: Config) -> Config {
     config.windows_runner_instance = Some("windows".into());
@@ -57,6 +58,25 @@ impl DispatchLog {
     }
 }
 
+#[derive(Default)]
+struct FramePause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl FramePause {
+    async fn wait_until_reached(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.reached.notified())
+            .await
+            .expect("fake runner did not reach the paused frame");
+    }
+
+    async fn pause(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+}
+
 struct RoutingPeer {
     visits: Mutex<Vec<Visit>>,
     frames: Arc<Mutex<Vec<Frame>>>,
@@ -72,6 +92,10 @@ struct RoutingPeer {
     last_behavior: AtomicUsize,
     queued: Arc<tokio::sync::Notify>,
     queue_release: Arc<tokio::sync::Semaphore>,
+    queue_cancelled: Arc<tokio::sync::Notify>,
+    last_hello_pause: Mutex<Option<Arc<FramePause>>>,
+    have_pause: Arc<Mutex<Option<Arc<FramePause>>>>,
+    run_pause: Arc<Mutex<Option<Arc<FramePause>>>>,
     endpoints: Mutex<Vec<crate::WindowsRunner>>,
     refused: Arc<Mutex<std::collections::HashMap<Uuid, TerminalRecord>>>,
     dispatches: Arc<Mutex<DispatchLog>>,
@@ -99,6 +123,10 @@ impl RoutingPeer {
             last_behavior: AtomicUsize::new(0),
             queued: Arc::new(tokio::sync::Notify::new()),
             queue_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            queue_cancelled: Arc::default(),
+            last_hello_pause: Mutex::default(),
+            have_pause: Arc::default(),
+            run_pause: Arc::default(),
             endpoints: Mutex::new(Vec::new()),
             refused: Arc::default(),
             dispatches: Arc::default(),
@@ -197,6 +225,14 @@ impl Connector for RoutingPeer {
         let fail_cancel = self.fail_cancel_once.clone();
         let queued = self.queued.clone();
         let queue_release = self.queue_release.clone();
+        let queue_cancelled = self.queue_cancelled.clone();
+        let hello_pause = if instance == "windows" {
+            self.last_hello_pause.lock().unwrap().take()
+        } else {
+            None
+        };
+        let have_pause = self.have_pause.clone();
+        let run_pause = self.run_pause.clone();
         let refused = self.refused.clone();
         let dispatches = self.dispatches.clone();
         Box::pin(async move {
@@ -215,7 +251,10 @@ impl Connector for RoutingPeer {
                     read_frame_async(&mut peer).await.unwrap(),
                     Some(Frame::Hello { .. })
                 ));
-                write_frame_async(
+                if let Some(pause) = &hello_pause {
+                    pause.pause().await;
+                }
+                let hello = write_frame_async(
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
@@ -229,12 +268,19 @@ impl Connector for RoutingPeer {
                         platforms,
                     },
                 )
-                .await
-                .unwrap();
+                .await;
+                if hello_pause.is_some() && hello.is_err() {
+                    return;
+                }
+                hello.unwrap();
                 while let Ok(Some(frame)) = read_frame_async(&mut peer).await {
                     frames.lock().unwrap().push(frame.clone());
                     match frame {
                         Frame::Have { .. } => {
+                            let pause = have_pause.lock().unwrap().take();
+                            if let Some(pause) = pause {
+                                pause.pause().await;
+                            }
                             if write_frame_async(
                                 &mut peer,
                                 &Frame::HaveReply {
@@ -277,6 +323,10 @@ impl Connector for RoutingPeer {
                                     id,
                                     &instance,
                                 );
+                            }
+                            let pause = run_pause.lock().unwrap().take();
+                            if let Some(pause) = pause {
+                                pause.pause().await;
                             }
                             if matches!(behavior, 2 | 13 | 17 | 20) {
                                 dispatches.lock().unwrap().finished(id);
@@ -375,7 +425,7 @@ impl Connector for RoutingPeer {
                                     write_frame_async(&mut peer, &Frame::Terminal(terminal)).await;
                                 return;
                             }
-                            if behavior == 7 {
+                            if matches!(behavior, 7 | QUEUED_UNTIL_CANCEL) {
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Heartbeat {
@@ -385,6 +435,25 @@ impl Connector for RoutingPeer {
                                 )
                                 .await;
                                 queued.notify_one();
+                                if behavior == QUEUED_UNTIL_CANCEL {
+                                    queue_cancelled.notified().await;
+                                    dispatches.lock().unwrap().finished(id);
+                                    let _ = write_frame_async(
+                                        &mut peer,
+                                        &Frame::Terminal(
+                                            TerminalRecord::new(
+                                                id,
+                                                Outcome::Cancelled,
+                                                0,
+                                                1_234,
+                                                0,
+                                            )
+                                            .with_ran(Ran::None),
+                                        ),
+                                    )
+                                    .await;
+                                    return;
+                                }
                                 queue_release.acquire().await.unwrap().forget();
                                 dispatches.lock().unwrap().finished(id);
                                 let _ = write_frame_async(
@@ -463,6 +532,9 @@ impl Connector for RoutingPeer {
                                 &Frame::CancelReply(CancelReply::new(id)),
                             )
                             .await;
+                            if behavior == QUEUED_UNTIL_CANCEL {
+                                queue_cancelled.notify_one();
+                            }
                             return;
                         }
                         Frame::JobStatus { .. } => {
@@ -1221,6 +1293,188 @@ async fn ordered_windows_last_stopped_or_draining_revisits_first_when_free() {
             .all(|v| v.instance == "ally-windows"));
         assert!(visits[last + 1].at.duration_since(visits[last].at) >= Duration::from_secs(5));
     }
+}
+
+async fn assert_windows_placement_cancelled(motor: &Motor, stream: crate::JobStream) {
+    let id = stream.job_id;
+    let records = tokio::time::timeout(Duration::from_secs(2), async {
+        motor.cancel(CancelRequest::new(id)).await.unwrap();
+        collect(stream).await
+    })
+    .await
+    .expect("placement cancellation must interrupt the current wait");
+    assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+        if t.job_id == id && t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)));
+}
+
+#[tokio::test]
+async fn ordered_windows_cancels_busy_unreachable_placement_during_handshake() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    let hello = Arc::<FramePause>::default();
+    *peer.last_hello_pause.lock().unwrap() = Some(hello.clone());
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut request = f.request("true").with_platform(Platform::Windows);
+    request.queue_wait_limit_s = Some(30);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    hello.wait_until_reached().await;
+    let visits = peer.visits.lock().unwrap().len();
+
+    assert_windows_placement_cancelled(&motor, stream).await;
+    hello.release.notify_one();
+    let replay = collect(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert!(matches!(replay.as_slice(), [StreamRecord::Terminal(t)]
+        if t.job_id == id && t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)));
+    let status = motor.job_status(id).await.unwrap();
+    assert_eq!(status.state, "terminal");
+    assert!(status
+        .terminal
+        .is_some_and(|t| t.outcome == Outcome::Cancelled));
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    assert_eq!(peer.visits.lock().unwrap().len(), visits);
+    assert!(peer.dispatches.lock().unwrap().runs.is_empty());
+}
+
+#[tokio::test]
+async fn ordered_windows_cancels_during_placement_backoff() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior.store(12, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut request = f.request("true").with_platform(Platform::Windows);
+    request.queue_wait_limit_s = Some(30);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let reached_last = peer
+                .visits
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|v| v.instance == "windows");
+            let stored = crate::storage::durable_value(&peer.module_state).unwrap();
+            if reached_last && stored["jobs"][id.to_string()]["windows_runner"]["name"] == "ally" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first placement pass must have returned to the Ally for backoff");
+    let visits = peer.visits.lock().unwrap().len();
+
+    assert_windows_placement_cancelled(&motor, stream).await;
+    assert_eq!(peer.visits.lock().unwrap().len(), visits);
+    assert!(peer.dispatches.lock().unwrap().runs.is_empty());
+}
+
+#[tokio::test]
+async fn ordered_windows_cancel_wins_before_run_commit() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let have = Arc::<FramePause>::default();
+    *peer.have_pause.lock().unwrap() = Some(have.clone());
+    let motor = peer.motor(ordered(f.config.clone()));
+    let stream = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    have.wait_until_reached().await;
+
+    // The runner is ready to receive a Run as soon as it answers Have.
+    // Commit cancellation first, then let submission proceed to that boundary.
+    let visits = peer.visits.lock().unwrap().len();
+    motor
+        .cancel(CancelRequest::new(stream.job_id))
+        .await
+        .unwrap();
+    have.release.notify_one();
+    let records = tokio::time::timeout(Duration::from_secs(2), collect(stream))
+        .await
+        .unwrap();
+    assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+        if t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)));
+    assert_eq!(peer.visits.lock().unwrap().len(), visits);
+    assert!(peer.dispatches.lock().unwrap().runs.is_empty());
+}
+
+#[tokio::test]
+async fn ordered_windows_cancel_reaches_accepted_queued_run() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior
+        .store(QUEUED_UNTIL_CANCEL, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut stream = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    assert_windows_queued(&peer, &mut stream).await;
+    let id = stream.job_id;
+
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    let records = tokio::time::timeout(Duration::from_secs(2), collect(stream))
+        .await
+        .unwrap();
+    assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+        if t.job_id == id && t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)
+            && t.queue_wait_ms == 1_234));
+    let frames = peer.frames.lock().unwrap();
+    assert_eq!(
+        frames.iter().filter(|f| matches!(f, Frame::Run(_))).count(),
+        1
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| matches!(f, Frame::Cancel(c) if c.job_id == id))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn ordered_windows_run_commit_wins_until_runner_refuses() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior.store(2, Ordering::SeqCst);
+    let run = Arc::<FramePause>::default();
+    *peer.run_pause.lock().unwrap() = Some(run.clone());
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut stream = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    run.wait_until_reached().await;
+    let id = stream.job_id;
+
+    // Until the paused runner responds to Run, only that runner can settle it.
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    assert!(matches!(
+        stream.records.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let visits = peer.visits.lock().unwrap().len();
+    assert!(peer
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f, Frame::Cancel(c) if c.job_id == id)));
+
+    // The refusal proves no start. The previous CancelReply must not make the
+    // placement loop forget that it has been asked to stop.
+    run.release.notify_one();
+    let records = tokio::time::timeout(Duration::from_secs(2), collect(stream))
+        .await
+        .unwrap();
+    assert!(matches!(records.as_slice(), [StreamRecord::Terminal(t)]
+        if t.outcome == Outcome::Cancelled && t.ran == Some(Ran::None)));
+    assert_eq!(peer.visits.lock().unwrap().len(), visits);
+    assert_eq!(peer.dispatches.lock().unwrap().runs.len(), 1);
 }
 
 #[tokio::test]

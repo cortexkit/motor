@@ -292,7 +292,7 @@ impl Motor {
             .lock()
             .unwrap()
             .get(&id)
-            .map(|s| s.subscribe());
+            .map(|s| s.ready.subscribe());
         // A cancel retry must not release a booking its submission still owns.
         // Shutdown settles even a request whose grant has not arrived yet.
         if let Some(mut fence) = fence {
